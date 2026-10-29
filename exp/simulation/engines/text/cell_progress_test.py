@@ -44,9 +44,3 @@ def test_mixed_purposes_carry_no_qualifier() -> None:
     )
     observe()
     assert seen == [ProgressEvent(stage="evaluation cells", completed=0, total=2)]
-
-
-def test_reporter_without_observer_is_silent() -> None:
-    """A missing hook produces no events."""
-    observe = cell_progress_reporter(None, (_Cell(purpose="fit"),), {})
-    observe()

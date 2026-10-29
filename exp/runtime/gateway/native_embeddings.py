@@ -9,7 +9,7 @@ boundary method.
 
 Deliberately absent on day one (each is a documented follow-up, not an
 oversight): keyed replay (an inbound ``Idempotency-Key`` is ignored, never
-keyed), input guardrails (the guardrail engine reads chat messages), project
+keyed), input inspection (applicable guardrails reject before acceptance), project
 targets (learned selection embeds the chat prompt), and body-signing dialects
 (Bedrock has no OpenAI embeddings wire).
 """
@@ -22,6 +22,7 @@ from dataclasses import replace
 from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -30,14 +31,19 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.native import require_unguarded_surface
+from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
     authority_error,
-    gateway_updating_failure,
+)
+from exp.runtime.gateway.native_admission import (
     record_dead_admission_rungs,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_embeddings_body
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
@@ -48,6 +54,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.openai_compatible import openai_embedding_request
@@ -61,6 +68,7 @@ class _EmbeddingsPlane(Protocol):
     _accounting: NativeAttemptAccounting
     _write_ledger: SyncWriteLedger
     _request_timeout_seconds: float
+    _guardrails: GuardrailEngine | None
 
     def _escalate_accepted(self, authorization: AuthorizationSnapshot, reason: str) -> str: ...
 
@@ -126,7 +134,6 @@ class NativeEmbeddingsMixin:
                 no rung of the alias serves embeddings.
         """
         assert_not_internal_classification()
-        self._accounting.sweep_expired()
         data = json.loads(argument)
         try:
             decoded = decode_native_embeddings_body(str(data["body"]))
@@ -141,8 +148,12 @@ class NativeEmbeddingsMixin:
                 request=request,
                 deadline_monotonic=deadline,
             )
+            authorization = authorize_serving_model_chains(self._components, authorization)
+            authorization = with_client_identity(authorization, data)  # reporting-only app facts
+            self._accounting.require_clear()
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise authority_error(exc) from exc
+        require_unguarded_surface(self._guardrails, authorization, "embeddings")
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -172,6 +183,7 @@ def _admit_accepted(
         dispatchable = dispatchable_route_profiles(
             plane._components.runtime_catalogs,  # noqa: SLF001
             route,
+            reread=lambda: plane._components.runtime_catalogs,  # noqa: SLF001
         )
     except NativeDialectUnavailableError as exc:
         return plane._escalate_accepted(authorization, str(exc))  # noqa: SLF001
@@ -188,7 +200,7 @@ def _admit_accepted(
     )
     if not dispatchable.indexes:
         return plane._escalate_accepted(  # noqa: SLF001
-            authorization, "every certified deployment was unavailable at admission"
+            authorization, UNAVAILABLE_AT_ADMISSION
         )
     serving: list[int] = []
     for index, (profile, _client) in zip(
@@ -248,6 +260,7 @@ def _admit_accepted(
             route=route,
             request=request,
             deadline_monotonic=deadline,
+            no_paid_prework=True,
             signers=(None,) * depth,
             dispatch_bindings=(None,) * depth,
             reasoning_carrier_authorities=(None,) * depth,
@@ -255,6 +268,7 @@ def _admit_accepted(
     )
     response: JsonObject = {
         "request_id": authorization.request_id,
+        "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         "alias": authorization.alias,
         "alias_revision_id": authorization.alias_revision_id,
         "exact_model_id": route.snapshot.exact_model_id,

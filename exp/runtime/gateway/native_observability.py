@@ -11,10 +11,12 @@ module keeps only the request-serving authority path.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.discovery import (
     public_model_list,
     public_model_object,
@@ -27,10 +29,17 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
+from exp.runtime.gateway.native_accounting_recovery import recovery_drained
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
-from exp.runtime.gateway.sqlite.migrations import close_idle_connections
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
+
+if TYPE_CHECKING:
+    from exp_gateway_native import CaptureCollector
+
+    from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+    from exp.runtime.gateway.native_capture import CaptureController
+    from exp.runtime.gateway.video.engine import VideoEngine
 
 
 class NativeObservabilityMixin:
@@ -41,6 +50,31 @@ class NativeObservabilityMixin:
     _data_plane_metrics: Callable[[], str] | None
     _usage_reporter: Callable[[], JsonObject] | None
     _readiness_probe: Callable[[], bool] | None
+    _guardrails: GuardrailEngine | None
+    _background_recovery: bool
+    _videos: VideoEngine | None
+    _request_timeout_seconds: float
+    _capture: CaptureController | None
+
+    @property
+    def capture_collector(self) -> CaptureCollector | None:
+        """Return this instance's collector for its native execution binding."""
+        return None if self._capture is None else self._capture.native
+
+    @property
+    def request_timeout_seconds(self) -> float:
+        """Return the per-request budget shared with the data plane."""
+        return self._request_timeout_seconds
+
+    @property
+    def reconciled_expired_requests(self) -> int:
+        """Return crashed requests reconciled at startup."""
+        return self._components.reconciled_expired_requests
+
+    @property
+    def reconciled_unknown_attempts(self) -> int:
+        """Return crashed attempts reconciled at startup."""
+        return self._components.reconciled_unknown_attempts
 
     def models(self, argument: str) -> str:
         """Return the granted model list body for one authenticated key."""
@@ -141,16 +175,49 @@ class NativeObservabilityMixin:
             data_plane = json.loads(self._data_plane_metrics())
         retained_replayed, abandoned_cancelled, inflight = self._accounting.counters()
         lead_rungs_skipped, dead_rungs_skipped = self._accounting.admission_rung_skips()
+        rung_sheds, rung_overflows, rung_refusals = self._accounting.rung_admission_counters()
+        rate_limit_sheds, fresh_session_spills = self._accounting.rung_rate_counters()
+        throttles_surfaced, throttles_failed_over, throttle_backoffs, throttle_backoffs_forced = (
+            self._accounting.throttle_cache_counters()
+        )
         control_plane: JsonObject = {
             "sweep_retained_settlements_replayed": retained_replayed,
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
             "admission_dead_rungs_skipped": dead_rungs_skipped,
             "admission_lead_rungs_skipped": lead_rungs_skipped,
             "admission_parameter_coercions": self._accounting.admission_parameter_coercions(),
+            "rung_admission_sheds": rung_sheds,
+            "rung_saturated_overflows": rung_overflows,
+            "rung_saturation_refusals": rung_refusals,
+            "rung_rate_limit_sheds": rate_limit_sheds,
+            "rung_fresh_session_spills": fresh_session_spills,
+            # Cache-stakes throttle dispositions on pools authoring a
+            # throttle_cache_threshold; the surfaced branch reserves no
+            # further attempt row, so this counter is its worker-side trace.
+            "throttle_surfaced_cache_preserving": throttles_surfaced,
+            "throttle_failover_cold": throttles_failed_over,
+            # Post-backoff redials of a throttled rung on pools authoring a
+            # throttle_redial schedule; each also lands as an attempt row.
+            "throttle_backoff_redials": throttle_backoffs,
+            # The subset of those redials the warm rung's own dispatch-policy
+            # facts shed and the accounting force-admitted there anyway; the
+            # attempt row stays throttle_backoff, so this is its only trace.
+            "throttle_backoff_forced_admissions": throttle_backoffs_forced,
+            "sticky_spill_bindings": self._accounting.sticky.size(),
+            # Live learned request ceilings keyed by rung (JSON snapshot only;
+            # the Prometheus rendering stays worker-global counters so no
+            # per-rung label cardinality is exported).
+            "rung_learned_ceilings": self._accounting.loads.learned_ceilings(),
             "inflight_attempts": inflight,
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
             "accounting_healthy": self._accounting.accounting_healthy,
+            "observation_recording_dropped": (
+                0 if self._guardrails is None else self._guardrails.observation_recording_dropped
+            ),
+            "observation_recording_failed": (
+                0 if self._guardrails is None else self._guardrails.observation_recording_failed
+            ),
         }
         return {"data_plane": data_plane, "control_plane": control_plane}
 
@@ -168,16 +235,12 @@ class NativeObservabilityMixin:
     def readiness(self, argument: str) -> str:
         """Return whether bridge settlement and composition accounting stay healthy.
 
-        Readiness fails closed once the bridge's own settlement registry has
-        latched a durable-write loss, once the composition's accounting
-        surface reports unhealthy, or when an injected hosted lifecycle probe
-        answers false or raises.
+        This instance's retained writes and infrastructure failures fail closed.
+        A host composing several instances owns process readiness separately.
         """
         del argument
-        if not self._accounting.accounting_healthy:
-            return "false"
         try:
-            if not self._components.accounting_healthy:
+            if not self._components.accounting_healthy or not self._accounting.accounting_healthy:
                 return "false"
         except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
             return "false"
@@ -188,13 +251,45 @@ class NativeObservabilityMixin:
                 return "false"
         return "true"
 
+    def close(self, timeout_seconds: float = 10.0) -> bool:
+        """Stop background recovery after the native data plane has drained."""
+        if not 0 <= timeout_seconds <= 300:
+            raise ValueError("gateway shutdown timeout must be between zero and 300 seconds")
+        deadline = time.monotonic() + timeout_seconds
+        videos_closed = self._videos is None or self._videos.close(timeout_seconds)
+        accounting_closed = self._accounting.close(max(0.0, deadline - time.monotonic()))
+        return videos_closed and accounting_closed
+
+    @property
+    def accounting_drained(self) -> bool:
+        """Whether this instance owns no accepted work or accounting write still in progress.
+
+        A host must also stop new execution before closing an idle instance. A
+        durable acknowledgment can finish this lifetime while its ledger retains
+        an unresolved financial hold for a later authoritative usage receipt.
+        Durable open video jobs still need this instance's poller. Explicit
+        process close may preserve them for restart instead of waiting for renders.
+        """
+        return recovery_drained(self._accounting) and (self._videos is None or self._videos.idle)
+
+    def recover_accounting(self) -> None:
+        """Run one bounded recovery pass when the host explicitly owns its scheduling.
+
+        Calls on one instance must be serialized. Recovery must continue while
+        accepted work or failed writes remain, even after its HTTP callers leave.
+        """
+        if self._background_recovery:
+            raise RuntimeError("this control plane already owns a background recovery thread")
+        self._accounting.sweep_expired()
+
     def close_thread_resources(self, argument: str) -> str:
-        """Release the calling thread's cached resources before it exits.
+        """Release resources cached by the calling callback worker.
 
         The data plane pins control-plane callbacks to a fixed pool of worker
-        threads and calls this once per worker as the pool shuts down, so the
-        SQLite connections cached per thread by ``persistent_connection``
-        close with the worker instead of outliving it.
+        threads. The individual process bridge calls this when a worker exits;
+        a host-bound target calls it after each callback, before releasing its
+        execution lease. A shared worker cannot retain an idle target's SQLite
+        connections after the host retires that target.
 
         Args:
             argument: Empty JSON object, matching the callback shape.
@@ -203,4 +298,6 @@ class NativeObservabilityMixin:
             JSON object reporting the number of connections closed.
         """
         del argument
+        if isinstance(self._components.ledger, SQLiteAttemptLedger):
+            self._components.ledger.classification_memo.clear()
         return json.dumps({"closed_connections": close_idle_connections()}, separators=(",", ":"))

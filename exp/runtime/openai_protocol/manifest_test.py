@@ -16,7 +16,6 @@ from exp.runtime.openai_protocol.manifest import (
     RESPONSES_INCLUDE_PATHS_ACCEPTED,
     RESPONSES_INCLUDE_PATHS_REJECTED,
     RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED,
-    RESPONSES_INPUT_ITEM_FIELDS_REJECTED,
     RESPONSES_MANIFEST,
     RESPONSES_REASONING_CONTEXTS_ACCEPTED,
     RESPONSES_REASONING_EFFORTS_ACCEPTED,
@@ -48,19 +47,33 @@ def test_manifests_classify_explicit_exclusions() -> None:
     chat = disposition_map(CHAT_MANIFEST)
     responses = disposition_map(RESPONSES_MANIFEST)
     assert chat["audio"] == CompatibilityDisposition.UNSUPPORTED
+    # OpenAI's deprecated tools spellings are rewritten to tools/tool_choice
+    # with disclosure (legacy_functions), never refused.
+    for legacy in ("functions", "function_call"):
+        assert chat[legacy] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     # Value-constrained acceptances: the wire models admit only the no-op
-    # values Copilot hardcodes (n:1, truncation:"disabled",
-    # prompt_cache_options:{"mode":"implicit"}).
+    # values Copilot hardcodes (n:1, truncation:"disabled").
     assert chat["n"] == CompatibilityDisposition.SUPPORTED
     # Retention opt-out admitted at its no-op false (OpenAI agents hardcode it);
     # store:true stays a named rejection in the Chat wire model.
     assert chat["store"] == CompatibilityDisposition.SUPPORTED
     assert responses["truncation"] == CompatibilityDisposition.SUPPORTED
-    assert responses["prompt_cache_options"] == CompatibilityDisposition.SUPPORTED
+    # OpenAI's prompt-cache options: forwarded where the wire carries them.
+    assert responses["prompt_cache_options"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    assert chat["prompt_cache_options"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert chat["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    # Chat verbosity is admitted (forwarded on native Responses rungs, dropped
+    # with disclosure elsewhere); opencode sends it on every request.
+    assert chat["verbosity"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    assert chat["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    # OpenRouter's sampling extras: forwarded or dropped per rung, never refused.
+    for extra in ("repetition_penalty", "min_p", "top_a"):
+        assert chat[extra] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
+    # Every enable-thinking spelling is admitted and translated, never dropped.
+    for spelling in ("reasoning", "thinking", "chat_template_kwargs", "enable_thinking"):
+        assert chat[spelling] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["service_tier"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["service_tier"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["background"] == CompatibilityDisposition.UNSUPPORTED
@@ -69,7 +82,22 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["store"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert responses["top_logprobs"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    assert responses["max_tool_calls"] == CompatibilityDisposition.UNSUPPORTED
+    # Hints that cannot change a correct answer are removed with disclosure.
+    for hint in ("prompt_cache_retention", "seed"):
+        assert chat[hint] == CompatibilityDisposition.IGNORED
+        assert responses[hint] == CompatibilityDisposition.IGNORED
+
+
+def test_schema_drift_fields_carry_capability_vocabulary() -> None:
+    """Explicit cache boundaries and the tool-call cap name their catalog slots."""
+    chat = {field.field_path: field for field in CHAT_MANIFEST.fields}
+    responses = {field.field_path: field for field in RESPONSES_MANIFEST.fields}
+    assert chat["prompt_cache_options"].capability == "prompt_cache_boundaries"
+    assert chat["prompt_cache_retention"].capability == "prompt_cache_boundaries"
+    assert responses["max_tool_calls"].capability == "tool_call_limit"
+    assert responses["prompt_cache_options"].capability == "prompt_cache_boundaries"
 
 
 def _sdk_literal_values(annotation: object) -> frozenset[str]:
@@ -180,7 +208,5 @@ def test_every_official_sdk_echoable_input_item_field_is_decided() -> None:
     }
     for item_type, sdk_type in sdk_items.items():
         accepted = RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED[item_type]
-        rejected = RESPONSES_INPUT_ITEM_FIELDS_REJECTED[item_type]
-        assert not accepted & rejected, item_type
-        undecided = set(sdk_type.__annotations__) - accepted - rejected
+        undecided = set(sdk_type.__annotations__) - accepted
         assert not undecided, _decided(undecided, f"echoed {item_type} input item")

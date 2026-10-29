@@ -24,12 +24,19 @@ from exp.common.models import ModelSnapshot
 
 
 class JudgeScoreObservation(ContractModel):
-    """Raw dimension score bound to a stored judgment and rollout."""
+    """Raw dimension score bound to a stored judgment and rollout.
+
+    Attributes:
+        judgment: Immutable source judgment pointer.
+        source_rollout: Immutable rollout assessed by that judgment.
+        dimension_id: Axis whose rubric defines the score bounds.
+        raw_score: Signed integer validated against the bound rubric during calibration.
+    """
 
     judgment: ArtifactInput
     source_rollout: ArtifactInput
     dimension_id: ArtifactId
-    raw_score: int = Field(ge=0)
+    raw_score: int
 
 
 class InsufficientCalibrationRiskAcceptance(ArtifactEnvelope):

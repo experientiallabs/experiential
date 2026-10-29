@@ -13,18 +13,28 @@
 //!
 //! | dialect                 | source                                        |
 //! |-------------------------|-----------------------------------------------|
-//! | `OpenAiResponses`       | `error.param`, else fixed unknown-argument msg |
-//! | `OpenAiCompatible`      | `error.param`, else fixed unknown-argument msg |
+//! | `OpenAiResponses`       | envelope `param`, else fixed unknown-argument msg |
+//! | `OpenAiCompatible`      | envelope `param`, else fixed unknown-argument msg |
 //! | `AnthropicMessages`     | leading `path: ` or `` `path` `` message token |
 //! | `GeminiGenerateContent` | `fieldViolations[].field`, else `* path: ` msg |
 //! | `BedrockConverseStream` | none — no machine-readable parameter contract  |
 //!
-//! The explanation relayed alongside it comes from `error.message` for every
-//! dialect except Bedrock, which reports a bare top-level `message`.
+//! The explanation relayed alongside it comes from `error.message` for the
+//! Anthropic and Gemini dialects, from a bare top-level `message` for
+//! Bedrock, and for the OpenAI family from whichever envelope spelling the
+//! lane answered (`crate::error_envelope`: the documented nested object, xAI's
+//! string `error`, the flat vLLM/Novita/API-Management objects, FastAPI's
+//! `detail`).
 
 use serde_json::Value;
 
 use crate::dialects::Dialect;
+use crate::error_envelope::{openai_family_envelope, parse_error_document, ErrorEnvelope};
+pub use crate::rejection_shapes::{
+    content_filtered_completion, rejected_by_account_quota, rejected_by_lane_limitation,
+    rejected_by_routing_gate, rejected_caller_reference_not_found, rejected_encrypted_reasoning,
+    rejected_via_decode_failure, upstream_relayed_message,
+};
 
 /// Longest parameter path relayed; anything longer is treated as prose.
 const MAXIMUM_PATH_LENGTH: usize = 128;
@@ -45,13 +55,13 @@ const UNKNOWN_ARGUMENT_PREFIXES: [&str; 2] = [
 /// fields, prose, oversized or non-path content, non-JSON — yields `None`
 /// and the caller keeps the content-free sanitized message.
 pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
+    let value = parse_error_document(body)?;
     let candidate = match dialect {
         Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
-            let error = value.get("error")?;
-            match error.get("param").and_then(Value::as_str) {
-                Some(param) => Some(param.to_string()),
-                None => unknown_argument_name(error.get("message")?.as_str()?),
+            let envelope = openai_family_envelope(&value)?;
+            match envelope.param {
+                Some(param) => Some(param),
+                None => unknown_argument_name(envelope.message?),
             }
         }
         Dialect::AnthropicMessages => {
@@ -62,13 +72,44 @@ pub fn rejected_parameter(dialect: Dialect, body: &str) -> Option<String> {
             }
         }
         Dialect::GeminiGenerateContent => gemini_field_violation(&value),
-        Dialect::BedrockConverseStream => None,
+        Dialect::BedrockConverseStream | Dialect::TypesafeSystemone => None,
     }?;
     valid_parameter_path(&candidate).then_some(candidate)
 }
 
 /// OpenAI-family `error.code` naming a deployment model the provider cannot serve.
 const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+
+/// The provider's own error sentence from one client-error body, read only
+/// from the dialect's documented message field (never from echoed request
+/// data or unrelated metadata).
+pub(crate) fn error_message_field(dialect: Dialect, value: &Value) -> Option<&str> {
+    match dialect {
+        // The OpenAI family is spelled many ways by the lanes that speak it;
+        // the envelope reader owns every documented spelling.
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+            openai_family_envelope(value)?.message
+        }
+        Dialect::AnthropicMessages | Dialect::GeminiGenerateContent => {
+            value.get("error")?.get("message")?.as_str()
+        }
+        // Bedrock reports a modeling error as a bare top-level `message`.
+        Dialect::BedrockConverseStream => value.get("message")?.as_str(),
+        // TypeSafe defines status classes, not a stable public error envelope.
+        Dialect::TypesafeSystemone => None,
+    }
+}
+
+/// The OpenAI-family envelope of one parsed body, `None` for other dialects.
+fn family_envelope(dialect: Dialect, value: &Value) -> Option<ErrorEnvelope<'_>> {
+    match dialect {
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => openai_family_envelope(value),
+        Dialect::AnthropicMessages
+        | Dialect::GeminiGenerateContent
+        | Dialect::BedrockConverseStream
+        | Dialect::TypesafeSystemone => None,
+    }
+}
 
 /// Whether one client-error body reports that the dispatched model does not exist.
 ///
@@ -79,22 +120,18 @@ const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
 /// and the certified ladder must advance past it exactly as it does for a 404.
 /// Only the documented code field is read; the message is never inspected.
 pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
-    let value: Value = match serde_json::from_str(body) {
-        Ok(value) => value,
-        Err(_) => return false,
+    let Some(value) = parse_error_document(body) else {
+        return false;
     };
-    match dialect {
-        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
-            value
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-                == Some(MODEL_NOT_FOUND_CODE)
-        }
-        Dialect::AnthropicMessages
-        | Dialect::GeminiGenerateContent
-        | Dialect::BedrockConverseStream => false,
-    }
+    family_envelope(dialect, &value)
+        // Novita spells the same verdict as its flat `reason` token,
+        // `MODEL_NOT_FOUND`; the comparison is case-insensitive for it.
+        .is_some_and(|envelope| {
+            envelope
+                .code
+                .as_deref()
+                .is_some_and(|code| code.eq_ignore_ascii_case(MODEL_NOT_FOUND_CODE))
+        })
 }
 
 /// Extract the provider's own explanation from one client-error body.
@@ -112,29 +149,132 @@ pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
 /// site to the client-error class. Provider messages for authentication,
 /// not-found, and server-side failures are operator-facing and can name
 /// deployments or accounts, so they stay content-free.
-pub fn rejected_detail(dialect: Dialect, body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let message = match dialect {
-        Dialect::OpenAiResponses
-        | Dialect::OpenAiCompatible
-        | Dialect::AnthropicMessages
-        | Dialect::GeminiGenerateContent => value.get("error")?.get("message")?.as_str()?,
-        // Bedrock reports a modeling error as a bare top-level `message`.
-        Dialect::BedrockConverseStream => value.get("message")?.as_str()?,
+///
+/// `request_words` are label-shaped values the dispatched request itself
+/// carried (today: the payload's own `model`). The caller already knows
+/// them, so a provider sentence naming one verbatim is prose about the
+/// request, never infrastructure to redact: Anthropic's client-version gate
+/// names the rejected model unquoted ("claude-fable-5-1 requires Claude Code
+/// 2.1.251 or later"), and dropping that sentence left callers with a
+/// generic 400 for a client-side fix (2026-09-04 ledger).
+pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> Option<String> {
+    let Some(value) = parse_error_document(body) else {
+        return plain_text_detail(dialect, body, request_words);
     };
-    sanitized_detail(message)
+    let message = error_message_field(dialect, &value)?;
+    if dialect == Dialect::OpenAiCompatible {
+        if let Some(relayed) = family_envelope(dialect, &value)
+            .and_then(|envelope| envelope.error_object)
+            .and_then(|error| upstream_relayed_message(error, message))
+        {
+            return sanitized_detail(&relayed, request_words);
+        }
+    }
+    sanitized_detail(message, request_words)
+}
+
+/// Longest non-JSON client-error body relayed as the provider's sentence.
+const MAXIMUM_PLAIN_TEXT_BODY: usize = 512;
+
+/// The provider's sentence when a client-error body is plain text, not JSON.
+///
+/// Some origins and reseller relays answer a 4xx with a bare sentence
+/// (`text/plain`), which no envelope reader could parse, so the caller got
+/// only "verify the request fields". A short single-line body is the
+/// provider's own explanation and takes the same identifier screen as an
+/// envelope sentence; an HTML error page, a multi-line dump, or anything
+/// longer than one sentence stays generic. TypeSafe defines no error prose
+/// contract and is never read.
+fn plain_text_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> Option<String> {
+    if dialect == Dialect::TypesafeSystemone {
+        return None;
+    }
+    let text = body.trim();
+    if text.is_empty()
+        || text.len() > MAXIMUM_PLAIN_TEXT_BODY
+        || text.starts_with('<')
+        || text.starts_with('{')
+        || text.starts_with('[')
+    {
+        return None;
+    }
+    sanitized_detail(text, request_words)
+}
+
+/// The provider's own error code or type from one client-error body, as a
+/// bounded identifier token (`invalid_value`, `content_filter`,
+/// `invalid_request_error`, `INVALID_ARGUMENT`, or a numeric status).
+///
+/// Read only from the dialect's documented code field; it is a vocabulary
+/// token, never prose, so it is safe to relay when [`rejected_detail`] has to
+/// drop the sentence (a provider explanation naming a request or account
+/// handle otherwise left the caller with nothing but "verify the request
+/// fields"). It also classifies the body: a content-filter code is the
+/// model's verdict on the content, not a request-shape error.
+pub fn rejected_code(dialect: Dialect, body: &str) -> Option<String> {
+    let value = parse_error_document(body)?;
+    let token = match dialect {
+        Dialect::BedrockConverseStream | Dialect::TypesafeSystemone => return None,
+        Dialect::OpenAiResponses | Dialect::OpenAiCompatible => {
+            openai_family_envelope(&value)?.code?
+        }
+        Dialect::AnthropicMessages | Dialect::GeminiGenerateContent => {
+            let error = value.get("error")?;
+            let candidate = match dialect {
+                Dialect::GeminiGenerateContent => error.get("status").or_else(|| error.get("code")),
+                _ => error
+                    .get("code")
+                    .filter(|code| !code.is_null())
+                    .or_else(|| error.get("type")),
+            }?;
+            match candidate {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => return None,
+            }
+        }
+    };
+    let identifier = !token.is_empty()
+        && token.len() <= 64
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    identifier.then_some(token)
+}
+
+/// Whether one provider code token says nothing beyond "the request was
+/// rejected": the family-wide type every 4xx carries, or a bare numeric
+/// status. Such a token is still classified but never relayed as detail, so a
+/// body whose sentence had to drop keeps the generic message rather than
+/// gaining a meaningless suffix.
+pub fn generic_error_code(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "invalid_request_error"
+            | "invalid_request"
+            | "invalid_request_body"
+            | "bad_request"
+            | "error"
+            | "invalid_argument"
+    ) || lower.chars().all(|c| c.is_ascii_digit())
 }
 
 /// One provider sentence reduced to bounded, single-line, printable text.
 ///
-/// Control characters end the candidate rather than being escaped: their
-/// presence means the field carries a payload, not a sentence. Interior runs
-/// of spaces and tabs collapse so the relayed text stays one readable line,
-/// and [`carries_provider_identifier`] then rejects any sentence naming
-/// provider-side infrastructure.
-fn sanitized_detail(message: &str) -> Option<String> {
+/// Control characters mean the field carries a payload, not a sentence, and
+/// the candidate drops. Interior runs of spaces and tabs collapse so the
+/// relayed text stays one readable line. Every word
+/// [`carries_provider_identifier`] flags (an account, deployment, key, or
+/// network handle the provider echoed) is MASKED as `[redacted]`, keeping
+/// the sentence around it: dropping the whole line left 459 callers a day
+/// (2026-09-07) with "verify the request fields" and nothing to act on,
+/// while the handle itself is the only part that must not cross. Words the
+/// request itself carried stay. An over-long sentence is cut to the bound
+/// with an ellipsis rather than dropped.
+pub(crate) fn sanitized_detail(message: &str, request_words: &[&str]) -> Option<String> {
     let trimmed = message.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAXIMUM_DETAIL_LENGTH {
+    if trimmed.is_empty() {
         return None;
     }
     if trimmed
@@ -144,10 +284,41 @@ fn sanitized_detail(message: &str) -> Option<String> {
         return None;
     }
     let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() || collapsed.split(' ').any(carries_provider_identifier) {
+    if collapsed.is_empty() {
         return None;
     }
-    Some(collapsed)
+    Some(bounded_masked_line(&collapsed, request_words))
+}
+
+/// The placeholder a provider-side handle becomes in a relayed sentence.
+pub(crate) const REDACTED: &str = "[redacted]";
+
+/// Mask every identifier-bearing word of one collapsed line and bound its
+/// length. Trailing punctuation on a masked word survives so the sentence
+/// still reads (`org_a1b2c3:` -> `[redacted]:`).
+pub(crate) fn bounded_masked_line(collapsed: &str, request_words: &[&str]) -> String {
+    let masked = collapsed
+        .split(' ')
+        .map(|word| {
+            if carries_provider_identifier(word, request_words) {
+                let tail_start = word
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| c.is_alphanumeric())
+                    .map_or(word.len(), |(index, c)| index + c.len_utf8());
+                format!("{REDACTED}{}", &word[tail_start..])
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if masked.chars().count() <= MAXIMUM_DETAIL_LENGTH {
+        return masked;
+    }
+    let mut cut: String = masked.chars().take(MAXIMUM_DETAIL_LENGTH - 1).collect();
+    cut.push('\u{2026}');
+    cut
 }
 
 /// Whether one word of a provider sentence names provider-side infrastructure.
@@ -158,14 +329,23 @@ fn sanitized_detail(message: &str) -> Option<String> {
 /// a partially redacted explanation reads as fact while hiding what was cut,
 /// and the caller keeps the generic message instead. A quoted word is the
 /// value the caller sent back to them, so only the unambiguous network and
-/// resource shapes disqualify it.
-fn carries_provider_identifier(word: &str) -> bool {
+/// resource shapes disqualify it; a word matching one of `request_words`
+/// (label-shaped values the dispatched payload itself carried, such as its
+/// `model`) is the same caller-known exception without the quotes, though
+/// the unambiguous network and resource shapes still disqualify it.
+pub(crate) fn carries_provider_identifier(word: &str, request_words: &[&str]) -> bool {
     let bare = word.trim_matches(|c: char| !c.is_alphanumeric());
     if word.contains("://") || word.contains('@') || bare.to_ascii_lowercase().starts_with("arn:") {
         return true;
     }
     if bare.len() == 36 && bare.chars().filter(|c| *c == '-').count() == 4 {
         return true;
+    }
+    if request_words
+        .iter()
+        .any(|known| bare.eq_ignore_ascii_case(known))
+    {
+        return false;
     }
     let dotted: Vec<&str> = bare.split('.').collect();
     if dotted.len() == 4
@@ -371,6 +551,43 @@ mod tests {
     }
 
     #[test]
+    fn rejected_code_reads_the_documented_code_field_as_a_bounded_token() {
+        let openai = r#"{"error": {"code": "invalid_value", "type": "invalid_request_error", "message": "x"}}"#;
+        assert_eq!(
+            rejected_code(Dialect::OpenAiResponses, openai).as_deref(),
+            Some("invalid_value")
+        );
+        let typed = r#"{"error": {"code": null, "type": "invalid_request_error", "message": "x"}}"#;
+        assert_eq!(
+            rejected_code(Dialect::OpenAiCompatible, typed).as_deref(),
+            Some("invalid_request_error")
+        );
+        let numeric = r#"{"error": {"code": 400, "message": "x"}}"#;
+        assert_eq!(
+            rejected_code(Dialect::OpenAiCompatible, numeric).as_deref(),
+            Some("400")
+        );
+        let anthropic =
+            r#"{"type": "error", "error": {"type": "invalid_request_error", "message": "x"}}"#;
+        assert_eq!(
+            rejected_code(Dialect::AnthropicMessages, anthropic).as_deref(),
+            Some("invalid_request_error")
+        );
+        let gemini = r#"{"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "x"}}"#;
+        assert_eq!(
+            rejected_code(Dialect::GeminiGenerateContent, gemini).as_deref(),
+            Some("INVALID_ARGUMENT")
+        );
+        // Prose or hostile shapes are never a token; Bedrock has no code field.
+        let prose = r#"{"error": {"code": "not a code!{}", "message": "x"}}"#;
+        assert_eq!(rejected_code(Dialect::OpenAiCompatible, prose), None);
+        assert_eq!(
+            rejected_code(Dialect::BedrockConverseStream, r#"{"message": "x"}"#),
+            None
+        );
+    }
+
+    #[test]
     fn gemini_message_path_token_is_relayed_without_violation_details() {
         // Exact live shape from generativelanguage.googleapis.com (2026-08-29).
         let body = r#"{"error": {"code": 400, "status": "INVALID_ARGUMENT",
@@ -480,7 +697,9 @@ mod tests {
             Dialect::GeminiGenerateContent => {
                 "google.rpc.BadRequest fieldViolations, else leading message path token"
             }
-            Dialect::BedrockConverseStream => "none: no machine-readable parameter contract",
+            Dialect::BedrockConverseStream | Dialect::TypesafeSystemone => {
+                "none: no machine-readable parameter contract"
+            }
         }
     }
 
@@ -490,18 +709,18 @@ mod tests {
         let openai = r#"{"error": {"message": "Unknown parameter: 'top_k'.",
             "type": "invalid_request_error"}}"#;
         assert_eq!(
-            rejected_detail(Dialect::OpenAiCompatible, openai).as_deref(),
+            rejected_detail(Dialect::OpenAiCompatible, openai, &[]).as_deref(),
             Some("Unknown parameter: 'top_k'.")
         );
         let anthropic = r#"{"type": "error", "error": {"type": "invalid_request_error",
             "message": "`top_p` is deprecated for this model."}}"#;
         assert_eq!(
-            rejected_detail(Dialect::AnthropicMessages, anthropic).as_deref(),
+            rejected_detail(Dialect::AnthropicMessages, anthropic, &[]).as_deref(),
             Some("`top_p` is deprecated for this model.")
         );
         let bedrock = r#"{"message": "The provided model does not support tool use."}"#;
         assert_eq!(
-            rejected_detail(Dialect::BedrockConverseStream, bedrock).as_deref(),
+            rejected_detail(Dialect::BedrockConverseStream, bedrock, &[]).as_deref(),
             Some("The provided model does not support tool use.")
         );
     }
@@ -509,39 +728,79 @@ mod tests {
     #[test]
     fn provider_explanation_is_dropped_when_it_is_not_one_bounded_sentence() {
         let multiline = r#"{"error": {"message": "failed\n  at deployment-7\n"}}"#;
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, multiline), None);
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, multiline, &[]),
+            None
+        );
+        // An over-long sentence is bounded with an ellipsis, not dropped.
         let oversized = format!(
             r#"{{"error": {{"message": "{}"}}}}"#,
             "x".repeat(MAXIMUM_DETAIL_LENGTH + 1)
         );
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, &oversized), None);
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}"), None);
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "<html>"), None);
+        let bounded = rejected_detail(Dialect::OpenAiCompatible, &oversized, &[]).expect("bounded");
+        assert_eq!(bounded.chars().count(), MAXIMUM_DETAIL_LENGTH);
+        assert!(bounded.ends_with('\u{2026}'));
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, "{}", &[]), None);
+        assert_eq!(
+            rejected_detail(Dialect::OpenAiCompatible, "<html>", &[]),
+            None
+        );
         let blank = r#"{"error": {"message": "   "}}"#;
-        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank), None);
+        assert_eq!(rejected_detail(Dialect::OpenAiCompatible, blank, &[]), None);
     }
 
     #[test]
-    fn provider_explanation_is_dropped_when_it_names_provider_infrastructure() {
+    fn provider_infrastructure_is_masked_and_the_sentence_relayed() {
         // One readable sentence each, differing only in the operator-facing
-        // value the provider chose to echo back.
-        for message in [
-            "The deployment gpt4o-prod-7f2a91be44 is not configured for this account.",
-            "Model access denied for account 5f4dcc3b5aa765d61d8327deb882cf99.",
-            "Request 3f8a1c2e-9b44-4d17-9a1e-77c0d2b8e451 failed validation.",
-            "Route your request to https://eastus2.api.internal.example.com instead.",
-            "Contact platform-oncall@example.com about this quota.",
-            "The endpoint 10.42.117.8 rejected the model.",
-            "Deployment prod-7 is retired.",
-            "Quota exhausted for acct-123.",
-            "Use region eastus2 instead.",
-            "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
+        // value the provider chose to echo back: the value is masked, the
+        // sentence around it (what the caller can act on) survives.
+        for (message, masked) in [
+            (
+                "The deployment gpt4o-prod-7f2a91be44 is not configured for this account.",
+                "The deployment [redacted] is not configured for this account.",
+            ),
+            (
+                "Model access denied for account 5f4dcc3b5aa765d61d8327deb882cf99.",
+                "Model access denied for account [redacted].",
+            ),
+            (
+                "Request 3f8a1c2e-9b44-4d17-9a1e-77c0d2b8e451 failed validation.",
+                "Request [redacted] failed validation.",
+            ),
+            (
+                "Route your request to https://eastus2.api.internal.example.com instead.",
+                "Route your request to [redacted] instead.",
+            ),
+            (
+                "Contact platform-oncall@example.com about this quota.",
+                "Contact [redacted] about this quota.",
+            ),
+            (
+                "The endpoint 10.42.117.8 rejected the model.",
+                "The endpoint [redacted] rejected the model.",
+            ),
+            (
+                "Deployment prod-7 is retired.",
+                "Deployment [redacted] is retired.",
+            ),
+            (
+                "Quota exhausted for acct-123.",
+                "Quota exhausted for [redacted].",
+            ),
+            (
+                "Use region eastus2 instead.",
+                "Use region [redacted] instead.",
+            ),
+            (
+                "Model arn:aws:bedrock:us-east-1:481516234299:model/private is unavailable.",
+                "Model [redacted] is unavailable.",
+            ),
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
             assert_eq!(
-                rejected_detail(Dialect::OpenAiCompatible, &body),
-                None,
-                "relayed an identifier-bearing sentence: {message}"
+                rejected_detail(Dialect::OpenAiCompatible, &body, &[]).as_deref(),
+                Some(masked),
+                "identifier not masked: {message}"
             );
         }
         // Ordinary caller-actionable prose stays relayable, including the
@@ -555,7 +814,7 @@ mod tests {
         ] {
             let body = format!(r#"{{"error": {{"message": "{message}"}}}}"#);
             assert_eq!(
-                rejected_detail(Dialect::OpenAiCompatible, &body).as_deref(),
+                rejected_detail(Dialect::OpenAiCompatible, &body, &[]).as_deref(),
                 Some(message),
                 "dropped a caller-actionable sentence: {message}"
             );
@@ -566,7 +825,7 @@ mod tests {
     fn relayed_explanation_collapses_interior_whitespace_runs() {
         let padded = r#"{"error": {"message": "  Unknown   parameter:\t'top_k'.  "}}"#;
         assert_eq!(
-            rejected_detail(Dialect::OpenAiCompatible, padded).as_deref(),
+            rejected_detail(Dialect::OpenAiCompatible, padded, &[]).as_deref(),
             Some("Unknown parameter: 'top_k'.")
         );
     }
@@ -616,3 +875,65 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod request_word_tests {
+    use super::*;
+    use crate::dialects::Dialect;
+
+    #[test]
+    fn a_sentence_naming_the_requests_own_model_is_relayed() {
+        // The Anthropic client-version gate names the rejected model unquoted;
+        // the caller sent that id, so redacting the sentence hid the one
+        // actionable fact (upgrade the client) behind a generic 400.
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "claude-fable-5-1 requires Claude Code version 2.1.251 or later. Please upgrade Claude Code to continue."}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, body, &[]).as_deref(),
+            Some(
+                "[redacted] requires Claude Code version 2.1.251 or later. \
+                 Please upgrade Claude Code to continue."
+            ),
+            "without the request's own words the label-shaped model id is masked"
+        );
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]).as_deref(),
+            Some(
+                "claude-fable-5-1 requires Claude Code version 2.1.251 or later. \
+                 Please upgrade Claude Code to continue."
+            )
+        );
+    }
+
+    #[test]
+    fn request_words_do_not_admit_other_identifiers_in_the_same_sentence() {
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "claude-fable-5-1 is retired on deployment prod-7f2a; contact your operator."}}"#;
+        assert_eq!(
+            rejected_detail(Dialect::AnthropicMessages, body, &["claude-fable-5-1"]).as_deref(),
+            Some("claude-fable-5-1 is retired on deployment [redacted]; contact your operator."),
+            "an infrastructure label beside the known word is masked, the known word kept"
+        );
+    }
+
+    #[test]
+    fn request_words_never_admit_network_or_resource_shapes() {
+        // Even a caller-supplied value keeps the unambiguous network and
+        // resource shapes redacted: relaying an ARN or address helps nobody.
+        let body = r#"{"type": "error", "error": {"type": "invalid_request_error",
+            "message": "Model arn:aws:bedrock:us-east-1:123:model/x is unavailable."}}"#;
+        assert_eq!(
+            rejected_detail(
+                Dialect::AnthropicMessages,
+                body,
+                &["arn:aws:bedrock:us-east-1:123:model/x"],
+            )
+            .as_deref(),
+            Some("Model [redacted] is unavailable.")
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "param_attribution_envelope_tests.rs"]
+mod envelope_tests;

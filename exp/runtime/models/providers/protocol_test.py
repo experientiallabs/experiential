@@ -21,6 +21,7 @@ from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
+    MediaHandle,
     TextContentPart,
     VideoContentPart,
 )
@@ -36,8 +37,12 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
 )
 from exp.runtime.models.providers.protocol import (
+    DEVELOPER_ROLE_REWRITE_DISCLOSURE,
     BoundedSyncModelClientAdapter,
     SyncModelClientAdapter,
+    developer_role_rewrite_disclosure,
+    emulated_gateway_capabilities,
+    emulated_stop_sequences,
     preflight_gateway_request,
     require_gateway_provider,
 )
@@ -258,6 +263,54 @@ def test_preflight_rejects_over_limit_stop_list_with_a_named_parameter_error() -
     preflight_gateway_request(request, GatewayDeploymentCapabilities(supports_stop_sequences=True))
 
 
+def test_preflight_admits_an_undeclared_stop_when_the_data_plane_emulates_it() -> None:
+    """A Responses rung has no stop field, yet admits stop: the gateway cuts the stream itself."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("</severity>",),
+    )
+    undeclared = GatewayDeploymentCapabilities(supports_stop_sequences=False)
+
+    with pytest.raises(ProviderCapabilityError) as caught:
+        preflight_gateway_request(request, undeclared)
+    assert caught.value.capability == "stop_sequences"
+
+    assert emulated_gateway_capabilities("openai_responses") == frozenset({"stop_sequences"})
+    assert emulated_gateway_capabilities("openai_compatible") == frozenset({"developer_messages"})
+    # parallel_tool_calls emulation is opt-in: admission's last resort on any wire.
+    assert emulated_gateway_capabilities(
+        "openai_compatible", emulate_parallel_tool_calls=True
+    ) == frozenset({"developer_messages", "parallel_tool_calls"})
+    preflight_gateway_request(
+        request,
+        undeclared,
+        emulated_capabilities=emulated_gateway_capabilities("openai_responses"),
+    )
+    # Emulation is per capability: an unrelated undeclared feature still rejects.
+    with pytest.raises(ProviderCapabilityError):
+        preflight_gateway_request(
+            request.model_copy(update={"stream": True}),
+            undeclared,
+            public_stream=True,
+            emulated_capabilities=emulated_gateway_capabilities("openai_responses"),
+        )
+
+
+def test_emulated_stop_sequences_follow_the_dialect_and_the_request() -> None:
+    """Only a Responses rung hands the caller's sequences to the data plane."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("</block>", "DONE"),
+    )
+    assert emulated_stop_sequences("openai_responses", request) == ("</block>", "DONE")
+    assert emulated_stop_sequences("anthropic_messages", request) == ()
+    assert (
+        emulated_stop_sequences("openai_responses", request.model_copy(update={"stop": ()})) == ()
+    )
+
+
 def test_tinker_is_explicitly_excluded_from_gateway_execution() -> None:
     """Tinker remains optimizer-only until it has a cancellable stream contract."""
     with pytest.raises(ProviderCapabilityError, match="tinker_gateway_execution"):
@@ -293,6 +346,47 @@ def test_preflight_rejects_an_image_on_a_route_that_does_not_declare_it() -> Non
     """A picture is never dropped and answered from the surrounding text alone."""
     with pytest.raises(ProviderCapabilityError, match="image_input"):
         preflight_gateway_request(_image_request(), GatewayDeploymentCapabilities())
+
+
+def test_an_image_refusal_names_the_message_that_carries_it() -> None:
+    """A caller who believes the session is text can find the image to remove.
+
+    The 2026-10-26 reports ("our input is just text") came from coding agents
+    whose history carried an image many turns back; the refusal named only
+    "image input".
+    """
+    image = _image_request()
+    history = image.model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="be brief"),
+                *image.messages,
+                GatewayMessage(role="assistant", content="a cat"),
+                GatewayMessage(role="user", content="thanks, now plain text only"),
+            )
+        }
+    )
+    with pytest.raises(ProviderCapabilityError, match="image_input") as raised:
+        preflight_gateway_request(history, GatewayDeploymentCapabilities())
+    detail = raised.value.detail
+    assert detail is not None
+    assert detail.startswith("Message 2 of 4 in this request (role user) carries an image")
+    assert "what is this" not in detail
+    assert "\u2014" not in detail and "\u2013" not in detail
+
+
+def test_a_non_image_refusal_carries_no_image_detail() -> None:
+    """Only the image refusal gains a location; other labels keep their wording."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("END",),
+    )
+    with pytest.raises(ProviderCapabilityError, match="stop_sequences") as raised:
+        preflight_gateway_request(
+            request, GatewayDeploymentCapabilities(supports_stop_sequences=False)
+        )
+    assert raised.value.detail is None
 
 
 def test_preflight_admits_an_inline_image_on_an_image_route() -> None:
@@ -430,6 +524,59 @@ def test_preflight_rejects_a_document_url_on_an_inline_only_route() -> None:
     )
 
 
+def _handle_request(handle: MediaHandle) -> GatewayRequest:
+    """Build one Chat request carrying a single image handle beside text."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="describe",
+                content_parts=(
+                    TextContentPart(text="describe"),
+                    ImageContentPart(handle=handle),
+                ),
+            ),
+        ),
+    )
+
+
+def test_preflight_refuses_a_handle_without_the_route_declaration() -> None:
+    """An image route that never declared handles refuses one before dispatch."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    with pytest.raises(ProviderCapabilityError, match="media_handle_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_image_input=True),
+            route_provider="openai",
+        )
+
+
+def test_preflight_refuses_a_handle_on_another_providers_route() -> None:
+    """A declared route still refuses a handle uploaded to a different provider."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    capabilities = GatewayDeploymentCapabilities(
+        supports_image_input=True, supports_media_handle_input=True
+    )
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider") as error:
+        preflight_gateway_request(request, capabilities, route_provider="anthropic")
+    assert error.value.detail is not None and "uploaded to openai" in error.value.detail
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        preflight_gateway_request(request, capabilities)
+    preflight_gateway_request(request, capabilities, route_provider="openai")
+
+
+def test_preflight_checks_the_media_kind_before_the_handle() -> None:
+    """A handle never bypasses the image, video, or PDF declaration."""
+    request = _handle_request(MediaHandle(provider="openai", reference="file-abc"))
+    with pytest.raises(ProviderCapabilityError, match="image_input"):
+        preflight_gateway_request(
+            request,
+            GatewayDeploymentCapabilities(supports_media_handle_input=True),
+            route_provider="openai",
+        )
+
+
 def _audio_request() -> GatewayRequest:
     """Build one caller request carrying a clip beside its text."""
     return GatewayRequest(
@@ -465,3 +612,62 @@ def test_preflight_admits_audio_on_a_declared_audio_route() -> None:
     preflight_gateway_request(
         _audio_request(), GatewayDeploymentCapabilities(supports_audio_input=True)
     )
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    (
+        "openai_compatible",
+        "anthropic_messages",
+        "bedrock_converse_stream",
+        "gemini_generate_content",
+    ),
+)
+def test_developer_messages_are_rewritten_on_wires_without_the_role(dialect: str) -> None:
+    """A wire without a ``developer`` role admits one as its instruction role, disclosed."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="developer", content="Answer in French."),
+            GatewayMessage(role="user", content="hi"),
+        ),
+    )
+    undeclared = GatewayDeploymentCapabilities()
+
+    with pytest.raises(ProviderCapabilityError) as caught:
+        preflight_gateway_request(request, undeclared)
+    assert caught.value.capability == "developer_messages"
+    preflight_gateway_request(
+        request, undeclared, emulated_capabilities=emulated_gateway_capabilities(dialect)
+    )
+    assert (
+        developer_role_rewrite_disclosure(dialect, request, undeclared)
+        == DEVELOPER_ROLE_REWRITE_DISCLOSURE
+    )
+    # A lane that declares the role serves as before, with nothing to disclose.
+    declared = GatewayDeploymentCapabilities(supports_developer_messages=True)
+    assert developer_role_rewrite_disclosure(dialect, request, declared) is None
+    # No developer message, no rewrite.
+    plain = request.model_copy(update={"messages": request.messages[1:]})
+    assert developer_role_rewrite_disclosure(dialect, plain, undeclared) is None
+
+
+def test_native_responses_still_requires_the_developer_declaration() -> None:
+    """The Responses wire defines ``developer``; it is never rewritten there."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="developer", content="Answer in French."),
+            GatewayMessage(role="user", content="hi"),
+        ),
+    )
+    undeclared = GatewayDeploymentCapabilities()
+
+    assert "developer_messages" not in emulated_gateway_capabilities("openai_responses")
+    with pytest.raises(ProviderCapabilityError):
+        preflight_gateway_request(
+            request,
+            undeclared,
+            emulated_capabilities=emulated_gateway_capabilities("openai_responses"),
+        )
+    assert developer_role_rewrite_disclosure("openai_responses", request, undeclared) is None

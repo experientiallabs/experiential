@@ -8,12 +8,18 @@ engines cannot drift at the message boundary.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import MessageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import (
+    TOOL_ERROR_TEXT_PREFIX,
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
+    GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.audios import openai_chat_audio_part, reject_audio_part
 from exp.runtime.models.providers.documents import (
     anthropic_document_block,
@@ -26,19 +32,196 @@ from exp.runtime.models.providers.images import (
     openai_chat_image_part,
     responses_image_part,
 )
+from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
+
+TOOL_RESULT_IMAGE_FOLD_HEADER = (
+    "Images returned by the tool results above. This model's wire carries only text "
+    "inside tool messages, so each image is attached here, numbered where it appeared:"
+)
+"""Leading text of the user message that carries folded tool-result images."""
+
+TOOL_RESULT_DOCUMENT_FOLD_HEADER = (
+    "Documents returned by the tool results above. This model's wire cannot carry "
+    "a document inside a tool result, so each document is attached here, numbered "
+    "where it appeared:"
+)
+"""Leading text of the user message that carries folded tool-result documents."""
+
+TOOL_RESULT_ATTACHMENT_FOLD_HEADER = (
+    "Images and documents returned by the tool results above. This model's wire "
+    "carries only text inside tool messages, so each one is attached here, "
+    "numbered where it appeared:"
+)
+"""Leading text of the user message that carries both folded attachment kinds."""
+
+FoldedAttachmentKind = Literal["image", "document"]
+"""Attachment kinds a fold can move out of tool results into a following user turn."""
+
+
+def tool_result_image_marker(ordinal: int) -> str:
+    """Return the in-place marker left where a folded tool-result image stood."""
+    return f"[image {ordinal}: attached in the next user message]"
+
+
+def tool_result_document_marker(ordinal: int) -> str:
+    """Return the in-place marker left where a folded tool-result document stood."""
+    return f"[document {ordinal}: attached in the next user message]"
+
+
+def fold_tool_result_attachments(
+    messages: tuple[GatewayMessage, ...],
+    *,
+    kinds: tuple[FoldedAttachmentKind, ...],
+) -> tuple[GatewayMessage, ...]:
+    """Move tool-result attachments into one user message after each run of results.
+
+    A fold dialect's tool results carry no such attachment on its wire (Chat
+    Completions and Gemini ``functionResponse`` define no image or document
+    carrier inside a tool result; Responses and Bedrock carry images but not
+    documents), while a user turn carries both on every one of those wires.
+    The fold keeps every attachment the caller sent: each tool message keeps
+    its text with a numbered per-kind marker where the attachment stood, and
+    one user message following the LAST tool message of the contiguous run (a
+    user message between two results of one parallel batch breaks the
+    tool-call linkage providers check) carries the attachments in order,
+    each introduced by its number and the tool call that returned it. The
+    disclosure travels in ``x-experiential-ignored-parameters`` as the fold
+    constant naming the kind (``TOOL_RESULT_IMAGE_FOLD_DISCLOSURE``,
+    ``TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE``).
+
+    Args:
+        messages: The request's canonical messages.
+        kinds: Attachment kinds this wire cannot carry inside a tool result.
+
+    Returns:
+        The folded messages; the same tuple when no tool message carries a
+        folded kind.
+    """
+    folded_kinds = frozenset(kinds)
+    if not folded_kinds or not folded_kinds <= {"image", "document"}:
+        raise ValueError("fold kinds must be image and/or document")
+    if not any(
+        message.role == "tool" and any(part.kind in folded_kinds for part in message.content_parts)
+        for message in messages
+    ):
+        return messages
+    out: list[GatewayMessage] = []
+    pending: list[tuple[int, str, str, MessageContentPart]] = []
+    ordinals: dict[str, int] = {"image": 0, "document": 0}
+
+    def flush() -> None:
+        """Emit the pending attachments as one user message after the tool run."""
+        if not pending:
+            return
+        pending_kinds = {kind for _number, _call_id, kind, _part in pending}
+        header = (
+            TOOL_RESULT_IMAGE_FOLD_HEADER
+            if pending_kinds == {"image"}
+            else TOOL_RESULT_DOCUMENT_FOLD_HEADER
+            if pending_kinds == {"document"}
+            else TOOL_RESULT_ATTACHMENT_FOLD_HEADER
+        )
+        parts: list[MessageContentPart] = [TextContentPart(text=header)]
+        for number, call_id, kind, part in pending:
+            label = "Image" if kind == "image" else "Document"
+            parts.append(TextContentPart(text=f"\n{label} {number} (tool_call_id {call_id}):"))
+            parts.append(part)
+        out.append(
+            GatewayMessage(
+                role="user",
+                content="".join(part.text for part in parts if part.kind == "text"),
+                content_parts=tuple(parts),
+            )
+        )
+        pending.clear()
+
+    for message in messages:
+        if message.role != "tool":
+            flush()
+            out.append(message)
+            continue
+        if not any(part.kind in folded_kinds for part in message.content_parts):
+            out.append(message)
+            continue
+        texts: list[str] = []
+        kept: list[MessageContentPart] = []
+        for part in message.content_parts:
+            if part.kind in folded_kinds:
+                ordinals[part.kind] += 1
+                number = ordinals[part.kind]
+                pending.append((number, message.tool_call_id or "", part.kind, part))
+                marker = (
+                    tool_result_image_marker(number)
+                    if part.kind == "image"
+                    else tool_result_document_marker(number)
+                )
+                texts.append(marker)
+                # The marker rides as a text part where the attachment stood,
+                # so a message that keeps a non-folded attachment stays
+                # internally consistent (its parts flatten to its content).
+                kept.append(TextContentPart(text=marker))
+            elif part.kind == "text":
+                texts.append(part.text)
+                if part.text:
+                    kept.append(part)
+            else:
+                # An attachment kind this fold leaves alone (an image on a
+                # documents-only fold) stays on the tool message; its wire
+                # carries it inside the tool result natively.
+                kept.append(part)
+        if not any(part.kind != "text" for part in kept):
+            # Every attachment folded: the message is text-only again, and a
+            # text-only message carries no parts.
+            kept = []
+        out.append(
+            message.model_copy(update={"content": "".join(texts), "content_parts": tuple(kept)})
+        )
+    flush()
+    return tuple(out)
 
 
 def responses_items(message: GatewayMessage) -> list[JsonObject]:
     """Translate one non-instruction gateway message to Responses input items."""
     if message.role == "tool":
-        return [
-            {
-                "type": "function_call_output",
-                "call_id": message.tool_call_id or "",
-                "output": message.content or "",
-            }
-        ]
+        output_value: str | list[JsonObject]
+        if message.content_parts:
+            # The SDK list form round-trips: text and image parts re-emit as
+            # typed output parts (the image encoder is the same one user
+            # messages use). A failed invocation folds its error prefix in as
+            # a leading text part, derived from the canonical flag each time
+            # so replays never accumulate prefixes.
+            output_value = []
+            for part in message.content_parts:
+                if part.kind == "text":
+                    output_value.append({"type": "input_text", "text": part.text})
+                elif part.kind == "image":
+                    output_value.append(responses_image_part(part))
+                else:
+                    # The canonical contract carries text, image, and
+                    # document parts on tool messages, but the builder folds
+                    # documents into a following user turn before this point
+                    # (this wire has no document carrier inside a tool
+                    # output); anything else here is a gateway bug.
+                    raise ProviderResponseError("tool results carry only text and image parts")
+            if message.tool_is_error:
+                output_value.insert(0, {"type": "input_text", "text": TOOL_ERROR_TEXT_PREFIX})
+        else:
+            output_value = message.folded_tool_error_content()
+        output_item: JsonObject = {
+            "type": "function_call_output",
+            "call_id": message.tool_call_id or "",
+            "output": output_value,
+        }
+        # Tool attribution round-trips verbatim: present stays present and
+        # absent stays absent, so pre-namespace histories are unchanged.
+        if message.provider_tool_name is not None:
+            output_item["name"] = message.provider_tool_name
+        if message.provider_tool_namespace is not None:
+            output_item["namespace"] = message.provider_tool_namespace
+        if message.provider_tool_caller is not None:
+            output_item["caller"] = message.provider_tool_caller
+        return [output_item]
     if message.role == "user":
         if message.content_parts:
             return [
@@ -64,10 +247,18 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
     items: list[JsonObject] = []
     indexed_items: list[tuple[int, JsonObject]] = []
     for block in message.provider_reasoning:
+        if block.kind == "exposed_reasoning_content":
+            # Plaintext reasoning replays only on an exposure-gated Chat rung;
+            # route narrowing disclosed the drop for this wire.
+            continue
+        if block.kind in {"thinking", "redacted_thinking"}:
+            # Anthropic-signed thinking replays only on its own wire; route
+            # shaping disclosed the drop for this one.
+            continue
         if block.kind != "encrypted_reasoning":
-            # Anthropic thinking cannot replay on the OpenAI wire; route
+            # A gateway reasoning carrier belongs to the Chat wire; route
             # admission rejects the combination before dispatch.
-            raise ProviderResponseError("thinking blocks cannot replay on the Responses wire")
+            raise ProviderResponseError("reasoning carriers cannot replay on the Responses wire")
         # Reasoning items precede the assistant action they belong to, and
         # the encrypted payload is the round-trip authority; the display-only
         # summary is deliberately empty on replay. The item id and status are
@@ -94,25 +285,31 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             if message.provider_item_id is None:
                 raise ProviderResponseError("Responses assistant output omitted its provider ID")
             output_message: JsonObject = {
-                "type": "message",
-                "id": message.provider_item_id,
+                # A client- or gateway-minted id OpenAI would refuse: the turn
+                # replays at its position as plain assistant history.
                 "role": "assistant",
-                "status": message.provider_status or "completed",
-                "content": (
-                    [
-                        {
-                            "type": "output_text",
-                            "text": message.content,
-                            "annotations": [],
-                            "logprobs": [],
-                        }
-                    ]
-                    if message.content is not None
-                    else []
-                ),
+                "content": message.content or "",
             }
-            if message.provider_phase is not None:
-                output_message["phase"] = message.provider_phase
+            if openai_issued_item_id(message.provider_item_id, "message"):
+                output_message = {
+                    "type": "message",
+                    "id": message.provider_item_id,
+                    "role": "assistant",
+                    "status": message.provider_status or "completed",
+                    "content": (
+                        [
+                            {
+                                "type": "output_text",
+                                "text": message.content,
+                                "annotations": [],
+                            }
+                        ]
+                        if message.content is not None
+                        else []
+                    ),
+                }
+                if message.provider_phase is not None:
+                    output_message["phase"] = message.provider_phase
             indexed_items.append((message.provider_output_index, output_message))
     for call in message.tool_calls:
         item: JsonObject = {
@@ -121,7 +318,18 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             "name": call.name,
             "arguments": call.arguments_json(),
         }
-        if call.provider_item_id is not None:
+        # The provider rejects a namespaced call replayed without its
+        # namespace ("Missing namespace for function_call ..."), so the
+        # retained value re-emits verbatim; absent stays absent.
+        if call.provider_namespace is not None:
+            item["namespace"] = call.provider_namespace
+        # SDK 3.0 programmatic tool-calling attribution round-trips verbatim
+        # like the namespace; absent stays absent.
+        if call.provider_caller is not None:
+            item["caller"] = call.provider_caller
+        if call.provider_item_id is not None and openai_issued_item_id(
+            call.provider_item_id, "function_call"
+        ):
             item["id"] = call.provider_item_id
         if call.provider_status is not None:
             item["status"] = call.provider_status
@@ -135,6 +343,39 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             raise ProviderResponseError("Responses output items repeated a provider index")
         items[:0] = [item for _index, item in sorted(indexed_items)]
     return items
+
+
+def retained_cache_marked_blocks(
+    blocks: tuple[JsonObject, ...] | list[JsonObject],
+) -> list[JsonObject]:
+    """Drop empty text blocks while keeping their cache breakpoints.
+
+    The wire rejects empty text blocks, but Claude Code lands its
+    prompt-cache marker on the LAST block of a turn, which can be empty;
+    dropping the block must not drop the breakpoint or the whole prefix
+    bills uncached (the block-cache incident class). A displaced marker
+    lands on the closest retained block before it (an empty block adds no
+    bytes, so that boundary is byte-identical), or on the first retained
+    block after it when nothing precedes (a slightly wider, still valid
+    breakpoint). Adjacent duplicate markers collapse: one marker per
+    boundary suffices.
+    """
+    retained: list[JsonObject] = []
+    displaced: object | None = None
+    for block in blocks:
+        if block.get("text"):
+            kept = dict(block)
+            if displaced is not None and "cache_control" not in kept:
+                kept["cache_control"] = displaced
+            displaced = None
+            retained.append(kept)
+        elif "cache_control" in block:
+            if retained:
+                if "cache_control" not in retained[-1]:
+                    retained[-1] = {**retained[-1], "cache_control": block["cache_control"]}
+            else:
+                displaced = block["cache_control"]
+    return retained
 
 
 def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
@@ -152,7 +393,7 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
     Returns:
         The ordered Anthropic content blocks for the turn.
     """
-    marked = [block for block in message.provider_text_blocks if block.get("text")]
+    marked = retained_cache_marked_blocks(message.provider_text_blocks)
     blocks: list[JsonObject] = []
     text_index = 0
     for part in message.content_parts:
@@ -168,11 +409,77 @@ def _anthropic_multimodal_blocks(message: GatewayMessage) -> list[JsonObject]:
         if part.kind == "document":
             blocks.append(anthropic_document_block(part))
             continue
+        if not part.text:
+            # This wire rejects empty text content blocks post-dispatch
+            # ("text content blocks must be non-empty"), and an empty part
+            # carries nothing, so it drops loss-free; the turn's attachment
+            # guarantees the content array stays non-empty.
+            continue
         blocks.append(
             marked[text_index] if text_index < len(marked) else {"type": "text", "text": part.text}
         )
         text_index += 1
     return blocks
+
+
+_UNMARKABLE_REPLAY_BLOCKS = frozenset({"thinking", "redacted_thinking"})
+
+
+def ordered_blocks_with_markers(blocks: tuple[JsonObject, ...]) -> list[JsonObject]:
+    """Replay an ordered turn: empty text drops, its cache marker survives.
+
+    Same rule as :func:`retained_cache_marked_blocks`, extended to a turn that
+    mixes block kinds: a displaced marker lands on the closest retained block
+    before it that can carry one (text or tool_use; the wire refuses markers
+    on thinking blocks), else on the first such block after it. Signed
+    blocks themselves are never touched.
+    """
+    retained: list[JsonObject] = []
+    displaced: object | None = None
+
+    def markable(block: JsonObject) -> bool:
+        return block.get("type") not in _UNMARKABLE_REPLAY_BLOCKS
+
+    for block in blocks:
+        if block.get("type") == "text" and not block.get("text"):
+            marker = block.get("cache_control")
+            if marker is None:
+                continue
+            carrier = next(
+                (index for index in range(len(retained) - 1, -1, -1) if markable(retained[index])),
+                None,
+            )
+            if carrier is not None:
+                if "cache_control" not in retained[carrier]:
+                    retained[carrier] = {**retained[carrier], "cache_control": marker}
+            else:
+                displaced = marker
+            continue
+        kept = dict(block)
+        if displaced is not None and markable(kept) and "cache_control" not in kept:
+            kept["cache_control"] = displaced
+            displaced = None
+        retained.append(kept)
+    return retained
+
+
+def _reasoning_intact(message: GatewayMessage) -> bool:
+    """Whether the flattened reasoning still holds every thinking block the caller sent.
+
+    Admission may strip or narrow reasoning blocks for a rung; the verbatim
+    order is only replayed when it would say exactly what the flattened
+    fields say.
+    """
+    assert message.provider_anthropic_blocks is not None
+    sent = sum(
+        1
+        for block in message.provider_anthropic_blocks
+        if block.get("type") in {"thinking", "redacted_thinking"}
+    )
+    kept = sum(
+        1 for block in message.provider_reasoning if block.kind in {"thinking", "redacted_thinking"}
+    )
+    return sent == kept and sent > 0
 
 
 def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
@@ -183,6 +490,42 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             "tool_use_id": message.tool_call_id or "",
             "content": message.content or "",
         }
+        if message.content_parts:
+            # A tool screenshot or tool-returned document re-emits as the
+            # caller's exact block run: image and document parts become image
+            # and document blocks in their original positions. The canonical
+            # model restricts tool messages to these three kinds. Empty text
+            # parts drop loss-free (the wire rejects empty text blocks); an
+            # all-empty run keeps the flattened string content.
+            run: list[JsonObject] = []
+            for part in message.content_parts:
+                if part.kind == "image":
+                    run.append(anthropic_image_block(part))
+                elif part.kind == "document":
+                    run.append(anthropic_document_block(part))
+                elif part.kind == "text" and part.text:
+                    block: JsonObject = {"type": "text", "text": part.text}
+                    if part.cache_control is not None:
+                        block["cache_control"] = part.cache_control
+                    run.append(block)
+            if run:
+                result["content"] = run
+        if message.tool_references:
+            # A client-side tool search's loaded tools re-emit as the
+            # caller's reference blocks after the result's own content (a
+            # references-only result, the shape Claude Code's ToolSearch
+            # sends, is byte-identical); the provider expands each one into
+            # the named deferred tool's definition.
+            content = result["content"]
+            run = (
+                list(content)
+                if isinstance(content, list)
+                else ([{"type": "text", "text": content}] if content else [])
+            )
+            run.extend(
+                {"type": "tool_reference", "tool_name": name} for name in message.tool_references
+            )
+            result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:
@@ -197,10 +540,13 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # The caller's exact interleaving is preserved: an image before
             # its question reads differently from one after it.
             return "user", _anthropic_multimodal_blocks(message)
-        if message.provider_text_blocks:
-            # The cache-marked run re-emits the caller's exact blocks; the
-            # flattened content stays canonical for every other wire.
-            return "user", list(message.provider_text_blocks)
+        marked_run = retained_cache_marked_blocks(message.provider_text_blocks)
+        if marked_run:
+            # The cache-marked run re-emits the caller's blocks with empty
+            # ones dropped loss-free (the wire rejects them and they carry
+            # nothing) and their breakpoints migrated to a retained
+            # neighbor; the flattened content stays canonical elsewhere.
+            return "user", marked_run
         return "user", [{"type": "text", "text": message.content or ""}]
     if message.role != "assistant":
         raise ProviderResponseError("unsupported Anthropic message role")
@@ -208,8 +554,18 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         # An echoed server-tool block re-emits byte-for-byte at its position;
         # route admission guarantees this dispatch is an Anthropic rung.
         return "assistant", [message.provider_anthropic_block]
+    if message.provider_anthropic_blocks is not None and _reasoning_intact(message):
+        # A thinking turn replays in the caller's own block order: Anthropic
+        # verifies the latest assistant message against its signatures, and
+        # interleaved thinking puts thinking between tool_use blocks, an
+        # order the flattened fields below cannot express.
+        return "assistant", ordered_blocks_with_markers(message.provider_anthropic_blocks)
     blocks: list[JsonObject] = []
     for reasoning in message.provider_reasoning:
+        if reasoning.kind == "exposed_reasoning_content":
+            # Plaintext reasoning replays only on an exposure-gated Chat rung;
+            # route narrowing disclosed the drop for this wire.
+            continue
         # Thinking blocks lead the assistant turn (the Anthropic contract)
         # and re-emit verbatim: the signature must round-trip byte-exact.
         if reasoning.kind == "thinking":
@@ -224,15 +580,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             # route admission rejects the combination before dispatch.
             raise ProviderResponseError("encrypted reasoning cannot replay on the Anthropic wire")
     if message.provider_text_blocks:
-        blocks.extend(message.provider_text_blocks)
+        # Empty marked blocks drop with their breakpoints migrated, exactly
+        # as on user turns; the wire rejects an empty text block anywhere.
+        blocks.extend(retained_cache_marked_blocks(message.provider_text_blocks))
     elif message.content:
-        blocks.append({"type": "text", "text": message.content})
-    elif message.content is not None and not blocks and not message.tool_calls:
-        # An empty assistant text block is rejected by this wire, and an
-        # agent that answers with a tool call alone sends exactly that
-        # (OpenCode 1.18.26, captured live 2026-09-02). The block re-emits
-        # only when it is the entire turn, where dropping it would leave an
-        # empty content array the wire also rejects.
         blocks.append({"type": "text", "text": message.content})
     for call in message.tool_calls:
         tool_use: JsonObject = {
@@ -246,6 +597,21 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         if call.cache_control is not None:
             tool_use["cache_control"] = call.cache_control
         blocks.append(tool_use)
+    if blocks and all(
+        block.get("type") == "text" and not str(block.get("text", "")).strip() for block in blocks
+    ):
+        # The wire rejects a text block that is empty ("text content blocks
+        # must be non-empty") and a turn whose text is all whitespace ("must
+        # contain non-whitespace text"), while it accepts an EMPTY assistant
+        # content array in any position and whitespace text beside a
+        # tool_use or another text block (all verified live 2026-09-05 on
+        # fable-5-1 and sonnet-4-6). An assistant turn that carries only
+        # empty or whitespace text therefore dispatches as an empty array:
+        # the turn stays in place, so conversation structure is preserved,
+        # and nothing the model could read is lost. A cache marker on the
+        # dropped run is re-homed by the payload builder onto the closest
+        # retained block of a neighboring turn.
+        blocks = []
     return "assistant", blocks
 
 
@@ -261,6 +627,18 @@ ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
 """Beta token Anthropic requires before it accepts ``speed``
 (verified live 2026-08-30)."""
 
+ANTHROPIC_SAFEGUARDS_BETA = "dangerous-tool-use-2026-09-03"
+"""Beta token Anthropic requires before it accepts ``safeguards`` (Claude
+Code auto mode sends both together; captured live 2026-10-08)."""
+
+ANTHROPIC_FILES_API_BETA = "files-api-2025-04-14"
+"""Beta token Anthropic requires before a ``file`` source resolves an uploaded file."""
+
+ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA = "thinking-display-updates-2026-08-18"
+"""Beta token Anthropic requires before it accepts ``thinking.display: "updates"``
+(without it the provider answers 400 "thinking.adaptive.display: Input should be
+'summarized', 'omitted'")."""
+
 
 def anthropic_request_headers(
     profile_headers: dict[str, str],
@@ -268,10 +646,12 @@ def anthropic_request_headers(
 ) -> dict[str, str]:
     """Return the per-request Anthropic headers for one dispatch.
 
-    ``context_management``, ``diagnostics``, and ``speed`` are each served
-    behind an ``anthropic-beta`` token (each verified live: the bare field
+    ``context_management``, ``diagnostics``, ``speed``, ``safeguards`` and the
+    ``thinking.display: "updates"`` mode are each served behind an
+    ``anthropic-beta`` token (each verified live: the bare field
     is "Extra inputs are not permitted"), so their tokens join the
     connection's static headers exactly when the request carries the field.
+    An Anthropic Files handle likewise needs the Files API token.
     Allowlisted caller-forwarded tokens (``request.provider_beta_tokens``,
     e.g. the 1M context window) merge the same way. The merged list keeps
     operator tokens first, then caller tokens, then field-required tokens,
@@ -292,6 +672,13 @@ def anthropic_request_headers(
         required.append(ANTHROPIC_DIAGNOSTICS_BETA)
     if request.speed is not None:
         required.append(ANTHROPIC_FAST_MODE_BETA)
+    if request.safeguards is not None:
+        required.append(ANTHROPIC_SAFEGUARDS_BETA)
+    thinking = request.provider_thinking_config
+    if isinstance(thinking, dict) and thinking.get("display") == "updates":
+        required.append(ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA)
+    if any(handle.provider == "anthropic" for handle in request.media_handles):
+        required.append(ANTHROPIC_FILES_API_BETA)
     if not required:
         return headers
     existing = headers.get("anthropic-beta")
@@ -306,17 +693,63 @@ def anthropic_request_headers(
 def openai_chat_message(
     message: GatewayMessage,
     *,
-    fireworks_reasoning_route_sha256: str | None = None,
+    reasoning_route_sha256: str | None = None,
+    reasoning_output_exposed: bool = False,
+    deepseek_reasoning_history: bool = False,
+    forwards_cache_control: bool = False,
 ) -> JsonObject:
-    """Translate one gateway message to OpenAI Chat wire JSON."""
+    """Translate one gateway message to OpenAI Chat wire JSON.
+
+    A canonical ``developer`` message is emitted as ``system`` on this wire.
+    OpenAI's Chat Completions reference gives the two roles one definition
+    ("Developer-provided instructions that the model should follow, regardless
+    of messages sent by the user"), distinguished only by the model generation
+    each was introduced for (``developer`` replaces ``system`` from o1 on, and
+    those models accept ``system`` by converting it), so the fold is lossless
+    and needs no disclosure. It applies to every provider on the Chat wire
+    because this dialect never carries direct OpenAI traffic (that is the
+    Responses dialect) and the third-party OpenAI-compatible servers behind
+    it (Azure AI Foundry, DeepSeek, vLLM, and the like) enumerate the classic
+    roles only and 400 on ``developer`` by name. The Responses builder keeps
+    ``developer`` verbatim, since that wire defines the role. A rung whose
+    catalog does not declare ``developer`` support is admitted because of
+    this fold and the caller reads it as
+    ``messages.developer->system(rewritten_by_gateway)``
+    (``developer_role_rewrite_disclosure``).
+
+    ``reasoning_route_sha256`` is the active preserved-thinking route identity
+    for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``
+    block forwards to the provider only when it names that exact route.
+    ``reasoning_output_exposed`` marks a rung whose plaintext reasoning the
+    caller may replay verbatim (an ``exposed_reasoning_content`` block); any
+    other rung omits that block, which route narrowing already disclosed.
+    ``deepseek_reasoning_history`` marks DeepSeek's own origin, whose thinking
+    mode 400s a tools request unless every assistant message of the CURRENT
+    turn (after the last user message, text-only messages that precede a
+    tool call included) carries ``reasoning_content`` (presence checked,
+    content not; verified live 2026-09-10): caller plaintext forwards verbatim
+    there without the exposure stamp, and EVERY assistant message with no
+    reasoning block (an absent field or an explicit null) is backfilled with
+    an empty string. An empty string is harmless on the turns the provider
+    exempts (earlier turns, tool-less requests), so the builder does not track
+    turn boundaries; no other origin is touched.
+    """
     if message.role == "tool":
-        return {
+        tool_payload: JsonObject = {
             "role": "tool",
-            "content": message.content or "",
+            "content": message.folded_tool_error_content(),
             "tool_call_id": message.tool_call_id or "",
         }
+        # Legacy tool-result name attribution round-trips on the OpenAI
+        # wires: present stays present (the provider serves it) and absent
+        # stays absent, so name-free histories keep their exact wire bytes.
+        if message.provider_tool_name is not None:
+            tool_payload["name"] = message.provider_tool_name
+        if forwards_cache_control and message.cache_control is not None:
+            tool_payload["cache_control"] = message.cache_control
+        return tool_payload
     payload: JsonObject = {
-        "role": message.role,
+        "role": "system" if message.role == "developer" else message.role,
         "content": (
             [
                 {"type": "text", "text": part.text}
@@ -334,27 +767,88 @@ def openai_chat_message(
             else message.content or ""
         ),
     }
+    if forwards_cache_control and message.content_parts:
+        content = payload["content"]
+        assert isinstance(content, list)
+        marked = iter(retained_cache_marked_blocks(message.provider_text_blocks))
+        for part, block in zip(message.content_parts, content, strict=True):
+            assert isinstance(block, dict)
+            if part.kind == "text":
+                text_block = next(marked, {})
+                marker = text_block.get("cache_control", part.cache_control)
+            elif part.kind == "image" or part.kind == "document":
+                marker = part.cache_control
+            else:
+                marker = None
+            if isinstance(marker, dict):
+                block["cache_control"] = marker
+    if forwards_cache_control and message.provider_text_blocks and not message.content_parts:
+        payload["content"] = retained_cache_marked_blocks(message.provider_text_blocks)
     if message.tool_calls:
         payload["tool_calls"] = [
             {
+                **(
+                    {"cache_control": call.cache_control}
+                    if forwards_cache_control and call.cache_control is not None
+                    else {}
+                ),
                 "id": call.call_id,
                 "type": "function",
                 "function": {"name": call.name, "arguments": call.arguments_json()},
             }
             for call in message.tool_calls
         ]
-    if message.provider_reasoning:
-        if len(message.provider_reasoning) != 1:
+    # Anthropic-signed thinking replays only on its own wire; route shaping
+    # disclosed the drop for this one, so the Chat wire omits those blocks.
+    chat_reasoning = tuple(
+        block
+        for block in message.provider_reasoning
+        if block.kind not in {"thinking", "redacted_thinking"}
+    )
+    if chat_reasoning:
+        if len(chat_reasoning) != 1:
             raise ProviderResponseError("Chat reasoning history requires exactly one carrier")
-        block = message.provider_reasoning[0]
+        block = chat_reasoning[0]
+        if block.kind == "exposed_reasoning_content":
+            if reasoning_output_exposed or deepseek_reasoning_history:
+                payload["reasoning_content"] = block.content
+            return payload
         if (
             block.kind != "reasoning_content"
-            or fireworks_reasoning_route_sha256 is None
-            or block.route_sha256 != fireworks_reasoning_route_sha256
+            or reasoning_route_sha256 is None
+            or block.route_sha256 != reasoning_route_sha256
         ):
             raise ProviderResponseError("reasoning carrier belongs to a different Chat route")
         payload["reasoning_content"] = block.content
+    elif deepseek_reasoning_history and message.role == "assistant":
+        # DeepSeek's thinking mode rejects the whole request when any assistant
+        # message of the current turn arrives without the field — a text-only
+        # message before the tool call included (0.7.61 backfilled tool-call
+        # turns alone and the "text turn, then tool-call turn" agent shape
+        # still 400'd in production) — and accepts an empty one exactly like
+        # real reasoning, on exempt turns too. Histories that started on
+        # another provider, or that an OpenAI-compatible SDK re-serialized
+        # without the extension field, arrive this way on every turn.
+        payload["reasoning_content"] = ""
     return payload
+
+
+def _optional_description(tool: GatewayToolDefinition) -> JsonObject:
+    """Return the tool's description field, or nothing when the caller sent none.
+
+    An absent description stays absent on the wire: Mistral (directly, and
+    behind OpenRouter and Azure) rejects ``"description": null`` with "Input
+    should be a valid string", and every OpenAI-family wire treats the field
+    as optional. ``parameters`` is always present (a required schema) and
+    ``strict`` is always a boolean, so neither can serialize as null.
+
+    Args:
+        tool: One caller function declaration.
+
+    Returns:
+        ``{"description": ...}`` when the caller supplied one, else ``{}``.
+    """
+    return {} if tool.description is None else {"description": tool.description}
 
 
 def add_openai_tools(
@@ -362,6 +856,7 @@ def add_openai_tools(
     request: GatewayRequest,
     *,
     responses: bool,
+    forwards_cache_control: bool = False,
 ) -> None:
     """Add Responses-native or Chat-native tools and tool choice in place."""
     if request.tools or request.provider_native_tools:
@@ -370,9 +865,12 @@ def add_openai_tools(
                 {
                     "type": "function",
                     "name": tool.name,
-                    "description": tool.description,
+                    **_optional_description(tool),
                     "parameters": tool.parameters,
                     "strict": tool.strict,
+                    # OpenAI's deferred-loading marker for its native tool search;
+                    # a false or absent marker is omitted so today's bodies stay identical.
+                    **({"defer_loading": True} if tool.defer_loading else {}),
                 }
                 for tool in request.tools
             ]
@@ -390,10 +888,15 @@ def add_openai_tools(
         elif request.tools:
             payload["tools"] = [
                 {
+                    **(
+                        {"cache_control": tool.cache_control}
+                        if forwards_cache_control and tool.cache_control is not None
+                        else {}
+                    ),
                     "type": "function",
                     "function": {
                         "name": tool.name,
-                        "description": tool.description,
+                        **_optional_description(tool),
                         "parameters": tool.parameters,
                         "strict": tool.strict,
                     },
@@ -409,6 +912,31 @@ def add_openai_tools(
                     "type": "function",
                     "function": {"name": request.tool_choice.name},
                 }
+            )
+        elif isinstance(request.tool_choice, GatewayCustomToolChoice):
+            # Both spellings are OpenAI's own; route shaping names the
+            # translated function instead on every wire without custom tools.
+            payload["tool_choice"] = (
+                {"type": "custom", "name": request.tool_choice.name}
+                if responses
+                else {"type": "custom", "custom": {"name": request.tool_choice.name}}
+            )
+        elif isinstance(request.tool_choice, GatewayAllowedToolsChoice):
+            # Only an allowed-tools wire receives the selector verbatim (route
+            # shaping restricts the tools for every other one); both spellings
+            # are OpenAI's own, Chat nesting the set under ``allowed_tools``.
+            allowed: list[JsonObject] = [
+                {"type": "function", "name": name}
+                if responses
+                else {"type": "function", "function": {"name": name}}
+                for name in request.tool_choice.names
+            ]
+            allowed.extend(dict(entry) for entry in request.tool_choice.provider_entries)
+            selector: JsonObject = {"mode": request.tool_choice.mode, "tools": allowed}
+            payload["tool_choice"] = (
+                {"type": "allowed_tools", **selector}
+                if responses
+                else {"type": "allowed_tools", "allowed_tools": selector}
             )
         else:
             payload["tool_choice"] = request.tool_choice

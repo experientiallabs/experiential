@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
@@ -44,8 +45,9 @@ _BURST_CLIENT_THREADS = 12
 _IDLE_SECONDS = 12.0
 # Each cached SQLite connection holds the database plus WAL descriptors, so
 # the fixed pool bounds the count at two per worker plus the group-commit
-# writer's dedicated connection and the driver main thread's setup cache.
-_DESCRIPTOR_CEILING = 2 * (_CALLBACK_PERMITS + 3)
+# writer's dedicated connection, the driver main thread's setup cache, and the
+# video settlement poller's one long-lived thread.
+_DESCRIPTOR_CEILING = 2 * (_CALLBACK_PERMITS + 4)
 
 _DRIVER_SOURCE = textwrap.dedent(
     '''
@@ -137,6 +139,29 @@ class _SseUpstream(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         """Suppress request logs so test output cannot retain payload context."""
         del format, args
+
+
+class _BurstUpstream(ThreadingHTTPServer):
+    """Accept a full client burst before the provider thread is scheduled."""
+
+    # HTTP/1.0 opens a provider connection per request; the accept queue must
+    # cover all burst clients even while Python is servicing other handlers.
+    request_queue_size = 32
+
+
+def test_provider_listen_queue_accepts_the_whole_client_burst() -> None:
+    """Queued connections survive a scheduling pause without provider transport loss."""
+    upstream = _BurstUpstream((_HOST, 0), _SseUpstream)
+    connections: list[socket.socket] = []
+    try:
+        # Do not start the accept loop: all clients must fit while it is paused.
+        for _ in range(_BURST_CLIENT_THREADS):
+            connections.append(socket.create_connection((_HOST, upstream.server_port), timeout=0.5))
+        assert len(connections) == _BURST_CLIENT_THREADS
+    finally:
+        for connection in connections:
+            connection.close()
+        upstream.server_close()
 
 
 @dataclass(frozen=True)
@@ -237,7 +262,7 @@ def _engine(tmp_path: Path) -> Iterator[_ServingEngine]:
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
-    upstream = ThreadingHTTPServer((_HOST, 0), _SseUpstream)
+    upstream = _BurstUpstream((_HOST, 0), _SseUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
     _manager, raw_key = _configured_gateway(

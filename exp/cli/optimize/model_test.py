@@ -37,6 +37,7 @@ from exp.optimize.model.sft import (
     sft_model_optimization_output_dir,
     write_sft_model_optimization_config,
 )
+from exp.optimize.model.sft.run_manifest import MANIFEST_FILE, sft_run_records
 from exp.optimize.model.sft.runtime_source_test import _complete, _request
 from exp.optimize.model.sft.selection import load_latest_sft_model_optimization
 from exp.optimize.model.sft.training_test import _TIME, _FakeBackend, _persisted_dataset, _spec
@@ -999,9 +1000,12 @@ def test_accepted_prefix_resumes_after_crash_and_defers_later_completion(
     )
     assert len(accepted_dataset.rows) == 1
     assert (
-        sft_model_optimization_output_dir(configured.store, accepted_config.config_id)
-        / "manifest.json"
-    ).is_file()
+        sft_run_records(
+            configured.store,
+            sft_model_optimization_output_dir(configured.store, accepted_config.config_id),
+        ).read(MANIFEST_FILE)
+        is not None
+    )
     _complete(
         RuntimeInteractionJournal(configured.store.paths),
         key="completion-after-acceptance",
@@ -1298,11 +1302,11 @@ def test_schedule_ceiling_refuses_before_tinker_backend_construction(
     assert backend_calls == []
 
 
-def test_command_budget_rejects_sft_before_credentials_even_with_yes(
+def test_command_budget_requires_consent_before_sft_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shared ceiling rejects a priced schedule before Tinker construction.
+    """An unconfirmed command budget overrun stops before Tinker construction.
 
     Args:
         tmp_path: Pytest-owned project and settings directory.
@@ -1337,14 +1341,13 @@ def test_command_budget_rejects_sft_before_credentials_even_with_yes(
             configured.store.paths.project_id,
             "--root",
             str(configured.store.paths.root),
-            "--yes",
         ],
     )
 
     assert result.exit_code == 2
     flattened = _flat_cli_output(result.output)
-    assert "exceedstheconfiguredper-commandbudget" in flattened
-    assert "--yescannotoverride" in flattened
+    assert "exceedsthe$0.01budget" in flattened
+    assert "interactiveterminaltoproceed,oruse--yes" in flattened
     assert backend_calls == []
 
 

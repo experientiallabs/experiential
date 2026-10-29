@@ -346,12 +346,33 @@ def load_knn_bank(
 
 
 def _novelty_floor(embeddings: np.ndarray) -> float:
-    """Return the fifth percentile of each fit row's nearest distinct neighbor."""
+    """Return the fifth percentile of each distinct fit vector's nearest distinct neighbor.
+
+    Keep the first representative of each near-duplicate group in fit order.
+    Only retained representatives suppress later rows: near-duplicate similarity
+    is not transitive. Reuse one pairwise matrix for selection and neighbor
+    scores so comparisons run in NumPy rather than a Python loop over pairs.
+
+    Args:
+        embeddings: Unit-normalized embedding array of shape (N, D).
+
+    Returns:
+        The empirical cosine threshold, or 1.0 without two distinct representatives.
+    """
     if embeddings.shape[0] < 2:
         return 1.0
     similarities = embeddings @ embeddings.T
+    retained = np.ones(embeddings.shape[0], dtype=bool)
+    for index in range(embeddings.shape[0]):
+        if retained[index]:
+            # Compare in float64 so the tolerance is not rounded down to float32.
+            later = similarities[index, index + 1 :].astype(np.float64)
+            retained[index + 1 :] &= later < 1.0 - 1e-5
+    if np.count_nonzero(retained) < 2:
+        return 1.0
+    similarities[:, ~retained] = -np.inf
     np.fill_diagonal(similarities, -np.inf)
-    nearest = np.max(similarities, axis=1).astype(np.float64)
+    nearest = np.max(similarities, axis=1)[retained].astype(np.float64)
     return float(np.quantile(nearest, 0.05))
 
 

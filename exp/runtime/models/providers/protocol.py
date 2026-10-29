@@ -18,6 +18,7 @@ from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
 )
+from exp.runtime.models.providers.media_handles import preflight_media_handles
 
 
 class AsyncCompletedModelClient(Protocol):
@@ -181,12 +182,121 @@ class GatewayDispatchSigner(Protocol):
         ...
 
 
+# Wire dialects whose provider has no stop field but whose streams the native
+# data plane cuts itself: the OpenAI Responses API. A rung on one of these
+# dialects satisfies ``stop_sequences`` regardless of its catalog flag, because
+# the gateway, not the provider, honours the caller's sequences.
+STOP_SEQUENCE_EMULATED_DIALECTS: frozenset[str] = frozenset({"openai_responses"})
+
+
+# Wire dialects whose payload builder carries a ``developer`` message in the
+# provider's own instruction role: ``system`` on the OpenAI Chat wire, the
+# hoisted instruction field on Anthropic Messages, Bedrock Converse and Gemini
+# (later turns fold into user text there, disclosed by ``disclose_system_fold``).
+# None of these wires defines ``developer``, so a rung on one satisfies
+# ``developer_messages`` whatever its catalog flag says; the native Responses
+# wire defines the role and still requires the declaration.
+DEVELOPER_ROLE_REWRITE_DIALECTS: frozenset[str] = frozenset(
+    {
+        "openai_compatible",
+        "anthropic_messages",
+        "bedrock_converse_stream",
+        "gemini_generate_content",
+    }
+)
+
+DEVELOPER_ROLE_REWRITE_DISCLOSURE = "messages.developer->system(rewritten_by_gateway)"
+"""Disclosure recorded when a rung that does not declare ``developer`` messages
+serves them as the instruction role its wire carries."""
+
+
+def developer_role_rewrite_disclosure(
+    dialect: str,
+    request: GatewayRequest,
+    capabilities: GatewayDeploymentCapabilities,
+) -> str | None:
+    """Name the developer-to-system rewrite one rung applies, if it applies one.
+
+    A rung whose catalog declares ``developer`` support keeps serving exactly
+    as before; one that does not is admitted on a rewriting dialect and the
+    caller reads the rewrite in ``ignored_parameters``.
+
+    Args:
+        dialect: The rung's wire dialect.
+        request: The streaming-forced provider request for this rung.
+        capabilities: The rung's deployment capability declaration.
+
+    Returns:
+        :data:`DEVELOPER_ROLE_REWRITE_DISCLOSURE`, or ``None`` when the rung
+        declares the role, its wire defines it, or no developer message is sent.
+    """
+    if capabilities.supports_developer_messages or dialect not in DEVELOPER_ROLE_REWRITE_DIALECTS:
+        return None
+    if not _carries_developer_message(request):
+        return None
+    return DEVELOPER_ROLE_REWRITE_DISCLOSURE
+
+
+def _carries_developer_message(request: GatewayRequest) -> bool:
+    """Whether the request sends a ``developer`` message the preflight would judge."""
+    return any(
+        message.role == "developer" and message.provider_native_item is None
+        for message in request.messages
+    )
+
+
+def emulated_gateway_capabilities(
+    dialect: str, *, emulate_parallel_tool_calls: bool = False
+) -> frozenset[str]:
+    """Name the capabilities the data plane emulates for one wire dialect.
+
+    Args:
+        dialect: The rung's wire dialect (``GatewayWireProfile.dialect``).
+        emulate_parallel_tool_calls: Admit ``parallel_tool_calls`` on a rung
+            whose wire lacks the control (``true`` dropped as the provider's
+            default, ``false`` serialized by the data plane, both disclosed).
+            Admission turns this on only as the LAST resort, after no rung
+            honouring the control natively could serve, so a native rung is
+            always preferred over emulation.
+
+    Returns:
+        Capability labels admission treats as satisfied without a catalog
+        declaration; empty for dialects with nothing emulated.
+    """
+    emulated: set[str] = set()
+    if dialect in STOP_SEQUENCE_EMULATED_DIALECTS:
+        emulated.add("stop_sequences")
+    if dialect in DEVELOPER_ROLE_REWRITE_DIALECTS:
+        emulated.add("developer_messages")
+    if emulate_parallel_tool_calls:
+        emulated.add("parallel_tool_calls")
+    return frozenset(emulated)
+
+
+def emulated_stop_sequences(dialect: str, request: GatewayRequest) -> tuple[str, ...]:
+    """Return the stop sequences the data plane must enforce for one rung.
+
+    Args:
+        dialect: The rung's wire dialect.
+        request: Canonical request whose ``stop`` the provider wire cannot carry.
+
+    Returns:
+        The caller's exact sequences when this dialect emulates them; empty
+        when the provider honours ``stop`` natively (or none were requested).
+    """
+    if request.stop and dialect in STOP_SEQUENCE_EMULATED_DIALECTS:
+        return tuple(request.stop)
+    return ()
+
+
 def preflight_gateway_request(
     request: GatewayRequest,
     capabilities: GatewayDeploymentCapabilities,
     *,
     model_capabilities: ModelCapabilities | None = None,
     public_stream: bool | None = None,
+    route_provider: str | None = None,
+    emulated_capabilities: frozenset[str] = frozenset(),
 ) -> None:
     """Reject gateway semantics a deployment cannot preserve before provider dispatch.
 
@@ -199,6 +309,13 @@ def preflight_gateway_request(
         public_stream: Whether the caller requested streaming. ``None`` uses
             ``request.stream`` for standalone callers. Hosted execution passes
             this explicitly because its provider request is always streamed.
+        route_provider: The deployment's catalog provider. A provider media
+            handle is admissible only when this equals the handle's provider;
+            ``None`` (standalone callers) admits no handle.
+        emulated_capabilities: Capability labels the data plane provides for
+            this rung itself (see ``emulated_gateway_capabilities``); a
+            requirement in this set passes even when the catalog declares it
+            unsupported.
 
     Raises:
         ProviderCapabilityError: A present request feature is unsupported.
@@ -226,10 +343,7 @@ def preflight_gateway_request(
         requirements += ((request.stream, capabilities.supports_streaming, "streaming"),)
     requirements += (
         (
-            any(
-                message.role == "developer" and message.provider_native_item is None
-                for message in request.messages
-            ),
+            _carries_developer_message(request),
             capabilities.supports_developer_messages,
             "developer_messages",
         ),
@@ -273,12 +387,25 @@ def preflight_gateway_request(
             capabilities.supports_streaming_tool_arguments,
             "streaming_tool_arguments",
         ),
+        (
+            request.prompt_cache_ttl == "12h",
+            capabilities.supports_prompt_cache_ttl_12h,
+            "prompt_cache_ttl_12h",
+        ),
     )
     if request.stream and not caller_stream:
         requirements += ((True, capabilities.supports_streaming, "streaming"),)
     for requested, supported, capability in requirements:
-        if requested and not supported:
-            raise ProviderCapabilityError(capability=capability)
+        if requested and not supported and capability not in emulated_capabilities:
+            raise ProviderCapabilityError(
+                capability=capability,
+                detail=(_image_location_detail(request) if capability == "image_input" else None),
+            )
+    preflight_media_handles(
+        request.media_handles,
+        supports_media_handle_input=capabilities.supports_media_handle_input,
+        route_provider=route_provider,
+    )
     stop_limit = capabilities.maximum_stop_sequences
     if stop_limit is not None and len(request.stop) > stop_limit:
         raise ProviderParameterError(
@@ -289,6 +416,36 @@ def preflight_gateway_request(
             param=("stop_sequences" if request.surface == GatewayApiSurface.MESSAGES else "stop"),
             code="invalid_parameter",
         )
+
+
+def _image_location_detail(request: GatewayRequest) -> str | None:
+    """Say which message carries the image a text-only route refused.
+
+    A caller who believes the conversation is text sees only "cannot accept
+    image input" and cannot find the cause: the image is usually a pasted
+    screenshot or a tool result many turns back, or a clipboard paste that
+    carried an image beside its text. Naming the message (position and role)
+    lets the caller remove it. Content is never quoted.
+
+    Args:
+        request: Canonical request whose images the route cannot accept.
+
+    Returns:
+        The complete caller-safe sentence, or ``None`` when no message
+        carries an image part.
+    """
+    total = len(request.messages)
+    for index, message in enumerate(request.messages):
+        if message.images:
+            return (
+                f"Message {index + 1} of {total} in this request (role {message.role}) "
+                "carries an image, and the selected model route accepts text only. "
+                "Images often come from a pasted screenshot, a clipboard paste that "
+                "included an image, or a tool result earlier in the conversation. "
+                "Remove the image from the conversation (or start a new session), "
+                "or choose an image-capable model alias."
+            )
+    return None
 
 
 def require_gateway_provider(provider: str) -> None:

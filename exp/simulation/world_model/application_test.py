@@ -197,9 +197,9 @@ def test_session_uses_canonical_prompt_and_exact_prior_transcript() -> None:
     first = world_model.step(session.id, _action("Ask for the account email"))
     second = world_model.step(session.id, _action("Send the reset link"))
 
-    assert first.message == {"role": "user", "content": "First observation"}
+    assert first.messages[0] == {"role": "user", "content": "First observation"}
     assert first.terminal is False
-    assert second.message == {"role": "user", "content": "Finished"}
+    assert second.messages[0] == {"role": "user", "content": "Finished"}
     assert second.terminal is True
     assert len(retriever.queries) == 2
     assert len(client.requests) == 2
@@ -211,7 +211,10 @@ def test_session_uses_canonical_prompt_and_exact_prior_transcript() -> None:
         {"role": "assistant", "content": "Ask for the account email"},
         {"role": "user", "content": "First observation"},
     ]
-    assert second_payload["candidate_response"] == "Send the reset link"
+    assert second_payload["candidate_response"] == {
+        "content": "Send the reset link",
+        "tool_calls": [],
+    }
     task_payload = cast(dict[str, object], second_payload["task"])
     assert task_payload["instruction"] == "Reset the password"
     assert task_payload["initial_context"] == {"tenant": {"name": "support"}}
@@ -287,7 +290,7 @@ def test_failed_response_identity_or_size_never_advances_transcript() -> None:
         world_model.step(session.id, _action("first"))
     result = world_model.step(session.id, _action("second"))
 
-    assert result.message == {"role": "user", "content": "ok"}
+    assert result.messages[0] == {"role": "user", "content": "ok"}
     assert _request_payload(client.requests[1])["visible_conversation"] == []
 
     wrong_runtime, wrong_retriever, wrong_client = _runtime(
@@ -432,6 +435,7 @@ def test_loader_resolves_exact_serving_artifact_without_dispatch(
         """
         loaded.append(cast(str, args[1]))
         assert kwargs["client"] is client
+        assert kwargs["capabilities"] == catalog.world.capabilities
         binding = cast(RAGEmbedderBinding, kwargs["embedder"])
         assert binding.client is embedder_client
         assert binding.snapshot == embedder_snapshot
@@ -503,6 +507,7 @@ def _runtime(
         ),
         retriever=cast(TraceRAGRetriever, retriever),
         client=client,
+        capabilities=ModelCapabilities(),
     )
     return runtime, retriever, client
 
@@ -526,7 +531,7 @@ def _snapshot(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="fixture",
         model_id=model_id,
-        capabilities_sha256=sha256_json(resolved_capabilities),
+        capabilities_sha256=resolved_capabilities.identity_sha256(),
         connection_sha256=sha256_json({"connection": model_id}),
     )
 
@@ -570,3 +575,46 @@ def _build_pointers() -> ProjectBuildArtifacts:
         fit_rag=ArtifactInput(artifact_id="fit-rag", sha256="4" * 64),
         world_model=ArtifactInput(artifact_id="world-model", sha256="5" * 64),
     )
+
+
+def test_public_session_returns_tool_messages_and_retains_environment_state() -> None:
+    """Public sessions simulate parallel function calls without invoking external tools."""
+    from exp.common.tasks import ToolSchema
+
+    runtime, _, client = _runtime(
+        outputs=(
+            '{"tool_results":[{"call_id":"a","content":"one"},'
+            '{"call_id":"b","content":"two"}],"state":{"count":2}}',
+            '{"message":"","terminal":true}',
+        )
+    )
+    world = WorldModel(runtime)
+    session = world.new_session(
+        task="Research",
+        tools=(ToolSchema(name="lookup", description="Look up a company", input_schema={}),),
+    )
+    action = cast(
+        ChatCompletionAssistantMessageParam,
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": identifier,
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"query":"Acme"}'},
+                }
+                for identifier in ("a", "b")
+            ],
+        },
+    )
+    result = world.step(session.id, action)
+    assert result.messages == (
+        {"role": "tool", "tool_call_id": "a", "content": "one"},
+        {"role": "tool", "tool_call_id": "b", "content": "two"},
+    )
+    assert not result.terminal
+    world.step(session.id, _action("Done"))
+    payload = _request_payload(client.requests[1])
+    assert payload["environment_state"] == {"count": 2}
+    conversation = cast(list[dict[str, object]], payload["visible_conversation"])
+    assert [message["role"] for message in conversation] == ["assistant", "tool", "tool"]

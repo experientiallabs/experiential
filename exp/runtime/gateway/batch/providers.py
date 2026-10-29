@@ -1,8 +1,11 @@
 """Provider batch API clients for the v1 batch lane: OpenAI, Anthropic, OpenRouter.
 
-Each client speaks one provider's asynchronous batch product directly, with
-no dialect translation: a line's body is already shaped for the surface it
-names, and the provider must natively serve that surface. Result parsing is
+Each client speaks one provider's asynchronous batch product directly and
+declares the public surfaces it serves. OpenAI and OpenRouter accept a line's
+body as the caller shaped it; Anthropic Message Batches speak only the
+Messages wire, so Chat Completions and Responses lines are carried across by
+``line_wire`` (the synchronous lane's own decoders and payload builder) and
+their results rendered back in the caller's surface. Result parsing is
 strict, and any URL a provider hands back is exact-host validated before it
 is fetched, so a compromised response cannot redirect credentials.
 """
@@ -11,19 +14,33 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Protocol
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import Field
+from pydantic import Field, JsonValue
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.batch.contracts import (
     COMPLETION_WINDOW,
     BatchJob,
+    BatchLine,
     BatchLineResult,
     BatchStatus,
     BatchSubmitError,
+    BatchSurface,
+    provider_error_message,
+)
+from exp.runtime.gateway.batch.line_wire import (
+    anthropic_line_params,
+    anthropic_result_body,
+    line_usage,
+)
+from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage
+from exp.runtime.models.providers.errors import (
+    ProviderResponseError,
+    normalized_provider_failure,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,21 +63,45 @@ OPENROUTER_HOST = "openrouter.ai"
 
 
 class ProviderBatchSnapshot(ContractModel):
-    """One poll of a provider batch job: status plus progress counts."""
+    """One poll of a provider batch job: status plus progress counts.
+
+    ``cancelled_lines`` counts the lines the provider cut short on a
+    cancellation request; it is included in ``failed``. A provider that ends
+    a cancelled batch under its ordinary completed status reports the cut
+    here, and the engine, which holds the caller's persisted cancellation
+    intent, decides whether the job ends CANCELLED or COMPLETED.
+    """
 
     status: BatchStatus
     completed: int = Field(default=0, ge=0)
     failed: int = Field(default=0, ge=0)
+    cancelled_lines: int = Field(default=0, ge=0)
     results_ready: bool = False
     failure_message: str | None = None
 
 
 class ProviderBatchClient(Protocol):
-    """One provider's asynchronous batch product behind a uniform seam."""
+    """One provider's asynchronous batch product behind a uniform seam.
+
+    ``surfaces`` is the engine's truth of which public surfaces this client
+    can carry to its provider; the host catalog may narrow it per model but
+    never widen it. ``line_request`` shapes one line's body for the wire and
+    is the submit-time proof that a line is expressible on it.
+    """
 
     provider: str
     supports_cancel: bool
     requires_uniform_model: bool
+    surfaces: tuple[BatchSurface, ...]
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """Return the provider-shaped request body for one line.
+
+        Raises:
+            BatchSubmitError: The line's surface body cannot be expressed on
+                this provider's wire; reported per line at submit.
+        """
+        ...
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Submit one whole job; returns the provider's batch id."""
@@ -98,21 +139,33 @@ def require_exact_host(url: str, host: str) -> str:
     return url
 
 
-def _usage_tokens(body: JsonObject | None) -> tuple[int, int]:
-    """Extract provider-reported input and output token counts from one body."""
-    if not isinstance(body, dict):
-        return (0, 0)
-    usage = body.get("usage")
-    if not isinstance(usage, dict):
-        return (0, 0)
-    prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-    completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
-    input_tokens = prompt if isinstance(prompt, int) and prompt >= 0 else 0
-    output_tokens = completion if isinstance(completion, int) and completion >= 0 else 0
-    return (input_tokens, output_tokens)
+def _line_result(
+    custom_id: str,
+    status_code: int,
+    *,
+    usage: GatewayUsage,
+    response: JsonObject | None = None,
+    error: JsonObject | None = None,
+) -> BatchLineResult:
+    """Build one line result carrying the provider's reported usage in full.
 
-
-_PROVIDER_ERROR_DETAIL_LIMIT = 400
+    ``usage`` is read from the provider's own body (``line_usage``), which for
+    a translated result differs from the rendered response: the Message keeps
+    the cache legs the rendered surface may not carry. An error result carries
+    usage only when the provider served the line and its result could not be
+    rendered; every other error result reports zero.
+    """
+    return BatchLineResult(
+        custom_id=custom_id,
+        status_code=status_code,
+        response=response,
+        error=error,
+        input_tokens=usage.input_tokens or 0,
+        output_tokens=usage.output_tokens or 0,
+        cached_input_tokens=usage.cached_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+    )
 
 
 def provider_error_detail(response: httpx.Response) -> str | None:
@@ -120,10 +173,11 @@ def provider_error_detail(response: httpx.Response) -> str | None:
 
     OpenAI, Anthropic, and OpenRouter all answer failures with a JSON body
     whose ``error.message`` names the rejection (an unknown model, a
-    malformed line, an exhausted quota). Only that field is read: a body that
-    is not JSON, or that carries no message string, yields None, so an HTML
-    error page or an unexpected shape never reaches the caller. The message
-    is reduced to printable characters, whitespace-normalized, and bounded.
+    malformed line, an exhausted quota). Only that field is read, through the
+    shared :func:`provider_error_message` walker (nested envelopes, printable
+    characters, whitespace-normalized, bounded): a body that is not JSON, or
+    that carries no message string, yields None, so an HTML error page or an
+    unexpected shape never reaches the caller.
     """
     try:
         parsed = response.json()
@@ -131,18 +185,29 @@ def provider_error_detail(response: httpx.Response) -> str | None:
         return None
     if not isinstance(parsed, dict):
         return None
-    error = parsed.get("error")
-    message = error.get("message") if isinstance(error, dict) else error
-    if not isinstance(message, str):
-        return None
-    # Printable characters only: the detail reaches the caller's batch
-    # object and the worker log, so a control character (ESC, NUL, a
-    # terminal escape) in a malformed upstream body must never pass through.
-    printable = "".join(char for char in message if char.isprintable() or char.isspace())
-    detail = " ".join(printable.split())
-    if not detail:
-        return None
-    return detail[:_PROVIDER_ERROR_DETAIL_LIMIT]
+    return provider_error_message(parsed.get("error"))
+
+
+def _unrenderable_line(
+    custom_id: str, exc: ProviderResponseError | BatchSubmitError, *, usage: GatewayUsage
+) -> BatchLineResult:
+    """Fail one served line whose result the engine could not read or render.
+
+    The caller-visible error object carries only the synchronous lane's
+    sanitized failure message for a malformed provider response, never text
+    derived from the provider body; a stored line body that no longer decodes
+    (an engine-authored message) is reported as it is. The provider served
+    the line, so its reported usage rides the result and still bills.
+    """
+    if isinstance(exc, ProviderResponseError):
+        failure = normalized_provider_failure(exc)
+        error: JsonObject = {
+            "type": GatewayFailureClass.MALFORMED_RESPONSE.value,
+            "message": failure.safe_message,
+        }
+    else:
+        error = {"type": "invalid_request", "message": exc.message}
+    return _line_result(custom_id, 502, usage=usage, error=error)
 
 
 async def _checked(response: httpx.Response, *, action: str) -> JsonObject:
@@ -191,9 +256,17 @@ def _openai_status(raw: str) -> BatchStatus:
 
 
 def _int_count(counts: JsonObject, key: str) -> int:
-    """Read one non-negative integer count field, defaulting to zero."""
+    """Read one progress count field tolerantly, defaulting to zero.
+
+    Progress counts (``request_counts``) only drive the public batch object
+    and the poller's terminal decision; money settles from the per-line
+    results, which are read strictly. A malformed count must therefore never
+    wedge polling, so a bool, negative, or non-integer value reads as zero.
+    """
     value = counts.get(key, 0)
-    return value if isinstance(value, int) and value >= 0 else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _parse_output_line(raw: JsonObject) -> BatchLineResult | None:
@@ -211,14 +284,15 @@ def _parse_output_line(raw: JsonObject) -> BatchLineResult | None:
             return None
         if code >= 400:
             return BatchLineResult(custom_id=custom_id, status_code=code, error=body)
-        input_tokens, output_tokens = _usage_tokens(body)
-        return BatchLineResult(
-            custom_id=custom_id,
-            status_code=code,
-            response=body,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
+        try:
+            usage = line_usage(body)
+        except ProviderResponseError as exc:
+            # A malformed usage value fails the line as the synchronous lane
+            # fails a malformed response; it never settles at zero tokens.
+            return _unrenderable_line(
+                custom_id, exc, usage=GatewayUsage(input_tokens=0, output_tokens=0)
+            )
+        return _line_result(custom_id, code, usage=usage, response=body)
     if isinstance(error, dict):
         return BatchLineResult(custom_id=custom_id, status_code=500, error=error)
     return None
@@ -230,11 +304,16 @@ class OpenAIBatchClient:
     provider = "openai"
     supports_cancel = True
     requires_uniform_model = False
+    surfaces: tuple[BatchSurface, ...] = ("/v1/chat/completions", "/v1/responses")
     _base = f"https://{OPENAI_HOST}/v1"
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """Bind an optional injected transport for tests."""
         self._transport = transport
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """The caller's body under the provider model id; the wire is native."""
+        return {**line.body, "model": line.provider_model}
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Upload the input JSONL then create the provider batch."""
@@ -244,7 +323,7 @@ class OpenAIBatchClient:
                     "custom_id": line.custom_id,
                     "method": "POST",
                     "url": line.surface,
-                    "body": {**line.body, "model": line.provider_model},
+                    "body": self.line_request(line),
                 }
             )
             for line in job.lines
@@ -339,12 +418,39 @@ class OpenAIBatchClient:
             await _checked(response, action="batch cancel")
 
 
+_ANTHROPIC_UNSERVED_REASONS: dict[str, str] = {
+    "canceled": "the provider canceled this request before it completed",
+    "expired": "the provider expired this request before it completed",
+}
+
+
+def _anthropic_line_error(kind: JsonValue | None, error: JsonValue | None) -> JsonObject:
+    """Shape one non-succeeded Anthropic result as a line error with a reason.
+
+    An ``errored`` result carries the provider's own error object (its
+    ``message`` is the reason). ``canceled`` and ``expired`` results carry no
+    error object at all, so the reason is written here: the host ledgers the
+    line as failed WITH a cause, never as completed with zero tokens. A
+    result type the provider never documented is named as ``unknown``.
+    """
+    if isinstance(error, dict):
+        return error
+    name = kind if isinstance(kind, str) and kind else "unknown"
+    return {
+        "type": name,
+        "message": _ANTHROPIC_UNSERVED_REASONS.get(
+            name, f"the provider reported this request as {name}"
+        ),
+    }
+
+
 class AnthropicBatchClient:
     """Anthropic Message Batches: inline requests, results via a returned URL."""
 
     provider = "anthropic"
     supports_cancel = True
     requires_uniform_model = False
+    surfaces: tuple[BatchSurface, ...] = ("/v1/messages", "/v1/chat/completions", "/v1/responses")
     _base = f"https://{ANTHROPIC_HOST}/v1"
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
@@ -355,14 +461,14 @@ class AnthropicBatchClient:
         """Build the versioned Anthropic auth headers."""
         return {"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION}
 
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """Messages params for one line, translated from its surface when needed."""
+        return anthropic_line_params(line)
+
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Create one message batch with every line inline."""
         requests = [
-            {
-                "custom_id": line.custom_id,
-                "params": {**line.body, "model": line.provider_model},
-            }
-            for line in job.lines
+            {"custom_id": line.custom_id, "params": self.line_request(line)} for line in job.lines
         ]
         async with _client(self._transport) as client:
             response = await client.post(
@@ -388,12 +494,14 @@ class AnthropicBatchClient:
         counts = counts if isinstance(counts, dict) else {}
         processing = str(body.get("processing_status", "in_progress"))
         succeeded = _int_count(counts, "succeeded")
-        errored = (
-            _int_count(counts, "errored")
-            + _int_count(counts, "canceled")
-            + _int_count(counts, "expired")
-        )
+        canceled = _int_count(counts, "canceled")
+        errored = _int_count(counts, "errored") + canceled + _int_count(counts, "expired")
         if processing == "ended":
+            # Anthropic ends a canceled batch with the same "ended" status as a
+            # completed one; only the per-line counts say what happened, so
+            # the cut is reported as cancelled_lines and the engine, which
+            # holds the caller's persisted cancellation intent, picks the
+            # terminal status.
             status = BatchStatus.COMPLETED
         elif processing == "canceling":
             status = BatchStatus.CANCELLING
@@ -403,6 +511,7 @@ class AnthropicBatchClient:
             status=status,
             completed=succeeded,
             failed=errored,
+            cancelled_lines=canceled,
             results_ready=processing == "ended",
         )
 
@@ -427,6 +536,8 @@ class AnthropicBatchClient:
                     code="provider_error",
                 )
         parsed: list[BatchLineResult] = []
+        lines_by_id = {line.custom_id: line for line in job.lines}
+        created_at = time.time()
         for raw_line in content.text.splitlines():
             text = raw_line.strip()
             if not text:
@@ -439,27 +550,58 @@ class AnthropicBatchClient:
             if not isinstance(custom_id, str) or not isinstance(result, dict):
                 continue
             kind = result.get("type")
-            if kind == "succeeded" and isinstance(result.get("message"), dict):
-                message = result["message"]
-                input_tokens, output_tokens = _usage_tokens(message)
-                parsed.append(
-                    BatchLineResult(
-                        custom_id=custom_id,
-                        status_code=200,
-                        response=message,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                    )
-                )
-            else:
-                error = result.get("error")
+            if kind != "succeeded":
                 parsed.append(
                     BatchLineResult(
                         custom_id=custom_id,
                         status_code=500,
-                        error=error if isinstance(error, dict) else {"type": str(kind)},
+                        error=_anthropic_line_error(kind, result.get("error")),
                     )
                 )
+                continue
+            message = result.get("message")
+            if not isinstance(message, dict):
+                parsed.append(
+                    BatchLineResult(
+                        custom_id=custom_id,
+                        status_code=502,
+                        error={
+                            "type": "malformed_response",
+                            "message": "the provider reported success without a message object",
+                        },
+                    )
+                )
+                continue
+            try:
+                usage = line_usage(message)
+            except ProviderResponseError as exc:
+                parsed.append(
+                    _unrenderable_line(
+                        custom_id, exc, usage=GatewayUsage(input_tokens=0, output_tokens=0)
+                    )
+                )
+                continue
+            line = lines_by_id.get(custom_id)
+            if line is None:
+                # A result for a line this job never submitted cannot be
+                # rendered in a surface; the Message stays as the provider
+                # sent it and the engine drops the unmatched custom id.
+                parsed.append(_line_result(custom_id, 200, usage=usage, response=message))
+                continue
+            try:
+                body = anthropic_result_body(
+                    line,
+                    message,
+                    request_id=f"{job.batch_id}:{custom_id}",
+                    created_at=created_at,
+                )
+            except (ProviderResponseError, BatchSubmitError) as exc:
+                # The provider served the line, so its reported usage rides
+                # the error result and still bills; the caller learns the
+                # result could not be rendered in their surface.
+                parsed.append(_unrenderable_line(custom_id, exc, usage=usage))
+                continue
+            parsed.append(_line_result(custom_id, 200, usage=usage, response=body))
         return parsed
 
     async def cancel(self, *, job: BatchJob, api_key: str) -> None:
@@ -478,11 +620,16 @@ class OpenRouterBatchClient:
     provider = "openrouter"
     supports_cancel = False
     requires_uniform_model = True
+    surfaces: tuple[BatchSurface, ...] = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
     _base = f"https://{OPENROUTER_HOST}/api/beta"
 
     def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
         """Bind an optional injected transport for tests."""
         self._transport = transport
+
+    def line_request(self, line: BatchLine) -> JsonObject:
+        """The caller's body as shaped; the model rides the batch, not the line."""
+        return dict(line.body)
 
     async def submit(self, *, job: BatchJob, api_key: str) -> str:
         """Create one batch; endpoint and model serialize before requests."""
@@ -492,7 +639,9 @@ class OpenRouterBatchClient:
         payload = {
             "endpoint": job.surface,
             "model": model,
-            "requests": [{"custom_id": line.custom_id, "body": line.body} for line in job.lines],
+            "requests": [
+                {"custom_id": line.custom_id, "body": self.line_request(line)} for line in job.lines
+            ],
         }
         async with _client(self._transport) as client:
             response = await client.post(

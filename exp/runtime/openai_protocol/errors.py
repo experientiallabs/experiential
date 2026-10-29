@@ -9,7 +9,11 @@ from typing import Literal
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import (
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayRefusalReason,
+)
 
 THROTTLED_RETRY_AFTER_SECONDS = 5
 UNAVAILABLE_RETRY_AFTER_SECONDS = 2
@@ -28,6 +32,9 @@ class OpenAIErrorDetail(ContractModel):
     ]
     param: str | None = Field(default=None, max_length=512)
     code: str = Field(min_length=1, max_length=128)
+    refusal_reason: GatewayRefusalReason | None = None
+    """The bounded refusal category, present only on a ``refusal`` error, so a
+    caller reads which policy declined without any provider prose."""
 
 
 class OpenAIErrorEnvelope(ContractModel):
@@ -54,6 +61,7 @@ class OpenAIProtocolError(ValueError):
         ] = "invalid_request_error",
         param: str | None = None,
         retry_after_seconds: int | None = None,
+        refusal_reason: GatewayRefusalReason | None = None,
     ) -> None:
         """Create one sanitized public protocol failure.
 
@@ -64,6 +72,7 @@ class OpenAIProtocolError(ValueError):
             error_type: OpenAI error category.
             param: Exact public request field responsible for the error.
             retry_after_seconds: Optional positive wait advertised as ``Retry-After``.
+            refusal_reason: Bounded refusal category, set only on a ``refusal``.
         """
         if retry_after_seconds is not None and retry_after_seconds <= 0:
             raise ValueError("retry_after_seconds must be positive")
@@ -75,6 +84,7 @@ class OpenAIProtocolError(ValueError):
             type=error_type,
             param=param,
             code=code,
+            refusal_reason=refusal_reason,
         )
 
     def envelope(self) -> OpenAIErrorEnvelope:
@@ -82,8 +92,17 @@ class OpenAIProtocolError(ValueError):
         return OpenAIErrorEnvelope(error=self.detail)
 
     def json_body(self) -> JsonObject:
-        """Return a JSON-compatible body suitable for an HTTP response."""
-        return self.envelope().model_dump(mode="json")
+        """Return a JSON-compatible body suitable for an HTTP response.
+
+        ``refusal_reason`` is additive: it appears only on a refusal, so every
+        other error keeps its exact pre-existing envelope shape.
+        """
+        body = self.envelope().model_dump(mode="json")
+        if self.detail.refusal_reason is None:
+            error = body.get("error")
+            if isinstance(error, dict):
+                error.pop("refusal_reason", None)
+        return body
 
     def headers(self) -> dict[str, str]:
         """Return transport headers implied by this error, such as ``Retry-After``."""
@@ -181,7 +200,9 @@ def public_failure_error(
         GatewayFailureClass.AUTHORIZATION: (403, "model_not_granted", "permission_error"),
         GatewayFailureClass.QUOTA_EXCEEDED: (429, "insufficient_quota", "insufficient_quota"),
         GatewayFailureClass.THROTTLED: (429, "unavailable_route", "api_error"),
-        GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
+        # 504 is replaced at the edge by the CDN's own "origin timed out"
+        # page; a 503 keeps this retryable error visible to the caller.
+        GatewayFailureClass.TIMEOUT: (503, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),
         GatewayFailureClass.GUARDRAIL: (400, "content_filter", "invalid_request_error"),
         # A refusal with no visible refusal text is the model's answer to the
@@ -190,6 +211,10 @@ def public_failure_error(
         # safety system"); the provider billed the processed input, so a 502
         # would misdescribe a charged call as an infrastructure fault.
         GatewayFailureClass.REFUSAL: (400, "refusal", "invalid_request_error"),
+        # The same family: the model's answer to the content was nothing. A
+        # 4xx is what no OpenAI or Anthropic SDK auto-retries, so a
+        # conversation that keeps yielding an empty turn surfaces once.
+        GatewayFailureClass.EMPTY_COMPLETION: (400, "empty_completion", "invalid_request_error"),
         GatewayFailureClass.UNAVAILABLE: (503, "gateway_unavailable", "api_error"),
     }
     status, code, error_type = mappings.get(
@@ -231,8 +256,14 @@ def public_failure_error(
             )
     retry_after_seconds: int | None = None
     if failure.failure_class is GatewayFailureClass.THROTTLED:
-        retry_after_seconds = THROTTLED_RETRY_AFTER_SECONDS
-    elif failure.failure_class is GatewayFailureClass.UNAVAILABLE:
+        # A failure carrying its known throttle window advertises that wait
+        # (floored at the default) so the header never contradicts the
+        # message; without one the fixed default backoff applies.
+        retry_after_seconds = max(
+            THROTTLED_RETRY_AFTER_SECONDS,
+            failure.retry_after_seconds or THROTTLED_RETRY_AFTER_SECONDS,
+        )
+    elif failure.failure_class in {GatewayFailureClass.UNAVAILABLE, GatewayFailureClass.TIMEOUT}:
         retry_after_seconds = UNAVAILABLE_RETRY_AFTER_SECONDS
     elif failure.failure_class is GatewayFailureClass.QUOTA_EXCEEDED:
         moment = now if now is not None else datetime.now(UTC)
@@ -243,6 +274,13 @@ def public_failure_error(
             f"{message}. The allocation resets at {boundary}; retry after that time "
             "or ask the gateway operator to raise the monthly budget."
         )
+    # A refusal names its bounded category to the caller; an unnamed one is
+    # explicitly ``unspecified`` so a client can always branch on the field.
+    refusal_reason = (
+        (failure.refusal_reason or GatewayRefusalReason.UNSPECIFIED)
+        if failure.failure_class is GatewayFailureClass.REFUSAL
+        else None
+    )
     return OpenAIProtocolError(
         status_code=status,
         code=code,
@@ -250,7 +288,33 @@ def public_failure_error(
         error_type=error_type,
         param=param,
         retry_after_seconds=retry_after_seconds,
+        refusal_reason=refusal_reason,
     )
+
+
+def validated_operation_headers(
+    idempotency_key: str | None, client_request_id: str | None
+) -> tuple[str | None, str | None]:
+    """Validate the two caller identity headers as independent concepts.
+
+    ``Idempotency-Key`` names one retriable operation and is the only header
+    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
+    caller correlation identity: Codex sends its session id there on every
+    request of a session (captured live 2026-08-29), and the provider serves
+    those requests without deduplication, so treating it as an operation key
+    would reject the second request of every real session as a conflict. It
+    is echoed on responses and scopes route affinity only, and the two
+    headers may therefore carry different values.
+    """
+    for name, value in (
+        ("Idempotency-Key", idempotency_key),
+        ("X-Client-Request-Id", client_request_id),
+    ):
+        if value is not None and (
+            not value or len(value) > 512 or any(ord(char) < 32 for char in value)
+        ):
+            raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
+    return idempotency_key, client_request_id
 
 
 def _next_utc_month_start(moment: datetime) -> datetime:

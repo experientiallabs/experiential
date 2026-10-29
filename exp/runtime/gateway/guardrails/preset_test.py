@@ -216,6 +216,26 @@ def test_standard_preset_accepts_explicit_fail_open() -> None:
     assert policy.protected is False
 
 
+def test_standard_preset_uses_configured_revision_by_default() -> None:
+    """An omitted rollout revision uses the shared policy contract's default."""
+    policy = policy_from_authored(_standard_item(), _ADAPTERS)
+    assert policy.revision == "configured"
+
+
+@pytest.mark.parametrize("revision", ["detector-v2", "r" * 256])
+def test_standard_preset_preserves_authored_revision(revision: str) -> None:
+    """Preset expansion retains the operator's bounded detector rollout identity."""
+    policy = policy_from_authored(_standard_item(revision=revision), _ADAPTERS)
+    assert policy.revision == revision
+
+
+@pytest.mark.parametrize("revision", ["", "r" * 257, None, 1])
+def test_standard_preset_rejects_invalid_revision(revision: str | int | None) -> None:
+    """Empty, oversized, and non-string revisions cannot reach the replay contract."""
+    with pytest.raises(ValueError, match="standard guardrail preset is malformed"):
+        policy_from_authored(_standard_item(revision=revision), _ADAPTERS)
+
+
 def test_capability_adapters_without_preset_are_rejected() -> None:
     """Bindings without an explicit standard opt-in are not implied."""
     with pytest.raises(ValueError, match="requires the standard preset"):

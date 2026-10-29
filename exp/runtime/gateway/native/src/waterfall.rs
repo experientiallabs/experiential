@@ -6,36 +6,43 @@
 //! mirroring the python executor's semantics: each dispatch is durably
 //! reserved through the `start_attempt` bridge callback immediately before
 //! network work, same-deployment redials happen only for retryable failure
-//! classes and only before commitment, failover advances to the next
-//! certified deployment for failover-eligible failures before commitment,
-//! and the first outward semantic event permanently freezes the serving
-//! deployment. When the alias revision enables refusal failover, refusal
-//! deltas are withheld in a bounded in-memory buffer so a refusal-only
-//! terminal can advance to the next deployment without exposing the refused
-//! route; mixed output or buffer overflow commits and flushes. Candidate
+//! classes and only before commitment, a pre-commit throttle on a rung the
+//! pool's `throttle_redial` schedule marks worth waiting for is re-dialed on
+//! the same deployment after a bounded backoff (see `throttle_backoff`),
+//! failover advances to the next certified deployment for failover-eligible
+//! failures before commitment, and the first outward semantic event
+//! permanently freezes the serving deployment. When the alias revision
+//! enables refusal failover, refusal deltas are withheld in a bounded
+//! in-memory buffer so a refusal-only terminal can advance to the next
+//! deployment without exposing the refused route; mixed output or buffer
+//! overflow commits and flushes. A turn whose only output was a call to the
+//! gateway's tool-search tool (withheld inside the relay, see `tool_search`)
+//! does not commit either: the control plane runs the search and rebuilds
+//! the rung's dispatch, and the same depth is dialed again under a bounded
+//! round budget (`search_round`). Candidate
 //! selection policy (health circuits, budgets, attempt counting) stays in
 //! python: the loop only states its position and the classified failure, and
 //! the control plane answers with a reservation, a later depth, or
 //! exhaustion.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::bridge::Bridge;
-use crate::dialects::Dialect;
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
-use crate::relay::{
-    collection_public_error, ended_without_terminal, remaining, track_event, UpstreamRelay,
-};
+use crate::relay::{collection_public_error, remaining, UpstreamRelay};
 use crate::settlement::AttemptGuard;
-use crate::upstream::open_stream;
+use crate::throttle_backoff::{track_retry_after, with_largest_retry_after};
+use crate::tool_search::{ToolSearchRound, WithheldSearchCall};
+
+mod output_guardrails;
+use output_guardrails::inspect_outward;
+pub use output_guardrails::OutputGuardrailContext;
 
 /// Byte bound for withheld refusal deltas, matching the python executor's
 /// `_MAX_WITHHELD_REFUSAL_BYTES`.
@@ -44,103 +51,6 @@ pub const MAXIMUM_WITHHELD_REFUSAL_BYTES: usize = 65_536;
 /// Event-count bound for withheld refusal deltas, matching the python
 /// executor's `_MAX_WITHHELD_REFUSAL_EVENTS`.
 pub const MAXIMUM_WITHHELD_REFUSAL_EVENTS: usize = 256;
-
-/// One deployment's wire configuration inside the admitted ordered route.
-/// Payloads are built python-side per deployment, since model identities and
-/// dialects may differ across one certified pool.
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeploymentWire {
-    pub provider: String,
-    pub deployment_id: String,
-    pub dialect: String,
-    pub url: String,
-    pub headers: HashMap<String, String>,
-    pub timeout_seconds: f64,
-    /// Structured payload the data plane serializes itself; null for
-    /// body-signing dialects, whose route entry carries `upstream_body`.
-    #[serde(default)]
-    pub upstream_payload: Value,
-    /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
-    /// When present it is sent verbatim: the signature covers these exact
-    /// bytes, so re-serializing a structured payload here could invalidate
-    /// it.
-    #[serde(default)]
-    pub upstream_body: Option<String>,
-    #[serde(default)]
-    pub fireworks_reasoning_route_sha256: Option<String>,
-    pub idempotency_key: String,
-    /// Deployment override for the flat first-byte allowance; the serving
-    /// configuration's default applies when absent.
-    #[serde(default)]
-    pub time_to_first_byte_base_seconds: Option<f64>,
-    /// Deployment override for the input-scaled first-byte allowance in
-    /// seconds per million approximate input tokens; the serving
-    /// configuration's default applies when absent.
-    #[serde(default)]
-    pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
-}
-
-/// The frozen retry-policy facts returned by admission.
-#[derive(Debug, Clone, Copy)]
-pub struct RoutePolicy {
-    pub maximum_total_attempts: u32,
-    pub maximum_same_deployment_attempts: u32,
-    pub refusal_failover: bool,
-}
-
-/// Everything one waterfall run needs besides its request guard.
-pub struct WaterfallContext<'a> {
-    pub bridge: &'a Arc<Bridge>,
-    pub http: &'a reqwest::Client,
-    pub request_id: &'a str,
-    /// The presented virtual key, forwarded so hosted budget-error policy
-    /// can shape a rejected reservation for the caller.
-    pub raw_key: &'a str,
-    pub route: &'a [DeploymentWire],
-    pub policy: RoutePolicy,
-    pub deadline: Instant,
-    /// Fail-fast flat bound on the wait for each physical attempt's first
-    /// provider byte. Applied per attempt (each redial and each failover
-    /// advance gets a fresh window); it bounds the connect/header/first-byte
-    /// phase only and never caps generation once the provider has started
-    /// answering. Deployments may override it per wire entry.
-    pub time_to_first_byte: Duration,
-    /// Default input-scaled first-byte allowance in seconds per million
-    /// approximate input tokens, so a very large prompt whose prefill
-    /// legitimately takes longer than the flat bound is not misread as a
-    /// dead lane. Deployments may override it per wire entry.
-    pub time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
-    /// Approximate input tokens for this request: the raw body's bytes
-    /// divided by four. An allowance heuristic only, never a billing
-    /// quantity.
-    pub approximate_input_tokens: f64,
-    /// The bridge `remember` argument retaining an output-less turn: a
-    /// successful terminal reached before any semantic output still answers
-    /// the caller with a response id, and a response id the caller received
-    /// must stay continuable (api.openai.com persists `incomplete` responses
-    /// too). Only the Responses route carries one; it runs ahead of the
-    /// attempt's settlement so the control plane can still resolve the
-    /// request's continuation context.
-    pub output_less_retention: Option<String>,
-}
-
-/// The effective first-byte allowance for one attempt: the deployment's (or
-/// serving default's) flat base plus its input-scaled allowance.
-pub(crate) fn first_byte_allowance(
-    wire: &DeploymentWire,
-    default_base: Duration,
-    default_slope_seconds_per_million: f64,
-    approximate_input_tokens: f64,
-) -> Duration {
-    let base = wire
-        .time_to_first_byte_base_seconds
-        .unwrap_or(default_base.as_secs_f64());
-    let slope = wire
-        .time_to_first_byte_seconds_per_million_input_tokens
-        .unwrap_or(default_slope_seconds_per_million);
-    let scaled = slope * (approximate_input_tokens.max(0.0) / 1_000_000.0);
-    Duration::from_secs_f64((base + scaled).max(0.001))
-}
 
 /// The winning outcome of one waterfall run.
 pub enum Won {
@@ -165,39 +75,77 @@ pub struct CommittedAttempt {
     /// Whether refusal deltas already reached (or will reach) the caller;
     /// a later typed refusal terminal then completes instead of failing.
     pub visible_refusal: bool,
+    /// Whether this attempt served the re-dial that stripped the replayed
+    /// encrypted reasoning items the rung refused (disclosed to the caller
+    /// through `crate::replay_repair::REPLAY_REPAIR_HEADER`).
+    pub encrypted_reasoning_stripped: bool,
+    /// The gateway-run tool-search rounds that led to this attempt, in
+    /// order; empty on every request the gateway searched nothing for.
+    pub tool_search_rounds: Vec<ToolSearchRound>,
+    /// The model called the gateway's search tool in the same turn as other
+    /// semantic output: the rung committed on that output and the call was
+    /// dropped (disclosed as `tool_search->dropped(after_output)`).
+    pub tool_search_dropped_after_output: bool,
+    /// The streamed-output pace the control plane set for this attempt
+    /// (`output_pacing`); `None` streams unpaced, as every attempt did before.
+    pub pace: Option<f64>,
+    /// See [`Served::rate_limit_headers`].
+    pub rate_limit_headers: Vec<(String, String)>,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
 pub struct SettledAttempt {
     pub depth: usize,
     pub events: Vec<Event>,
+    /// See [`CommittedAttempt::encrypted_reasoning_stripped`].
+    pub encrypted_reasoning_stripped: bool,
+    /// See [`Served::empty_completion`]: the ladder exhausted on empty turns
+    /// and these events are the typed empty answer.
+    pub empty_completion: bool,
+    /// See [`CommittedAttempt::tool_search_rounds`].
+    pub tool_search_rounds: Vec<ToolSearchRound>,
+    /// See [`Served::rate_limit_headers`].
+    pub rate_limit_headers: Vec<(String, String)>,
 }
 
-fn is_semantic(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::TextDelta(_)
-            | Event::RefusalDelta(_)
-            | Event::ProviderTextDelta { .. }
-            | Event::ProviderRefusalDelta { .. }
-            | Event::ProviderOutputItemStarted { .. }
-            | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
-            | Event::ThinkingDelta { .. }
-            | Event::ThinkingSignature { .. }
-            | Event::RedactedThinking { .. }
-            | Event::EncryptedReasoning { .. }
-            | Event::ReasoningContentDelta { .. }
-            | Event::ToolCallStarted { .. }
-            | Event::ToolArgumentsDelta { .. }
-            | Event::ToolCallCompleted { .. }
-            | Event::TextBlockStarted { .. }
-            | Event::CitationDelta { .. }
-            | Event::ServerToolUseStarted { .. }
-            | Event::ServerToolArgumentsDelta { .. }
-            | Event::ServerToolUseCompleted { .. }
-            | Event::ServerToolResult { .. }
-    )
+/// The facts of the attempt that served, as the response surfaces name them.
+#[derive(Debug, Clone, Default)]
+pub struct Served {
+    pub depth: usize,
+    pub encrypted_reasoning_stripped: bool,
+    /// The answer is an empty turn the ladder could not improve on (every
+    /// rung, or the committed rung, closed with nothing): the caller holds a
+    /// typed 200 under `x-gateway-warning: empty_completion`, the ledger the
+    /// typed `empty_completion` failure.
+    pub empty_completion: bool,
+    /// The serving rung's provider rate-limit headers, relayed only when it
+    /// dispatched on the caller's own credential
+    /// (`rate_limit_headers::caller_rate_limit_headers`).
+    pub rate_limit_headers: Vec<(String, String)>,
+}
+
+impl CommittedAttempt {
+    /// The serving facts of this committed attempt.
+    pub fn served(&self) -> Served {
+        Served {
+            depth: self.depth,
+            encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
+            empty_completion: false,
+            rate_limit_headers: self.rate_limit_headers.clone(),
+        }
+    }
+}
+
+impl SettledAttempt {
+    /// The serving facts of this settled attempt.
+    pub fn served(&self) -> Served {
+        Served {
+            depth: self.depth,
+            encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
+            empty_completion: self.empty_completion,
+            rate_limit_headers: self.rate_limit_headers.clone(),
+        }
+    }
 }
 
 /// The control plane's answer to one `start_attempt` callback.
@@ -211,30 +159,13 @@ pub(crate) struct StartResponse {
     pub(crate) exhausted: bool,
     #[serde(default)]
     pub(crate) failure: Option<Failure>,
-}
-
-/// Whether the classified failure leaves any successor dispatch possible
-/// under the rust-side facts (caps, flags, remaining route, deadline). The
-/// control plane re-checks with health and budget state and may still answer
-/// with exhaustion.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn successor_possible(
-    policy: RoutePolicy,
-    route_length: usize,
-    deadline: Instant,
-    total_attempts: u32,
-    same_deployment_attempts: u32,
-    depth: usize,
-    failure: &Failure,
-    refusal_eligible: bool,
-) -> bool {
-    if total_attempts >= policy.maximum_total_attempts || remaining(deadline).is_zero() {
-        return false;
-    }
-    let same = failure.retryable_same_deployment
-        && same_deployment_attempts < policy.maximum_same_deployment_attempts;
-    let failover = (failure.failover_eligible || refusal_eligible) && depth + 1 < route_length;
-    same || failover
+    /// A durable zero-attempt certificate from the trusted accounting callback.
+    #[serde(default)]
+    pub(crate) known_unbilled: bool,
+    /// The reserved attempt's output pace; absent unless a self-hosted rung
+    /// is paced for this request's class (`output_pacing`).
+    #[serde(default)]
+    pub(crate) output_tokens_per_second: Option<f64>,
 }
 
 /// One pre-commit attempt outcome, private to the waterfall loop.
@@ -247,16 +178,33 @@ enum AttemptEnd {
         refusal_eligible: bool,
         /// Withheld refusal deltas plus the failing terminal, flushed
         /// outward only when the ladder is exhausted with a non-refusal
-        /// failure (the python executor's `withheld_non_refusal_failure`).
+        /// failure.
         exhaustion_flush: Vec<Event>,
         usage: Option<Usage>,
         tool_names: Vec<String>,
         opened: bool,
+        /// Whether the failing dial was the stripped re-dial, so an
+        /// exhaustion flush of its withheld output still discloses it.
+        encrypted_reasoning_stripped: bool,
+    },
+    /// The dial's only output was one or more calls to the gateway's
+    /// tool-search tool, withheld inside the relay, and it ended
+    /// successfully: nothing committed, and the waterfall runs the search
+    /// and dials the same depth again.
+    ToolSearchRound {
+        calls: Vec<WithheldSearchCall>,
+        usage: Option<Usage>,
+        tool_names: Vec<String>,
+    },
+    /// Refused replay input was repaired; another physical reservation is required.
+    Repair {
+        failure: Failure,
+        usage: Option<Usage>,
+        tool_names: Vec<String>,
     },
     /// Accounting failed mid-attempt; the request is answered internal.
     Accounting,
-    /// The attempt settled, but retaining its output-less continuation
-    /// failed; the public retention error answers the caller.
+    /// The attempt finalized, but inspection or continuation retention failed.
     Retention(PublicError),
 }
 
@@ -266,16 +214,63 @@ enum AttemptEnd {
 /// request is either finalized (`Settled`/`Failed`) or owned by the single
 /// committed attempt the caller must settle.
 pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuard) -> Won {
+    if !ctx.policy.valid() {
+        guard
+            .abandon(&Failure::new(
+                FailureClass::Internal,
+                "gateway retry policy contract failed",
+            ))
+            .await;
+        return Won::Failed(PublicError::internal());
+    }
     let mut total_attempts: u32 = 0;
     let mut counts: Vec<u32> = vec![0; ctx.route.len()];
+    let mut physical_counts: Vec<u32> = vec![0; ctx.route.len()];
+    let mut reasoning_repair = false;
+    // Post-backoff redials made per depth: the schedule's per-rung cap
+    // counts only these, never a retryable-class redial of the same rung.
+    let mut throttle_redials: Vec<u32> = vec![0; ctx.route.len()];
+    // Per depth, the replayed payload with the encrypted reasoning items the
+    // rung refused stripped out: every later dial of that rung in this
+    // request (a throttle redial, a same-rung retry) sends it directly
+    // instead of earning the refusal again. Another rung may still decrypt
+    // the original, so it starts from the payload as replayed.
+    let mut repaired: Vec<Option<Value>> = vec![None; ctx.route.len()];
     let mut current_depth: Option<usize> = None;
     let mut last_failure: Option<Failure> = None;
+    // The longest wait any throttled rung stated, so an exhausted ladder
+    // tells the caller the whole story rather than the last rung's.
+    let mut largest_retry_after: Option<u32> = None;
+    // Whether this reservation re-dials the rung that just throttled after
+    // the schedule's backoff was waited out; consumed by one `start_attempt`.
+    let mut throttle_backoff = false;
+    // Per depth, the wire a tool-search round rebuilt for the rung (the
+    // conversation extended with the search call and its result, the
+    // matched tools loaded); every later dial of that depth sends it.
+    let mut search_wires: Vec<Option<DeploymentWire>> = vec![None; ctx.route.len()];
+    // The rounds completed so far, handed to the winning attempt to render.
+    let mut tool_search_rounds: Vec<ToolSearchRound> = Vec::new();
+    let mut rounds_done: u32 = 0;
+    // Whether this reservation re-dials the same depth after a tool-search
+    // round; consumed by one `start_attempt`.
+    let mut tool_search_round = false;
     loop {
+        let search_redial = std::mem::take(&mut tool_search_round);
+        let repair_redial = std::mem::take(&mut reasoning_repair);
         let argument = compact_json(&json!({
             "request_id": ctx.request_id,
             "raw_key": ctx.raw_key,
             "attempt_ordinal": total_attempts,
             "current_depth": current_depth,
+            // A post-backoff redial of the throttled rung: the control plane
+            // claims the same depth through its own throttle window and
+            // discloses the attempt as `throttle_backoff`.
+            "throttle_backoff": std::mem::take(&mut throttle_backoff),
+            // A same-depth re-dial after a gateway tool-search round: the
+            // control plane reserves the same rung and discloses the attempt
+            // as `tool_search_round`.
+            "tool_search_round": search_redial,
+            "reasoning_repair": repair_redial,
             "failure": last_failure.as_ref().map(|failure| json!({
                 "failure_class": failure.failure_class.as_str(),
                 "safe_message": failure.safe_message,
@@ -286,6 +281,16 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // survive the round trip to reach the caller.
                 "rejected_parameter": failure.rejected_parameter,
                 "provider_detail": failure.provider_detail,
+                // Ownership survives the round trip too: the echoed exhaustion
+                // must still render as the customer's 400.
+                "customer_owned": failure.customer_owned,
+                // The refusal category survives the round trip so an exhausted
+                // refusal ladder still names its reason to the caller.
+                "refusal_reason": failure.refusal_reason.map(|reason| reason.as_str()),
+                // A throttle's stated wait survives too, so an exhausted
+                // throttle ladder advertises it as `Retry-After`.
+                "retry_after_seconds": failure.retry_after_seconds,
+                "header_timeout": failure.header_timeout.map(|phase| phase.as_str()),
             })),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
@@ -320,8 +325,12 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     "all exact-model deployments are unavailable",
                 )
             });
-            return Won::Failed(collection_public_error(&failure.boundary()));
+            let failure = with_largest_retry_after(failure, largest_retry_after);
+            let mut error = collection_public_error(&failure.boundary());
+            error.known_unbilled = started.known_unbilled;
+            return Won::Failed(error);
         }
+        let attempt_pace = started.output_tokens_per_second;
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
             guard
                 .abandon(&Failure::new(
@@ -342,16 +351,167 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 .await;
             return Won::Failed(PublicError::internal());
         };
-        if current_depth == Some(depth) {
+        if !fallback_rules::dial_admitted(wire, current_depth, depth, last_failure.as_ref()) {
+            // The control plane reserved a failover-only rung outside its
+            // rules (a first dial, or a successor to a failure its set does
+            // not name); the two halves of the contract disagree, so the
+            // request fails closed rather than dialing the rung.
+            guard.rebind(attempt_id);
+            let failure = Failure::new(
+                FailureClass::Internal,
+                "gateway attempt wire contract failed: failover-only rung reserved outside its rules",
+            );
+            guard
+                .settle("failed", None, &[], Some(&failure), true)
+                .await;
+            return Won::Failed(PublicError::internal());
+        }
+        if current_depth == Some(depth) && !search_redial {
             METRICS.record_open_retry();
         }
         guard.rebind(attempt_id);
+        if !ctx.policy.permits(total_attempts, physical_counts[depth]) {
+            let failure = Failure::new(
+                FailureClass::Internal,
+                "gateway reserved beyond the request attempt budget",
+            );
+            guard
+                .settle("failed", None, &[], Some(&failure), true)
+                .await;
+            return Won::Failed(PublicError::internal());
+        }
         total_attempts += 1;
-        counts[depth] += 1;
-        let end = run_attempt(ctx, guard, wire, depth).await;
+        physical_counts[depth] += 1;
+        if !search_redial && !repair_redial {
+            counts[depth] += 1;
+        }
+        // A rung a tool-search round rebuilt dials its rebuilt wire; the
+        // route's own entry still answers every policy question above.
+        let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
+        let mut end = run_attempt(
+            ctx,
+            guard,
+            dial_wire,
+            depth,
+            &mut repaired[depth],
+            repair_redial,
+            &tool_search_rounds,
+        )
+        .await;
+        // Every pre-commit failure of a tenant origin answers opaquely; the
+        // relay marks the failures it yields after an open the same way.
+        if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &mut end {
+            failure.tenant_origin |= dial_wire.tenant_origin;
+        }
+        if guard.input_gate.is_some() {
+            if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &end {
+                // Gate rejection can drop settlement while it awaits the same input verdict.
+                guard
+                    .capture_observation()
+                    .record(&Event::Failed(failure.clone()));
+            }
+        }
         match end {
-            AttemptEnd::Committed(committed) => return Won::Committed(committed),
-            AttemptEnd::Settled(settled) => return Won::Settled(settled),
+            AttemptEnd::Committed(mut committed) => {
+                // The committed stream has parsed at least its first
+                // semantic chunk, so an aggregator's upstream label (if any)
+                // is known here; settle it with whatever outcome follows.
+                guard.record_upstream_provider(committed.relay.upstream_provider());
+                committed.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
+                committed.pace = attempt_pace;
+                return Won::Committed(committed);
+            }
+            AttemptEnd::Settled(mut settled) => {
+                settled.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
+                return Won::Settled(settled);
+            }
+            AttemptEnd::ToolSearchRound {
+                calls,
+                usage,
+                tool_names,
+            } => {
+                // The search-call turn was the rung's own answer, not a
+                // retry of it: the round budget bounds it, not the
+                // same-deployment cap.
+                let max_rounds = ctx.tool_search.map_or(0, |search| search.max_rounds);
+                if rounds_done >= max_rounds
+                    || !ctx.policy.permits(total_attempts, physical_counts[depth])
+                    || remaining(ctx.deadline).is_zero()
+                {
+                    // The model called the search tool past the budget (or
+                    // after the control plane withdrew the tool): the turn
+                    // has no answer in it, and the request fails closed with
+                    // the gateway's own error rather than a half answer.
+                    let failure = if !ctx.policy.permits(total_attempts, physical_counts[depth]) {
+                        Failure::new(FailureClass::InvalidRequest, "The request exhausted gateway.retry attempt limits before producing an answer. Increase the limits and resend.")
+                    } else {
+                        search_round::budget_exhausted()
+                    };
+                    guard
+                        .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+                        .await;
+                    return Won::Failed(if failure.failure_class == FailureClass::Internal {
+                        PublicError::internal()
+                    } else {
+                        collection_public_error(&failure.boundary())
+                    });
+                }
+                rounds_done += 1;
+                let reply = match search_round::negotiate(
+                    ctx,
+                    guard,
+                    depth,
+                    rounds_done,
+                    &calls,
+                    usage.as_ref(),
+                    &tool_names,
+                    &mut tool_search_rounds,
+                )
+                .await
+                {
+                    Ok(reply) => reply,
+                    Err(won) => return won,
+                };
+                if reply.exhausted {
+                    rounds_done = max_rounds;
+                }
+                // The rebuilt wire carries the extended conversation; a
+                // payload stripped from the OLD conversation on an earlier
+                // dial of this rung must not be dialed over it.
+                repaired[depth] = None;
+                search_wires[depth] = Some(reply.wire);
+                current_depth = Some(depth);
+                last_failure = None;
+                tool_search_round = true;
+                continue;
+            }
+            AttemptEnd::Repair {
+                failure,
+                usage,
+                tool_names,
+            } => {
+                let possible = ctx.policy.permits(total_attempts, physical_counts[depth])
+                    && !remaining(ctx.pre_commit_deadline()).is_zero();
+                if !guard
+                    .settle(
+                        "failed",
+                        usage.as_ref(),
+                        &tool_names,
+                        Some(&failure),
+                        !possible,
+                    )
+                    .await
+                {
+                    return Won::Failed(PublicError::internal());
+                }
+                if !possible {
+                    return Won::Failed(collection_public_error(&failure.boundary()));
+                }
+                current_depth = Some(depth);
+                last_failure = None;
+                reasoning_repair = true;
+                continue;
+            }
             AttemptEnd::Accounting => return Won::Failed(PublicError::internal()),
             AttemptEnd::Retention(error) => return Won::Failed(error),
             AttemptEnd::Ladder {
@@ -361,21 +521,92 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 usage,
                 tool_names,
                 opened,
+                encrypted_reasoning_stripped,
             } => {
                 if opened {
                     guard.mark_opened();
                 }
+                track_retry_after(&mut largest_retry_after, &failure);
                 let boundary = failure.clone().boundary();
-                let possible = successor_possible(
-                    ctx.policy,
-                    ctx.route.len(),
-                    ctx.deadline,
-                    total_attempts,
-                    counts[depth],
-                    depth,
-                    &failure,
-                    refusal_eligible,
-                );
+                // A pre-commit throttle on a rung worth waiting for is
+                // re-dialed after the schedule's backoff; otherwise the
+                // existing redial and failover rules decide.
+                let fits = ctx.policy.permits(total_attempts, physical_counts[depth]);
+                let backoff = if fits {
+                    throttle_backoff_delay(
+                        ctx,
+                        wire,
+                        &failure,
+                        throttle_redials[depth],
+                        total_attempts,
+                    )
+                } else {
+                    None
+                };
+                let mut next_policy = ctx.policy;
+                let retry_wait = if failure.retryable_same_deployment
+                    && fits
+                    && counts[depth] < ctx.policy.maximum_same_deployment_attempts
+                {
+                    ctx.policy.backoff.map(|backoff| {
+                        backoff.delay(
+                            counts[depth].saturating_sub(1),
+                            failure.retry_after_seconds,
+                            remaining(ctx.deadline).saturating_sub(first_byte_allowance(
+                                wire,
+                                ctx.time_to_first_byte,
+                                ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+                                ctx.approximate_input_tokens,
+                            )),
+                            ctx.request_id,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let mut failure = failure;
+                if retry_wait == Some(None) {
+                    failure.retryable_same_deployment = false;
+                }
+                if !fits {
+                    next_policy.maximum_same_deployment_attempts = counts[depth];
+                }
+                let possible = backoff.is_some()
+                    || successor_possible(
+                        next_policy,
+                        ctx.route,
+                        ctx.pre_commit_deadline(),
+                        total_attempts,
+                        counts[depth],
+                        depth,
+                        &physical_counts,
+                        &failure,
+                        refusal_eligible,
+                    );
+                if !possible
+                    && (!exhaustion_flush.is_empty()
+                        || failure.failure_class == FailureClass::EmptyCompletion)
+                {
+                    if let Err(inspection_failure) =
+                        inspect_outward(ctx, &tool_search_rounds, &exhaustion_flush).await
+                    {
+                        if !guard
+                            .settle(
+                                "failed",
+                                usage.as_ref(),
+                                &tool_names,
+                                Some(&inspection_failure),
+                                true,
+                            )
+                            .await
+                        {
+                            return Won::Failed(PublicError::internal());
+                        }
+                        return Won::Failed(collection_public_error(
+                            &inspection_failure.boundary(),
+                        ));
+                    }
+                }
                 if !guard
                     .settle(
                         "failed",
@@ -387,6 +618,17 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     .await
                 {
                     return Won::Failed(PublicError::internal());
+                }
+                if let Some(delay) = backoff {
+                    // The failed attempt is settled; the wait is the only
+                    // thing between it and the redial's own reservation.
+                    tokio::time::sleep(delay).await;
+                    throttle_redials[depth] += 1;
+                    throttle_backoff = true;
+                } else if possible {
+                    if let Some(Some(delay)) = retry_wait {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 if possible {
                     current_depth = Some(depth);
@@ -400,483 +642,82 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     return Won::Settled(SettledAttempt {
                         depth,
                         events: exhaustion_flush,
+                        encrypted_reasoning_stripped,
+                        empty_completion: false,
+                        tool_search_rounds: Vec::new(),
+                        rate_limit_headers: Vec::new(),
                     });
                 }
+                if failure.failure_class == FailureClass::EmptyCompletion {
+                    // Every rung the ladder could reach closed this
+                    // conversation with nothing. That is the model's answer,
+                    // not an outage: the last attempt is settled `failed` /
+                    // `empty_completion` above ($0, the ledger's record), and
+                    // the caller receives the empty turn as a typed 200
+                    // (`x-gateway-warning: empty_completion`) that no SDK
+                    // auto-retries -- a 502 here made one Claude Code session
+                    // re-send a 44k-token prompt every minute (2026-09-15).
+                    let mut events = Vec::with_capacity(2);
+                    if let Some(tracked) = usage {
+                        events.push(Event::Usage(tracked));
+                    }
+                    events.push(Event::Completed);
+                    return Won::Settled(SettledAttempt {
+                        depth,
+                        events,
+                        encrypted_reasoning_stripped,
+                        empty_completion: true,
+                        tool_search_rounds: std::mem::take(&mut tool_search_rounds),
+                        rate_limit_headers: Vec::new(),
+                    });
+                }
+                let boundary = with_largest_retry_after(boundary, largest_retry_after);
                 return Won::Failed(collection_public_error(&boundary));
             }
         }
     }
 }
 
-/// Resolve the dispatch headers for one physical open attempt. Body-signing
-/// dialects (Bedrock SigV4) are signed here, immediately before the provider
-/// POST, so neither queue time nor a spent earlier attempt can age the
-/// signature toward AWS's short clock window. Other dialects use the route
-/// entry's headers unchanged.
-async fn dispatch_headers(
-    bridge: &Bridge,
-    request_id: &str,
-    wire: &DeploymentWire,
-) -> Result<HashMap<String, String>, PublicError> {
-    let mut headers = wire.headers.clone();
-    let Some(body) = wire.upstream_body.as_deref() else {
-        return Ok(headers);
-    };
-    let argument = compact_json(&json!({
-        "request_id": request_id,
-        "url": wire.url,
-        "body": body,
-    }));
-    let text = bridge.call("sign_dispatch", argument).await?;
-    let signed: HashMap<String, String> = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|value| {
-            serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null)).ok()
-        })
-        .ok_or_else(PublicError::internal)?;
-    headers.extend(signed);
-    Ok(headers)
-}
+mod attempt;
+use attempt::run_attempt;
 
-/// Open and read one physical attempt up to commitment or its terminal.
-async fn run_attempt(
-    ctx: &WaterfallContext<'_>,
-    guard: &mut AttemptGuard,
-    wire: &DeploymentWire,
-    depth: usize,
-) -> AttemptEnd {
-    let Some(dialect) = Dialect::from_str(&wire.dialect) else {
-        // Admission validated every dialect; reaching here is wire drift.
-        return AttemptEnd::Ladder {
-            failure: Failure::new(
-                FailureClass::Internal,
-                "gateway engine does not support the resolved provider dialect",
-            ),
-            refusal_eligible: false,
-            exhaustion_flush: Vec::new(),
-            usage: None,
-            tool_names: Vec::new(),
-            opened: false,
-        };
-    };
-    // Body-signing dialects sign immediately before every physical attempt
-    // so neither queue time nor a spent prior attempt can age the signature
-    // (a same-deployment redial or a failover advance both call `run_attempt`
-    // again, so each always gets a fresh signature); signing failures are
-    // neither same-deployment-retryable nor failover-eligible, matching the
-    // python executor's hard stop on an authentication failure.
-    let headers = match dispatch_headers(ctx.bridge, ctx.request_id, wire).await {
-        Ok(headers) => headers,
-        Err(_) => {
-            return AttemptEnd::Ladder {
-                failure: Failure::new(
-                    FailureClass::ProviderAuthentication,
-                    "provider dispatch signing failed",
-                ),
-                refusal_eligible: false,
-                exhaustion_flush: Vec::new(),
-                usage: None,
-                tool_names: Vec::new(),
-                opened: false,
-            };
-        }
-    };
-    // The connection's raw timeout bounds each chunk read, exactly like the
-    // python streaming path. The open phase is additionally bounded by the
-    // fail-fast time-to-first-byte window (fresh per attempt) so a dead lane
-    // that never answers is abandoned in seconds, not after the full
-    // per-deployment timeout.
-    let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
-    let first_byte_deadline = Instant::now()
-        + first_byte_allowance(
-            wire,
-            ctx.time_to_first_byte,
-            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
-            ctx.approximate_input_tokens,
-        );
-    let open_bound = remaining(ctx.deadline)
-        .min(phase_timeout)
-        .min(remaining(first_byte_deadline));
-    let response = match open_stream(
-        ctx.http,
-        &wire.url,
-        &headers,
-        &wire.idempotency_key,
-        &wire.upstream_payload,
-        wire.upstream_body.as_deref(),
-        open_bound,
-        dialect,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(failure) => {
-            return AttemptEnd::Ladder {
-                failure,
-                refusal_eligible: false,
-                exhaustion_flush: Vec::new(),
-                usage: None,
-                tool_names: Vec::new(),
-                opened: false,
-            }
-        }
-    };
-    guard.mark_opened();
-    let mut relay = match wire.fireworks_reasoning_route_sha256.clone() {
-        Some(route_sha256) => UpstreamRelay::new_with_reasoning_content_route(
-            response,
-            dialect,
-            first_byte_deadline,
-            Some(route_sha256),
-        ),
-        None => UpstreamRelay::new(response, dialect, first_byte_deadline),
-    };
-    let mut usage: Option<Usage> = None;
-    let mut tool_names: Vec<String> = Vec::new();
-    let mut withheld: Vec<Event> = Vec::new();
-    let mut withheld_bytes = 0usize;
-    loop {
-        let event = match relay
-            .next_event(ctx.deadline, phase_timeout, guard.started)
-            .await
-        {
-            Ok(Some(event)) => event,
-            Ok(None) => {
-                return AttemptEnd::Ladder {
-                    failure: ended_without_terminal(),
-                    refusal_eligible: false,
-                    exhaustion_flush: Vec::new(),
-                    usage,
-                    tool_names,
-                    opened: true,
-                }
-            }
-            Err(failure) => {
-                return AttemptEnd::Ladder {
-                    failure,
-                    refusal_eligible: false,
-                    exhaustion_flush: Vec::new(),
-                    usage,
-                    tool_names,
-                    opened: true,
-                }
-            }
-        };
-        track_event(&event, &mut usage, &mut tool_names);
-        let refusal_text = match &event {
-            Event::RefusalDelta(text) | Event::ProviderRefusalDelta { delta: text, .. } => {
-                Some(text)
-            }
-            _ => None,
-        };
-        if let Some(text) = refusal_text {
-            if ctx.policy.refusal_failover {
-                let event_bytes = text.len();
-                if withheld_bytes + event_bytes > MAXIMUM_WITHHELD_REFUSAL_BYTES
-                    || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
-                {
-                    // Buffer overflow commits and flushes.
-                    let mut prefix = std::mem::take(&mut withheld);
-                    prefix.push(event);
-                    return AttemptEnd::Committed(Box::new(CommittedAttempt {
-                        depth,
-                        prefix,
-                        relay,
-                        usage,
-                        tool_names,
-                        visible_refusal: true,
-                    }));
-                }
-                withheld_bytes += event_bytes;
-                withheld.push(event);
-                continue;
-            }
-        }
-        if is_semantic(&event) {
-            // First outward semantic output freezes this deployment; any
-            // withheld refusals flush ahead of it.
-            let visible_refusal = !withheld.is_empty()
-                || matches!(
-                    event,
-                    Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-                );
-            let mut prefix = std::mem::take(&mut withheld);
-            prefix.push(event);
-            return AttemptEnd::Committed(Box::new(CommittedAttempt {
-                depth,
-                prefix,
-                relay,
-                usage,
-                tool_names,
-                visible_refusal,
-            }));
-        }
-        if !event.is_terminal() {
-            // Pre-commit non-semantic events are dropped from the outward
-            // stream (usage stays tracked), matching the python executor.
-            continue;
-        }
-        match &event {
-            Event::Failed(failure) => {
-                let typed_refusal = failure.failure_class == FailureClass::Refusal;
-                let exhaustion_flush = if !withheld.is_empty() && !typed_refusal {
-                    let mut flush = std::mem::take(&mut withheld);
-                    flush.push(event.clone());
-                    flush
-                } else {
-                    withheld.clear();
-                    Vec::new()
-                };
-                return AttemptEnd::Ladder {
-                    failure: failure.clone(),
-                    refusal_eligible: typed_refusal && ctx.policy.refusal_failover,
-                    exhaustion_flush,
-                    usage,
-                    tool_names,
-                    opened: true,
-                };
-            }
-            _ => {
-                if !withheld.is_empty() {
-                    // A refusal-only stream that terminated successfully is
-                    // a provider refusal: withhold the output and advance,
-                    // matching the python executor's converted terminal.
-                    withheld.clear();
-                    return AttemptEnd::Ladder {
-                        failure: Failure::new(
-                            FailureClass::Refusal,
-                            "provider refused the request",
-                        ),
-                        refusal_eligible: ctx.policy.refusal_failover,
-                        exhaustion_flush: Vec::new(),
-                        usage,
-                        tool_names,
-                        opened: true,
-                    };
-                }
-                // A successful terminal with no semantic output: retain the
-                // output-less continuation while the attempt is still in
-                // flight, settle, then answer with the tracked usage ahead of
-                // the terminal so the encoders keep the client-visible token
-                // accounting.
-                let retention_failure = match &ctx.output_less_retention {
-                    Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
-                    None => None,
-                };
-                let outcome = if matches!(event, Event::Incomplete) {
-                    "incomplete"
-                } else {
-                    "completed"
-                };
-                if !guard
-                    .settle(outcome, usage.as_ref(), &tool_names, None, true)
-                    .await
-                {
-                    return AttemptEnd::Accounting;
-                }
-                if let Some(error) = retention_failure {
-                    // The provider outcome settled above, exactly like a
-                    // committed attempt's retention failure; only the HTTP
-                    // result reports it.
-                    return AttemptEnd::Retention(error);
-                }
-                let mut events = Vec::with_capacity(2);
-                if let Some(tracked) = usage {
-                    events.push(Event::Usage(tracked));
-                }
-                events.push(event);
-                return AttemptEnd::Settled(SettledAttempt { depth, events });
-            }
-        }
-    }
-}
+mod commit;
+pub(crate) use commit::is_semantic;
+mod fallback_rules;
+mod wire;
+pub(crate) use wire::{
+    approximate_input_tokens, attribute_header_timeout, first_byte_allowance,
+    first_token_allowance, open_phase_bound, pre_first_byte_budget, PRE_FIRST_BYTE_MAX,
+    PRE_FIRST_BYTE_RESERVE,
+};
+pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
+
+mod empty;
+use empty::settle_output_less;
+pub(crate) use empty::{
+    billed_empty_completion, empty_completion_failure, unreported_empty_completion,
+};
+
+mod dispatch;
+pub(crate) use dispatch::{customer_owned, dispatch_headers};
+
+mod successor;
+pub(crate) use successor::successor_possible;
+use successor::throttle_backoff_delay;
+
+mod search_round;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
-        DeploymentWire {
-            provider: "openai".to_string(),
-            deployment_id: "d".to_string(),
-            dialect: "openai_compatible".to_string(),
-            url: "https://provider.test".to_string(),
-            headers: HashMap::new(),
-            timeout_seconds: 60.0,
-            upstream_payload: Value::Null,
-            upstream_body: None,
-            fireworks_reasoning_route_sha256: None,
-            idempotency_key: "op".to_string(),
-            time_to_first_byte_base_seconds: base,
-            time_to_first_byte_seconds_per_million_input_tokens: slope,
-        }
-    }
-
-    #[test]
-    fn first_byte_allowance_scales_with_input_and_honors_overrides() {
-        let default_base = Duration::from_secs(15);
-        // No overrides, tiny request: effectively the flat default.
-        let flat = first_byte_allowance(&wire(None, None), default_base, 240.0, 100.0);
-        assert!((flat.as_secs_f64() - 15.024).abs() < 1e-6);
-        // No overrides, one million approximate tokens: base plus the
-        // full default slope.
-        let scaled = first_byte_allowance(&wire(None, None), default_base, 240.0, 1_000_000.0);
-        assert!((scaled.as_secs_f64() - 255.0).abs() < 1e-6);
-        // Deployment overrides replace both the base and the slope.
-        let overridden = first_byte_allowance(
-            &wire(Some(30.0), Some(60.0)),
-            default_base,
-            240.0,
-            500_000.0,
-        );
-        assert!((overridden.as_secs_f64() - 60.0).abs() < 1e-6);
-        // A zero slope pins the flat bound regardless of input size.
-        let pinned = first_byte_allowance(&wire(None, Some(0.0)), default_base, 240.0, 9e9);
-        assert!((pinned.as_secs_f64() - 15.0).abs() < 1e-6);
-    }
-
-    fn policy(refusal_failover: bool) -> RoutePolicy {
-        RoutePolicy {
-            maximum_total_attempts: 8,
-            maximum_same_deployment_attempts: 2,
-            refusal_failover,
-        }
-    }
-
-    fn far_deadline() -> Instant {
-        Instant::now() + Duration::from_secs(60)
-    }
-
-    #[test]
-    fn successor_requires_capacity_and_an_eligible_class() {
-        let retryable = Failure::new(FailureClass::ProviderInternal, "boom").with_retry(true, true);
-        // Same-deployment retry within the per-deployment cap.
-        assert!(successor_possible(
-            policy(false),
-            1,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &retryable,
-            false,
-        ));
-        // The per-deployment cap forbids a redial but failover still runs.
-        assert!(successor_possible(
-            policy(false),
-            2,
-            far_deadline(),
-            2,
-            2,
-            0,
-            &retryable,
-            false,
-        ));
-        // A single-deployment route with the redial cap reached is exhausted.
-        assert!(!successor_possible(
-            policy(false),
-            1,
-            far_deadline(),
-            2,
-            2,
-            0,
-            &retryable,
-            false,
-        ));
-        // The hard total cap ends the ladder regardless of class.
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            far_deadline(),
-            8,
-            1,
-            0,
-            &retryable,
-            false,
-        ));
-        // An expired deadline ends the ladder.
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            Instant::now(),
-            1,
-            1,
-            0,
-            &retryable,
-            false,
-        ));
-    }
-
-    #[test]
-    fn ineligible_classes_never_advance_without_refusal_opt_in() {
-        let invalid = Failure::new(FailureClass::InvalidRequest, "bad request");
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &invalid,
-            false,
-        ));
-        let refusal = Failure::new(FailureClass::Refusal, "provider refused the request");
-        assert!(!successor_possible(
-            policy(false),
-            4,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &refusal,
-            false,
-        ));
-        // The refusal advances only when the alias revision opted in.
-        assert!(successor_possible(
-            policy(true),
-            4,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &refusal,
-            true,
-        ));
-        // Refusal failover cannot pass the last deployment.
-        assert!(!successor_possible(
-            policy(true),
-            1,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &refusal,
-            true,
-        ));
-    }
-
-    #[test]
-    fn failover_only_classes_skip_the_redial_and_advance() {
-        let throttled = Failure::new(FailureClass::Throttled, "throttled").with_retry(false, true);
-        assert!(successor_possible(
-            policy(false),
-            2,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &throttled,
-            false,
-        ));
-        assert!(!successor_possible(
-            policy(false),
-            1,
-            far_deadline(),
-            1,
-            1,
-            0,
-            &throttled,
-            false,
-        ));
-    }
-}
+mod ladder_tests;
+#[cfg(test)]
+mod progress_tests;
+#[cfg(test)]
+mod repair_ladder_tests;
+#[cfg(test)]
+mod revisit_ladder_tests;
+#[cfg(test)]
+mod tenant_ladder_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tool_search_ladder_tests;

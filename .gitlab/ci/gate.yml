@@ -1,0 +1,124 @@
+# gate: the whole-repository quality, architecture, and non-live behavior gate
+# that .github/workflows/gate.yml describes, on GitLab's free small Linux
+# runner. Runs only for manual runs (RUN_WORKFLOW=gate) on any branch: merge
+# request, main, and tag pipelines run nothing, as for every area. The macOS
+# evidence and Windows snapshot-authority jobs are not mirrored here.
+
+.gate:
+  extends: [.tools]
+  stage: test
+  image: python:3.13.17-trixie@sha256:2d90366719bf27f9a26d3496b34bfe44fc383b10e7360ca316152f7b348f4f92
+  needs: []
+  timeout: 1h
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RUN_WORKFLOW == "gate"
+  variables:
+    # Type-check and exercise the complete package, including the capture engine.
+    UV_PYTHON: "3.13"
+    UV_CACHE_DIR: $CI_PROJECT_DIR/.ci-cache/uv
+    CARGO_HOME: $CI_PROJECT_DIR/.ci-cache/cargo
+    CARGO_TARGET_DIR: $CI_PROJECT_DIR/.ci-cache/target
+  # The uv cache holds the wheels uv builds from source, above all the
+  # git-pinned exp-mitmproxy-rs; cargo keeps crate downloads and the crate's
+  # compiled dependencies. Keyed on uv.lock so a dependency change starts cold.
+  cache:
+    key:
+      prefix: gate
+      files:
+        - uv.lock
+    paths:
+      - .ci-cache/
+  before_script:
+    - !reference [.snippets, uv]
+    - !reference [.snippets, rust]
+    - uv sync --locked --extra dev
+
+# Known advisories in the committed lockfiles: OSV-Scanner reads uv.lock and
+# the native crate's Cargo.lock and fails on any advisory that
+# .gitlab/ci/osv-scanner.toml does not accept by ID with a reason and an expiry.
+gate-dependency-audit:
+  extends: [.tools]
+  stage: test
+  image: python:3.13.17-trixie@sha256:2d90366719bf27f9a26d3496b34bfe44fc383b10e7360ca316152f7b348f4f92
+  needs: []
+  timeout: 10m
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RUN_WORKFLOW == "gate"
+  script:
+    - curl -fsSL --proto '=https' --retry 3 -o /tmp/osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+    - echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum --check --strict -
+    - chmod +x /tmp/osv-scanner
+    - >-
+      /tmp/osv-scanner scan source --config .gitlab/ci/osv-scanner.toml
+      --lockfile uv.lock --lockfile exp/runtime/gateway/native/Cargo.lock
+
+gate-rust:
+  extends: [.gate]
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --check --manifest-path exp/runtime/gateway/native/Cargo.toml
+    - cargo clippy --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features -- -D warnings
+    # The crate's unit-test binary links the image's libpython.
+    - export PYO3_PYTHON="$CI_PROJECT_DIR/.venv/bin/python"
+    - export LD_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    - cargo test --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features
+    # Explicit cache crosses the real Python and native bridge.
+    - export PYTHONPATH="$CI_PROJECT_DIR:$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+    - >-
+      cargo test --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --no-default-features
+      waterfall::attempt::google_cache::bridge_tests::real_python_control_plane_creates_and_reuses_through_bridge
+      -- --ignored --exact
+    - unset PYTHONPATH
+    # Native parity tests are present, not skipped.
+    - uv run pytest -q exp/runtime/gateway/native_bridge_test.py -k "rust" -rs --no-header
+
+gate-lint:
+  extends: [.gate]
+  script:
+    - uv run ruff check .
+    - uv run ruff format --check .
+    - uv run ty check
+    # Tinker SDK adapter tests, which the shards ignore.
+    - uv run pytest -q -k "not live" exp/optimize/model/sft/tinker_test.py
+
+gate-tests:
+  extends: [.gate]
+  # Balanced as in .github/workflows/gate.yml. A path a shard ignores must be
+  # another shard's path, or run elsewhere: Tinker in gate-lint, and the two
+  # evidence suites (comparison_evidence, composition_evidence) in the macOS
+  # evidence job, which GitLab does not run. The matrix carries only the shard
+  # name, because GitLab writes matrix values into the job name.
+  parallel:
+    matrix:
+      - SHARD: [rest, router-hosted, router, gateway, evaluation]
+  script:
+    - |
+      case "$SHARD" in
+        rest)
+          # One known-red test is deselected by node id; every other test is strict.
+          # release_test.py::test_installed_wheel_no_spend_release_evidence installs
+          # freshly built wheels plus git-pinned capture dependencies into a new
+          # environment and fails in this setup; .github/workflows/gate.yml deselects
+          # it from the Linux shards too.
+          paths="exp --ignore=exp/optimize/router --ignore=exp/runtime/gateway
+            --ignore=exp/optimize/evaluation --ignore=exp/optimize/model/sft/tinker_test.py
+            --ignore=exp/simulation/tests/comparison_evidence_test.py
+            --deselect=exp/tests/release_test.py::test_installed_wheel_no_spend_release_evidence" ;;
+        router-hosted)
+          paths="exp/optimize/router/hosted_test.py exp/optimize/router/automatic" ;;
+        router)
+          paths="exp/optimize/router --ignore=exp/optimize/router/hosted_test.py
+            --ignore=exp/optimize/router/automatic" ;;
+        gateway)
+          paths="exp/runtime/gateway" ;;
+        evaluation)
+          paths="exp/optimize/evaluation" ;;
+        *)
+          echo "unknown shard: $SHARD" >&2; exit 1 ;;
+      esac
+      # One worker per CPU: the small runner has two, and oversubscribing it
+      # trips the suite's deadline- and garbage-collection-timed tests.
+      # Word splitting of $paths is intended: it holds paths and pytest flags.
+      uv run pytest -n "$(nproc)" --dist worksteal -q -k "not live" $paths --ignore=exp/optimize/router/tests/composition_evidence_test.py

@@ -211,8 +211,7 @@ def build_fidelity_report(
         failures=tuple(failures),
         pairs=tuple(pairs),
     )
-    destination = store.project_directory / "artifacts" / report.fidelity_report_id
-    if destination.exists():
+    if store.exists(report.fidelity_report_id):
         existing, _input = read_fidelity_report(store, report.fidelity_report_id)
         replay = report.model_copy(update={"created_at": existing.created_at})
         if existing != replay:

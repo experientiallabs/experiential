@@ -40,6 +40,7 @@ from exp.common.project.catalog import (
 from exp.common.project.events import ProjectStage
 from exp.common.project.manifests import ArtifactManifest, file_digest
 from exp.common.project.project import write_project_config
+from exp.common.project.testing import RawArtifact
 
 _CREATED_AT = datetime(2026, 8, 17, tzinfo=UTC)
 _REVISION = "producer-revision"
@@ -71,6 +72,7 @@ def _project_store(
     tmp_path: Path,
     *,
     with_catalog: bool = False,
+    with_blob: bool = False,
     project_id: str = "portable-project",
 ) -> ProjectStore:
     """Create a selected provider-free graph plus one unrelated sibling artifact."""
@@ -88,7 +90,12 @@ def _project_store(
                 sha256="a" * 64,
             ),
         ),
-        files={"nested/trace.json": {"trace_id": "trace-1"}},
+        files={
+            "nested/trace.json": {
+                "trace_id": "trace-1",
+                "payload": "x" * (1_100_000 if with_blob else 0),
+            }
+        },
     )
     trace_input = artifact_input(trace)
     task = store.artifacts.write_json(
@@ -413,7 +420,7 @@ def test_bundle_rejects_unsupported_project_schema_and_truncation(tmp_path: Path
     """Future Project schemas and incomplete archives fail before destination visibility."""
     unsupported = _project_store(tmp_path / "unsupported")
     write_project_config(
-        unsupported.paths.project_toml,
+        unsupported.paths,
         unsupported.load_project().model_copy(update={"schema_version": 999}),
     )
     with pytest.raises(ProjectBundleError, match="schema version is unsupported"):
@@ -686,7 +693,7 @@ def _rewrite_trace_graph(
     source_id: str = "platform-source:upload-1",
 ) -> None:
     """Forge a digest-consistent selected graph for boundary-failure tests."""
-    trace_directory = store.paths.artifact_directory("trace-selected")
+    trace_directory = RawArtifact(store.paths, "trace-selected")
     trace_manifest = ArtifactManifest.model_validate_json(
         (trace_directory / "manifest.json").read_bytes()
     )
@@ -703,14 +710,14 @@ def _rewrite_trace_graph(
     (trace_directory / "manifest.json").write_bytes(canonical_json_bytes(trace_manifest))
     trace_pointer = artifact_input(trace_manifest)
 
-    task_directory = store.paths.artifact_directory("tasks-selected")
+    task_directory = RawArtifact(store.paths, "tasks-selected")
     task_manifest = ArtifactManifest.model_validate_json(
         (task_directory / "manifest.json").read_bytes()
     ).model_copy(update={"inputs": (trace_pointer,)})
     (task_directory / "manifest.json").write_bytes(canonical_json_bytes(task_manifest))
     project = store.load_project()
     write_project_config(
-        store.paths.project_toml,
+        store.paths,
         project.model_copy(
             update={
                 "provider_free_stage": ProjectProviderFreeStage(

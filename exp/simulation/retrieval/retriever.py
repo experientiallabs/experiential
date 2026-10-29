@@ -14,8 +14,13 @@ from exp.simulation.retrieval.embedding import (
     default_rag_embedder,
     embed_rag_texts,
 )
+from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
 from exp.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
 from exp.simulation.retrieval.transitions import render_rag_key
+
+
+class RAGQueryInputLimitError(ValueError):
+    """An eligible query needs more embedding input than its frozen reservation."""
 
 
 class TraceRAGRetriever:
@@ -64,7 +69,7 @@ class TraceRAGRetriever:
 
     @property
     def maximum_attempts(self) -> int:
-        """Return the maximum provider attempts made by one query embedding."""
+        """Return the maximum provider attempts made by each query-embedding batch."""
         return self._embedder.maximum_attempts
 
     @property
@@ -95,14 +100,20 @@ class TraceRAGRetriever:
             raise ValueError("query-embedding reservation retry bound differs from the client")
         if reservation.input_usd_per_million_tokens != self.input_usd_per_million_tokens:
             raise ValueError("query-embedding reservation price differs from the active catalog")
+        if not self._has_eligible_transition(query):
+            return OperationEconomics(cost_usd=NumericMeasurement(value=0, provenance="estimated"))
         key_text = render_rag_key(
             task=query.task,
             initial_context=query.initial_context,
             action=query.action,
         )
-        input_tokens = len(key_text.encode("utf-8"))
+        input_tokens = plan_rag_embedding_inputs(
+            (key_text,), maximum_chunk_bytes=self._index.embedding_chunk_bytes
+        ).maximum_input_tokens
         if input_tokens > reservation.maximum_input_tokens:
-            raise ValueError("canonical RAG query exceeds its reserved input-token ceiling")
+            raise RAGQueryInputLimitError(
+                "canonical RAG query exceeds its reserved input-token ceiling"
+            )
         maximum_input_tokens = input_tokens * reservation.maximum_attempts
         cost = maximum_input_tokens * reservation.input_usd_per_million_tokens / 1_000_000
         return OperationEconomics(cost_usd=NumericMeasurement(value=cost, provenance="estimated"))
@@ -120,12 +131,18 @@ class TraceRAGRetriever:
         Raises:
             ValueError: Query embedding dimensions differ from the frozen index.
         """
+        if not self._has_eligible_transition(query):
+            return ()
         key_text = render_rag_key(
             task=query.task,
             initial_context=query.initial_context,
             action=query.action,
         )
-        query_vector = embed_rag_texts(self._embedder, (key_text,))[0]
+        query_vector = embed_rag_texts(
+            self._embedder,
+            (key_text,),
+            maximum_chunk_bytes=self._index.embedding_chunk_bytes,
+        )[0]
         if len(query_vector) != self._index.embedding_dimension:
             raise ValueError(
                 f"RAG query embedding has dimension {len(query_vector)}, expected "
@@ -143,6 +160,11 @@ class TraceRAGRetriever:
         candidates.sort(key=lambda match: (-match.score, match.transition.transition_id))
         limit = self._index.default_top_k if query.top_k is None else query.top_k
         return tuple(candidates[:limit])
+
+    def _has_eligible_transition(self, query: RAGQuery) -> bool:
+        """Check lineage eligibility before estimating or dispatching an embedding."""
+        excluded = set(query.excluded_lineage_ids)
+        return any(transition.lineage_id not in excluded for transition in self._transitions)
 
 
 def load_fit_rag_retriever(

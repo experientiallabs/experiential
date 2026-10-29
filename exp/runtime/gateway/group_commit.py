@@ -23,21 +23,30 @@ import logging
 import queue
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar, cast
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
-from exp.runtime.gateway.sqlite.migrations import connect_database
+from exp.runtime.gateway.model_chain_authority import ChainOperation, SQLiteChainPreflight
+from exp.runtime.gateway.native_settlement import (
+    tool_search_requests_kwarg,
+    upstream_provider_kwarg,
+    web_search_requests_kwarg,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -97,10 +106,34 @@ async def abandoned_write_outcome[R](write: asyncio.Task[R]) -> R | None:
 
 @dataclass(frozen=True)
 class _PendingWrite:
-    """One queued ledger operation and the future resolved after durable commit."""
+    """One queued ledger operation and the future resolved after durable commit.
+
+    Attributes:
+        prepare: Optional pretransaction context retaining proof handles through the write;
+            None applies the queued operation directly.
+    """
 
     apply: Callable[[sqlite3.Connection], object]
     future: concurrent.futures.Future[object]
+    prepare: (
+        Callable[
+            [sqlite3.Connection], AbstractContextManager[Callable[[sqlite3.Connection], object]]
+        ]
+        | None
+    ) = None
+
+
+@contextmanager
+def _prepared_chain_write(
+    core: SQLiteAttemptLedger,
+    connection: sqlite3.Connection,
+    authorization: AuthorizationSnapshot,
+    operation: ChainOperation,
+    apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
+) -> Iterator[Callable[[sqlite3.Connection], object]]:
+    """Own a queued operation's proof on the writer, including after caller cancellation."""
+    with core.prepare_chain_authority(authorization, operation, connection=connection) as proof:
+        yield lambda connection: apply(connection, proof)
 
 
 class GroupCommitAttemptLedger:
@@ -158,9 +191,15 @@ class GroupCommitAttemptLedger:
         Args:
             authorization: Frozen authority and request identity.
         """
-        await self._submit(
-            lambda connection: self.core.apply_accept_request(
-                connection, authorization=authorization
+        await asyncio.shield(
+            asyncio.wrap_future(
+                self._enqueue_chain(
+                    authorization,
+                    "accept",
+                    lambda connection, proof: self.core.apply_accept_request(
+                        connection, authorization=authorization, chain_preflight=proof
+                    ),
+                )
             )
         )
 
@@ -171,9 +210,14 @@ class GroupCommitAttemptLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably reserve budget and record one dispatch before provider work.
 
@@ -182,24 +226,41 @@ class GroupCommitAttemptLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
+            dispatch_reason: Optional policy-dispatch disclosure code.
+            preferred_deployment: The route's bypassed preferred rung, when divergent.
 
         Returns:
             Stable new attempt ID.
         """
-        return await self._submit(
-            lambda connection: self.core.apply_start_attempt(
-                connection,
-                snapshot=snapshot,
-                deployment=deployment,
-                attempt_ordinal=attempt_ordinal,
-                route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
-                route_reason=route_reason,
-                fallback_reason=fallback_reason,
-            )
+        return cast(
+            AttemptId,
+            await asyncio.shield(
+                asyncio.wrap_future(
+                    self._enqueue_chain(
+                        snapshot.authorization,
+                        "reserve",
+                        lambda connection, proof: self.core.apply_start_attempt(
+                            connection,
+                            chain_preflight=proof,
+                            snapshot=snapshot,
+                            deployment=deployment,
+                            attempt_ordinal=attempt_ordinal,
+                            route_depth=route_depth,
+                            maximum_cost_nano_usd=maximum_cost_nano_usd,
+                            reserved_input_tokens=reserved_input_tokens,
+                            reserved_output_tokens=reserved_output_tokens,
+                            route_reason=route_reason,
+                            fallback_reason=fallback_reason,
+                            dispatch_reason=dispatch_reason,
+                            preferred_deployment=preferred_deployment,
+                            **({} if service_tier is None else {"service_tier": service_tier}),
+                        ),
+                    )
+                )
+            ),
         )
 
     async def finish_attempt(
@@ -210,6 +271,15 @@ class GroupCommitAttemptLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -219,15 +289,36 @@ class GroupCommitAttemptLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from ``Retry-After``.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung named as serving.
+            web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         """
+        # The host's apply hook is the object this facade forwards to, so it is
+        # the one probed for the settle keywords; a hook that predates one gets
+        # none. Its signature is what is probed, so it is not trusted statically.
+        apply = cast("Callable[..., None]", self.core.apply_finish_attempt)
         await self._submit(
-            lambda connection: self.core.apply_finish_attempt(
+            lambda connection: apply(
                 connection,
                 attempt_id=attempt_id,
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
                 first_token_at=first_token_at,
+                retry_after_seconds=retry_after_seconds,
+                ratelimit_limit_requests=ratelimit_limit_requests,
+                ratelimit_remaining_requests=ratelimit_remaining_requests,
+                ratelimit_limit_tokens=ratelimit_limit_tokens,
+                ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                **({} if service_tier is None else {"service_tier": service_tier}),
+                **upstream_provider_kwarg(apply, upstream_provider),
+                **web_search_requests_kwarg(apply, web_search_requests),
+                **tool_search_requests_kwarg(apply, tool_search_requests),
             )
         )
 
@@ -236,18 +327,31 @@ class GroupCommitAttemptLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably terminalize accepted work that never reached dispatch.
+        certify_no_effects: bool = False,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Return the no-effects certificate only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted admission attestation; omitted callers cannot certify.
+            web_search_requests: Completed searches with no model attempt to own the meter.
         """
-        await self._submit(
+        return await self._submit(
             lambda connection: self.core.apply_finish_request(
-                connection, authorization=authorization, failure=failure
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
+                web_search_requests=web_search_requests,
             )
         )
+
+    @property
+    def stopped(self) -> bool:
+        """Return whether the actual writer exited, not just whether new submissions are closed."""
+        return not self._thread.is_alive()
 
     async def flush(self) -> None:
         """Resolve after every previously enqueued operation is durably committed."""
@@ -295,7 +399,21 @@ class GroupCommitAttemptLedger:
                         break
                     batch.append(extra)
                 try:
-                    self._commit_batch(connection, batch)
+                    with ExitStack() as preparations:
+                        ready: list[_PendingWrite] = []
+                        for pending in batch:
+                            try:
+                                apply = (
+                                    pending.apply
+                                    if pending.prepare is None
+                                    else preparations.enter_context(pending.prepare(connection))
+                                )
+                            except Exception as exc:  # noqa: BLE001 - isolate each preflight failure.
+                                _resolve_exception(pending.future, exc)
+                            else:
+                                ready.append(_PendingWrite(apply, pending.future))
+                        if ready:
+                            self._commit_batch(connection, ready)
                 except Exception as exc:  # noqa: BLE001 - blocked callers receive the failure.
                     _logger.exception("gateway ledger batch failed outside its own transaction")
                     for pending in batch:
@@ -310,6 +428,7 @@ class GroupCommitAttemptLedger:
                             )
         finally:
             connection.close()
+            self.core.classification_memo.clear()
             self._fail_pending()
 
     def _fail_pending(self) -> None:
@@ -417,7 +536,29 @@ class GroupCommitAttemptLedger:
         """
         return await asyncio.shield(asyncio.wrap_future(self._enqueue(apply)))
 
-    def _enqueue(self, apply: Callable[[sqlite3.Connection], _T]) -> concurrent.futures.Future[_T]:
+    def _enqueue_chain(
+        self,
+        authorization: AuthorizationSnapshot,
+        operation: ChainOperation,
+        apply: Callable[[sqlite3.Connection, SQLiteChainPreflight | None], object],
+    ) -> concurrent.futures.Future[object]:
+        """Queue classification before BEGIN without giving callers ownership of live handles."""
+        return self._enqueue(
+            lambda connection: apply(connection, None),
+            prepare=lambda connection: _prepared_chain_write(
+                self.core, connection, authorization, operation, apply
+            ),
+        )
+
+    def _enqueue(
+        self,
+        apply: Callable[[sqlite3.Connection], _T],
+        *,
+        prepare: Callable[
+            [sqlite3.Connection], AbstractContextManager[Callable[[sqlite3.Connection], object]]
+        ]
+        | None = None,
+    ) -> concurrent.futures.Future[_T]:
         """Queue one operation for the writer thread and return its commit future.
 
         Args:
@@ -437,6 +578,7 @@ class GroupCommitAttemptLedger:
                 _PendingWrite(
                     apply=apply,
                     future=cast("concurrent.futures.Future[object]", future),
+                    prepare=prepare,
                 )
             )
         return future
@@ -476,11 +618,13 @@ class SyncGroupCommitLedger:
         Args:
             authorization: Frozen authority and request identity.
         """
-        self._writer.submit_blocking(
-            lambda connection: self._writer.core.apply_accept_request(
-                connection, authorization=authorization
-            )
-        )
+        self._writer._enqueue_chain(
+            authorization,
+            "accept",
+            lambda connection, proof: self._writer.core.apply_accept_request(
+                connection, authorization=authorization, chain_preflight=proof
+            ),
+        ).result()
 
     def start_attempt(
         self,
@@ -489,9 +633,14 @@ class SyncGroupCommitLedger:
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably reserve budget and record one dispatch before provider work.
 
@@ -500,24 +649,37 @@ class SyncGroupCommitLedger:
             deployment: Exact deployment about to receive the request.
             attempt_ordinal: Zero-based physical dispatch position for this request.
             route_depth: Zero-based operational route position.
-            maximum_cost_micro_usd: Conservative charge reserved before dispatch.
+            maximum_cost_nano_usd: Conservative charge reserved before dispatch.
             route_reason: Optional learned-selection reason code.
             fallback_reason: Optional embedding or router fallback reason code.
+            dispatch_reason: Optional policy-dispatch disclosure code.
+            preferred_deployment: The route's bypassed preferred rung, when divergent.
 
         Returns:
             Stable new attempt ID.
         """
-        return self._writer.submit_blocking(
-            lambda connection: self._writer.core.apply_start_attempt(
-                connection,
-                snapshot=snapshot,
-                deployment=deployment,
-                attempt_ordinal=attempt_ordinal,
-                route_depth=route_depth,
-                maximum_cost_micro_usd=maximum_cost_micro_usd,
-                route_reason=route_reason,
-                fallback_reason=fallback_reason,
-            )
+        return cast(
+            AttemptId,
+            self._writer._enqueue_chain(
+                snapshot.authorization,
+                "reserve",
+                lambda connection, proof: self._writer.core.apply_start_attempt(
+                    connection,
+                    chain_preflight=proof,
+                    snapshot=snapshot,
+                    deployment=deployment,
+                    attempt_ordinal=attempt_ordinal,
+                    route_depth=route_depth,
+                    maximum_cost_nano_usd=maximum_cost_nano_usd,
+                    reserved_input_tokens=reserved_input_tokens,
+                    reserved_output_tokens=reserved_output_tokens,
+                    route_reason=route_reason,
+                    fallback_reason=fallback_reason,
+                    dispatch_reason=dispatch_reason,
+                    preferred_deployment=preferred_deployment,
+                    **({} if service_tier is None else {"service_tier": service_tier}),
+                ),
+            ).result(),
         )
 
     def finish_attempt(
@@ -528,6 +690,15 @@ class SyncGroupCommitLedger:
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
         """Durably settle one attempt with normalized content-free fields.
 
@@ -537,15 +708,34 @@ class SyncGroupCommitLedger:
             failure: Sanitized failure when no successful terminal event exists.
             finalize_request: Whether this attempt is the final route for its parent request.
             first_token_at: Wall-clock time the attempt streamed its first token, or ``None``.
+            retry_after_seconds: Provider-stated wait from ``Retry-After``.
+            ratelimit_limit_requests: Provider-stated request-rate ceiling.
+            ratelimit_remaining_requests: Provider-stated requests remaining.
+            ratelimit_limit_tokens: Provider-stated token-rate ceiling.
+            ratelimit_remaining_tokens: Provider-stated tokens remaining.
+            upstream_provider: The upstream an aggregator rung named as serving.
+            web_search_requests: Gateway-executed web searches billed to the attempt.
+            tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         """
+        # Same probe as the async facade: the host hook decides the keywords.
+        apply = cast("Callable[..., None]", self._writer.core.apply_finish_attempt)
         self._writer.submit_blocking(
-            lambda connection: self._writer.core.apply_finish_attempt(
+            lambda connection: apply(
                 connection,
                 attempt_id=attempt_id,
                 terminal_event=terminal_event,
                 failure=failure,
                 finalize_request=finalize_request,
                 first_token_at=first_token_at,
+                retry_after_seconds=retry_after_seconds,
+                ratelimit_limit_requests=ratelimit_limit_requests,
+                ratelimit_remaining_requests=ratelimit_remaining_requests,
+                ratelimit_limit_tokens=ratelimit_limit_tokens,
+                ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+                **({} if service_tier is None else {"service_tier": service_tier}),
+                **upstream_provider_kwarg(apply, upstream_provider),
+                **web_search_requests_kwarg(apply, web_search_requests),
+                **tool_search_requests_kwarg(apply, tool_search_requests),
             )
         )
 
@@ -554,16 +744,24 @@ class SyncGroupCommitLedger:
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably terminalize accepted work that never reached dispatch.
+        certify_no_effects: bool = False,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Return the no-effects certificate only after the terminal write commits.
 
         Args:
             authorization: Frozen authority identifying the accepted request.
             failure: Sanitized pre-dispatch terminal failure.
+            certify_no_effects: Trusted admission attestation; omitted callers cannot certify.
+            web_search_requests: Completed searches with no model attempt to own the meter.
         """
-        self._writer.submit_blocking(
+        return self._writer.submit_blocking(
             lambda connection: self._writer.core.apply_finish_request(
-                connection, authorization=authorization, failure=failure
+                connection,
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
+                web_search_requests=web_search_requests,
             )
         )
 

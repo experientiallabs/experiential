@@ -23,12 +23,10 @@ from exp.common.models import (
     ReasoningEffort,
     SFTModelProvenance,
     load_model_catalog,
+    normalize_gateway_catalog,
     write_model_catalog,
 )
-from exp.common.models.catalog import (
-    SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION,
-    infer_azure_api_surface,
-)
+from exp.common.models.catalog import SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
 
 
 def _catalog() -> ModelCatalog:
@@ -130,7 +128,8 @@ model = "candidate"
         encoding="utf-8",
     )
     migrated = load_model_catalog(legacy)
-    assert migrated.schema_version == 2
+    # v1 -> v2 (billing source) -> v3 (nano-USD) in one load.
+    assert migrated.schema_version == 3
     assert migrated.models["candidate"].billing_source == BillingSource.CUSTOMER_MANAGED
 
     current = tmp_path / "current.toml"
@@ -147,7 +146,7 @@ def test_legacy_catalog_rejects_current_billing_source_injection(tmp_path: Path)
     path = tmp_path / "injected-v1.toml"
     write_model_catalog(path, _catalog())
     path.write_text(
-        path.read_text(encoding="utf-8").replace("schema_version = 2", "schema_version = 1"),
+        path.read_text(encoding="utf-8").replace("schema_version = 3", "schema_version = 1"),
         encoding="utf-8",
     )
 
@@ -165,7 +164,7 @@ def test_legacy_catalog_rejects_noninteger_schema_one_lookalikes(
     write_model_catalog(path, _catalog())
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            "schema_version = 2", f"schema_version = {schema_version}"
+            "schema_version = 3", f"schema_version = {schema_version}"
         ),
         encoding="utf-8",
     )
@@ -195,6 +194,7 @@ def test_authored_schema_version_window_and_shape_are_pinned() -> None:
             ModelCatalog.model_validate({**authored, "schema_version": rejected})
     assert sorted(ModelCatalog.model_fields) == [
         "connections",
+        "gateway_model_chains",
         "gateway_pools",
         "models",
         "roles",
@@ -240,7 +240,7 @@ def test_legacy_catalog_recursively_migrates_sft_base_model_billing(tmp_path: Pa
     current_text = path.read_text(encoding="utf-8")
     legacy_text = "\n".join(
         line for line in current_text.splitlines() if not line.startswith("billing_source =")
-    ).replace("schema_version = 2", "schema_version = 1")
+    ).replace("schema_version = 3", "schema_version = 1")
     path.write_text(legacy_text, encoding="utf-8")
 
     migrated = load_model_catalog(path)
@@ -289,7 +289,7 @@ def test_legacy_catalog_rejects_nested_sft_billing_source_injection(tmp_path: Pa
         ),
     )
     current_text = path.read_text(encoding="utf-8")
-    legacy_text = current_text.replace("schema_version = 2", "schema_version = 1")
+    legacy_text = current_text.replace("schema_version = 3", "schema_version = 1")
     legacy_text = legacy_text.replace('billing_source = "host_managed"\n', "", 1)
     path.write_text(legacy_text, encoding="utf-8")
 
@@ -334,7 +334,7 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
                         reasoning_effort_required=True,
                     ),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=1_250_000,
+                        input_nano_usd_per_million_tokens=1_250_000,
                     ),
                     pricing_source="operator",
                 ),
@@ -354,7 +354,7 @@ def test_gateway_metadata_is_deployment_local_and_secret_free(tmp_path: Path) ->
         "high",
         "max",
     )
-    assert "input_micro_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
+    assert "input_nano_usd_per_million_tokens = 1250000" in path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -511,15 +511,63 @@ def test_native_provider_rejects_a_custom_endpoint_that_could_receive_its_key(
         )
 
 
-def test_azure_surface_inference_follows_the_resource_host() -> None:
-    """Foundry hosts serve model inference, Azure OpenAI hosts serve deployments."""
-    assert infer_azure_api_surface("https://resource.openai.azure.com") == "openai_deployments"
-    assert (
-        infer_azure_api_surface("https://Resource.Services.AI.Azure.com/models")
-        == "model_inference"
+def test_trusted_custom_origin_allows_a_native_dialect_custom_endpoint() -> None:
+    """An explicit trusted origin routes a native provider through a custom base_url.
+
+    A reseller that speaks the Anthropic Messages API serves claude-* in the
+    native dialect when the caller opts in; the fixed-origin guard stays on for
+    every case that does not set the flag.
+    """
+    connection = ConnectionConfig(
+        provider="anthropic",
+        base_url="https://reseller.example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+        trusted_custom_origin=True,
     )
-    assert infer_azure_api_surface("https://resource.inference.ai.azure.com") == "model_inference"
-    assert infer_azure_api_surface("https://gateway.example.test/tenant-a") is None
+    assert connection.base_url == "https://reseller.example.test/v1"
+    assert connection.trusted_custom_origin is True
+
+
+def test_trusted_custom_origin_requires_a_base_url_and_a_native_provider() -> None:
+    """The opt-in is meaningless without a custom origin, and only for native providers."""
+    with pytest.raises(ValueError, match="requires an explicit base_url"):
+        ConnectionConfig(provider="anthropic", trusted_custom_origin=True)
+    with pytest.raises(ValueError, match="only to a native provider"):
+        ConnectionConfig(
+            provider="openai-compatible",
+            base_url="https://reseller.example.test/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+    with pytest.raises(ValueError, match="requires an https base_url"):
+        ConnectionConfig(
+            provider="anthropic",
+            base_url="http://reseller.example.test/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+
+
+def test_tenant_origin_requires_https_and_moves_identity_only_when_set() -> None:
+    """A tenant origin names an explicit https endpoint and is its own dispatch identity."""
+    plain = ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://tenant.example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+    )
+    tenant = plain.model_copy(update={"tenant_origin": True})
+    assert ConnectionConfig.model_validate(tenant.model_dump()).tenant_origin is True
+    assert tenant.identity_sha256() != plain.identity_sha256()
+    assert "tenant_origin" not in plain.model_dump()
+    assert tenant.model_dump()["tenant_origin"] is True
+    for base_url in (None, "http://tenant.example.test/v1"):
+        with pytest.raises(ValueError, match="tenant_origin requires an explicit https base_url"):
+            ConnectionConfig(
+                provider="openai-compatible",
+                base_url=base_url,
+                api_key_env="FIXTURE_API_KEY",
+                tenant_origin=True,
+            )
 
 
 def test_undeclared_foundry_endpoint_keeps_its_stored_identity() -> None:
@@ -764,3 +812,290 @@ def test_declared_foundry_endpoint_spellings_keep_their_stored_identity() -> Non
 
     assert root.identity_sha256() == with_models.identity_sha256()
     assert root.identity_sha256() != with_v1_root.identity_sha256()
+
+
+def test_astra_responses_capability_slots_default_off() -> None:
+    """The three GPT-6 Astra Responses capability slots exist and default off.
+
+    These are declaration slots for async function calling, mid-turn steering,
+    and mid-conversation reasoning-effort updates. They default False (no
+    deployment advertises a behavior the decoder/turn lifecycle does not yet
+    honor) and, being defaulted, stay identity-invisible (see
+    gateway_catalog_test's identity-digest pin). The platform's
+    generation-capability vocabulary is drift-locked to these field names, so
+    they must remain present for that projection to admit the keys.
+    """
+    caps = GatewayDeploymentCapabilities()
+    assert caps.supports_async_tools is False
+    assert caps.supports_mid_turn_steering is False
+    assert caps.supports_reasoning_effort_update is False
+    # Defaulted addition contributes zero identity bytes.
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+
+def test_minimum_output_tokens_is_a_defaulted_positive_lane_fact() -> None:
+    """The provider output floor defaults off (identity-invisible, no schema
+    bump), is declared per deployment, and must be a positive count."""
+    caps = GatewayDeploymentCapabilities()
+    assert caps.minimum_output_tokens is None
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+    assert GatewayDeploymentCapabilities(minimum_output_tokens=16).minimum_output_tokens == 16
+    with pytest.raises(ValidationError):
+        GatewayDeploymentCapabilities(minimum_output_tokens=0)
+
+
+def test_for_service_tier_reprices_whole_request_for_flex_and_priority() -> None:
+    """A requested flex/priority card replaces the base schedule whole-request;
+    other tiers (and no card) leave the base schedule unchanged."""
+    from exp.common.models.catalog import GatewayServiceTierPrices, GatewayTokenPrices
+
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000,
+        cached_input_nano_usd_per_million_tokens=100_000,
+        output_nano_usd_per_million_tokens=4_000_000,
+        reasoning_nano_usd_per_million_tokens=4_000_000,
+        flex=GatewayServiceTierPrices(
+            input_nano_usd_per_million_tokens=500_000,
+            output_nano_usd_per_million_tokens=2_000_000,
+        ),
+        priority=GatewayServiceTierPrices(
+            input_nano_usd_per_million_tokens=2_000_000,
+            output_nano_usd_per_million_tokens=8_000_000,
+        ),
+    )
+
+    flex = prices.for_service_tier("flex")
+    assert flex.input_nano_usd_per_million_tokens == 500_000
+    assert flex.output_nano_usd_per_million_tokens == 2_000_000
+    # A dimension absent on the card stays honestly unpriced, never the base.
+    assert flex.cached_input_nano_usd_per_million_tokens is None
+    assert flex.long_context is None
+
+    priority = prices.for_service_tier("priority")
+    assert priority.input_nano_usd_per_million_tokens == 2_000_000
+    assert priority.output_nano_usd_per_million_tokens == 8_000_000
+
+    # default/auto/None and an unpriced tier carry no override.
+    assert prices.for_service_tier("default") is prices
+    assert prices.for_service_tier("auto") is prices
+    assert prices.for_service_tier(None) is prices
+    no_card = GatewayTokenPrices(input_nano_usd_per_million_tokens=1)
+    assert no_card.for_service_tier("flex") is no_card
+
+
+def test_price_rates_are_bounded_so_a_nano_usd_attempt_always_fits_int8() -> None:
+    """Every rate is integer nano-USD per million tokens, bounded at
+    ``MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS`` ($1,000 per million tokens,
+    above every published price) on the base schedule, every service-tier
+    card, and every long-context tier, so no authored catalog can produce an
+    attempt cost the int8 ledger column cannot hold."""
+    import pytest
+    from pydantic import ValidationError
+
+    from exp.common.models.catalog import (
+        MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
+        GatewayLongContextTier,
+        GatewayServiceTierPrices,
+        GatewayTokenPrices,
+    )
+
+    assert MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS == 1_000_000_000_000
+    bound = MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+    at_bound = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=bound,
+        cached_input_nano_usd_per_million_tokens=bound,
+        output_nano_usd_per_million_tokens=bound,
+        reasoning_nano_usd_per_million_tokens=bound,
+        flex=GatewayServiceTierPrices(output_nano_usd_per_million_tokens=bound),
+        long_context=GatewayLongContextTier(
+            input_threshold_tokens=200_000, input_nano_usd_per_million_tokens=bound
+        ),
+    )
+    assert at_bound.input_nano_usd_per_million_tokens == bound
+    for field in (
+        "input_nano_usd_per_million_tokens",
+        "cached_input_nano_usd_per_million_tokens",
+        "output_nano_usd_per_million_tokens",
+        "reasoning_nano_usd_per_million_tokens",
+    ):
+        with pytest.raises(ValidationError):
+            GatewayTokenPrices.model_validate({field: bound + 1})
+        with pytest.raises(ValidationError):
+            GatewayServiceTierPrices.model_validate({field: bound + 1})
+        with pytest.raises(ValidationError):
+            GatewayLongContextTier.model_validate(
+                {"input_threshold_tokens": 200_000, field: bound + 1}
+            )
+    assert not any("micro" in name for name in GatewayTokenPrices.model_fields)
+
+
+def test_schema_2_toml_catalog_upgrades_its_micro_usd_prices_on_load(tmp_path: Path) -> None:
+    """A ``models.toml`` authored by the micro-USD build loads with every price
+    renamed and x1000, restamped schema 3, and is written back as schema 3."""
+    path = tmp_path / "models.toml"
+    path.write_text(
+        """
+schema_version = 2
+
+[connections.provider]
+provider = "openai"
+
+[models.candidate]
+connection = "provider"
+model = "candidate"
+billing_source = "customer_managed"
+
+[models.candidate.gateway.prices]
+input_micro_usd_per_million_tokens = 1250000
+output_micro_usd_per_million_tokens = 10000000
+""".strip(),
+        encoding="utf-8",
+    )
+    loaded = load_model_catalog(path)
+    assert loaded.schema_version == 3
+    gateway = loaded.models["candidate"].gateway
+    assert gateway is not None
+    prices = gateway.prices
+    assert prices.input_nano_usd_per_million_tokens == 1_250_000_000
+    assert prices.output_nano_usd_per_million_tokens == 10_000_000_000
+    write_model_catalog(path, loaded)
+    text = path.read_text(encoding="utf-8")
+    assert "schema_version = 3" in text
+    assert "input_nano_usd_per_million_tokens = 1250000000" in text
+    assert "micro" not in text
+    # A schema-3 file still carrying a micro key is refused, never coerced.
+    path.write_text(text.replace("input_nano_usd", "input_micro_usd"), encoding="utf-8")
+    with pytest.raises(ModelCatalogError, match="micro-USD price key"):
+        load_model_catalog(path)
+
+
+def test_schema_drift_disclosure_slots_default_off() -> None:
+    """The five schema-drift disclosure slots exist and default off.
+
+    False means the capability is not declared. Defaulted fields stay
+    identity-invisible, so the pinned catalog digest does not move.
+    """
+    caps = GatewayDeploymentCapabilities()
+    assert caps.supports_prompt_cache_boundaries is False
+    assert caps.supports_custom_tools is False
+    assert caps.supports_grammar_tools is False
+    assert caps.supports_tool_call_limit is False
+    assert caps.reports_model_status is False
+    assert caps.reports_reasoning_tokens is False
+    assert caps.model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+
+
+def test_grammar_tools_require_custom_tools() -> None:
+    """Grammar-tool support cannot be declared without custom-tool support."""
+    with pytest.raises(ValueError, match="requires supports_custom_tools=true"):
+        GatewayDeploymentCapabilities(supports_grammar_tools=True)
+
+
+def test_custom_and_grammar_tools_can_be_declared_together() -> None:
+    """Grammar-tool support is accepted when custom-tool support is also declared."""
+    caps = GatewayDeploymentCapabilities(
+        supports_custom_tools=True,
+        supports_grammar_tools=True,
+    )
+    assert caps.supports_custom_tools is True
+    assert caps.supports_grammar_tools is True
+
+
+def test_anthropic_inference_geography_round_trip_and_identity(tmp_path: Path) -> None:
+    """Geography is durable connection identity; absent settings preserve canonical bytes."""
+    plain = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+    us = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY", inference_geo="us")
+    assert "inference_geo" not in plain.model_dump()
+    assert us.identity_sha256() != plain.identity_sha256()
+    catalog = ModelCatalog(
+        connections={"anthropic": us},
+        models={
+            "claude": ModelRecord(
+                connection="anthropic",
+                model="claude-sonnet-4-6",
+                billing_source=BillingSource.HOST_MANAGED,
+            )
+        },
+    )
+    path = tmp_path / "regional.toml"
+    write_model_catalog(path, catalog)
+    assert load_model_catalog(path) == catalog
+    with pytest.raises(ValidationError, match="inference_geo"):
+        ConnectionConfig(provider="openai", inference_geo="us")
+    with pytest.raises(ValidationError, match="inference_geo"):
+        ConnectionConfig.model_validate({"provider": "anthropic", "inference_geo": "global"})
+
+
+def test_plan_connections_bind_each_kind_to_its_one_provider() -> None:
+    """A ChatGPT plan is an openai sign-in and a Claude plan an anthropic one, and nothing else."""
+    assert ConnectionConfig(provider="openai", subscription="chatgpt").subscription == "chatgpt"
+    assert (
+        ConnectionConfig(provider="anthropic", subscription="anthropic").subscription == "anthropic"
+    )
+    with pytest.raises(ValueError, match="sign-in for provider 'anthropic'"):
+        ConnectionConfig(provider="openai", subscription="anthropic")
+    with pytest.raises(ValueError, match="omit api_key_env"):
+        ConnectionConfig(provider="openai", subscription="chatgpt", api_key_env="OPENAI_API_KEY")
+    with pytest.raises(ValueError, match="omit base_url"):
+        ConnectionConfig(
+            provider="anthropic",
+            subscription="anthropic",
+            base_url="https://example.com/v1",
+            trusted_custom_origin=True,
+        )
+    # The plan client never sends inference_geo, so a residency constraint is refused, not dropped.
+    with pytest.raises(ValueError, match="inference_geo"):
+        ConnectionConfig(provider="anthropic", subscription="anthropic", inference_geo="us")
+
+
+def test_plan_identity_differs_from_the_api_key_origin_and_serializes_only_when_set() -> None:
+    """A plan is a different endpoint identity; API-key connections keep their exact bytes."""
+    plan = ConnectionConfig(provider="anthropic", subscription="anthropic")
+    key = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+
+    assert plan.identity_sha256() != key.identity_sha256()
+    assert "subscription" not in key.model_dump(mode="json")
+    assert plan.model_dump(mode="json")["subscription"] == "anthropic"
+    assert ConnectionConfig.model_validate(plan.model_dump(mode="json")) == plan
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        None,
+        GatewayTokenPrices(),
+        GatewayTokenPrices(input_nano_usd_per_million_tokens=1_000_000_000),
+    ],
+)
+def test_authored_price_presence_survives_json_and_toml(
+    card: GatewayTokenPrices | None, tmp_path: Path
+) -> None:
+    """Capability metadata and an explicitly unknown price card stay distinct on reload."""
+    catalog = _catalog()
+    metadata = (
+        GatewayDeploymentMetadata() if card is None else GatewayDeploymentMetadata(prices=card)
+    )
+    record = catalog.models["candidate-economy"].model_copy(update={"gateway": metadata})
+    catalog = catalog.model_copy(update={"models": {"candidate-economy": record}})
+    snapshot = normalize_gateway_catalog(catalog)
+    path = tmp_path / "models.toml"
+    write_model_catalog(path, catalog)
+    restored = (
+        ModelCatalog.model_validate_json(catalog.model_dump_json()),
+        load_model_catalog(path),
+    )
+    for loaded in restored:
+        assert loaded.models["candidate-economy"].token_prices == card
+        assert normalize_gateway_catalog(loaded).model_dump() == snapshot.model_dump()
+    assert record.token_prices == card
+
+
+def test_capability_only_metadata_differs_from_an_authored_unknown_card() -> None:
+    """Catalog equality must not discard an intended change in pricing authority."""
+    record = _catalog().models["candidate-economy"]
+    absent = record.model_copy(update={"gateway": GatewayDeploymentMetadata()})
+    unknown = record.model_copy(
+        update={"gateway": GatewayDeploymentMetadata(prices=GatewayTokenPrices())}
+    )
+    assert absent.gateway == unknown.gateway
+    assert absent != unknown

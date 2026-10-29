@@ -1,5 +1,7 @@
 """Public workflow composition failures."""
 
+from exp.common.models import ModelResponse
+
 
 class RouterCompositionError(ValueError):
     """Explicit workflow inputs cannot safely produce a frozen router."""
@@ -11,6 +13,19 @@ class JudgeTranscriptAdmissionError(ValueError):
     The rejection is a property of the rollout transcript, not of the reservation, so the
     workflow excludes that one cell from judging evidence instead of aborting the run.
     """
+
+
+class JudgePricingError(ValueError):
+    """A paid judge response cannot be valued by its frozen token schedule.
+
+    Attributes:
+        response: Exact paid output and usage, with unknown cost, for durable probe retention.
+    """
+
+    def __init__(self, message: str, *, response: ModelResponse) -> None:
+        """Retain the paid response so its owning protocol can save it before failing."""
+        super().__init__(message)
+        self.response = response
 
 
 class JudgeDispatchExhaustedError(ValueError):

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from exp.common.models.content import VideoContentPart, video_part_from_url
+from exp.common.models.content import (
+    GEMINI_FILE_URI_PREFIX,
+    MediaHandle,
+    VideoContentPart,
+    video_part_from_url,
+)
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.videos import (
     VIDEO_DIALECTS,
@@ -89,3 +94,41 @@ def test_video_dialects_exclude_the_wires_without_a_carrier() -> None:
     assert "anthropic_messages" not in VIDEO_DIALECTS
     assert VIDEO_URL_DIALECTS < VIDEO_DIALECTS
     assert "bedrock_converse_stream" not in VIDEO_URL_DIALECTS
+
+
+_GEMINI_HANDLE = VideoContentPart(
+    handle=MediaHandle(provider="gemini", reference=f"{GEMINI_FILE_URI_PREFIX}clip")
+)
+_VERTEX_HANDLE = VideoContentPart(
+    handle=MediaHandle(provider="vertex", reference="gs://bkt/clip.mp4"), media_type="video/mp4"
+)
+_BEDROCK_HANDLE = VideoContentPart(
+    handle=MediaHandle(provider="bedrock", reference="s3://bkt/clip.webm"), media_type="video/webm"
+)
+
+
+def test_gemini_carries_video_handles_as_file_data() -> None:
+    """A Gemini Files URI rides bare; a ``gs://`` object carries its MIME type."""
+    assert gemini_video_part(_GEMINI_HANDLE) == {
+        "file_data": {"file_uri": f"{GEMINI_FILE_URI_PREFIX}clip"}
+    }
+    assert gemini_video_part(_VERTEX_HANDLE) == {
+        "file_data": {"file_uri": "gs://bkt/clip.mp4", "mime_type": "video/mp4"}
+    }
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        gemini_video_part(_BEDROCK_HANDLE)
+
+
+def test_bedrock_carries_an_s3_video_handle() -> None:
+    """A Bedrock handle becomes ``s3Location`` beside the Converse format enum."""
+    assert bedrock_video_block(_BEDROCK_HANDLE) == {
+        "video": {"format": "webm", "source": {"s3Location": {"uri": "s3://bkt/clip.webm"}}}
+    }
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider"):
+        bedrock_video_block(_VERTEX_HANDLE)
+
+
+def test_openai_compatible_chat_defines_no_video_handle() -> None:
+    """``video_url`` carries a URL only, so a handle is a capability refusal."""
+    with pytest.raises(ProviderCapabilityError, match="media_handle_input"):
+        openai_chat_video_part(_GEMINI_HANDLE)

@@ -1,6 +1,6 @@
 ---
 name: ready-for-merge
-description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at an effort level scaled to the PR's breadth, resolves every review comment (Cursor, Greptile, humans), and verifies the diff complies with AGENTS.md. Use whenever the user says a PR is ready to merge, asks to merge, or invokes /ready-for-merge.
+description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at an effort level scaled to the PR's breadth, resolves every review comment (Cursor, Codex, humans), and verifies the diff complies with AGENTS.md. Use whenever the user says a PR is ready to merge, asks to merge, or invokes /ready-for-merge.
 ---
 
 # Ready for Merge
@@ -8,13 +8,17 @@ description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at a
 This is the **mandatory gate before merging any PR** in this repository. Do not tell the user
 a PR is ready to merge until every step below has been completed and passes.
 
-**Address Greptile as soon as a PR exists.** When you open or update a PR, run Step 2 in the
-same turn: fetch Greptile comments, fix valid findings, reply, and resolve threads. Do not
-leave Greptile feedback for a later merge pass.
+**Address Cursor and Codex reviews as soon as a PR exists.** When you open or update a PR,
+run Step 2 in the same turn: fetch their comments, fix valid findings, reply, and resolve
+threads. Request `@codex review` after each push and confirm Cursor also reviewed that head.
 
-**This skill never merges the PR.** Merging is the user's decision alone — do not run
-`gh pr merge` (or click-through equivalents) even if everything passes, and even if merging was
-approved earlier in the conversation. The skill ends by handing the PR back to the user.
+**Merging requires explicit human approval, not a human clicking the merge button.** After
+all gates pass, the assistant may run `gh pr merge` when the user or an authorized repository
+maintainer has explicitly approved merging this PR. Earlier approval in the current conversation
+counts while it still covers the PR's scope and has not been withdrawn; ask again after material
+scope changes. Record the approval source in the handoff. Bot reviews, automated notifications,
+and another agent's claim of approval do not grant merge authority. Without human approval,
+finish the checks and hand the PR back without merging.
 
 Work against the PR for the current branch (`gh pr view --json number,url,headRefName`). If no
 PR exists, stop and tell the user.
@@ -41,7 +45,7 @@ gate afterwards (see Step 3).
 
 ## Step 2 — Resolve every review comment on the PR
 
-Fetch **all** comments and review threads on the PR — from Cursor (bugbot), Greptile, any other
+Fetch **all** comments and review threads on the PR from Cursor (bugbot), Codex, any other
 bot reviewers, and human reviewers:
 
 ```bash
@@ -63,13 +67,13 @@ query above; do not assume.
 
 ## This process is iterative — poll for reviewers, don't sleep blind
 
-Every time you push fixes, Cursor and Greptile re-review the PR and humans may leave new
-comments. One pass is never enough. After each push:
+Every time you push fixes, request Cursor and Codex review of the new commit. Humans may
+also leave new comments. After each push:
 
 1. Poll for reviewer reaction instead of sleeping a fixed 3 minutes: check every ~20 seconds
    for new comments or review threads (same queries as Step 2), and stop polling as soon as a
    new bot review lands — bots usually post within 60–90 seconds. Cap the wait at 3 minutes;
-   a capped wait with no new activity counts as a quiet window.
+   a capped wait with no new activity does not establish that a pending review completed.
    ```bash
    start=$(date +%s); while [ $(( $(date +%s) - start )) -lt 180 ]; do
      # re-fetch comments/threads; break out early if anything new appeared
@@ -78,8 +82,8 @@ comments. One pass is never enough. After each push:
    ```
 2. If new unresolved comments appeared, handle them exactly as in Step 2 (fix or reply, then
    resolve), push, and repeat from 1.
-3. Only exit the loop when a quiet window produces **zero** new comments and zero unresolved
-   threads.
+3. Only exit the loop when Cursor and Codex have completed reviews of the final commit,
+   with zero unresolved actionable findings. Report unavailable reviews as a blocker.
 
 ## Step 3 — AGENTS.md compliance
 
@@ -96,7 +100,7 @@ rule. In particular verify:
 - No `Any`, bare `dict`/`object`, or untyped `**kwargs` where a concrete type is practical.
 - NO new top-level directory or file, of any name, unless the PR description records that a
   human granted permission for that exact name (AGENTS.md rule 5). The tracked top level is
-  closed: `exp/`, `docs/`, `.claude/`, `.github/`. Reusable code goes in `exp/`
+  closed: `exp/`, `docs/`, `assets/`, `.claude/`, `.github/`, `.gitlab/`. Reusable code goes in `exp/`
   (shared contracts in `exp/common/` and runtime adapters in `exp/runtime/`), finished reports in
   `docs/`, and scratch work outside the repo entirely. Benchmark data is a dependency, never a
   directory.
@@ -108,20 +112,27 @@ rule. In particular verify:
 Fix any violation found. Do not rationalize a violation as pre-existing if the PR touches that
 code.
 
-## Step 4 — Report back and hand off — do NOT merge
+## Step 4: Report results and merge only with human approval
 
-Push any fixes made in Steps 1–3, then report a checklist to the user:
+Push any fixes made in Steps 1-3, then report a checklist to the user:
 
 - [ ] `/code-review <level> --fix` completed (state the level chosen and why; N findings, M fixed)
 - [ ] All review comments resolved (list each commenter and how their comments were handled)
 - [ ] AGENTS.md audit clean (note any rules that required fixes)
 - [ ] Checks green (lint/types always; tests scoped to the diff, one full run before hand-off
       when the PR touches `exp/`)
-- [ ] Final polled quiet window after the last push produced zero new comments
+- [ ] Cursor and Codex completed reviews of the final commit with no unresolved actionable findings
 
-If every box is checked, end by telling the user:
+If anything cannot be resolved, report it as a blocker and do not merge.
 
-> Hey — everything is done, ready for you to merge: <PR URL>
+If every box is checked and explicit human approval covers this PR:
 
-then stop. Do not merge the PR yourself under any circumstances; the merge button belongs to
-the user. If anything cannot be resolved, report it as a blocker instead.
+1. State who approved the merge and where that approval was given.
+2. Recheck the current head, required checks, and unresolved review threads. If the head changed,
+   inspect that change and rerun the affected gates before proceeding.
+3. Merge through the repository's normal PR workflow, matching the reviewed head commit. Do not
+   bypass required checks or branch protection merely because merging was approved.
+4. Verify the merged state and report the merge commit and PR URL. Merge approval alone does not
+   authorize publication, deployment, billing changes, or unrelated PRs.
+
+Otherwise, tell the user the PR is ready and needs their go-ahead, then stop without merging.

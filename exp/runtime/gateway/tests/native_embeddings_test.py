@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import signal
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests.native_messages_test import (
     _DRIVER_SOURCE,
     _HOST,
@@ -107,7 +109,9 @@ class _EmbeddingsUpstream(BaseHTTPRequestHandler):
             data.append({"object": "embedding", "index": position, "embedding": embedding})
         if selector == "short-count":
             data.pop()
-        prompt_tokens = sum(len(text.split()) for text in inputs)
+        prompt_tokens = sum(
+            len(item.split()) if isinstance(item, str) else len(item) for item in inputs
+        )
         body: JsonObject = {"object": "list", "data": data, "model": payload["model"]}
         if selector != "unbilled":
             body["usage"] = {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}
@@ -143,7 +147,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         revision=None,
         capabilities=ModelCapabilities(supports_embeddings=True),
         gateway_capabilities=GatewayDeploymentCapabilities(),
-        prices=GatewayTokenPrices(input_micro_usd_per_million_tokens=20_000),
+        prices=GatewayTokenPrices(input_nano_usd_per_million_tokens=20_000),
         pricing_source=None,
         replace=False,
     )
@@ -274,6 +278,60 @@ def test_official_client_round_trips_base64_vectors_and_settles(engine: _Serving
     assert _total(engine.base, "output_tokens") == output_before
 
 
+@pytest.mark.parametrize("inputs", [[0, 42, 100257], [[1, 2], [3]]])
+def test_official_client_token_arrays_cross_native_serving(
+    engine: _ServingEngine, inputs: list[int] | list[list[int]]
+) -> None:
+    """Single and batched IDs retain their values, vector count, and input-only settlement."""
+    input_before = _total(engine.base, "input_tokens")
+    output_before = _total(engine.base, "output_tokens")
+    completed_before = _terminal_attempts(engine.base, "completed")
+    count = 1 if isinstance(inputs[0], int) else len(inputs)
+    batch = [inputs] if isinstance(inputs[0], int) else inputs
+    with openai.OpenAI(
+        base_url=f"{engine.base}/v1", api_key=engine.raw_key, max_retries=0
+    ) as client:
+        response = client.embeddings.create(
+            model="embedder", input=inputs, extra_body={"stream": False}
+        )
+    assert [item.index for item in response.data] == list(range(count))
+    assert [item.embedding for item in response.data] == [_vector(i) for i in range(count)]
+    assert response.usage.prompt_tokens == response.usage.total_tokens == 3
+    assert _last_upstream_payload() == {
+        "model": "embedder-model-exact",
+        "input": batch,
+        "encoding_format": "base64",
+    }
+    assert _terminal_attempts(engine.base, "completed") == completed_before + 1
+    assert _total(engine.base, "input_tokens") == input_before + 3
+    assert _total(engine.base, "output_tokens") == output_before
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"input": [True]},
+        {"input": [1.0]},
+        {"input": [[1], []]},
+        {"input": ["x", [1]]},
+        {"stream": True},
+        {"stream": 0},
+        {"temperature": 0},
+    ],
+)
+def test_invalid_token_or_stream_requests_never_dispatch(
+    engine: _ServingEngine, patch: JsonObject
+) -> None:
+    """The real native route refuses malformed inputs before provider work or acceptance."""
+    payloads_before = len(_EmbeddingsUpstream.payloads)
+    requests_before = _total(engine.base, "requests")
+    response = _post(engine, {"model": "embedder", "input": "hello", **patch})
+    assert response.status_code == 400
+    assert response.json()["error"]["param"]
+    assert len(_EmbeddingsUpstream.payloads) == payloads_before
+    assert _total(engine.base, "requests") == requests_before
+
+
 def test_raw_float_request_forwards_every_field_and_ignores_idempotency_key(
     engine: _ServingEngine,
 ) -> None:
@@ -361,10 +419,36 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
     engine: _ServingEngine, selector: str, expected_fragment: str
 ) -> None:
     """A vector-count mismatch, a missing prompt_tokens, or a 5xx never reaches the caller."""
-    failed_before = _terminal_attempts(engine.base, "failed")
-    response = _post(engine, {"model": "embedder", "input": [selector, "second"]})
+    inputs = [selector, "second"]
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        (request_watermark,) = connection.execute(
+            "SELECT coalesce(max(rowid), 0) FROM gateway_requests"
+        ).fetchone()
+    with _EmbeddingsUpstream.payloads_lock:
+        posts_before = sum(
+            payload.get("input") == inputs for payload in _EmbeddingsUpstream.payloads
+        )
+    response = _post(engine, {"model": "embedder", "input": inputs})
     assert response.status_code == 502, response.text
     error = response.json()["error"]
     assert error["code"] == "all_routes_failed"
     assert expected_fragment in error["message"]
-    assert _terminal_attempts(engine.base, "failed") == failed_before + 1
+    with _EmbeddingsUpstream.payloads_lock:
+        posts = sum(payload.get("input") == inputs for payload in _EmbeddingsUpstream.payloads)
+    physical_attempts = posts - posts_before
+    assert 1 <= physical_attempts <= (2 if selector == "server-error" else 1)
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        attempts = connection.execute(
+            """
+            SELECT a.request_id, a.state, a.attempt_ordinal, a.terminal_at
+            FROM gateway_attempts AS a
+            JOIN gateway_requests AS r ON r.request_id = a.request_id
+            WHERE r.rowid > ? ORDER BY a.attempt_ordinal
+            """,
+            (request_watermark,),
+        ).fetchall()
+    assert len(attempts) == physical_attempts
+    assert len({row[0] for row in attempts}) == 1
+    assert [row[1] for row in attempts] == ["failed"] * physical_attempts
+    assert [row[2] for row in attempts] == list(range(physical_attempts))
+    assert all(row[3] is not None for row in attempts)

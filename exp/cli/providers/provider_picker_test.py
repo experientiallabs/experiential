@@ -321,6 +321,7 @@ def test_rediscovered_configured_models_reuse_their_existing_rows() -> None:
     _, models = prepared
     assert [model.model for model in models] == ["gpt-5.6-terra"]
     assert all(not model.alias.endswith("-2") for model in models)
+    assert "openai: 2 models" in console.output
 
 
 def test_provider_whose_models_are_all_configured_is_still_prepared() -> None:
@@ -697,7 +698,7 @@ def test_openai_compatible_keeps_verified_and_unknown_identities() -> None:
     assert serves_role(by_model["hosted-chat"].capabilities, SetupRole.WORLD_MODEL)
     assert by_model["hosted-preview"].capabilities is None
     assert by_model["hosted-preview"].pricing_source is PricingSource.UNKNOWN
-    assert f"1 models, 1 with {provider_picker.UNKNOWN_METADATA_LABEL}" in console.output
+    assert f"2 models, 1 with {provider_picker.UNKNOWN_METADATA_LABEL}" in console.output
 
 
 def test_discovered_metadata_and_roles_come_from_the_maintained_table() -> None:
@@ -1410,6 +1411,7 @@ def test_experiential_cloud_lists_through_the_openai_compatible_family() -> None
             provider="openai-compatible",
             api_key="xpl_test_key",
             base_url=HOSTED_GATEWAY_DEFAULT_BASE_URL,
+            catalog="experiential",
         )
     ]
     assert [model.model for model in models] == ["deepseek-v4-flash"]

@@ -24,7 +24,7 @@ from exp.common.project import (
 )
 from exp.common.tasks import TaskCase, TaskSet, load_task_set
 from exp.common.traces import load_trace_dataset
-from exp.simulation.ingest.dataset import verify_current_trace_dataset
+from exp.common.traces.ingest.dataset import verify_current_trace_dataset
 from exp.simulation.mining.coverage import CoverageReport
 
 if TYPE_CHECKING:

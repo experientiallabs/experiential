@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ProviderDeadlineExceeded,
     RequestDeadline,
     ScriptedAsyncJsonTransport,
+    SyncJsonTransportAdapter,
     post_json_async,
     run_with_retry_async,
 )
@@ -20,6 +25,8 @@ from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     ProviderTransportError,
     RetryPolicy,
+    ScriptedJsonTransport,
+    is_known_unbilled_failure,
 )
 
 _IMMEDIATE_RETRY = RetryPolicy(
@@ -27,6 +34,402 @@ _IMMEDIATE_RETRY = RetryPolicy(
     initial_delay_seconds=0,
     maximum_delay_seconds=0,
 )
+
+
+@dataclass
+class _RetryClock:
+    """Deterministic wall-time substitute for retry and deadline tests.
+
+    Attributes:
+        now: Monotonic test time.
+        sleeps: Requested delays without real elapsed wall time.
+    """
+
+    now: float = 10.0
+    sleeps: list[float] = field(default_factory=list)
+
+    async def sleep(self, seconds: float) -> None:
+        """Advance the injected clock without waiting on wall time."""
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+@pytest.mark.parametrize("queued_seconds", [0.4, 1.1])
+def test_sync_transport_queue_consumes_the_original_deadline(
+    monkeypatch: pytest.MonkeyPatch, method: str, queued_seconds: float
+) -> None:
+    """A queued sync dispatch gets only remaining time and cannot start after expiry."""
+    clock = _RetryClock()
+    timeouts: list[float] = []
+    wire = ScriptedJsonTransport()
+
+    def dispatch(
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        payload: JsonObject | None = None,
+    ) -> JsonHttpResponse:
+        """Record actual dispatch only after the adapter admits its queued work."""
+        del url, headers, payload
+        timeouts.append(timeout_seconds)
+        return JsonHttpResponse(200, {"ok": True})
+
+    async def queued[**P](
+        function: Callable[P, JsonHttpResponse], *args: P.args, **kwargs: P.kwargs
+    ) -> JsonHttpResponse:
+        """Run the worker after a deterministic delay without sleeping in the test."""
+        clock.now += queued_seconds
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(async_transport, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(asyncio, "to_thread", queued)
+    monkeypatch.setattr(wire, method, dispatch)
+    adapter = SyncJsonTransportAdapter(wire)
+
+    async def scenario() -> JsonHttpResponse:
+        """Exercise the public adapter entrypoint with a one-second total bound."""
+        if method == "get":
+            return await adapter.get("https://provider.test", headers={}, timeout_seconds=1.0)
+        return await adapter.post(
+            "https://provider.test", headers={}, payload={}, timeout_seconds=1.0
+        )
+
+    if queued_seconds > 1:
+        with pytest.raises(ProviderDeadlineExceeded):
+            asyncio.run(scenario())
+        assert timeouts == []
+    else:
+        assert asyncio.run(scenario()).status_code == 200
+        assert timeouts == pytest.approx([1.0 - queued_seconds])
+
+
+def test_real_http_retry_after_waits_long_enough_to_admit() -> None:
+    """A one-second refusal succeeds after its server wait instead of exhausting at 0.75s."""
+    clock = _RetryClock()
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Admit only after one virtual second has passed."""
+        del request
+        nonlocal attempts
+        attempts += 1
+        if clock.now < 11:
+            return httpx.Response(429, json={}, headers={"Retry-After": "1"})
+        return httpx.Response(200, json={"ok": True})
+
+    async def scenario() -> None:
+        """Exercise the production HTTPX decoder and retry loop with no network."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transport = HttpxAsyncJsonTransport(client)
+
+            async def operation(timeout: float) -> dict[str, bool]:
+                """Turn the production response metadata into its typed retry error."""
+                response = await transport.post(
+                    "https://provider.test/v1", headers={}, payload={}, timeout_seconds=timeout
+                )
+                async_transport._successful_body(response)
+                return {"ok": True}
+
+            assert await run_with_retry_async(
+                operation,
+                policy=RetryPolicy(),
+                deadline=RequestDeadline.after(10, now_monotonic=clock.now),
+                sleep=clock.sleep,
+                now_monotonic=lambda: clock.now,
+                random_sample=lambda: 0.5,
+            ) == {"ok": True}
+
+    asyncio.run(scenario())
+    assert attempts == 2
+    assert clock.sleeps == [1.5]
+
+
+def test_certified_admission_retries_do_not_consume_paid_attempts() -> None:
+    """Five refusals before a success fit a one-paid-attempt policy and fixed deadline."""
+    clock = _RetryClock()
+    timeouts: list[float] = []
+
+    async def operation(timeout: float) -> str:
+        """Reject before dispatch five times, then perform the one admitted operation."""
+        timeouts.append(timeout)
+        if len(timeouts) <= 5:
+            raise ProviderTransportError(
+                "admission busy", status_code=429, retry_after_seconds=1, known_unbilled=True
+            )
+        return "ok"
+
+    assert (
+        asyncio.run(
+            run_with_retry_async(
+                operation,
+                policy=RetryPolicy(maximum_attempts=1),
+                deadline=RequestDeadline.after(30, now_monotonic=clock.now),
+                sleep=clock.sleep,
+                now_monotonic=lambda: clock.now,
+                random_sample=lambda: 0,
+            )
+        )
+        == "ok"
+    )
+    assert len(timeouts) == 6
+    assert all(later < earlier for earlier, later in zip(timeouts, timeouts[1:], strict=False))
+    assert clock.sleeps == [1, 1, 1, 2, 2]
+
+
+@pytest.mark.parametrize("unknown_first", [False, True])
+def test_admission_deadline_retains_aggregate_billing_proof(unknown_first: bool) -> None:
+    """An unpaid final429 cannot erase an earlier ambiguous dispatch when time expires."""
+    clock = _RetryClock()
+    attempts = 0
+
+    async def operation(timeout: float) -> str:
+        """Optionally lose one dispatch response before later certified refusals."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        if unknown_first and attempts == 1:
+            raise ProviderTransportError("lost response")
+        raise ProviderTransportError(
+            "admission busy", status_code=429, retry_after_seconds=1, known_unbilled=True
+        )
+
+    with pytest.raises(ProviderDeadlineExceeded) as caught:
+        asyncio.run(
+            run_with_retry_async(
+                operation,
+                policy=RetryPolicy(),
+                deadline=RequestDeadline.after(2.5, now_monotonic=clock.now),
+                sleep=clock.sleep,
+                now_monotonic=lambda: clock.now,
+                random_sample=lambda: 0,
+            )
+        )
+    assert is_known_unbilled_failure(caught.value) is not unknown_first
+    assert sum(clock.sleeps) < 2.5
+
+
+@pytest.mark.parametrize("known_unbilled", [False, True])
+def test_cancellation_during_backoff_keeps_dispatch_provenance(known_unbilled: bool) -> None:
+    """Cancelling unpaid admission wait is free; cancelling after uncertain dispatch is not."""
+    sleeping = asyncio.Event()
+
+    async def operation(timeout: float) -> str:
+        """Reject using the selected trusted or ordinary upstream throttle."""
+        del timeout
+        raise ProviderTransportError("busy", status_code=429, known_unbilled=known_unbilled)
+
+    async def sleep(seconds: float) -> None:
+        """Signal retry wait and block until the caller cancels."""
+        del seconds
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        """Cancel the real loop during its backoff, preserving CancelledError semantics."""
+        task = asyncio.create_task(
+            run_with_retry_async(
+                operation, policy=RetryPolicy(), deadline=RequestDeadline.after(10), sleep=sleep
+            )
+        )
+        await sleeping.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert is_known_unbilled_failure(caught.value) is known_unbilled
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_dispatch_never_claims_unbilled() -> None:
+    """A prior unpaid refusal cannot certify the currently in-flight network attempt."""
+    started = asyncio.Event()
+    attempts = 0
+
+    async def operation(timeout: float) -> str:
+        """Refuse once, then block after the next request was dispatched."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ProviderTransportError("busy", status_code=429, known_unbilled=True)
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("active operation returned")
+
+    async def no_wait(seconds: float) -> None:
+        """Permit the second attempt without spending real time."""
+        del seconds
+
+    async def scenario() -> None:
+        """Cancel active I/O and inspect the aggregate request proof."""
+        task = asyncio.create_task(
+            run_with_retry_async(
+                operation, policy=RetryPolicy(), deadline=RequestDeadline.after(10), sleep=no_wait
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert not is_known_unbilled_failure(caught.value)
+
+    asyncio.run(scenario())
+
+
+def test_overlong_admission_sleep_raises_typed_deadline_with_unpaid_proof() -> None:
+    """The absolute request deadline also interrupts an unexpectedly stalled sleeper."""
+
+    async def operation(timeout: float) -> str:
+        """Return only an authenticated pre-dispatch refusal."""
+        del timeout
+        raise ProviderTransportError("busy", status_code=429, known_unbilled=True)
+
+    async def sleep(seconds: float) -> None:
+        """Simulate scheduling delay lasting beyond the approved request deadline."""
+        del seconds
+        await asyncio.Event().wait()
+
+    with pytest.raises(ProviderDeadlineExceeded) as caught:
+        asyncio.run(
+            run_with_retry_async(
+                operation,
+                policy=RetryPolicy(initial_delay_seconds=0.001),
+                deadline=RequestDeadline.after(0.05),
+                sleep=sleep,
+                random_sample=lambda: 0,
+            )
+        )
+    assert is_known_unbilled_failure(caught.value)
+
+
+@pytest.mark.parametrize("seconds", [float("inf"), float("nan"), -1, 0])
+def test_admission_retry_deadline_must_be_finite_and_positive(seconds: float) -> None:
+    """Certified unpaid retries cannot turn an infinite deadline into an unbounded loop."""
+    with pytest.raises(ValueError, match="finite and positive"):
+        RequestDeadline.after(seconds)
+    with pytest.raises(ValueError, match="finite and positive"):
+        RequestDeadline(seconds)
+
+
+@pytest.mark.parametrize("hint", [1, 3])
+def test_directed_throttle_does_not_retry_before_unserviceable_hint(hint: float) -> None:
+    """A server hint beyond the deadline or delay ceiling cannot trigger an early retry."""
+    attempts = 0
+    clock = _RetryClock()
+    failure = ProviderTransportError("busy", status_code=429, retry_after_seconds=hint)
+
+    async def operation(timeout: float) -> str:
+        """Always return the same unknown-billing throttle for exact error identity checks."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        raise failure
+
+    expected = ProviderDeadlineExceeded if hint == 1 else ProviderTransportError
+    with pytest.raises(expected) as caught:
+        asyncio.run(
+            run_with_retry_async(
+                operation,
+                policy=RetryPolicy(),
+                deadline=RequestDeadline.after(0.5, now_monotonic=clock.now),
+                sleep=clock.sleep,
+                now_monotonic=lambda: clock.now,
+                random_sample=lambda: 0,
+            )
+        )
+    assert attempts == 1
+    assert clock.sleeps == []
+    assert not is_known_unbilled_failure(caught.value)
+
+
+@pytest.mark.parametrize("succeed", [False, True])
+def test_server_minimum_can_exceed_backoff_ceiling_within_request_deadline(succeed: bool) -> None:
+    """Ordinary five-second throttles retain three potentially paid attempts and exact pacing."""
+    clock = _RetryClock()
+    attempts = 0
+    failure = ProviderTransportError("busy", status_code=429, retry_after_seconds=5)
+
+    async def operation(timeout: float) -> str:
+        """Succeed after two ordinary upstream throttles, or exhaust the unchanged allowance."""
+        del timeout
+        nonlocal attempts
+        attempts += 1
+        if succeed and attempts == 3:
+            return "ok"
+        raise failure
+
+    async def scenario() -> str:
+        """Use one 30-second deadline without changing the default two-second backoff bound."""
+        return await run_with_retry_async(
+            operation,
+            policy=RetryPolicy(),
+            deadline=RequestDeadline.after(30, now_monotonic=clock.now),
+            sleep=clock.sleep,
+            now_monotonic=lambda: clock.now,
+            random_sample=lambda: 0.5,
+        )
+
+    if succeed:
+        assert asyncio.run(scenario()) == "ok"
+    else:
+        with pytest.raises(ProviderTransportError) as caught:
+            asyncio.run(scenario())
+        assert caught.value is failure
+        assert not is_known_unbilled_failure(caught.value)
+    assert attempts == 3
+    assert clock.sleeps == [6, 6]
+
+
+@pytest.mark.parametrize(
+    ("url", "trusted", "authenticated", "status", "redirected", "expected"),
+    [
+        ("https://gateway.test/v1", True, True, 429, False, True),
+        ("https://gateway.test/v1", False, True, 429, False, False),
+        ("https://gateway.test.attacker.test/v1", True, True, 429, False, False),
+        ("https://gateway.test:444/v1", True, True, 429, False, False),
+        ("https://name@gateway.test/v1", True, True, 429, False, False),
+        ("http://gateway.test/v1", True, True, 429, False, False),
+        ("https://gateway.test/v1", True, False, 429, False, False),
+        ("https://gateway.test/v1", True, True, 200, False, False),
+        ("https://gateway.test/v1", True, True, 503, False, False),
+        ("https://gateway.test/v1", True, True, 429, True, False),
+    ],
+)
+def test_admission_proof_requires_exact_authenticated_origin(
+    url: str, trusted: bool, authenticated: bool, status: int, redirected: bool, expected: bool
+) -> None:
+    """A trusted receipt cannot cross origin, auth, status, or redirect boundaries."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a marked response after optionally redirecting the actual HTTPX request."""
+        if redirected and request.url.path == "/v1":
+            return httpx.Response(307, headers={"Location": "/redirected"})
+        return httpx.Response(
+            status,
+            json={},
+            headers={"x-gateway-admission-refused": "true", "Retry-After": "1"},
+        )
+
+    async def scenario() -> None:
+        """Decode the response through the public explicitly configured transport seam."""
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=True
+        ) as client:
+            transport = HttpxAsyncJsonTransport(
+                client, trusted_admission_origin="https://gateway.test" if trusted else None
+            )
+            response = await transport.post(
+                url,
+                headers={"Authorization": "Bearer fixture"} if authenticated else {},
+                payload={},
+                timeout_seconds=1,
+            )
+            assert response.known_unbilled is expected
+            assert response.retry_after_seconds == 1
+
+    asyncio.run(scenario())
 
 
 def test_post_reuses_one_idempotency_identity_across_safe_retries() -> None:
@@ -231,3 +634,35 @@ def test_httpx_decode_failure_does_not_expose_body_or_headers() -> None:
     message = asyncio.run(scenario())
     assert canary not in message
     assert "header-canary" not in message
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_async_transport_names_connection_failures_without_exposing_secrets(method: str) -> None:
+    """Async JSON transport uses the same safe failure diagnostics as embedding requests."""
+    canary = "private-connection-canary"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """Raise one connection failure whose original message must stay private."""
+        raise httpx.ConnectError(canary, request=request)
+
+    async def scenario() -> str:
+        """Exercise the actual async adapter with an injected failing network transport."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transport = HttpxAsyncJsonTransport(client)
+            with pytest.raises(ProviderTransportError) as caught:
+                if method == "get":
+                    await transport.get(
+                        "https://provider.test/v1/models", headers={}, timeout_seconds=1
+                    )
+                else:
+                    await transport.post(
+                        "https://provider.test/v1/embeddings",
+                        headers={},
+                        payload={"input": canary},
+                        timeout_seconds=1,
+                    )
+            return str(caught.value)
+
+    message = asyncio.run(scenario())
+    assert "ConnectError" in message
+    assert canary not in message

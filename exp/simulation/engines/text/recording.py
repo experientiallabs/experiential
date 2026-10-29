@@ -1,20 +1,19 @@
-"""Visible-turn recording, context preflight, and text-only model-call boundaries."""
+"""Visible-turn recording, context preflight, and simulated model-call boundaries."""
 
 from __future__ import annotations
 
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
-
-from pydantic import JsonValue
+from threading import Lock
+from typing import TYPE_CHECKING, cast
 
 from exp.common.core.artifacts import (
-    FailureAttribution,
     FailureCode,
-    StructuredFailure,
+    JsonObject,
+    redact_secret_json,
 )
 from exp.common.models import (
     AssistantAction,
@@ -28,87 +27,61 @@ from exp.common.models import (
     ModelSnapshot,
     NumericMeasurement,
     OperationEconomics,
+    ToolCall,
     combine_economics,
     completion_request_cost_usd,
-    reconcile_completion_economics,
     verify_completion_reservation,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.rollouts import (
-    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutEventKind,
     RolloutSpan,
     StopReason,
 )
+from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
+from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
-from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
+from exp.simulation.engines.text.environment import SimulatedToolUseError
+from exp.simulation.engines.text.errors import (
+    TextSimulationError,
+    provider_call_failure,
+    text_failure,
+)
+from exp.simulation.engines.text.grounding import estimate_retrieval_economics
+from exp.simulation.engines.text.memory import TurnMemory
 from exp.simulation.engines.text.prompt import (
+    MemoryContext,
+    SimulatedToolResult,
     TextWorldModelProtocolError,
     TextWorldModelTransition,
+    candidate_rag_actions,
+    parse_world_model_transition,
     text_prompt_sha256,
 )
+from exp.simulation.engines.text.recording_payloads import (
+    RecordedTextCalls,
+    bounded_candidate_request,
+    delivered_world_span,
+    model_span,
+    priced_response,
+    world_retry_request,
+)
 from exp.simulation.engines.text.redaction import redact_json
-from exp.simulation.retrieval import RAGAction, RAGQuery
+from exp.simulation.engines.text.tokens import (
+    TokenCounter,
+    WorldModelCapacityError,
+    bound_unpublished_output,
+)
+from exp.simulation.retrieval import RAGQuery
+from exp.simulation.retrieval.retriever import RAGQueryInputLimitError
 
 if TYPE_CHECKING:
     from exp.simulation.world_model import GroundedWorldModel
+    from exp.simulation.world_model.runtime import PreparedGroundedWorldModelCall
 
 logger = logging.getLogger(__name__)
-
-
-class TextSimulationError(RuntimeError):
-    """A text simulator boundary failed with an artifact-safe terminal classification."""
-
-    def __init__(self, stop_reason: StopReason, failure: StructuredFailure) -> None:
-        super().__init__(failure.message)
-        self.stop_reason = stop_reason
-        self.failure = failure
-
-
-@runtime_checkable
-class TokenCounter(Protocol):
-    """Counts the full serialized request before a model client can send it."""
-
-    def count(self, request: ModelRequest) -> int:
-        """Return a conservative number of context tokens required by one request.
-
-        Args:
-            request: Complete provider-neutral request before provider conversion.
-
-        Returns:
-            A nonnegative count that includes all visible request content.
-        """
-        ...
-
-
-class Utf8UpperBoundTokenCounter:
-    """Provider-neutral byte upper bound used when no exact tokenizer is supplied."""
-
-    def count(self, request: ModelRequest) -> int:
-        """Count UTF-8 request bytes plus per-message framing as a conservative token bound.
-
-        Args:
-            request: Complete provider-neutral request to preflight.
-
-        Returns:
-            A conservative nonnegative bound that never silently shortens request content.
-        """
-        rendered = request.model_dump_json(exclude_none=False)
-        return len(rendered.encode("utf-8")) + 4 * len(request.messages)
-
-
-@dataclass(frozen=True)
-class RecordedTextCalls:
-    """Immutable recorded calls, visible world transitions, and separated operation economics."""
-
-    candidate_spans: tuple[RolloutSpan, ...]
-    world_model_spans: tuple[RolloutSpan, ...]
-    candidate_economics: OperationEconomics
-    world_model_economics: OperationEconomics
-    retrieval_economics: OperationEconomics
-    transitions: tuple[TextWorldModelTransition, ...]
-    retrieved_transition_ids: tuple[tuple[str, ...], ...]
 
 
 class RecordingCandidateClient:
@@ -128,15 +101,20 @@ class RecordingCandidateClient:
         maximum_cost_usd: float,
         stop_on_overspend: bool,
         maximum_steps: int,
+        retry_uncapped_infrastructure: bool = False,
+        maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
+        world_model_json_object_output: bool = False,
+        maximum_transition_attempts: int = 1,
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
+        memory: TurnMemory | None = None,
     ) -> None:
-        """Bind one task, two independent model clients, and strict text-mode boundaries.
+        """Bind one task, two independent model clients, and strict simulation boundaries.
 
         Args:
-            task: Canonical no-tools task currently being simulated.
+            task: Canonical task currently being simulated.
             candidate: Candidate model injected into the customer agent.
             world_model: Model that simulates the next visible text turn.
             grounded_world_model: Artifact-bound executor over the exact fit-only index.
@@ -148,15 +126,23 @@ class RecordingCandidateClient:
             stop_on_overspend: When true, reconciled spend reaching the ceiling blocks the
                 next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
+            retry_uncapped_infrastructure: Whether uncapped authority permits a fresh generation.
             maximum_output_tokens: Per-call output budget used without silent truncation.
+            world_model_json_object_output: Frozen provider JSON mode for simulation responses.
+            maximum_transition_attempts: Bounded simulator attempts for each candidate action.
             redacted_field_names: Project fields redacted before events persist.
             clock: Time source used to order emitted spans deterministically in tests.
             token_counter: Full-request counter used before every provider call.
+            memory: Frozen learned memory this task may read, recalled once per world turn
+                and delivered with the turn's request; None for a simulator without memory.
         """
+        if maximum_transition_attempts < 1:
+            raise ValueError("maximum_transition_attempts must be positive")
+        self._maximum_transition_attempts = maximum_transition_attempts
         self._task = task
         self._candidate = candidate
         self._world_model = world_model
-        self._grounded_world_model = grounded_world_model
+        self._grounded_world_model = replace(grounded_world_model, token_counter=token_counter)
         self._query_embedding = query_embedding
         self._candidate_request = candidate_request
         self._world_model_request = world_model_request
@@ -164,23 +150,54 @@ class RecordingCandidateClient:
         self._maximum_cost_usd = maximum_cost_usd
         self._stop_on_overspend = stop_on_overspend
         self._maximum_steps = maximum_steps
+        self._retry_uncapped_infrastructure = retry_uncapped_infrastructure
+        self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._world_model_json_object_output = world_model_json_object_output
         self._redacted_field_names = redacted_field_names
         self._clock = clock
         self._token_counter = token_counter
+        self._memory = memory
         self._candidate_spans: list[RolloutSpan] = []
         self._world_model_spans: list[RolloutSpan] = []
         self._candidate_responses: list[ModelResponse] = []
         self._world_model_responses: list[ModelResponse] = []
+        self._invalid_world_model_responses: list[ModelResponse] = []
         self._transitions: list[TextWorldModelTransition] = []
         self._retrieved_transition_ids: list[tuple[str, ...]] = []
         self._retrieval_economics: list[OperationEconomics] = []
         self._visible_transcript: tuple[ModelMessage, ...] = ()
         self._terminal = False
+        self._environment_state: JsonObject = {}
+        self._pending_tools: dict[str, tuple[ToolCall, SimulatedToolResult]] = {}
+        self._tool_lock = Lock()
         self._failure: TextSimulationError | None = None
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd: float | None = None
+        self._unknown_dispatch_is_upper_bound = False
         self._overspend_warned = False
+
+    def observe_tool(self, action: ToolCall) -> Observation:
+        """Consume exactly one generated result for the pending candidate invocation.
+
+        Args:
+            action: Exact call emitted by the candidate, including its arguments and ID.
+
+        Returns:
+            Simulated content and error status, without external tool execution.
+
+        Raises:
+            SimulatedToolUseError: The call is unknown, modified, or already consumed.
+        """
+        with self._tool_lock:
+            pending = self._pending_tools.get(action.call_id)
+            if pending is None or pending[0] != action:
+                raise SimulatedToolUseError(
+                    "tool call does not match an unconsumed simulated result"
+                )
+            del self._pending_tools[action.call_id]
+        result = pending[1]
+        return Observation(content=result.content, is_error=result.is_error)
 
     @property
     def terminal_error(self) -> TextSimulationError | None:
@@ -238,7 +255,13 @@ class RecordingCandidateClient:
                 require_complete_usage=False,
             ),
             world_model_economics=combine_economics(
-                tuple(response.economics for response in self._world_model_responses),
+                tuple(
+                    response.economics
+                    for response in (
+                        *self._world_model_responses,
+                        *self._invalid_world_model_responses,
+                    )
+                ),
                 require_complete_usage=False,
             ),
             retrieval_economics=combine_economics(
@@ -259,7 +282,7 @@ class RecordingCandidateClient:
             Candidate response after the corresponding world-model turn has been recorded.
 
         Raises:
-            TextSimulationError: The request uses tools, overflows context, reaches a terminal
+            TextSimulationError: The request overflows context, reaches a terminal
                 limit, or either model returns an unsupported or truncated response.
         """
         try:
@@ -268,23 +291,12 @@ class RecordingCandidateClient:
             self._failure = self._failure or exc
             raise
         except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
-            classification = classify_retry(exc)
-            details: dict[str, JsonValue] = {
-                "phase": "candidate_or_world_model",
-                "retry_classification": classification.reason,
-            }
-            if self._provider_dispatch_unknown_spend:
-                details["provider_dispatch_unknown_spend"] = True
-                reserved = self._unknown_dispatch_reserved_cost_usd
-                if reserved is not None:
-                    details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved
-            failure = StructuredFailure(
-                code=FailureCode.PROVIDER,
-                message=f"text simulation provider call failed with {type(exc).__name__}",
-                retryable=classification.retryable,
-                exception_type=type(exc).__name__,
-                attribution=FailureAttribution.MODEL,
-                details=details,
+            failure = provider_call_failure(
+                exc,
+                retry_uncapped_infrastructure=self._retry_uncapped_infrastructure,
+                unknown_spend=self._provider_dispatch_unknown_spend,
+                reserved_cost_usd=self._unknown_dispatch_reserved_cost_usd,
+                reserved_cost_is_upper_bound=self._unknown_dispatch_is_upper_bound,
             )
             text_error = TextSimulationError(StopReason.FAILURE, failure)
             self._failure = self._failure or text_error
@@ -304,7 +316,7 @@ class RecordingCandidateClient:
             Exception: The active candidate, embedder, or world-model provider fails.
         """
         if self._terminal:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.COMPLETED,
                 FailureCode.UNSUPPORTED,
                 "candidate requested another turn after the text world model reached a terminal "
@@ -312,17 +324,37 @@ class RecordingCandidateClient:
                 phase="candidate_after_terminal",
             )
         if len(self._candidate_responses) >= self._maximum_steps:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_STEPS,
                 FailureCode.BUDGET,
                 f"text simulation reached its maximum of {self._maximum_steps} candidate turns",
                 phase="candidate_turn_limit",
             )
-        _require_text_only_candidate_request(request)
-        candidate_request = _bounded_candidate_request(
+        if self._pending_tools:
+            raise text_failure(
+                StopReason.FAILURE,
+                FailureCode.VALIDATION,
+                "consume every simulated tool result before requesting another candidate turn",
+                phase="pending_tool_results",
+            )
+        if request.tools != self._task.tools:
+            raise text_failure(
+                StopReason.FAILURE,
+                FailureCode.VALIDATION,
+                "candidate request must preserve the task's declared tool schemas",
+                phase="candidate_tools",
+            )
+        candidate_request = bounded_candidate_request(
             request,
             visible_transcript=self._visible_transcript,
-            maximum_output_tokens=self._maximum_output_tokens,
+            maximum_output_tokens=min(
+                self._maximum_output_tokens,
+                self._remaining_output_tokens(),
+                self._candidate.capabilities.maximum_output_tokens or self._maximum_output_tokens,
+            ),
+        )
+        candidate_request = bound_unpublished_output(
+            candidate_request, self._candidate.capabilities, self._token_counter
         )
         _preflight_context(
             self._candidate.alias,
@@ -335,6 +367,7 @@ class RecordingCandidateClient:
                 self._candidate_request,
                 model=self._candidate.snapshot,
                 capabilities=self._candidate.capabilities,
+                token_prices=self._candidate.token_prices,
                 maximum_attempts=self._completion_maximum_attempts,
                 role="candidate",
             )
@@ -353,20 +386,21 @@ class RecordingCandidateClient:
                 if self._candidate_request is not None
                 else None
             ),
+            reserved_cost_is_upper_bound=(
+                self._candidate_request is not None
+                and self._candidate_request.maximum_is_upper_bound()
+                and self._token_counter.count(candidate_request)
+                <= self._candidate_request.planning_input_tokens()
+            ),
         )
-        if self._candidate_request is not None:
-            candidate_response = candidate_response.model_copy(
-                update={
-                    "economics": reconcile_completion_economics(
-                        self._candidate_request,
-                        candidate_response.economics,
-                    )
-                }
-            )
+        self._unknown_dispatch_is_upper_bound = False
+        candidate_response, pricing_error = priced_response(
+            candidate_response, self._candidate_request
+        )
         candidate_ended_at = timestamp(self._clock, not_before=candidate_started_at)
         self._candidate_responses.append(candidate_response)
         self._candidate_spans.append(
-            _model_span(
+            model_span(
                 span_id=f"candidate-{len(self._candidate_responses)}",
                 kind=RolloutEventKind.AGENT_MODEL_CALL,
                 started_at=candidate_started_at,
@@ -376,24 +410,70 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        if pricing_error is not None:
+            raise pricing_error
         _require_response_identity(candidate_response, self._candidate, role="candidate")
         self._clear_unknown_dispatch()
         _require_complete_response(candidate_response, role="candidate")
-        _require_text_only_action(candidate_response.output, role="candidate")
-        candidate_content = candidate_response.output.content
-        if candidate_content is None:  # pragma: no cover - text-only validation guarantees text
-            raise TypeError("text-only candidate response omitted visible content")
-        rag_query = RAGQuery(
-            task=self._task.instruction,
-            initial_context=self._task.initial_context,
-            action=RAGAction(kind="message", content=candidate_content),
-            excluded_lineage_ids=(self._task.lineage_group_id,),
-            top_k=self._grounded_world_model.artifact.top_k,
+        calls = candidate_response.output.tool_calls
+        names = {tool.name for tool in self._task.tools}
+        if any(call.name not in names for call in calls) or len({c.call_id for c in calls}) != len(
+            calls
+        ):
+            raise text_failure(
+                StopReason.FAILURE,
+                FailureCode.VALIDATION,
+                "candidate tool calls require declared tool names and unique call IDs",
+                phase="candidate_tools",
+            )
+        world_output = min(
+            self._maximum_output_tokens,
+            self._world_model.capabilities.maximum_output_tokens or self._maximum_output_tokens,
         )
-        query_economics = self._grounded_world_model.retriever.estimate_query_economics(
-            rag_query,
-            self._query_embedding,
+        memory = self._recall(candidate_request.messages, candidate_response.output)
+        try:
+            self._grounded_world_model.preflight_turn(
+                task=self._task,
+                visible_messages=candidate_request.messages,
+                candidate_response=candidate_response.output,
+                maximum_output_tokens=world_output,
+                state=self._environment_state,
+                json_object_output=self._world_model_json_object_output,
+                maximum_input_tokens=(
+                    self._world_model_request.maximum_input_tokens
+                    if self._world_model_request
+                    else None
+                ),
+                memory=memory,
+            )
+        except WorldModelCapacityError as exc:
+            raise text_failure(
+                StopReason.CONTEXT_OVERFLOW,
+                FailureCode.CONTEXT_OVERFLOW,
+                str(exc),
+                phase="world_model_preflight",
+            ) from exc
+        queries = tuple(
+            RAGQuery(
+                task=self._task.instruction,
+                initial_context=self._task.initial_context,
+                action=action,
+                excluded_lineage_ids=(self._task.lineage_group_id,),
+                top_k=self._grounded_world_model.artifact.top_k,
+            )
+            for action in candidate_rag_actions(candidate_response.output)
         )
+        try:
+            query_economics = estimate_retrieval_economics(
+                queries, self._grounded_world_model.retriever, self._query_embedding
+            )
+        except RAGQueryInputLimitError as exc:
+            raise text_failure(
+                StopReason.MAXIMUM_COST,
+                FailureCode.BUDGET,
+                "grounding query exceeds its reserved input-token ceiling",
+                phase="query_embedding_budget",
+            ) from exc
         self._check_spend_ceiling(role="query embedding")
         self._retrieval_economics.append(query_economics)
         prepared = self._dispatch_provider(
@@ -402,13 +482,98 @@ class RecordingCandidateClient:
                 visible_messages=candidate_request.messages,
                 candidate_response=candidate_response.output,
                 excluded_lineage_ids=(self._task.lineage_group_id,),
-                maximum_output_tokens=self._maximum_output_tokens,
+                state=self._environment_state,
+                maximum_output_tokens=world_output,
+                json_object_output=self._world_model_json_object_output,
+                memory=memory,
             ),
             # The retained retrieval estimate above already covers this dispatch's worst case
             # in every reconciliation path, so the window's incremental reservation is zero.
             reserved_cost_usd=0.0,
+            reserved_cost_is_upper_bound=True,
         )
         self._clear_unknown_dispatch()
+        transition = self._complete_world_turn(prepared, candidate_ended_at)
+        self._transitions.append(transition)
+        self._visible_transcript = (
+            *self._visible_transcript,
+            ModelMessage(role="assistant", assistant_action=candidate_response.output),
+            *transition.visible_messages,
+        )
+        self._environment_state = transition.state
+        self._pending_tools = {
+            call.call_id: (call, result)
+            for call, result in zip(calls, transition.tool_results, strict=True)
+        }
+        self._terminal = transition.terminal
+        return candidate_response
+
+    def _recall(
+        self, visible_messages: tuple[ModelMessage, ...], action: AssistantAction
+    ) -> MemoryContext | None:
+        """Recall learned memory for one world turn, or None without memory.
+
+        A recall failure ends the episode as a retryable simulator failure, so resume can
+        run the cell again; decisions already saved replay without another call.
+        """
+        if self._memory is None:
+            return None
+        try:
+            return self._memory.context(visible_messages, action, self._environment_state)
+        except Exception as exc:
+            raise text_failure(
+                StopReason.FAILURE,
+                FailureCode.PROVIDER,
+                f"memory recall failed: {exc}",
+                phase="memory_recall",
+                exception_type=type(exc).__name__,
+                retryable=True,
+            ) from exc
+
+    def _complete_world_turn(
+        self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
+    ) -> TextWorldModelTransition:
+        """Retry invalid simulator replies without repeating the candidate or retrieval.
+
+        Each attempt passes normal context and spend admission and retains its raw response.
+        Correction messages stay private to the simulator and never enter the visible transcript.
+        """
+        attempt = prepared
+        for number in range(self._maximum_transition_attempts):
+            try:
+                return self._dispatch_world_turn(attempt, candidate_ended_at)
+            except TextWorldModelProtocolError as exc:
+                if number + 1 == self._maximum_transition_attempts:
+                    raise text_failure(
+                        StopReason.FAILURE,
+                        FailureCode.PROVIDER,
+                        str(exc),
+                        phase="world_model_protocol",
+                        exception_type=type(exc).__name__,
+                        retryable=True,
+                    ) from exc
+                attempt = replace(
+                    prepared,
+                    request=world_retry_request(
+                        prepared.request,
+                        prepared.action,
+                        str(exc),
+                        capabilities=self._world_model.capabilities,
+                        reservation=self._world_model_request,
+                        token_counter=self._token_counter,
+                    ),
+                )
+        raise AssertionError("a positive transition allowance must return or raise")
+
+    def _dispatch_world_turn(
+        self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
+    ) -> TextWorldModelTransition:
+        """Admit, record and validate one simulator reply, including rejected reply costs."""
+        prepared = prepared.fit_context(
+            self._world_model.capabilities,
+            self._token_counter,
+            self._world_model_request.maximum_input_tokens if self._world_model_request else None,
+        )
         _preflight_context(
             self._world_model.alias,
             self._world_model.capabilities,
@@ -420,6 +585,7 @@ class RecordingCandidateClient:
                 self._world_model_request,
                 model=self._world_model.snapshot,
                 capabilities=self._world_model.capabilities,
+                token_prices=self._world_model.token_prices,
                 maximum_attempts=self._completion_maximum_attempts,
                 role="world model",
             )
@@ -438,27 +604,26 @@ class RecordingCandidateClient:
                 if self._world_model_request is not None
                 else None
             ),
+            reserved_cost_is_upper_bound=(
+                self._world_model_request is not None
+                and self._world_model_request.maximum_is_upper_bound()
+                and self._token_counter.count(prepared.request)
+                <= self._world_model_request.planning_input_tokens()
+            ),
         )
         world_request = dispatched.request
         world_response = dispatched.response
-        if self._world_model_request is not None:
-            world_response = world_response.model_copy(
-                update={
-                    "economics": reconcile_completion_economics(
-                        self._world_model_request,
-                        world_response.economics,
-                    )
-                }
-            )
-            dispatched = replace(dispatched, response=world_response)
+        self._unknown_dispatch_is_upper_bound = False
+        world_response, pricing_error = priced_response(world_response, self._world_model_request)
+        dispatched = replace(dispatched, response=world_response)
         world_ended_at = timestamp(self._clock, not_before=world_started_at)
         self._retrieved_transition_ids.append(
             tuple(match.transition.transition_id for match in dispatched.matches)
         )
         self._world_model_responses.append(world_response)
         self._world_model_spans.append(
-            _model_span(
-                span_id=f"world-model-{len(self._world_model_responses)}",
+            model_span(
+                span_id=f"world-model-{len(self._world_model_spans) + 1}",
                 kind=RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL,
                 started_at=world_started_at,
                 ended_at=world_ended_at,
@@ -467,28 +632,87 @@ class RecordingCandidateClient:
                 redacted_field_names=self._redacted_field_names,
             )
         )
+        if pricing_error is not None:
+            raise pricing_error
         _require_response_identity(world_response, self._world_model, role="world model")
         self._clear_unknown_dispatch()
         _require_complete_response(world_response, role="world model")
         try:
             transition = self._grounded_world_model.parse_turn(dispatched).transition
         except TextWorldModelProtocolError as exc:
-            raise _text_failure(
+            self._invalid_world_model_responses.append(self._world_model_responses.pop())
+            failure = text_failure(
                 StopReason.FAILURE,
                 FailureCode.PROVIDER,
                 str(exc),
                 phase="world_model_protocol",
                 exception_type=type(exc).__name__,
                 retryable=True,
-            ) from exc
-        self._transitions.append(transition)
-        self._visible_transcript = (
-            *self._visible_transcript,
-            ModelMessage(role="assistant", assistant_action=candidate_response.output),
-            transition.visible_message,
+            )
+            self._world_model_spans[-1] = self._world_model_spans[-1].model_copy(
+                update={"failure": failure.failure}
+            )
+            raise
+        self._world_model_spans[-1] = delivered_world_span(
+            self._world_model_spans[-1], transition.visible_messages, self._redacted_field_names
         )
-        self._terminal = transition.terminal
-        return candidate_response
+        return transition
+
+    def _remaining_output_tokens(self) -> int:
+        """Admit generated tokens, including reasoning, without treating missing usage as zero."""
+        usages = [response.economics.usage for response in self._candidate_responses]
+        if any(usage is None for usage in usages):
+            raise text_failure(
+                StopReason.MAXIMUM_OUTPUT_TOKENS,
+                FailureCode.BUDGET,
+                "candidate usage is missing; cannot safely admit more output tokens",
+                phase="candidate_token_budget",
+            )
+        used = sum(usage.output_tokens for usage in usages if usage is not None)
+        remaining = self._maximum_rollout_output_tokens - used
+        if remaining <= 0:
+            raise text_failure(
+                StopReason.MAXIMUM_OUTPUT_TOKENS,
+                FailureCode.BUDGET,
+                "rollout output-token budget exhausted; increase it to continue",
+                phase="candidate_token_budget",
+            )
+        return remaining
+
+    def checkpoint(self) -> TextRolloutCheckpoint | None:
+        """Return safe resumable state only at a complete, unredacted world-turn boundary."""
+        if self._pending_tools or not (
+            len(self._candidate_responses)
+            == len(self._world_model_responses)
+            == len(self._transitions)
+        ):
+            return None
+        checkpoint = TextRolloutCheckpoint(
+            visible_transcript=self._visible_transcript,
+            candidate_responses=tuple(self._candidate_responses),
+            world_model_responses=tuple(self._world_model_responses),
+            retrieval_economics=tuple(self._retrieval_economics),
+            invalid_world_model_responses=tuple(self._invalid_world_model_responses),
+        )
+        raw = checkpoint.model_dump(mode="json")
+        safe, _ = redact_secret_json(redact_json(raw, self._redacted_field_names))
+        return checkpoint if safe == raw else None
+
+    def restore(self, checkpoint: TextRolloutCheckpoint, spans: tuple[RolloutSpan, ...]) -> None:
+        """Restore a validated built-in chat prefix without dispatching any prior call."""
+        self._visible_transcript = checkpoint.visible_transcript
+        self._candidate_responses = list(checkpoint.candidate_responses)
+        self._world_model_responses = list(checkpoint.world_model_responses)
+        self._invalid_world_model_responses = list(checkpoint.invalid_world_model_responses)
+        self._transitions = [
+            parse_world_model_transition(item.output) for item in checkpoint.world_model_responses
+        ]
+        self._environment_state = self._transitions[-1].state if self._transitions else {}
+        self._retrieval_economics = list(checkpoint.retrieval_economics)
+        self._candidate_spans = [s for s in spans if s.kind == RolloutEventKind.AGENT_MODEL_CALL]
+        self._world_model_spans = [
+            s for s in spans if s.kind == RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL
+        ]
 
     def _check_spend_ceiling(self, *, role: str) -> None:
         """Apply the episode's overspend policy before one paid dispatch.
@@ -507,11 +731,12 @@ class RecordingCandidateClient:
         costs = [
             *(response.economics.cost_usd for response in self._candidate_responses),
             *(response.economics.cost_usd for response in self._world_model_responses),
+            *(response.economics.cost_usd for response in self._invalid_world_model_responses),
             *(economics.cost_usd for economics in self._retrieval_economics),
         ]
         if any(cost is None for cost in costs):
             if self._stop_on_overspend:
-                raise _text_failure(
+                raise text_failure(
                     StopReason.MAXIMUM_COST,
                     FailureCode.BUDGET,
                     f"{role} call is blocked because prior provider spend is unknown",
@@ -529,7 +754,7 @@ class RecordingCandidateClient:
         if total < self._maximum_cost_usd:
             return
         if self._stop_on_overspend:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 f"reconciled provider spend reached the simulation ceiling before the {role} call",
@@ -550,18 +775,14 @@ class RecordingCandidateClient:
         operation: Callable[[], ResultT],
         *,
         reserved_cost_usd: float | None,
+        reserved_cost_is_upper_bound: bool,
     ) -> ResultT:
         """Run one provider dispatch inside an explicit unknown-spend accounting window.
 
-        The executing client owns bounded transport retries inside the same retry-inclusive
-        reservation that admitted this dispatch, so this boundary never multiplies attempts.
-        While the dispatch is in flight its worst-case reservation is retained so a failure
-        that leaves spend unknown persists an exact conservative charge with its evidence
-        instead of an unpriceable hole.
-
         Args:
             operation: One provider dispatch whose spend is ambiguous until it returns.
-            reserved_cost_usd: Retry-inclusive worst-case charge admitted for this dispatch.
+            reserved_cost_usd: Retained retry-inclusive estimate for this dispatch.
+            reserved_cost_is_upper_bound: Whether that estimate bounds all possible charges.
 
         Returns:
             The successful dispatch result.
@@ -571,12 +792,14 @@ class RecordingCandidateClient:
         """
         self._provider_dispatch_unknown_spend = True
         self._unknown_dispatch_reserved_cost_usd = reserved_cost_usd
+        self._unknown_dispatch_is_upper_bound = reserved_cost_is_upper_bound
         return operation()
 
     def _clear_unknown_dispatch(self) -> None:
         """Mark the most recent provider dispatch as fully priced and recorded."""
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd = None
+        self._unknown_dispatch_is_upper_bound = False
 
 
 def _require_completion_request_bounds(
@@ -602,7 +825,7 @@ def _require_completion_request_bounds(
     """
     output_tokens = request.maximum_output_tokens
     if output_tokens is None:
-        raise _text_failure(
+        raise text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
             f"{role} request lacks a reserved output ceiling",
@@ -615,7 +838,7 @@ def _require_completion_request_bounds(
             output_tokens=output_tokens,
         )
     except ValueError as exc:
-        raise _text_failure(
+        raise text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
             str(exc),
@@ -630,6 +853,7 @@ def _verify_completion_budget_binding(
     capabilities: ModelCapabilities,
     maximum_attempts: int,
     role: str,
+    token_prices: GatewayTokenPrices | None = None,
 ) -> None:
     """Translate active reservation drift into a structured zero-dispatch budget failure.
 
@@ -639,6 +863,7 @@ def _verify_completion_budget_binding(
         capabilities: Active explicit prices and capacities.
         maximum_attempts: Active provider retry ceiling.
         role: Candidate or world-model diagnostic label.
+        token_prices: Optional full active schedule, verified against frozen preparation.
 
     Raises:
         TextSimulationError: Active model, economics, capacity, or retry metadata drifted.
@@ -648,10 +873,11 @@ def _verify_completion_budget_binding(
             reservation,
             model=model,
             capabilities=capabilities,
+            token_prices=token_prices,
             maximum_attempts=maximum_attempts,
         )
     except ValueError as exc:
-        raise _text_failure(
+        raise text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
             str(exc),
@@ -662,66 +888,6 @@ def _verify_completion_budget_binding(
 def text_prompt_digest() -> str:
     """Return the immutable prompt digest retained alongside a world-model simulator snapshot."""
     return text_prompt_sha256()
-
-
-def _bounded_candidate_request(
-    request: ModelRequest,
-    *,
-    visible_transcript: tuple[ModelMessage, ...],
-    maximum_output_tokens: int,
-) -> ModelRequest:
-    """Inject the visible transcript and enforce a caller-visible output budget."""
-    requested_budget = request.maximum_output_tokens
-    if requested_budget is not None and requested_budget > maximum_output_tokens:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.VALIDATION,
-            "candidate requested more output tokens than the frozen text simulation budget",
-            phase="candidate_output_budget",
-        )
-    return request.model_copy(
-        update={
-            "messages": _messages_with_visible_transcript(request.messages, visible_transcript),
-            "maximum_output_tokens": requested_budget or maximum_output_tokens,
-            "tool_choice": "none",
-        }
-    )
-
-
-def _messages_with_visible_transcript(
-    messages: tuple[ModelMessage, ...],
-    visible_transcript: tuple[ModelMessage, ...],
-) -> tuple[ModelMessage, ...]:
-    """Append retained visible turns unless a stateful agent already supplied that suffix."""
-    if not visible_transcript:
-        return messages
-    if len(messages) >= len(visible_transcript) and messages[-len(visible_transcript) :] == (
-        visible_transcript
-    ):
-        return messages
-    return (*messages, *visible_transcript)
-
-
-def _require_text_only_candidate_request(request: ModelRequest) -> None:
-    """Reject candidate tool configuration before it can reach a provider."""
-    if request.tools or (request.tool_choice is not None and request.tool_choice != "none"):
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            "text simulation accepts only tool-free candidate requests; use sandbox mode for tools",
-            phase="candidate_tools",
-        )
-
-
-def _require_text_only_action(action: AssistantAction, *, role: str) -> None:
-    """Reject tool-call outputs that cannot be simulated in the v1 text engine."""
-    if action.tool_calls or action.content is None:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            f"{role} emitted tool calls or no visible text; use sandbox mode for tools",
-            phase=f"{role.replace(' ', '_')}_tools",
-        )
 
 
 def _require_response_identity(
@@ -749,7 +915,7 @@ def _require_response_identity(
         and response.model.connection_sha256 == expected.connection_sha256
     ):
         return
-    raise _text_failure(
+    raise text_failure(
         StopReason.FAILURE,
         FailureCode.VALIDATION,
         f"{role} response identity does not match its pinned resolved model",
@@ -760,7 +926,7 @@ def _require_response_identity(
 def _require_complete_response(response: ModelResponse, *, role: str) -> None:
     """Turn an explicit provider length stop into a durable failed simulation cell."""
     if response.finish_reason == ModelFinishReason.LENGTH:
-        raise _text_failure(
+        raise text_failure(
             StopReason.LENGTH,
             FailureCode.PROVIDER,
             f"{role} response reached its maximum output budget; EXP did not truncate it",
@@ -777,28 +943,24 @@ def _preflight_context(
     """Fail closed when full request plus output budget cannot fit a known context window."""
     budget = request.maximum_output_tokens
     if budget is None:  # pragma: no cover - bounded callers always provide an explicit budget
-        raise _text_failure(
+        raise text_failure(
             StopReason.FAILURE,
             FailureCode.VALIDATION,
             f"model alias {alias!r} has no explicit output budget",
             phase="output_budget",
         )
-    if capabilities.maximum_output_tokens is None:
-        raise _text_failure(
-            StopReason.FAILURE,
-            FailureCode.UNSUPPORTED,
-            f"model alias {alias!r} does not report an output limit for safe text simulation",
-            phase="model_capabilities",
-        )
-    if capabilities.maximum_output_tokens < budget:
-        raise _text_failure(
+    if (
+        capabilities.maximum_output_tokens is not None
+        and capabilities.maximum_output_tokens < budget
+    ):
+        raise text_failure(
             StopReason.FAILURE,
             FailureCode.UNSUPPORTED,
             f"model alias {alias!r} cannot supply the requested {budget} output tokens",
             phase="model_capabilities",
         )
     if capabilities.context_window_tokens is None:
-        raise _text_failure(
+        raise text_failure(
             StopReason.CONTEXT_OVERFLOW,
             FailureCode.CONTEXT_OVERFLOW,
             f"model alias {alias!r} does not report a context window for safe text simulation",
@@ -806,7 +968,7 @@ def _preflight_context(
         )
     input_tokens = token_counter.count(request)
     if input_tokens < 0:
-        raise _text_failure(
+        raise text_failure(
             StopReason.FAILURE,
             FailureCode.VALIDATION,
             "text simulation token counter returned a negative request size",
@@ -814,77 +976,10 @@ def _preflight_context(
         )
     required = input_tokens + budget
     if required > capabilities.context_window_tokens:
-        raise _text_failure(
+        raise text_failure(
             StopReason.CONTEXT_OVERFLOW,
             FailureCode.CONTEXT_OVERFLOW,
             f"model alias {alias!r} context window {capabilities.context_window_tokens} cannot "
             f"fit {input_tokens} input plus {budget} output tokens",
             phase="context_preflight",
         )
-
-
-def _model_span(
-    *,
-    span_id: str,
-    kind: RolloutEventKind,
-    started_at: datetime,
-    ended_at: datetime,
-    request: ModelRequest,
-    response: ModelResponse,
-    redacted_field_names: frozenset[str],
-) -> RolloutSpan:
-    """Build one redacted model-call span from canonical request and visible response fields."""
-    payload_value: JsonValue = {
-        "request": request.model_dump(mode="json", exclude_none=True),
-        "response": {
-            "output": response.output.model_dump(mode="json", exclude_none=True),
-            "finish_reason": response.finish_reason.value,
-        },
-    }
-    payload = redact_json(payload_value, redacted_field_names)
-    if not isinstance(payload, dict):  # pragma: no cover - fixed object input remains an object
-        raise TypeError("model span payload must remain a JSON object")
-    return RolloutSpan(
-        span_id=span_id,
-        kind=kind,
-        started_at=started_at,
-        ended_at=ended_at,
-        payload=payload,
-        model=response.model,
-        usage=response.economics.usage,
-    )
-
-
-def _text_failure(
-    stop_reason: StopReason,
-    code: FailureCode,
-    message: str,
-    *,
-    phase: str,
-    exception_type: str | None = None,
-    retryable: bool = False,
-) -> TextSimulationError:
-    """Build one non-secret structured simulator failure with a stable phase label.
-
-    Args:
-        stop_reason: Terminal classification recorded with the failed episode.
-        code: Structured failure code persisted with the evidence.
-        message: Non-secret operator-facing failure description.
-        phase: Stable simulator phase label persisted in the failure details.
-        exception_type: Optional exception class name retained for diagnostics.
-        retryable: Whether resume may supersede this failure with a fresh attempt.
-
-    Returns:
-        One artifact-safe terminal simulator error.
-    """
-    return TextSimulationError(
-        stop_reason,
-        StructuredFailure(
-            code=code,
-            message=message,
-            retryable=retryable,
-            exception_type=exception_type,
-            attribution=FailureAttribution.MODEL,
-            details={"phase": phase},
-        ),
-    )

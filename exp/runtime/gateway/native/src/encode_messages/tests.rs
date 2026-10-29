@@ -2,26 +2,8 @@
 //! implementation stays within the repository line budget.
 
 use super::*;
+use crate::errors::FailureClass;
 use crate::events::CompletedToolCall;
-
-#[test]
-fn usage_reports_cached_reads_out_of_the_input_total() {
-    let usage = Usage {
-        input_tokens: Some(10),
-        output_tokens: Some(4),
-        cached_input_tokens: Some(3),
-        cache_creation_input_tokens: None,
-        reasoning_tokens: None,
-    };
-    assert_eq!(
-        messages_usage(Some(&usage)),
-        json!({"input_tokens": 7, "output_tokens": 4, "cache_read_input_tokens": 3})
-    );
-    assert_eq!(
-        messages_usage(None),
-        json!({"input_tokens": 0, "output_tokens": 0})
-    );
-}
 
 #[test]
 fn error_body_folds_param_and_maps_status_first() {
@@ -62,6 +44,9 @@ fn a_text_less_refusal_is_an_invalid_request_error_on_the_messages_surface() {
             "error": {
                 "type": "invalid_request_error",
                 "message": "provider refused the request",
+                // A refusal with no named reason still carries the category,
+                // as `unspecified`, on the Anthropic envelope.
+                "refusal_reason": "unspecified",
             },
         })
     );
@@ -72,9 +57,13 @@ fn completed_body_orders_text_before_tool_use_blocks() {
     let events = vec![
         Event::TextDelta("hi".to_string()),
         Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -83,12 +72,15 @@ fn completed_body_orders_text_before_tool_use_blocks() {
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{\"b\":1,\"a\":2}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -109,19 +101,26 @@ fn completed_body_orders_text_before_tool_use_blocks() {
 fn completed_body_preserves_interleaved_block_order() {
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::TextDelta("after ".to_string()),
@@ -142,9 +141,13 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
     // text may arrive between the tool's arguments and its completion.
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -154,12 +157,15 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -188,18 +194,26 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
     // buffers and flushes as one delta after A's block closes.
     let events = vec![
         Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-a".to_string(),
             name: "alpha".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
             delta: "{\"a\": ".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
             index: 1,
             call_id: "call-b".to_string(),
             name: "beta".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 1,
@@ -212,23 +226,29 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "call-a".to_string(),
                 name: "alpha".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{\"a\": 1}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ToolCallCompleted {
             index: 1,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "call-b".to_string(),
                 name: "beta".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{\"b\": 2}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -391,9 +411,13 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
             signature: "sig-a".to_string(),
         },
         Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -402,12 +426,15 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
         Event::ToolCallCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "call-1".to_string(),
                 name: "search".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -459,12 +486,15 @@ fn web_search_events() -> Vec<Event> {
         Event::ServerToolUseCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "srvtoolu_1".to_string(),
                 name: "web_search".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{\"query\": \"current stable Python\"}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ServerToolResult {
@@ -583,12 +613,15 @@ fn paused_turn_keeps_its_stop_reason_on_both_paths() {
         Event::ServerToolUseCompleted {
             index: 0,
             call: CompletedToolCall {
+                namespace: None,
+                caller: None,
                 call_id: "srvtoolu_1".to_string(),
                 name: "web_search".to_string(),
                 provider_item_id: None,
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::PausedTurn,
@@ -607,28 +640,6 @@ fn paused_turn_keeps_its_stop_reason_on_both_paths() {
     let aggregated = completed_messages_body("request-abc", "coding", &events).expect("aggregates");
     assert_eq!(aggregated.body["stop_reason"], json!("pause_turn"));
     assert!(!aggregated.incomplete);
-}
-
-#[test]
-fn usage_reports_both_cache_legs_out_of_the_folded_input_total() {
-    // A live cached turn folds input as uncached + read + write for the
-    // ledger; callers get the provider's own shape back, with each cache
-    // leg on its own field (Claude Code displays cache_creation on turn 1).
-    let usage = Usage {
-        input_tokens: Some(45_543),
-        output_tokens: Some(9),
-        cached_input_tokens: Some(0),
-        cache_creation_input_tokens: Some(45_338),
-        reasoning_tokens: None,
-    };
-    assert_eq!(
-        messages_usage(Some(&usage)),
-        json!({
-            "input_tokens": 205,
-            "output_tokens": 9,
-            "cache_creation_input_tokens": 45_338,
-        })
-    );
 }
 
 #[test]
@@ -652,9 +663,15 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
     ));
 
     let events = vec![Event::TextDelta("hi".to_string()), Event::Completed];
-    let aggregated =
-        completed_messages_body_with_ignored("request-abc", "coding", &events, &ignored)
-            .expect("aggregates");
+    let aggregated = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &events,
+        &ignored,
+        None,
+        false,
+    )
+    .expect("aggregates");
     assert_eq!(
         aggregated.body["x-experiential-ignored-parameters"],
         json!(["reasoning_effort", "anthropic-beta.claude-code-20250219"])
@@ -672,4 +689,242 @@ fn ignored_generation_controls_are_disclosed_by_both_messages_encoders() {
         .body
         .get("x-experiential-ignored-parameters")
         .is_none());
+}
+
+fn exposed_reasoning_events() -> Vec<Event> {
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "route-a".to_string(),
+            delta: "step ".to_string(),
+        },
+        Event::ReasoningContentDelta {
+            route_sha256: "route-a".to_string(),
+            delta: "one".to_string(),
+        },
+        Event::TextDelta("answer".to_string()),
+        Event::Completed,
+    ]
+}
+
+pub(super) fn tool_turn_reasoning_events() -> Vec<Event> {
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "route-a".to_string(),
+            delta: "think privately".to_string(),
+        },
+        Event::ToolCallStarted {
+            custom: false,
+            namespace: None,
+            caller: None,
+            index: 0,
+            call_id: "call-1".to_string(),
+            name: "lookup".to_string(),
+            thought_signature: None,
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{}".to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                namespace: None,
+                caller: None,
+                call_id: "call-1".to_string(),
+                name: "lookup".to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+                thought_signature: None,
+            },
+        },
+        Event::Completed,
+    ]
+}
+
+pub(super) fn frame_names(frames: &[String]) -> Vec<&str> {
+    frames
+        .iter()
+        .map(|frame| {
+            frame
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("event: "))
+                .expect("named frame")
+        })
+        .collect()
+}
+
+#[test]
+fn exposed_reasoning_streams_as_an_unsigned_thinking_block() {
+    // A Tencent/DeepSeek rung marked reasoning_output_exposed returns its
+    // plaintext reasoning on the Chat wire as `reasoning_content`; on the
+    // Messages wire the same text is a thinking block whose signature stays
+    // empty (Anthropic always signs, so an unsigned block is recognizably the
+    // gateway's plaintext when the caller replays it).
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_reasoning_output(true.into());
+    let mut frames = encoder.start().expect("starts");
+    for event in &exposed_reasoning_events() {
+        frames.extend(encoder.feed(event).expect("streams reasoning"));
+    }
+    assert_eq!(
+        frame_names(&frames),
+        vec![
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert!(frames[2].contains("{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}"));
+    assert!(frames[3].contains("{\"type\":\"thinking_delta\",\"thinking\":\"step \"}"));
+    assert!(frames[4].contains("{\"type\":\"thinking_delta\",\"thinking\":\"one\"}"));
+    assert!(!frames.iter().any(|frame| frame.contains("signature_delta")));
+    assert!(frames[7].contains("{\"type\":\"text_delta\",\"text\":\"answer\"}"));
+
+    let aggregated = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &exposed_reasoning_events(),
+        &[],
+        None,
+        true,
+    )
+    .expect("aggregates");
+    assert_eq!(
+        aggregated.body["content"],
+        json!([
+            {"type": "thinking", "thinking": "step one", "signature": ""},
+            {"type": "text", "text": "answer"},
+        ])
+    );
+}
+
+#[test]
+fn unexposed_reasoning_stays_dropped_on_the_messages_surface() {
+    // Hidden-reasoning rungs never leak: without exposure the Messages
+    // encoders keep OpenAI-wire reasoning invisible, exactly as before.
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    let mut frames = encoder.start().expect("starts");
+    for event in &exposed_reasoning_events() {
+        frames.extend(encoder.feed(event).expect("streams"));
+    }
+    assert!(!frames.iter().any(|frame| frame.contains("thinking")));
+    let aggregated = completed_messages_body("request-abc", "coding", &exposed_reasoning_events())
+        .expect("aggregates");
+    assert_eq!(
+        aggregated.body["content"],
+        json!([{"type": "text", "text": "answer"}])
+    );
+}
+
+#[test]
+fn tool_turn_reasoning_round_trips_as_a_trailing_redacted_thinking_carrier() {
+    // A tool turn's reasoning must come back as the sealed opaque carrier
+    // (never raw plaintext: a CoT-injection vector on the way back in). The
+    // carrier is only known once every tool call completed, after the
+    // sequential thinking block has closed, so it rides one trailing
+    // `redacted_thinking` block: Anthropic's own "opaque, replay verbatim"
+    // shape, which every Messages client (Claude Code) echoes untouched.
+    let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.set_reasoning_output(true.into());
+    encoder.set_reasoning_content_carrier(carrier.to_string());
+    let mut frames = encoder.start().expect("starts");
+    for event in &tool_turn_reasoning_events() {
+        frames.extend(encoder.feed(event).expect("streams"));
+    }
+    assert_eq!(
+        frame_names(&frames),
+        vec![
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    assert!(frames[3].contains("{\"type\":\"thinking_delta\",\"thinking\":\"think privately\"}"));
+    assert!(frames[5].contains("\"type\":\"tool_use\""));
+    assert!(frames[8].contains(&format!(
+        "{{\"type\":\"redacted_thinking\",\"data\":\"{carrier}\"}}"
+    )));
+    assert!(frames[10].contains("\"stop_reason\":\"tool_use\""));
+
+    let aggregated = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &tool_turn_reasoning_events(),
+        &[],
+        Some(carrier),
+        true,
+    )
+    .expect("aggregates");
+    assert_eq!(
+        aggregated.body["content"],
+        json!([
+            {"type": "thinking", "thinking": "think privately", "signature": ""},
+            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+            {"type": "redacted_thinking", "data": carrier},
+        ])
+    );
+    assert_eq!(aggregated.body["stop_reason"], json!("tool_use"));
+
+    // Exposure only governs the plaintext display block; the carrier rides
+    // regardless (Fireworks-style hidden reasoning on a tool turn).
+    let hidden = completed_messages_body_with_reasoning(
+        "request-abc",
+        "coding",
+        &tool_turn_reasoning_events(),
+        &[],
+        Some(carrier),
+        false,
+    )
+    .expect("aggregates");
+    assert_eq!(
+        hidden.body["content"],
+        json!([
+            {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+            {"type": "redacted_thinking", "data": carrier},
+        ])
+    );
+}
+
+#[test]
+fn tool_turn_reasoning_without_a_sealed_carrier_fails_closed() {
+    // Mirrors the Chat encoders: reasoning the gateway authority did not seal
+    // never leaves as plaintext on a tool turn.
+    let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
+    encoder.start().expect("starts");
+    let events = tool_turn_reasoning_events();
+    let mut error = None;
+    for event in &events {
+        if let Err(failure) = encoder.feed(event) {
+            error = Some(failure);
+            break;
+        }
+    }
+    let error = error.expect("terminal without a carrier fails");
+    assert_eq!(error.status_code, 502);
+    assert!(error.message.contains("not sealed"));
+
+    let aggregated =
+        completed_messages_body_with_reasoning("request-abc", "coding", &events, &[], None, true);
+    assert!(aggregated.is_err());
 }

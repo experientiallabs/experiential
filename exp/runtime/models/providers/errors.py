@@ -8,6 +8,9 @@ from enum import StrEnum
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.pricing import (
+    ProviderPricingUnavailableError as ProviderPricingUnavailableError,
+)
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
@@ -15,6 +18,37 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 
 class ProviderResponseError(ValueError):
     """A provider returned a completed response that violates EXP's typed contract."""
+
+
+def retain_unbounded_response_liability(error: BaseException) -> None:
+    """Attach an owning durable receipt's unknown liability without changing retry policy.
+
+    Call only after a paid response was saved without a verified charge or upper bound.
+    The exception's class and message retain their original validation meaning.
+    """
+    error.__dict__["_exp_unbounded_response_liability"] = True
+
+
+def has_unbounded_response_liability(error: BaseException) -> bool:
+    """Read explicit receipt-owner evidence, never infer it from generic error text."""
+    return error.__dict__.get("_exp_unbounded_response_liability") is True
+
+
+class ProviderTruncatedResponseError(ProviderResponseError):
+    """A length-terminated tool response ended inside JSON, with no HTTP retry authority.
+
+    An explicitly uncapped evaluation may retain this invalid attempt and start a new bounded
+    rollout generation. The same request must not be resent by the provider client.
+
+    Attributes:
+        response_body: Successful decoded HTTP body retained by the owning client boundary,
+            or None when no HTTP body has been attached. It never appears in the error message.
+    """
+
+    def __init__(self, message: str, *, response_body: JsonObject | None = None) -> None:
+        """Retain one sanitized failure and optional paid body for durable outer wrappers."""
+        super().__init__(message)
+        self.response_body = response_body
 
 
 class ProviderRetryableResponseError(ProviderResponseError):
@@ -55,14 +89,17 @@ class ProviderRefusalError(ProviderResponseError):
 class ProviderCapabilityError(ValueError):
     """A request requires gateway behavior the deployment cannot preserve."""
 
-    def __init__(self, *, capability: str) -> None:
+    def __init__(self, *, capability: str, detail: str | None = None) -> None:
         """Name the unsupported public capability without provider content.
 
         Args:
             capability: Stable capability field rejected before dispatch.
+            detail: Optional caller-safe sentence completing the public
+                message, such as which provider a media handle names.
         """
         super().__init__(f"provider deployment does not support {capability}")
         self.capability = capability
+        self.detail = detail
 
 
 class ProviderParameterError(ValueError):
@@ -92,15 +129,20 @@ class UnsupportedReasoningEffortError(ProviderParameterError):
             supported_efforts: Ordered effort values accepted by every route deployment.
             param: Public request path carrying the unsupported value.
         """
+        # "effort parameter" + "not supported" is deliberate phrasing: Claude
+        # Code's built-in recovery latch drops output_config.effort and
+        # retries only when the 400 message matches that predicate; any other
+        # wording turns a gracefully degradable condition into a wedged
+        # session (issue #795).
         if supported_efforts:
             choices = ", ".join(repr(value) for value in supported_efforts)
             message = (
-                f"Reasoning effort {effort!r} is not supported by this model route. "
-                f"Supported values: {choices}."
+                f"The effort parameter value {effort!r} is not supported by this model "
+                f"route. Supported values: {choices}."
             )
         else:
             message = (
-                f"The parameter {param!r} is not supported by this model route. "
+                f"The effort parameter ({param!r}) is not supported by this model route. "
                 "Remove the field or choose a different model."
             )
         super().__init__(message=message, param=param, code="unsupported_parameter")

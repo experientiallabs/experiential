@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine, Iterator
+from concurrent.futures import Future
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
 
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import (
     BoundedInspect,
     ClassifierTimeoutError,
@@ -17,7 +22,25 @@ from exp.runtime.gateway.guardrails.bounded import (
     _NativeCallbackRunner,
     run_on_native_loop,
 )
-from exp.runtime.gateway.guardrails.http_json import shared_http_json_client
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailAction,
+    GuardrailCapabilityKind,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailPolicy,
+)
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.http_json import (
+    HttpJsonClassifier,
+    _CookieFreeTransport,
+    close_shared_http_json_client,
+    shared_http_json_client,
+)
+from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 10.0) -> None:
@@ -79,6 +102,98 @@ def test_bounded_inspect_returns_the_inspect_result() -> None:
         assert await bound.run(inspect, 0.5, adapter_id="healthy") == 7
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_before_start", [False, True])
+def test_worker_returns_after_factory_failure_or_prestart_cancellation(
+    cancel_before_start: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing cannot skip the return boundary when no inspect task was created."""
+    worker = _IsolationWorker()
+    start_entered = threading.Event()
+    start_release = threading.Event()
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    original_return = _IsolationWorker._return_after_callback
+    factory_calls: list[str] = []
+
+    def block_loop() -> None:
+        """Let cancellation and close happen before the queued submission starts."""
+        start_entered.set()
+        assert start_release.wait(10)
+
+    def factory() -> Coroutine[object, object, int]:
+        """Fail synchronously before returning a coroutine."""
+        factory_calls.append("called")
+        raise RuntimeError("synthetic factory failure")
+
+    def block_return(self: _IsolationWorker, returned: Future[None]) -> None:
+        """Hold the source callback after queuing its subject-free return signal."""
+        original_return(self, returned)
+        if self is worker:
+            callback_entered.set()
+            assert callback_release.wait(10)
+
+    monkeypatch.setattr(_IsolationWorker, "_return_after_callback", block_return)
+    try:
+        assert worker._ready.wait(2)
+        worker.assert_running()
+        loop = worker._loop
+        assert loop is not None
+        loop.call_soon_threadsafe(block_loop)
+        assert start_entered.wait(2)
+        outcome, returned, _generation = worker.submit(factory)
+        if cancel_before_start:
+            assert outcome.cancel()
+        worker.stop_when_idle()
+        start_release.set()
+        assert callback_entered.wait(2)
+        assert not returned.done()
+        assert worker._busy
+        assert worker._thread.is_alive()
+        if cancel_before_start:
+            assert outcome.cancelled()
+            assert not factory_calls
+        else:
+            with pytest.raises(RuntimeError, match="synthetic factory failure"):
+                outcome.result(timeout=2)
+            assert factory_calls == ["called"]
+        callback_release.set()
+        assert returned.result(timeout=2) is None
+    finally:
+        start_release.set()
+        callback_release.set()
+        worker.stop_when_idle()
+        worker.wait_stopped(2)
+    assert not worker._thread.is_alive()
+
+
+def test_completion_before_quarantine_insertion_does_not_retain_the_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout racing completion cannot leave a completed subject in the quarantine map."""
+    bound = BoundedInspect(max_inflight=1)
+    worker = _IsolationWorker()
+    pending: Future[object] = Future()
+    original_track = bound._track_abandoned
+    pending.add_done_callback(lambda done: bound._finish_detached("racing", done))
+
+    def finish_then_track(adapter_id: str, task: Future[object]) -> None:
+        """Complete after abandon's first done check and before quarantine insertion."""
+        task.set_exception(RuntimeError("synthetic detector failure"))
+        original_track(adapter_id, task)
+
+    monkeypatch.setattr(bound, "_track_abandoned", finish_then_track)
+    try:
+        assert worker._ready.wait(2)
+        bound._abandon("racing", worker, pending, 0)
+        assert not bound._abandoned
+        assert bound.detached_inspect_count() == 0
+        assert not bound.quarantined_adapter_ids()
+    finally:
+        worker.stop_when_idle()
+        worker.wait_stopped(2)
+        bound.close(timeout_seconds=2)
 
 
 def test_isolation_workers_are_daemon_threads() -> None:
@@ -871,3 +986,511 @@ def test_native_callback_returns_when_inspect_blocks_before_first_await() -> Non
     finally:
         hold.set()
         _wait_sync(lambda: bound.detached_inspect_count() == 0)
+
+
+class _ShutdownClassifier(ScriptedClassifier):
+    """Expose the actual worker thread and optionally hold cancellation-resistant work."""
+
+    def __init__(self, release: threading.Event | None = None) -> None:
+        """Create a thread receipt and an optional synchronous inspection barrier."""
+        super().__init__()
+        self.release = release
+        self.started = threading.Event()
+        self.threads: list[threading.Thread] = []
+
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Record this worker and finish only after an optional blocking barrier releases."""
+        del request, check
+        self.threads.append(threading.current_thread())
+        self.started.set()
+        if self.release is not None:
+            assert self.release.wait(5)
+        return ClassifierVerdict(flagged=False)
+
+
+def _shutdown_engine(
+    classifier: _ShutdownClassifier, inspects: BoundedInspect | None = None
+) -> tuple[GuardrailEngine, GuardrailPolicy, GatewayRequest]:
+    """Compose the real engine's two worker pools around a synthetic classifier."""
+    policy = GuardrailPolicy(
+        policy_id="shutdown-observer",
+        mode="observe",
+        protected=True,
+        checks=(
+            GuardrailCheck(
+                check_id="input",
+                adapter_id="fixture",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=5000,
+            ),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"fixture": classifier})),
+        monotonic=time.monotonic,
+        inspects=inspects,
+        max_observations=1,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="synthetic shutdown probe"),),
+    )
+    return engine, policy, request
+
+
+def test_repeated_engine_close_stops_owned_observation_and_enforcement_workers() -> None:
+    """Each closed SDK engine releases its idle pool threads instead of accumulating them."""
+    workers: set[threading.Thread] = set()
+    for _ in range(3):
+        classifier = _ShutdownClassifier()
+        engine, policy, request = _shutdown_engine(classifier)
+        try:
+            engine.observe_input(
+                policy=policy, request=request, deadline_monotonic=time.monotonic() + 5
+            )
+            assert classifier.started.wait(2)
+            asyncio.run(
+                engine.enforce_input(
+                    policy=policy.model_copy(update={"mode": "enforce"}),
+                    request=request,
+                    deadline_monotonic=time.monotonic() + 5,
+                )
+            )
+        finally:
+            engine.close(timeout_seconds=1)
+        workers.update(classifier.threads)
+        assert len(set(classifier.threads)) == 2
+        assert all(not worker.is_alive() for worker in workers)
+
+
+def test_engine_close_preserves_a_caller_owned_enforcement_pool() -> None:
+    """An injected pool remains usable after the engine closes its own observer pool."""
+    shared = BoundedInspect(max_inflight=1)
+    classifier = _ShutdownClassifier()
+    engine, policy, request = _shutdown_engine(classifier, shared)
+
+    async def enforce() -> GatewayRequest:
+        """Use the supplied pool through the real engine before shutting down the host."""
+        return await engine.enforce_input(
+            policy=policy.model_copy(update={"mode": "enforce"}),
+            request=request,
+            deadline_monotonic=time.monotonic() + 5,
+        )
+
+    async def reuse() -> int:
+        """Prove the caller still owns pool admission and its running worker."""
+
+        async def inspect() -> int:
+            """Return on the caller's reusable pool."""
+            return 7
+
+        return await shared.run(inspect, 1, adapter_id="independent-owner")
+
+    try:
+        assert asyncio.run(enforce()) == request
+        engine.close(timeout_seconds=1)
+        assert asyncio.run(reuse()) == 7
+        assert classifier.threads[0].is_alive()
+    finally:
+        engine.close(timeout_seconds=1)
+        shared.close(timeout_seconds=1)
+    assert not classifier.threads[0].is_alive()
+
+
+def test_pool_shutdown_preserves_stubborn_observation_ownership_until_actual_exit() -> None:
+    """A bounded close cannot release bytes or destroy a classifier still using its subject."""
+    release = threading.Event()
+    classifier = _ShutdownClassifier(release)
+    engine, policy, request = _shutdown_engine(classifier)
+    try:
+        engine.observe_input(
+            policy=policy, request=request, deadline_monotonic=time.monotonic() + 5
+        )
+        assert classifier.started.wait(2)
+        started = time.monotonic()
+        engine.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        assert classifier.threads[0].is_alive()
+        assert engine._observations._bytes == len(observation_subject_bytes(request))
+        assert len(engine._observations._jobs) == 1
+
+        async def refused() -> None:
+            """A closed pool must not invoke even a different, nonquarantined adapter."""
+
+            async def inspect() -> None:
+                """Make accidental admission a visible failure."""
+                pytest.fail("closed observation pool invoked a classifier")
+
+            with pytest.raises(RuntimeError, match="closed"):
+                await engine._observation_inspects.run(inspect, 1, adapter_id="later")
+
+        asyncio.run(refused())
+        release.set()
+        _wait_sync(lambda: not classifier.threads[0].is_alive())
+        assert engine._observations._idle.wait(2)
+        assert engine._observations._bytes == 0
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_pool_close_wakes_queued_acquisition_and_refuses_new_admission() -> None:
+    """Shutdown wakes pending admission without interrupting a still-running inspect."""
+    release = threading.Event()
+    entered = threading.Event()
+    workers: list[threading.Thread] = []
+    bound = BoundedInspect(max_inflight=1)
+
+    async def scenario() -> None:
+        """Close a full pool while another adapter is waiting for its sole worker."""
+
+        async def blocked() -> int:
+            """Keep the worker busy until the test releases it."""
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(5)
+            return 3
+
+        async def unexpected() -> int:
+            """Fail if queued or new work is admitted during shutdown."""
+            pytest.fail("closed pool admitted another classifier")
+
+        active = asyncio.create_task(bound.run(blocked, 5, adapter_id="active"))
+        await _wait_until(entered.is_set)
+        waiting = asyncio.create_task(bound.run(unexpected, 5, adapter_id="queued"))
+        await _wait_until(lambda: bool(bound._pool._waiters))
+        started = time.monotonic()
+        bound.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        with pytest.raises(RuntimeError, match="closed"):
+            await waiting
+        with pytest.raises(RuntimeError, match="closed"):
+            await bound.run(unexpected, 1, adapter_id="new")
+        assert not active.done()
+        release.set()
+        assert await active == 3
+        await _wait_until(lambda: not workers[0].is_alive())
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        bound.close(timeout_seconds=2)
+
+
+def test_pool_close_stops_a_worker_whose_startup_finishes_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out reserved worker cannot become a parked thread after its owner closes."""
+    release_start = threading.Event()
+    entered = threading.Event()
+    _delay_isolation_worker_start(monkeypatch, release_start, entered)
+    before = set(threading.enumerate())
+    bound = BoundedInspect(max_inflight=1)
+    try:
+        asyncio.run(_timeout_while_isolation_start_is_held(bound))
+        assert entered.wait(2)
+        workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread not in before and thread.name == "exp-guardrail-isolate"
+        ]
+        assert len(workers) == 1
+        bound.close(timeout_seconds=0.01)
+        assert workers[0].is_alive()
+        release_start.set()
+        _wait_sync(lambda: not workers[0].is_alive())
+    finally:
+        release_start.set()
+        bound.close(timeout_seconds=2)
+
+
+@contextmanager
+def _keepalive_classifier() -> Iterator[tuple[str, list[threading.Event]]]:
+    """Serve real loopback HTTP and expose peer disconnects without retaining request data."""
+    connections: list[socket.socket] = []
+    disconnected: list[threading.Event] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        """Return an allow verdict over a persistent HTTP/1.1 connection."""
+
+        protocol_version = "HTTP/1.1"
+
+        def setup(self) -> None:
+            """Track the socket so a failing regression can still clean it up."""
+            super().setup()
+            self.disconnected = threading.Event()
+            connections.append(self.connection)
+            disconnected.append(self.disconnected)
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib HTTP handler contract
+            """Consume one synthetic request and send a bounded classifier verdict."""
+            self.rfile.read(int(self.headers["Content-Length"]))
+            body = b'{"flagged":false}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def finish(self) -> None:
+            """Signal when the client actually closes its keepalive connection."""
+            try:
+                super().finish()
+            finally:
+                self.disconnected.set()
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Keep the synthetic HTTP fixture silent."""
+            del format, args
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(
+            target=lambda: server.serve_forever(poll_interval=0.01), daemon=True
+        )
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/inspect", disconnected
+        finally:
+            server.shutdown()
+            for connection in connections:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                connection.close()
+            thread.join(2)
+            assert not thread.is_alive()
+            assert all(event.wait(2) for event in disconnected)
+
+
+def test_repeated_pool_close_releases_real_http_keepalive_connections() -> None:
+    """Closed owners must close pooled sockets on their loop before that loop disappears."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="synthetic HTTP shutdown probe"),),
+    )
+    check = GuardrailCheck(
+        check_id="http-shutdown",
+        adapter_id="http",
+        capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+        stage=GuardrailCheckStage.INPUT,
+        action=GuardrailAction.BLOCK,
+        timeout_ms=2000,
+    )
+    clients: list[httpx.AsyncClient] = []
+    workers: list[threading.Thread] = []
+    with _keepalive_classifier() as (url, disconnected):
+        classifier = HttpJsonClassifier(adapter_id="http", url=url)
+        for count in range(1, 4):
+            bound = BoundedInspect(max_inflight=1)
+
+            async def inspect() -> ClassifierVerdict:
+                """Use the actual adapter and retain receipts beyond worker-loop teardown."""
+                clients.append(shared_http_json_client())
+                workers.append(threading.current_thread())
+                return await classifier.inspect_input(request=request, check=check)
+
+            try:
+                assert not asyncio.run(bound.run(inspect, 2, adapter_id="http")).flagged
+                assert len(disconnected) == count
+                assert not disconnected[-1].is_set()
+                bound.close(timeout_seconds=1)
+                assert clients[-1].is_closed
+                assert not workers[-1].is_alive()
+                assert disconnected[-1].wait(1)
+            finally:
+                bound.close(timeout_seconds=1)
+        assert len({id(client) for client in clients}) == 3
+        assert all(client.is_closed for client in clients)
+
+
+def test_pool_close_waits_for_stubborn_inspect_before_closing_its_http_client() -> None:
+    """An abandoned inspect keeps its usable loop-local client until the actual work exits."""
+    bound = BoundedInspect(max_inflight=1)
+    release = threading.Event()
+    entered = threading.Event()
+    clients: list[httpx.AsyncClient] = []
+    workers: list[threading.Thread] = []
+
+    async def inspect() -> None:
+        """Keep using the worker after the caller times out and requests shutdown."""
+        clients.append(shared_http_json_client())
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(5)
+        assert not clients[-1].is_closed
+
+    async def scenario() -> None:
+        """Detach the blocking work before closing its owning pool."""
+        active = asyncio.create_task(bound.run(inspect, 0.2, adapter_id="stubborn-http"))
+        await _wait_until(entered.is_set)
+        with pytest.raises(ClassifierTimeoutError):
+            await active
+        started = time.monotonic()
+        bound.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        assert workers[0].is_alive()
+        assert not clients[0].is_closed
+        assert bound.detached_inspect_count() == 1
+        release.set()
+        await _wait_until(lambda: not workers[0].is_alive())
+        assert clients[0].is_closed
+        assert bound.detached_inspect_count() == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        bound.close(timeout_seconds=2)
+
+
+def test_slow_http_cleanup_keeps_its_owner_without_extending_close_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow transport close continues on its owned daemon and never reopens admission."""
+    release = threading.Event()
+    closing = threading.Event()
+    closed = threading.Event()
+    workers: list[threading.Thread] = []
+    original_close = _CookieFreeTransport.aclose
+    bound = BoundedInspect(max_inflight=1)
+
+    async def delayed_close(transport: _CookieFreeTransport) -> None:
+        """Hold transport cleanup until the caller's finite join budget has expired."""
+        closing.set()
+        await _wait_hold(release)
+        await original_close(transport)
+        closed.set()
+
+    async def inspect() -> None:
+        """Create one client whose transport belongs only to this worker."""
+        workers.append(threading.current_thread())
+        shared_http_json_client()
+
+    async def refused() -> None:
+        """Reject new inspection while cleanup still owns its closing loop."""
+        with pytest.raises(RuntimeError, match="closed"):
+            await bound.run(inspect, 1, adapter_id="later")
+
+    monkeypatch.setattr(_CookieFreeTransport, "aclose", delayed_close)
+    try:
+        asyncio.run(bound.run(inspect, 1, adapter_id="http"))
+        started = time.monotonic()
+        bound.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        assert closing.wait(1)
+        assert workers[0].is_alive()
+        assert not closed.is_set()
+        asyncio.run(refused())
+        bound.close(timeout_seconds=0.02)
+        assert workers[0].is_alive()
+        assert not closed.is_set()
+        release.set()
+        bound.close(timeout_seconds=2)
+        assert closed.is_set()
+        assert not workers[0].is_alive()
+    finally:
+        release.set()
+        bound.close(timeout_seconds=2)
+
+
+def test_pool_close_preserves_other_loops_and_injected_http_clients() -> None:
+    """One closing worker cannot close another owner or an explicitly injected transport."""
+    first = BoundedInspect(max_inflight=1)
+    second = BoundedInspect(max_inflight=1)
+    clients: list[httpx.AsyncClient] = []
+
+    async def capture() -> httpx.AsyncClient:
+        """Return a strong receipt for this worker's loop-local client."""
+        client = shared_http_json_client()
+        clients.append(client)
+        return client
+
+    async def scenario() -> None:
+        """Keep the other owners usable throughout the first pool's shutdown."""
+        caller_client = shared_http_json_client()
+
+        def allow(_request: httpx.Request) -> httpx.Response:
+            """Return a synthetic response without owning a real connection pool."""
+            return httpx.Response(200, json={"flagged": False})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(allow)) as injected:
+            classifier = HttpJsonClassifier(
+                adapter_id="injected",
+                url="https://classifier.example.invalid/inspect",
+                client=injected,
+            )
+
+            async def use_injected() -> ClassifierVerdict:
+                """Use a caller-supplied client from the worker that will shut down."""
+                return await classifier.inspect_input(
+                    request=GatewayRequest(
+                        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+                        messages=(GatewayMessage(role="user", content="synthetic owner probe"),),
+                    ),
+                    check=GuardrailCheck(
+                        check_id="owner",
+                        adapter_id="injected",
+                        capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                        stage=GuardrailCheckStage.INPUT,
+                        action=GuardrailAction.BLOCK,
+                        timeout_ms=1000,
+                    ),
+                )
+
+            try:
+                first_client = await first.run(capture, 1, adapter_id="first")
+                second_client = await second.run(capture, 1, adapter_id="second")
+                assert not (await first.run(use_injected, 1, adapter_id="injected")).flagged
+                first.close(timeout_seconds=1)
+                assert first_client.is_closed
+                assert not second_client.is_closed
+                assert not caller_client.is_closed
+                assert not injected.is_closed
+                assert await second.run(capture, 1, adapter_id="second") is second_client
+                assert not (await use_injected()).flagged
+            finally:
+                first.close(timeout_seconds=1)
+                second.close(timeout_seconds=1)
+                await close_shared_http_json_client()
+        assert injected.is_closed
+        assert caller_client.is_closed
+        assert all(client.is_closed for client in clients)
+
+    asyncio.run(scenario())
+
+
+def test_http_cleanup_failure_logs_no_exception_content_and_stops_its_worker(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failed cleanup is visible without logging transport exceptions or retaining a dead loop."""
+    bound = BoundedInspect(max_inflight=1)
+    workers: list[threading.Thread] = []
+    original_close = _CookieFreeTransport.aclose
+
+    async def failed_close(transport: _CookieFreeTransport) -> None:
+        """Close the real transport before raising an intentionally sensitive fake error."""
+        await original_close(transport)
+        raise RuntimeError("synthetic private payload or credential")
+
+    async def inspect() -> None:
+        """Create the client that exercises the worker's failing finalizer."""
+        workers.append(threading.current_thread())
+        shared_http_json_client()
+
+    monkeypatch.setattr(_CookieFreeTransport, "aclose", failed_close)
+    try:
+        asyncio.run(bound.run(inspect, 1, adapter_id="http"))
+        bound.close(timeout_seconds=1)
+        assert not workers[0].is_alive()
+        assert "guardrail HTTP client cleanup failed" in caplog.text
+        assert "synthetic private" not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+    finally:
+        bound.close(timeout_seconds=1)

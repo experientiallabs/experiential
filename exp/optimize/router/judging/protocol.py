@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections import OrderedDict
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
 from typing import Literal, cast
 
@@ -13,7 +17,6 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
-    sha256_json,
     stable_id,
 )
 from exp.common.judging import RawJudgment, Rubric
@@ -30,12 +33,14 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
+from exp.common.tasks import load_task_set
+from exp.optimize.router.errors import JudgePricingError, JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeProtocolProbeArtifact,
     ManualJudgeError,
 )
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 PairwiseCitationEvidence = tuple[tuple[ArtifactId, tuple[str, ...], tuple[str, ...]], ...]
 
@@ -104,6 +109,7 @@ class TemplateJudgeClient:
         code_revision: str,
         maximum_input_tokens: int | None = None,
         maximum_output_tokens: int,
+        request_scope: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Bind one target, optional same-task reference, and exact finalized contract.
 
@@ -121,6 +127,7 @@ class TemplateJudgeClient:
             code_revision: Exact producer revision for probe artifacts.
             maximum_input_tokens: Reserved request ceiling that rendered evidence must fit.
             maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
+            request_scope: Optional durable request scope keyed by the exact probe identity.
 
         Raises:
             ManualJudgeError: Pairwise feedback lacks a distinct same-task reference, or the
@@ -150,6 +157,8 @@ class TemplateJudgeClient:
         self._code_revision = code_revision
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
+        self._request_scope = request_scope
+        self._reference_answer = _authored_reference_answer(store, rollout)
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
         self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
@@ -208,18 +217,8 @@ class TemplateJudgeClient:
         Returns:
             Provider response after model dispatch or exact probe replay.
         """
-        probe_id = stable_id(
-            "manual-judge-probe",
-            {
-                "setup": self._setup_input.model_dump(mode="json"),
-                "rollout": self._rollout_input.model_dump(mode="json"),
-                "reference": (
-                    self._reference_input.model_dump(mode="json")
-                    if self._reference_input is not None
-                    else None
-                ),
-                "order": order,
-            },
+        probe_id = judge_probe_id(
+            self._setup_input, self._rollout_input, self._reference_input, order
         )
         saved = _read_probe_if_present(self._store, probe_id)
         if saved is not None:
@@ -231,23 +230,33 @@ class TemplateJudgeClient:
                 order,
             )
             self._probes.append(artifact_input(self._store.artifacts.read(saved.probe_id).manifest))
+            if saved.pricing_error is not None:
+                assert saved.unpriced_response is not None
+                raise JudgePricingError(saved.pricing_error, response=saved.unpriced_response)
             return ModelResponse(
                 output=AssistantAction(content=json.dumps(saved.response)),
                 model=saved.model,
                 economics=saved.economics,
             )
-        response = self._client.complete(
-            _bounded_judge_request(
-                self._template,
-                self._rubric,
-                candidate_a,
-                candidate_b,
-                maximum_input_tokens=self._maximum_input_tokens,
-                maximum_output_tokens=self._maximum_output_tokens,
-            )
-        )
+        context = self._request_scope(probe_id) if self._request_scope else nullcontext()
+        pricing_error = None
+        with context:
+            try:
+                response = self._client.complete(
+                    _bounded_judge_request(
+                        self._template,
+                        self._rubric,
+                        candidate_a,
+                        candidate_b,
+                        reference_answer=self._reference_answer,
+                        maximum_input_tokens=self._maximum_input_tokens,
+                        maximum_output_tokens=self._maximum_output_tokens,
+                    )
+                )
+            except JudgePricingError as error:
+                response, pricing_error = error.response, error
         self._provider_calls_made += 1
-        raw = _raw_response(response)
+        raw = _raw_response(response) if pricing_error is None else {}
         inputs = tuple(
             sorted(
                 (
@@ -271,6 +280,8 @@ class TemplateJudgeClient:
             response=raw,
             model=response.model,
             economics=response.economics,
+            pricing_error=str(pricing_error) if pricing_error is not None else None,
+            unpriced_response=response if pricing_error is not None else None,
         )
         try:
             manifest = self._store.artifacts.write_json(
@@ -282,6 +293,8 @@ class TemplateJudgeClient:
         except ArtifactAlreadyExistsError as exc:
             raise ManualJudgeError("manual judge probe conflicted during persistence") from exc
         self._probes.append(artifact_input(manifest))
+        if pricing_error is not None:
+            raise pricing_error
         return response
 
     def _normalize_single(self, response: ModelResponse) -> ModelResponse:
@@ -465,6 +478,24 @@ def pairwise_citation_evidence_from_probes(
     return tuple((dimension_id, (), ()) for dimension_id in first_by_id)
 
 
+def judge_probe_id(
+    setup: ArtifactInput,
+    rollout: ArtifactInput,
+    reference: ArtifactInput | None,
+    order: Literal["single", "forward", "reverse"],
+) -> str:
+    """Identify one exact provider probe, including probes interrupted before artifact storage."""
+    return stable_id(
+        "manual-judge-probe",
+        {
+            "setup": setup.model_dump(mode="json"),
+            "rollout": rollout.model_dump(mode="json"),
+            "reference": reference.model_dump(mode="json") if reference is not None else None,
+            "order": order,
+        },
+    )
+
+
 def _read_probe_if_present(store: ProjectStore, probe_id: str) -> JudgeProtocolProbeArtifact | None:
     """Load a completed probe when its stable identity already exists.
 
@@ -570,77 +601,98 @@ def _raw_response(response: ModelResponse) -> JsonObject:
     return cast(JsonObject, value)
 
 
+_REFERENCE_ANSWER_CACHE_SIZE = 8
+_reference_answers: OrderedDict[tuple[str, str], dict[str, str]] = OrderedDict()
+_reference_answers_lock = threading.Lock()
+
+
+def _authored_reference_answer(store: ProjectStore, rollout: RolloutArtifact) -> str | None:
+    """Return the expected answer of a simulated rollout's authored scenario, if any.
+
+    Task sets are immutable and content-addressed, so the answers of the few most recently
+    judged sets are kept in memory by artifact ID and task digest instead of re-reading the
+    whole set for every judgment.
+
+    Args:
+        store: Project-local immutable artifact store.
+        rollout: Verified rollout; simulated and sandbox rollouts carry a task-set binding.
+
+    Returns:
+        The authored task's reference answer, or None for production evidence, mined tasks
+        and authored tasks without one.
+    """
+    binding = rollout.simulation_binding or rollout.sandbox_binding
+    if binding is None:
+        return None
+    key = (binding.task_set_input.artifact_id, binding.task_set_tasks_sha256)
+    with _reference_answers_lock:
+        answers = _reference_answers.get(key)
+        if answers is not None:
+            _reference_answers.move_to_end(key)
+            return answers.get(rollout.task_id)
+    loaded = load_task_set(store.artifacts, binding.task_set_input.artifact_id)
+    if loaded.task_set.tasks_sha256 != binding.task_set_tasks_sha256:
+        raise ManualJudgeError("rollout task set differs from its simulation binding")
+    answers = {
+        task.task_id: task.reference_answer
+        for task in loaded.tasks
+        if task.reference_answer is not None
+    }
+    with _reference_answers_lock:
+        _reference_answers[key] = answers
+        _reference_answers.move_to_end(key)
+        while len(_reference_answers) > _REFERENCE_ANSWER_CACHE_SIZE:
+            _reference_answers.popitem(last=False)
+    return answers.get(rollout.task_id)
+
+
 def _bounded_judge_request(
     template: JudgePromptTemplate,
     rubric: Rubric,
     candidate_a: RolloutArtifact,
     candidate_b: RolloutArtifact | None,
     *,
+    reference_answer: str | None = None,
     maximum_input_tokens: int | None,
     maximum_output_tokens: int,
 ) -> ModelRequest:
-    """Build one judge request whose rendered evidence fits the reserved input ceiling.
-
-    Span payloads are elided deterministically, largest first, until the complete request
-    fits. Each elided payload keeps its span identity plus an exact digest and byte count,
-    so the judge still sees the full episode structure and the final output.
+    """Preserve full visible evidence and reject requests beyond the declared capacity.
 
     Args:
         template: Finalized executable prompt contract.
         rubric: Finalized scoring rubric.
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
-        maximum_input_tokens: Reserved conservative request ceiling, or ``None`` for no bound.
-        maximum_output_tokens: Reserved per-call output-token ceiling for dispatches.
+        reference_answer: Authored scenario's expected answer, shown only to the judge.
+        maximum_input_tokens: Conservative model input capacity, or None for no bound.
+        maximum_output_tokens: Reserved per-call output-token ceiling.
 
     Returns:
-        Complete provider-neutral judge request within the reserved ceiling.
+        Complete request without explicit sampling controls, preserving configured reasoning.
 
     Raises:
-        ManualJudgeError: The request exceeds the ceiling with every span payload elided.
+        JudgeTranscriptAdmissionError: Full evidence cannot fit the reserved model capacity.
     """
-    counter = Utf8UpperBoundTokenCounter()
-    rollouts = (candidate_a,) if candidate_b is None else (candidate_a, candidate_b)
-    elided: set[tuple[str, str]] = set()
-    while True:
-        request = ModelRequest(
-            messages=(
-                ModelMessage(role="system", content=template.prompt.text),
-                ModelMessage(
-                    role="user",
-                    content=_render_request(
-                        template,
-                        rubric,
-                        candidate_a,
-                        candidate_b,
-                        elided_spans=frozenset(elided),
-                    ),
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content=template.prompt.text),
+            ModelMessage(
+                role="user",
+                content=_render_request(
+                    template, rubric, candidate_a, candidate_b, reference_answer=reference_answer
                 ),
             ),
-            temperature=0.0,
-            maximum_output_tokens=maximum_output_tokens,
+        ),
+        maximum_output_tokens=maximum_output_tokens,
+    )
+    counted = Utf8UpperBoundTokenCounter().count(request)
+    if maximum_input_tokens is not None and counted > maximum_input_tokens:
+        raise JudgeTranscriptAdmissionError(
+            f"full judge evidence needs {counted:,} conservative input tokens, above the "
+            f"{maximum_input_tokens:,} reservation; choose a larger-context judge or "
+            "increase the judge input reservation"
         )
-        if maximum_input_tokens is None or counter.count(request) <= maximum_input_tokens:
-            return request
-        remaining = [
-            (
-                len(
-                    json.dumps(span["payload"], ensure_ascii=False, sort_keys=True).encode("utf-8")
-                ),
-                rollout.rollout_id,
-                cast(str, span["span_id"]),
-            )
-            for rollout in rollouts
-            for span in cast(list[JsonObject], visible_rollout_evidence(rollout)["spans"])
-            if (rollout.rollout_id, span["span_id"]) not in elided and span["payload"]
-        ]
-        if not remaining:
-            raise ManualJudgeError(
-                "judge request exceeds its reserved input ceiling with every span "
-                "payload elided; raise the judge input reservation"
-            )
-        _size, rollout_id, span_id = max(remaining)
-        elided.add((rollout_id, span_id))
+    return request
 
 
 def _render_request(
@@ -649,19 +701,21 @@ def _render_request(
     candidate_a: RolloutArtifact,
     candidate_b: RolloutArtifact | None,
     *,
-    elided_spans: frozenset[tuple[str, str]] = frozenset(),
+    reference_answer: str | None = None,
 ) -> str:
     """Render all finalized mapped variables and the exact saved response schema.
 
     Rollout variables use the shared judge-visible evidence projection, so rendered
-    requests exclude provider request payloads and candidate reasoning content.
+    requests exclude provider request payloads and candidate reasoning content. An authored
+    scenario's reference answer, when present, follows the mapped variables as its own
+    section; requests for every other scenario are unchanged.
 
     Args:
         template: Finalized executable prompt contract.
         rubric: Finalized scoring rubric.
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
-        elided_spans: Rollout and span identities whose payloads are digest-elided.
+        reference_answer: Authored scenario's expected answer, shown only to the judge.
 
     Returns:
         Deterministic request body containing every mapped variable and schema.
@@ -670,57 +724,26 @@ def _render_request(
         "rubric": [item.prompt_payload() for item in rubric.dimensions],
     }
     if candidate_b is None:
-        values["rollout"] = _rollout_payload(candidate_a, elided_spans)
+        values["rollout"] = visible_rollout_evidence(candidate_a)
     else:
-        values["candidate_a"] = _rollout_payload(candidate_a, elided_spans)
-        values["candidate_b"] = _rollout_payload(candidate_b, elided_spans)
+        values["candidate_a"] = visible_rollout_evidence(candidate_a)
+        values["candidate_b"] = visible_rollout_evidence(candidate_b)
     sections = [
         f"{cast(str, template.variable_mapping[key])}:\n"
         + json.dumps(values[key], ensure_ascii=False, sort_keys=True)
         for key in template.variable_mapping
     ]
+    if reference_answer is not None:
+        sections.append(
+            "REFERENCE_ANSWER (written by the scenario author as an expected answer; the "
+            "assistant never saw it, and a different answer can still be correct):\n"
+            + json.dumps(reference_answer, ensure_ascii=False)
+        )
     sections.append(
         "RESPONSE_SCHEMA:\n"
         + json.dumps(template.response_schema, ensure_ascii=False, sort_keys=True)
     )
     return "\n\n".join(sections)
-
-
-def _rollout_payload(
-    rollout: RolloutArtifact,
-    elided_spans: frozenset[tuple[str, str]] = frozenset(),
-) -> JsonObject:
-    """Return judge-visible evidence with selected span payloads digest-elided.
-
-    Args:
-        rollout: Verified immutable production rollout.
-        elided_spans: Rollout and span identities whose payloads are digest-elided.
-
-    Returns:
-        Deterministic judge-visible evidence projection with elided payload stubs.
-    """
-    evidence = visible_rollout_evidence(rollout)
-    if not elided_spans:
-        return evidence
-    spans = []
-    for span in cast(list[JsonObject], evidence["spans"]):
-        if (rollout.rollout_id, cast(str, span["span_id"])) not in elided_spans:
-            spans.append(span)
-            continue
-        payload = cast(JsonObject, span["payload"])
-        spans.append(
-            {
-                **span,
-                "payload": {
-                    "payload_elided": True,
-                    "payload_sha256": sha256_json(payload),
-                    "payload_bytes": len(
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-                    ),
-                },
-            }
-        )
-    return {**evidence, "spans": spans}
 
 
 def _validate_normalized_dimensions(dimensions: list[JsonObject], rubric: Rubric) -> None:

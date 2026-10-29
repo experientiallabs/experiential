@@ -7,8 +7,9 @@ import asyncio
 import math
 import time
 from collections.abc import Coroutine, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 from uuid import uuid4
 
 from exp.common.core.artifacts import JsonObject
@@ -19,8 +20,10 @@ from exp.common.models import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    ProviderDeadlineExceeded,
     RequestDeadline,
     as_async_transport,
     post_json_async,
@@ -30,6 +33,7 @@ from exp.runtime.models.providers.async_transport import (
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpTransport,
@@ -37,7 +41,12 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    is_unbilled_attempt,
+    propagate_request_attempt_evidence,
 )
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_RETRY_POLICY = RetryPolicy()
@@ -79,6 +88,16 @@ def completion_timeout_seconds(
     return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
 
 
+SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
+"""Wire dialects with a request field that preserves the caller's service tier.
+
+Canonical here (the lowest module both the wire dispatch and the profile share);
+``dialect_dispatch`` re-exports it so existing import paths are unchanged. A tier
+on any other dialect is stripped or declined, so ``forwards_tier`` gates on it to
+keep FORWARD and BILL consistent by construction.
+"""
+
+
 @dataclass(frozen=True)
 class GatewayWireProfile:
     """Everything a gateway data plane needs to dispatch one provider call.
@@ -86,6 +105,28 @@ class GatewayWireProfile:
     The native (Rust) data plane builds provider payloads and parses provider
     streams itself; this profile carries the connection-specific wire facts
     that only the resolved Python client knows.
+
+    Attributes:
+        credential_receipt: Optional worker-private source-credential receipt,
+            excluded from diagnostics and never serialized onto the native wire.
+            On Vertex this identifies the resolved service account, not a rotating
+            OAuth bearer, and does not authorize static-auth recovery.
+        recovery_binding: Optional private scope frozen from this exact profile
+            before recovery selection, excluded from diagnostics.
+        operational_region: Verified region or named global service scope for
+            this exact endpoint, or None when its scope is unknown.
+        supports_logprobs: Verified Chat probability support on this exact model.
+        supports_responses_logprobs: Native Responses probability support, opt-in.
+        logprobs_reasoning_efforts: Qualified efforts; empty means unknown support.
+        speech_url: Full OpenAI-wire ``/audio/speech`` endpoint sharing ``headers``;
+            None when the connection speaks no speech wire.
+        transcriptions_url: Full OpenAI-wire ``/audio/transcriptions`` endpoint
+            sharing ``headers``; None when the connection speaks no transcription wire.
+        organization_tag_key: Private HMAC key for the opaque per-organization
+            scheduling tag a self-hosted SystemOne origin receives
+            (``exp.runtime.gateway.organization_tag``); None sends no tag. Excluded
+            from diagnostics. The tag is only ever attached on a host-funded,
+            non-tenant rung, whatever this field holds.
     """
 
     dialect: str
@@ -95,8 +136,15 @@ class GatewayWireProfile:
     url: str
     """Full endpoint URL, including provider-specific query parameters."""
 
-    headers: Mapping[str, str] = field(default_factory=dict)
-    """Authenticated request headers for every dispatch."""
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    """Authenticated request headers for every dispatch, excluded from diagnostics."""
+
+    credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
+    recovery_binding: FrozenRecoveryBinding | None = field(default=None, repr=False)
+    operational_region: str | None = None
+
+    inference_geo: Literal["us"] | None = field(default=None, kw_only=True)
+    """Operator constraint applied after caller payload shaping on each Anthropic attempt."""
 
     model_id: str = ""
     """Exact provider model identifier."""
@@ -108,6 +156,45 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    tenant_origin: bool = False
+    """A customer-addressed origin: the data plane answers its failures opaquely and holds its
+    socket to the tenant destination policy (ports and platform infrastructure)."""
+    service_tier_pricing_enabled: bool = False
+    """Whether this HOST-funded rung may still forward ``service_tier``.
+
+    Normally a host-funded rung strips the tier (the gateway bills catalog
+    rates while a tier changes provider pricing). A model whose catalog carries
+    per-tier PASS-THROUGH pricing sets this so the tier reaches the provider on
+    the house lane too, and settlement bills the REQUESTED tier at that card's
+    cost. BYOK rungs forward regardless (``billing_customer_managed``); this
+    only widens the host-funded case for opted-in models.
+    """
+    service_tier_cards: frozenset[str] = frozenset()
+    """The named tiers this host-funded rung carries a pass-through card for.
+
+    Forwarding is PER-TIER, not lane-level: a mixed route may pair a rung
+    carded for ``flex`` with one that is not, and the tier is emitted only on
+    the candidate that can also BILL it. Populated from the deployment's
+    per-tier price cards; BYOK ignores it (it forwards every tier).
+    """
+    forwards_prompt_cache_key: bool = False
+    """Whether this rung's provider routes by ``prompt_cache_key``.
+
+    True where the field is documented (OpenAI) or verified live to pin a
+    request to one prefix-cache node (Tencent TokenHub, 2026-09-05: shared-stem
+    hit rate 4/10 without the key, 10/10 with it). Every other endpoint,
+    BYOK included, stays untouched: an unknown top-level field is a 400 on a
+    strict OpenAI-compatible server, and the wire profile is the only place
+    that knows.
+    """
+    forwards_prompt_cache_ttl: bool = False
+    """Whether this rung's wire carries OpenAI's ``prompt_cache_options.ttl``.
+
+    True only on OpenAI's own Responses API. The catalog's
+    ``supports_prompt_cache_ttl_12h`` says the lane's model honours the 12-hour
+    lifetime; this says the wire can send it, so a ChatGPT plan rung or a relay
+    inheriting the lane's capabilities declines instead of guessing.
+    """
     """Whether this rung dispatches on tenant-owned (BYOK) credentials.
 
     Tier selectors (``service_tier``) forward only where the caller pays the
@@ -115,6 +202,42 @@ class GatewayWireProfile:
     charges while the gateway bills catalog rates, so the field never
     reaches the provider there.
     """
+
+    forwards_cache_control: bool = False
+    """Whether this Chat adapter accepts explicit Anthropic cache markers."""
+
+    @property
+    def preserves_cache_control(self) -> bool:
+        """Whether this adapter can carry or translate explicit cache checkpoints."""
+        return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
+            self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
+
+    forwards_prompt_cache_options: bool = False
+    """Whether this rung's wire carries OpenAI's explicit prompt-caching controls.
+
+    ``prompt_cache_options.mode`` and the content-block ``prompt_cache_breakpoint``
+    markers (https://developers.openai.com/api/docs/guides/prompt-caching). True only
+    on origins that document or relay them: OpenAI's own API, Azure OpenAI and
+    OpenRouter (``prompt_cache_options.openai_prompt_cache_origin``). Every other
+    OpenAI-shaped server keeps the fields off its wire: a strict one answers an
+    unknown field with a 400.
+    """
+
+    def honors_cache_markers(self, *, openai_breakpoints: bool) -> bool:
+        """Whether this rung caches at the caller's explicit cache markers.
+
+        Args:
+            openai_breakpoints: Whether the caller marked blocks with OpenAI's
+                ``prompt_cache_breakpoint`` (``GatewayRequest.prompt_cache_breakpoints``),
+                which OpenAI-wire rungs carrying the field re-emit as such.
+
+        Returns:
+            True when the markers reach the provider in a form it caches at.
+        """
+        return self.preserves_cache_control or (
+            openai_breakpoints and self.forwards_prompt_cache_options
+        )
 
     minimum_temperature: float = 0.0
     """Smallest temperature value accepted by this provider wire."""
@@ -141,10 +264,10 @@ class GatewayWireProfile:
     """Largest top-k value accepted by the provider wire, when known."""
 
     supports_logprobs: bool = False
-    """Provider metadata for logprob support.
 
-    Dispatch stays disabled until normalized output projection exists.
-    """
+    supports_responses_logprobs: bool = False
+
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
 
     supports_frequency_penalty: bool = False
     """Whether this exact route accepts the ``frequency_penalty`` sampling control.
@@ -166,7 +289,10 @@ class GatewayWireProfile:
     """Exact provider field used to carry normalized reasoning effort."""
 
     reasoning_effort: str | None = None
-    """Optional provider default used when the wire requires an explicit effort."""
+    """The rung's catalog default depth (``reasoning_default_effort``).
+
+    Emitted when the wire requires an explicit effort, and the depth a
+    budget-less caller ``thinking`` config translates to on this rung."""
 
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     """Exact caller values declared by this deployment, in canonical order."""
@@ -180,11 +306,59 @@ class GatewayWireProfile:
     fireworks_reasoning_route_sha256: str | None = None
     """Exact Fireworks route identity that authorizes opaque reasoning replay."""
 
+    hunyuan_reasoning_route_sha256: str | None = None
+    """Exact Hunyuan (Tencent) route identity that authorizes gateway-sealed
+    preserved-thinking replay, mirroring ``fireworks_reasoning_route_sha256``:
+    non-None marks this rung as a reasoning-carrier rung whose native
+    ``reasoning_content`` round-trips through a gateway-issued opaque carrier."""
+
+    reasoning_output_exposed: bool = False
+    """Whether this rung's plaintext reasoning is exposed to the caller on output.
+
+    Off by default so OpenAI-hidden reasoning (o-series: only opaque/summary
+    events exist) never leaks. Turned on per rung for the exposable-plaintext
+    category (Tencent/DeepSeek/Anthropic) so the caller sees the model's thinking
+    it is already billed for; the round-trip token stays the sealed carrier."""
+
+    deepseek_reasoning_history: bool = False
+    """Whether this rung is DeepSeek's own API, whose thinking mode enforces
+    ``reasoning_content`` on every assistant tool-call turn in the history.
+
+    Origin-derived (``is_deepseek_base_url``), never a catalog stamp: the Chat
+    wire builder replays caller plaintext ``reasoning_content`` verbatim on
+    this rung and backfills an empty string on every assistant message that
+    lacks it — the provider requires the field on each assistant message of
+    the current turn, text-only ones included, and accepts an empty one
+    anywhere (DeepSeek validates presence, not content; verified live
+    2026-09-10).
+    Independent of ``reasoning_output_exposed``, which still decides alone
+    whether the caller SEES the reasoning deltas on output."""
+
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message ONLY as the
+    very first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not ``loop.first`` (a
+    second leading system turn included), so a vLLM origin serving it 400s
+    the whole request; coding agents put instruction turns mid-conversation
+    on every tool loop. A catalog stamp (``ModelCapabilities
+    .system_messages_leading_only``), never a hostname rule: the Chat wire
+    builder folds every instruction turn past the first into user text on a
+    declared rung and leaves every other rung's messages untouched."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 
     maximum_output_tokens: int | None = None
     """Largest caller output-token ceiling accepted by this exact model."""
+
+    minimum_output_tokens: int | None = None
+    """Smallest output-token ceiling this rung's provider accepts, when declared.
+
+    Catalog-declared (``GatewayDeploymentCapabilities.minimum_output_tokens``).
+    A smaller explicit caller ceiling is refused before dispatch, never raised.
+    Route selection may keep another rung that accepts the caller's ceiling."""
 
     signs_request_body: bool = False
     """Whether dispatch headers are computed per request over the exact
@@ -192,14 +366,67 @@ class GatewayWireProfile:
     pre-serialized body the data plane must send verbatim, and the resolved
     client exposes ``sign_gateway_dispatch``."""
 
+    omits_output_token_limit: bool = False
+    """Whether this rung's payload must carry no output-token ceiling.
+
+    The ChatGPT plan backend rejects ``max_output_tokens`` outright (400
+    "Unsupported parameter"). A ceiling is caller authority, so a request that
+    carries one narrows the plan rung out at admission (the route keeps any
+    API-key rung that honors it) and the payload never carries the field."""
+
     embeddings_url: str | None = None
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
     embeddings surface excludes the rung instead of dispatching a chat URL."""
 
+    decisions_url: str | None = None
+    """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
+
+    organization_tag_key: bytes | None = field(default=None, repr=False)
+
+    openai_decisions_url: str | None = None
+    """Full OpenAI Decisions API ``/decisions`` endpoint, present only on direct
+    OpenAI connections and sharing ``headers``; ``None`` keeps the OpenAI-shaped
+    decisions surface off every other wire."""
+
     images_url: str | None = None
-    """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
-    sharing ``headers``; ``None`` when the connection speaks no images wire."""
+    """Full image-generation endpoint for this connection, sharing ``headers``:
+    the OpenAI-wire ``/images/generations`` URL, or a Bedrock Stability model's
+    InvokeModel URL; ``None`` when the connection speaks no images wire."""
+
+    images_wire: Literal["openai", "bedrock_stability"] = "openai"
+    """The body and answer shape ``images_url`` speaks: the OpenAI Images API, or
+    Stability AI's Bedrock InvokeModel body (one image per call, signed per
+    dispatch like every Bedrock body)."""
+
+    speech_url: str | None = None
+    transcriptions_url: str | None = None
+
+    videos_url: str | None = None
+    """Full video-job creation endpoint for this connection, sharing ``headers``:
+    Veo's ``models/{model}:predictLongRunning`` on a Gemini connection, xAI's
+    ``/videos/generations`` on an xAI-origin OpenAI-compatible connection, and
+    ``None`` on every other connection, so the video surface excludes the rung."""
+
+    anthropic_vertex_version: str | None = None
+    """Set ONLY on an ``anthropic_messages`` rung served through Vertex AI
+    (Claude on Vertex). When present, the dispatch body builder drops the
+    top-level ``model`` field (the model is in the ``:rawPredict`` URL) and sets
+    ``anthropic_version`` to this value, which is how Vertex carries the version
+    that direct Anthropic sends in the ``anthropic-version`` HEADER. ``None`` on
+    direct Anthropic / Bedrock / Azure-Foundry Claude, whose bodies name the
+    model and omit ``anthropic_version``."""
+
+    @property
+    def replays_plaintext_reasoning(self) -> bool:
+        """Whether this rung forwards caller plaintext ``reasoning_content`` verbatim.
+
+        True on an exposure-stamped rung (the caller replays what that rung
+        itself returned) and on DeepSeek's origin, which REQUIRES the field on
+        tool-call history regardless of whether its output is exposed. Route
+        narrowing and the disclosure gate read this, never the two flags apart.
+        """
+        return self.reasoning_output_exposed or self.deepseek_reasoning_history
 
     def __post_init__(self) -> None:
         """Reject malformed operator wire contracts before admission."""
@@ -209,6 +436,9 @@ class GatewayWireProfile:
             "openai_compatible",
             "gemini_generate_content",
             "bedrock_converse_stream",
+            "typesafe_systemone",
+            # ElevenLabs' audio wire: admitted only on the audio surfaces.
+            "elevenlabs_audio",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {
@@ -284,6 +514,33 @@ class GatewayWireProfile:
             or self.maximum_output_tokens <= 0
         ):
             raise ValueError("gateway wire maximum_output_tokens must be a positive integer")
+
+    @property
+    def forwards_service_tier(self) -> bool:
+        """Whether this rung emits ``service_tier`` to the provider.
+
+        True on BYOK rungs (the caller pays the provider directly) and on
+        host-funded rungs whose model carries per-tier pass-through pricing.
+        """
+        return self.billing_customer_managed or self.service_tier_pricing_enabled
+
+    def forwards_tier(self, tier: str | None) -> bool:
+        """Whether this rung emits and can BILL the SPECIFIC requested ``tier``.
+
+        The single source of truth for FORWARD == BILL: forwarding is per-tier
+        AND requires a tier-capable wire dialect, so the accounting reprice and
+        the payload emission can never diverge. No tier -> False; a dialect with
+        no ``service_tier`` wire field -> False (it would strip or decline);
+        BYOK -> True (the caller pays the provider directly); otherwise the
+        host-funded rung must carry a pass-through card for THAT tier (else it
+        strips the tier and runs the provider default at the base rate —
+        billing-safe and disclosed).
+        """
+        if tier is None or self.dialect not in SERVICE_TIER_DIALECTS:
+            return False
+        if self.billing_customer_managed:
+            return True
+        return self.service_tier_pricing_enabled and tier in self.service_tier_cards
 
 
 class ProviderHttpClient(abc.ABC):
@@ -379,31 +636,72 @@ class ProviderHttpClient(abc.ABC):
         }
         request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
 
+        attempts = 0
+        unbilled_attempts = 0
+
         async def attempt(timeout_seconds: float) -> ModelResponse:
             """Send and parse one provider attempt under its remaining time bound."""
+            nonlocal attempts, unbilled_attempts
+            attempts += 1
             started_at = time.monotonic()
-            response = await self._transport.post(
-                url,
-                headers=request_headers,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                response = await self._transport.post(
+                    url,
+                    headers=request_headers,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                )
+            except ProviderTransportError as error:
+                unbilled_attempts += int(is_unbilled_attempt(error))
+                raise
             if not 200 <= response.status_code < 300:
+                unbilled_attempts += int(response.known_unbilled)
+                error = response.body.get("error")
+                if (
+                    idempotency_key is None
+                    and response.status_code == 409
+                    and isinstance(error, dict)
+                    and error.get("code") == "idempotency_replay_unavailable"
+                ):
+                    # The gateway confirms this completed operation cannot be replayed. A new
+                    # client-owned attempt gets a new key and remains inside the retry allowance.
+                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
+                    retry_after_seconds=response.retry_after_seconds,
+                    known_unbilled=response.known_unbilled,
                 )
-            return self._parse_response(
-                response.body,
-                latency_seconds=time.monotonic() - started_at,
-            )
+            try:
+                return self._parse_response(
+                    response.body,
+                    latency_seconds=time.monotonic() - started_at,
+                )
+            except ProviderTruncatedResponseError as error:
+                # A typed response cannot represent unfinished tool JSON. Preserve the
+                # paid body for the owning durable wrapper before it rejects this action.
+                raise ProviderTruncatedResponseError(
+                    str(error), response_body=deepcopy(response.body)
+                ) from error
+            except ProviderRetryableResponseError:
+                if idempotency_key is None:
+                    # Replaying a cached, completed empty response cannot produce usable output.
+                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
+                raise
 
-        return await run_with_retry_async(
+        result = await run_with_retry_async(
             attempt,
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
             classify=_classify_complete_retry,
+        )
+        return result.model_copy(
+            update={
+                "economics": result.economics.model_copy(
+                    update={"provider_attempts": attempts, "unbilled_attempts": unbilled_attempts}
+                )
+            }
         )
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
@@ -543,5 +841,14 @@ async def _wait_for[ResultT](
     Returns:
         The provider result before timeout.
     """
-    async with asyncio.timeout(timeout_seconds):
-        return await operation
+    timeout = asyncio.timeout(timeout_seconds)
+    try:
+        async with timeout:
+            return await operation
+    except TimeoutError as error:
+        if not timeout.expired():
+            raise
+        failure = ProviderDeadlineExceeded("provider request deadline exceeded")
+        if isinstance(error.__cause__, asyncio.CancelledError):
+            propagate_request_attempt_evidence(error.__cause__, failure)
+        raise failure from error

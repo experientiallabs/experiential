@@ -4,28 +4,31 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError, model_validator
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json
+from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
     GatewayLongContextTier,
-    GatewayPoolRecord,
+    GatewayRungDispatchPolicy,
     GatewayTokenPrices,
     ModelCatalog,
     ModelRecord,
     SFTModelProvenance,
 )
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
+    FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     SANE_MAX_SNAPSHOT_SCHEMA_VERSION,
     SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotDigestError,
+    CatalogSnapshotUnitError,
     ExactModelDeployment,
     ExactModelPool,
     NormalizedGatewayCatalog,
@@ -34,6 +37,13 @@ from exp.common.models.gateway_catalog import (
     normalize_gateway_catalog,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_chains import (
+    GatewayDeploymentRung,
+    GatewayModelChain,
+    GatewayModelReferenceRung,
+    expand_model_chain,
+)
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
 _DIGEST = "a" * 64
@@ -53,6 +63,224 @@ def _minimal_normalized() -> NormalizedGatewayCatalog:
     )
     pool = ExactModelPool(pool_id="dep-1", exact_model_id="exact-1", deployment_ids=("dep-1",))
     return NormalizedGatewayCatalog(deployments=(deployment,), pools=(pool,))
+
+
+def unavailable_child_catalog() -> ModelCatalog:
+    """Author a parent suffix and independent model without inventing a retired child's lane."""
+    return ModelCatalog(
+        connections={"provider": ConnectionConfig(provider="openai")},
+        models={
+            alias: ModelRecord(
+                connection="provider",
+                model=f"provider-{model}",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                gateway=GatewayDeploymentMetadata(exact_model_id=model),
+            )
+            for alias, model in (("a1", "a"), ("a2", "a"), ("c1", "c"))
+        },
+        gateway_pools={
+            "pool-a": GatewayPoolRecord(
+                exact_model_id="a",
+                deployment_aliases=("a1", "a2"),
+                equivalence=GatewayEquivalenceCertification(
+                    certification_id="parent",
+                    provenance="test exact-model evidence",
+                    evidence_sha256=_DIGEST,
+                    certified_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+            ),
+        },
+        gateway_model_chains={
+            "a": GatewayModelChain(
+                model_id="a",
+                pool_id="pool-a",
+                revision="parent",
+                rungs=(
+                    GatewayDeploymentRung(deployment_id="a1"),
+                    GatewayModelReferenceRung(model_id="b"),
+                    GatewayDeploymentRung(deployment_id="a2"),
+                ),
+            ),
+            "b": GatewayModelChain(
+                model_id="b",
+                pool_id="retired-b",
+                revision="retired",
+                available=False,
+            ),
+        },
+    )
+
+
+def test_poolless_unavailable_child_normalizes_without_synthetic_routes() -> None:
+    """An explicit empty tombstone preserves the parent suffix and independent plain model."""
+    authored = unavailable_child_catalog()
+    normalized = normalize_gateway_catalog(authored)
+    assert tuple(d.deployment_id for d in normalized.deployments) == ("a1", "a2", "c1")
+    assert {p.pool_id for p in normalized.pools} == {"pool-a", "c1"}
+    assert set(authored.models) == {"a1", "a2", "c1"}
+    expanded = expand_model_chain("a", normalized.chains_by_model())
+    assert [segment.deployment_ids for segment in expanded.segments] == [("a1",), ("a2",)]
+    assert expanded.visited_model_ids == ("a", "b")
+    assert expanded.examined_rungs == 3
+    assert [(e.reason, e.model_id, e.cursor) for e in expanded.events] == [
+        ("model_entered", "a", 0),
+        ("model_entered", "b", 1),
+        ("model_unavailable", "b", 1),
+        ("traversal_exhausted", "a", 2),
+    ]
+    assert normalized.requires_model_chain_authority(pool_id="pool-a")
+    assert not normalized.requires_model_chain_authority(pool_id="c1")
+    with pytest.raises(ValueError, match="pool is absent"):
+        normalized.requires_model_chain_authority(pool_id="retired-b")
+    assert NormalizedGatewayCatalog.model_validate_json(normalized.model_dump_json()) == normalized
+    plain = normalize_gateway_catalog(authored.model_copy(update={"gateway_model_chains": {}}))
+    assert plain.identity_sha256() != normalized.identity_sha256()
+    revised = authored.gateway_model_chains["b"].model_copy(update={"revision": "retired-again"})
+    changed = normalize_gateway_catalog(
+        authored.model_copy(
+            update={
+                "gateway_model_chains": {"a": authored.gateway_model_chains["a"], "b": revised},
+            }
+        )
+    )
+    assert changed.identity_sha256() != normalized.identity_sha256()
+
+
+@pytest.mark.parametrize(
+    "case", ["available", "unavailable-nonempty", "foreign-pool", "foreign-rung", "omitted-child"]
+)
+def test_unavailable_child_exception_never_weakens_pool_or_reference_identity(case: str) -> None:
+    """Only an absent pool on an explicitly unavailable empty chain is permitted."""
+    normalized = normalize_gateway_catalog(unavailable_child_catalog())
+    parent, child = normalized.model_chains
+    if case in {"available", "unavailable-nonempty"}:
+        child = GatewayModelChain(
+            model_id="b",
+            pool_id="retired-b",
+            revision="r",
+            available=case == "available",
+            rungs=(GatewayDeploymentRung(deployment_id="b1"),),
+        )
+    elif case == "foreign-pool":
+        child = child.model_copy(update={"pool_id": "pool-a"})
+    elif case == "foreign-rung":
+        parent = parent.model_copy(
+            update={"available": False, "rungs": (GatewayDeploymentRung(deployment_id="c1"),)}
+        )
+    with pytest.raises(ValueError, match="same-exact|belong|unavailable"):
+        NormalizedGatewayCatalog(
+            deployments=normalized.deployments,
+            pools=normalized.pools,
+            model_chains=(parent,) if case == "omitted-child" else (parent, child),
+        )
+    with pytest.raises(ValidationError, match="at least 1"):
+        ExactModelPool(pool_id="retired-b", exact_model_id="b", deployment_ids=())
+
+
+class _PoolRequiredChainReader(ContractModel):
+    """Frozen pool-required reader boundary before poolless unavailable-child support.
+
+    Attributes:
+        schema_version: Reader's known schema, default five.
+        deployments: Actual deployment metadata, empty by default.
+        pools: Nonempty physical pool records, empty by default.
+        model_chains: Explicit chain policy, empty by default.
+    """
+
+    schema_version: int = 5
+    deployments: tuple[ExactModelDeployment, ...] = ()
+    pools: tuple[ExactModelPool, ...] = ()
+    model_chains: tuple[GatewayModelChain, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_pool(self) -> _PoolRequiredChainReader:
+        """Preserve the exact cross-field condition, not a prunable unknown-field error."""
+        pools = {pool.pool_id: pool for pool in self.pools}
+        for chain in self.model_chains:
+            pool = pools.get(chain.pool_id)
+            if pool is None or pool.exact_model_id != chain.model_id:
+                raise ValueError("model chain must name its same-exact certified pool")
+        return self
+
+
+@pytest.mark.parametrize("schema", [5, 6])
+def test_poolless_tombstone_requires_capable_reader_even_under_tolerant_loading(
+    schema: int,
+) -> None:
+    """A prior chain reader rejects the new shape rather than silently inventing an empty pool."""
+    normalized = normalize_gateway_catalog(unavailable_child_catalog())
+    raw = normalized.model_dump(mode="json")
+    raw["schema_version"] = schema
+    with pytest.raises(ValidationError, match="same-exact"):
+        load_forward_compatible(_PoolRequiredChainReader, json.dumps(raw))
+    plain = _minimal_normalized()
+    old = _PoolRequiredChainReader.model_validate_json(plain.model_dump_json())
+    assert (
+        sha256_json(old.model_dump(mode="json", exclude_defaults=True)) == plain.identity_sha256()
+    )
+
+
+class _PreChainSchema5(ContractModel):
+    """Frozen current-main top-level reader shape without model-chain execution."""
+
+    schema_version: int = Field(default=5, ge=1)
+    deployments: tuple[ExactModelDeployment, ...] = ()
+    pools: tuple[ExactModelPool, ...] = ()
+
+    def identity_sha256(self) -> Sha256:
+        """Reproduce the current-main default-excluding identity contract."""
+        return sha256_json(self.model_dump(mode="json", by_alias=True, exclude_defaults=True))
+
+
+class _PreChainSchema4(_PreChainSchema5):
+    """Older stable reader uses tolerant parsing for schema-five documents."""
+
+    schema_version: int = Field(default=4, ge=1)
+
+
+def _read_pre_chain(data: str, digest: str, *, schema: int) -> _PreChainSchema5:
+    """Exercise each old reader's same-schema digest check and foreign-schema bypass."""
+    parsed, _dropped = load_forward_compatible(
+        _PreChainSchema5 if schema == 5 else _PreChainSchema4, data
+    )
+    if parsed.schema_version == schema and parsed.identity_sha256() != digest:
+        raise CatalogSnapshotDigestError("catalog snapshot digest does not match pinned authority")
+    return parsed
+
+
+def test_empty_model_chains_preserve_current_main_schema5_identity() -> None:
+    """Empty chains preserve current-main identity and older serving compatibility."""
+    current = _minimal_normalized()
+    for explicit in (False, True):
+        document = current.model_dump(mode="json")
+        if not explicit:
+            document.pop("model_chains")
+        for schema in (4, 5):
+            loaded = _read_pre_chain(json.dumps(document), current.identity_sha256(), schema=schema)
+            assert loaded.deployments == current.deployments
+            assert loaded.pools == current.pools
+            if schema == 5:
+                assert loaded.identity_sha256() == current.identity_sha256()
+
+
+def test_populated_chains_require_a_feature_floor_not_only_schema5() -> None:
+    """Current-main refuses lost policy, but schema-four workers require the host fleet fence."""
+    plain = _minimal_normalized()
+    policy = GatewayModelChain(
+        model_id="exact-1",
+        pool_id="dep-1",
+        revision="explicit-policy",
+        available=False,
+        rungs=(GatewayDeploymentRung(deployment_id="dep-1"),),
+    )
+    current = plain.model_copy(update={"model_chains": (policy,)})
+    with pytest.raises(CatalogSnapshotDigestError):
+        _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=5)
+    # Schema four treats five as foreign and silently drops the unavailable
+    # policy. Publishing chains to that fleet is unsafe even though main uses five.
+    lost_policy = _read_pre_chain(current.model_dump_json(), current.identity_sha256(), schema=4)
+    assert lost_policy.deployments == plain.deployments
+    assert "model_chains" not in type(lost_policy).model_fields
 
 
 def test_load_forward_compatible_drops_unknown_fields_and_reports_them() -> None:
@@ -121,6 +349,35 @@ def test_read_pinned_snapshot_same_version_requires_the_exact_digest() -> None:
         read_pinned_normalized_snapshot(catalog.model_dump_json().encode(), "b" * 64)
 
 
+def test_read_pinned_snapshot_upgrades_schema_3_and_refuses_older_money_units() -> None:
+    """Schema 3 (the previous build's micro-USD snapshot) is UPGRADED at read
+    time by version (see ``nano_usd_upgrade_test`` for the price twin pins);
+    schema 1 and 2 are refused by name; a schema-4 document smuggling a micro
+    key is refused. The refusal is its own error, never a digest mismatch."""
+    assert SNAPSHOT_SCHEMA_VERSION == 5
+    assert FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION == 4
+    micro: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
+    # The previous build wrote every price key under its micro name (nulls too).
+    micro["deployments"][0]["gateway"]["prices"] = {
+        key.replace("_nano_usd_", "_micro_usd_"): value
+        for key, value in micro["deployments"][0]["gateway"]["prices"].items()
+    }
+    micro["schema_version"] = 3
+    served = read_pinned_normalized_snapshot(json.dumps(micro).encode(), "b" * 64)
+    assert served.schema_version == 3
+    assert served.deployments[0].gateway.prices == GatewayTokenPrices()
+    for micro_version in (1, 2):
+        micro["schema_version"] = micro_version
+        with pytest.raises(CatalogSnapshotUnitError, match="predates"):
+            read_pinned_normalized_snapshot(json.dumps(micro).encode(), "b" * 64)
+    nano: dict[str, Any] = json.loads(_minimal_normalized().model_dump_json())
+    nano["deployments"][0]["gateway"]["prices"]["input_micro_usd_per_million_tokens"] = 1
+    with pytest.raises(CatalogSnapshotUnitError, match="micro-USD price key"):
+        read_pinned_normalized_snapshot(json.dumps(nano).encode(), "b" * 64)
+    assert issubclass(CatalogSnapshotUnitError, ValueError)
+    assert not issubclass(CatalogSnapshotUnitError, CatalogSnapshotDigestError)
+
+
 def test_read_pinned_snapshot_serves_a_cross_version_snapshot_without_the_digest_check() -> None:
     """Roll-safety guard: a snapshot from a NEWER build (higher schema_version,
     an unknown pool field, a digest this build cannot recompute) is SERVED under
@@ -169,11 +426,11 @@ def _identity_fixture_catalog() -> ModelCatalog:
                         supports_streaming=True, supports_image_input=True
                     ),
                     prices=GatewayTokenPrices(
-                        input_micro_usd_per_million_tokens=150,
-                        output_micro_usd_per_million_tokens=600,
+                        input_nano_usd_per_million_tokens=150,
+                        output_nano_usd_per_million_tokens=600,
                         long_context=GatewayLongContextTier(
                             input_threshold_tokens=200_000,
-                            input_micro_usd_per_million_tokens=300,
+                            input_nano_usd_per_million_tokens=300,
                         ),
                     ),
                 ),
@@ -215,11 +472,14 @@ def test_identity_digest_is_pinned_until_a_deliberate_schema_version_bump() -> N
     - You deliberately changed identity output (default change, rename,
       removal, normalization change): bump ``SNAPSHOT_SCHEMA_VERSION`` and
       repin BOTH values below in the same change.
+
+    Version 4 (the micro-USD to nano-USD money-unit move) renamed every price
+    key, so the digest was repinned with it.
     """
     normalized = normalize_gateway_catalog(_identity_fixture_catalog())
     assert (SNAPSHOT_SCHEMA_VERSION, normalized.identity_sha256()) == (
-        3,
-        "f9e74a42f5b47ec0a0739836ef15bbfa36df4eaa7c34efee10c421d46962529f",
+        5,
+        "df22e497cb162814a54a4321963859fd1bc8499e8fdd68c1e35c7df6a1520f0e",
     )
 
 
@@ -235,6 +495,7 @@ def test_added_defaulted_fields_and_explicit_defaults_do_not_perturb_identity() 
         GatewayDeploymentCapabilities(),
         GatewayTokenPrices(),
         GatewayDeploymentMetadata(),
+        GatewayRungDispatchPolicy(),
         ModelCapabilities(),
         NormalizedGatewayCatalog(),
     ):
@@ -251,16 +512,71 @@ def test_added_defaulted_fields_and_explicit_defaults_do_not_perturb_identity() 
     )
 
 
+def test_defaulted_cache_write_fields_do_not_perturb_identity_but_populated_ones_do() -> None:
+    """Defaulted cache-write fields stay identity-invisible; populated ones change the digest."""
+    # Defaulted cache-write pricing and capability stay excluded from identity.
+    assert (
+        GatewayDeploymentCapabilities(reports_cache_creation_input_tokens=False).model_dump(
+            mode="json", by_alias=True, exclude_defaults=True
+        )
+        == {}
+    )
+    assert GatewayTokenPrices().model_dump(mode="json", by_alias=True, exclude_defaults=True) == {}
+    assert GatewayLongContextTier(input_threshold_tokens=200_000).model_dump(
+        mode="json", by_alias=True, exclude_defaults=True
+    ) == {"input_threshold_tokens": 200000}
+
+    base = _identity_fixture_catalog()
+    base_digest = normalize_gateway_catalog(base).identity_sha256()
+
+    # Populated cache-write pricing changes the deployment digest and thus the catalog identity.
+    priced = base.model_copy(deep=True)
+    priced.models["bare"] = priced.models["bare"].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    cache_creation_input_nano_usd_per_million_tokens=3_750_000,
+                    long_context=GatewayLongContextTier(
+                        input_threshold_tokens=200_000,
+                        cache_creation_input_nano_usd_per_million_tokens=3_000_000,
+                    ),
+                ),
+                capabilities=GatewayDeploymentCapabilities(
+                    reports_cache_creation_input_tokens=True
+                ),
+            )
+        }
+    )
+    assert normalize_gateway_catalog(priced).identity_sha256() != base_digest
+
+    # Explicit defaults still hash identically to leaving them unset.
+    explicit = base.model_copy(deep=True)
+    explicit.models["bare"] = explicit.models["bare"].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(cache_creation_input_nano_usd_per_million_tokens=None),
+                capabilities=GatewayDeploymentCapabilities(
+                    reports_cache_creation_input_tokens=False
+                ),
+            )
+        }
+    )
+    assert normalize_gateway_catalog(explicit).identity_sha256() == base_digest
+
+
 def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
     """Anti-regression change-detector for the roll-safety contract.
 
     A rolling deploy detects a cross-version snapshot only by ``schema_version``,
-    so every change to the normalized-catalog TOP-LEVEL shape MUST bump
-    ``SNAPSHOT_SCHEMA_VERSION`` in the same change (nested additive growth is
-    covered by the pinned identity digest test above, which defaulted fields
-    pass automatically). If this fails, bump ``SNAPSHOT_SCHEMA_VERSION`` and
-    update the pinned fingerprint below together, so the reader keeps serving
-    old and new pods through a roll instead of hard-failing.
+    so every change to the normalized-catalog TOP-LEVEL shape stops here for a
+    deliberate decision. A defaulted ADDITIVE field is identity-invisible (the
+    pinned identity digest test above passes untouched) and an older reader
+    drops it as unknown, so it updates this fingerprint WITHOUT a bump and its
+    authoring stays deployment-ordered (author only once every worker parses
+    it). Anything else (a default change, rename, removal, or normalization
+    change) MUST bump ``SNAPSHOT_SCHEMA_VERSION`` and repin the digest test in
+    the same change, so the reader keeps serving old and new pods through a
+    roll instead of hard-failing.
     """
     fingerprint = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
@@ -269,8 +585,8 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
         "pool": sorted(ExactModelPool.model_fields),
     }
     assert fingerprint == {
-        "schema_version": 3,
-        "normalized": ["deployments", "pools", "schema_version"],
+        "schema_version": 5,
+        "normalized": ["deployments", "model_chains", "pools", "schema_version"],
         "deployment": [
             "billing_source",
             "capabilities",
@@ -291,6 +607,8 @@ def test_normalized_schema_change_requires_a_schema_version_bump() -> None:
             "exact_model_id",
             "failover_mode",
             "pool_id",
+            "throttle_cache_threshold",
+            "throttle_redial",
         ],
     }
 
@@ -596,6 +914,163 @@ def test_authored_pool_failover_mode_carries_into_the_normalized_pool() -> None:
     )
 
 
+def test_affinity_pool_and_dispatch_policy_round_trip_and_move_identity() -> None:
+    """The affinity opt-in normalizes intact, and AUTHORING it moves the digest.
+
+    Adding the fields to the schema is identity-invisible (the pinned-digest
+    test above); actually authoring a value is a real catalog change and must
+    produce a new content address.
+    """
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-affinity",
+        provenance="operator comparison run 2026-09-04",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+
+    def catalog(*, opted_in: bool) -> ModelCatalog:
+        """Build the same two-rung catalog with and without the opt-in."""
+        dispatch = (
+            GatewayRungDispatchPolicy(concurrency_bound=8, fair_share=True, affinity_weight=10.0)
+            if opted_in
+            else None
+        )
+        return ModelCatalog(
+            connections={"openai": ConnectionConfig(provider="openai")},
+            models={
+                "route-a": ModelRecord(
+                    connection="openai",
+                    model="m-a",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    gateway=GatewayDeploymentMetadata(
+                        exact_model_id="exact-affinity", dispatch=dispatch
+                    ),
+                ),
+                "route-b": ModelRecord(
+                    connection="openai",
+                    model="m-b",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    gateway=GatewayDeploymentMetadata(exact_model_id="exact-affinity"),
+                ),
+            },
+            gateway_pools={
+                "affinity-pool": GatewayPoolRecord(
+                    exact_model_id="exact-affinity",
+                    deployment_aliases=("route-a", "route-b"),
+                    equivalence=certification,
+                    failover_mode=(
+                        "maximize_cache_affinity" if opted_in else "maximize_availability"
+                    ),
+                )
+            },
+        )
+
+    normalized = normalize_gateway_catalog(catalog(opted_in=True))
+    assert normalized.pools[0].failover_mode == "maximize_cache_affinity"
+    lead = next(
+        deployment for deployment in normalized.deployments if deployment.source_alias == "route-a"
+    )
+    assert lead.gateway.dispatch == GatewayRungDispatchPolicy(
+        concurrency_bound=8, fair_share=True, affinity_weight=10.0
+    )
+    baseline = normalize_gateway_catalog(catalog(opted_in=False))
+    assert normalized.identity_sha256() != baseline.identity_sha256()
+
+
+def test_pool_throttle_cache_threshold_validates_normalizes_and_is_identity_inert() -> None:
+    """The cache-stakes threshold is a bounded fraction, carried intact, inert unauthored.
+
+    An unauthored (``None``) threshold contributes zero identity bytes, so the
+    field's existence leaves every published pool digest where it was (the
+    pinned-digest fixture above authors a ``maximize_cache`` pool without one
+    and stays pinned); authoring a value is a real catalog change.
+    """
+    certification = GatewayEquivalenceCertification(
+        certification_id="certification-threshold",
+        provenance="operator comparison run 2026-09-10",
+        evidence_sha256=_DIGEST,
+        certified_at=datetime(2026, 9, 10, tzinfo=UTC),
+    )
+
+    def record(threshold: float | None) -> GatewayPoolRecord:
+        """Build the same certified pool with one authored threshold."""
+        return GatewayPoolRecord(
+            exact_model_id="exact-threshold",
+            deployment_aliases=("route-a", "route-b"),
+            equivalence=certification,
+            failover_mode="maximize_cache",
+            throttle_cache_threshold=threshold,
+        )
+
+    for accepted in (None, 0.0, 0.5, 1.0):
+        assert record(accepted).throttle_cache_threshold == accepted
+    for rejected in (-0.1, 1.1, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            record(rejected)
+
+    # Unauthored: byte-identical identity serialization to a pool that never
+    # heard of the field, spelled implicitly or explicitly.
+    unauthored = record(None).model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    assert "throttle_cache_threshold" not in unauthored
+    legacy = GatewayPoolRecord(
+        exact_model_id="exact-threshold",
+        deployment_aliases=("route-a", "route-b"),
+        equivalence=certification,
+        failover_mode="maximize_cache",
+    )
+    assert legacy.model_dump(mode="json", by_alias=True, exclude_defaults=True) == unauthored
+
+    def catalog(threshold: float | None) -> ModelCatalog:
+        """Build the two-rung authored catalog around one pool record."""
+        return ModelCatalog(
+            connections={"openai": ConnectionConfig(provider="openai")},
+            models={
+                "route-a": ModelRecord(
+                    connection="openai",
+                    model="m-a",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    gateway=GatewayDeploymentMetadata(exact_model_id="exact-threshold"),
+                ),
+                "route-b": ModelRecord(
+                    connection="openai",
+                    model="m-b",
+                    billing_source=BillingSource.HOST_MANAGED,
+                    gateway=GatewayDeploymentMetadata(exact_model_id="exact-threshold"),
+                ),
+            },
+            gateway_pools={"threshold-pool": record(threshold)},
+        )
+
+    baseline = normalize_gateway_catalog(catalog(None))
+    assert baseline.pools[0].throttle_cache_threshold is None
+    assert baseline.pools[0].failover_mode == "maximize_cache"
+    authored = normalize_gateway_catalog(catalog(0.5))
+    assert authored.pools[0].throttle_cache_threshold == 0.5
+    assert authored.identity_sha256() != baseline.identity_sha256()
+    # The redial schedule rides the same hop and is just as inert unauthored.
+    assert baseline.pools[0].throttle_redial is None
+    schedule = GatewayThrottleRedialPolicy(max_attempts=3, base_delay_ms=500, max_delay_ms=8_000)
+    scheduled = catalog(None).model_copy(
+        update={
+            "gateway_pools": {
+                "threshold-pool": record(None).model_copy(update={"throttle_redial": schedule})
+            }
+        }
+    )
+    normalized = normalize_gateway_catalog(scheduled)
+    assert normalized.pools[0].throttle_redial == schedule
+    assert normalized.identity_sha256() != baseline.identity_sha256()
+    # The normalized pool bounds the fraction exactly like the authored record.
+    with pytest.raises(ValidationError):
+        ExactModelPool(
+            pool_id="threshold-pool",
+            exact_model_id="exact-threshold",
+            deployment_ids=("route-a", "route-b"),
+            equivalence=certification,
+            throttle_cache_threshold=2.0,
+        )
+
+
 def test_equivalence_catalog_rejects_implicit_false_or_ambiguous_grouping() -> None:
     """Missing exact declarations, training handles, and repeated membership fail closed."""
     certification = GatewayEquivalenceCertification(
@@ -662,3 +1137,21 @@ def test_normalized_multi_deployment_pool_requires_operator_certification() -> N
             exact_model_id="exact-one",
             deployment_ids=("route-a", "route-b"),
         )
+
+
+def test_probability_defaults_preserve_published_snapshot_identity() -> None:
+    """Absent and explicit dark probability metadata hydrate the same pinned catalog."""
+    caps = GatewayDeploymentCapabilities.model_validate({})
+    explicit = GatewayDeploymentCapabilities(
+        supports_responses_logprobs=False, logprobs_reasoning_efforts=()
+    )
+    assert caps == explicit
+    assert explicit.model_dump(mode="json", exclude_defaults=True) == {}
+    normalized = normalize_gateway_catalog(_identity_fixture_catalog())
+    document = normalized.model_dump(mode="json", by_alias=True, exclude_defaults=True)
+    assert "supports_responses_logprobs" not in str(document)
+    assert "logprobs_reasoning_efforts" not in str(document)
+    assert (
+        NormalizedGatewayCatalog.model_validate(document).identity_sha256()
+        == normalized.identity_sha256()
+    )

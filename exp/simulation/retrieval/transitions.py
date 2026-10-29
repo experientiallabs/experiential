@@ -118,8 +118,9 @@ def _trace_transitions(trace: Trace, lineage_id: str) -> list[RAGTransition]:
         if action.kind == "tool_call":
             observation_pair = _tool_observation(
                 span,
-                spans[index + 1 :],
+                spans,
                 used_tool_observations,
+                spans[index:],
             )
         else:
             observation_pair = _message_observation(span, spans[index + 1 :])
@@ -180,13 +181,14 @@ def _action(span: TraceSpan) -> RAGAction | None:
 
 def _tool_observation(
     action_span: TraceSpan,
-    later_spans: Sequence[TraceSpan],
+    spans: Sequence[TraceSpan],
     used_span_ids: set[str],
+    pending_spans: Sequence[TraceSpan],
 ) -> tuple[TraceSpan, RAGObservation] | None:
     """Find the exact subsequent observed result for one real tool call."""
     call_id = action_span.attributes.get("gen_ai.tool.call.id")
     tool_name = action_span.attributes.get("gen_ai.tool.name")
-    for span in later_spans:
+    for span in spans:
         if span.span_id in used_span_ids or span.started_at < action_span.ended_at:
             continue
         if span.attributes.get("gen_ai.operation.name") != _TOOL_OPERATION:
@@ -194,11 +196,32 @@ def _tool_observation(
         if call_id is not None:
             if span.attributes.get("gen_ai.tool.call.id") != call_id:
                 continue
-        elif span.attributes.get("gen_ai.tool.name") != tool_name:
+        else:
+            if (
+                span.attributes.get("gen_ai.tool.name") != tool_name
+                or span.attributes.get("gen_ai.tool.call.id") is not None
+            ):
+                continue
+            possible = sum(
+                candidate.attributes.get("gen_ai.operation.name") != _TOOL_OPERATION
+                and candidate.attributes.get("gen_ai.tool.name") == tool_name
+                and candidate.attributes.get("gen_ai.tool.call.id") is None
+                and candidate.ended_at <= span.started_at
+                for candidate in pending_spans
+            )
+            if possible > 1:
+                raise ValueError(
+                    f"ambiguous result for tool {tool_name!r}; supply call IDs before "
+                    "using this trace as action/reply evidence"
+                )
+        if "gen_ai.tool.message" not in span.attributes:
             continue
-        content = _visible_text(span.attributes.get("gen_ai.tool.message"))
-        if content is None:
-            continue
+        value = span.attributes["gen_ai.tool.message"]
+        content = normalize_durable_text(
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        )
         used_span_ids.add(span.span_id)
         return span, RAGObservation(kind="tool_result", content=content)
     return None

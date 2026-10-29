@@ -1,7 +1,10 @@
-//! Incremental upstream relay: one provider response decoded and normalized
-//! into gateway events, plus the shared collection helpers that bound and
-//! classify what the relay yields. The waterfall commits a relay to one
-//! deployment; the HTTP surfaces then drain it live or to completion.
+//! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
+
+mod deadline;
+pub use deadline::{
+    deadline_while_generating, stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE,
+};
+mod progress;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
@@ -10,16 +13,19 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 
+use crate::codex_native_inversion::{NativeToolInverter, NativeToolTranslation};
 use crate::dialects::{
     Dialect, FrameDecoder, Normalizer, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
+use crate::stop_sequences::StopSequenceGuard;
+use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
+use crate::tool_serialization::ToolCallSerializer;
 use crate::waterfall::CommittedAttempt;
 
-/// Map one collection failure to its public error, honoring the shared
-/// aggregate-output overflow contract.
+/// Map collection failures to public errors, honoring aggregate-output bounds.
 pub fn collection_public_error(failure: &Failure) -> PublicError {
     if failure.safe_message == OUTPUT_OVERFLOW_MESSAGE {
         return PublicError::provider_output_too_large();
@@ -27,13 +33,12 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
     failure.public_error()
 }
 
-/// Approximate retained size of one aggregated event, in bytes. Completed
-/// tool calls charge their full argument text, matching the python engine's
-/// bounded aggregation, which also charges the completed call after its
-/// streamed deltas.
+/// Approximate retained event bytes. Completed calls charge their full arguments
+/// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::TextDelta(text) | Event::RefusalDelta(text) => text.len(),
+        Event::GeminiThoughtPart(part) => crate::dialects::json_retained_bytes(part),
+        Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()
         }
@@ -44,44 +49,49 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::EncryptedReasoning {
             encrypted_content, ..
         } => encrypted_content.len(),
-        Event::ReasoningContentDelta { delta, .. } => delta.len(),
+        Event::ReasoningContentDelta { delta, .. } | Event::ReasoningTextDelta(delta) => {
+            delta.len()
+        }
         Event::ToolArgumentsDelta { delta, .. } | Event::ServerToolArgumentsDelta { delta, .. } => {
             delta.len()
         }
-        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => {
-            call.raw_arguments.len().max(64)
-        }
+        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => call
+            .raw_arguments
+            .len()
+            .max(64)
+            .saturating_add(call.thought_signature.as_deref().map_or(0, str::len)),
         Event::ServerToolResult { block, .. } => block.len(),
         Event::CitationDelta { citation, .. } => citation.len(),
+        Event::HostedToolItemStarted { item, .. } | Event::HostedToolItemCompleted { item, .. } => {
+            item.len()
+        }
+        Event::HostedToolItemProgress { payload, .. } => payload.len(),
+        Event::ProviderTextAnnotation { annotation, .. } => annotation.len(),
+        Event::ProviderOutputItemStarted { item_id, .. } => {
+            64usize.saturating_add(item_id.as_deref().map_or(0, str::len))
+        }
+        Event::ChoiceLogprobsDelta(delta) => delta.retained_bytes(),
+        Event::ProviderResponsesLogprobs {
+            item_id,
+            phase,
+            records,
+            ..
+        } => crate::dialects::records_retained_bytes(records)
+            .map(|size| {
+                size.saturating_add(item_id.len())
+                    .saturating_add(phase.len())
+            })
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
+        Event::SafeguardResults(results) => crate::dialects::records_retained_bytes(results)
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         _ => 64,
     }
 }
 
-/// Classify one mid-stream chunk timeout the way the python transport does:
-/// a stalled provider read is a retryable transport failure unless the
-/// request's own deadline is exhausted.
-pub fn stream_timeout_failure(deadline: Instant) -> Failure {
-    if remaining(deadline).is_zero() {
-        Failure::new(FailureClass::Timeout, "gateway execution deadline exceeded")
-    } else {
-        Failure::new(
-            FailureClass::Transport,
-            "provider transport failed; retry the request",
-        )
-        .with_retry(true, true)
-    }
-}
-
-/// Classify a provider that accepted the connection but did not stream its
-/// first byte within the fail-fast time-to-first-byte bound. A stalled lead
-/// deployment must not hold the request for its full per-chunk timeout, so
-/// this is a transient, capacity-shaped failure that is failover-eligible.
-///
-/// It is deliberately *not* same-deployment retryable: a lane that accepted
-/// the connection but never answered is the clearest dead-lane signal, and
-/// redialing it would only stall again for another window. Skipping the redial
-/// and advancing straight to the next certified deployment is what keeps a
-/// fresh pod's cost on a dead lane near one fail-fast window instead of several.
+/// Classify a provider missing its first semantic token within the fail-fast bound.
+/// Headers, keepalives and role-only frames do not count. Advance to the next
+/// certified deployment without redialing the stalled lane, limiting its cost
+/// to one first-token window rather than the full per-chunk timeout.
 pub fn first_byte_timeout_failure() -> Failure {
     Failure::new(
         FailureClass::Timeout,
@@ -118,6 +128,16 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
             // (and price) per-invocation server tool activity.
             tool_names.push(call.name.clone());
         }
+        // Hosted Responses tool INVOCATIONS are provider-executed too; the
+        // item type ("web_search_call", "mcp_call", ...) names the activity.
+        // Results, approvals, and opaque conversation items never record a
+        // call that did not occur.
+        Event::HostedToolItemCompleted { item_type, .. }
+            if crate::events::hosted_item_type_is_invocation(item_type)
+                && !tool_names.contains(item_type) =>
+        {
+            tool_names.push(item_type.clone());
+        }
         _ => {}
     }
 }
@@ -126,44 +146,99 @@ pub fn track_event(event: &Event, usage: &mut Option<Usage>, tool_names: &mut Ve
 /// whichever wire framing the dialect uses (SSE, or the AWS binary
 /// event-stream framing for Bedrock).
 pub struct UpstreamRelay {
+    /// Response-side inversion map for Codex native tools translated on a
+    /// foreign wire; empty on every native-Responses route (a no-op there).
+    native_tool_inverter: NativeToolInverter,
+    /// Swallows every call to the gateway's tool-search tool so the caller
+    /// never sees it; inert until the tool is named (see `tool_search`).
+    tool_search: ToolSearchWithholder,
     stream: BoxStream<'static, reqwest::Result<Bytes>>,
     decoder: FrameDecoder,
     normalizer: Normalizer,
+    /// Normalized events not yet passed through the stop-sequence guard.
     pending: VecDeque<Event>,
+    /// Guarded events ready to yield.
+    ready: VecDeque<Event>,
+    /// Gateway-emulated stop sequences for this rung, when the provider wire
+    /// carries none; `None` passes every event straight through.
+    stop_guard: Option<StopSequenceGuard>,
+    /// Gateway-emulated `parallel_tool_calls: false`: one tool call per turn.
+    tool_serializer: Option<ToolCallSerializer>,
+    /// The provider of a customer-managed (BYOK) rung: a credential or account
+    /// failure the provider declares on this stream, before or after commit,
+    /// is re-owned as the customer's. `None` on house rungs.
+    customer_managed_provider: Option<String>,
+    /// A tenant origin: every failure this stream yields answers opaquely.
+    tenant_origin: bool,
     eof: bool,
+    /// Whether any body byte has arrived: stamps the time-to-first-byte
+    /// histogram once. It does NOT satisfy the stall bound below: a provider
+    /// can send headers, keepalive comments and role-only frames at once and
+    /// still stall for minutes before its first token (2026-09-19, ~2 min
+    /// medians on a lane whose first byte was instant).
     first_byte_recorded: bool,
-    /// Fail-fast bound for the very first provider byte. Once the first byte
-    /// arrives (`first_byte_recorded`), subsequent reads use the deployment's
-    /// per-chunk timeout instead, so a slow reasoning model can stream for a
-    /// long time after it has started answering.
-    first_byte_deadline: Instant,
+    /// Whether the first-token allowance still applies. Committed genuine
+    /// output or a private token begins generation; withheld refusals do not.
+    /// Generation uses a progress-idle deadline, independent of whether the
+    /// waterfall can still safely fail over.
+    stall_bound_armed: bool,
+    /// Commitment prevents failover; it does not itself prove generation.
+    committed: bool,
+    /// Irreversible provider tool work has its own phase: byte-idle and the
+    /// hard deadline still apply, but generation may legitimately be silent.
+    provider_tools: progress::ProviderTools,
+    /// Client tool arguments the provider buffers: generation may stay silent
+    /// longer while one is open, still under the hard deadline.
+    tool_arguments: progress::BufferedToolArguments,
+    /// Last genuine normalized generation progress, never the arrival of
+    /// transport bytes or protocol scaffolding. The connection timeout bounds
+    /// the gap from this instant once generation has begun.
+    last_progress_at: Option<Instant>,
+    /// Time handed to the consumer is not provider-idle time. Only generation
+    /// idle pauses here; first-token and total deadlines remain absolute.
+    yielded_at: Option<Instant>,
+    /// Fail-fast bound for the provider's first token, absolute from the dial
+    /// (`waterfall::first_token_allowance`: the first-token base plus the
+    /// input slope; the header phase has its own, shorter first-byte bound).
+    first_token_deadline: Instant,
     /// Wall-clock time this relay yielded its first output token (a content,
     /// reasoning, or tool-call delta), or `None` before any token arrives.
     /// Distinct from `first_byte_recorded`: the first byte can be an SSE frame
     /// carrying only role/lifecycle scaffolding, so time-to-first-token is
     /// stamped on the first event that carries visible model output.
     first_token_at: Option<SystemTime>,
+    observation: Option<crate::settlement::Observation>,
+    capture_reasoning: Option<crate::capture::reasoning::Observer>,
+    /// Capture-only probabilities this dial requested (`crate::capture::logprobs`).
+    pub(crate) logprobs: crate::capture::logprobs::Held,
 }
 
 impl UpstreamRelay {
+    /// Image models put a complete encoded image in one SSE frame.
+    pub fn allow_image_output(&mut self) {
+        if let FrameDecoder::Sse(decoder) = &mut self.decoder {
+            decoder.allow_image_output();
+        }
+    }
+
     pub fn new(
         response: reqwest::Response,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
     ) -> Self {
-        Self::new_with_reasoning_content_route(response, dialect, first_byte_deadline, None)
+        Self::new_with_reasoning_content_route(response, dialect, first_token_deadline, None)
     }
 
     pub fn new_with_reasoning_content_route(
         response: reqwest::Response,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
         reasoning_content_route_sha256: Option<String>,
     ) -> Self {
         Self::from_stream_with_reasoning_content_route(
             response.bytes_stream().boxed(),
             dialect,
-            first_byte_deadline,
+            first_token_deadline,
             reasoning_content_route_sha256,
         )
     }
@@ -172,15 +247,15 @@ impl UpstreamRelay {
     fn from_stream(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
     ) -> Self {
-        Self::from_stream_with_reasoning_content_route(stream, dialect, first_byte_deadline, None)
+        Self::from_stream_with_reasoning_content_route(stream, dialect, first_token_deadline, None)
     }
 
     fn from_stream_with_reasoning_content_route(
         stream: BoxStream<'static, reqwest::Result<Bytes>>,
         dialect: Dialect,
-        first_byte_deadline: Instant,
+        first_token_deadline: Instant,
         reasoning_content_route_sha256: Option<String>,
     ) -> Self {
         Self {
@@ -191,11 +266,160 @@ impl UpstreamRelay {
                 reasoning_content_route_sha256,
             ),
             pending: VecDeque::new(),
+            ready: VecDeque::new(),
+            stop_guard: None,
+            tool_serializer: None,
+            customer_managed_provider: None,
+            tenant_origin: false,
             eof: false,
             first_byte_recorded: false,
-            first_byte_deadline,
+            stall_bound_armed: true,
+            committed: false,
+            provider_tools: progress::ProviderTools::default(),
+            tool_arguments: progress::BufferedToolArguments::default(),
+            last_progress_at: None,
+            yielded_at: None,
+            first_token_deadline,
             first_token_at: None,
+            native_tool_inverter: NativeToolInverter::default(),
+            tool_search: ToolSearchWithholder::default(),
+            observation: None,
+            capture_reasoning: None,
+            logprobs: Default::default(),
         }
+    }
+
+    pub(crate) fn set_observation(&mut self, observation: crate::settlement::Observation) {
+        self.observation = Some(observation);
+    }
+
+    pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
+        self.logprobs.attach(&observer);
+        self.capture_reasoning = Some(observer);
+    }
+
+    /// Parse gateway-requested probabilities into the capture side buffer only.
+    pub(crate) fn enable_logprobs_capture(&mut self) {
+        self.normalizer.enable_logprobs_capture();
+        self.logprobs.injected = true;
+    }
+
+    /// Close the network body before any settlement callback is awaited.
+    /// Already normalized usage and terminals remain in the guard snapshot.
+    pub(crate) fn close_transport(&mut self) {
+        self.stream = futures_util::stream::empty().boxed();
+        self.eof = true;
+        let events = self.normalizer.finish_metadata_drain();
+        self.queue_events(events);
+        // Drain only already decoded events through effective stop/tool rules.
+        // This never polls the provider and retains a stop-adjusted terminal.
+        let mut drain_failure = None;
+        loop {
+            match self.guard_next_pending() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(failure) => {
+                    self.pending.clear();
+                    drain_failure = Some(failure);
+                    break;
+                }
+            }
+        }
+        if let Some(observation) = self.observation.take() {
+            for event in &self.ready {
+                // queue_events already recorded the newest meter, folded
+                // across dials. A raw buffered report can be older or partial.
+                if !matches!(event, Event::Usage(_)) {
+                    observation.record(event);
+                }
+                observation.record_effective_terminal(event);
+            }
+        }
+        if let Some(failure) = drain_failure {
+            self.ready.push_back(Event::Failed(failure));
+        }
+    }
+
+    fn queue_events(&mut self, events: Vec<Event>) {
+        let taken = self.normalizer.take_captured_logprobs();
+        self.logprobs
+            .forward(taken, self.capture_reasoning.as_ref());
+        if let Some(observation) = &self.observation {
+            observation.record_service_tier(&self.normalizer.service_tier);
+            // Several dialects retain a parsed meter until terminal encoding.
+            // Accounting observes it now, even when this frame yields no event.
+            if let Some(usage) = self.normalizer.observed_usage() {
+                if self.normalizer.meter_replaces_earlier() {
+                    observation.replace_usage(usage);
+                } else {
+                    observation.record(&Event::Usage(usage.clone()));
+                }
+            }
+            for event in &events {
+                match event {
+                    Event::Usage(_) => observation.record(event),
+                    Event::Failed(failure) => {
+                        observation.record(&Event::Failed(self.owned_failure(failure.clone())));
+                    }
+                    _ if event.is_terminal() => observation.record(event),
+                    _ => {}
+                }
+            }
+            if self.normalizer.unreported_stop_read_as_length() {
+                observation.mark_unreported_truncation();
+            }
+        }
+        self.pending.extend(events);
+    }
+
+    /// Pin the attempt. Structural output can commit before generation, so
+    /// it keeps the full first-token allowance until genuine progress arrives.
+    pub fn commit(&mut self) {
+        self.committed = true;
+        if self.last_progress_at.is_some() {
+            self.stall_bound_armed = false;
+        }
+    }
+
+    /// A private token starts generation without committing the attempt.
+    /// Its buffered carrier has not escaped, so a later stall can fail over.
+    pub fn private_progress(&mut self) {
+        self.stall_bound_armed = false;
+    }
+
+    /// Absolute expiry checks are required even when the stream is always
+    /// ready: Tokio's timeout polls a ready future before its timer.
+    fn read_failure(&self, deadline: Instant, phase_timeout: Duration) -> Option<Failure> {
+        if remaining(deadline).is_zero() {
+            if self.last_progress_at.is_some() {
+                return Some(deadline_while_generating());
+            }
+            return Some(stream_timeout_failure(deadline));
+        }
+        if self.provider_tools.active() {
+            return None;
+        }
+        if self.stall_bound_armed {
+            return remaining(self.first_token_deadline)
+                .is_zero()
+                .then(first_byte_timeout_failure);
+        }
+        let idle_bound = self.tool_arguments.idle_bound(phase_timeout);
+        self.last_progress_at
+            .filter(|last| last.elapsed() >= idle_bound)
+            .map(|_| {
+                Failure::new(
+                    FailureClass::Transport,
+                    "provider stopped making progress; retry the request",
+                )
+                .with_retry(false, true)
+            })
+    }
+
+    /// Prefer the normalizer's latest cumulative report on an abnormal end.
+    /// Dialects that yield usage directly keep their last yielded report.
+    pub fn usage_before_failure(&self, reported: Option<Usage>) -> Option<Usage> {
+        self.normalizer.observed_usage().cloned().or(reported)
     }
 
     /// The wall-clock time this relay yielded its first output token, or
@@ -205,6 +429,169 @@ impl UpstreamRelay {
         self.first_token_at
     }
 
+    /// The upstream an aggregator named for this stream (OpenRouter's `provider`), settled at commit.
+    pub fn upstream_provider(&self) -> Option<String> {
+        self.normalizer.upstream_provider().map(str::to_string)
+    }
+
+    /// Caller-known words (the dispatched model id) exempt from the stream-error identifier screen.
+    pub fn set_request_words<I, S>(&mut self, words: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the caller's output cap into terminal classification.
+    pub fn set_output_token_cap(&mut self, cap: Option<u64>) {
+        self.normalizer.set_output_token_cap(cap);
+    }
+
+    /// Carry the rung's cache-write accounting into usage normalization.
+    pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.normalizer
+            .set_cache_writes_within_reads(writes_within_reads);
+    }
+
+    /// Carry whether this rung asked for 12-hour cache writes into usage normalization.
+    pub fn set_twelve_hour_cache_writes(&mut self, requested: bool) {
+        self.normalizer.set_twelve_hour_cache_writes(requested);
+    }
+
+    /// Carry the tokens this attempt's own automatic cache create wrote.
+    pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
+        self.normalizer.set_gemini_cache_writes(written);
+    }
+
+    /// Carry the Codex native-tool inversion map (see
+    /// `codex_native_inversion`); applied to every tool-call event this relay
+    /// yields. Empty leaves every event untouched.
+    pub fn set_native_tool_translation(&mut self, translation: NativeToolTranslation) {
+        self.native_tool_inverter.translation = translation;
+    }
+
+    /// Name the gateway's tool-search tool (see `tool_search`): every call to
+    /// it is withheld from the yielded events and accumulated for the
+    /// waterfall. `None` withholds nothing.
+    pub fn set_tool_search_tool_name(&mut self, tool_name: Option<String>) {
+        self.tool_search.set_tool_name(tool_name);
+    }
+
+    /// How many completed calls to the tool-search tool this relay withheld
+    /// and has not handed over yet.
+    pub fn withheld_search_call_count(&self) -> usize {
+        self.tool_search.withheld_count()
+    }
+
+    /// Whether this relay saw any call to the tool-search tool, completed or
+    /// still open.
+    pub fn withheld_search_call_seen(&self) -> bool {
+        self.tool_search.withheld_any()
+    }
+
+    /// Hand over the withheld tool-search calls, leaving none behind.
+    /// Whether the dial's search calls exceeded the withholder's bounds.
+    pub fn withheld_search_overflowed(&self) -> bool {
+        self.tool_search.overflowed()
+    }
+
+    pub fn take_withheld_search_calls(&mut self) -> Vec<WithheldSearchCall> {
+        self.tool_search.take_withheld()
+    }
+
+    /// Name the customer-managed provider this relay dispatches on, so every
+    /// provider-declared credential or quota failure it yields is the
+    /// customer's (see `stream_errors::customer_credential_failure`).
+    pub fn set_customer_managed_provider(&mut self, provider: Option<String>) {
+        self.customer_managed_provider = provider;
+    }
+
+    /// Mark this relay's origin as a tenant's, so every failure it yields is opaque.
+    pub fn set_tenant_origin(&mut self, tenant: bool) {
+        self.tenant_origin = tenant;
+    }
+
+    /// Attribute one yielded failure: a customer-managed provider owns its
+    /// credential failures, and a tenant origin's answer is opaque.
+    fn owned_failure(&self, failure: Failure) -> Failure {
+        let failure = match self.customer_managed_provider.as_deref() {
+            Some(provider) => crate::stream_errors::customer_credential_failure(failure, provider),
+            None => failure,
+        };
+        failure.with_tenant_origin(self.tenant_origin)
+    }
+
+    /// Serialize this relay's tool calls to one per turn (the caller sent
+    /// `parallel_tool_calls: false` to a wire without that control).
+    pub fn set_serialize_tool_calls(&mut self, serialize: bool) {
+        self.tool_serializer = serialize.then(ToolCallSerializer::new);
+    }
+
+    /// Enable the probability output requested in the frozen provider payload.
+    pub fn set_probability_output(&mut self, chat: bool, payload: &serde_json::Value) {
+        self.normalizer.enable_chat_logprobs(
+            chat && payload.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true),
+        );
+        self.normalizer.enable_responses_logprobs(
+            payload.get("top_logprobs").is_some_and(|v| !v.is_null())
+                || payload
+                    .get("include")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|items| items.iter().any(|v| v == "message.output_text.logprobs")),
+        );
+    }
+
+    /// Enforce stop sequences before yielding events; an empty set is a no-op.
+    pub fn set_stop_sequences<I, S>(&mut self, sequences: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.stop_guard = StopSequenceGuard::new(sequences);
+    }
+
+    /// Move one normalized event through the stop-sequence guard (if any)
+    /// onto the ready queue.
+    fn guard_next_pending(&mut self) -> Result<bool, Failure> {
+        let Some(mut event) = self.pending.pop_front() else {
+            return Ok(false);
+        };
+        if let Event::Failed(failure) = &event {
+            event = Event::Failed(self.owned_failure(failure.clone()));
+        }
+        // Progress belongs to the provider, not the outward projection. A
+        // stop-sequence match suppresses later text while still draining the
+        // provider's genuine generation to its terminal usage report.
+        self.provider_tools.observe(&event);
+        self.tool_arguments.observe(&event);
+        if event.is_generation_progress() {
+            self.last_progress_at = Some(Instant::now());
+            if self.committed {
+                self.stall_bound_armed = false;
+            }
+        }
+        // The gateway's own search tool is withheld first: it is not one of
+        // the caller's tools, so it never counts toward one-call-per-turn
+        // serialization and never reaches the Codex inversion or the caller.
+        let Some(mut event) = self.tool_search.filter(event) else {
+            return Ok(true);
+        };
+        if let Some(serializer) = self.tool_serializer.as_mut() {
+            let Some(kept) = serializer.filter(event) else {
+                return Ok(true);
+            };
+            event = kept;
+        }
+        for event in self.native_tool_inverter.filter(event)? {
+            match self.stop_guard.as_mut() {
+                Some(guard) => self.ready.extend(guard.filter(event)),
+                None => self.ready.push_back(event),
+            }
+        }
+        Ok(true)
+    }
+
     /// Route an abnormal stream termination through the normalizer's recovery.
     /// The relay is done either way, so mark EOF; when recovery applies (a
     /// Gemini stream that emitted content) the synthesized terminal is buffered
@@ -212,8 +599,9 @@ impl UpstreamRelay {
     /// propagates. See `Normalizer::recover_abnormal_end`.
     fn recover_or_fail(&mut self, failure: Failure) -> Result<(), Failure> {
         self.eof = true;
+        self.stream = futures_util::stream::empty().boxed();
         let events = self.normalizer.recover_abnormal_end(failure)?;
-        self.pending.extend(events);
+        self.queue_events(events);
         Ok(())
     }
 
@@ -227,8 +615,13 @@ impl UpstreamRelay {
         phase_timeout: Duration,
         request_started: Instant,
     ) -> Result<Option<Event>, Failure> {
+        if let (Some(yielded), Some(last)) =
+            (self.yielded_at.take(), self.last_progress_at.as_mut())
+        {
+            *last += yielded.elapsed();
+        }
         loop {
-            if let Some(event) = self.pending.pop_front() {
+            if let Some(event) = self.ready.pop_front() {
                 // Every yielded event exits here, so this is the one place that
                 // stamps time-to-first-token: the first event carrying visible
                 // model output. Prefix events peeked during commit also passed
@@ -236,34 +629,72 @@ impl UpstreamRelay {
                 // whether it is later replayed from a prefix or drained live.
                 if self.first_token_at.is_none() && event.is_output_token() {
                     self.first_token_at = Some(SystemTime::now());
+                    if let Some(observation) = &self.observation {
+                        observation.record_first_token(self.first_token_at);
+                    }
+                }
+                if let Some(observation) = &self.observation {
+                    observation.record(&event);
+                    observation.record_effective_terminal(&event);
+                }
+                self.yielded_at = Some(Instant::now());
+                if let Some(observer) = &self.capture_reasoning {
+                    observer.observe(&event);
                 }
                 return Ok(Some(event));
+            }
+            if self.guard_next_pending()? {
+                continue;
             }
             if self.eof {
                 return Ok(None);
             }
-            // Before the first byte the fail-fast time-to-first-byte bound
-            // applies; after it, each chunk is paced by the deployment's own
-            // per-chunk timeout so long-running generation is never capped.
-            let waiting_for_first_byte = !self.first_byte_recorded;
-            let bound = if waiting_for_first_byte {
-                remaining(deadline).min(remaining(self.first_byte_deadline))
+            // Already decoded events, especially a terminal with usage, are
+            // drained first. A slow downstream consumer cannot turn a received
+            // terminal into a provider stall. No fresh read may bypass expiry.
+            let drain_started = self.normalizer.metadata_drain_started();
+            if let Some(started) = drain_started {
+                // One existing body-read allowance from declared finish, never
+                // renewed by trailers, keepalives or downstream backpressure.
+                // EOF ends immediately; the total request deadline still wins.
+                if remaining(deadline).is_zero() || started.elapsed() >= phase_timeout {
+                    self.close_transport();
+                    continue;
+                }
+            } else if let Some(failure) = self.read_failure(deadline, phase_timeout) {
+                return Err(failure);
+            }
+            // Bytes never renew either bound. Genuine progress renews the
+            // generation idle window, while the total request deadline stays
+            // fixed across progress and all physical attempts.
+            let progress_deadline = if let Some(started) = drain_started {
+                started + phase_timeout
+            } else if self.provider_tools.active() {
+                Instant::now() + phase_timeout
+            } else if self.stall_bound_armed {
+                self.first_token_deadline
             } else {
-                remaining(deadline).min(phase_timeout)
+                self.last_progress_at.expect("generation has begun")
+                    + self.tool_arguments.idle_bound(phase_timeout)
             };
+            let bound = remaining(deadline).min(remaining(progress_deadline));
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(_))) => {
+                Ok(Some(Err(error))) => {
                     // A transport break mid-stream: recover a Gemini partial as
                     // Incomplete, otherwise surface the retryable transport
                     // failure. Pre-content it stays a retryable transport error
-                    // either way.
+                    // either way. The engine's account of the break (never
+                    // provider text) rides to the ledger.
                     self.recover_or_fail(
                         Failure::new(
                             FailureClass::Transport,
                             "provider transport failed; retry the request",
                         )
-                        .with_retry(true, true),
+                        .with_retry(true, true)
+                        .with_provider_detail(Some(
+                            crate::upstream::transport_error_detail("stream", &error),
+                        )),
                     )?;
                     continue;
                 }
@@ -287,34 +718,47 @@ impl UpstreamRelay {
                     };
                     if let Some(frame) = tail {
                         match self.normalizer.feed(&frame) {
-                            Ok(events) => self.pending.extend(events),
+                            Ok(events) => self.queue_events(events),
                             Err(failure) => {
                                 self.recover_or_fail(failure)?;
                                 continue;
                             }
                         }
                     }
-                    // A Gemini stream may end cleanly after its last content
-                    // frame without a finishReason frame; synthesize the
-                    // terminal completion (folding the last-seen usage) so a
-                    // real answer is not thrown away as malformed. A stream
-                    // that produced no content stays terminal-less and the
-                    // caller still synthesizes `ended_without_terminal`.
-                    self.pending.extend(self.normalizer.on_stream_end());
+                    // A stream may end cleanly without a terminal frame: a
+                    // Gemini stream after its last content frame (no
+                    // finishReason), or an OpenAI-compatible stream whose
+                    // finish_reason chunk arrived without a `[DONE]` sentinel
+                    // (Azure Foundry's DeepSeek content-filter ending). The
+                    // normalizer synthesizes the terminal the dialect already
+                    // declared so a real answer or refusal is not thrown away
+                    // as malformed; a stream that declared nothing stays
+                    // terminal-less and the caller still synthesizes
+                    // `ended_without_terminal`.
+                    match self.normalizer.on_stream_end() {
+                        Ok(events) => self.queue_events(events),
+                        Err(failure) => {
+                            self.recover_or_fail(failure)?;
+                        }
+                    }
                     continue;
                 }
                 Err(_) => {
-                    // A first-byte stall while the request deadline still has
-                    // budget is the fail-fast case: classify it as a
-                    // failover-eligible transient so the next rung is tried at
-                    // once. A later chunk stall, or an exhausted request
-                    // deadline, keeps the existing transport/deadline mapping.
-                    if waiting_for_first_byte && !remaining(deadline).is_zero() {
-                        return Err(first_byte_timeout_failure());
+                    if drain_started.is_some() {
+                        self.close_transport();
+                        continue;
                     }
-                    return Err(stream_timeout_failure(deadline));
+                    return Err(self
+                        .read_failure(deadline, phase_timeout)
+                        .unwrap_or_else(|| stream_timeout_failure(deadline)));
                 }
             };
+            if drain_started.is_some_and(|started| {
+                remaining(deadline).is_zero() || started.elapsed() >= phase_timeout
+            }) {
+                self.close_transport();
+                continue;
+            }
             if !self.first_byte_recorded {
                 METRICS
                     .time_to_first_byte_ms
@@ -337,19 +781,29 @@ impl UpstreamRelay {
             };
             for frame in frames {
                 match self.normalizer.feed(&frame) {
-                    Ok(events) => self.pending.extend(events),
+                    Ok(events) => self.queue_events(events),
                     Err(failure) => {
                         self.recover_or_fail(failure)?;
                         break;
                     }
                 }
             }
+            if self.normalizer.metadata_drain_started().is_some() {
+                // An always-ready stream of trailers must not prevent the
+                // request owner from cancelling its pending read.
+                tokio::task::yield_now().await;
+            }
         }
     }
 }
 
-/// Drain one committed attempt to completion for non-streaming responses,
-/// bounding total retained output like the python service's aggregation.
+impl Drop for UpstreamRelay {
+    fn drop(&mut self) {
+        self.close_transport();
+    }
+}
+
+/// Drain one non-streaming attempt, bounding output like the Python aggregation.
 pub async fn collect_committed(
     committed: &mut CommittedAttempt,
     deadline: Instant,
@@ -358,12 +812,20 @@ pub async fn collect_committed(
 ) -> Result<Vec<Event>, Failure> {
     let mut events: Vec<Event> = Vec::new();
     let mut retained_bytes = 0usize;
+    let mut lease = crate::retained::RetainedLease::default();
     let mut retain = |events: &mut Vec<Event>, event: Event| -> Result<(), Failure> {
-        retained_bytes = retained_bytes.saturating_add(event_retained_bytes(&event));
+        let bytes = event_retained_bytes(&event);
+        retained_bytes = retained_bytes.saturating_add(bytes);
         if retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
             return Err(Failure::new(
                 FailureClass::ProviderInternal,
                 OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        if !lease.reserve(bytes) {
+            return Err(Failure::new(
+                FailureClass::Unavailable,
+                crate::retained::WORKER_RETENTION_EXHAUSTED_MESSAGE,
             ));
         }
         events.push(event);
@@ -376,11 +838,14 @@ pub async fn collect_committed(
         return Ok(events);
     }
     loop {
-        match committed
+        let next = committed
             .relay
             .next_event(deadline, phase_timeout, request_started)
-            .await?
-        {
+            .await;
+        if matches!(next, Err(_) | Ok(None) | Ok(Some(Event::Failed(_)))) {
+            committed.usage = committed.relay.usage_before_failure(committed.usage.take());
+        }
+        match next? {
             Some(event) => {
                 track_event(&event, &mut committed.usage, &mut committed.tool_names);
                 let terminal = event.is_terminal();
@@ -395,145 +860,15 @@ pub async fn collect_committed(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dialects::Dialect;
-    use crate::events::Event;
-    use futures_util::stream;
+mod gemini_usage_tests;
+#[cfg(test)]
+mod progress_tests;
+#[cfg(test)]
+mod tests;
 
-    #[tokio::test]
-    async fn first_token_at_is_stamped_on_the_first_output_delta() {
-        // A content delta then the OpenAI terminal sentinel.
-        let frames = vec![
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let mut relay = UpstreamRelay::from_stream(
-            stream::iter(frames).boxed(),
-            Dialect::OpenAiCompatible,
-            Instant::now() + Duration::from_secs(5),
-        );
-        assert!(
-            relay.first_token_at().is_none(),
-            "no first-token time before any event is yielded"
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let per_chunk = Duration::from_secs(5);
-        let first = relay
-            .next_event(deadline, per_chunk, Instant::now())
-            .await
-            .expect("the stream yields")
-            .expect("an event is produced");
-        assert!(
-            matches!(&first, Event::TextDelta(text) if text == "hi"),
-            "the first output event is the content delta"
-        );
-        assert!(
-            relay.first_token_at().is_some(),
-            "the first content delta stamps time-to-first-token"
-        );
-    }
-
-    #[test]
-    fn a_first_byte_stall_fails_over_without_redialing_the_dead_lane() {
-        let failure = first_byte_timeout_failure();
-        assert_eq!(failure.failure_class, FailureClass::Timeout);
-        assert!(failure.failover_eligible);
-        // A stalled lane is skipped, not redialed: redialing it would only
-        // stall again for another window.
-        assert!(!failure.retryable_same_deployment);
-    }
-
-    #[tokio::test]
-    async fn a_gemini_partial_then_abnormal_frame_ends_incomplete_not_failed() {
-        // A Gemini content frame, its usage, then a structurally malformed frame
-        // (a non-string text part). The relay must route the abnormal end
-        // through recovery: yield the content, fold the usage, and end on an
-        // Incomplete terminal instead of surfacing the malformed failure.
-        let frames = vec![
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":3}}\n\n",
-            )),
-            Ok::<_, reqwest::Error>(Bytes::from(
-                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":5}]}}]}\n\n",
-            )),
-        ];
-        let mut relay = UpstreamRelay::from_stream(
-            stream::iter(frames).boxed(),
-            Dialect::GeminiGenerateContent,
-            Instant::now() + Duration::from_secs(5),
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let per_chunk = Duration::from_secs(5);
-        let mut seen: Vec<Event> = Vec::new();
-        loop {
-            let event = relay
-                .next_event(deadline, per_chunk, Instant::now())
-                .await
-                .expect("recovery yields events, never the malformed failure");
-            match event {
-                Some(event) => {
-                    let terminal = event.is_terminal();
-                    seen.push(event);
-                    if terminal {
-                        break;
-                    }
-                }
-                None => panic!("the recovered terminal must arrive before EOF"),
-            }
-        }
-        assert!(
-            matches!(seen.first(), Some(Event::TextDelta(text)) if text == "partial"),
-            "the partial content is delivered"
-        );
-        assert!(
-            seen.iter().any(|event| matches!(event, Event::Usage(_))),
-            "last-seen usage is folded so delivered tokens bill"
-        );
-        assert!(
-            matches!(seen.last(), Some(Event::Incomplete)),
-            "the turn ends incomplete, not failed"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stalled_first_byte_trips_the_ttft_bound_not_the_chunk_timeout() {
-        // A provider that opened the stream but never sends a byte must fail
-        // over in about the time-to-first-byte window, not the (far larger)
-        // per-chunk deployment timeout.
-        let never = stream::pending::<reqwest::Result<Bytes>>().boxed();
-        let time_to_first_byte = Duration::from_millis(80);
-        let mut relay = UpstreamRelay::from_stream(
-            never,
-            Dialect::OpenAiCompatible,
-            Instant::now() + time_to_first_byte,
-        );
-        let request_deadline = Instant::now() + Duration::from_secs(120);
-        let per_chunk_timeout = Duration::from_secs(35);
-
-        let started = Instant::now();
-        let outcome = relay
-            .next_event(request_deadline, per_chunk_timeout, started)
-            .await;
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "expected a fail-fast time-to-first-byte trip, waited {elapsed:?}"
-        );
-        let failure = outcome.expect_err("a never-yielding stream must not succeed");
-        assert_eq!(failure.failure_class, FailureClass::Timeout);
-        assert!(
-            failure.failover_eligible,
-            "a first-byte stall must advance to the next deployment"
-        );
-    }
-}
+#[cfg(test)]
+#[path = "relay_disconnect_tests.rs"]
+mod disconnect_tests;
 
 #[cfg(test)]
 mod h2_abort_tests {
@@ -628,6 +963,12 @@ mod h2_abort_tests {
         );
         assert_eq!(failure.failure_class, FailureClass::Transport);
         assert!(failure.failover_eligible, "an aborted rung fails over");
+        // The engine's account of the mid-stream break rides to the ledger.
+        let detail = failure
+            .provider_detail
+            .as_deref()
+            .expect("transport detail");
+        assert!(detail.starts_with("stream "), "{detail}");
     }
 
     #[tokio::test]
@@ -642,3 +983,7 @@ mod h2_abort_tests {
         assert!(failure.failover_eligible);
     }
 }
+
+#[cfg(test)]
+#[path = "codex_native_stream_tests.rs"]
+mod codex_native_stream_tests;

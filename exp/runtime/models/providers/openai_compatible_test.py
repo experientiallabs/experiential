@@ -6,39 +6,52 @@ are imported by `azure_test` and `native_test` so every adapter exercises one tr
 
 from __future__ import annotations
 
+import json
 import math
 import os
-from typing import Literal
+from pathlib import Path
+from typing import Literal, cast
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
+    ModelFinishReason,
     ModelMessage,
     ModelRequest,
     ModelSnapshot,
     ToolCall,
     ToolChoice,
 )
+from exp.common.models.catalog_prices import GatewayTokenPrices
+from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.tasks import ToolSchema
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderTruncatedResponseError,
 )
 from exp.runtime.models.providers.openai_compatible import (
+    OPENROUTER_BASE_URL,
     OpenAICompatibleClient,
     OpenAICompatibleResponseError,
+    OpenRouterClient,
     openai_compatible_request,
     openai_compatible_response,
     openai_embedding_request,
     openai_embedding_response_raw,
+    openai_images_request,
+    parse_openai_wire_tool_call,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     RetryPolicy,
     ScriptedJsonTransport,
+    classify_retry,
 )
 
 
@@ -246,6 +259,164 @@ def test_openai_compatible_client_retries_only_the_same_endpoint() -> None:
     assert idempotency_keys[0] == idempotency_keys[1]
 
 
+@pytest.mark.parametrize(
+    ("provider", "model_id", "details", "expected_read", "expected_write", "expected_cost"),
+    [
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 80, "cache_write_tokens": 80},
+            0,
+            80,
+            180_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            20,
+            20,
+            105_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 100, "cache_write_tokens": 100},
+            0,
+            100,
+            200_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 80, "cache_write_tokens": 0},
+            80,
+            0,
+            40_000,
+        ),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 10, "cache_write_tokens": 20},
+            10,
+            20,
+            112_500,
+        ),
+        ("openrouter", "google/gemini-2.5-pro", {"cache_write_tokens": 20}, None, 20, None),
+        ("openrouter", "google/gemini-2.5-pro", {"cached_tokens": 40}, 40, None, None),
+        ("openrouter", "google/gemini-2.5-pro", {}, None, None, None),
+        (
+            "openrouter",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 0, "cache_write_tokens": 0},
+            0,
+            0,
+            100_000,
+        ),
+        (
+            "openrouter",
+            "google/gemma-3-27b-it",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+        (
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+        (
+            "openai-compatible",
+            "google/gemini-2.5-pro",
+            {"cached_tokens": 40, "cache_write_tokens": 20},
+            40,
+            20,
+            90_000,
+        ),
+    ],
+)
+def test_client_cache_accounting_uses_only_the_configured_provider_policy(
+    provider: str,
+    model_id: str,
+    details: JsonObject,
+    expected_read: int | None,
+    expected_write: int | None,
+    expected_cost: int | None,
+) -> None:
+    """Gemini writes leave the overlapping read leg; other models retain disjoint usage.
+
+    Different fresh, read, and write rates expose both overbilling on a small
+    overlap and incorrectly unpriceable usage when the raw slices exceed input.
+    The write rate includes the provider's write plus read charge for that leg.
+    """
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "model": "served-model-alias",
+                    "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 0,
+                        "prompt_tokens_details": details,
+                    },
+                },
+            )
+        ]
+    )
+    client_type = OpenRouterClient if provider == "openrouter" else OpenAICompatibleClient
+    client = client_type(
+        model=_snapshot(provider, model_id),
+        base_url=OPENROUTER_BASE_URL if provider == "openrouter" else "https://example.test/v1",
+        api_key="fixture-key",
+        transport=transport,
+    )
+    response = client.complete(_request())
+    usage = response.economics.usage
+    assert usage is not None
+    assert usage.input_tokens == 100
+    assert usage.cached_input_tokens == expected_read
+    assert usage.cache_write_input_tokens == expected_write
+    assert response.model.model_id == "served-model-alias"
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=250_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=2_000_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=2_000_000_000,
+        output_nano_usd_per_million_tokens=4_000_000_000,
+        reasoning_nano_usd_per_million_tokens=4_000_000_000,
+    )
+    assert schedule_usage_cost_nano_usd(prices, usage) == expected_cost
+
+
+@pytest.mark.parametrize("unknown", ["cached_tokens", "cache_write_tokens"])
+def test_openrouter_cache_overlap_preserves_explicit_unknown_meters(unknown: str) -> None:
+    """A compatibility zero marked unreported must not become measured cache usage."""
+    details: JsonObject = {"cached_tokens": 0, "cache_write_tokens": 0}
+    response = openai_compatible_response(
+        {
+            "choices": [{"message": {"content": "done"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 0,
+                "prompt_tokens_details": details,
+                "unreported_token_details": [unknown],
+            },
+        },
+        configured_model=_snapshot("openrouter", "google/gemini-2.5-pro"),
+        latency_seconds=1,
+    )
+    usage = response.economics.usage
+    assert usage is not None
+    assert usage.cached_input_tokens == (None if unknown == "cached_tokens" else 0)
+    assert usage.cache_write_input_tokens == (None if unknown == "cache_write_tokens" else 0)
+
+
 def test_response_without_choices_fails_closed_without_exposing_the_key() -> None:
     """A response with no choices raises a typed error that never includes the credential."""
     secret = "fake-secret-key-value"
@@ -255,9 +426,10 @@ def test_response_without_choices_fails_closed_without_exposing_the_key() -> Non
         base_url="https://example.test/v1",
         api_key=secret,
         transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=1),
     )
 
-    with pytest.raises(OpenAICompatibleResponseError, match="no choices") as captured:
+    with pytest.raises(ProviderResponseError, match="no choices") as captured:
         client.complete(_request())
     assert secret not in str(captured.value)
     assert secret not in repr(captured.value)
@@ -303,6 +475,15 @@ def test_openai_embedding_request_carries_optional_dimensions_and_encoding() -> 
         "input": ["a"],
         "dimensions": 256,
         "encoding_format": "float",
+    }
+
+
+def test_openai_embedding_request_preserves_pretokenized_inputs() -> None:
+    """The provider wire receives exact numeric tokens, never decoded text or extra flags."""
+    assert openai_embedding_request("m", ((0, 42, 100257), (3,)), encoding_format="base64") == {
+        "model": "m",
+        "input": [[0, 42, 100257], [3]],
+        "encoding_format": "base64",
     }
 
 
@@ -437,3 +618,621 @@ def test_openai_compatible_refusal_is_typed_without_exposing_content() -> None:
 
     assert error.value.signal is ProviderRefusalSignal.CONTENT_POLICY
     assert canary not in str(error.value)
+
+
+_HUNYUAN_BASE_URL = "https://api.hunyuan.cloud.tencent.com/v1"
+
+
+def test_hunyuan_rung_exposes_reasoning_only_when_the_capability_is_declared() -> None:
+    """Plaintext reasoning is exposed per rung, never inferred from the endpoint."""
+    exposed = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_HUNYUAN_BASE_URL,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert exposed.hunyuan_reasoning_route_sha256 is not None
+    assert exposed.reasoning_output_exposed is True
+
+
+def test_hunyuan_rung_without_the_capability_stays_stripped_but_keeps_its_carrier_route() -> None:
+    """An undeclared rung on the Hunyuan endpoint fails closed on exposure.
+
+    The carrier route identity still resolves so tool-loop replay stays sealed,
+    but the caller never sees plaintext ``reasoning_content`` — closing the hole
+    where endpoint detection alone would expose every model on the endpoint.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_HUNYUAN_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_only_the_hunyuan_endpoint_routes_by_prompt_cache_key_among_compatible_rungs() -> None:
+    """Tencent's per-node prefix cache honors the hint; other shims may reject it.
+
+    Measured live 2026-09-05 on TokenHub: shared-stem hits 2/8 without the
+    key, 7/8 with it. A generic OpenAI-compatible server gets no unknown
+    field unless the rung is BYOK (decided at dispatch, not here).
+    """
+    hunyuan = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_HUNYUAN_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert hunyuan.forwards_prompt_cache_key is True
+    tokenhub = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert tokenhub.forwards_prompt_cache_key is True
+    generic = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert generic.forwards_prompt_cache_key is False
+
+
+def test_reasoning_exposure_requires_a_carrier_route_even_when_declared() -> None:
+    """A declared capability without a carrier route exposes nothing (both gates)."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_tokenhub_intl_rung_resolves_a_carrier_route_and_exposes_when_declared() -> None:
+    """The TokenHub-intl origin the platform serves through is a Hunyuan route.
+
+    This is the endpoint the live Tencent lane dispatches through; recognizing
+    it is what makes the carrier route resolve so plaintext reasoning returns and
+    round-trips instead of being stripped.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is True
+
+
+def test_deepseek_origin_replays_reasoning_history_without_the_exposure_stamp() -> None:
+    """DeepSeek's own API is a reasoning-HISTORY route by origin, not by catalog stamp.
+
+    Its thinking mode requires ``reasoning_content`` on every assistant tool-call
+    turn (400 otherwise), so the flag is derived from the base URL alone. Output
+    exposure stays the catalog's decision: an unstamped rung still hides the
+    deltas, and the rung is not a sealed-carrier route either.
+    """
+    for base_url in ("https://api.deepseek.com/v1", "https://api.deepseek.com"):
+        profile = OpenAICompatibleClient(
+            model=_snapshot(model_id="deepseek-flash"),
+            base_url=base_url,
+            api_key="fake-key",
+        ).gateway_wire_profile()
+        assert profile.deepseek_reasoning_history is True
+        assert profile.replays_plaintext_reasoning is True
+        assert profile.reasoning_output_exposed is False
+        assert profile.hunyuan_reasoning_route_sha256 is None
+        assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_deepseek_reasoning_history_is_off_for_every_other_compatible_origin() -> None:
+    """Hunyuan and generic shims never backfill: an unknown field is a 400 on strict servers."""
+    for base_url in (_HUNYUAN_BASE_URL, "https://openrouter.ai/api/v1", "https://example.test/v1"):
+        profile = OpenAICompatibleClient(
+            model=_snapshot(model_id="deepseek-v4-flash"),
+            base_url=base_url,
+            api_key="fake-key",
+        ).gateway_wire_profile()
+        assert profile.deepseek_reasoning_history is False
+        assert profile.replays_plaintext_reasoning is False
+
+
+def test_buffered_request_backfills_reasoning_content_on_deepseek_assistant_turns() -> None:
+    """The non-streaming builder applies the DeepSeek rule too, tool-call and text turns alike.
+
+    ``RouterRuntime.complete`` serializes through ``openai_compatible_request``,
+    not the streaming ``openai_chat_message``; a text-then-tool-call history on
+    this path would otherwise still draw DeepSeek's thinking-mode 400. The
+    typed request carries no reasoning to forward, so the rule here is the
+    backfill alone; system, user, and tool messages are untouched.
+    """
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="read a.txt"),
+            ModelMessage(role="assistant", content="Let me read it."),
+            ModelMessage(
+                role="assistant",
+                assistant_action=AssistantAction(
+                    tool_calls=(ToolCall(call_id="call_foreign_1", name="read_file", arguments={}),)
+                ),
+            ),
+            ModelMessage(role="tool", content="hello", tool_call_id="call_foreign_1"),
+        ),
+        tools=(ToolSchema(name="read_file", description="Read.", input_schema={"type": "object"}),),
+    )
+    payload = openai_compatible_request("deepseek-flash", request, deepseek_reasoning_history=True)
+    system, user, text_turn, tool_call_turn, tool = cast("list[JsonObject]", payload["messages"])
+    assert text_turn == {"role": "assistant", "content": "Let me read it.", "reasoning_content": ""}
+    assert tool_call_turn["tool_calls"] and tool_call_turn["reasoning_content"] == ""
+    assert all("reasoning_content" not in message for message in (system, user, tool))
+    # Off the DeepSeek origin the buffered wire is byte-identical to before.
+    generic = cast(
+        "list[JsonObject]", openai_compatible_request("deepseek-flash", request)["messages"]
+    )
+    assert all("reasoning_content" not in message for message in generic)
+
+
+def test_deepseek_client_builds_buffered_requests_with_the_backfill_from_its_origin() -> None:
+    """The client derives the buffered-path backfill from its base URL, like the wire profile."""
+    deepseek = OpenAICompatibleClient(
+        model=_snapshot(model_id="deepseek-flash"),
+        base_url="https://api.deepseek.com/v1",
+        api_key="fake-key",
+    )
+    messages = cast("list[JsonObject]", deepseek._build_request(_request())["messages"])
+    assert messages[2]["tool_calls"] and messages[2]["reasoning_content"] == ""
+    generic = OpenAICompatibleClient(
+        model=_snapshot(model_id="deepseek-flash"),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+    )
+    generic_messages = cast("list[JsonObject]", generic._build_request(_request())["messages"])
+    assert "reasoning_content" not in generic_messages[2]
+
+
+_NATIVE_REASONING_ORIGIN = "https://hy4-preview--serve.modal.run/v1"
+
+
+def test_reasoning_content_native_rung_resolves_a_carrier_route_on_any_origin() -> None:
+    """The catalog flag, not the hostname, makes a rung a preserved-thinking route.
+
+    A self-hosted vLLM origin serving hy4-preview with ``--reasoning-parser``
+    returns the standard ``reasoning_content`` field and accepts it back, so a
+    rung declaring ``reasoning_content_native`` resolves the Hunyuan carrier
+    route and exposes plaintext when the exposure capability is declared. The
+    ``prompt_cache_key`` node pin stays Tencent-host-keyed: the declaration
+    says nothing about whether the origin tolerates unknown request fields.
+    """
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.fireworks_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_reasoning_content_native_rung_without_exposure_keeps_its_carrier_but_stays_stripped() -> (
+    None
+):
+    """Exposure still fails closed per rung on a flagged origin."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is False
+
+
+def test_an_unflagged_arbitrary_origin_stays_stripped_and_unpinned() -> None:
+    """Without the flag an unknown origin gets no carrier, no exposure, no cache hint."""
+    profile = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_output_exposed=True,
+    ).gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.reasoning_output_exposed is False
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_the_flag_matches_the_tencent_hosts_route_identity_for_one_model() -> None:
+    """A flagged origin and the Tencent host derive the same model-keyed route identity.
+
+    The carrier's route binding is the model's identity, so the same model
+    self-hosted resolves the same route digest the Tencent lane does; the
+    carrier domain stays the Hunyuan scheme either way.
+    """
+    flagged = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url=_NATIVE_REASONING_ORIGIN,
+        api_key="fake-key",
+        reasoning_content_native=True,
+    ).gateway_wire_profile()
+    tencent = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://tokenhub-intl.tencentcloudmaas.com/v1",
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert flagged.hunyuan_reasoning_route_sha256 == tencent.hunyuan_reasoning_route_sha256
+
+
+def test_openrouter_routes_by_prompt_cache_key_as_its_sticky_session_key() -> None:
+    """OpenRouter documents ``prompt_cache_key`` as its sticky-routing fallback key.
+
+    OpenRouter load-balances one model across upstream providers and pins a
+    conversation to the provider that served it only after a cache hit is
+    observed, keyed by ``session_id`` else the OpenAI-style ``prompt_cache_key``
+    (openrouter.ai/docs/features/prompt-caching, read 2026-09-11). Without the
+    hint, two identical prefixes can land on different providers or nodes, so
+    the cache miss a caller sees is real and the metering of it is correct.
+    Forwarding the tenant-namespaced key makes placement deterministic per
+    conversation, and OpenRouter forwards provider-specific fields upstream,
+    so Tencent's per-node pin rides along on the hy4 lane.
+    """
+    profile = OpenRouterClient(
+        model=_snapshot(provider="openrouter", model_id="tencent/hy4-preview"),
+        base_url=OPENROUTER_BASE_URL,
+        api_key="fake-key",
+    ).gateway_wire_profile()
+    assert profile.forwards_prompt_cache_key is True
+    # The OpenRouter origin is neither a Hunyuan nor a Fireworks carrier route.
+    assert profile.hunyuan_reasoning_route_sha256 is None
+    assert profile.fireworks_reasoning_route_sha256 is None
+
+
+def test_buffered_request_folds_a_trailing_system_turn_for_deepseek_only() -> None:
+    """The buffered builder applies the same DeepSeek trailing-instruction rule."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject], openai_compatible_request("DeepSeek-V4-Flash", request)["messages"]
+    )
+    assert folded == [{"role": "user", "content": "Create a ticket.\n\nReminder: be terse."}]
+    kept = cast(list[JsonObject], openai_compatible_request("fake-model", request)["messages"])
+    assert [message["role"] for message in kept] == ["user", "system"]
+
+
+def test_system_messages_leading_only_rung_threads_the_fold_to_its_wire_profile() -> None:
+    """The catalog declaration reaches the streaming profile; an undeclared rung stays off."""
+    declared = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://gateway.xplabs.ai/qwen/v1",
+        api_key="fake-key",
+        system_messages_leading_only=True,
+    ).gateway_wire_profile()
+    assert declared.system_messages_leading_only is True
+    undeclared = OpenAICompatibleClient(
+        model=_snapshot(), base_url="https://gateway.xplabs.ai/qwen/v1", api_key="fake-key"
+    ).gateway_wire_profile()
+    assert undeclared.system_messages_leading_only is False
+
+
+def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung() -> None:
+    """The buffered builder applies the same leading-only rule as the streaming one."""
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content="You are precise."),
+            ModelMessage(role="user", content="Create a ticket."),
+            ModelMessage(role="system", content="Reminder: be terse."),
+            ModelMessage(role="user", content="Go."),
+        ),
+        tools=(),
+    )
+    folded = cast(
+        list[JsonObject],
+        openai_compatible_request("qwen3.8-27b", request, system_messages_leading_only=True)[
+            "messages"
+        ],
+    )
+    assert folded == [
+        {"role": "system", "content": "You are precise."},
+        {"role": "user", "content": "Create a ticket.\n\nReminder: be terse."},
+        {"role": "user", "content": "Go."},
+    ]
+    kept = cast(list[JsonObject], openai_compatible_request("qwen3.8-27b", request)["messages"])
+    assert [message["role"] for message in kept] == ["system", "user", "system", "user"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a":1',
+        '{"a":',
+        '{"a":"unfinished',
+        '{"a":t',
+        '{"a":tr',
+        '{"a":tru',
+        '{"a":f',
+        '{"a":fa',
+        '{"a":fal',
+        '{"a":fals',
+        '{"a":n',
+        '{"a":nu',
+        '{"a":nul',
+        '{"a":-',
+        '{"a":1.',
+        '{"a":1e',
+        '{"a":1e-',
+        '{"a":-2.3E+',
+        r'{"a":"\u',
+        r'{"a":"\u0',
+        r'{"a":"\u01',
+        r'{"a":"\u012',
+        r'{"a":[true,{"key":"\u12',
+        r'{"\u01',
+    ],
+)
+@pytest.mark.parametrize("finish_reason", ["length", "stop", "tool_calls"])
+def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
+    arguments: str, finish_reason: str
+) -> None:
+    """EOF tool fragments merit only a fresh rollout; normal-stop malformed data stays unchanged.
+
+    Args:
+        arguments: Exact incomplete tool-argument JSON retained in the response body.
+        finish_reason: Length, stop, or tool-calls terminal reason paired with that fragment.
+    """
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "choices": [
+                        {
+                            "finish_reason": finish_reason,
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call-a",
+                                        "function": {
+                                            "name": "create_ticket",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fake-key",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=3, initial_delay_seconds=0),
+    )
+    expected = (
+        ProviderTruncatedResponseError
+        if finish_reason == "length"
+        else OpenAICompatibleResponseError
+    )
+    with pytest.raises(expected) as caught:
+        client.complete(_request())
+    assert not classify_retry(caught.value).retryable
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a": invalid}',
+        "[]",
+        '[{"a":',
+        '{"a":1,}',
+        '{"a":"bad\\x"}',
+        '{"a":truX',
+        '{"a":tru ',
+        '{"a":True',
+        '{"a":nux',
+        '{"a":01',
+        '{"a":1.e',
+        '{"a":1e+-',
+        '{"a":1. ',
+        '{"a":+1',
+        '{"a":--',
+        '{"a":١',
+        r'{"a":"\u0x',
+        r'{"a":"\q',
+        '{"a":"bad\n',
+        '{"a":1 "b":"unfinished',
+        '{"a":1,] ',
+        '{"a":[1,}',
+        '{"a":true false',
+        "{} {",
+        '{"a" "b":',
+    ],
+)
+def test_length_does_not_upgrade_malformed_or_structural_tool_arguments(arguments: str) -> None:
+    """A length label alone cannot turn an invalid complete value into infrastructure evidence.
+
+    Args:
+        arguments: Complete or malformed JSON that cannot qualify as a valid object prefix.
+    """
+    with pytest.raises(OpenAICompatibleResponseError):
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call-a",
+                                    "function": {"name": "create_ticket", "arguments": arguments},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0,
+        )
+
+
+def test_length_keeps_valid_output_and_rejects_missing_tool_identity() -> None:
+    """Complete length output retains the native limit flag; absent call identity is unchanged.
+
+    Raises:
+        AssertionError: Valid length-limited output or missing tool identity changes classification.
+    """
+    payload: JsonObject = {"choices": [{"finish_reason": "length", "message": {"content": "done"}}]}
+    response = openai_compatible_response(payload, configured_model=_snapshot(), latency_seconds=0)
+    assert response.finish_reason == ModelFinishReason.LENGTH
+    with pytest.raises(ProviderResponseError) as caught:
+        openai_compatible_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {
+                            "tool_calls": [
+                                {"function": {"name": "create_ticket", "arguments": "{"}}
+                            ]
+                        },
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0,
+        )
+    assert not isinstance(caught.value, ProviderTruncatedResponseError)
+
+
+@pytest.mark.parametrize(
+    "complete",
+    [
+        r'{"a":[true,false,null, -12.34e+5, {"\u00e9":"x\n\u0000"}]}',
+        r'{"a":0,"b":-0.001,"c":1E-9,"d":1.0e+10,"e":"quote\"slash\\"}',
+    ],
+)
+def test_every_proper_prefix_of_nested_tool_json_is_truncated(complete: str) -> None:
+    """Every cut inside a valid object is recoverable without accepting its partial contents.
+
+    Args:
+        complete: Valid nested JSON object whose proper prefixes are tested independently.
+    """
+    for end in range(1, len(complete)):
+        with pytest.raises(ProviderTruncatedResponseError):
+            parse_openai_wire_tool_call(
+                {
+                    "id": "call-a",
+                    "function": {"name": "create_ticket", "arguments": complete[:end]},
+                },
+                0,
+                hit_length_limit=True,
+            )
+    result = parse_openai_wire_tool_call(
+        {"id": "call-a", "function": {"name": "create_ticket", "arguments": complete}},
+        0,
+        hit_length_limit=True,
+    )
+    assert result.raw_arguments == complete
+
+
+@pytest.mark.parametrize(
+    ("fixture", "model_id"),
+    [
+        ("mistral_small_2603_reasoning_response.json", "mistral-small-2603"),
+        ("mistral_large_4_response.json", "mistral-large-4"),
+    ],
+)
+def test_mistral_typed_content_parts_answer_with_the_text_parts_only(
+    fixture: str, model_id: str
+) -> None:
+    """A reasoning Mistral response's answer is its text parts, never its thinking.
+
+    The fixtures are verbatim Mistral API responses (2026-10-06) to "What is
+    17*23? Answer with just the number.", whose ``message.content`` is an
+    array of a ``thinking`` part and a ``text`` part.
+    """
+    payload = json.loads((Path(__file__).parent / "testdata" / fixture).read_text())
+    response = openai_compatible_response(
+        payload,
+        configured_model=_snapshot("mistral", model_id),
+        latency_seconds=1,
+    )
+    assert response.output.content == "391"
+
+
+def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> None:
+    """Text parts join in order; unknown types are skipped; malformed parts never truncate."""
+    response = openai_compatible_response(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "39"},
+                            {"type": "reference", "reference_ids": [1]},
+                            {"type": "text", "text": "1"},
+                        ]
+                    }
+                }
+            ]
+        },
+        configured_model=_snapshot("mistral", "mistral-small-2603"),
+        latency_seconds=1,
+    )
+    assert response.output.content == "391"
+    for malformed in (["391"], [{"type": "text", "text": "39"}, {"type": "text", "text": 1}]):
+        with pytest.raises(ProviderResponseError, match="part must be"):
+            openai_compatible_response(
+                {"choices": [{"message": {"content": malformed}}]},
+                configured_model=_snapshot("mistral", "mistral-small-2603"),
+                latency_seconds=1,
+            )
+
+
+def test_tool_argument_duplicate_keys_are_rejected_before_typed_replay() -> None:
+    """Raw arguments cannot collapse duplicates into an apparently valid cached proposal."""
+    with pytest.raises(OpenAICompatibleResponseError, match="duplicate JSON keys"):
+        parse_openai_wire_tool_call(
+            {
+                "id": "answer",
+                "function": {"name": "submit_proposal", "arguments": '{"value":1,"value":2}'},
+            },
+            0,
+        )
+
+
+@pytest.mark.parametrize("asked", [None, "url", "b64_json"])
+def test_inline_images_forces_base64_whatever_the_caller_asked(
+    asked: Literal["url", "b64_json"] | None,
+) -> None:
+    """An inline-images rung (xAI, Zero Data Retention) always asks for ``b64_json``."""
+    request = ImagesRequest(prompt="a cat", n=2, response_format=asked)
+    body = openai_images_request("grok-imagine-image", request, inline_images=True)
+    assert body == {
+        "model": "grok-imagine-image",
+        "prompt": "a cat",
+        "n": 2,
+        "response_format": "b64_json",
+    }
+
+
+def test_other_rungs_forward_the_callers_response_format() -> None:
+    """Without inline images the caller's choice, or its absence, is forwarded as given."""
+    asked = ImagesRequest(prompt="a cat", response_format="url")
+    assert openai_images_request("dall-e-3", asked)["response_format"] == "url"
+    assert "response_format" not in openai_images_request("dall-e-3", ImagesRequest(prompt="a"))

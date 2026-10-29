@@ -1,0 +1,30 @@
+# GitLab CI entry point. Every job lives in .gitlab/ci/*.yml, one file per
+# pipeline area; docs/gitlab-ci.md is the contract those files follow.
+
+workflow:
+  rules:
+    # Merge request pipelines for branches with an open merge request, branch
+    # pipelines otherwise, so one change never runs twice. Tag pushes arrive as
+    # push pipelines.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_PIPELINE_SOURCE =~ /^(push|web|api)$/
+  auto_cancel:
+    on_new_commit: interruptible
+
+stages:
+  - preflight
+  - build
+  - test
+  - publish
+
+variables:
+  RUN_WORKFLOW:
+    value: ""
+    description: >-
+      Manual pipelines only: the pipeline area to run, named after its file in
+      .gitlab/ci without the .yml suffix (python-package or gate).
+
+include:
+  - local: .gitlab/ci/*.yml

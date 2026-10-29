@@ -4,6 +4,19 @@ Experiential builds immutable task evidence from agent traces, composes and fits
 runs those routers on loopback, and executes bounded SFT from persisted datasets. All importable
 code lives under `exp/`; benchmark data arrives as a dependency (see rule 6).
 
+## Product and repository boundaries
+
+Make open-source Experiential excellent for individual users. Keep enterprise operations,
+organization management, billing, and deployment orchestration in other repos. Enterprise
+builders can build that layer themselves, but this boundary must never compromise our
+gateway's performance, security, or maintainability.
+
+Public code, documentation, commit messages, PR descriptions, and comments must describe the
+standalone open-source behavior. Keep private repository links, internal deployment details,
+customer information, and private operational or experiment evidence in private repos or local
+records. Limit disclosure cleanup to sensitive cases; preserve legitimate public interfaces
+and ordinary technical terminology. Keep shared interfaces small, performant, and reliable.
+
 ## Toolchain
 
 Managed with `uv`; lint/format with `ruff`; type-check with `ty`.
@@ -30,14 +43,15 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `config`, `optimize`, and `run`. An invocation without a
-  subcommand opens the default gateway home screen. `exp/cli/app_test.py` and the release tests
+- The root CLI command set is exact: `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`.
+  An invocation without a subcommand opens the default gateway home screen.
+  `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
 
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `config/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  `build/`, `capture/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
   default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
@@ -50,17 +64,27 @@ uv run pytest -q
 
 ## Evidence, simulation, and routing lifecycle
 
-- `exp/simulation/` owns trace ingestion, representative-task mining, typed simulation specs,
-  current engines, orchestration, artifact construction, and comparisons. New modules for those
-  responsibilities go inside `exp/simulation/`, never at the flat `exp/` root.
-- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` is the only CLI path
-  from local traces to immutable task evidence. It accepts 100 through 1000 normalized traces,
-  writes manifest-bound fit and held-out tasks plus `proposals_pending` review state, builds both
-  RAG indexes under a strict embedding-cost ceiling, and binds the grounded world model without a
-  completion or judge call. Route each corpus through an explicit canonical source loader.
-- New trace sources belong in `exp/simulation/ingest/`, normalize into the `Trace` and `TraceSpan`
-  contracts in `exp/common/traces/`, support file ingestion, and register from
-  `exp/simulation/ingest/__init__.py`.
+- `exp/common/traces/ingest/` owns reusable source parsing, trace normalization, provenance,
+  streaming and import persistence. Gateway-specific capture/protocol adapters live under
+  `exp/runtime/gateway/ingest/` and supply canonical evidence to the shared ingestion layer.
+- `exp/simulation/` owns representative-task mining, typed simulation specs, current engines,
+  orchestration, artifact construction, and comparisons. New modules for those responsibilities
+  go inside `exp/simulation/`, never at the flat `exp/` root.
+- `exp build PROJECT --traces TRACE_FILE --source SOURCE --root ROOT` imports canonical traces
+  into shared `<root>/gateway/traffic.db` SQLite storage, then mines scenarios from that exact
+  saved evidence. `--source gateway --identity ID` selects retained captures for one explicit
+  identity. Imports preserve source provenance, prompts, tools, results, normalization exclusions
+  and model identity; immutable import IDs and project associations are transactional and
+  idempotent. Ingestion remains a common Python operation, not a separate CLI command.
+  Build writes manifest-bound fit and held-out tasks plus
+  `proposals_pending` review state, builds both RAG indexes with cost-aware spend consent,
+  and binds the grounded world model without a completion or judge call. Route each corpus
+  through an explicit canonical source loader. The interactive wizard defaults to provider
+  configuration and build preparation; router optimization requires an explicit selection.
+- New file trace sources belong in `exp/common/traces/ingest/`, normalize into the `Trace` and
+  `TraceSpan` contracts in `exp/common/traces/`, and register with the explicit shared source table.
+  Runtime-specific source adapters stay with their runtime owner. Common ingestion never imports
+  runtime or simulation code; source selection is composed by the consuming command.
 - Python applications use `exp.compose_router` to complete review, plan-bound simulation,
   judgment, fitting, held-out verification, reporting, and runtime loading. Callers inject the
   approved review and setup suppliers, simulator factory, judge, runtime catalog, and finite
@@ -129,14 +153,18 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `optimize`, `config`, and `run`. The optimize group is locked
+- The root CLI is locked to `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`. Capture runs
+  in the foreground with no management subcommands. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
   deliberate change to the locked surface and needs the same scrutiny as a public API change.
 - Every paid CLI command uses `exp.cli.shared.consent.require_spend_consent` after a credential-free
   conservative estimate and before credential or provider-client construction. The setting in
-  `.exp/settings.toml` is a hard per-command ceiling. Estimates at or below half run automatically,
-  higher in-budget estimates need explicit confirmation, and `--yes` never overrides the ceiling.
+  `.exp/settings.toml` is a per-command warning budget. Estimates at or below half run automatically;
+  higher estimates need explicit confirmation. An over-budget estimate must warn and offer a
+  default-no proceed choice instead of rejecting the command. `--yes` is explicit authorization
+  for the displayed estimate, including budget overruns. Component budgets use this same consent
+  path, and execution must honor the approved estimate without changing saved warning budgets.
 - Long-lived gateway serving is exempt from one-shot spend consent. Startup performs no provider
   call; every later request requires key-derived authority and content-free attempt accounting.
 - `exp optimize model PROJECT` runs only a project-bound immutable W12 to W13 SFT configuration.
@@ -144,7 +172,7 @@ uv run pytest -q
   simulator. The config freezes the W12 manifest, native Tinker base-model snapshot, capability
   digest, and credential-reference digest without persisting any secret. A finite cap requires a
   conservative estimate for every exact scheduled batch before shared cost authorization;
-  `--yes` confirms only an in-budget estimate after those checks. Completed W13 artifacts are
+  `--yes` confirms the displayed estimate after those checks. Completed W13 artifacts are
   recursively verified before an opaque sampling handle is atomically registered in `models.toml`.
 - Changes to this composition seam require focused persisted-dataset, resume, budget, immutable
   pointer, drift, and catalog-provenance coverage. The seam composes a persisted dataset into an
@@ -153,10 +181,17 @@ uv run pytest -q
 
 ## Python
 
+- Use Python 3.13+ for whole-repository development and quality gates so Capture's conditional
+  dependencies are installed. Published SDK and Capture command help support remains Python 3.12;
+  CI checks that minimum separately.
 - Every Python file must have a module docstring.
 - Every class, function, and method uses a Google-style docstring, including private helpers,
   nested functions, and test helpers, so each callable states its contract locally. An absolutely
   trivial callable may use one clear summary line.
+- Document dataclass and Pydantic model fields in a Google-style `Attributes:` section of the
+  class docstring. Do not use standalone string literals after field declarations as inline
+  attribute docstrings. Keep field declarations together below the class docstring; field
+  descriptions belong in `Attributes:`, including defaults, constraints, and behavioral caveats.
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through a local rich
@@ -212,7 +247,7 @@ uv run pytest -q
    its existing identity digest remains frozen for router artifact compatibility.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `exp/`,
-   `docs/`, `assets/`, `.claude/`, `.github/`. That list is closed.
+   `docs/`, `assets/`, `.claude/`, `.github/`, `.gitlab/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -233,9 +268,10 @@ uv run pytest -q
      and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
      references verified against main), and `docs/cookbook/` (end-to-end walks through the whole
      pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
-     plus two root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
-     and one artifact per command) and `docs/release-scope.md` (the supported and explicitly
-     excluded claims of the current release, checked by `exp/tests/release_test.py`). Nothing else: raw
+     plus three root pages: `docs/usage.md` (the terse map of the CLI surface: one line of purpose
+     and one artifact per command), `docs/release-scope.md` (the supported and explicitly
+     excluded claims of the current release, checked by `exp/tests/release_test.py`), and
+     `docs/gitlab-ci.md` (the CI pipeline conventions). Nothing else: raw
      result JSONs, vector sources, design notes, and drafts stay out of the repo. `docs/README.md`
      indexes every doc and records its purpose. Update or remove superseded material only after
      checking references and retaining durable evidence.
@@ -251,7 +287,10 @@ uv run pytest -q
      `exp/runtime/models/providers/`.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `.github/` — CI workflows.
+   - `.github/`: the gate, gateway-latency, and python-package workflows.
+   - `.gitlab/`: GitLab CI. `.gitlab/ci/` holds one file per pipeline area, included by the
+     root `.gitlab-ci.yml`; its `osv-scanner.toml` is the shared advisory policy for both CI
+     systems. `docs/gitlab-ci.md` describes the conventions.
 
    Scratch work has no home in this repo. One-off scripts, experiment runners, scratchpads, and
    drafts go outside the checkout (`/tmp`, a personal directory, or the Notion experiments area
@@ -269,8 +308,11 @@ uv run pytest -q
    implementation when requirements differ materially and document the boundary.
 
 8. **Keep imports explicit and fail-fast.** Put imports at module scope unless moving them is
-   required to break a real circular dependency. Do not use lazy imports for optional convenience,
-   and do not catch `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
+   required to break a real circular dependency. Declaration-only CLI command modules may defer
+   their execution-module import until command dispatch to satisfy the startup-isolation gate:
+   help and configuration must not load optimization machinery. Execution modules keep imports
+   at module scope. Do not defer imports for optional convenience, and do not catch
+   `ImportError`/`ModuleNotFoundError` to silently fall back to alternate behavior.
 
 9. **Design every public surface from the perspective of a dev using it.** Before implementing a
    feature, write the call site first — the Python snippet or CLI invocation an outside developer
@@ -303,10 +345,11 @@ uv run pytest -q
 13. **Run `/ready-for-merge` before every PR merge.** No PR is merged until the
     `ready-for-merge` skill (`.claude/skills/ready-for-merge/SKILL.md`) has been run and passes:
     `/code-review --fix` at an effort level scaled to the PR's breadth (see the skill), every
-    review comment (Cursor, Greptile, humans) resolved, and a full AGENTS.md compliance audit
-    of the diff. When opening or updating a PR, fetch Greptile review comments in the same
+    review comment (Cursor, Codex, humans) resolved, and a full AGENTS.md compliance audit
+    of the diff. When opening or updating a PR, fetch Cursor and Codex review comments in the same
     turn and address them immediately: fix valid findings, reply on the thread, and resolve
-    it. Do not wait for `/ready-for-merge` to start that loop.
+    it. Request `@codex review` after each push and verify both reviewers completed on the
+    final commit. Do not wait for `/ready-for-merge` to start that loop.
 
 14. **No silent legacy, shims, or backwards compatibility.** Any legacy path, shim,
     compatibility constant, migration branch, deprecated alias, versioned fallback, or other
@@ -327,6 +370,34 @@ uv run pytest -q
     The palette above is the contract. Rendering scripts for one-off visuals do not belong in the
     repository (rule 5).
 
+16. **Follow prior art; one mechanism per concern.** Before building anything, find how the
+    codebase already does it and do it that way, even when the existing mechanism is less
+    convenient than a fresh one. An existing mechanism carries cases a new one will miss. A second
+    mechanism for a concern listed below is not added beside the first: either extend the owner,
+    or migrate every existing call site to the new one in the same change series. Parallel work
+    sessions are the usual source of drift, so check this map before writing code:
+
+    | Concern | Owner | Use |
+    | --- | --- | --- |
+    | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
+    | Spend consent and cost warnings | `exp/cli/shared/consent.py` | `require_spend_consent` |
+    | Command results and saved detail | `exp/optimize/evaluation/export.py`, `exp/cli/build/summary.py` | A short summary on the terminal; the full output saved atomically beside the saved run under the project's runtime directory (`export_report`, `save_details`), then a `Report: <path>` line |
+    | Usage errors | `exp/cli/shared/options.py` | `usage_error` |
+    | Interactive choices | `exp/cli/shared/picker.py` | `choose_one` |
+    | Terminal styling | `exp/cli/shared/theme.py` | `EXP_THEME` |
+    | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
+    | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
+    | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
+    | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
+    | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
+    | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
+    | Gateway execution bindings | `exp/runtime/gateway/native/src/execution_binding.rs`, `exp/runtime/gateway/native/src/bridge.rs` | Hosts explicitly supply callback targets and resource handles; bound bridges retain them through requests, callbacks and detached cleanup. Individual execution uses the direct process bridge. Hosted identity and allocation policy belong to the host |
+    | Gateway active-request capacity | `exp/runtime/gateway/native/src/permit_queue.rs`, `exp/runtime/gateway/native/src/dispatch_capacity.rs` | `PermitQueue.acquire_scoped` grants global and supplied capacity together; shared `DispatchPermit` ownership retains both through terminal accounting |
+    | Gateway accounting recovery rotation | `exp/runtime/gateway/native_accounting_recovery.py` | `RecoveryRotation` rotates stable work identities within one control plane; admission never runs recovery I/O |
+
+    Keep this table current. A change that introduces an owner for a new concern adds its row in
+    the same commit.
+
 ## One package
 
 This repo publishes **one flagship distribution**: `experiential`, whose importable python code
@@ -343,6 +414,12 @@ Rules of the road:
   workflow publishes prebuilt abi3 wheels). The crate ships no importable python beyond the
   compiled `exp_gateway_native` module; python code still belongs under `exp/`. No further path
   sources or distributions may be added.
+- **Exact pins only**: every requirement in `[project.dependencies]` and the extras is an `==`
+  pin, except `openai`, which callers' own code imports and which stays the certified
+  `>=3.0,<4` range, and the `dev` extra's unversioned `experiential[sft]` self-reference. A
+  version moves only by a reviewed edit, and `[tool.uv] exclude-newer` keeps every resolved
+  release at least 7 days old. Only packages this project publishes are exempt; an urgent
+  security fix gets a dated `exclude-newer-package` cutoff with a removal date, never `false`.
 - **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
   requirements. Provider-neutral catalog metadata and immutable snapshots live under
   `exp/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves
@@ -350,9 +427,13 @@ Rules of the road:
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["exp"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.
-- **Publishing**: `.github/workflows/python-package.yml` builds and publishes the flagship
-  `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix; the publish job
-  runs only for a GitHub release and uses the `pypi` trusted-publisher environment.
+- **Publishing**: `.github/workflows/python-package.yml` builds the flagship
+  `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix. PRs and main
+  pushes build and smoke-test without publishing. Publication requires a protected release
+  tag (`v<version>`) reachable from main, or an explicit latest-release replay on protected
+  main, and uses PyPI trusted publishing from the `pypi` environment. Only the isolated
+  publish jobs have `id-token: write`. Publish the native distribution before the flagship.
+  `docs/gitlab-ci.md` documents GitHub operation and the retained GitLab configuration.
 
 ## Docs
 

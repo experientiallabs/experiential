@@ -18,10 +18,23 @@ pub struct PublicError {
     pub param: Option<String>,
     #[serde(default)]
     pub retry_after_seconds: Option<u32>,
+    /// Committed control-plane proof that this admission created no provider attempt.
+    /// Never derived from upstream headers or a provider error body.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub known_unbilled: bool,
+    /// The bounded category of a provider refusal (`code: refusal` only):
+    /// every refusal answer carries one, `unspecified` when the provider
+    /// named no reason. Absent on every other error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<RefusalReason>,
 }
 
 fn default_error_type() -> String {
     "invalid_request_error".to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl PublicError {
@@ -33,19 +46,28 @@ impl PublicError {
             error_type: error_type.to_string(),
             param: None,
             retry_after_seconds: None,
+            known_unbilled: false,
+            refusal_reason: None,
         }
     }
 
     /// The OpenAI error envelope body, matching `OpenAIProtocolError.json_body()`.
+    ///
+    /// A refusal adds the one additive `refusal_reason` field; every other
+    /// error keeps the exact four-field envelope.
     pub fn json_body(&self) -> serde_json::Value {
-        json!({
+        let mut body = json!({
             "error": {
                 "message": self.message,
                 "type": self.error_type,
                 "param": self.param,
                 "code": self.code,
             }
-        })
+        });
+        if let Some(reason) = self.refusal_reason {
+            body["error"]["refusal_reason"] = json!(reason.as_str());
+        }
+        body
     }
 
     pub fn invalid_key() -> Self {
@@ -128,6 +150,13 @@ pub enum FailureClass {
     /// `QuotaExceeded`, which is the CALLER's gateway credit.
     ProviderQuota,
     Refusal,
+    /// The provider closed the turn as complete and delivered nothing the
+    /// caller can receive: no text, no tool call, no renderable reasoning
+    /// (an OpenAI empty assistant message, a reasoning-only turn on a rung
+    /// whose reasoning the gateway strips). Like a refusal it is the model's
+    /// answer to the request content, not rung deadness: it never opens the
+    /// deployment's health circuit and answers a 4xx no client auto-retries.
+    EmptyCompletion,
     MalformedResponse,
     ProviderInternal,
     Cancelled,
@@ -151,6 +180,7 @@ impl FailureClass {
             FailureClass::ProviderNotFound => "provider_not_found",
             FailureClass::ProviderQuota => "provider_quota",
             FailureClass::Refusal => "refusal",
+            FailureClass::EmptyCompletion => "empty_completion",
             FailureClass::MalformedResponse => "malformed_response",
             FailureClass::ProviderInternal => "provider_internal",
             FailureClass::Cancelled => "cancelled",
@@ -161,10 +191,98 @@ impl FailureClass {
     }
 }
 
+/// The bounded category of a provider refusal, derived from the provider's
+/// own code and sentence (`stream_errors::refusal_reason`) and shared with
+/// the python `GatewayRefusalReason`.
+///
+/// The caller sees WHICH policy declined the content as a fixed phrase,
+/// never the provider's prose: the vocabulary is closed so a client can
+/// branch on it, and the raw token keeps riding `provider_detail` into the
+/// ledger only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// A cyber-safety verdict (OpenAI `cyber_policy`).
+    CyberPolicy,
+    /// A biological, chemical, radiological, or nuclear weapons verdict.
+    Cbrn,
+    /// A general content-policy or safety-system verdict.
+    ContentPolicy,
+    /// The output would recite copyrighted material (Gemini `RECITATION`).
+    Recitation,
+    /// The provider's data-inspection layer blocked the content (Gemini
+    /// `SPII`, Qwen `data_inspection_failed`).
+    DataInspection,
+    /// The provider refused without naming a reason.
+    Unspecified,
+}
+
+impl RefusalReason {
+    /// The wire name shared with the python enum and the public error field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RefusalReason::CyberPolicy => "cyber_policy",
+            RefusalReason::Cbrn => "cbrn",
+            RefusalReason::ContentPolicy => "content_policy",
+            RefusalReason::Recitation => "recitation",
+            RefusalReason::DataInspection => "data_inspection",
+            RefusalReason::Unspecified => "unspecified",
+        }
+    }
+
+    /// The fixed caller-facing phrase, or none for an unnamed refusal.
+    pub fn phrase(&self) -> Option<&'static str> {
+        match self {
+            RefusalReason::CyberPolicy => Some("cybersecurity policy"),
+            RefusalReason::Cbrn => Some("biological/chemical safety policy"),
+            RefusalReason::ContentPolicy => Some("content policy"),
+            RefusalReason::Recitation => Some("recitation of copyrighted material"),
+            RefusalReason::DataInspection => Some("data inspection"),
+            RefusalReason::Unspecified => None,
+        }
+    }
+}
+
+/// The generic refusal sentence every refusal message starts from.
+const REFUSAL_MESSAGE: &str = "provider refused the request";
+
 /// One sanitized provider failure, the Rust mirror of `GatewayFailure`,
 /// including the executor's per-failure retry classification: whether the
 /// same deployment may be redialed and whether a later certified deployment
 /// may serve the request instead.
+/// Safe message of [`Failure::empty_completion`]; content-free and stable so
+/// the ledger and the public error name the same shape.
+/// Response header that names a completed answer the caller should read
+/// with care; `empty_completion` is its one value today: every rung (or the
+/// committed rung) closed the turn with nothing, and the 200 the caller holds
+/// is that empty turn, not a delivered answer. Rides every non-streaming
+/// response and every settled stream; a live stream has already sent its
+/// headers, so there the terminal frames alone carry the shape.
+pub const GATEWAY_WARNING_HEADER: &str = "x-gateway-warning";
+pub const EMPTY_COMPLETION_WARNING: &str = "empty_completion";
+
+/// The `x-gateway-warning: empty_completion` header pair when `flagged`.
+pub fn empty_completion_headers(flagged: bool) -> Vec<(String, String)> {
+    if flagged {
+        vec![(
+            GATEWAY_WARNING_HEADER.to_string(),
+            EMPTY_COMPLETION_WARNING.to_string(),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The one answer a tenant origin's upstream failure gets. Distinct transport,
+/// TLS, timeout and status messages would let a caller map ports and services
+/// behind a customer-addressed endpoint, so none of them crosses; the precise
+/// cause stays on the failure for settlement.
+pub const TENANT_ORIGIN_MESSAGE: &str =
+    "your custom endpoint could not be reached or returned an invalid response";
+
+pub const EMPTY_COMPLETION_MESSAGE: &str = "the model ended its turn without producing any output; \
+     adjust the request (for example, end the conversation on a user turn or ask for a text answer) and resend";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub failure_class: FailureClass,
@@ -179,9 +297,85 @@ pub struct Failure {
     pub rejected_parameter: Option<String>,
     /// The provider's own bounded single-line explanation of a client error,
     /// relayed only for that class so the caller sees what was actually
-    /// refused. Every other class stays content-free.
+    /// refused; every other class stays caller-content-free. On a coerced
+    /// malformed-response boundary it instead carries the gateway's own
+    /// static parse-reject reason, which never reaches the caller but does
+    /// reach settlement so the ledger can name the exact wire shape that
+    /// failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_detail: Option<String>,
+    /// Known wait before a retry can dispatch (a throttle window's
+    /// remainder). When present on a throttled failure, the public mapping
+    /// advertises this value as `Retry-After` (floored at the fixed default)
+    /// so the header never contradicts the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
+    /// The failure is the CUSTOMER's own provider configuration (a rejected
+    /// credential or exhausted account on their BYOK rung). The class keeps
+    /// its ladder semantics (fail over to any other rung), but a terminal
+    /// answer is their 400 naming the fix, and settlement files it client-side.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub customer_owned: bool,
+    /// A TypeSafe HTTP response definitively rejected dispatch before work.
+    /// Only the transport may set this; unknown outcomes remain false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_provider_rejected: bool,
+    /// A typed remote HTTP/2 graceful retirement during open. Health-only:
+    /// the connection error does not prove this request was never processed.
+    #[serde(skip)]
+    pub graceful_transport_retirement: bool,
+    /// The bounded category of a refusal, set by every refusal builder so
+    /// the public error and the settlement ledger can name which policy
+    /// declined the content without parsing `provider_detail`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<RefusalReason>,
+    /// Allowlisted rate-limit headers harvested from the provider response
+    /// that produced this failure (a non-2xx open carries the interesting
+    /// ones: a 429's `retry-after` and remaining-quota counts). Settlement
+    /// hoists them into the payload's `rate_limit_headers` map; they never
+    /// reach the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_headers: Option<Box<serde_json::Map<String, serde_json::Value>>>,
+    /// The provider refused a replayed reasoning item's `encrypted_content`
+    /// (OpenAI `invalid_encrypted_content`: a payload sealed by another
+    /// organization or tenant, or one it never issued). In-process only: the
+    /// waterfall re-dials the same rung once with those items stripped, so the
+    /// flag never crosses the bridge and never reaches settlement.
+    #[serde(skip)]
+    pub encrypted_reasoning_rejected: bool,
+    /// The failure came from a customer-addressed origin. Its class, message
+    /// and detail still settle as they are; only the caller-facing answer
+    /// collapses to [`TENANT_ORIGIN_MESSAGE`] (see [`Self::public_error`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tenant_origin: bool,
+    /// Set only on a header-phase timeout: which bound expired. A lane that
+    /// spent its OWN first-byte allowance is a hung-lane strike; one cut by
+    /// the request's pre-first-byte budget (or deadline) is not, because
+    /// the budget is shared and a healthy fallback dialed late gets only its
+    /// remainder. Crosses the bridge as `header_timeout` (python
+    /// `GatewayHeaderTimeout`), read by the control plane's lane ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_timeout: Option<HeaderTimeout>,
+}
+
+/// Which bound ended a dial waiting for its provider's response headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderTimeout {
+    /// The rung's own first-byte allowance expired: the lane did not answer.
+    Allowance,
+    /// The request's shared budget (or deadline) expired first.
+    Budget,
+}
+
+impl HeaderTimeout {
+    /// The boundary token, shared with python `GatewayHeaderTimeout`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allowance => "allowance",
+            Self::Budget => "budget",
+        }
+    }
 }
 
 impl Failure {
@@ -193,7 +387,51 @@ impl Failure {
             failover_eligible: false,
             rejected_parameter: None,
             provider_detail: None,
+            retry_after_seconds: None,
+            customer_owned: false,
+            decision_provider_rejected: false,
+            graceful_transport_retirement: false,
+            refusal_reason: None,
+            rate_limit_headers: None,
+            encrypted_reasoning_rejected: false,
+            tenant_origin: false,
+            header_timeout: None,
         }
+    }
+
+    /// The provider refusal for one bounded reason. The message is the fixed
+    /// generic sentence followed by the reason's fixed phrase (nothing the
+    /// provider wrote), and the reason rides the failure into the public
+    /// error and settlement.
+    pub fn refusal(reason: RefusalReason) -> Self {
+        let safe_message = match reason.phrase() {
+            Some(phrase) => format!("{REFUSAL_MESSAGE}: {phrase}"),
+            None => REFUSAL_MESSAGE.to_string(),
+        };
+        Self {
+            refusal_reason: Some(reason),
+            ..Self::new(FailureClass::Refusal, &safe_message)
+        }
+    }
+
+    /// The provider closed the turn as complete while sending nothing the
+    /// caller can receive: no text, no tool call, and no reasoning the
+    /// surface renders (OpenRouter's DeepSeek rungs answer a reasoning-only
+    /// turn this way, live 2026-09-12; OpenAI returns a 4-token empty
+    /// assistant message to some Claude Code conversations, live
+    /// 2026-09-15). Pre-commit the redial and the ladder stay on (the empty
+    /// answer is not deterministic), but the class is [`FailureClass::
+    /// EmptyCompletion`]: the model's answer to the request content, so it
+    /// never feeds the rung's health circuit, and once the ladder is
+    /// exhausted (or post-commit, where there is no ladder) the caller
+    /// receives the empty turn as a typed 200 under
+    /// [`GATEWAY_WARNING_HEADER`] rather than a 502 that every SDK
+    /// auto-retries -- 2026-09-15 one Claude Code session re-sent the same
+    /// 44k-token prompt every minute for an hour against a 502. The 400
+    /// mapping below is the defensive shape for any path that still renders
+    /// the failure itself: 4xx, so no client retries it.
+    pub fn empty_completion() -> Self {
+        Self::new(FailureClass::EmptyCompletion, EMPTY_COMPLETION_MESSAGE).with_retry(true, true)
     }
 
     /// Attach one already-validated provider parameter path.
@@ -215,6 +453,62 @@ impl Failure {
         self
     }
 
+    /// Attach the allowlisted rate-limit headers of the producing response,
+    /// and, on a throttled failure, the provider's own integer `Retry-After`
+    /// so the control plane sizes the throttle window from it.
+    pub fn with_rate_limit_facts(
+        mut self,
+        headers: Option<serde_json::Map<String, serde_json::Value>>,
+        retry_after_seconds: Option<u32>,
+    ) -> Self {
+        self.rate_limit_headers = headers.map(Box::new);
+        if self.failure_class == FailureClass::Throttled && self.retry_after_seconds.is_none() {
+            self.retry_after_seconds = retry_after_seconds;
+        }
+        self
+    }
+
+    /// Mark this failure as a tenant origin's when `tenant` is set; never clears.
+    pub fn with_tenant_origin(mut self, tenant: bool) -> Self {
+        self.tenant_origin |= tenant;
+        self
+    }
+
+    /// Whether the caller sees only [`TENANT_ORIGIN_MESSAGE`]: every class an
+    /// upstream answer or connection produces. The caller's own classes, the
+    /// gateway's, and an empty completion (a delivered turn) keep their shape.
+    fn tenant_opaque(&self) -> bool {
+        self.tenant_origin
+            && matches!(
+                self.failure_class,
+                FailureClass::InvalidRequest
+                    | FailureClass::Throttled
+                    | FailureClass::Transport
+                    | FailureClass::Timeout
+                    | FailureClass::ProviderAuthentication
+                    | FailureClass::ProviderNotFound
+                    | FailureClass::ProviderQuota
+                    | FailureClass::Refusal
+                    | FailureClass::MalformedResponse
+                    | FailureClass::ProviderInternal
+            )
+    }
+
+    /// The message a caller may read for this failure.
+    pub fn caller_message(&self) -> &str {
+        if self.tenant_opaque() {
+            TENANT_ORIGIN_MESSAGE
+        } else {
+            &self.safe_message
+        }
+    }
+
+    /// Mark whether the provider refused replayed encrypted reasoning.
+    pub fn with_encrypted_reasoning_rejected(mut self, rejected: bool) -> Self {
+        self.encrypted_reasoning_rejected = rejected;
+        self
+    }
+
     /// Coerce this failure to its boundary form: the python engine replaces
     /// malformed-response detail with one generic safe message before both
     /// accounting and the public error, so the native plane does the same.
@@ -227,18 +521,26 @@ impl Failure {
                 // The generic boundary message is about to erase the specific
                 // parse-reject reason, so emit it once as a structured,
                 // content-free operator line (the crate's stderr idiom) before
-                // it is lost. The reason is always a static parser label, never
+                // it is lost. The reason is a static parser label, optionally
+                // carrying one provider discriminator (an item or event type)
+                // already reduced to a bounded identifier-shaped token, never
                 // provider payload, so it is safe to log.
                 let line = json!({
                     "event": "malformed_response_boundary",
                     "reason": self.safe_message,
                 });
                 eprintln!("exp-gateway-native: {line}");
+                // The reason also rides provider_detail into settlement so
+                // the ledger names the exact wire shape that failed; the
+                // public error never relays it (that path is scoped to the
+                // invalid-request class).
                 Failure::new(
                     FailureClass::MalformedResponse,
                     "provider returned a malformed response; retry the request",
                 )
                 .with_retry(self.retryable_same_deployment, self.failover_eligible)
+                .with_tenant_origin(self.tenant_origin)
+                .with_provider_detail(Some(self.safe_message))
             }
             _ => self,
         }
@@ -250,6 +552,25 @@ impl Failure {
     /// the reset boundary is computed control-plane side; the PoC returns the
     /// plain safe message with a one-hour retry hint instead.
     pub fn public_error(&self) -> PublicError {
+        // A tenant origin's upstream failure: one status, code and message
+        // whatever broke, so the answer cannot fingerprint what sits behind it.
+        if self.tenant_opaque() {
+            return PublicError::new(
+                502,
+                "custom_endpoint_failed",
+                TENANT_ORIGIN_MESSAGE,
+                "api_error",
+            );
+        }
+        // The customer's own BYOK credential or account: their 400, with the
+        // message that names their provider and the fix.
+        if self.customer_owned {
+            let code = match self.failure_class {
+                FailureClass::ProviderQuota => "provider_account_quota",
+                _ => "provider_credential_rejected",
+            };
+            return PublicError::new(400, code, &self.safe_message, "invalid_request_error");
+        }
         let (status, code, error_type) = match self.failure_class {
             FailureClass::InvalidRequest => (400, "invalid_request", "invalid_request_error"),
             FailureClass::UnsupportedCapability => {
@@ -259,7 +580,9 @@ impl Failure {
             FailureClass::Authorization => (403, "model_not_granted", "permission_error"),
             FailureClass::QuotaExceeded => (429, "insufficient_quota", "insufficient_quota"),
             FailureClass::Throttled => (429, "unavailable_route", "api_error"),
-            FailureClass::Timeout => (504, "deadline_exceeded", "api_error"),
+            // A 504 is replaced at the edge by the CDN's own "origin timed out"
+            // page, hiding our body; a 503 keeps our retryable error visible.
+            FailureClass::Timeout => (503, "deadline_exceeded", "api_error"),
             FailureClass::Cancelled => (499, "request_cancelled", "api_error"),
             FailureClass::Guardrail => (400, "content_filter", "invalid_request_error"),
             // A provider refusal with no visible refusal text is the model's
@@ -269,10 +592,22 @@ impl Failure {
             // convention is that status with its own code. The provider billed
             // the processed input, so a 502 would misdescribe a charged call.
             FailureClass::Refusal => (400, "refusal", "invalid_request_error"),
+            // An empty completion is the same family: the model's answer to
+            // the content was nothing. A 4xx is the shape no OpenAI or
+            // Anthropic SDK retries (both retry 408/409/429/5xx only), so a
+            // conversation that keeps yielding an empty turn surfaces once
+            // instead of looping; the message names the remedy.
+            FailureClass::EmptyCompletion => (400, "empty_completion", "invalid_request_error"),
             FailureClass::Unavailable => (503, "gateway_unavailable", "api_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };
         let mut error = PublicError::new(status, code, &self.safe_message, error_type);
+        if self.failure_class == FailureClass::Refusal {
+            // Every refusal answer names its category; a refusal built
+            // without one (a visible-refusal stream, a bare stop reason) is
+            // explicitly `unspecified` so clients can branch on the field.
+            error.refusal_reason = Some(self.refusal_reason.unwrap_or(RefusalReason::Unspecified));
+        }
         if self.failure_class == FailureClass::InvalidRequest {
             error.param = self.rejected_parameter.clone();
             if let Some(detail) = self.provider_detail.as_deref() {
@@ -289,9 +624,12 @@ impl Failure {
             }
         }
         error.retry_after_seconds = match self.failure_class {
-            FailureClass::Throttled => Some(5),
+            // A failure carrying its known throttle window advertises that
+            // wait (floored at the fixed default) so the Retry-After header a
+            // client honors never contradicts the message it reads.
+            FailureClass::Throttled => Some(self.retry_after_seconds.map_or(5, |wait| wait.max(5))),
             FailureClass::QuotaExceeded => Some(3600),
-            FailureClass::Unavailable => Some(2),
+            FailureClass::Unavailable | FailureClass::Timeout => Some(2),
             _ => None,
         };
         error
@@ -301,6 +639,75 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tenant_origin_collapses_every_upstream_class_and_keeps_the_rest() {
+        let upstream = [
+            FailureClass::InvalidRequest,
+            FailureClass::Throttled,
+            FailureClass::Transport,
+            FailureClass::Timeout,
+            FailureClass::ProviderAuthentication,
+            FailureClass::ProviderNotFound,
+            FailureClass::ProviderQuota,
+            FailureClass::Refusal,
+            FailureClass::MalformedResponse,
+            FailureClass::ProviderInternal,
+        ];
+        for class in upstream {
+            let mut failure = Failure::new(class, "connect failed: Connection refused")
+                .with_provider_detail(Some("http 404".to_string()))
+                .with_rejected_parameter(Some("model".to_string()))
+                .with_tenant_origin(true);
+            failure.customer_owned = true;
+            failure.retry_after_seconds = Some(9);
+            let error = failure.public_error();
+            assert_eq!(error.status_code, 502, "{class:?}");
+            assert_eq!(error.code, "custom_endpoint_failed");
+            assert_eq!(error.message, TENANT_ORIGIN_MESSAGE);
+            assert_eq!(error.param, None);
+            assert_eq!(error.retry_after_seconds, None);
+            assert_eq!(error.refusal_reason, None);
+            assert_eq!(failure.caller_message(), TENANT_ORIGIN_MESSAGE);
+            // Settlement still reads the precise cause.
+            assert_eq!(failure.safe_message, "connect failed: Connection refused");
+            assert_eq!(failure.failure_class, class);
+        }
+        for class in [
+            FailureClass::Authentication,
+            FailureClass::Authorization,
+            FailureClass::QuotaExceeded,
+            FailureClass::UnsupportedCapability,
+            FailureClass::Cancelled,
+            FailureClass::Guardrail,
+            FailureClass::EmptyCompletion,
+            FailureClass::Internal,
+            FailureClass::Unavailable,
+        ] {
+            let failure = Failure::new(class, "gateway's own answer").with_tenant_origin(true);
+            assert_ne!(failure.public_error().code, "custom_endpoint_failed");
+            assert_eq!(failure.caller_message(), "gateway's own answer");
+        }
+        // An ordinary rung keeps its distinct answer.
+        let house = Failure::new(FailureClass::Transport, "provider transport failed");
+        assert_eq!(
+            house.with_tenant_origin(false).caller_message(),
+            "provider transport failed"
+        );
+    }
+
+    #[test]
+    fn the_malformed_boundary_keeps_a_tenant_origin_opaque() {
+        let failure = Failure::new(FailureClass::MalformedResponse, "unexpected item type")
+            .with_tenant_origin(true)
+            .boundary();
+        assert!(failure.tenant_origin);
+        assert_eq!(failure.public_error().message, TENANT_ORIGIN_MESSAGE);
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("unexpected item type")
+        );
+    }
 
     #[test]
     fn a_refusal_is_a_request_error_with_its_own_code_never_a_routing_failure() {
@@ -314,10 +721,93 @@ mod tests {
         assert_eq!(error.error_type, "invalid_request_error");
         assert_eq!(error.message, "provider refused the request");
         assert_eq!(error.retry_after_seconds, None);
+        // A refusal built without a reason still names its category.
+        assert_eq!(error.refusal_reason, Some(RefusalReason::Unspecified));
+        assert_eq!(error.json_body()["error"]["refusal_reason"], "unspecified");
         // Untyped provider failures keep the routing-failure shape.
         let internal = Failure::new(FailureClass::ProviderInternal, "provider failed");
         assert_eq!(internal.public_error().status_code, 502);
         assert_eq!(internal.public_error().code, "all_routes_failed");
+    }
+
+    #[test]
+    fn every_refusal_reason_renders_its_fixed_phrase_and_wire_name() {
+        // (reason, wire name, public message): the message is the generic
+        // sentence plus the reason's fixed phrase, never provider prose.
+        let table = [
+            (
+                RefusalReason::CyberPolicy,
+                "cyber_policy",
+                "provider refused the request: cybersecurity policy",
+            ),
+            (
+                RefusalReason::Cbrn,
+                "cbrn",
+                "provider refused the request: biological/chemical safety policy",
+            ),
+            (
+                RefusalReason::ContentPolicy,
+                "content_policy",
+                "provider refused the request: content policy",
+            ),
+            (
+                RefusalReason::Recitation,
+                "recitation",
+                "provider refused the request: recitation of copyrighted material",
+            ),
+            (
+                RefusalReason::DataInspection,
+                "data_inspection",
+                "provider refused the request: data inspection",
+            ),
+            (
+                RefusalReason::Unspecified,
+                "unspecified",
+                "provider refused the request",
+            ),
+        ];
+        for (reason, wire, message) in table {
+            let failure = Failure::refusal(reason)
+                .with_provider_detail(Some("cyber_policy: raw provider prose".into()));
+            assert_eq!(failure.failure_class, FailureClass::Refusal);
+            assert_eq!(failure.refusal_reason, Some(reason));
+            assert_eq!(reason.as_str(), wire);
+            let error = failure.public_error();
+            // Status, code, and type are unchanged so existing clients behave
+            // the same; the reason is the one additive field.
+            assert_eq!(error.status_code, 400);
+            assert_eq!(error.code, "refusal");
+            assert_eq!(error.error_type, "invalid_request_error");
+            assert_eq!(error.message, message);
+            assert_eq!(error.refusal_reason, Some(reason));
+            let body = error.json_body();
+            assert_eq!(body["error"]["refusal_reason"], wire);
+            assert_eq!(body["error"]["code"], "refusal");
+            // The provider's own detail never reaches the caller.
+            assert!(!body.to_string().contains("raw provider prose"));
+            // The enum round-trips through its snake_case wire name.
+            let back: RefusalReason =
+                serde_json::from_value(serde_json::Value::String(wire.to_string()))
+                    .expect("round trip");
+            assert_eq!(back, reason);
+        }
+        // Every other class stays free of the field, on the struct and in
+        // the envelope, so non-refusal payloads are byte-identical.
+        let throttled = Failure::new(FailureClass::Throttled, "slow down").public_error();
+        assert_eq!(throttled.refusal_reason, None);
+        assert!(throttled.json_body()["error"]
+            .get("refusal_reason")
+            .is_none());
+        assert!(serde_json::to_value(&throttled)
+            .expect("serializable")
+            .get("refusal_reason")
+            .is_none());
+        // A boundary payload without the field still deserializes.
+        let legacy: PublicError = serde_json::from_value(serde_json::json!({
+            "status_code": 400, "code": "refusal", "message": "m"
+        }))
+        .expect("field is optional");
+        assert_eq!(legacy.refusal_reason, None);
     }
 
     #[test]
@@ -376,8 +866,17 @@ mod tests {
             coerced.safe_message,
             "provider returned a malformed response; retry the request"
         );
+        // The specific reason survives as the settlement-facing detail so the
+        // ledger names the wire shape that failed, while the public error
+        // stays generic (detail relay is scoped to invalid requests).
+        assert_eq!(coerced.provider_detail.as_deref(), Some("specific detail"));
+        assert_eq!(
+            coerced.public_error().message,
+            "provider returned a malformed response; retry the request"
+        );
         let transport = Failure::new(FailureClass::Transport, "kept").boundary();
         assert_eq!(transport.safe_message, "kept");
+        assert_eq!(transport.provider_detail, None);
     }
 
     #[test]
@@ -393,6 +892,23 @@ mod tests {
             let back: FailureClass = serde_json::from_value(wire).expect("round trip");
             assert_eq!(back.as_str(), class.as_str());
         }
+    }
+
+    #[test]
+    fn a_throttled_failure_advertises_its_known_window_floored_at_the_default() {
+        // The throttled-exhaustion message names the remaining window, so the
+        // Retry-After header must advertise the same wait: a fixed 5s header
+        // beside a "retry in 30s" body sends honoring clients straight back
+        // into the window.
+        let mut throttled = Failure::new(FailureClass::Throttled, "retry in 30s");
+        throttled.retry_after_seconds = Some(30);
+        assert_eq!(throttled.public_error().retry_after_seconds, Some(30));
+        // A shorter-than-default window keeps the default floor.
+        throttled.retry_after_seconds = Some(2);
+        assert_eq!(throttled.public_error().retry_after_seconds, Some(5));
+        // Without a known window the fixed default backoff applies.
+        let bare = Failure::new(FailureClass::Throttled, "provider throttled the request");
+        assert_eq!(bare.public_error().retry_after_seconds, Some(5));
     }
 
     #[test]

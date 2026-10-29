@@ -2,55 +2,85 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Collection, Sequence
 from typing import Literal, cast
 
 from openai.types import EmbeddingCreateParams
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.responses.response_create_params import ResponseCreateParams
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
-from pydantic_core import ErrorDetails
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models.content import (
-    DocumentContentPart,
-    MessageContentPart,
-    TextContentPart,
-    audio_part_from_input_audio,
-    document_part_from_file_data,
-    image_part_from_url,
-    video_part_from_url,
-)
 from exp.common.models.model import ToolCall
-from exp.runtime.gateway.compatibility import (
-    CompatibilityDisposition,
-    CompatibilityManifest,
-)
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
+    ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
-    GatewayNamedToolChoice,
     GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
     SealedReasoningContentBlock,
 )
-from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
-from exp.runtime.gateway.reasoning_carrier import (
-    FIREWORKS_REASONING_CONTENT_PREFIX,
-    parse_reasoning_content_carrier,
+from exp.runtime.gateway.embeddings_contracts import (
+    EmbeddingInputs,
+    EmbeddingsRequest,
+    EmbeddingTokenIds,
 )
+from exp.runtime.gateway.reasoning_carrier import (
+    parse_reasoning_content_carrier,
+    scheme_for_carrier,
+)
+from exp.runtime.gateway.sampling_extras import SAMPLING_EXTRA_FIELDS, sampling_extras_of
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
+    restore_chat_cache_control,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
+from exp.runtime.openai_protocol.client_field_repairs import (
+    chat_output_cap,
+    repair_chat,
+    repair_responses,
+)
+from exp.runtime.openai_protocol.custom_tool_wire import (
+    ChatCustomToolCall,
+    CustomToolCallItem,
+    CustomToolCallOutputItem,
+)
+from exp.runtime.openai_protocol.custom_tools import (
+    chat_custom_call_messages,
+    chat_custom_declaration,
+    chat_custom_output_message,
+    custom_turn_cache_disclosures,
+    expand_chat_custom_calls,
+)
+from exp.runtime.openai_protocol.enable_thinking import (
+    CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,
+    translate_enable_thinking,
+)
+from exp.runtime.openai_protocol.errors import (
+    invalid_field,
+    unsupported_field,
+    validated_operation_headers,
+)
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
     RESPONSES_MANIFEST,
-    disposition_map,
+    responses_include_options,
+    validate_manifest,
+)
+from exp.runtime.openai_protocol.media_parts import message_content
+from exp.runtime.openai_protocol.prompt_cache_controls import (
+    extract_prompt_cache_breakpoints,
+    prompt_cache_fields,
+    restore_responses_breakpoints,
+)
+from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
+from exp.runtime.openai_protocol.reasoning_replay import (
+    ReplayedReasoningTooLong,
+    fold_replayed_reasoning,
+    replayed_reasoning_disclosures,
 )
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
@@ -61,35 +91,98 @@ from exp.runtime.openai_protocol.responses_input import (
     ReplayedReasoning,
     responses_input_messages,
 )
+from exp.runtime.openai_protocol.responses_probe import (
+    official_responses_probe,
+    require_responses_input,
+    require_responses_text_spelling,
+)
 from exp.runtime.openai_protocol.structured_text import (
-    JSON_OBJECT_TRANSLATION_DISCLOSURE,
+    chat_json_object_output,
     chat_structured_text,
+    responses_json_object_output,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_argument_repairs import replayed_tool_arguments
+from exp.runtime.openai_protocol.tool_call_extra_content import thought_signature
+from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
+from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
+from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
+from exp.runtime.openai_protocol.web_search import (
+    chat_web_search,
+    responses_web_search,
+    split_online_suffix,
+)
 from exp.runtime.openai_protocol.wire_models import (
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
     _AdditionalToolsItem,
     _AssistantToolCall,
-    _ChatAudioPart,
-    _ChatFilePart,
-    _ChatImagePart,
     _ChatRequest,
     _ChatTool,
-    _ChatVideoPart,
-    _ContentPart,
-    _CustomToolCall,
-    _CustomToolCallOutput,
-    _EmbeddingsRequest,
     _FunctionCall,
+    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
     _ResponseReasoningItem,
-    _ResponsesFilePart,
     _ResponsesInputItem,
     _ResponsesRequest,
     _ResponseTool,
-    _TextPart,
+    _WireModel,
 )
+
+
+class _EmbeddingsRequest(_WireModel):
+    """Closed OpenAI embeddings profile with text and pre-tokenized inputs.
+
+    Attributes:
+        model: Public model alias requested by the caller.
+        input: One text/token input or a homogeneous batch of either form.
+        dimensions: Optional positive vector width requested from the provider.
+        encoding_format: Optional float or base64 response encoding.
+        user: Optional gateway-only attribution, at most 1,024 characters.
+        stream: Literal false convenience, validated and omitted upstream.
+    """
+
+    model: str = Field(min_length=1, max_length=256)
+    input: str | EmbeddingTokenIds | EmbeddingInputs
+    dimensions: int | None = Field(default=None, gt=0)
+    encoding_format: Literal["float", "base64"] | None = None
+    user: str | None = Field(default=None, max_length=1024)
+    stream: Literal[False] = False
+
+    @field_validator("stream", mode="before")
+    @classmethod
+    def _require_nonstreaming(cls, value: JsonValue) -> Literal[False]:
+        """Accept only literal false, without coercing zero or string values."""
+        if value is not False:
+            raise ValueError("embeddings do not stream; omit stream or set it to false")
+        return False
+
+    @field_validator("input")
+    @classmethod
+    def _require_nonempty_input(
+        cls, value: str | EmbeddingTokenIds | EmbeddingInputs
+    ) -> str | EmbeddingTokenIds | EmbeddingInputs:
+        """Reject empty texts or batches without treating token ID zero as empty."""
+        if isinstance(value, str):
+            if not value:
+                raise ValueError("input must not be an empty string")
+            return value
+        if not value:
+            raise ValueError("input must not be an empty array")
+        if any(not item for item in value if not isinstance(item, int)):
+            raise ValueError("input array must not contain empty inputs")
+        return value
+
+    def batch_inputs(self) -> EmbeddingInputs:
+        """Normalize one string or flat token sequence to one logical batch item."""
+        if isinstance(self.input, str):
+            return (self.input,)
+        if isinstance(self.input[0], int):
+            # The validated union is homogeneous; a flat sequence contains only token IDs.
+            return (cast(EmbeddingTokenIds, self.input),)
+        return cast(EmbeddingInputs, self.input)
+
 
 _CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
 _RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
@@ -117,17 +210,42 @@ class DecodedEmbeddingsRequest(ContractModel):
     request: EmbeddingsRequest
 
 
-def _without_chat_reasoning_content(payload: JsonObject) -> JsonObject:
-    """Hide the authenticated Chat extension from official OpenAI validation."""
+_CHAT_MESSAGE_EXTENSION_KEYS = frozenset(
+    {
+        "reasoning_content",
+        "reasoning",
+        "reasoning_details",
+        "provider_specific_fields",
+        "thinking_blocks",
+        "reasoning_items",
+        "images",
+    }
+)
+"""Message keys the strict wire model owns; hidden from official validation.
+
+``reasoning_content`` is the authenticated Chat extension and ``reasoning`` /
+``reasoning_details`` are OpenRouter's replayed-reasoning fields (folded by
+``reasoning_replay``); the other four are LiteLLM's message-dump keys, which
+``_Message`` admits only in their empty (or, for ``provider_specific_fields``,
+dropped-and-disclosed) forms.
+"""
+
+
+def _without_chat_message_extensions(payload: JsonObject) -> JsonObject:
+    """Hide the wire-model-owned message keys from official OpenAI validation."""
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
         return payload
     changed = False
     messages: list[JsonValue] = []
     for raw_message in raw_messages:
-        if isinstance(raw_message, dict) and "reasoning_content" in raw_message:
+        if isinstance(raw_message, dict) and _CHAT_MESSAGE_EXTENSION_KEYS & raw_message.keys():
             messages.append(
-                {key: value for key, value in raw_message.items() if key != "reasoning_content"}
+                {
+                    key: value
+                    for key, value in raw_message.items()
+                    if key not in _CHAT_MESSAGE_EXTENSION_KEYS
+                }
             )
             changed = True
         else:
@@ -145,8 +263,12 @@ def decode_chat(
 
     OpenCode may attach an Anthropic-style ``cache_control`` annotation on
     Chat messages and on text content parts. Supported ephemeral forms are
-    validated and removed before official OpenAI validation and before
-    canonical conversion. Other unknown nested fields stay rejected.
+    validated outside official OpenAI validation and retained on canonical
+    cache carriers for adapters that support them. Unknown keys on messages, their
+    tool calls and content parts are dropped with disclosure
+    (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown
+    nested field stays rejected. The Vercel AI SDK's camelCase ``promptCacheKey`` is
+    folded onto ``prompt_cache_key`` first, so it decodes as the documented wire field.
 
     Args:
         payload: Parsed JSON request body.
@@ -159,20 +281,37 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
+    payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
+    breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
+    payload = cache_payload = breakpoints.marked  # Breakpoints ride the cache_control path.
     payload = drop_opencode_cache_control(payload)
-    _validate_manifest(payload, CHAT_MANIFEST)
+    validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     _validate_official(
         _CHAT_OFFICIAL,
-        _without_chat_reasoning_content(payload),
-        extension_fields={"top_k", "reasoning_effort"},
+        _without_chat_message_extensions(payload),
+        extension_fields={
+            "top_k",
+            *SAMPLING_EXTRA_FIELDS,
+            "reasoning_effort",
+            "enable_thinking",
+            "thinking_budget",
+            "max_output_tokens",
+            "provider",
+            "gateway",
+            "plugins",
+        },
     )
     request = _validate_wire(_ChatRequest, payload)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
+    alias, online_suffix = split_online_suffix(request.model)
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
-    maximum = request.max_completion_tokens or request.max_tokens
+    maximum, maximum_parameter, cap_disclosures = chat_output_cap(
+        request.max_completion_tokens, request.max_tokens, request.max_output_tokens
+    )
     stop = (
         ()
         if request.stop is None
@@ -180,37 +319,71 @@ def decode_chat(
         if isinstance(request.stop, str)
         else request.stop
     )
+    thinking = translate_enable_thinking(request)
+    raw_chat_tools = payload.get("tools")
+    chat_native_tools = tuple(
+        GatewayProviderNativeTool(
+            index=index,
+            tool=chat_custom_declaration(tool.custom)
+            if tool.custom is not None
+            else cast("JsonObject", raw_chat_tools[index]),
+        )
+        for index, tool in enumerate(request.tools)
+        if tool.type != "function" and isinstance(raw_chat_tools, list)
+    )
+    messages, cache_disclosures = restore_chat_cache_control(
+        _messages(request.messages, "messages"), cache_payload
+    )
+    messages = expand_chat_custom_calls(request.messages, messages)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            messages=_messages(request.messages, "messages"),
-            tools=tuple(_chat_tool(tool) for tool in request.tools),
-            tool_choice=_chat_tool_choice(request.tool_choice),
+            messages=messages,
+            tools=tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
+            provider_native_tools=chat_native_tools,
+            tool_search=chat_tool_search(chat_native_tools),
+            tool_choice=chat_tool_choice(request.tool_choice, native_tools=chat_native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
+            json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
-                (JSON_OBJECT_TRANSLATION_DISCLOSURE,)
-                if request.response_format is not None
-                and request.response_format.type == "json_object"
-                else ()
+                *alias_disclosures,
+                *cap_disclosures,
+                *breakpoints.disclosures,
+                *cache_disclosures,
+                *custom_turn_cache_disclosures(cache_payload.get("messages")),
+                *thinking.disclosures,
+                *(
+                    (CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,)
+                    if request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.preserve_thinking is not None
+                    else ()
+                ),
+                *replayed_reasoning_disclosures(request.messages),
+            ),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=_provider_preferences(payload, request.provider),
+            gateway=request.gateway,
+            web_search=chat_web_search(
+                options=request.web_search_options,
+                plugins=request.plugins,
+                online_suffix=online_suffix,
             ),
             maximum_output_tokens=maximum,
-            maximum_output_tokens_parameter=(
-                "max_completion_tokens"
-                if request.max_completion_tokens is not None
-                else "max_tokens"
-                if request.max_tokens is not None
-                else None
-            ),
+            maximum_output_tokens_parameter=maximum_parameter,
+            thinking_budget=request.thinking_budget,
+            provider_thinking_config=thinking.thinking_config,
             stop=stop,
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
             frequency_penalty=request.frequency_penalty,
             presence_penalty=request.presence_penalty,
+            sampling_extras=sampling_extras_of(request),
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=thinking.reasoning_effort,
+            thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(
                 request.stream_options is not None and request.stream_options.include_usage
@@ -219,13 +392,16 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            prompt_cache_mode=cache.mode,
+            prompt_cache_breakpoints=cache.breakpoints,
             service_tier=request.service_tier,
+            text_verbosity=request.verbosity,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
-    return DecodedGatewayRequest(alias=request.model, request=canonical)
+        raise validation_protocol_error(exc) from exc
+    return DecodedGatewayRequest(alias=alias, request=canonical)
 
 
 def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
@@ -244,19 +420,20 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    _validate_manifest(payload, EMBEDDINGS_MANIFEST)
-    _validate_official(_EMBEDDINGS_OFFICIAL, payload)
+    validate_manifest(payload, EMBEDDINGS_MANIFEST)
+    if payload.get("stream") is True:
+        raise unsupported_field("stream")
+    _validate_official(_EMBEDDINGS_OFFICIAL, payload, extension_fields={"stream"})
     request = _validate_wire(_EmbeddingsRequest, payload)
-    inputs = (request.input,) if isinstance(request.input, str) else request.input
     try:
         canonical = EmbeddingsRequest(
-            inputs=inputs,
+            inputs=request.batch_inputs(),
             dimensions=request.dimensions,
             encoding_format=request.encoding_format,
             user=request.user,
         )
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        raise validation_protocol_error(exc) from exc
     return DecodedEmbeddingsRequest(alias=request.model, request=canonical)
 
 
@@ -279,45 +456,32 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    _validate_manifest(payload, RESPONSES_MANIFEST)
+    payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
+    breakpoints = extract_prompt_cache_breakpoints(payload, container="input")
+    payload = breakpoints.payload
+    validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
-    official_probe = dict(payload)
-    if isinstance(raw := payload.get("input"), list):
-        # The installed SDK lags the live surface on echoed output items:
-        # it has no message `phase` and requires `status` alongside `id`,
-        # while real Codex echoes carry id+phase and omit status, and it
-        # requires reasoning `content` to be an array while Codex echoes an
-        # explicit null that the provider accepts (both captured
-        # 2026-08-29). The strict wire model owns those contracts, so the
-        # official probe sees a normalized item.
-        adapted: list[JsonValue] = []
-        for index, entry in enumerate(cast("list[JsonValue]", raw)):
-            if isinstance(entry, dict):
-                entry = _official_image_details(entry, f"input.{index}")
-            if isinstance(entry, dict) and entry.get("type") == "message":
-                item = {key: value for key, value in entry.items() if key != "phase"}
-                if item.get("id") is not None and "status" not in item:
-                    item["status"] = "completed"
-                adapted.append(item)
-            elif (
-                isinstance(entry, dict)
-                and entry.get("type") == "reasoning"
-                and "content" in entry
-                and entry.get("content") is None
-            ):
-                adapted.append({key: value for key, value in entry.items() if key != "content"})
-            else:
-                adapted.append(entry)
-        official_probe["input"] = adapted
+    cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
+    alias, online_suffix = split_online_suffix(request.model)
+    require_responses_input(request)
+    if not isinstance(request.input, str):
+        for item_index, item in enumerate(request.input):
+            if isinstance(item, _ResponseMessage):
+                require_responses_text_spelling(item_index, item)
+    official_probe = official_responses_probe(payload)
     _validate_official(
         _RESPONSES_OFFICIAL,
         official_probe,
-        extension_fields={"top_k", "reasoning", "client_metadata"},
+        extension_fields={"top_k", "reasoning", "client_metadata", "provider", "gateway"},
     )
-    include_encrypted_reasoning = _include_encrypted_reasoning(request.include)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    (
+        include_encrypted_reasoning,
+        include_output_text_logprobs,
+        include_web_search_sources,
+    ) = responses_include_options(request.include)
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
     raw_input = payload.get("input")
@@ -337,12 +501,29 @@ def decode_responses(
                     tool=cast("JsonObject", raw_tools[tool_index]),
                 )
             )
-    messages = list(
-        _response_input_messages(
-            request.input,
-            raw_items=cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else (),
+    replayed_items = cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else ()
+    marked = breakpoints.marked.get("input") if breakpoints.present else None
+    cache_disclosures: list[str] = []
+    try:
+        messages = list(
+            _response_input_messages(
+                request.input,
+                raw_items=replayed_items,
+                marked_items=cast("list[JsonObject]", marked) if isinstance(marked, list) else (),
+                cache_disclosures=cache_disclosures,
+            )
         )
-    )
+    except ValidationError as exc:
+        # History reconstruction folds echoed items into canonical messages,
+        # so a canonical-contract violation (such as duplicate call_ids in one
+        # assistant segment) first surfaces here, past the wire models. It is
+        # caller-shaped input all the same: name the rule instead of letting
+        # the exception escape as an unclassified 500.
+        detail = exc.errors(include_url=False)[0]
+        raise invalid_field(
+            "input",
+            "Invalid value for 'input': " + detail["msg"].removeprefix("Value error, ") + ".",
+        ) from exc
     if request.instructions is not None:
         messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
     try:
@@ -351,9 +532,25 @@ def decode_responses(
             messages=tuple(messages),
             tools=tuple(function_tools),
             provider_native_tools=tuple(native_tools),
-            tool_choice=_responses_tool_choice(request.tool_choice),
+            web_search=responses_web_search(native_tools, online_suffix=online_suffix),
+            tool_search=responses_tool_search(native_tools),
+            tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
+            json_object_output=responses_json_object_output(request.text),
+            ignored_parameters=(
+                *alias_disclosures,
+                *breakpoints.disclosures,
+                *cache_disclosures,
+                *replayed_reasoning_disclosures(
+                    ()
+                    if isinstance(request.input, str)
+                    else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
+                ),
+            ),
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=_provider_preferences(payload, request.provider),
+            gateway=request.gateway,
             maximum_output_tokens=request.max_output_tokens,
             maximum_output_tokens_parameter=(
                 "max_output_tokens" if request.max_output_tokens is not None else None
@@ -361,8 +558,10 @@ def decode_responses(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
-            logprobs=(True if request.top_logprobs is not None else None),
+            logprobs=None,
             top_logprobs=request.top_logprobs,
+            include_output_text_logprobs=include_output_text_logprobs,
+            include_web_search_sources=include_web_search_sources,
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
             reasoning_context=(
                 request.reasoning.context if request.reasoning is not None else None
@@ -394,12 +593,26 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            # The provider defaults ("implicit", "30m") are already satisfied.
+            prompt_cache_ttl=cache.ttl,
+            prompt_cache_mode=cache.mode,
+            prompt_cache_breakpoints=cache.breakpoints,
             service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        error = validation_protocol_error(exc)
+        if error.detail.param == "messages":
+            # The canonical transcript is empty: every input item was
+            # consumed without a turn (``input: []`` beside a
+            # previous_response_id). Name the field the caller sent.
+            raise invalid_field(
+                "input",
+                "Invalid value for 'input': a continuation needs at least one new input "
+                "item; resend the turn you want answered.",
+            ) from exc
+        raise error from exc
     developer_messages_param = None
     if request.instructions is not None:
         developer_messages_param = "instructions"
@@ -415,45 +628,20 @@ def decode_responses(
         if developer_index is not None:
             developer_messages_param = f"input.{developer_index}.role"
     return DecodedGatewayRequest(
-        alias=request.model,
+        alias=alias,
         request=canonical,
         developer_messages_param=developer_messages_param,
     )
 
 
-def _official_image_details(entry: JsonObject, param: str) -> JsonObject:
-    """Default the detail level of every ``input_image`` part of one item.
-
-    The Responses surface treats ``input_image.detail`` as optional and
-    resolves an omitted level to ``auto``, while the installed SDK marks the
-    field required. Only the official probe sees the resolved default: the
-    strict wire model owns the real contract and keeps an unstated level
-    unstated on the provider wire. An ``input_audio`` part is refused by name.
-    """
-    content = entry.get("content")
-    if not isinstance(content, list):
-        return entry
-    parts: list[JsonValue] = []
-    for index, part in enumerate(cast("list[JsonValue]", content)):
-        if isinstance(part, dict) and part.get("type") == "input_audio":
-            raise unsupported_field(
-                f"{param}.content.{index}.input_audio",
-                message="Audio input is not available on Responses; use Chat Completions.",
-            )
-        if isinstance(part, dict) and part.get("type") == "input_image" and "detail" not in part:
-            parts.append({**part, "detail": "auto"})
-        else:
-            parts.append(part)
-    return {**entry, "content": parts}
-
-
-def _validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> None:
-    """Reject unsupported and unknown top-level fields before responder work."""
-    decisions = disposition_map(manifest)
-    for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
-            raise unsupported_field(field)
+def _provider_preferences(
+    payload: JsonObject, preferences: ProviderRoutingPreferences | None
+) -> JsonObject | None:
+    """The caller's validated ``provider`` object as sent, or None when absent."""
+    if preferences is None:
+        return None
+    raw = payload.get("provider")
+    return dict(raw) if isinstance(raw, dict) else None
 
 
 def _validate_official(
@@ -469,7 +657,7 @@ def _validate_official(
         }
         adapter.validate_python(official_payload)
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
+        raise validation_protocol_error(exc) from exc
 
 
 def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) -> ModelT:
@@ -477,197 +665,95 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
     try:
         return model.model_validate(payload)
     except ValidationError as exc:
-        raise _validation_protocol_error(exc) from exc
-
-
-_LOCATION_NOISE = {"body", "non-streaming", "streaming"}
-_UNION_BRANCH_TYPES = {"str", "int", "float", "bool", "list", "tuple", "dict", "NoneType"}
-_OUTPUT_ITEM_VARIANTS = {
-    "message",
-    "function_call",
-    "function_call_output",
-    "reasoning",
-    "additional_tools",
-    "custom_tool_call",
-    "custom_tool_call_output",
-}
-
-
-def _cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
-    """Drop pydantic union-branch labels so the path names request fields."""
-    cleaned: list[str] = []
-    for part in location:
-        text = str(part)
-        if text in _LOCATION_NOISE:
-            continue
-        # Typed-dict union branches are labeled with their class name, which
-        # no request field ever shares: every public field is lower case.
-        if isinstance(part, str) and (
-            part.startswith("_") or "[" in text or text in _UNION_BRANCH_TYPES or text[:1].isupper()
-        ):
-            continue
-        if text in _OUTPUT_ITEM_VARIANTS and cleaned and cleaned[-1].isdigit():
-            continue
-        # A discriminated part whose tag is also its payload field name
-        # (``file.file``, ``image_url.image_url``) reports the tag once.
-        if cleaned and cleaned[-1] == text and not text.isdigit():
-            continue
-        cleaned.append(text)
-    return tuple(cleaned)
-
-
-_WIRE_TYPE_NAMES = {
-    "str": "a string",
-    "int": "an integer",
-    "float": "a number",
-    "bool": "a boolean",
-    "list": "an array",
-    "tuple": "an array",
-    "dict": "an object",
-    "NoneType": "null",
-}
-"""JSON-shape names for python input types, used in expected/got messages."""
-
-_EXPECTED_BY_ERROR_TYPE = {
-    "string_type": "a string",
-    "string_too_short": "a non-empty string",
-    "int_type": "an integer",
-    "int_parsing": "an integer",
-    "float_type": "a number",
-    "float_parsing": "a number",
-    "bool_type": "a boolean",
-    "list_type": "an array",
-    "tuple_type": "an array",
-    "dict_type": "an object",
-    "model_type": "an object",
-    "model_attributes_type": "an object",
-    "missing": "a value",
-    "none_required": "null",
-}
-"""Shape-level expectations for the pydantic error types worth naming."""
-
-
-def _shape_message(param: str, details: list[ErrorDetails]) -> str | None:
-    """Describe what shape a field expected versus what arrived.
-
-    Only structural facts appear: expectations come from this gateway's own
-    wire models and the got side is the JSON type of the caller's value,
-    never the value itself and never provider prose.
-    """
-    expected: list[str] = []
-    got: str | None = None
-    for detail in details:
-        phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
-        if detail["type"] in {"literal_error", "enum"}:
-            context = detail.get("ctx") or {}
-            allowed = context.get("expected")
-            if isinstance(allowed, str):
-                phrase = f"one of {allowed}"
-        if phrase is not None and phrase not in expected:
-            expected.append(phrase)
-        # A missing-field complaint carries the parent object as its input,
-        # so it contributes no honest "got" type.
-        if detail["type"] != "missing" and "input" in detail:
-            got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
-    if not expected:
-        return None
-    description = " or ".join(expected)
-    if got is not None:
-        return f"Invalid value for '{param}': expected {description}, but got {got} instead."
-    return f"Invalid value for '{param}': expected {description}."
-
-
-def _validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
-    """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
-
-    Union validation reports every branch's complaints. Errors group by
-    their branch (the location minus its final field segment); among the
-    most field-specific groups, the branch the caller actually meant is the
-    one with the fewest complaints, so its deepest cleaned location names
-    the real field (an echoed item's ``input.1.caller``), never a union
-    branch label such as ``input.str``. The chosen field's own complaints
-    then name the expected shape against the arriving JSON type.
-    """
-    groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
-    for detail in error.errors(include_url=False):
-        groups.setdefault(tuple(detail["loc"][:-1]), []).append(
-            (_cleaned_location(detail["loc"]), detail)
-        )
-    if not groups:
-        return invalid_field("body")
-    deepest = max(len(location) for members in groups.values() for location, _ in members)
-    candidates = [
-        members
-        for members in groups.values()
-        if any(len(location) == deepest for location, _ in members)
-    ]
-    best = min(candidates, key=len)
-    location = max((cleaned for cleaned, _ in best), key=len, default=())
-    param = ".".join(location) or "body"
-    details = [detail for cleaned, detail in best if cleaned == location]
-    if param == "body":
-        # A whole-request rule (such as the attachment count ceiling) has no
-        # field of its own, so its own wording is the only useful message.
-        for detail in details:
-            if detail["type"] == "value_error":
-                return invalid_field(param, detail["msg"].removeprefix("Value error, ") + ".")
-    for detail in details:
-        # A field validator's own wording states this gateway's exact value
-        # constraint (only our wire models raise these, so the text is
-        # display-safe and never echoes the caller's value).
-        if detail["type"] == "value_error":
-            return invalid_field(
-                param,
-                f"Invalid value for {param!r}: "
-                + detail["msg"].removeprefix("Value error, ")
-                + ".",
-            )
-    return invalid_field(param, _shape_message(param, details))
-
-
-def _validated_operation_headers(
-    idempotency_key: str | None, client_request_id: str | None
-) -> tuple[str | None, str | None]:
-    """Validate the two caller identity headers as independent concepts.
-
-    ``Idempotency-Key`` names one retriable operation and is the only header
-    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
-    caller correlation identity: Codex sends its session id there on every
-    request of a session (captured live 2026-08-29), and the provider serves
-    those requests without deduplication, so treating it as an operation key
-    would reject the second request of every real session as a conflict. It
-    is echoed on responses and scopes route affinity only, and the two
-    headers may therefore carry different values.
-    """
-    for name, value in (
-        ("Idempotency-Key", idempotency_key),
-        ("X-Client-Request-Id", client_request_id),
-    ):
-        if value is not None and (
-            not value or len(value) > 512 or any(ord(char) < 32 for char in value)
-        ):
-            raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
-    return idempotency_key, client_request_id
+        raise validation_protocol_error(exc) from exc
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:
     """Convert ordered wire messages while retaining raw assistant arguments."""
     converted: list[GatewayMessage] = []
+    custom_call_ids: set[str] = set()
     for message_index, message in enumerate(messages):
         calls = tuple(
-            _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
-            for call_index, call in enumerate(message.history_tool_calls)
+            _tool_call(call)
+            for call in message.history_tool_calls
+            if not isinstance(call, ChatCustomToolCall)
         )
-        provider_reasoning: tuple[SealedReasoningContentBlock, ...] = ()
-        if message.reasoning_content is not None:
-            try:
-                provider_reasoning = (parse_reasoning_content_carrier(message.reasoning_content),)
-            except ValueError as exc:
-                param = f"{prefix}.{message_index}.reasoning_content"
-                raise invalid_field(param, f"'{param}' must be a gateway-issued carrier.") from exc
-        content, content_parts = _message_content(
+        custom_calls = tuple(
+            call for call in message.history_tool_calls if isinstance(call, ChatCustomToolCall)
+        )
+        custom_call_ids.update(call.id for call in custom_calls)
+        provider_reasoning: tuple[
+            SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
+        ] = ()
+        try:
+            folded = fold_replayed_reasoning(
+                reasoning_content=message.reasoning_content,
+                reasoning=message.reasoning,
+                reasoning_details=message.reasoning_details,
+            )
+        except ReplayedReasoningTooLong as exc:
+            param = f"{prefix}.{message_index}.reasoning_details"
+            raise invalid_field(
+                param,
+                f"'{param}' plaintext reasoning exceeds 8,388,608 characters. "
+                "Shorten the replayed reasoning_details and retry.",
+            ) from exc
+        if folded.plaintext is not None:
+            param = f"{prefix}.{message_index}.{folded.source_field}"
+            # The scheme is fixed by the carrier's own opaque prefix. A known
+            # prefix MUST parse as that provider's carrier. Text under no known
+            # prefix is the plaintext an exposure-gated rung itself returned on
+            # an assistant turn (Tencent/DeepSeek), or the plaintext OpenRouter
+            # handed the caller: it decodes as caller-owned history and route
+            # admission decides which rungs may carry it.
+            scheme = scheme_for_carrier(folded.plaintext)
+            if scheme is None:
+                # Plaintext reasoning is caller-owned history on ANY assistant
+                # turn, tool-call turns included: AI-SDK clients re-serialize a
+                # reasoning part onto the same assistant message as its tool
+                # calls, and exposure-gated providers themselves emit
+                # reasoning_content on tool turns. The field is baked into the
+                # transcript, so rejecting it wedges every session that ever
+                # touched a reasoning-exposed model (the sealed-carrier bond
+                # applies only to text presented AS a gateway-issued carrier,
+                # which keeps its strict path below).
+                try:
+                    provider_reasoning = (ExposedReasoningContentBlock(content=folded.plaintext),)
+                except ValidationError as exc:
+                    raise invalid_field(
+                        param,
+                        f"'{param}' plaintext reasoning exceeds 8,388,608 characters. "
+                        f"Shorten the replayed {folded.source_field} and retry.",
+                    ) from exc
+            else:
+                try:
+                    provider_reasoning = (
+                        parse_reasoning_content_carrier(folded.plaintext, scheme=scheme),
+                    )
+                except ValueError as exc:
+                    raise invalid_field(
+                        param, f"'{param}' must be a gateway-issued carrier."
+                    ) from exc
+        content, content_parts = message_content(
             message.content, f"{prefix}.{message_index}.content"
         )
+        if custom_calls and content is None and not calls and not provider_reasoning:
+            # A turn of custom calls alone starts with its first native history
+            # item; ``expand_chat_custom_calls`` appends the rest after cache
+            # restoration, which maps wire messages one to one.
+            converted.append(chat_custom_call_messages(custom_calls[:1])[0])
+            continue
+        if content is None and not calls and not provider_reasoning:
+            # A null or omitted ``content`` (Go clients drop an empty tool
+            # result under ``omitempty``) leaves the message empty. Name the
+            # field here: the canonical message refuses it in its own
+            # validator, which escaped decode as an unclassified 500.
+            param = f"{prefix}.{message_index}.content"
+            raise invalid_field(
+                param,
+                f"Invalid value for '{param}': a {message.role} message needs content. "
+                "Send a string (it may be empty) or an array of content parts.",
+            )
         converted.append(
             GatewayMessage(
                 role=message.role,
@@ -675,155 +761,53 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 content_parts=content_parts,
                 tool_call_id=message.tool_call_id,
                 tool_calls=calls,
+                provider_tool_name=message.name,
                 provider_reasoning=provider_reasoning,
+                # An empty object is the common LiteLLM stamp and carries
+                # nothing to disclose; only a populated one is a dropped field.
+                provider_specific_fields=message.provider_specific_fields or None,
             )
         )
+        if message.role == "tool" and message.tool_call_id in custom_call_ids:
+            converted[-1] = chat_custom_output_message(
+                converted[-1], f"{prefix}.{message_index}.content"
+            )
     return tuple(converted)
 
 
-def _message_content(
-    content: str | tuple[_ContentPart, ...] | None,
-    param: str,
-) -> tuple[str | None, tuple[MessageContentPart, ...]]:
-    """Flatten wire content parts, retaining attachments in the caller's order.
+def _tool_call(call: _AssistantToolCall) -> ToolCall:
+    """Parse one replayed call, keeping its exact text; text naming no object gets a stand-in.
 
-    Args:
-        content: Wire content: plain text, ordered parts, or absent.
-        param: Public parameter path used to report an invalid attachment.
-
-    Returns:
-        The flattened text and, only for a message that carries an image,
-        a video, audio, or a document, the ordered canonical parts. A text-only
-        message keeps its previous representation exactly, so nothing
-        downstream changes for it.
-
-    Raises:
-        OpenAIProtocolError: An image or video reference is not a supported
-            URL or base64 data URL, an audio part is not base64 WAV or MP3,
-            or a file is not an inline PDF.
-    """
-    if content is None or isinstance(content, str):
-        return content, ()
-    parts: list[MessageContentPart] = []
-    for index, part in enumerate(content):
-        if isinstance(part, _TextPart):
-            # An empty text part carries no content and contributes nothing to
-            # the flattened text, while Anthropic and Gemini reject an empty
-            # block outright. Real clients emit one beside an attachment
-            # (OpenCode 1.18.26, captured live 2026-09-02), so it is dropped
-            # here rather than failing a turn that does carry an image.
-            if part.text:
-                parts.append(TextContentPart(text=part.text))
-            continue
-        if isinstance(part, _ChatVideoPart):
-            try:
-                parts.append(video_part_from_url(part.video_url.url))
-            except ValueError as exc:
-                location = f"{param}.{index}.video_url"
-                raise invalid_field(
-                    location,
-                    f"'{location}' must be an http(s) URL or a base64 data URL "
-                    "of an MP4, MPEG, QuickTime, WebM, FLV, 3GPP, or WMV video.",
-                ) from exc
-            continue
-        if isinstance(part, _ChatAudioPart):
-            audio = part.input_audio
-            try:
-                parts.append(audio_part_from_input_audio(audio.data, audio.format))
-            except ValueError as exc:
-                location = f"{param}.{index}.input_audio"
-                hint = f"'{location}' must carry base64 audio data with format 'wav' or 'mp3'."
-                raise invalid_field(location, hint) from exc
-            continue
-        if isinstance(part, (_ChatFilePart, _ResponsesFilePart)):
-            parts.append(_document_part(part, f"{param}.{index}"))
-            continue
-        url, detail = (
-            (part.image_url.url, part.image_url.detail)
-            if isinstance(part, _ChatImagePart)
-            else (part.image_url, part.detail)
-        )
-        try:
-            parts.append(image_part_from_url(url, detail=detail))
-        except ValueError as exc:
-            location = f"{param}.{index}.image_url"
-            raise invalid_field(
-                location,
-                f"'{location}' must be an http(s) URL or a base64 data URL "
-                "of a PNG, JPEG, GIF, or WebP image.",
-            ) from exc
-    text = "".join(part.text for part in parts if part.kind == "text")
-    if all(part.kind == "text" for part in parts):
-        return text, ()
-    return text, tuple(parts)
-
-
-def _document_part(part: _ChatFilePart | _ResponsesFilePart, param: str) -> DocumentContentPart:
-    """Convert one ``file`` or ``input_file`` part into the canonical document.
-
-    Args:
-        part: Validated caller file part.
-        param: Public parameter path of the part, used to report an invalid file.
-
-    Returns:
-        The canonical document part carrying the caller's bytes or URL.
-
-    Raises:
-        OpenAIProtocolError: The file data is not an inline PDF.
-    """
-    if isinstance(part, _ChatFilePart):
-        file_data, filename, location = part.file.file_data, part.file.filename, f"{param}.file"
-    elif part.file_data is None:
-        try:
-            return DocumentContentPart(url=part.file_url, name=part.filename or None)
-        except ValueError as exc:
-            raise invalid_field(
-                f"{param}.file_url", f"'{param}.file_url' must be an http(s) URL."
-            ) from exc
-    else:
-        file_data, filename, location = part.file_data, part.filename, param
-    try:
-        return document_part_from_file_data(file_data, name=filename)
-    except ValueError as exc:
-        raise invalid_field(
-            f"{location}.file_data",
-            f"'{location}.file_data' must be the base64 bytes of a PDF, bare or as a "
-            "data:application/pdf;base64 URL, within the size limit.",
-        ) from exc
-
-
-def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
-    """Parse one complete tool call while retaining its exact raw argument string."""
+    Each rung's wire then takes the raw text or the stand-in (``history_tool_arguments``)."""
     # Some SDK stacks echo a zero-argument call as an empty string; the
     # canonical empty object mirrors the streaming completion seed, since no
     # provider wire accepts empty argument bytes.
-    raw_arguments = call.function.arguments or "{}"
-    try:
-        parsed = json.loads(raw_arguments)
-    except json.JSONDecodeError as exc:
-        raise invalid_field(param, f"'{param}' must encode one JSON object.") from exc
-    if not isinstance(parsed, dict):
-        raise invalid_field(param, f"'{param}' must encode one JSON object.")
+    raw_arguments = call.function.arguments if call.function.arguments.strip() else "{}"
+    arguments, treatment = replayed_tool_arguments(raw_arguments)
     return ToolCall(
         call_id=call.id,
         name=call.function.name,
-        arguments=cast(JsonObject, parsed),
+        arguments=arguments,
         raw_arguments=raw_arguments,
+        arguments_treatment=treatment,
         cache_control=(
             call.cache_control.model_dump(mode="json", exclude_none=True)
             if call.cache_control is not None
             else None
         ),
+        provider_thought_signature=thought_signature(call.extra_content, call.thought_signature),
     )
 
 
 def _chat_tool(tool: _ChatTool) -> GatewayToolDefinition:
     """Convert one Chat function tool without weakening strictness."""
+    assert tool.function is not None  # the wire validator pairs type and body
     return GatewayToolDefinition(
         name=tool.function.name,
         description=tool.function.description,
         parameters=tool.function.parameters,
         strict=tool.function.strict,
+        defer_loading=tool.defer_loading,
     )
 
 
@@ -834,81 +818,42 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
         description=tool.description,
         parameters=tool.parameters,
         strict=bool(tool.strict),
+        defer_loading=tool.defer_loading,
     )
-
-
-def _chat_tool_choice(
-    value: JsonValue,
-) -> Literal["auto", "none", "required"] | GatewayNamedToolChoice | None:
-    """Normalize Chat tool-choice strings and named-function objects."""
-    if value is None:
-        return None
-    if isinstance(value, str) and value in {"auto", "none", "required"}:
-        return cast(Literal["auto", "none", "required"], value)
-    if isinstance(value, dict):
-        function = value.get("function")
-        if value.get("type") == "function" and isinstance(function, dict):
-            name = function.get("name")
-            if isinstance(name, str):
-                return GatewayNamedToolChoice(name=name)
-    raise invalid_field("tool_choice")
-
-
-def _responses_tool_choice(
-    value: JsonValue,
-) -> Literal["auto", "none", "required"] | GatewayNamedToolChoice | None:
-    """Normalize Responses tool-choice strings and named-function objects."""
-    if value is None:
-        return None
-    if isinstance(value, str) and value in {"auto", "none", "required"}:
-        return cast(Literal["auto", "none", "required"], value)
-    if isinstance(value, dict) and value.get("type") == "function":
-        name = value.get("name")
-        if isinstance(name, str):
-            return GatewayNamedToolChoice(name=name)
-    raise invalid_field("tool_choice")
-
-
-def _include_encrypted_reasoning(include: tuple[str, ...] | None) -> bool:
-    """Validate the closed ``include`` selector list.
-
-    Args:
-        include: Raw caller include paths.
-
-    Returns:
-        Whether the caller asked for ``reasoning.encrypted_content``.
-
-    Raises:
-        OpenAIProtocolError: An include path is not supported by this gateway.
-    """
-    if include is None:
-        return False
-    for path in include:
-        if path != "reasoning.encrypted_content":
-            raise invalid_field(
-                "include",
-                f"The include path {path!r} is not supported by this gateway. "
-                "Only 'reasoning.encrypted_content' is available.",
-            )
-    return bool(include)
 
 
 def _response_input_messages(
     value: str | tuple[_ResponsesInputItem, ...],
     *,
     raw_items: Sequence[JsonObject] = (),
+    marked_items: Sequence[JsonObject] = (),
+    cache_disclosures: list[str],
 ) -> tuple[GatewayMessage, ...]:
-    """Validate replay details and reconstruct OpenAI or Fireworks history."""
+    """Validate replay details and reconstruct OpenAI or Fireworks history.
+
+    ``marked_items`` carry text-block breakpoints as ``cache_control`` (see
+    ``prompt_cache_controls``); restore disclosures land in ``cache_disclosures``.
+    """
     if isinstance(value, str):
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(item, (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput)):
+        if isinstance(
+            item,
+            (
+                _AdditionalToolsItem,
+                CustomToolCallItem,
+                CustomToolCallOutputItem,
+                _HostedToolItemEcho,
+            ),
+        ):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _CustomToolCall):
+            if isinstance(item, _HostedToolItemEcho):
+                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
+            elif isinstance(item, CustomToolCallItem):
                 native_role = "assistant"
-            elif isinstance(item, _CustomToolCallOutput):
+            elif isinstance(item, CustomToolCallOutputItem):
                 native_role = "tool"
             else:
                 native_role = "developer"
@@ -916,10 +861,31 @@ def _response_input_messages(
                 ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
             )
         elif isinstance(item, _ResponseReasoningItem):
-            if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
+            if item.encrypted_content is None:
+                if item.id is None:
+                    raise invalid_field(
+                        f"input.{index}.id",
+                        "A reasoning input item requires an id or encrypted_content.",
+                    )
+                # A store=true flow replays reasoning by item id alone (the
+                # SDK marks encrypted_content optional); only the issuing
+                # native Responses wire can resolve the id, so the item is
+                # carried verbatim like a hosted-tool item and the provider
+                # judges resolvability, rather than rejecting SDK-legal
+                # input the provider itself may serve.
+                replayed.append(
+                    ReplayedNativeItem(index=index, role="assistant", item=raw_items[index])
+                )
+                continue
+            # The carrier's own prefix names the scheme it was sealed under
+            # (Fireworks or Hunyuan, the latter including every declared
+            # ``reasoning_content_native`` origin); any other value is a native
+            # provider's encrypted reasoning.
+            scheme = scheme_for_carrier(item.encrypted_content)
+            if scheme is not None:
                 try:
                     block: EncryptedReasoningBlock | SealedReasoningContentBlock = (
-                        parse_reasoning_content_carrier(item.encrypted_content)
+                        parse_reasoning_content_carrier(item.encrypted_content, scheme=scheme)
                     )
                 except ValueError as exc:
                     raise invalid_field(
@@ -933,9 +899,26 @@ def _response_input_messages(
                     output_index=index,
                     status=item.status,
                 )
-            replayed.append(ReplayedReasoning(index=index, block=block))
+            try:
+                visible = (
+                    tuple(
+                        ExposedReasoningContentBlock(content=part.text)
+                        for part in item.summary
+                        if part.text
+                    )
+                    if scheme is not None
+                    else ()
+                )
+            except ValidationError as exc:
+                raise invalid_field(
+                    f"input.{index}.summary",
+                    "Replayed reasoning summary exceeds 8,388,608 characters.",
+                ) from exc
+            replayed.append(ReplayedReasoning(index=index, block=block, visible=visible))
         elif isinstance(item, _ResponseMessage):
-            converted = _messages((item,), f"input.{index}")
+            converted = restore_responses_breakpoints(
+                _messages((item,), f"input.{index}"), marked_items, index, cache_disclosures
+            )
             if converted and item.role == "assistant":
                 converted = (
                     converted[0].model_copy(
@@ -953,21 +936,54 @@ def _response_input_messages(
             wire_call = _AssistantToolCall(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
+                extra_content=item.extra_content,
             )
             replayed.append(
                 ReplayedFunctionCall(
                     index=index,
-                    call=_tool_call(wire_call, f"input.{index}.arguments").model_copy(
+                    call=_tool_call(wire_call).model_copy(
                         update={
                             "provider_item_id": item.id,
                             "provider_output_index": index,
                             "provider_status": item.status,
+                            "provider_namespace": item.namespace,
+                            "provider_caller": item.caller,
                         }
                     ),
                 )
             )
         else:
+            if isinstance(item.output, str):
+                output_text, output_parts = item.output, ()
+            else:
+                # The SDK list form: text and image parts map onto the
+                # canonical tool message (the tool-message contract carries
+                # exactly those two kinds); any other kind is a named 400
+                # because a tool result has no canonical carrier for it and
+                # dropping it would misstate what the tool returned.
+                output_text, output_parts = message_content(item.output, f"input.{index}.output")
+                unsupported = next(
+                    (part for part in output_parts if part.kind not in ("text", "image")),
+                    None,
+                )
+                if unsupported is not None:
+                    raise unsupported_field(
+                        f"input.{index}.output",
+                        message=(
+                            "function_call_output.output supports text and image parts "
+                            f"only; this list carries a {unsupported.kind!r} part."
+                        ),
+                    )
+                output_text = output_text or ""
             replayed.append(
-                ReplayedFunctionOutput(index=index, call_id=item.call_id, output=item.output)
+                ReplayedFunctionOutput(
+                    index=index,
+                    call_id=item.call_id,
+                    output=output_text,
+                    name=item.name,
+                    namespace=item.namespace,
+                    caller=item.caller,
+                    content_parts=output_parts,
+                )
             )
     return responses_input_messages(tuple(replayed))

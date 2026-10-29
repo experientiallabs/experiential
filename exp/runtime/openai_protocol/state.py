@@ -114,33 +114,6 @@ class ResponseReplayStore(Protocol):
         ...
 
 
-class ResponseContinuationStore(Protocol):
-    """Namespaced state operations required by Responses continuations.
-
-    Implementations must apply their finite retention policy to the complete namespace and public
-    response identity. Missing, expired, evicted, or cross-namespace state must fail closed.
-    """
-
-    async def remember(
-        self,
-        *,
-        namespace: ProtocolNamespace,
-        response_id: str,
-        state: ContinuationState,
-    ) -> None:
-        """Retain one completed Responses continuation within implementation bounds."""
-        ...
-
-    async def resolve(
-        self,
-        *,
-        namespace: ProtocolNamespace,
-        previous_response_id: str,
-    ) -> ContinuationState:
-        """Resolve an exact namespaced continuation or fail closed."""
-        ...
-
-
 class _BoundedReplayLease:
     """One local caller's ownership or join handle for a keyed response."""
 
@@ -397,21 +370,35 @@ class ContinuationState(ContractModel):
                     and call.provider_item_id is None
                     and call.provider_output_index is None
                     and call.provider_status is None
+                    and call.provider_namespace is None
+                    and call.provider_caller is None
+                    and call.provider_thought_signature is None
                 ):
                     continue
-                retained_calls.append(
-                    {
-                        "call_id": call.call_id,
-                        "raw_arguments": call.raw_arguments,
-                        "provider_item_id": call.provider_item_id,
-                        "provider_output_index": call.provider_output_index,
-                        "provider_status": call.provider_status,
-                    }
-                )
+                retained_call: dict[str, object] = {
+                    "call_id": call.call_id,
+                    "raw_arguments": call.raw_arguments,
+                    "provider_item_id": call.provider_item_id,
+                    "provider_output_index": call.provider_output_index,
+                    "provider_status": call.provider_status,
+                }
+                if call.provider_namespace is not None:
+                    retained_call["provider_namespace"] = call.provider_namespace
+                if call.provider_caller is not None:
+                    retained_call["provider_caller"] = call.provider_caller
+                if call.provider_thought_signature is not None:
+                    retained_call["provider_thought_signature"] = call.provider_thought_signature
+                retained_calls.append(retained_call)
             if retained_calls:
                 authority["tool_calls"] = retained_calls
             if message.tool_is_error:
                 authority["tool_is_error"] = True
+            if message.provider_tool_name is not None:
+                authority["provider_tool_name"] = message.provider_tool_name
+            if message.provider_tool_namespace is not None:
+                authority["provider_tool_namespace"] = message.provider_tool_namespace
+            if message.provider_tool_caller is not None:
+                authority["provider_tool_caller"] = message.provider_tool_caller
             if len(authority) > 1:
                 replay_authority.append(authority)
         if replay_authority:

@@ -30,16 +30,17 @@ from exp.common.project import (
     artifact_input,
     coordinate_completed_build_selection,
 )
+from exp.common.project.database import project_connection
 from exp.common.project.project import require_durable_source_id
 from exp.common.release_revision import installed_release_revision
 from exp.common.tasks import TaskSet
 from exp.common.traces import load_trace_dataset
-from exp.simulation.ingest.dataset import (
+from exp.common.traces.ingest.dataset import (
     PersistedTraceDataset,
     persist_trace_dataset,
 )
-from exp.simulation.ingest.otlp import TraceNormalizationResult
-from exp.simulation.ingest.sources import load_trace_source
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
+from exp.common.traces.ingest.sources import load_trace_source
 from exp.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,
@@ -286,7 +287,7 @@ def _initialize_provider_free_project(
         retrieval=None,
         budgets=None,
     )
-    if not store.paths.project_toml.exists():
+    if not store.exists():
         try:
             store.initialize(proposed)
         except ProjectStoreError:
@@ -458,17 +459,19 @@ def select_completed_build(
     store: ProjectStore,
     build: ProjectBuildArtifacts,
     review: BuildReviewReadiness,
+    *,
+    trace_import_id: ArtifactId | None = None,
 ) -> None:
     """Select a completed graph before advancing its recoverable review handoff.
 
-    Official build writers share one cross-process coordination lock. The immutable build is
-    selected first, then review readiness advances. If execution stops between those writes, an
-    exact restart verifies the selected graph and repairs the review handoff without provider work.
+    Official build writers share one cross-process coordination lock. The configuration head and
+    review handoff commit in one short SQLite transaction after immutable evidence is complete.
 
     Args:
         store: Project store receiving the completed-build selection.
         build: Verified immutable trace, task, RAG, and world-model graph.
         review: Exact readiness record derived from the graph's trace and task artifacts.
+        trace_import_id: Stored corpus to pin with this build, or None for direct normalized input.
 
     Raises:
         ValueError: The proposed graph and review name different trace or task artifacts.
@@ -476,8 +479,62 @@ def select_completed_build(
     if build.trace_dataset != review.trace_dataset or build.task_set != review.task_set:
         raise ValueError("completed build does not match proposed build review")
     with _build_review_coordination(store):
-        store.bind_completed_build(build)
-        select_build_review(store, review)
+        with project_connection(store.paths.root, write=True):
+            store.bind_completed_build(build, trace_import_id=trace_import_id)
+            select_build_review(store, review)
+
+
+def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
+    """Select another task set over the completed build's unchanged trace evidence.
+
+    The trace dataset, retrieval indexes and world model stay selected. The build review is
+    rebound to the new task set, which discards judge state bound to the previous one. The
+    check and the rebinding share one project write transaction, so a concurrent build or
+    hosted binding cannot interleave.
+
+    Args:
+        store: Plain project with a completed build and its build review.
+        task_set: Task-set manifest whose only input is the build's trace dataset.
+
+    Raises:
+        ValueError: The project has no completed build review, it names another build, or
+            hosted setup, spend, judge or router evidence is bound to the current task set.
+    """
+    with _build_review_coordination(store), project_connection(store.paths.root, write=True):
+        config = store.load_project()
+        build = config.build
+        current = store.read_review()
+        if build is None or not isinstance(current, dict) or "build_review" not in current:
+            raise ValueError("project has no completed build review; run exp build first")
+        review = BuildReviewReadiness.model_validate(current["build_review"])
+        if review.trace_dataset != build.trace_dataset or review.task_set != build.task_set:
+            raise ValueError("project build review differs from its selected build; rebuild it")
+        if task_set == build.task_set:
+            return
+        if any(
+            binding is not None
+            for binding in (
+                config.system,
+                config.build_spend_ledger,
+                config.hosted_judge,
+                config.router_policy,
+                config.router_report,
+            )
+        ):
+            raise ValueError(
+                "hosted or router-bound projects keep their task set; select scenarios on a "
+                "plain evaluation project"
+            )
+        binding = review.model_dump(mode="json", exclude={"readiness_id"})
+        binding["task_set"] = task_set.model_dump(mode="json")
+        select_completed_build(
+            store,
+            build.model_copy(update={"task_set": task_set}),
+            BuildReviewReadiness.model_validate(
+                {**binding, "readiness_id": _build_review_id(binding)}
+            ),
+            trace_import_id=config.trace_import_id,
+        )
 
 
 @contextmanager

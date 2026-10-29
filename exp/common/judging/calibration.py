@@ -726,6 +726,8 @@ def _validate_human_score_target(
         raise CalibrationError("human score belongs to a different frozen rubric")
     if human_score.dimension_id not in rubric_dimensions:
         raise CalibrationError("human score dimension is absent from the frozen rubric")
+    if not rubric.axis(human_score.dimension_id).contains_score(human_score.score):
+        raise CalibrationError("human score is outside the frozen rubric axis range")
     try:
         expected_lineage = split.lineage_for_rollout(human_score.rollout_id)
     except ValueError as exc:

@@ -6,6 +6,8 @@ use super::{aggregate, OutputSlot, ResponsesSseEncoder};
 use crate::encode::compact_json;
 use crate::errors::Failure;
 use crate::events::ProviderOutputItemStatus;
+use crate::tool_search::annotate_tool_search_usage_details;
+use crate::web_search::annotate_usage_details;
 
 impl ResponsesSseEncoder {
     /// Build one SDK-readable Responses envelope for the current lifecycle state.
@@ -24,6 +26,8 @@ impl ResponsesSseEncoder {
                     self.messages[key].item(include_content, fallback_status)
                 }
                 OutputSlot::Tool(index) => self.tools[index].item(fallback_status),
+                // Hosted tool items re-serve the provider's verbatim JSON.
+                OutputSlot::HostedTool(index) => self.hosted[index].item.clone(),
                 OutputSlot::Reasoning(index) => self.reasoning[index].item(
                     include_content,
                     fallback_status,
@@ -44,7 +48,7 @@ impl ResponsesSseEncoder {
             json!({
                 "code": "server_error",
                 "message": failure
-                    .map(|failure| failure.safe_message.clone())
+                    .map(|failure| failure.caller_message().to_string())
                     .unwrap_or_else(|| "Gateway stream failed.".to_string()),
             })
         } else {
@@ -75,7 +79,15 @@ impl ResponsesSseEncoder {
             "max_output_tokens": self.envelope.max_output_tokens,
             "previous_response_id": self.envelope.previous_response_id,
             "usage": if include_content {
-                aggregate::responses_usage(self.usage.as_ref())
+                let mut usage = aggregate::responses_usage(self.usage.as_ref());
+                self.reasoning_estimate.annotate(
+                    &mut usage,
+                    self.usage.as_ref(),
+                    "output_tokens_details",
+                );
+                annotate_usage_details(&mut usage, self.web_search.as_ref());
+                annotate_tool_search_usage_details(&mut usage, self.tool_search_requests());
+                usage
             } else {
                 Value::Null
             },

@@ -26,6 +26,7 @@ from exp.common.models import (
     normalize_gateway_catalog,
     write_model_catalog,
 )
+from exp.runtime.gateway.model_chain_authority import refuse_unenforced_model_chains
 
 
 class GatewayCatalogAuthoringError(ValueError):
@@ -168,7 +169,7 @@ def plan_singleton_deployment_update(
     revision: str | None,
     capabilities: ModelCapabilities,
     gateway_capabilities: GatewayDeploymentCapabilities,
-    prices: GatewayTokenPrices,
+    prices: GatewayTokenPrices | None,
     pricing_source: str | None,
     billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
     replace: bool,
@@ -185,7 +186,7 @@ def plan_singleton_deployment_update(
         revision: Optional exact provider revision.
         capabilities: Existing runtime capability declaration.
         gateway_capabilities: Gateway protocol capability declaration.
-        prices: Integer attribution rates, with unknown represented by ``None``.
+        prices: Authored attribution card, or None when only capabilities are declared.
         pricing_source: Optional provenance label for the rates.
         billing_source: Credential ownership frozen for every dispatched attempt.
         replace: Whether an existing deployment alias may change.
@@ -220,18 +221,20 @@ def plan_singleton_deployment_update(
         raise GatewayCatalogAuthoringError(
             f"unknown provider connection {connection_name!r}; add it first"
         )
+    metadata = GatewayDeploymentMetadata(
+        exact_model_id=exact_model_id,
+        capabilities=gateway_capabilities,
+        pricing_source=pricing_source,
+    )
+    if prices is not None:
+        metadata = metadata.model_copy(update={"prices": prices})
     record = ModelRecord(
         connection=connection_name,
         model=provider_model,
         revision=revision,
         billing_source=billing_source,
         capabilities=capabilities,
-        gateway=GatewayDeploymentMetadata(
-            exact_model_id=exact_model_id,
-            capabilities=gateway_capabilities,
-            prices=prices,
-            pricing_source=pricing_source,
-        ),
+        gateway=metadata,
     )
     existing = current.models.get(deployment_alias)
     if existing is not None and existing != record and not replace:
@@ -261,6 +264,7 @@ def apply_singleton_deployment_update(root: Path, update: SingletonDeploymentUpd
         root: EXP root containing the locked catalog.
         update: Previously validated singleton deployment mutation.
     """
+    refuse_unenforced_model_chains(update.normalized)
     if update.changed:
         write_model_catalog(root / "models.toml", update.updated)
     _write_catalog_snapshot(root, update.updated, update.normalized)
@@ -352,48 +356,6 @@ def rollback_singleton_deployment_update(
         )
 
 
-def upsert_certified_pool(
-    root: Path,
-    *,
-    pool_id: str,
-    exact_model_id: str,
-    deployment_aliases: tuple[str, ...],
-    certification: GatewayEquivalenceCertification,
-    expected_catalog_sha256: str,
-    replace: bool,
-) -> tuple[NormalizedGatewayCatalog, Path, bool]:
-    """Author one certified ordered pool against an optimistic catalog digest.
-
-    Args:
-        root: EXP root containing ``models.toml`` and gateway snapshots.
-        pool_id: Stable direct-pool and public-alias identifier.
-        exact_model_id: Exact logical model identity shared by every deployment.
-        deployment_aliases: Ordered existing deployment aliases.
-        certification: Operator evidence binding the declared equivalence.
-        expected_catalog_sha256: Normalized digest observed before this mutation.
-        replace: Whether an existing pool declaration may change.
-
-    Returns:
-        Updated normalized catalog, immutable snapshot path, and change status.
-
-    Raises:
-        GatewayCatalogAuthoringError: The catalog moved or the pool already differs.
-    """
-    path = root / "models.toml"
-    with file_write_lock(path, what="the gateway exact-model pool catalog"):
-        update = plan_certified_pool_update(
-            root,
-            pool_id=pool_id,
-            exact_model_id=exact_model_id,
-            deployment_aliases=deployment_aliases,
-            certification=certification,
-            expected_catalog_sha256=expected_catalog_sha256,
-            replace=replace,
-        )
-        apply_certified_pool_update(root, update)
-    return update.normalized, update.snapshot, update.changed
-
-
 def plan_certified_pool_update(
     root: Path,
     *,
@@ -468,6 +430,7 @@ def apply_certified_pool_update(root: Path, update: CertifiedPoolUpdate) -> None
         root: EXP root containing the locked catalog.
         update: Previously validated mutation plan.
     """
+    refuse_unenforced_model_chains(update.normalized)
     if update.changed:
         write_model_catalog(root / "models.toml", update.updated)
     _write_catalog_snapshot(root, update.updated, update.normalized)
@@ -568,6 +531,8 @@ def _write_catalog_snapshot(
     Returns:
         Content-addressed normalized snapshot path.
     """
+    refuse_unenforced_model_chains(normalized)
+    refuse_unenforced_model_chains(catalog)
     snapshot = root / "gateway" / "catalog-snapshots" / f"{normalized.identity_sha256()}.json"
     authored = authored_snapshot_path(snapshot)
     authored_bytes = canonical_json_bytes(catalog)

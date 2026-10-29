@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import math
 import os
-import stat
+import sqlite3
+import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -16,11 +17,19 @@ from pathlib import Path
 from typing import Self
 from uuid import uuid4
 
+from filelock import BaseFileLock, FileLock, SoftFileLock, Timeout
 from pydantic import AwareDatetime, Field, ValidationError, field_validator, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256, canonical_json_bytes
-from exp.common.core.files import fsync_directory_best_effort
-from exp.common.core.locks import FileLockTimeout, file_write_lock
+from exp.common.core.artifacts import (
+    ArtifactId,
+    ContractModel,
+    Sha256,
+    canonical_json_bytes,
+    stable_id,
+)
+from exp.common.core.locks import DEFAULT_LOCK_TIMEOUT_S, FileLockTimeout, file_write_lock
+from exp.common.project.database import project_connection
+from exp.common.project.records import ProjectRecordError, ProjectRecords
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +38,7 @@ _LEASE_SUFFIX = ".json"
 _DEFAULT_STALE_AFTER_SECONDS = 15 * 60
 _DEFAULT_POLL_INTERVAL_SECONDS = 0.02
 _DEFAULT_WAIT_TIMEOUT_SECONDS = 10.0
+_OWNER_PROTOCOL = "kernel-lock-v1:"
 
 
 class TextCellLeaseError(RuntimeError):
@@ -53,7 +63,24 @@ class TextCellLeaseStatus(StrEnum):
 
 
 class TextCellLease(ContractModel):
-    """One fsync-backed exclusive claim made before any provider call in a cell."""
+    """One durable exclusive claim made before any provider call in a cell.
+
+    Attributes:
+        lease_id: Stable identity for the exact cell and attempt.
+        resolution_id: Frozen model-resolution identity.
+        simulation_id: Simulation whose cells share one spend boundary.
+        rollout_id: Expected immutable outcome for this attempt.
+        binding_sha256: Digest of the frozen cell binding.
+        maximum_cost_usd: Optional shared simulation spending ceiling.
+        reserved_cost_usd: Concrete reservation retained until spend is reconciled.
+        owner_id: Ownership protocol and unique nonce identifying the live kernel lock.
+        owner_pid: Diagnostic process number, never the default liveness authority.
+        claimed_at: Time the exclusive claim was created.
+        expires_at: Recorded deadline used by explicit process-liveness test overrides.
+        status: Active ownership or an abandoned-attempt tombstone.
+        unknown_spend_blocks_budget: Whether ambiguous paid work retains its budget barrier.
+        dispatch_intent_recorded: Whether external dispatch intent was committed.
+    """
 
     lease_id: ArtifactId
     resolution_id: ArtifactId
@@ -111,10 +138,11 @@ class TextCellLeaseClaim:
 class TextCellLeaseStore:
     """Coordinate one local project's paid text-simulation cells across processes.
 
-    A claim file is atomically created before a candidate or world-model provider call. A process
-    that sees a live claim waits for its immutable rollout up to a bounded deadline. An expired
-    claim with a dead owner becomes a durable non-reserving tombstone: the earlier process may have
-    paid a provider just before crashing, so the cell is not replayed.
+    A claim commits atomically before a candidate or world-model provider call. A process
+    that sees a live claim waits for its immutable rollout up to a bounded deadline. Each owner
+    holds a kernel file lock for the lifetime of its execution. A claim whose owner has exited
+    becomes a durable tombstone: the earlier process may have paid a provider just before crashing,
+    so the cell is not replayed and its unknown spend remains reserved.
     """
 
     def __init__(
@@ -134,10 +162,12 @@ class TextCellLeaseStore:
         Args:
             project_directory: Canonical mutable directory for one EXP project.
             clock: Aware wall clock used for durable lease timestamps.
-            owner_alive: Process-liveness probe, injectable for deterministic recovery tests.
+            owner_alive: Optional process-liveness override for deterministic recovery tests.
+                The default probes the exact owner's kernel lock, independently of PID reuse.
             sleep: Short follower wait seam, injectable for deterministic tests.
             monotonic: Deadline clock, injectable with ``sleep`` for deterministic tests.
-            stale_after_seconds: Minimum retained duration before a dead claim is stale.
+            stale_after_seconds: Recorded claim deadline. A live owner's kernel lock remains
+                authoritative after this deadline; confirmed owner exit permits immediate recovery.
             poll_interval_seconds: Follower interval while another process owns a live claim.
             wait_timeout_seconds: Maximum wait for active same-cell or budget contention.
 
@@ -150,14 +180,21 @@ class TextCellLeaseStore:
             raise ValueError("text-cell lease poll_interval_seconds must be positive")
         if not math.isfinite(wait_timeout_seconds) or wait_timeout_seconds <= 0:
             raise ValueError("text-cell lease wait_timeout_seconds must be finite and positive")
+        if project_directory.parent.name != "projects":
+            raise ValueError("text-cell leases require a canonical project directory")
+        self._records = ProjectRecords(
+            project_directory.parent.parent, project_directory.name, "simulation-leases"
+        )
         self._directory = project_directory / _LEASE_DIRECTORY_NAME
         self._clock = clock
-        self._owner_alive = _owner_process_is_alive if owner_alive is None else owner_alive
+        self._owner_alive = owner_alive
         self._sleep = sleep
         self._monotonic = monotonic
         self._stale_after = timedelta(seconds=stale_after_seconds)
         self._poll_interval_seconds = poll_interval_seconds
         self._wait_timeout_seconds = wait_timeout_seconds
+        self._admission_lock = threading.RLock()
+        self._ownership_locks: dict[str, FileLock] = {}
 
     def acquire(
         self,
@@ -172,6 +209,7 @@ class TextCellLeaseStore:
         observed_spend_usd: Callable[[], float | None],
         stop_on_overspend: bool = False,
         cancelled: Callable[[], bool] | None = None,
+        reservation_cost_usd: float | None = None,
     ) -> TextCellLeaseClaim:
         """Atomically reserve one paid cell, or wait for its completed immutable artifact.
 
@@ -188,6 +226,7 @@ class TextCellLeaseStore:
             stop_on_overspend: When true, unknown or ceiling-reaching spend blocks admission;
                 by default the authorized run continues with a logged warning.
             cancelled: Optional cooperative cancellation probe checked before and during waits.
+            reservation_cost_usd: Optional frozen whole-cell bound enabling parallel admission.
 
         Returns:
             An owned claim, completed follower result, budget block, or stale recovery result.
@@ -197,29 +236,43 @@ class TextCellLeaseStore:
         """
         if maximum_cost_usd is not None and maximum_cost_usd <= 0:
             raise ValueError("text-cell maximum_cost_usd must be positive")
+        if reservation_cost_usd is not None and (
+            not math.isfinite(reservation_cost_usd) or reservation_cost_usd <= 0
+        ):
+            raise ValueError("cell reservation must be finite and positive")
         deadline = self._monotonic() + self._wait_timeout_seconds
         is_cancelled = (lambda: False) if cancelled is None else cancelled
         while True:
             if is_cancelled():
                 return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
+            queued_at = self._monotonic()
+            if not self._wait_for_local_turn(cancelled):
                 return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
             try:
-                decision = self._admit_once(
-                    lease_id=lease_id,
-                    resolution_id=resolution_id,
-                    simulation_id=simulation_id,
-                    rollout_id=rollout_id,
-                    binding_sha256=binding_sha256,
-                    maximum_cost_usd=maximum_cost_usd,
-                    rollout_completed=rollout_completed,
-                    observed_spend_usd=observed_spend_usd,
-                    stop_on_overspend=stop_on_overspend,
-                    lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
-                )
-            except FileLockTimeout:
-                decision = None
+                # Waiting behind our own metadata writers is scheduling, not evidence that
+                # another runner owns this cell. Only contention consumes the follower wait.
+                deadline += self._monotonic() - queued_at
+                remaining = deadline - self._monotonic()
+                if remaining <= 0 or is_cancelled():
+                    return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
+                try:
+                    decision = self._admit_once(
+                        lease_id=lease_id,
+                        resolution_id=resolution_id,
+                        simulation_id=simulation_id,
+                        rollout_id=rollout_id,
+                        binding_sha256=binding_sha256,
+                        maximum_cost_usd=maximum_cost_usd,
+                        rollout_completed=rollout_completed,
+                        observed_spend_usd=observed_spend_usd,
+                        stop_on_overspend=stop_on_overspend,
+                        reservation_cost_usd=reservation_cost_usd,
+                        lock_timeout_seconds=min(self._poll_interval_seconds, remaining),
+                    )
+                except FileLockTimeout:
+                    decision = None
+            finally:
+                self._admission_lock.release()
             if decision is not None:
                 return decision
             remaining = deadline - self._monotonic()
@@ -227,8 +280,21 @@ class TextCellLeaseStore:
                 return TextCellLeaseClaim(TextCellLeaseState.CONTENDED, None, None)
             self._sleep(min(self._poll_interval_seconds, remaining))
 
+    def _wait_for_local_turn(self, cancelled: Callable[[], bool] | None) -> bool:
+        """Wait outside the follower deadline, letting cooperative cancellation leave the queue."""
+        if cancelled is None:
+            self._admission_lock.acquire()
+            return True
+        while not cancelled():
+            if self._admission_lock.acquire(timeout=self._poll_interval_seconds):
+                return True
+        return False
+
     def release(self, lease: TextCellLease) -> None:
         """Remove this owner's claim after its immutable rollout is safely persisted.
+
+        Lock or filesystem cleanup failures are logged and leave the claim intact. A later
+        admission reaps it using the authoritative rollout, without repeating provider work.
 
         Args:
             lease: Exact active claim obtained from ``acquire`` or its durable intent successor.
@@ -239,9 +305,10 @@ class TextCellLeaseStore:
         self._ensure_directory()
         path = self._path(lease.lease_id)
         try:
-            with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+            with self._admission_transaction():
                 existing = self._read_optional(path)
                 if existing is None:
+                    self.abandon(lease)
                     return
                 intended = lease.model_copy(update={"dispatch_intent_recorded": True})
                 if existing != lease and existing != intended:
@@ -249,17 +316,32 @@ class TextCellLeaseStore:
                         f"text-cell lease {lease.lease_id!r} changed before its owner released it"
                     )
                 self._reap(path, existing)
-        except OSError as exc:
+                self.abandon(lease)
+        except (OSError, FileLockTimeout) as exc:
             logger.warning(
                 "could not release text-cell lease %s after immutable rollout persistence: %s",
                 lease.lease_id,
                 exc,
             )
+            self.abandon(lease)
+
+    def abandon(self, lease: TextCellLease) -> None:
+        """End this execution's kernel ownership without deleting its durable claim.
+
+        The caller must have stopped executing the cell. Missing rollout evidence remains an
+        ambiguous paid attempt, so a follower records the existing stale outcome without replay.
+
+        Args:
+            lease: Claim owned by this store whose execution has ended.
+        """
+        lock = self._ownership_locks.pop(lease.owner_id, None)
+        if lock is not None:
+            lock.release()
 
     def stale_recovery_pending(self, lease_id: ArtifactId) -> bool:
         """Return whether a dead prior claim awaits this exact cell's recovery rollout.
 
-        A stale tombstone, or an expired claim whose owner process is gone, keeps a
+        A stale tombstone, or a claim whose owner execution is gone, keeps a
         whole-ceiling budget barrier that only this cell's persisted recovery evidence
         clears, so callers should run such cells before admitting sibling cells.
 
@@ -267,7 +349,7 @@ class TextCellLeaseStore:
             lease_id: Stable local filename for the exact resolution and cell binding.
 
         Returns:
-            True when a stale tombstone or a dead expired claim awaits this cell's recovery.
+            True when a stale tombstone or an abandoned claim awaits this cell's recovery.
         """
         try:
             lease = self._read_optional(self._path(lease_id))
@@ -296,7 +378,7 @@ class TextCellLeaseStore:
         self._ensure_directory()
         path = self._path(lease.lease_id)
         intended = lease.model_copy(update={"dispatch_intent_recorded": True})
-        with file_write_lock(self._admission_path(), what="text simulation cell admission"):
+        with self._admission_transaction():
             existing = self._read_optional(path)
             if existing is None:
                 raise TextCellLeaseError(
@@ -324,69 +406,122 @@ class TextCellLeaseStore:
         observed_spend_usd: Callable[[], float | None],
         stop_on_overspend: bool,
         lock_timeout_seconds: float,
+        reservation_cost_usd: float | None = None,
     ) -> TextCellLeaseClaim | None:
         """Make one lock-protected admission attempt, returning ``None`` for a live follower."""
         self._ensure_directory()
-        with file_write_lock(
-            self._admission_path(),
-            what="text simulation cell admission",
-            timeout_s=lock_timeout_seconds,
-        ):
-            path = self._path(lease_id)
-            existing = self._read_optional(path)
-            now = _aware_now(self._clock)
-            if existing is not None:
-                self._require_same_claim(
-                    existing,
+        lease: TextCellLease | None = None
+        try:
+            with self._admission_transaction(timeout_s=lock_timeout_seconds):
+                path = self._path(lease_id)
+                existing = self._read_optional(path)
+                now = _aware_now(self._clock)
+                if existing is not None:
+                    self._require_same_claim(
+                        existing,
+                        resolution_id=resolution_id,
+                        simulation_id=simulation_id,
+                        rollout_id=rollout_id,
+                        binding_sha256=binding_sha256,
+                        maximum_cost_usd=maximum_cost_usd,
+                    )
+                    if rollout_completed(existing.rollout_id):
+                        self._reap(path, existing)
+                        return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+                    if existing.status == TextCellLeaseStatus.STALE:
+                        return TextCellLeaseClaim(TextCellLeaseState.STALE, existing, None)
+                    if self._is_stale(existing, now):
+                        stale = self._tombstone(path, existing)
+                        return TextCellLeaseClaim(TextCellLeaseState.STALE, stale, None)
+                    return None
+                if rollout_completed(rollout_id):
+                    return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
+                # Request-budgeted cells share no whole-cell reservation. Consulting every
+                # sibling's artifacts here makes independent admission quadratic in run size.
+                active_leases = (
+                    ()
+                    if maximum_cost_usd is None
+                    else self._active_leases_for(
+                        resolution_id=resolution_id,
+                        simulation_id=simulation_id,
+                        now=now,
+                        rollout_completed=rollout_completed,
+                    )
+                )
+                spend = observed_spend_usd()
+                reservation, contended = self._reserve_budget(
+                    maximum_cost_usd=maximum_cost_usd,
+                    observed_spend_usd=spend,
+                    active_leases=active_leases,
+                    stop_on_overspend=stop_on_overspend,
+                    reservation_cost_usd=reservation_cost_usd,
+                )
+                if contended:
+                    return None
+                if maximum_cost_usd is not None and reservation is None:
+                    return TextCellLeaseClaim(TextCellLeaseState.BUDGET_BLOCKED, None, spend)
+                lease = TextCellLease(
+                    lease_id=lease_id,
                     resolution_id=resolution_id,
                     simulation_id=simulation_id,
                     rollout_id=rollout_id,
                     binding_sha256=binding_sha256,
                     maximum_cost_usd=maximum_cost_usd,
+                    reserved_cost_usd=reservation,
+                    owner_id=f"{_OWNER_PROTOCOL}{uuid4().hex}",
+                    owner_pid=os.getpid(),
+                    claimed_at=now,
+                    expires_at=now + self._stale_after,
                 )
-                if rollout_completed(existing.rollout_id):
-                    self._reap(path, existing)
-                    return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
-                if existing.status == TextCellLeaseStatus.STALE:
-                    return TextCellLeaseClaim(TextCellLeaseState.STALE, existing, None)
-                if self._is_stale(existing, now):
-                    stale = self._tombstone(path, existing)
-                    return TextCellLeaseClaim(TextCellLeaseState.STALE, stale, None)
-                return None
-            if rollout_completed(rollout_id):
-                return TextCellLeaseClaim(TextCellLeaseState.COMPLETED, None, None)
-            active_leases = self._active_leases_for(
-                resolution_id=resolution_id,
-                simulation_id=simulation_id,
-                now=now,
-                rollout_completed=rollout_completed,
-            )
-            spend = observed_spend_usd()
-            reservation, contended = self._reserve_budget(
-                maximum_cost_usd=maximum_cost_usd,
-                observed_spend_usd=spend,
-                active_leases=active_leases,
-                stop_on_overspend=stop_on_overspend,
-            )
-            if contended:
-                return None
-            if maximum_cost_usd is not None and reservation is None:
-                return TextCellLeaseClaim(TextCellLeaseState.BUDGET_BLOCKED, None, spend)
-            lease = TextCellLease(
-                lease_id=lease_id,
-                resolution_id=resolution_id,
-                simulation_id=simulation_id,
-                rollout_id=rollout_id,
-                binding_sha256=binding_sha256,
-                maximum_cost_usd=maximum_cost_usd,
-                reserved_cost_usd=reservation,
-                owner_id=uuid4().hex,
-                owner_pid=os.getpid(),
-                claimed_at=now,
-                expires_at=now + self._stale_after,
-            )
-            self._write_exclusive(path, lease)
-            return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
+                self._hold_ownership(lease)
+                self._write_exclusive(path, lease)
+                return TextCellLeaseClaim(TextCellLeaseState.OWNED, lease, spend)
+        except BaseException:
+            if lease is not None:
+                self.abandon(lease)
+            raise
+
+    @contextmanager
+    def _admission_transaction(
+        self, *, timeout_s: float = DEFAULT_LOCK_TIMEOUT_S
+    ) -> Iterator[None]:
+        """Queue local metadata writers before the bounded cross-process lock.
+
+        Local workers wake when their predecessor exits. Their queue wait is separate from
+        the bounded cross-process lock and SQLite admission. No provider call runs under
+        either lock.
+
+        Args:
+            timeout_s: Cross-process file lock and SQLite wait allowance after the local turn.
+
+        Yields:
+            None while both metadata locks are held.
+
+        Raises:
+            FileLockTimeout: Another process holds the file lock or database past the deadline.
+        """
+        self._admission_lock.acquire()
+        try:
+            deadline = time.monotonic() + timeout_s
+            with file_write_lock(
+                self._admission_path(),
+                what="text simulation cell admission",
+                timeout_s=max(0.0, deadline - time.monotonic()),
+            ):
+                with project_connection(
+                    self._records.root,
+                    write=True,
+                    timeout_s=max(0.0, deadline - time.monotonic()),
+                ):
+                    yield
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise FileLockTimeout(
+                    "text simulation database is busy; retry the operation"
+                ) from exc
+            raise
+        finally:
+            self._admission_lock.release()
 
     def _reserve_budget(
         self,
@@ -395,6 +530,7 @@ class TextCellLeaseStore:
         observed_spend_usd: float | None,
         active_leases: tuple[TextCellLease, ...],
         stop_on_overspend: bool,
+        reservation_cost_usd: float | None = None,
     ) -> tuple[float | None, bool]:
         """Reserve budget for one paid cell under the selected overspend policy.
 
@@ -403,8 +539,8 @@ class TextCellLeaseStore:
         spend unknown, the cell is admitted with a logged warning and a conservative
         whole-budget reservation. In stop mode unknown or ceiling-reaching spend yields no
         reservation, so the caller blocks the cell instead of dispatching it. Finite-budget
-        cells serialize on live reservations in both modes so spend reconciliation stays
-        exact.
+        cells without a per-cell reservation serialize. Stop-mode cells with frozen
+        reservations can overlap while the total reserved and observed spend stays in budget.
         """
         if maximum_cost_usd is None:
             return None, False
@@ -420,6 +556,12 @@ class TextCellLeaseStore:
         if stop_on_overspend:
             if observed_spend_usd is None:
                 return None, False
+            if reservation_cost_usd is not None:
+                reserved = math.fsum(lease.reserved_cost_usd or 0 for lease in active_leases)
+                available = maximum_cost_usd - observed_spend_usd - reserved
+                if reservation_cost_usd <= available + 1e-9:
+                    return reservation_cost_usd, False
+                return None, bool(active_leases)
             if active_leases:
                 return None, True
             remaining_ceiling = maximum_cost_usd - observed_spend_usd
@@ -455,7 +597,8 @@ class TextCellLeaseStore:
     ) -> tuple[TextCellLease, ...]:
         """Reap completed claims, tombstone dead claims, and return valid reservations."""
         leases = []
-        for path in sorted(self._directory.glob(f"*{_LEASE_SUFFIX}")):
+        for record_id in self._records.list_ids():
+            path = self._path(record_id)
             lease = self._read_optional(path)
             if lease is None:
                 continue
@@ -476,8 +619,64 @@ class TextCellLeaseStore:
         return tuple(leases)
 
     def _is_stale(self, lease: TextCellLease, now: datetime) -> bool:
-        """Recognize only expired claims whose local owner process is no longer alive."""
-        return now >= lease.expires_at and not self._owner_alive(lease.owner_pid)
+        """Recognize a stopped owner without trusting a reused or foreign process number."""
+        if self._owner_alive is not None:
+            return now >= lease.expires_at and not self._owner_alive(lease.owner_pid)
+        if not lease.owner_id.startswith(_OWNER_PROTOCOL):
+            raise TextCellLeaseError(
+                "text-cell claim uses an unsupported ownership protocol; start a fresh evaluation "
+                "after stopping its previous execution. The existing claim was not changed."
+            )
+        probe = self._owner_lock(lease)
+        try:
+            self._acquire_owner_lock(probe)
+        except Timeout:
+            return False
+        except OSError as exc:
+            raise TextCellLeaseError(
+                "cannot verify text-cell ownership; retry the evaluation"
+            ) from exc
+        else:
+            probe.release()
+            return True
+
+    def _owner_lock(self, lease: TextCellLease) -> FileLock:
+        """Return the exact owner's shared kernel lock with a safe derived filename."""
+        lock_id = stable_id("owner", {"owner_id": lease.owner_id})
+        path = self._directory / f"{lock_id}.lock"
+        if path.is_symlink():
+            raise TextCellLeaseError("text-cell owner lock must not be a symlink")
+        return FileLock(path, timeout=0, mode=0o600, thread_local=False)
+
+    def _hold_ownership(self, lease: TextCellLease) -> None:
+        """Acquire ownership before publishing a claim and retain it throughout execution."""
+        lock = self._owner_lock(lease)
+        try:
+            self._acquire_owner_lock(lock)
+        except (OSError, Timeout) as exc:
+            raise TextCellLeaseError(
+                "cannot claim text-cell ownership; retry the evaluation"
+            ) from exc
+        self._ownership_locks[lease.owner_id] = lock
+
+    def _acquire_owner_lock(self, lock: BaseFileLock) -> None:
+        """Acquire only a native lock, rejecting library fallback even on contention."""
+        try:
+            lock.acquire(timeout=0)
+        except BaseException:
+            self._require_kernel_lock(lock)
+            raise
+        self._require_kernel_lock(lock)
+
+    @staticmethod
+    def _require_kernel_lock(lock: BaseFileLock) -> None:
+        """Reject soft existence/PID locks because they cannot prove owner termination."""
+        if isinstance(lock, SoftFileLock):
+            lock.release()
+            raise TextCellLeaseError(
+                "text-cell ownership requires kernel file locking; use a filesystem with "
+                "native lock support. The existing claim was not changed."
+            )
 
     def _tombstone(self, path: Path, lease: TextCellLease) -> TextCellLease:
         """Atomically retain non-replay evidence without retaining its budget reservation."""
@@ -492,83 +691,26 @@ class TextCellLeaseStore:
         return stale
 
     def _reap(self, path: Path, expected: TextCellLease) -> None:
-        """Remove a claim whose immutable rollout now makes replay impossible."""
-        descriptor, metadata = self._open_exact(path, expected)
+        """Delete an unchanged claim only after its immutable rollout is durable."""
         try:
-            current = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
-            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
-                raise TextCellLeaseError(f"text-cell lease {path} changed before reap")
-            os.unlink(path.name, dir_fd=descriptor)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            self._records.replace(
+                expected.lease_id, expected=canonical_json_bytes(expected), replacement=None
+            )
+        except ProjectRecordError as exc:
+            raise TextCellLeaseError(str(exc)) from exc
 
     def _replace_exact(
-        self,
-        path: Path,
-        *,
-        expected: TextCellLease,
-        replacement: TextCellLease,
+        self, path: Path, *, expected: TextCellLease, replacement: TextCellLease
     ) -> None:
-        """Replace one unchanged regular lease by directory-relative no-follow mutation."""
-        directory_descriptor, metadata = self._open_exact(path, expected)
-        staging_name = f".{path.name}.{uuid4().hex}.partial"
-        staging_descriptor: int | None = None
+        """Conditionally replace a claim without weakening its persisted identity."""
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            staging_descriptor = os.open(staging_name, flags, 0o600, dir_fd=directory_descriptor)
-            payload = canonical_json_bytes(replacement)
-            with os.fdopen(staging_descriptor, "wb", closefd=False) as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.close(staging_descriptor)
-            staging_descriptor = None
-            current = os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
-            if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
-                metadata.st_dev,
-                metadata.st_ino,
-            ):
-                raise TextCellLeaseError(f"text-cell lease {path} changed before tombstone")
-            os.replace(
-                staging_name,
-                path.name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
+            self._records.replace(
+                expected.lease_id,
+                expected=canonical_json_bytes(expected),
+                replacement=canonical_json_bytes(replacement),
             )
-            os.fsync(directory_descriptor)
-        finally:
-            if staging_descriptor is not None:
-                os.close(staging_descriptor)
-            with suppress(FileNotFoundError):
-                os.unlink(staging_name, dir_fd=directory_descriptor)
-            os.close(directory_descriptor)
-
-    def _open_exact(self, path: Path, expected: TextCellLease) -> tuple[int, os.stat_result]:
-        """Open the lease directory and prove its current name still denotes expected content."""
-        directory_descriptor = self._open_directory(path.parent)
-        lease_descriptor: int | None = None
-        try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            lease_descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
-            metadata = os.fstat(lease_descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise TextCellLeaseError(f"text-cell lease {path} is not a regular file")
-            payload = b""
-            while chunk := os.read(lease_descriptor, 64 * 1024):
-                payload += chunk
-            current = TextCellLease.model_validate_json(payload)
-            if current != expected:
-                raise TextCellLeaseError(f"text-cell lease {path} changed before mutation")
-            return directory_descriptor, metadata
-        except (OSError, ValidationError, ValueError, TextCellLeaseError) as exc:
-            os.close(directory_descriptor)
-            if isinstance(exc, TextCellLeaseError):
-                raise
-            raise TextCellLeaseError(f"text-cell lease {path} cannot be mutated safely") from exc
-        finally:
-            if lease_descriptor is not None:
-                os.close(lease_descriptor)
+        except ProjectRecordError as exc:
+            raise TextCellLeaseError(str(exc)) from exc
 
     def _require_same_claim(
         self,
@@ -609,74 +751,24 @@ class TextCellLeaseStore:
         return self._directory / "admission"
 
     def _read_optional(self, path: Path) -> TextCellLease | None:
-        """Load one regular, complete, typed lease record without following a symlink."""
-        if not path.exists():
-            return None
-        if path.is_symlink() or not path.is_file():
-            raise TextCellLeaseError(f"text-cell lease path {path} is not a safe regular file")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        """Read one verified claim from its project-owned database namespace."""
         try:
-            descriptor = os.open(path, flags)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise TextCellLeaseError(f"text-cell lease {path} cannot be opened safely") from exc
-        try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise TextCellLeaseError(f"text-cell lease {path} is not a regular file")
-            with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                payload = handle.read()
-        finally:
-            os.close(descriptor)
-        try:
+            payload = self._records.read(path.stem)
+            if payload is None:
+                return None
             lease = TextCellLease.model_validate_json(payload)
         except (ValidationError, ValueError) as exc:
-            raise TextCellLeaseError(f"text-cell lease {path} is malformed") from exc
-        expected_name = f"{lease.lease_id}{_LEASE_SUFFIX}"
-        if path.name != expected_name:
-            raise TextCellLeaseError(f"text-cell lease {path} does not match its record identity")
+            raise TextCellLeaseError(f"text-cell lease {path.stem} is malformed") from exc
+        if lease.lease_id != path.stem:
+            raise TextCellLeaseError("text-cell lease differs from its database identity")
         return lease
 
     def _write_exclusive(self, path: Path, lease: TextCellLease) -> None:
-        """Create and fsync one claim via ``O_EXCL`` before any provider call may begin."""
-        directory_descriptor = self._open_directory(path.parent)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        """Commit one exclusive claim before any provider dispatch can begin."""
         try:
-            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory_descriptor)
-        except FileExistsError as exc:  # pragma: no cover - admission lock serializes this race
-            os.close(directory_descriptor)
-            raise TextCellLeaseError(f"text-cell lease {lease.lease_id!r} already exists") from exc
-        except OSError as exc:
-            os.close(directory_descriptor)
-            raise TextCellLeaseError(
-                f"text-cell lease {lease.lease_id!r} cannot be created safely"
-            ) from exc
-        try:
-            payload = canonical_json_bytes(lease)
-            with os.fdopen(descriptor, "wb", closefd=False) as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except BaseException:
-            with suppress(FileNotFoundError):
-                os.unlink(path.name, dir_fd=directory_descriptor)
-            raise
-        finally:
-            os.close(descriptor)
-            os.close(directory_descriptor)
-        fsync_directory_best_effort(path.parent)
-
-    @staticmethod
-    def _open_directory(directory: Path) -> int:
-        """Open one real lease directory without following a swapped symlink."""
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            return os.open(directory, flags)
-        except OSError as exc:
-            raise TextCellLeaseError(
-                f"text simulation lease directory {directory} cannot be opened safely"
-            ) from exc
+            self._records.write(lease.lease_id, canonical_json_bytes(lease), exclusive=True)
+        except ProjectRecordError as exc:
+            raise TextCellLeaseError(str(exc)) from exc
 
 
 def _aware_now(clock: Callable[[], datetime]) -> datetime:
@@ -685,14 +777,3 @@ def _aware_now(clock: Callable[[], datetime]) -> datetime:
     if now.tzinfo is None or now.utcoffset() is None:
         raise TextCellLeaseError("text-cell lease clock must return timezone-aware datetimes")
     return now.astimezone(UTC)
-
-
-def _owner_process_is_alive(pid: int) -> bool:
-    """Return whether a local owner PID still exists without signaling it."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True

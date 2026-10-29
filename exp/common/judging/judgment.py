@@ -15,13 +15,21 @@ class DimensionJudgment(ContractModel):
 
     Retired citation-era fields such as ``feedback`` and ``evidence_span_ids``
     are rejected. Rebuild the judgment under the current rationale-only contract.
+
+    Attributes:
+        dimension_id: Identity of the rubric axis being scored.
+        raw_score: Signed integer inside the inclusive axis range.
+        calibrated_score: Finite calibrated value inside the same range.
+        min_score: Inclusive lower bound, strictly below max_score.
+        max_score: Inclusive upper bound.
+        rationale: Optional explanation of the judgment, defaulting to None.
     """
 
     dimension_id: ArtifactId
-    raw_score: int = Field(ge=0)
-    calibrated_score: float = Field(ge=0)
-    min_score: int = Field(ge=0)
-    max_score: int = Field(ge=0)
+    raw_score: int
+    calibrated_score: float
+    min_score: int
+    max_score: int
     rationale: str | None = None
 
     @field_validator("calibrated_score")
@@ -33,6 +41,7 @@ class DimensionJudgment(ContractModel):
 
     @model_validator(mode="after")
     def _require_score_inside_axis_range(self) -> DimensionJudgment:
+        """Require both observations to stay within a nondegenerate signed axis."""
         if self.min_score >= self.max_score:
             raise ValueError("dimension judgment range must have min_score below max_score")
         if self.raw_score < self.min_score or self.raw_score > self.max_score:

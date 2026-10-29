@@ -4,6 +4,16 @@ Experiential resolves models from a secret-free `.exp/models.toml` catalog. `Run
 only construction service. Provider names do not imply capabilities or prices. Every completion or
 embedding alias must declare the protocol features and token prices it uses.
 
+Python applications can set `RuntimeModelCatalog(catalog, http_timeout_seconds=120.0)`
+when a custom HTTP transport performs durable work around dispatch. This finite, positive
+timeout covers the entire client operation, including the injected transport. Its default
+is 60 seconds; completion requests keep a longer output-derived allowance when needed.
+Values above the operating system's `threading.TIMEOUT_MAX` are rejected before resolution,
+so configured timeouts remain representable in Python and native dispatch.
+`with_catalog()` preserves the setting. A transport that needs a shorter network deadline
+must enforce that deadline separately. Bedrock, Tinker, and native-only TypeSafe execution
+retain their own timeout policies.
+
 Configure connections with `exp config providers` or the first `exp build` on a clean checkout.
 An interactive terminal opens a provider list: Up and Down move focus, Enter selects or deselects
 the focused provider, and the Complete row submits the selection. Agents skip that list with
@@ -54,6 +64,8 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Provider | Catalog `provider` | Credential | Endpoint identity |
 |---|---|---|---|
 | OpenAI | `openai` | `api_key_env` (suggested `OPENAI_API_KEY`) | Official OpenAI origin |
+| ChatGPT plan | `openai` with `subscription = "chatgpt"` | Browser sign-in stored under the connection ID; no `api_key_env` | `https://chatgpt.com/backend-api/codex` |
+| Claude plan | `anthropic` with `subscription = "anthropic"` | Sign-in through the operator's Anthropic OAuth app; no `api_key_env` | Official Anthropic origin |
 | OpenRouter | `openrouter` | `api_key_env` (suggested `OPENROUTER_API_KEY`) | Official OpenRouter origin |
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
@@ -63,9 +75,289 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | Amazon Bedrock | `bedrock` | AWS credential chain. No `api_key_env` | Optional catalog `region` |
 | Vertex AI | `vertex` | `api_key_env` holding service-account JSON | Project-and-location `base_url` |
 | Tinker sampling | `tinker` | `api_key_env` | Official Tinker origin |
+| TypeSafe SystemOne | `typesafe` | `api_key_env` (suggested `TYPESAFE_API_KEY`) | `https://api.typesafe.ai/v1/systemone`, native decisions only |
 
 Native fixed-origin providers reject a custom `base_url`. Use `openai-compatible` for a trusted
 third-party OpenAI-compatible host.
+
+## Claude Sonnet 5.5
+
+The exact `claude-sonnet-5-5` release uses adaptive thinking with a `high` default effort.
+Its supported effort levels are `low`, `medium`, `high`, `xhigh`, and `max`. Discovery keeps
+Sonnet 5's defaults separate. The published window is 1,000,000 tokens and synchronous output
+is bounded at 128,000 tokens. Base prices per million tokens are $2 input, $10 output, $0.20
+cache reads, $2.50 five-minute cache writes, and $4 one-hour cache writes; a hosted deployment
+must author its complete schedule rather than infer it from the provider name.
+
+On the gateway's Messages endpoint, turn off up-front thinking with the type-only object:
+
+```json
+{
+  "model": "sonnet",
+  "max_tokens": 512,
+  "thinking": {"type": "between_tools"},
+  "output_config": {"effort": "high"},
+  "messages": [{"role": "user", "content": "Summarize this in one sentence."}]
+}
+```
+
+Here `sonnet` is an alias configured for Sonnet 5.5 on an Anthropic Messages wire. Between-tools
+thinking works only at `low`, `medium`, or `high`; additional thinking fields, including null
+fields, are rejected. Use `output_config.effort` with this mode: the `reasoning` extension's
+depth controls are refused rather than allowed to replace it. A visibility-only `reasoning`
+object retains the mode. It is never translated to an effort-only request on another dialect.
+Use adaptive thinking for `xhigh` or `max`. `thinking.type=disabled` is rejected with a remedy
+naming `between_tools`, and explicit numeric thinking budgets are refused. The gateway's
+existing disclosed translation of bare `enabled` to `adaptive` remains available.
+
+Sonnet 5.5 does not support forced tool choice or non-default sampling controls. The gateway
+retains its existing capability-preservation policy: it prefers a route that preserves caller
+controls and otherwise discloses permitted substitutions, including forced tool choice to
+`auto`, rather than send a known-invalid upstream request. Use `auto` with strict tool schemas
+or structured output when schema validity is required. This does not guarantee a tool call.
+The exact model's forced-tool restriction applies on Messages, relayed OpenAI-compatible,
+and Bedrock wires alike.
+Assistant prefill is also unsupported: end the conversation with a user message. Admission
+excludes Sonnet 5.5 from a prefill request's route before dispatch and retains compatible rungs.
+
+Thinking blocks remain opaque and are replayed unchanged on their issuing wire. Keep history
+append-only: the provider binds Sonnet 5.5 blocks to their model, account, and conversation.
+The gateway does not claim support for new provider beta features merely because this model
+supports them. See the official [model specifications](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
+and [migration contract](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5).
+
+## Plan connections (ChatGPT and Claude)
+
+A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`
+(provider `openai`) or `subscription = "anthropic"` (provider `anthropic`). The connection names
+no credential and accepts no endpoint override. Its sign-in is an OAuth token pair stored under
+the connection ID (a `type = "oauth"` record in the user-only credential file for the local
+gateway; an embedder's own secret store when it supplies `subscription_token_source_factory`).
+The gateway mints a fresh bearer for every physical dispatch through the body-signing seam,
+refreshing five minutes ahead of expiry and persisting the rotated refresh token.
+
+Several plan connections certified into one exact-model pool are a rotating pool. Each response
+carries the plan's rolling usage windows (`x-codex-{primary,secondary}-*` for ChatGPT,
+`anthropic-ratelimit-unified-{5h,7d}-*` for Claude). The gateway reads them as a short and a
+long window, and a window at 100 percent (or a Claude `rejected` status) throttles that plan
+until the stated reset, so traffic moves to the next plan before the first 429 while sticky
+affinity keeps a conversation on one plan while it has room.
+
+```console
+exp config gateway provider add plan-a --provider openai --subscription chatgpt --root ROOT
+exp config gateway provider add plan-b --provider openai --subscription chatgpt \
+  --codex-auth-file ~/.codex/auth.json --non-interactive --root ROOT
+exp config gateway provider add claude-a --provider anthropic --subscription anthropic --root ROOT
+```
+
+A ChatGPT plan signs in through the public Codex OAuth client on its registered loopback callback
+(`localhost:1455`) or imports an existing Codex sign-in. An import hands the sign-in over: the
+refresh token rotates on every use, so sign Codex in again afterwards. The gateway sends its own
+`originator`. A Claude plan signs in through the OAuth application Anthropic issued to the
+OPERATOR of the gateway, configured with `EXP_ANTHROPIC_OAUTH_CLIENT_ID` and
+`EXP_ANTHROPIC_OAUTH_REDIRECT_URI` (optional: `_AUTHORIZE_URL`, `_TOKEN_URL`, `_SCOPES`, and
+`_BETA`, sent as `anthropic-beta` when the approval names one). Without that app a Claude plan
+connection refuses to resolve. The gateway never presents another client's identity: the app
+refuses Claude Code's public client ID and any `claude-code`/`claude-cli` identity header.
+
+Plan backends differ from the API-key origins. The ChatGPT backend streams only, requires provider
+storage off, and rejects `max_output_tokens`, so its wire profile drops the ceiling structurally.
+A plan rung pre-serializes its body for the per-dispatch bearer, so the engine's
+encrypted-reasoning replay repair does not run on it. Plan connections serve the gateway only;
+`exp config providers`, build, and optimize keep using API keys.
+
+## TypeSafe SystemOne decisions
+
+Use `provider = "typesafe"` with an explicitly authored catalog connection and deployment.
+The interactive provider picker does not offer TypeSafe. The connection uses the official
+`https://api.typesafe.ai/v1` root and sends its provider credential as a Bearer header to
+`/systemone`; it exposes no chat, Responses, or embeddings endpoint. The public gateway route is
+`POST /v1/systemone`, authenticated with a gateway virtual key, not the provider key.
+
+A deployment must declare `gateway.capabilities.supports_decisions = true`. Its ordinary
+`ModelCapabilities` should declare `supports_completions = false` and
+`supports_embeddings = false`; decision support is gateway metadata, not an addition to the
+frozen model-capability identity. Admission requires a known nonnegative
+`gateway.prices.input_nano_usd_per_million_tokens` and an explicit
+`gateway.prices.output_nano_usd_per_million_tokens = 0`. Unknown prices are not free prices.
+Only direct exact-model pools serve decisions; project-backed aliases are refused.
+
+Send `model` (the granted public alias), `state`, and `questions`, plus optional image `assets`.
+State and each question's instructions may be a string, JSON object, or array. This example uses
+all three question types; replace `systemone` with the decision alias your gateway grants:
+
+```json
+{
+  "model": "systemone",
+  "state": {"payment_received": true, "message": "Please send my invoice."},
+  "questions": {
+    "paid": {"type": "noul", "instructions": "Was payment received?"},
+    "topic": {
+      "type": "choice",
+      "instructions": "Classify the customer's request.",
+      "criteria": {"billing": "Invoices and payments", "other": "Anything else"}
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "Rate the urgency.",
+      "criteria": ["low", "medium", "high"]
+    }
+  }
+}
+```
+
+| Type | Question criteria | Answer fields |
+|---|---|---|
+| `noul` | Optional object with `true` and `false` text, object, or array descriptions | `type`, `noul` (probability from 0 to 1) |
+| `choice` | Object mapping 2 through 64 category names to text, object, or array descriptions, or `null` | `type`, `choice`, `confidence`, `probabilities` keyed by the requested names |
+| `score` | Ordered array of 2 through 10 text, object, or array descriptions | `type`, `score`, `confidence`, `legend`, `probabilities` keyed by zero-based index strings |
+
+The response contains `id`, the requested public `model` alias, `answers` under the original
+question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
+values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
+distributions must sum to 1, the selected choice must have the highest probability, and a score
+must be consistent with the distribution's weighted zero-based index. Probability keys must equal
+the requested criteria exactly. Scores and probabilities retain their provider values: they are
+never recomputed or normalized. Exact numeric consistency uses a `1e-6` tolerance. If every
+probability is hundredth-valued, it may instead be explained by one unit distribution within
+their independently rounded half-hundredth intervals, clipped to `[0, 1]`: the published total
+may then read 0.99 or 1.01, a choice may sit one hundredth below another category only if that
+distribution can make it highest, and a hundredth-valued score must match that distribution's
+weighted index. These bounded checks respect the shared probability mass and admit closed
+interval endpoints because rounding ties are unspecified. Beside hundredth-valued
+probabilities, a score is judged at the precision the provider reported it to: a tenth-valued
+score (`3.9` beside an expectation of 3.87) must lie within half a tenth, a hundredth-valued
+one within half a hundredth, and a thousandth-valued one within half a thousandth of that
+distribution's achievable weighted index. TypeSafe may also publish bins that were each
+rounded to hundredths with the normalization residual folded into one bin that rounded
+highest, beside a score computed from the unrounded distribution; when the published total is
+exactly 1, a score is also admitted against that convention's exact achievable weighted index:
+every other bin stays within half a hundredth, and the bin that absorbed the residual must itself
+have rounded at least as high as every other published bin, which also bounds how far it can
+drift on a near tie (four levels allow up to 0.01 more than independent rounding, five levels up
+to 0.02). A whole-number score is read at tenths. Precision is
+read from the number itself, so a hundredth-rounded score ending in zero (`1.10`) is read at
+tenths. Finer-precision totals, winners and scores keep the exact checks. A rejected score
+records its numbers (score, recomputed expectation, bins, achievable rounding envelope, folded
+residual envelope and tolerance) in the operator log and the ledger detail; the public error stays generic.
+Missing answers, mismatched types or criteria, and missing or invalid usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
+
+### Image assets
+
+TypeSafe accepts images through a top-level `assets` map keyed by caller-chosen reference strings.
+Each asset is `{"type": "image", "format": "png" | "jpg" | "jpeg", "data_base64": "..."}`
+(`type` is optional). The reference is written wherever the image belongs, as a whole string or
+inside a longer one, in `state`, a question's `instructions`, or its `criteria`; object keys are
+never references. Every asset must be referenced. Base64 uses the standard alphabet with `=`
+padding, no whitespace, and no `data:` prefix. Multipart file parts (`part`) are refused. The
+gateway adds `TypeSafe-Danger-Zone-Images: true` to the upstream request only when `assets` is
+present, so callers do not send it. A request with assets is served only by deployments whose
+`gateway.capabilities.supports_image_input` is true; otherwise it is refused with
+`unsupported_capability` on `assets` before dispatch. `box` questions are not served.
+
+The gateway bounds at most 256 assets, 1,024 UTF-8 bytes per reference, 65,536 reference bytes in
+total, 16,777,216 decoded bytes per image (TypeSafe's per-file limit), and 33,554,432 decoded image
+bytes per request; sizes are computed from the base64 text without decoding it. TypeSafe enforces
+its own format and pixel limits. Each image reserves a fixed 4,096-token planning allowance once per
+question that references it (a state image counts for every question), however often its reference
+repeats; settlement still bills only TypeSafe's reported input tokens. The TypeSafe opt-in header
+is sent only to `typesafe` deployments. Decision bodies over 1 MiB first take one unit per started
+MiB from a 128 MiB per-worker budget, held for the whole request, so concurrent large bodies wait
+rather than multiplying memory; the native front passes the body's byte length to admission.
+
+Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
+name, and at most 262,144 bytes for the normalized request excluding image assets. The raw body
+may additionally carry the base64 image data. Duplicate JSON keys, non-finite numbers, unknown
+fields, chat messages, tools, generation controls, and `stream` are rejected before acceptance
+with a field-specific `invalid_parameter` error that never quotes request content. Nested data must use valid UTF-8, integers in the inclusive range
+`-2^63` through `2^64 - 1`, and at most 64 JSON levels. These are gateway serialization bounds,
+not TypeSafe token limits. Objects and arrays retain their structure instead of becoming strings. Responses are buffered, never streamed. `Idempotency-Key` is
+ignored: resubmitting the same request is a new operation, not a replay. There is no continuation,
+prompt-based project selection, or chat input/output guardrail processing on this surface.
+
+The gateway reserves a bounded estimate for each dispatch: serialized state is counted for every
+question, question instructions and criteria add to input, and per-question protocol allowances
+cover input and output. This is an accounting estimate, not a provider-enforced token limit;
+no synthetic `max_tokens` field is sent. Settlement uses only TypeSafe's reported token counts,
+including reported output tokens even though their configured price is zero. The native adapter
+validates and retains those counts independently before checking the answers: a malformed answer
+still fails, but credible complete usage is settled rather than discarded. The cancellation guard
+retains that evidence for the same attempt and clears it when binding another attempt. Missing,
+partial, invalid, or zero-only counts remain unknown. Unknown outcomes
+retain a content-free unknown-cost attempt record and keep the monetary reservation held, with
+no invented usage, settled charge, or automatic retry. Only HTTP 400, 401, 403, 404, and 422
+establish a known rejection that releases the reservation without inventing zero-token usage.
+HTTP 402, 429, and 529 do not prove no work occurred: payment, throttle, and overload responses
+are terminal unknown outcomes with the hold retained, not automatic fallback signals. A known
+401 authentication rejection may advance to the next certified deployment. The route permits at
+most eight deployments and one dispatch per deployment, with no same-deployment or throttle redials.
+
+For a local SQLite gateway, an operator resolves one terminal decision hold explicitly through
+`SQLiteAttemptLedger.reconcile_decision_liability(attempt_id=..., assigned_cost_nano_usd=...)`
+after checking the provider's outcome. Zero releases the hold; a positive assignment records
+that budget amount while token usage and the provider cost estimate stay unknown. Repeating the
+same assignment is a no-op; a different assignment is refused. Holds survive request completion
+and process restarts until this explicit reconciliation, so unresolved work cannot fund repeats.
+
+## Completed responses with unknown pricing
+
+An adapter that has durably saved a completed paid response and its unknown liability can
+report missing price-relevant usage through the typed boundary:
+
+```python
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+
+raise ProviderPricingUnavailableError(
+    "Saved response cannot be priced from its reported usage; inspect the retained receipt."
+)
+```
+
+This error does not retry the HTTP request or permit the unpriceable answer to execute. A text
+evaluation using an explicitly uncapped `RequestBudget` records infrastructure-invalid evidence
+and may create a fresh rollout generation for the same task, model, and repeat. The existing
+three-generation limit includes the initial attempt. Every generation has new request coordinates;
+prior responses, invalid rollouts, and unknown liabilities remain saved. Persistent failure stays
+invalid after the final generation. Evaluation orchestration retries eligible cells after the
+current simulation phase completes.
+
+Finite budgets and simulations without a shared request ledger do not enable this retry.
+Reopening a retryable pricing failure rechecks the current budget before allocating a new
+generation. A finite cap preserves the original failure and receipt for a later uncapped retry;
+already completed generations still replay without spending under a finite cap.
+Generic `ValueError` failures, including previously saved ones, remain nonretryable. Identity,
+reservation-bound, and persistence failures must not be translated into the pricing-unavailable
+type. Missing usage is never replaced with zero or a measured charge.
+
+The same bounded fresh-generation policy applies when a paid cell's execution is interrupted
+before saving its rollout. Existing ownership checks must first prove the lease owner stopped.
+An uncapped shared ledger then permits a new generation while retaining the old lease tombstone,
+all paid responses, and any unknown request liabilities. The interrupted generation is recorded
+as infrastructure invalidity, not a model-quality or spending-limit failure. Its requests are
+never resent at the old coordinates.
+
+Catalog-backed evaluation supplies its shared ledger through `EvaluationServices.request_budget`.
+That current authority also permits recovery of saved stale-lease outcomes classified as budget
+failures by older executions, without rewriting those artifacts or their original selection.
+Finite budgets and callers without that ledger keep their existing stale-lease behavior. Completed
+successors replay for free even if the caller later lowers its cap. Interruptions count toward
+the same three-generation ceiling; an exhausted cell remains invalid.
+
+An unbounded paid-response liability, or an interrupted ancestor without a retained whole-cell
+reservation, leaves aggregate simulation spend and total execution cost unknown. A numeric
+reservation estimate is not a verified upper bound. Lineage and receipts are still verified,
+and valid successor rollouts determine report costs. A completed report may replay under a lower
+cap; missing judgments with unknown prior liability require explicit uncapped authorization.
+Invalid usage remains nonretryable even when its owning receipt records unbounded liability.
+
+A Chat response with retained `finish_reason="length"` whose tool arguments form an unfinished
+JSON object prefix raises `ProviderTruncatedResponseError`. Partial strings, literals, numbers
+and Unicode escapes qualify only when the preceding grammar is valid. A length label alone does
+not upgrade structural tool errors or malformed complete values. This error never retries the
+HTTP request. Catalog-backed evaluation saves the decoded HTTP body before rejection; exact
+replay raises from that saved body without contacting the provider. Explicitly uncapped
+evaluations may instead use the same bounded fresh-generation policy, retaining prior raw
+receipts and invalid evidence. Malformed ordinary stop responses keep their existing behavior,
+and a valid length response retains its length flag.
 
 ## OpenAI-compatible listing metadata
 
@@ -94,11 +386,12 @@ required price or limit remains unknown.
 | `supports_structured_output` | boolean | The alias accepts structured output |
 | `maximum_output_tokens` | positive integer | Declared output ceiling |
 | `context_window_tokens` | positive integer | Declared context window, only when the host publishes one |
-| `pricing.input_micro_usd_per_million_tokens` | integer `>= 0` | Configured input price in micro-USD per million tokens |
-| `pricing.output_micro_usd_per_million_tokens` | integer `>= 0` | Configured output price in micro-USD per million tokens |
-| `pricing.cached_input_micro_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in micro-USD per million tokens |
+| `pricing.input_nano_usd_per_million_tokens` | integer `>= 0` | Configured input price in nano-USD per million tokens |
+| `pricing.output_nano_usd_per_million_tokens` | integer `>= 0` | Configured output price in nano-USD per million tokens |
+| `pricing.cached_input_nano_usd_per_million_tokens` | integer `>= 0` | Configured cached-input price in nano-USD per million tokens |
 
-Micro-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000`.
+Nano-USD prices convert to catalog USD-per-million-token prices by dividing by `1_000_000_000`
+(one nano-USD is a billionth of a dollar; `1_250_000_000` is $1.25 per million tokens).
 When a trusted third-party compatible host publishes these fields, completion, tool,
 structured-output, and input/output price declarations can assign world-model and judge roles
 without a questionnaire. Router-candidate setup still requires a published or
@@ -121,6 +414,30 @@ Use `provider = "azure"`. The connection needs:
 The model record `model` field is the exact Azure deployment identifier sent on the wire. Experiential never
 derives a deployment from an alias or a base-model name. Use a separate alias for an embedding
 deployment.
+
+Foundry serves Claude only on the native Anthropic Messages API at `{resource}/anthropic/v1`, with
+the key as a Bearer token. A deployment routes there when its `model` (the deployment name) or its
+`served_model_id` is a Claude model id Experiential knows; set `served_model_id` to that id when the
+deployment carries a name of your own (`model = "my-opus"`, `served_model_id = "claude-opus-4-6"`).
+The request still names the deployment. Every other deployment uses the Azure OpenAI wire.
+
+Set `azure_api_surface = "responses"` to call a connection's OpenAI deployments over the native
+Responses API instead of Chat Completions: `{resource}/openai/v1/responses` with
+`api_version = "v1"`, or `{resource}/openai/responses?api-version=...` with a dated preview
+version. Responses-only fields then reach the deployment (`prompt_cache_key` as its cache-routing
+hint, reasoning, `include`), and Responses callers no longer go through a Chat translation. The
+surface is never inferred from the host. Use a separate connection for deployments that do not
+serve Responses. `store` stays off upstream on every Responses rung: continuation state for
+`previous_response_id` is held by the gateway, not the provider.
+
+```toml
+[connections.foundry-responses]
+provider = "azure"
+base_url = "https://myresource.services.ai.azure.com"
+api_key_env = "AZURE_OPENAI_API_KEY"
+api_version = "v1"
+azure_api_surface = "responses"
+```
 
 `AZURE_OPENAI_API_KEY` is paired with `AZURE_OPENAI_ENDPOINT` when that endpoint variable is set.
 A catalog endpoint that is not the same resource cannot use that key. Comparison lowercases the
@@ -198,6 +515,41 @@ supports_embeddings = true
 input_cost_per_million_tokens_usd = 0
 ```
 
+Claude of the adaptive-thinking generation (Fable 5, Mythos 5, Opus 4.7, Opus 4.8, Opus 5
+and Sonnet 5 inference profiles) takes a reasoning effort on the gateway's ConverseStream wire
+when its capabilities declare `supports_reasoning = true`. A caller effort is sent as
+`additionalModelRequestFields.thinking = {"type": "adaptive", "display": "summarized"}` with
+`output_config.effort`, which Converse forwards into the Anthropic request body. A model that
+thinks without a config (Opus 5, Sonnet 5, Fable 5) is asked only for the readable display.
+The summarized thinking streams back as display reasoning, and the reply carries the
+estimated reasoning count described in the gateway generation reference, because Converse
+reports thinking only inside `outputTokens`. The thinking signature is not returned: Converse
+has no replay path for it here, and adaptive thinking does not require replayed thinking on a
+tool turn. Older Claude releases and non-Claude Bedrock models keep no reasoning control on this
+wire, whatever their capabilities declare.
+
+## Anthropic inference geography
+
+For a reviewed first-party Claude 4.6+ route, set `inference_geo = "us"`
+on its `anthropic` connection. The connection identity includes the constraint.
+Both ordinary completions and gateway Messages payloads include it; the gateway
+applies it after translating Chat Completions, Responses, or Messages input.
+Caller-supplied `inference_geo = "global"` cannot override this connection setting.
+Each fallback needs its own constrained connection. No setting leaves existing
+caller behavior unchanged. Unsupported models return a provider error; model
+eligibility and the provider's 10% regional surcharge belong in the host catalog.
+
+```toml
+[connections.anthropic_us]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+inference_geo = "us"
+```
+
+[Anthropic data residency](https://platform.claude.com/docs/en/manage-claude/data-residency)
+documents eligible models and scope. This parameter does not establish a
+geography guarantee for a proxy, Bedrock, Vertex, or Foundry endpoint.
+
 ## Vertex AI
 
 Use `provider = "vertex"` for Google-published models served from a Google Cloud project.
@@ -209,10 +561,36 @@ JSON itself never travels on the wire, and the endpoint host is pinned to HTTPS
 Requests use the same `generateContent` wire protocol as the Gemini provider on
 `publishers/google/models/` routes.
 
+The model id spelling picks the wire. A bare id (`gemini-2.5-pro`) or a Google resource path
+(`publishers/google/models/gemini-2.5-pro`) is a Google-published model on the Gemini wire. A
+`<publisher>/<model>` id (`deepseek-ai/deepseek-v3.2-maas`, `xai/grok-4.20-reasoning`,
+`qwen/qwen3-coder-480b-a35b-instruct-maas`) is a Model Garden model served as a managed API
+(MaaS), which Vertex serves only over its OpenAI-compatible route
+`{base_url}/endpoints/openapi/chat/completions` (dialect `openai_compatible`, the same
+Chat Completions request and stream handling as `openai-compatible`), still under the OAuth
+bearer. Most MaaS models are addressed through the `global` location
+(`https://aiplatform.googleapis.com/v1/projects/PROJECT/locations/global`); a listing-style
+`publishers/<publisher>/models/<model>` spelling is collapsed onto the `<publisher>/<model>`
+form the route accepts. Google's own managed endpoints share the Gemini resource path in
+the listing (`publishers/google/models/gemma-4-26b-a4b-it-maas`) and are told apart by
+Vertex's `-maas` endpoint suffix, so both that spelling and `google/gemma-4-26b-a4b-it-maas`
+take the MaaS route.
+
+For models available in Google's US or EU multi-region, set the entire project-and-location
+root to `https://aiplatform.us.rep.googleapis.com/v1/projects/PROJECT/locations/us`
+or `https://aiplatform.eu.rep.googleapis.com/v1/projects/PROJECT/locations/eu`.
+Both the synchronous client and native gateway preserve that endpoint. A global endpoint
+does not guarantee a processing location; verify the model's availability and the applicable
+[Google data residency commitments](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/data-residency)
+before selecting a jurisdiction. Endpoint support alone does not enforce a routing policy
+on other models or fallback connections.
+
 Vertex is catalog-and-API configuration only: the interactive `exp config providers` picker
 does not offer it. Like Azure and Bedrock, provider names do not imply protocol support or
 prices, so every Vertex alias declares explicit capabilities. Embeddings are not supported on
-Vertex connections; use a `gemini` connection for Gemini embeddings.
+the Gemini-wire Vertex aliases; use a `gemini` connection for Gemini embeddings. MaaS aliases
+expose the compatible embeddings route (`endpoints/openapi/embeddings`) when their
+capabilities declare `supports_embeddings`.
 
 ```toml
 [connections.vertex]
@@ -230,6 +608,19 @@ input_cost_per_million_tokens_usd = 0
 output_cost_per_million_tokens_usd = 0
 ```
 
+## Provider rate-limit headers
+
+A response served on the caller's own credential (`billing_source = "customer_managed"`, the
+default for every local connection) carries the provider's numeric rate-limit headers:
+`x-ratelimit-{limit,remaining}-{requests,tokens}`,
+`anthropic-ratelimit-{requests,tokens}-{limit,remaining}`, and the plan windows
+(`x-codex-*`, `anthropic-ratelimit-unified-*`). For Azure AI Foundry these are the only live quota
+signal. A host-funded rung's headers describe a shared account and are never relayed. No other
+provider header is forwarded, and `retry-after` appears only on a refusal the gateway itself
+answers. Retry and failover ceilings per request are the `gateway.retry` object
+([request policy](gateway-request-policy.md)); concurrency is bounded by
+`exp run --max-active-requests` and each deployment's `dispatch_concurrency_bound`.
+
 ## Errors
 
 Missing credentials name the environment variable and the `exp config providers` recovery, never
@@ -237,3 +628,63 @@ a secret value. A missing Bedrock region lists the AWS resolution order. Azure e
 mismatches name `AZURE_OPENAI_ENDPOINT`, not the key. A malformed user-data credential file
 fails closed and tells the operator to move or delete it, then run `exp config providers`.
 Malformed provider responses fail closed and do not write partial catalog or evidence artifacts.
+
+## Novita error classification (2026-09-16)
+
+Novita is an OpenAI-compatible reseller whose gpt-5.6 lanes front per-region
+Azure OpenAI deployments. Three of its error shapes needed engine rules beyond
+the shared envelope reader (`crate::error_envelope`), all pinned in
+`upstream_reseller_tests.rs`:
+
+- **A 4xx that says the ACCOUNT cannot pay is `provider_quota`.** A drained
+  prepaid balance answers `400 "Insufficient quota available for instant
+  inference"`; a status-only read filed it as the caller's `invalid_request`.
+  A pre-stream 4xx whose code is a quota token or whose sentence carries
+  unambiguous funding wording (`rejected_by_account_quota`: insufficient
+  quota/balance/credits/funds, not enough balance, exceeded your current
+  quota — no bare "billing") takes the quota class, fails over, and keeps the
+  sentence ledger-only.
+- **A relay decode failure is unwrapped.** Novita's Responses relay sometimes
+  cannot decode the UPSTREAM error it received (`failed to decode error
+  response: json: cannot unmarshal number into Go struct field
+  ResponseError.error.code of type string, raw: {…}`) and answers its own 400
+  with the upstream document embedded after `raw: `. Pre-stream and in-stream
+  the engine reads that document (`relayed_decode_failure`; a zero code is
+  "no code", a truncated document still yields its message), classifies by
+  the UPSTREAM code and sentence (a relayed 429 throttles and fails over; a
+  relayed caller error keeps this status's caller class), and relays the
+  upstream sentence ("Exceeded maximum number of images (50) allowed in the
+  request.") instead of the decoder's noise.
+- **`reason` tokens classify** (`INVALID_REQUEST_BODY` generic,
+  `MODEL_NOT_FOUND` → lane policy, `NOT_ENOUGH_BALANCE` under 403 →
+  `provider_quota`, `RATE_LIMIT_EXCEEDED` / `TOKEN_LIMIT_EXCEEDED` throttle,
+  `FAILED_TO_AUTH` / `ACCESS_DENY` authenticate), see the architecture
+  reference.
+
+## OpenAI Decisions API
+
+`POST /v1/decisions` is the OpenAI Decisions API wire of the decisions surface (ledger
+`api_surface = decisions`), served only by direct OpenAI deployments (`provider = "openai"`). It
+accepts `model`, `input` (a string, or up to 256 user messages, optionally typed `message`, whose
+content is `input_text` and inline base64 `input_image` parts with at most 128 images; remote URLs
+and file ids are refused), a `questions` list of `predicate`, `choice` (with `choices` whose values
+are typed strings or booleans) and `score` (with `levels`) questions, and an optional
+`safety_identifier` (at most 128 characters, forwarded). Question names and descriptions are
+optional; named questions carry unique names. Bounds: at most 32 questions, 64 choices, 10 levels,
+and 32 MiB. A rung serves it only when it declares `supports_decisions`, prices output at exactly
+zero, and its connection exposes OpenAI's own `/decisions` endpoint (direct OpenAI connections;
+never Azure, ChatGPT plans, or SystemOne rungs, and a SystemOne body never reaches an OpenAI rung).
+A model with no such rung is refused with 400 `unsupported_capability` on `model`; when one of its
+rungs serves native decisions (the SystemOne lane's own rung rule), the refusal says so and points
+the caller to `POST /v1/systemone` on the same host with the same key and model id.
+Reservations count text and question bytes plus 2,048 tokens per image, 16 per message and 256 per
+question, with no output reservation. Answers are matched to questions by position and validated
+(echoed names, types, typed requested values, level labels and positions, unit probability totals
+within the rounding envelope); a `refusal` answer for one question passes through beside the
+others. The response is OpenAI's shape with the public alias as `model` and the provider's
+`usage`, whose cache read and write counts settle as their own legs, so the lane should author its
+cached and cache-write rates (at the input rate for this input-only wire) or those legs stay
+unknown. The same one-dispatch-per-deployment rule applies, and the HTTP status decides
+known rejection (a rejected credential alone fails over) while the OpenAI error envelope still
+names the caller's parameter.
+Reference: https://developers.openai.com/api/docs/guides/decisions

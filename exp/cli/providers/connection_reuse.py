@@ -3,6 +3,7 @@
 from typing import Literal
 
 from exp.common.models import ConnectionConfig, ProviderConnection
+from exp.common.models.azure_endpoints import AzureApiSurface
 
 
 def _effective_bedrock_auth_mode(
@@ -30,7 +31,7 @@ def reused_connection(
     api_key_env: str | None,
     base_url: str | None,
     api_version: str | None,
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None,
+    azure_api_surface: AzureApiSurface | None,
     region: str | None,
     aws_access_key_id_env: str | None = None,
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None,

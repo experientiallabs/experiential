@@ -10,13 +10,16 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
+    GatewayServiceTierAdmission,
+    GatewayServiceTierSettlement,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore
 from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.video.store import VideoJobStore
 from exp.runtime.models import RuntimeModelCatalog
 
 
@@ -41,9 +44,14 @@ class SyncWriteLedger(Protocol):
         deployment: ExactModelDeployment,
         attempt_ordinal: int,
         route_depth: int,
-        maximum_cost_micro_usd: int | None = None,
+        maximum_cost_nano_usd: int | None = None,
+        reserved_input_tokens: int | None = None,
+        reserved_output_tokens: int | None = None,
         route_reason: str | None = None,
         fallback_reason: str | None = None,
+        dispatch_reason: str | None = None,
+        preferred_deployment: ExactModelDeployment | None = None,
+        service_tier: GatewayServiceTierAdmission | None = None,
     ) -> AttemptId:
         """Durably mark one provider dispatch before network work."""
         ...
@@ -56,8 +64,33 @@ class SyncWriteLedger(Protocol):
         failure: GatewayFailure | None,
         finalize_request: bool = True,
         first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
     ) -> None:
-        """Durably settle one attempt exactly once."""
+        """Durably settle one attempt exactly once.
+
+        The ``retry_after_seconds`` and ``ratelimit_*`` values are the
+        provider's own rate-limit response headers, normalized, present on
+        successes and failures alike when the data plane harvested any; a
+        hosted ledger persists them per attempt for calibration analytics.
+        ``upstream_provider`` is the upstream an aggregator rung (OpenRouter)
+        named as having served the attempt in its response metadata, so a
+        zero-data-retention dispatch records which retention-free upstream
+        answered; ``None`` on every rung that names none.
+        ``web_search_requests`` counts the gateway-executed web searches billed
+        to the attempt, never a provider meter; the hosted ledger prices them
+        per attempt, and the engine omits the keyword entirely at zero.
+        ``tool_search_requests`` counts the gateway-executed tool-search rounds
+        billed to the attempt under the same rules: never a provider meter,
+        priced by the hosted ledger, omitted entirely at zero.
+        """
         ...
 
     def finish_request(
@@ -65,8 +98,18 @@ class SyncWriteLedger(Protocol):
         *,
         authorization: AuthorizationSnapshot,
         failure: GatewayFailure,
-    ) -> None:
-        """Durably finalize one request that produced no billable attempt."""
+        certify_no_effects: bool = False,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Finalize work and certify no paid effects under the dispatch write fence.
+
+        ``web_search_requests`` retains completed gateway searches with no model attempt.
+        Persist it atomically with the failure as provider expense, without customer charge.
+        Nonzero search usage must never receive a no-effects certificate.
+        Certification defaults false and requires trusted admission without paid prework.
+        Return true only after commit. Any prior attempt or uncertified terminal failure
+        returns false; persistence failures raise instead of certifying.
+        """
         ...
 
 
@@ -108,6 +151,19 @@ class NativeGatewayComponents(Protocol):
         not-enabled error. The returned object is a
         ``exp.runtime.gateway.batch.BatchControlPlane``; the loose annotation
         keeps the synchronous components importable without the batch package.
+        """
+        ...
+
+    @property
+    def video_jobs(self) -> VideoJobStore | None:
+        """Return the optional durable store enabling ``/v1/videos``.
+
+        Hosts without it return ``None`` (or omit the attribute) and every
+        video route answers a uniform 404. A host serving several workers
+        must back it with storage every worker shares, since any worker may
+        answer a poll for a job another worker created; every worker's
+        background poller then polls the same open jobs, which settlement's
+        exactly-once ledger write and the store's compare-and-set absorb.
         """
         ...
 

@@ -15,29 +15,48 @@ admission metrics.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-from pydantic import JsonValue
+from typing import TYPE_CHECKING, Literal, cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.common.models.model import ReasoningEffort
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayNamedToolChoice,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
+from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_request
+from exp.runtime.models.providers.dialect_dispatch import (
+    TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    strip_tool_result_documents,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
+    lane_default_reasoning_effort,
     profile_reasoning_efforts,
 )
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.reasoning_compat import (
-    anthropic_adaptive_only_thinking,
+    MINIMUM_THINKING_BUDGET_TOKENS,
+    REASONING_EFFORTS,
     efforts_by_nearness,
 )
-from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.models.providers.route_repairs import apply_route_repairs
+from exp.runtime.models.providers.schema_closing import close_schema_objects
+from exp.runtime.models.providers.streaming_requests import (
+    TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+    route_generation_parameter_requests,
+    strip_tool_result_images,
+)
+from exp.runtime.models.providers.thinking_budget_coercion import coerce_budget_to_effort
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -45,14 +64,76 @@ if TYPE_CHECKING:
 STRICT_TOOLS_DISCLOSURE = "tools.strict->false"
 """Disclosure recorded when strict tools degrade to best-effort schemas."""
 
+FORCED_TOOL_CHOICE_DISCLOSURE = "tool_choice->auto"
+"""Disclosure recorded when a forced tool choice relaxes to ``auto`` because no
+rung can force a tool (the model rejects it by name, or a budgeted thinking
+config forbids it)."""
+
+STRICT_TOOL_SCHEMA_CLOSED_DISCLOSURE = "tools.parameters.additionalProperties->false"
+"""Disclosure recorded when strict tool schemas have their objects closed for a
+rung whose strict validator requires it."""
+
 EFFORT_DROP_DISCLOSURE = "reasoning_effort"
 """Disclosure recorded when a zero-reasoning route drops the caller effort."""
 
-THINKING_DROP_DISCLOSURE = "thinking"
-"""Disclosure recorded when a zero-reasoning route drops adaptive thinking."""
+THINKING_DROP_DISCLOSURE = "thinking->dropped(unsupported_by_route)"
+"""Disclosure recorded when a route that cannot honor any depth drops the
+thinking config (no reasoning rung, or no legal budget under the ceiling)."""
 
-THINKING_DISABLED_DISCLOSURE = "thinking.type->adaptive"
-"""Disclosure recorded when an adaptive-only route overrides a disabled thinking config."""
+THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE = "thinking->dropped(superseded_by_effort)"
+"""Disclosure recorded when the caller's own effort (``output_config.effort``
+or ``reasoning.effort``) states the depth and the thinking config beside it is
+therefore redundant. Named so a caller never reads it as a stripped depth:
+Harbor read a bare ``thinking`` as "effort high does not apply" (2026-09-11)."""
+
+
+THINKING_NO_SERVABLE_TIER_DROP_DISCLOSURE = "thinking->dropped(no_servable_tier)"
+"""Disclosure recorded when the route CAN reason but no tier of its ladder
+serves this request end to end beside the caller's other controls, so the
+config drops and the rung answers at its own default depth. Distinct from
+``unsupported_by_route`` (no rung reasons at all) so a caller can tell "this
+model never thinks" from "this request could not state a depth"."""
+
+THINKING_EFFORT_DISCLOSURE_PREFIX = "thinking->reasoning_effort:"
+"""Disclosure prefix recorded when a thinking config translates to the effort
+a reasoning route speaks; the effective tier and the source that named it
+follow, rendered by :func:`thinking_effort_disclosure`."""
+
+ThinkingEffortSource = Literal["lane_default", "gateway_default", "disabled", "no_off_tier"]
+"""What named the depth a thinking config translated to.
+
+``lane_default``: a budget-less config (``adaptive``, or the bare ``enabled``
+Claude Code sends) read as the rung's catalog default depth
+(``reasoning_default_effort``). ``gateway_default``: the same config on a
+route whose rungs pin no default, so the provider-default analog (medium)
+stands in. ``disabled``: the explicit off switch. ``no_off_tier``: the off
+switch on a route that cannot turn reasoning off, served at its lowest tier
+exactly like an explicit ``none`` effort (``lowest_supported``).
+"""
+
+THINKING_ALREADY_OFF_DISCLOSURE = "thinking->dropped(no_reasoning_on_route)"
+"""Disclosure recorded when an off switch reaches a route with no reasoning
+rung: the request is already served without thinking, so the config drops."""
+
+EFFORT_BESIDE_DISABLED_SUFFIX = "->ignored(thinking_disabled)"
+"""Disclosure suffix recorded on the caller's effort field when a disabled
+thinking config beside it is translated for a foreign wire with one effort
+channel: the off switch states this call's intent (Claude Code pins its
+effort on every call, side calls included), so the effort yields."""
+
+
+def thinking_effort_disclosure(tier: str, source: ThinkingEffortSource) -> str:
+    """Render ``thinking->reasoning_effort:<tier>(<source>)`` for one translation.
+
+    Args:
+        tier: The EFFECTIVE tier after the nearest-tier snap onto the ladder.
+        source: What asked for that depth (see :data:`ThinkingEffortSource`).
+
+    Returns:
+        The disclosure string admission records in ``ignored_parameters``.
+    """
+    return f"{THINKING_EFFORT_DISCLOSURE_PREFIX}{tier}({source})"
+
 
 CLOSED_SCHEMA_DISCLOSURE = "json_schema.additionalProperties->false"
 """Disclosure recorded when an open structured-output schema is closed."""
@@ -72,6 +153,316 @@ class RequestCoercion:
     disclosures: tuple[str, ...]
 
 
+def _coerce_adaptive_budget(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Translate an adaptive thinking config for a budgeted-enabled route, disclosed.
+
+    See :func:`adaptive_thinking_budget.budgeted_enabled_request` for when the
+    translation applies, how the budget is chosen, and why an effort drops.
+    """
+    translated = budgeted_enabled_request(profiles, request)
+    if translated is None:
+        return None
+    return RequestCoercion(request=translated[0], disclosures=translated[1])
+
+
+THINKING_HEADROOM_DISCLOSURE = "reasoning_effort->none(max_tokens_headroom)"
+"""Disclosure recorded when default-on reasoning is turned off because the
+caller's ``max_tokens`` cannot hold any thinking (see
+:func:`reserve_thinking_headroom`)."""
+
+
+def reserve_thinking_headroom(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Turn default-on reasoning off when the caller's ceiling cannot hold thinking.
+
+    A lane that reasons by default (every rung pins an active catalog
+    ``reasoning_default_effort``) spends the caller's ``max_tokens`` on thinking
+    first, so a Messages request with a small ceiling and no reasoning signal
+    of its own ends as thinking cut off at ``max_tokens`` with no text at all
+    (hy4-preview at ``max_tokens: 32``, 48 such attempts in one day). Anthropic
+    refuses any ENABLED config whose budget cannot fit under the ceiling and
+    admits none below 1024 tokens, so a ceiling under that minimum is one no
+    caller could expect thinking to fit; rather than refuse (a client that
+    never asked for thinking has nothing to remove) the request dispatches at
+    ``reasoning_effort: none`` with disclosure and the model answers in text.
+    Only a route whose EVERY rung reasons by default AND offers a ``none``
+    tier is coerced: a rung without an active default already answers in
+    text, and a rung that cannot turn reasoning off (Anthropic's adaptive
+    generation) keeps its own behavior. A caller who stated any reasoning
+    signal (``thinking``, ``output_config.effort``, ``reasoning``) is never
+    second-guessed here.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request before narrowing.
+
+    Returns:
+        The disclosed coercion, or ``None`` when the rule does not apply.
+    """
+    if request.surface != GatewayApiSurface.MESSAGES:
+        return None
+    if request.provider_thinking_config is not None or request.reasoning_effort is not None:
+        return None
+    if request.provider_output_config is not None and "effort" in request.provider_output_config:
+        return None
+    ceiling = request.maximum_output_tokens
+    if not profiles or ceiling is None or ceiling >= MINIMUM_THINKING_BUDGET_TOKENS:
+        return None
+    for profile in profiles:
+        default = profile.reasoning_effort
+        if default is None or default == "none" or default not in REASONING_EFFORTS:
+            return None
+        if "none" not in profile_reasoning_efforts(profile):
+            return None
+    return RequestCoercion(
+        request=request.model_copy(update={"reasoning_effort": "none"}),
+        disclosures=(THINKING_HEADROOM_DISCLOSURE,),
+    )
+
+
+def _requested_thinking_tier(
+    profiles: Sequence[GatewayWireProfile],
+    config: Mapping[str, object],
+) -> tuple[ReasoningEffort, ThinkingEffortSource]:
+    """Resolve the depth one thinking config asks for on a route of effort rungs.
+
+    Numerical budgets cannot translate to advisory effort. A budget-less config
+    (``adaptive``, or the bare ``enabled`` Claude Code sends in think mode)
+    asks the MODEL to pick its depth, and on an effort rung the model's own
+    depth is its catalog default (``reasoning_default_effort``, carried on the
+    wire profile as ``reasoning_effort``): the first rung in route order that
+    pins an active default it can serve names the tier, so an operator sets a
+    lane's think-mode depth by catalog, not by code. A route whose rungs pin no
+    default falls back to medium, the provider-default analog. A ``none``
+    default is not a depth (that rung reasons only when asked), so it is
+    skipped rather than reading an active config as no reasoning.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        config: Verbatim caller ``thinking`` object.
+
+    Returns:
+        The requested tier and the source that named it.
+    """
+    if config.get("type") == "disabled":
+        return "none", "disabled"
+    default = lane_default_reasoning_effort(profiles)
+    if default is not None:
+        # Membership in REASONING_EFFORTS is checked by the resolver; the
+        # profile field is a plain string, hence the cast.
+        return cast("ReasoningEffort", default), "lane_default"
+    return "medium", "gateway_default"
+
+
+def _coerce_thinking_to_effort(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    *,
+    admits: Callable[[GatewayRequest], bool] | None = None,
+) -> RequestCoercion | None:
+    """Translate a thinking config onto the route's effort ladder.
+
+    Claude Code pins a ``thinking`` config on every model, so the named
+    rejection at route shaping would make whole sessions unusable against
+    reasoning models the provider itself serves fine through an effort. Once
+    every rung has declined the config verbatim (an all-non-Anthropic route
+    always does; a mixed route reaches here only when its Anthropic rung
+    declined too, for the config or for another control), the config
+    translates to the nearest effort the route actually serves, disclosed as
+    ``thinking->reasoning_effort:<tier>(<source>)``. The requested tier comes
+    from :func:`_requested_thinking_tier`: a budget-less config from the lane's
+    catalog default depth (medium
+    when no rung pins one). The combined ladder is a union of per-rung
+    ladders, so the naive nearest tier may be served only by rungs that reject
+    some other control; candidates are therefore tried in nearness order (ties
+    prefer the lower tier) and the translation is the closest tier that
+    survives full route construction and the caller's admission probe,
+    mirroring the explicit-effort snap in :func:`coerce_generation_parameters`.
+
+    An explicit disabled config only translates to an exact off tier; when
+    none serves it keeps the typed refusal. Where no active tier serves an
+    enabled config, it drops with disclosure: the route's default is stated
+    openly, which is the rule every first-party-pinned field follows here (a
+    zero-reasoning route drops a pinned effort the same way). A route with no
+    reasoning rung discloses ``unsupported_by_route``; a route that reasons
+    but cannot state any tier beside this request's other controls discloses
+    ``no_servable_tier``. The drop is offered only when the admission probe
+    accepts it, so a request whose real blocker is another control keeps that
+    rejection. An explicit caller effort is the same channel already stated in
+    the route's own vocabulary, so it wins verbatim and the config drops with
+    one disclosure. Replayed thinking blocks are signed provider state no
+    translation can carry; route shaping strips them from a foreign wire with
+    disclosure, so their presence never blocks the translation (and the
+    gateway never fabricates unsigned blocks on the response side).
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request that no rung accepted verbatim.
+        admits: Optional caller probe that must accept a candidate before it
+            is offered, threaded through so a nearer tier that dies one
+            layer later never blocks a farther tier that serves.
+
+    Returns:
+        The disclosed translation or drop, or ``None`` when the request
+        carries no thinking config or no offered request passes the probe.
+    """
+    config = request.provider_thinking_config
+    if config is None or not profiles:
+        return None
+    if "budget_tokens" in config:
+        # An advisory effort cannot enforce a numerical thinking-token bound,
+        # even when the caller also supplied an effort. Keep the refusal.
+        return None
+    if all(profile.dialect == "anthropic_messages" for profile in profiles):
+        # The config is native on every rung: shaping forwards, fills, or
+        # family-gates it itself and never raises the unsupported-parameter
+        # rejection, so whatever declined the request here lies elsewhere and
+        # a translation would replace real thinking for nothing.
+        return None
+
+    def admitted(coercion: RequestCoercion) -> RequestCoercion | None:
+        """Offer one coercion only when the caller's probe accepts it."""
+        if admits is not None and not admits(coercion.request):
+            return None
+        return coercion
+
+    ladder: set[str] = set()
+    for profile in profiles:
+        ladder.update(profile_reasoning_efforts(profile))
+    disabled = config.get("type") == "disabled"
+    if not ladder:
+        if disabled and not any(profile.supports_reasoning for profile in profiles):
+            # No rung reasons, so the off switch is already honored: the
+            # config drops and the request serves as asked (Claude Code's
+            # side calls send it to every model; claude-sonnet-5 behind its
+            # non-reasoning lanes refused them, production 2026-10-18).
+            dropped, disclosures = _drop_thinking_and_effort(
+                request, disclosure=THINKING_ALREADY_OFF_DISCLOSURE
+            )
+            return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
+        if disabled or any(profile.supports_reasoning for profile in profiles):
+            # An empty effort ladder can describe an always-reasoning model,
+            # not just a model with no reasoning channel. Never fall back to
+            # its unknown default after the caller supplied a control.
+            return None
+        dropped, disclosures = _drop_thinking_and_effort(request)
+        return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
+    yielded: tuple[str, ...] = ()
+    if disabled and request.reasoning_effort not in (None, "none"):
+        yielded = (f"{request.caller_effort_parameter}{EFFORT_BESIDE_DISABLED_SUFFIX}",)
+        request = _without_effort(request)
+    if request.reasoning_effort is not None and not disabled:
+        superseded = request.model_copy(update={"provider_thinking_config": None})
+        if admits is not None and not _route_serves(profiles, superseded, admits):
+            # The caller's effort wins, but this route may not speak it:
+            # snap it exactly as a bare effort would be snapped (Claude Code
+            # sends adaptive thinking beside effort medium or xhigh to routes
+            # whose ladder skips them, production 2026-10-18).
+            snapped = _coerce_generation_semantics(profiles, superseded, admits=admits)
+            if snapped is not None:
+                return RequestCoercion(
+                    request=snapped.request,
+                    disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE, *snapped.disclosures),
+                )
+        return admitted(
+            RequestCoercion(
+                request=superseded,
+                disclosures=(THINKING_SUPERSEDED_BY_EFFORT_DISCLOSURE,),
+            )
+        )
+    requested_tier, source = _requested_thinking_tier(profiles, config)
+    candidates = set(ladder)
+    if source == "disabled":
+        # An exact off tier preserves a disabled config. A route whose every
+        # rung reasons and none can stop serves it at its lowest tier, the
+        # rule an explicit ``none`` effort already follows
+        # (``lowest_supported``), disclosed so the caller knows reasoning
+        # stayed on. A route that still has a rung that never reasons keeps
+        # the refusal here: admission narrows to that rung first.
+        if "none" in ladder:
+            candidates.intersection_update({"none"})
+        elif all(profile.supports_reasoning for profile in profiles):
+            source = "no_off_tier"
+        else:
+            return None
+    else:
+        # An active config asked for reasoning; snapping it to 'none' would
+        # silently disable reasoning while calling it a translation, so a
+        # route whose only level is 'none' takes the disclosed drop instead.
+        candidates.discard("none")
+    for candidate in efforts_by_nearness(requested_tier, candidates):
+        translated_request = request.model_copy(
+            update={"provider_thinking_config": None, "reasoning_effort": candidate}
+        )
+        try:
+            indexes = compatible_generation_parameter_profile_indexes(profiles, translated_request)
+            # Per-rung admission is not enough here either: only a candidate
+            # whose narrowed rung set survives full route construction is a
+            # real translation (see the explicit-effort snap below).
+            route_generation_parameter_requests(
+                tuple(profiles[index] for index in indexes),
+                translated_request,
+            )
+        except (ProviderParameterError, ProviderCapabilityError):
+            continue
+        if admits is not None and not admits(translated_request):
+            continue
+        return RequestCoercion(
+            request=translated_request,
+            disclosures=(*yielded, thinking_effort_disclosure(candidate, source)),
+        )
+    if disabled:
+        return None
+    dropped, disclosures = _drop_thinking_and_effort(
+        request,
+        disclosure=(
+            THINKING_NO_SERVABLE_TIER_DROP_DISCLOSURE if candidates else THINKING_DROP_DISCLOSURE
+        ),
+    )
+    return admitted(RequestCoercion(request=dropped, disclosures=disclosures))
+
+
+def _without_effort(request: GatewayRequest) -> GatewayRequest:
+    """Clear the caller effort from ``reasoning_effort`` and ``output_config.effort``."""
+    updates: dict[str, object] = {"reasoning_effort": None}
+    if request.provider_output_config is not None and "effort" in request.provider_output_config:
+        remaining = {
+            key: value for key, value in request.provider_output_config.items() if key != "effort"
+        }
+        updates["provider_output_config"] = remaining or None
+    return request.model_copy(update=updates)
+
+
+def _drop_thinking_and_effort(
+    request: GatewayRequest,
+    *,
+    disclosure: str = THINKING_DROP_DISCLOSURE,
+) -> tuple[GatewayRequest, tuple[str, ...]]:
+    """Null the thinking config and effort channels for a route that cannot honor them.
+
+    Shared drop for the routes that cannot honor a reasoning signal: the
+    thinking config, the caller effort, and the Messages ``output_config.effort``
+    channel all go, and a ``clear_thinking`` context edit rides on the thinking
+    config and is stripped with it. Every removal is disclosed; ``disclosure``
+    names why the config went (no reasoning rung, or no servable tier). History
+    thinking blocks are NOT touched: Anthropic accepts replayed blocks without a
+    live thinking config.
+    """
+    updates: dict[str, object] = {"provider_thinking_config": None}
+    disclosures: list[str] = []
+    if request.reasoning_effort is not None:
+        disclosures.append(EFFORT_DROP_DISCLOSURE)
+    disclosures.append(disclosure)
+    if request.context_management is not None:
+        updates["context_management"] = _without_clear_thinking_edits(request.context_management)
+    return _without_effort(request).model_copy(update=updates), tuple(disclosures)
+
+
 def coerce_generation_parameters(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
@@ -80,11 +471,71 @@ def coerce_generation_parameters(
 ) -> RequestCoercion | None:
     """Build the minimal disclosed coercion after verbatim narrowing failed.
 
-    Only substitutions whose semantics survive are offered: a reasoning
-    effort snaps to the nearest level any rung supports on the canonical
-    ladder (ties prefer the lower level, so a coercion never spends more
-    than requested), and ANY effort on a route with no reasoning support at
-    all is dropped with disclosure. A zero-reasoning route cannot honor any
+    The independent route repairs (``route_repairs``: an out-of-range output
+    ceiling, a thinking toggle no rung can honor, encrypted reasoning no rung
+    can carry) apply first and compose with each other; when the repaired
+    request still does not serve, the effort substitutions below run on it and
+    both sets of disclosures are returned together. See
+    :func:`_coerce_generation_semantics` for the effort rules.
+
+    Args:
+        profiles: Ordered wire profiles for every live route deployment.
+        request: Decoded public request that no rung accepted verbatim.
+        admits: Optional caller probe that must accept a candidate.
+
+    Returns:
+        The disclosed substitution to retry with, or ``None``.
+    """
+    repair = apply_route_repairs(profiles, request)
+    if repair is None:
+        return _coerce_generation_semantics(profiles, request, admits=admits)
+    if _route_serves(profiles, repair.request, admits):
+        return RequestCoercion(request=repair.request, disclosures=repair.disclosures)
+    semantic = _coerce_generation_semantics(profiles, repair.request, admits=admits)
+    if semantic is not None:
+        return RequestCoercion(
+            request=semantic.request,
+            disclosures=(*repair.disclosures, *semantic.disclosures),
+        )
+    if admits is None:
+        # Unprobed: carry the repair forward so the stage that actually
+        # refuses names the caller's remedy.
+        return RequestCoercion(request=repair.request, disclosures=repair.disclosures)
+    return None
+
+
+def _route_serves(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    admits: Callable[[GatewayRequest], bool] | None,
+) -> bool:
+    """Whether a candidate survives narrowing, full route shaping, and the probe."""
+    try:
+        indexes = compatible_generation_parameter_profile_indexes(profiles, request)
+        route_generation_parameter_requests(tuple(profiles[index] for index in indexes), request)
+    except (ProviderParameterError, ProviderCapabilityError):
+        return False
+    return admits is None or admits(request)
+
+
+def _coerce_generation_semantics(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    *,
+    admits: Callable[[GatewayRequest], bool] | None = None,
+) -> RequestCoercion | None:
+    """Build the minimal disclosed effort or thinking substitution.
+
+    Only substitutions whose semantics survive are offered: an explicit
+    reasoning effort snaps down to the nearest supported level first; only
+    when no level at or below it serves does it rise to the nearest level
+    above (disclosed as ``nearest_supported``, or ``lowest_supported`` for
+    ``none``/``minimal`` below a route's whole ladder): the route cannot
+    serve the asked depth, and refusing pinned clients wedges every turn. A
+    thinking ``disabled`` config must remain off or receive a typed refusal.
+    An effort on a route
+    with no reasoning support at all is dropped with disclosure. A
+    zero-reasoning route cannot honor any
     depth, so the only serviceable semantic is the model's sole behavior,
     and first-party clients pin effort globally (Claude Code sends its
     configured effortLevel to every model), so a named rejection here makes
@@ -105,19 +556,55 @@ def coerce_generation_parameters(
         The disclosed substitution to retry with, or ``None`` when nothing
         coercible applies.
     """
-    disabled_thinking = _coerce_disabled_thinking(profiles, request)
-    if disabled_thinking is not None:
-        if admits is not None and not admits(disabled_thinking.request):
+    if (
+        request.logprobs is True
+        or request.include_output_text_logprobs
+        or request.top_logprobs is not None
+    ):
+        return None
+    budgeted = coerce_budget_to_effort(profiles, request, admits=admits)
+    if budgeted is not None:
+        return RequestCoercion(request=budgeted[0], disclosures=(budgeted[1],))
+    if (
+        request.provider_thinking_config is not None
+        and request.provider_thinking_config.get("type") == "between_tools"
+    ):
+        # No effort-only substitution preserves the absence of up-front thinking.
+        return None
+    adaptive_budget = _coerce_adaptive_budget(profiles, request)
+    if adaptive_budget is not None:
+        if admits is not None and not admits(adaptive_budget.request):
             return None
-        return disabled_thinking
-    if request.reasoning_effort is None:
+        return adaptive_budget
+    thinking_effort = _coerce_thinking_to_effort(profiles, request, admits=admits)
+    if thinking_effort is not None:
+        return thinking_effort
+    if request.provider_thinking_config is not None and (
+        request.provider_thinking_config.get("type") == "disabled"
+        or "budget_tokens" in request.provider_thinking_config
+    ):
         return None
     ladder: set[str] = set()
     for profile in profiles:
         ladder.update(profile_reasoning_efforts(profile))
+    adaptive_thinking = (
+        request.provider_thinking_config is not None
+        and request.provider_thinking_config.get("type") == "adaptive"
+    )
+    # An adaptive config with no effort beside it still cannot survive a route
+    # with no reasoning rung (the provider rejects it by name), so it reaches
+    # the drop path below instead of returning here. A budgeted-enabled route
+    # already translated it in ``_coerce_adaptive_budget``; a route that
+    # accepts adaptive verbatim keeps a non-empty ladder and returns here.
+    if request.reasoning_effort is None and not (adaptive_thinking and not ladder):
+        return None
     if not ladder:
+        if any(profile.supports_reasoning for profile in profiles):
+            return None
         updates: dict[str, object] = {"reasoning_effort": None}
-        disclosures: tuple[str, ...] = (EFFORT_DROP_DISCLOSURE,)
+        disclosures: tuple[str, ...] = (
+            (EFFORT_DROP_DISCLOSURE,) if request.reasoning_effort is not None else ()
+        )
         if request.provider_output_config is not None:
             # The Messages surface carries the same effort verbatim inside
             # output_config; a dropped effort must not reach the provider
@@ -128,30 +615,69 @@ def coerce_generation_parameters(
                 if key != "effort"
             }
             updates["provider_output_config"] = remaining or None
-        if (
-            request.provider_thinking_config is not None
-            and request.provider_thinking_config.get("type") == "adaptive"
-        ):
+        if adaptive_thinking:
             # Adaptive thinking is the effort's own channel on the Messages
             # surface (the model picks its depth from output_config.effort),
             # so a route with no reasoning rung cannot honor it either and
-            # the provider rejects it by name. A budgeted config is left
-            # verbatim: its semantics do not depend on an effort level.
+            # the provider rejects it by name, with or without an effort beside
+            # it. A budgeted config is left verbatim: its semantics do not
+            # depend on an effort level. A clear_thinking context edit rides on
+            # the thinking config and is stripped with it.
             updates["provider_thinking_config"] = None
-            disclosures = (EFFORT_DROP_DISCLOSURE, THINKING_DROP_DISCLOSURE)
+            disclosures = (*disclosures, THINKING_DROP_DISCLOSURE)
+            if request.context_management is not None:
+                updates["context_management"] = _without_clear_thinking_edits(
+                    request.context_management
+                )
         dropped_request = request.model_copy(update=updates)
         if admits is not None and not admits(dropped_request):
             return None
         return RequestCoercion(request=dropped_request, disclosures=disclosures)
-    if request.reasoning_effort in ladder:
+    if request.reasoning_effort is None or request.reasoning_effort in ladder:
         # The effort itself is portable; the verbatim failure lies elsewhere
         # and a snap would change semantics for nothing.
         return None
     # A heterogeneous waterfall can carry a nearby effort only on rungs that
     # reject some other control, so candidates are tried in nearness order
     # and the snap is the closest level that actually admits a rung.
-    for candidate in efforts_by_nearness(request.reasoning_effort, ladder):
-        snapped_request = request.model_copy(update={"reasoning_effort": candidate})
+    permitted = set(REASONING_EFFORTS[: REASONING_EFFORTS.index(request.reasoning_effort) + 1])
+    if request.reasoning_effort != "none":
+        # An active effort never snaps down to off: that would silently turn
+        # reasoning off while calling it the nearest tier (glm-5.1's zai rung,
+        # none or high, served "medium" with no reasoning at all).
+        permitted.discard("none")
+    candidates = efforts_by_nearness(request.reasoning_effort, ladder & permitted)
+    # When no tier at or below the request admits a rung, the request would
+    # otherwise be refused, so the nearest tier ABOVE it serves instead,
+    # nearest first (a tie with a lower tier never reaches here: every lower
+    # tier was already tried). "none"/"minimal" below the whole ladder keep
+    # their own reason: the route cannot turn reasoning off or go that
+    # shallow (pinned clients send "none" to every model; the gateway
+    # refused 925 such requests a day). Any other effort between or below
+    # the ladder's tiers is ``nearest_supported`` (a lane whose ladder was
+    # only "high" refused "medium" by name, gemini-3.8-flash in production
+    # 2026-10-17, before its real low/medium/high ladder was recorded).
+    above = tuple(
+        effort
+        for effort in REASONING_EFFORTS[REASONING_EFFORTS.index(request.reasoning_effort) + 1 :]
+        if effort in ladder
+    )
+    raised_reason = (
+        "lowest_supported"
+        if request.reasoning_effort in ("none", "minimal")
+        else "nearest_supported"
+    )
+    for candidate in (*candidates, *above):
+        snap_updates: JsonObject = {"reasoning_effort": candidate}
+        if (
+            request.provider_output_config is not None
+            and "effort" in request.provider_output_config
+        ):
+            snap_updates["provider_output_config"] = {
+                **request.provider_output_config,
+                "effort": candidate,
+            }
+        snapped_request = request.model_copy(update=snap_updates)
         try:
             indexes = compatible_generation_parameter_profile_indexes(profiles, snapped_request)
             # Per-rung admission is not enough: the narrowed rung set changes
@@ -169,61 +695,67 @@ def coerce_generation_parameters(
             continue
         return RequestCoercion(
             request=snapped_request,
-            disclosures=(f"reasoning_effort->{candidate}",),
+            disclosures=(
+                f"reasoning_effort->{candidate}({raised_reason})"
+                if candidate in above
+                else f"reasoning_effort->{candidate}",
+            ),
         )
     return None
 
 
-def _coerce_disabled_thinking(
-    profiles: Sequence[GatewayWireProfile],
-    request: GatewayRequest,
-) -> RequestCoercion | None:
-    """Drop a ``thinking.type: disabled`` config the route's model cannot honor.
+def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject | None:
+    """Return the context-management object without ``clear_thinking_*`` edits.
 
-    The adaptive-thinking Anthropic generation always reasons and rejects an
-    explicit ``disabled`` by name, so on a route whose Anthropic rungs are all
-    adaptive-only the caller's only alternative to a rejection is removing the
-    field. First-party clients pin the thinking mode globally (Claude Code
-    sends its configured mode to every model), so the config is dropped with
-    disclosure and the rung emits its sole supported mode, mirroring how a
-    budgeted ``enabled`` config is translated to adaptive. Routes with a rung
-    that honors ``disabled`` verbatim are left alone: narrowing already picks
-    that rung.
+    A ``clear_thinking`` context edit requires an active thinking config, so it
+    is stripped alongside a dropped thinking config; the provider rejects it by
+    name once the config is gone. Other edits are preserved verbatim.
 
     Args:
-        profiles: Ordered wire profiles for every live route deployment.
-        request: Decoded public request that no rung accepted verbatim.
+        context_management: Verbatim caller ``context_management`` object.
 
     Returns:
-        The disclosed drop, or ``None`` when the config is not a rejected
-        ``disabled`` on an adaptive-only Anthropic route.
+        The same object minus clear-thinking edits, or ``None`` when no edit
+        survives so the field is omitted entirely.
     """
-    config = request.provider_thinking_config
-    if config is None or config.get("type") != "disabled":
-        return None
-    anthropic_profiles = [
-        profile for profile in profiles if profile.dialect == "anthropic_messages"
+    edits = context_management.get("edits")
+    if not isinstance(edits, list):
+        return context_management
+    retained = [
+        edit
+        for edit in edits
+        if not (isinstance(edit, dict) and str(edit.get("type", "")).startswith("clear_thinking"))
     ]
-    if not anthropic_profiles or not all(
-        anthropic_adaptive_only_thinking(profile.model_id) for profile in anthropic_profiles
-    ):
-        return None
-    return RequestCoercion(
-        request=request.model_copy(update={"provider_thinking_config": None}),
-        disclosures=(THINKING_DISABLED_DISCLOSURE,),
-    )
+    if len(retained) == len(edits):
+        return context_management
+    if not retained:
+        remaining = {key: value for key, value in context_management.items() if key != "edits"}
+        return remaining or None
+    return {**context_management, "edits": retained}
 
 
 def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
-    Two capabilities are coercible, both only here — after every rung declined
-    the verbatim request — and both only as a disclosed drop. Degrading
+    Four coercions exist, all only here (after every rung declined the
+    verbatim request) and all only as a disclosed substitution. Degrading
     ``strict: true`` tools to best-effort schemas weakens a correctness
-    guarantee. Dropping ``service_tier`` changes pricing and latency
+    guarantee. Relaxing a forced ``tool_choice`` to ``auto`` weakens a
+    structural guarantee the same way (the model still sees the tools and the
+    prompt, so it usually calls one, but nothing forces it); a named
+    rejection instead would fail every forced-choice request against a model
+    the provider serves fine under ``auto``. Dropping ``service_tier``
+    changes pricing and latency
     semantics, which the caller can act on only when told, so the drop is
-    disclosed rather than silent. Every other capability names a feature with
-    no approximation and stays fail-closed.
+    disclosed rather than silent. Images inside TOOL results degrade to
+    placeholder text on an image-incapable route because the block is baked
+    into the caller's history and a rejection wedges the whole session; a
+    top-level user image keeps the fail-closed contract (the caller can
+    re-send it), so ``image_input`` coerces only when every image in the
+    request lives in a tool message; ``pdf_input`` and ``pdf_url_input``
+    follow the same rule for documents a tool returned (Claude Code's Read on
+    a PDF). Every other capability names a feature with no approximation and
+    stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
@@ -233,12 +765,46 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         The disclosed substitution to retry with, or ``None`` when the
         capability cannot be coerced.
     """
+    if capability == "image_input":
+        if any(message.role != "tool" and message.images for message in request.messages):
+            return None
+        stripped = strip_tool_result_images(request.messages)
+        if stripped is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"messages": stripped}),
+            disclosures=(TOOL_RESULT_IMAGE_DROP_DISCLOSURE,),
+        )
+    if capability in ("pdf_input", "pdf_url_input"):
+        if any(message.role != "tool" and message.documents for message in request.messages):
+            return None
+        stripped = strip_tool_result_documents(request.messages)
+        if stripped is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"messages": stripped}),
+            disclosures=(TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,),
+        )
     if capability == "service_tier":
         if request.service_tier is None:
             return None
         return RequestCoercion(
             request=request.model_copy(update={"service_tier": None}),
             disclosures=(SERVICE_TIER_DROP_DISCLOSURE,),
+        )
+    if capability == "forced_tool_choice":
+        choice = request.tool_choice
+        if isinstance(choice, GatewayAllowedToolsChoice) and choice.mode == "required":
+            relaxed: object = choice.model_copy(update={"mode": "auto"})
+        elif choice == "required" or isinstance(
+            choice, (GatewayNamedToolChoice, GatewayCustomToolChoice)
+        ):
+            relaxed = "auto"
+        else:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"tool_choice": relaxed}),
+            disclosures=(FORCED_TOOL_CHOICE_DISCLOSURE,),
         )
     if capability != "strict_tools" or not any(tool.strict for tool in request.tools):
         return None
@@ -358,7 +924,7 @@ def coerce_structured_text_schema(
         profile.dialect in _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS for profile in profiles
     ):
         return None
-    closed, changed = _close_schema_objects(request.structured_text.json_schema)
+    closed, changed = close_schema_objects(request.structured_text.json_schema)
     if not changed:
         return None
     return RequestCoercion(
@@ -373,63 +939,47 @@ def coerce_structured_text_schema(
     )
 
 
-_SCHEMA_CHILD_KEYS = ("properties", "$defs", "definitions", "patternProperties")
-"""Schema keys whose values map names to subschemas."""
+def coerce_strict_tool_schemas(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+) -> RequestCoercion | None:
+    """Close every object in each ``strict`` tool schema for a rung that needs it.
 
-_SCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
-"""Schema keys whose values list subschemas."""
-
-_SCHEMA_SINGLE_KEYS = ("items", "not", "if", "then", "else")
-"""Schema keys whose values are one subschema."""
-
-
-def _close_schema_objects(schema: JsonObject) -> tuple[JsonObject, bool]:
-    """Return ``schema`` with ``additionalProperties: false`` on every object.
-
-    An object is any node typed ``object`` or carrying ``properties``. The
-    walk descends through the standard composition and container keywords
-    and copies only the nodes it changes.
+    The Anthropic strict validator requires ``additionalProperties: false``
+    on every object of a strict tool's ``input_schema`` (verified live
+    2026-09-05: an absent or ``true`` value is a 400 by name), exactly as it
+    does for structured-output schemas. Closing the objects tightens the
+    input contract the caller already asked to have enforced, so it is a
+    disclosed coercion rather than a reason to drop ``strict``. Non-strict
+    tools, schemas already closed everywhere, and routes with no rung on such
+    a dialect pass through untouched.
 
     Args:
-        schema: One JSON Schema node.
+        profiles: Ordered wire profiles for the rungs the request will reach.
+        request: Admitted request, after generation-parameter narrowing.
 
     Returns:
-        The closed node and whether any node changed.
+        The disclosed substitution to dispatch, or ``None`` when nothing
+        needs closing.
     """
-    changed = False
-    closed: JsonObject = dict(schema)
-    is_object = schema.get("type") == "object" or "properties" in schema
-    if is_object and schema.get("additionalProperties") is not False:
-        closed["additionalProperties"] = False
-        changed = True
-    for key in _SCHEMA_CHILD_KEYS:
-        children = schema.get(key)
-        if isinstance(children, dict):
-            closed_children: dict[str, JsonValue] = {}
-            for name, child in children.items():
-                if isinstance(child, dict):
-                    closed_child, child_changed = _close_schema_objects(child)
-                    changed = changed or child_changed
-                    closed_children[name] = closed_child
-                else:
-                    closed_children[name] = child
-            closed[key] = closed_children
-    for key in _SCHEMA_LIST_KEYS:
-        members = schema.get(key)
-        if isinstance(members, list):
-            closed_members: list[JsonValue] = []
-            for member in members:
-                if isinstance(member, dict):
-                    closed_member, member_changed = _close_schema_objects(member)
-                    changed = changed or member_changed
-                    closed_members.append(closed_member)
-                else:
-                    closed_members.append(member)
-            closed[key] = closed_members
-    for key in _SCHEMA_SINGLE_KEYS:
-        single = schema.get(key)
-        if isinstance(single, dict):
-            closed_single, single_changed = _close_schema_objects(single)
-            changed = changed or single_changed
-            closed[key] = closed_single
-    return (closed if changed else schema), changed
+    if not any(tool.strict for tool in request.tools):
+        return None
+    if not any(
+        profile.dialect in _SCHEMA_DIALECTS_REQUIRING_CLOSED_OBJECTS for profile in profiles
+    ):
+        return None
+    changed_any = False
+    tools: list[GatewayToolDefinition] = []
+    for tool in request.tools:
+        if not tool.strict:
+            tools.append(tool)
+            continue
+        closed, changed = close_schema_objects(tool.parameters)
+        changed_any = changed_any or changed
+        tools.append(tool.model_copy(update={"parameters": closed}) if changed else tool)
+    if not changed_any:
+        return None
+    return RequestCoercion(
+        request=request.model_copy(update={"tools": tuple(tools)}),
+        disclosures=(STRICT_TOOL_SCHEMA_CLOSED_DISCLOSURE,),
+    )

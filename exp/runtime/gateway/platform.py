@@ -10,16 +10,17 @@ from urllib.parse import urlsplit
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
-from exp.common.models.catalog import BillingSource, GatewayEquivalenceCertification
+from exp.common.models.azure_endpoints import AzureApiSurface
+from exp.common.models.catalog import BillingSource, SubscriptionKind
 from exp.common.models.gateway_catalog import (
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
     ExactModelPoolId,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     AttemptId,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -30,6 +31,7 @@ from exp.runtime.gateway.contracts import (
     OrganizationId,
     VirtualKeyId,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 ConnectionId = ArtifactId
 ProviderConnectionRevisionId = ArtifactId
@@ -143,11 +145,13 @@ class ProviderConnectionRevision(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=256)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
     connection_sha256: Sha256
     active: bool = True
     created_at: AwareDatetime
@@ -247,10 +251,10 @@ class MonthlyBudgetRecord(ContractModel):
     organization_id: OrganizationId
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     scope: MonthlyBudgetScope
-    limit_micro_usd: int = Field(ge=0)
-    reserved_micro_usd: int = Field(ge=0)
-    settled_micro_usd: int = Field(ge=0)
-    remaining_micro_usd: int = Field(ge=0)
+    limit_nano_usd: int = Field(ge=0)
+    reserved_nano_usd: int = Field(ge=0)
+    settled_nano_usd: int = Field(ge=0)
+    remaining_nano_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
     exhausted: bool
     created_at: AwareDatetime
@@ -270,17 +274,23 @@ class AttemptReservationRequest(ContractModel):
     deployment: ExactModelDeployment
     attempt_ordinal: int = Field(ge=0)
     route_depth: int = Field(ge=0)
-    maximum_cost_micro_usd: int | None = Field(default=None, ge=0)
+    maximum_cost_nano_usd: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _require_matching_organization(self) -> AttemptReservationRequest:
-        """Reject tenant, deployment-list, or exact-model drift."""
+    def _require_matching_route(self) -> AttemptReservationRequest:
+        """Reject tenant, stage-cursor, or destination exact-model drift."""
         if self.organization_id != self.snapshot.authorization.organization_id:
             raise ValueError("attempt reservation organization differs from its snapshot")
         if self.deployment.deployment_id not in self.snapshot.deployment_ids:
             raise ValueError("attempt deployment is absent from its execution snapshot")
-        if self.deployment.exact_model_id != self.snapshot.exact_model_id:
-            raise ValueError("attempt deployment changes the selected exact model")
+        stage = self.snapshot.stage_for_depth(self.route_depth)
+        if (
+            self.deployment.deployment_id != self.snapshot.deployment_ids[self.route_depth]
+            or self.deployment.deployment_id not in stage.deployment_ids
+        ):
+            raise ValueError("attempt deployment differs from its authorized stage cursor")
+        if self.deployment.exact_model_id != stage.exact_model_id:
+            raise ValueError("attempt deployment changes the selected stage exact model")
         return self
 
 
@@ -301,6 +311,8 @@ class AttemptReservationRecord(ContractModel):
     billing_source: BillingSource
     input_rate: int | None = Field(default=None, ge=0)
     cached_input_rate: int | None = Field(default=None, ge=0)
+    cache_creation_input_rate: int | None = Field(default=None, ge=0)
+    cache_creation_1h_input_rate: int | None = Field(default=None, ge=0)
     output_rate: int | None = Field(default=None, ge=0)
     reasoning_rate: int | None = Field(default=None, ge=0)
     long_context_threshold_tokens: int | None = Field(default=None, gt=0)
@@ -311,12 +323,14 @@ class AttemptReservationRecord(ContractModel):
     """
     long_context_input_rate: int | None = Field(default=None, ge=0)
     long_context_cached_input_rate: int | None = Field(default=None, ge=0)
+    long_context_cache_creation_input_rate: int | None = Field(default=None, ge=0)
+    long_context_cache_creation_1h_input_rate: int | None = Field(default=None, ge=0)
     long_context_output_rate: int | None = Field(default=None, ge=0)
     long_context_reasoning_rate: int | None = Field(default=None, ge=0)
     attempt_ordinal: int = Field(ge=0)
     route_depth: int = Field(ge=0)
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
-    reserved_micro_usd: int | None = Field(default=None, ge=0)
+    reserved_nano_usd: int | None = Field(default=None, ge=0)
     started_at: AwareDatetime
 
 
@@ -379,8 +393,8 @@ class AttemptSettlementRecord(ContractModel):
     failure_class: GatewayFailureClass | None = None
     usage: GatewayUsage | None = None
     usage_source: AttemptUsageSource
-    estimated_cost_micro_usd: int | None = Field(default=None, ge=0)
-    settled_micro_usd: int | None = Field(default=None, ge=0)
+    estimated_cost_nano_usd: int | None = Field(default=None, ge=0)
+    settled_nano_usd: int | None = Field(default=None, ge=0)
     first_token_at: AwareDatetime | None = None
     """Wall-clock time this attempt streamed its first token, or ``None`` when it never did.
 
@@ -437,7 +451,7 @@ class IdentityUsageAttribution(ContractModel):
     cached_input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     reasoning_tokens: int = Field(ge=0)
-    known_estimated_cost_micro_usd: int = Field(ge=0)
+    known_estimated_cost_nano_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
     total_latency_ms: int = Field(ge=0)
     average_latency_ms: float | None = Field(default=None, ge=0)
@@ -453,7 +467,7 @@ class BillingSourceUsageAttribution(ContractModel):
     cached_input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     reasoning_tokens: int = Field(ge=0)
-    known_estimated_cost_micro_usd: int = Field(ge=0)
+    known_estimated_cost_nano_usd: int = Field(ge=0)
     unknown_cost_attempts: int = Field(ge=0)
     terminal_counts: tuple[UsageTerminalCount, ...]
 
@@ -562,7 +576,13 @@ GrantMutationCommand = Annotated[
 
 
 class UpsertProviderConnectionCommand(ContractModel):
-    """Create or explicitly revise one provider connection."""
+    """Create or explicitly revise one provider connection.
+
+    Attributes:
+        subscription: A plan connection's kind (``None`` for a key connection); dispatch mints a
+            per-request bearer from the plan sign-in the runtime's token source holds, so no
+            secret reference is carried. The remaining fields mirror ``ConnectionConfig``.
+    """
 
     kind: Literal["upsert_provider_connection"] = "upsert_provider_connection"
     organization_id: OrganizationId
@@ -571,11 +591,13 @@ class UpsertProviderConnectionCommand(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=256)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
     access_key_id_reference: OpaqueSecretReference | None = None
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    trusted_custom_origin: bool = False
+    subscription: SubscriptionKind | None = None
     replace: bool = False
 
 
@@ -648,7 +670,7 @@ class SetMonthlyBudgetCommand(ContractModel):
     organization_id: OrganizationId
     period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
     scope: MonthlyBudgetScope
-    limit_micro_usd: int = Field(ge=0)
+    limit_nano_usd: int = Field(ge=0)
     replace: bool = False
 
 

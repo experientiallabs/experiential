@@ -15,7 +15,6 @@ from exp.common.core.artifacts import (
     assert_secret_free,
     canonical_json_bytes,
 )
-from exp.common.core.files import write_bytes_atomic
 from exp.common.core.locks import file_write_lock
 from exp.common.project import (
     ArtifactCorruptionError,
@@ -90,14 +89,16 @@ def load_latest_sft_model_optimization(
     """
     path = latest_sft_model_optimization_path(store)
     _require_safe_coordination_path(store, path)
-    if not path.exists():
+    if store.records.read("latest-sft-model") is None:
         return None
-    if not path.is_file() or path.is_symlink():
+    if path.is_symlink():
         raise SFTModelOptimizationSelectionError(
             f"latest model-optimization pointer is not a safe file: {path}"
         )
     try:
-        pointer = LatestSFTModelOptimization.model_validate_json(path.read_bytes())
+        payload = store.records.read("latest-sft-model")
+        assert payload is not None
+        pointer = LatestSFTModelOptimization.model_validate_json(payload)
         assert_secret_free(pointer)
     except (OSError, ValueError) as exc:
         raise SFTModelOptimizationSelectionError(
@@ -200,7 +201,7 @@ def write_latest_sft_model_optimization(
                 "latest model-optimization selection changed before commit"
             )
         try:
-            write_bytes_atomic(path, canonical_json_bytes(pointer))
+            store.records.write("latest-sft-model", canonical_json_bytes(pointer))
         except OSError as exc:
             raise SFTModelOptimizationSelectionError(
                 f"cannot persist latest model-optimization pointer: {path}"

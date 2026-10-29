@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailCheck,
     GuardrailCompletion,
+)
+from exp.runtime.gateway.guardrails.streaming import (
+    StreamableClassifier,
+    StreamingRedactor,
 )
 
 _INTERNAL_CLASSIFICATION: ContextVar[bool] = ContextVar(
@@ -46,28 +50,6 @@ class InspectingClassifier(Protocol):
         ...
 
 
-class SyncInspectingClassifier(Protocol):
-    """Leftover synchronous detector used only through ``BoundedSyncClassifier``."""
-
-    def inspect_input(
-        self,
-        *,
-        request: GatewayRequest,
-        check: GuardrailCheck,
-    ) -> ClassifierVerdict:
-        """Inspect one canonical request on the caller's thread."""
-        ...
-
-    def inspect_output(
-        self,
-        *,
-        completion: GuardrailCompletion,
-        check: GuardrailCheck,
-    ) -> ClassifierVerdict:
-        """Inspect one winning completion on the caller's thread."""
-        ...
-
-
 class InternalClassifierClient(Protocol):
     """Direct adapter transport that never uses a public gateway HTTP route."""
 
@@ -87,6 +69,61 @@ class InternalClassifierClient(Protocol):
         check: GuardrailCheck,
     ) -> Awaitable[ClassifierVerdict]:
         """Inspect one winning completion through the bound adapter."""
+        ...
+
+    def stream_redactor(self, *, check: GuardrailCheck) -> StreamingRedactor | None:
+        """Return the check's deterministic redactor, or ``None``.
+
+        A redactor here is the capability signal that makes a check eligible
+        for incremental output enforcement. A transport that cannot prove an
+        adapter is deterministic returns ``None``, which keeps the check on
+        the buffered path.
+        """
+        ...
+
+    def input_window_digest(self, *, check: GuardrailCheck) -> str | None:
+        """Return the configuration digest of a windowed adapter, or ``None``.
+
+        A digest marks an adapter that sends only its own bounded window of the
+        request. A transport that cannot prove that returns ``None``, which keeps
+        the complete-request bound in force.
+        """
+        ...
+
+    def input_projection(
+        self, *, check: GuardrailCheck
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the adapter's bounded-subject projection, or ``None``.
+
+        A projection maps a request to a small one the adapter inspects
+        identically. A transport that cannot prove that returns ``None``, which
+        keeps the complete request as the subject.
+        """
+        ...
+
+
+@runtime_checkable
+class ProjectingClassifier(Protocol):
+    """An input adapter that reads only a bounded projection of the request."""
+
+    def project_input(self, request: GatewayRequest) -> GatewayRequest:
+        """Return a bounded request this adapter inspects exactly like ``request``."""
+        ...
+
+
+@runtime_checkable
+class WindowedClassifier(Protocol):
+    """An input adapter that sends a bounded window of the request, never all of it.
+
+    The engine binds the digest into replay revisions, and a policy whose input
+    checks are all windowed is not refused for its complete request size. The
+    digest covers every setting that can change a verdict, such as the model,
+    questions, thresholds, and window bounds.
+    """
+
+    @property
+    def configuration_digest(self) -> str:
+        """Return a content-free SHA-256 hex digest of the verdict settings."""
         ...
 
 
@@ -140,6 +177,38 @@ class DirectClassifierClient:
                 check=check,
             )
 
+    def stream_redactor(self, *, check: GuardrailCheck) -> StreamingRedactor | None:
+        """Return the bound adapter's deterministic redactor, or ``None``.
+
+        Only an adapter that offers one, such as the RE2 detector, can decide
+        about a prefix of a completion. Every other adapter, including every
+        remote or model-backed one, stays on the buffered path.
+        """
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, StreamableClassifier):
+            return None
+        return adapter.stream_redactor()
+
+    def input_window_digest(self, *, check: GuardrailCheck) -> str | None:
+        """Return the bound adapter's configuration digest when it is windowed.
+
+        Only an adapter that builds its own bounded window has one. Every
+        adapter that receives the complete request returns ``None``.
+        """
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, WindowedClassifier):
+            return None
+        return adapter.configuration_digest
+
+    def input_projection(
+        self, *, check: GuardrailCheck
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the bound adapter's bounded-subject projection when it has one."""
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, ProjectingClassifier):
+            return None
+        return adapter.project_input
+
 
 class ClassifierLookup(Protocol):
     """Resolve one replaceable classifier adapter by identity."""
@@ -174,8 +243,3 @@ def assert_not_internal_classification() -> None:
         raise GuardrailRecursionError(
             "classifier adapters cannot recurse through the public gateway route"
         )
-
-
-def internal_classification_active() -> bool:
-    """Return whether the current task is inside a classifier call."""
-    return _INTERNAL_CLASSIFICATION.get()

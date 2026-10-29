@@ -360,7 +360,7 @@ def test_explicit_providers_skip_the_opening_list_and_still_discover_models(
 
     console, catalog = _setup(
         root,
-        "1\n\n1\n\n2\n\ny\n",
+        "all\n\n1\n\n1\n\n2\n\ny\n",
         monkeypatch=monkeypatch,
         options=options,
     )
@@ -779,7 +779,9 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     """
     root = tmp_path / ".exp"
 
-    console, catalog = _setup(root, "2\n\n1\n\n1\n\n2\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(
+        root, "2\n\n1,2,3\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n", monkeypatch=monkeypatch
+    )
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -809,6 +811,27 @@ def test_interactive_setup_saves_providers_models_and_roles_it_derived(
     assert "openai-secret" not in printed
 
 
+def test_selected_models_without_build_roles_are_saved_for_later_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two completion models from one provider persist even with router selection empty."""
+    root = tmp_path / ".exp"
+    console, catalog = _setup(
+        root,
+        "1,2,3\n\n1\n\n1\n\n1\n\ny\n",
+        options=ProviderSetupOptions(providers=("openai",)),
+        monkeypatch=monkeypatch,
+    )
+
+    assert catalog is not None
+    saved = load_model_catalog(root / "models.toml")
+    assert set(saved.models) == {"gpt-5-6-luna", "gpt-5-6-terra", "text-embedding-3-small"}
+    assert saved.roles.world_model == saved.roles.judge == "gpt-5-6-luna"
+    assert saved.roles.candidates == ()
+    assert console.output.index("Models to configure") < console.output.index("World model")
+
+
 def test_interactive_final_rejection_writes_no_catalog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -821,7 +844,7 @@ def test_interactive_final_rejection_writes_no_catalog(
     """
     root = tmp_path / ".exp"
 
-    console, catalog = _setup(root, "2\n\n1\n\n1\n\n1\n\nn\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "2\n\nall\n\n1\n\n1\n\n1\n\nn\n", monkeypatch=monkeypatch)
 
     assert catalog is None
     assert "Configuration" in console.output
@@ -870,7 +893,7 @@ def test_back_from_the_model_screen_reselects_providers_without_losing_answers(
 
     console, catalog = _setup(
         root,
-        "2\n\nb\n3\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
+        "2\n\nb\n3\n\nall\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         monkeypatch=monkeypatch,
         lister=lister,
     )
@@ -952,7 +975,7 @@ def test_setup_preserves_entries_owned_by_providers_it_does_not_configure(
         ),
     )
 
-    console, catalog = _setup(root, "2\n\n1\n\n1\n\n1\n\ny\n", monkeypatch=monkeypatch)
+    console, catalog = _setup(root, "2\n\nall\n\n1\n\n1\n\n1\n\ny\n", monkeypatch=monkeypatch)
 
     assert catalog is not None
     saved = load_model_catalog(root / "models.toml")
@@ -1035,7 +1058,7 @@ def test_configured_models_are_reassignable_without_any_provider_request(
         ),
     )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    console = ScriptedConsole("1\n\n1\n1\n1\n1,2\n\n1\ny\n")
+    console = ScriptedConsole("\nall\n\n1\n1\n1\n1,2\n\n1\ny\n")
 
     catalog = run_provider_setup(
         root,
@@ -1102,7 +1125,7 @@ def test_offline_roles_include_models_on_tinker_without_provider_requests(tmp_pa
             roles=ModelRoles(world_model="chat", judge="chat", embedder="embed"),
         ),
     )
-    console = ScriptedConsole("1\n\n\n1\n1\n1\n\ny\n")
+    console = ScriptedConsole("\n\n1\n1\n1\n\ny\n")
 
     catalog = run_provider_setup(
         root,
@@ -1154,7 +1177,7 @@ def test_offline_roles_retain_assigned_tinker_alias_without_capabilities(tmp_pat
         roles=ModelRoles(world_model="legacy", judge="legacy", embedder="embed"),
     )
     write_model_catalog(root / "models.toml", original)
-    console = ScriptedConsole("1\n\n\n\n\ny\n")
+    console = ScriptedConsole("\n\n\n\n\ny\n")
 
     saved = run_provider_setup(
         root,
@@ -1238,7 +1261,7 @@ def test_offline_setup_preserves_exact_unverified_router_roles_without_revalidat
         ProviderSetupOptions(),
         non_interactive=False,
         replace=False,
-        console=ScriptedConsole("1\n\n\n\n\n\n\n\n\ny\n"),
+        console=ScriptedConsole("\n\n\n\n\n\n\n\ny\n"),
         lister=_UnavailableLister(),
     )
 

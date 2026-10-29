@@ -12,11 +12,14 @@ everywhere and carried on the surfaces the Anthropic wire caches natively
 top-level automatic marker), and dropped on wires that do not cache a marked
 block because a cache hint changes cost, not semantics; ``image`` and PDF
 ``document`` blocks are retained as canonical content parts so a route that
-declares the matching input capability carries them, while a document
-inside ``tool_result`` content is rejected loudly because the serving
-surface cannot preserve it there; ``video`` blocks are rejected because the
-wire defines none. Unknown or unsupported fields are rejected with a
-field-specific error, never silently dropped. Errors raise
+declares the matching input capability carries them — including ``image``
+and ``document`` sub-blocks inside ``tool_result`` content (tool screenshots
+and tool-returned files), which ride the tool message's content parts, and
+``tool_reference`` sub-blocks (a client-side tool search loading deferred
+tools), which ride the tool message's reference names;
+``video`` blocks are rejected because the wire defines none. Unknown or
+unsupported fields are rejected with a field-specific error, never silently
+dropped. Errors raise
 :class:`OpenAIProtocolError` so the shared boundary stays single-authority;
 the HTTP layer renders them in the Anthropic envelope.
 """
@@ -27,70 +30,81 @@ import json
 from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from pydantic_core import ErrorDetails
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
-    DOCUMENT_MEDIA_TYPES,
-    IMAGE_MEDIA_TYPES,
-    MAXIMUM_DOCUMENT_BASE64_BYTES,
-    MAXIMUM_DOCUMENT_NAME_CHARACTERS,
-    MAXIMUM_IMAGE_BASE64_BYTES,
-    DocumentContentPart,
-    ImageContentPart,
     MessageContentPart,
     TextContentPart,
-    image_part_from_url,
 )
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol.gateway_reasoning import (
+    EMPTY_GATEWAY_BLOCK,
+    gateway_reasoning_block,
+    merge_exposed_reasoning,
+)
 from exp.runtime.anthropic_protocol.manifest import (
+    MESSAGES_BETA_TOKENS_FIELD_BOUND,
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
-    MESSAGES_SERVER_TOOL_TYPES_ACCEPTED,
 )
-from exp.runtime.gateway.compatibility import CompatibilityDisposition
+from exp.runtime.anthropic_protocol.media_blocks import (
+    AnthropicWireModel,
+    CacheControl,
+    DocumentBlock,
+    ImageBlock,
+    ToolReferenceBlock,
+    cache_marker,
+    document_part_from_block,
+    image_part_from_block,
+    plain_document_text,
+    tool_reference_cache_marker,
+    tool_result_parts,
+    tool_result_references,
+    tool_result_text,
+)
+from exp.runtime.anthropic_protocol.reasoning_channels import (
+    ReasoningConfig,
+    resolve_reasoning_channels,
+)
+from exp.runtime.anthropic_protocol.server_tools import (
+    ServerTool,
+    messages_tool_search,
+    messages_web_search,
+    require_served_server_tool_types,
+)
+from exp.runtime.anthropic_protocol.tool_changes import (
+    CustomTool,
+    ToolAdditionBlock,
+    ToolRemovalBlock,
+    decode_tool_change,
+    tool_change_marker,
+    tool_change_text,
+    tools_after_changes,
+)
+from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
-    GatewayToolDefinition,
     ProviderReasoningBlock,
     RedactedThinkingBlock,
     ThinkingBlock,
 )
-from exp.runtime.models.providers.reasoning_compat import REASONING_EFFORTS
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field, unsupported_field
-from exp.runtime.openai_protocol.manifest import disposition_map
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy
+from exp.runtime.models.providers.cache_policy import (
+    multimodal_text_cache_blocks,
+    retain_multimodal_cache_boundaries,
+)
+from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
-
-_REJECTED_BLOCK_HINTS = {
-    kind: (
-        f"{kind} blocks are not supported: the Anthropic Messages wire defines no "
-        f"{kind} content, so send {kind} on the Chat Completions surface"
-    )
-    for kind in ("video", "audio")
-}
-_REJECTED_TOOL_RESULT_BLOCK_HINTS = {
-    "document": "document blocks are not supported inside tool_result content",
-    **_REJECTED_BLOCK_HINTS,
-}
+from exp.runtime.openai_protocol.unknown_message_fields import drop_unknown_message_keys
 
 
-class _WireModel(BaseModel):
-    """Strict private Anthropic wire model rejecting unknown nested fields."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class _CacheControl(_WireModel):
-    """Anthropic prompt-caching annotation, validated and then dropped."""
-
-    type: Literal["ephemeral"]
-    ttl: Literal["5m", "1h"] | None = None
-
-
-class _TextBlock(_WireModel):
+class _TextBlock(AnthropicWireModel):
     """One plain text content block.
 
     ``citations`` exists only as server-tool output echoed back in assistant
@@ -102,59 +116,11 @@ class _TextBlock(_WireModel):
 
     type: Literal["text"]
     text: str
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
     citations: tuple[JsonObject, ...] | None = None
 
 
-class _ImageSource(_WireModel):
-    """Where one image block's bytes come from: inline base64 or a URL."""
-
-    type: Literal["base64", "url"]
-    media_type: str | None = Field(default=None, max_length=64)
-    data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
-    url: str | None = Field(default=None, max_length=8_192)
-
-
-class _ImageBlock(_WireModel):
-    """One caller image content block."""
-
-    type: Literal["image"]
-    source: _ImageSource
-    cache_control: _CacheControl | None = None
-
-
-class _DocumentSource(_WireModel):
-    """Where one document block's bytes come from: inline base64 or a URL.
-
-    ``file`` sources name an uploaded Files API object this gateway does not
-    host and ``text``/``content`` sources carry non-PDF documents no other
-    wire accepts, so only the two carriers every declared route can serve
-    are accepted.
-    """
-
-    type: Literal["base64", "url"]
-    media_type: str | None = Field(default=None, max_length=64)
-    data: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_BASE64_BYTES)
-    url: str | None = Field(default=None, max_length=8_192)
-
-
-class _DocumentCitations(_WireModel):
-    """Per-document citations toggle; only the disabled form is servable."""
-
-    enabled: bool
-
-
-class _DocumentBlock(_WireModel):
-    """One caller PDF document content block."""
-
-    type: Literal["document"]
-    source: _DocumentSource
-    title: str | None = Field(default=None, max_length=MAXIMUM_DOCUMENT_NAME_CHARACTERS)
-    citations: _DocumentCitations | None = None
-    cache_control: _CacheControl | None = None
-
-
-class _ThinkingBlock(_WireModel):
+class _ThinkingBlock(AnthropicWireModel):
     """Extended-thinking assistant history block, carried verbatim."""
 
     type: Literal["thinking"]
@@ -162,24 +128,24 @@ class _ThinkingBlock(_WireModel):
     signature: str | None = None
 
 
-class _RedactedThinkingBlock(_WireModel):
+class _RedactedThinkingBlock(AnthropicWireModel):
     """Redacted-thinking assistant history block, carried verbatim."""
 
     type: Literal["redacted_thinking"]
     data: str = ""
 
 
-class _ToolUseBlock(_WireModel):
+class _ToolUseBlock(AnthropicWireModel):
     """One assistant tool invocation retained in request history."""
 
     type: Literal["tool_use"]
     id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     input: JsonObject
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
 
 
-class _ToolResultBlock(_WireModel):
+class _ToolResultBlock(AnthropicWireModel):
     """One tool result the caller returns for a prior assistant tool call.
 
     ``is_error`` rides the canonical tool message (``GatewayMessage.tool_is_error``)
@@ -189,12 +155,19 @@ class _ToolResultBlock(_WireModel):
 
     type: Literal["tool_result"]
     tool_use_id: str = Field(min_length=1, max_length=256)
-    content: str | tuple[_TextBlock, ...] | None = None
+    # Image and PDF document sub-blocks are real Anthropic wire (tool
+    # screenshots and tool-returned files: Claude Code's Read tool emits both
+    # routinely), and so are tool_reference sub-blocks (Claude Code's
+    # client-side ToolSearch loads deferred tools with them); rejecting any of
+    # them wedges the caller's session because the block is baked into history.
+    content: (
+        str | tuple[_TextBlock | ImageBlock | DocumentBlock | ToolReferenceBlock, ...] | None
+    ) = None
     is_error: bool = False
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
 
 
-class _ServerToolUseBlock(BaseModel):
+class ServerToolUseBlock(BaseModel):
     """One server-tool invocation echoed in history, carried shallowly.
 
     Server-tool block shapes are an evolving provider surface; a closed model
@@ -212,23 +185,25 @@ class _WebSearchToolResultBlock(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["web_search_tool_result"]
+    type: Literal["web_search_tool_result", "tool_search_tool_result", "tool_reference"]
 
 
 _ContentBlock = (
     _TextBlock
-    | _ImageBlock
-    | _DocumentBlock
+    | ImageBlock
+    | DocumentBlock
     | _ThinkingBlock
     | _RedactedThinkingBlock
     | _ToolUseBlock
     | _ToolResultBlock
-    | _ServerToolUseBlock
+    | ServerToolUseBlock
     | _WebSearchToolResultBlock
+    | ToolAdditionBlock
+    | ToolRemovalBlock
 )
 
 
-class _Message(_WireModel):
+class _Message(AnthropicWireModel):
     """One Anthropic conversation turn.
 
     ``system`` is a first-class mid-conversation role on the live API (the
@@ -238,59 +213,14 @@ class _Message(_WireModel):
 
     role: Literal["user", "assistant", "system"]
     content: str | tuple[_ContentBlock, ...]
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
 
 
-class _Tool(_WireModel):
-    """One caller-defined custom tool with its JSON Schema declaration.
-
-    The description bound is generous on purpose: the provider accepts 40k
-    character descriptions live (verified 2026-08-30) and a real Claude Code
-    toolset exceeded an 8k bound; the request-body cap is the effective limit.
-
-    ``eager_input_streaming``, ``defer_loading``, ``allowed_callers``, and
-    ``input_examples`` are provider-native tool annotations the live API
-    accepts bare (each verified 2026-08-30; Claude Code sends
-    ``eager_input_streaming`` conditionally). They forward verbatim on
-    Anthropic rungs, which own their validity rules, and drop with
-    disclosure elsewhere.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=65_536)
-    input_schema: JsonObject
-    cache_control: _CacheControl | None = None
-    type: Literal["custom"] | None = None
-    strict: bool = False
-    eager_input_streaming: bool | None = None
-    defer_loading: bool | None = None
-    allowed_callers: tuple[str, ...] | None = None
-    input_examples: tuple[JsonObject, ...] | None = None
+_MESSAGE_KEYS = frozenset(_Message.model_fields)
+"""Keys an Anthropic turn object may carry."""
 
 
-class _ServerTool(BaseModel):
-    """One Anthropic server tool, validated shallowly and carried verbatim.
-
-    Server tools (``web_search_20250305``-style) execute at the provider and carry
-    no ``input_schema``; their per-type configuration is an evolving provider
-    surface, so only the discriminator pair is validated and the raw entry
-    forwards byte-for-byte on native Anthropic rungs.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
-    name: str = Field(min_length=1, max_length=256)
-
-    @model_validator(mode="after")
-    def _require_server_type(self) -> _ServerTool:
-        """Reject the custom discriminator: custom tools take the strict model."""
-        if self.type == "custom":
-            raise ValueError("custom tools must declare an input_schema")
-        return self
-
-
-class _ToolChoice(_WireModel):
+class _ToolChoice(AnthropicWireModel):
     """Anthropic tool-choice selector."""
 
     type: Literal["auto", "any", "tool", "none"]
@@ -298,33 +228,45 @@ class _ToolChoice(_WireModel):
     disable_parallel_tool_use: bool | None = None
 
 
-class _Metadata(_WireModel):
+class _Metadata(AnthropicWireModel):
     """Request metadata; only ``user_id`` is defined by the public API."""
 
     user_id: str | None = Field(default=None, max_length=256)
 
 
-class _ThinkingConfig(_WireModel):
-    """Extended-thinking configuration validated closed, then forwarded verbatim."""
+class _ThinkingConfig(AnthropicWireModel):
+    """Extended-thinking configuration validated closed, then forwarded verbatim.
 
-    type: Literal["enabled", "disabled", "adaptive"]
+    Attributes:
+        type: Requested mode, validated against the selected model at admission.
+        budget_tokens: Positive manual thinking budget, only valid with enabled.
+        display: Optional provider display disposition. Between-tools thinking
+            accepts no fields besides type, including explicitly null fields.
+    """
+
+    type: Literal["enabled", "disabled", "adaptive", "between_tools"]
     budget_tokens: int | None = Field(default=None, gt=0)
     display: str | None = Field(default=None, max_length=64)
-    """Display disposition, forwarded verbatim (Claude Code sends "omitted";
-    accepted live without a beta, 2026-08-30). Bounded but deliberately not
-    enumerated: the value set is an evolving provider surface."""
 
     @model_validator(mode="after")
     def _require_budget_only_when_enabled(self) -> _ThinkingConfig:
-        """Bind the token budget to the one mode Anthropic defines it for."""
-        if self.type == "enabled" and self.budget_tokens is None:
-            raise ValueError("thinking.budget_tokens is required when thinking is enabled")
+        """Bind the token budget to the one mode Anthropic defines it for.
+
+        A budget is legal only on ``enabled``, but it is not REQUIRED there at
+        this boundary: Claude Code sends a bare ``{"type": "enabled"}`` and the
+        provider wire needs a budget, so route shaping derives one for an
+        Anthropic rung (disclosed) and an effort route reads the bare config as
+        its default depth. Rejecting it here made every such session die at
+        the gateway (Harbor, 2026-09-11).
+        """
+        if self.type == "between_tools" and self.model_fields_set != {"type"}:
+            raise ValueError("thinking between_tools accepts only the type field")
         if self.type != "enabled" and self.budget_tokens is not None:
             raise ValueError("thinking.budget_tokens is valid only when thinking is enabled")
         return self
 
 
-class _MessagesRequest(_WireModel):
+class _MessagesRequest(AnthropicWireModel):
     """Closed gateway Anthropic Messages request profile."""
 
     model: str = Field(min_length=1, max_length=256)
@@ -336,10 +278,11 @@ class _MessagesRequest(_WireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool | _ServerTool, ...] = ()
+    tools: tuple[CustomTool | ServerTool, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
+    reasoning: ReasoningConfig | None = None
     context_management: JsonObject | None = None
     output_config: JsonObject | None = None
     diagnostics: JsonObject | None = None
@@ -348,15 +291,32 @@ class _MessagesRequest(_WireModel):
     accepted live behind its beta header, 2026-08-30). Bounded but
     deliberately not enumerated: the value set is an evolving provider
     surface."""
-    cache_control: _CacheControl | None = None
+    cache_control: CacheControl | None = None
     """Top-level automatic prompt-caching marker (accepted live without a
     beta, 2026-08-30). Validated closed, forwarded verbatim on Anthropic
     rungs, and dropped with disclosure elsewhere: a cache hint changes
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    # Claude Code auto mode: opaque objects, carried verbatim from the payload.
+    safeguards: tuple[JsonObject, ...] | None = None
+    provider: ProviderRoutingPreferences | None = None
+    gateway: GatewayRequestPolicy | None = None
+    """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
     """Inference-region selector, forwarded verbatim (accepted live without
     a beta, 2026-08-30). Bounded but deliberately not enumerated: the
     region set is an evolving provider surface."""
+
+
+class _CountTokensRequest(_MessagesRequest):
+    """The ``count_tokens`` body: a Messages body with no generation budget.
+
+    Anthropic's count endpoint takes the prompt-side fields (``model``,
+    ``messages``, ``system``, ``tools``, ``tool_choice``, ``thinking``) and
+    no ``max_tokens``; a body that carries one is still counted, since the
+    budget changes nothing about the prompt.
+    """
+
+    max_tokens: int | None = Field(default=None, gt=0)
 
 
 def decode_messages(
@@ -382,9 +342,56 @@ def decode_messages(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
             The HTTP layer renders it in the Anthropic error envelope.
     """
-    _validate_manifest(payload)
-    request = _validate_wire(payload)
-    _require_served_server_tool_types(request.tools)
+    try:
+        return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
+
+
+def decode_messages_count_tokens(
+    payload: JsonObject,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
+    """Decode one Anthropic ``count_tokens`` body for prompt counting.
+
+    Identical to :func:`decode_messages` except that ``max_tokens`` is
+    optional: Anthropic's count request carries only prompt-side fields, so
+    the canonical request has no output budget (``maximum_output_tokens`` is
+    ``None``) and is never dispatched, only counted.
+
+    Args:
+        payload: Parsed JSON request body.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+
+    Returns:
+        Public alias and the canonical request to count.
+
+    Raises:
+        OpenAIProtocolError: The body is invalid, unknown, or unsupported.
+    """
+    if "gateway" in payload:
+        raise unsupported_field("gateway")
+    try:
+        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+    except ProviderParameterError as error:
+        raise invalid_field("messages.content.cache_control", str(error)) from error
+
+
+def _decode(
+    payload: JsonObject,
+    wire: type[_MessagesRequest],
+    *,
+    anthropic_beta: str | None,
+) -> DecodedGatewayRequest:
+    """Validate ``payload`` against ``wire`` and build the canonical request."""
+    # Clients stamp their own bookkeeping on the turns they replay; a key no
+    # turn defines is removed with disclosure rather than failing the whole
+    # conversation. Content blocks and top-level fields stay strict.
+    payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
+    validate_manifest(payload, MESSAGES_MANIFEST)
+    request = validate_wire(payload, wire)
+    require_served_server_tool_types(request.tools)
     forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
@@ -397,26 +404,58 @@ def decode_messages(
             )
         )
     for index, message in enumerate(request.messages):
-        messages.extend(_gateway_messages(message, index))
+        try:
+            messages.extend(_gateway_messages(message, index))
+        except ValidationError as exc:
+            # Turn translation builds canonical messages, so a canonical-
+            # contract violation (such as duplicate tool_use ids in one
+            # assistant turn) first surfaces here, past the wire models. It
+            # is caller-shaped input all the same: name the offending turn
+            # instead of letting the exception escape as an unclassified 500.
+            detail = exc.errors(include_url=False)[0]
+            raise invalid_field(
+                f"messages.{index}",
+                f"Invalid value for 'messages.{index}': "
+                + detail["msg"].removeprefix("Value error, ")
+                + ".",
+            ) from exc
+    tools, tool_change_disclosures = tools_after_changes(
+        request.tools, [message.content for message in request.messages]
+    )
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
+    channels = resolve_reasoning_channels(
+        request.reasoning,
+        max_tokens=request.max_tokens,
+        thinking=cast(JsonObject, payload["thinking"]) if request.thinking is not None else None,
+        output_config=(
+            cast(JsonObject, payload["output_config"])
+            if request.output_config is not None
+            else None
+        ),
+    )
+    _require_thinking_budget_below_max_tokens(channels.thinking_config, request.max_tokens)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
             messages=tuple(messages),
-            tools=tuple(_gateway_tool(tool) for tool in request.tools if isinstance(tool, _Tool)),
+            tools=tools,
             # Raw payload entries, mirroring thinking: the provider receives
             # each server tool byte-for-byte on Anthropic rungs.
             provider_server_tools=tuple(
                 cast(JsonObject, cast(list, payload["tools"])[tool_index])
                 for tool_index, tool in enumerate(request.tools)
-                if isinstance(tool, _ServerTool)
+                if isinstance(tool, ServerTool)
             ),
+            web_search=messages_web_search(payload, request.tools),
+            tool_search=messages_tool_search(request.tools),
             tool_choice=_gateway_tool_choice(request.tool_choice),
             parallel_tool_calls=parallel_tool_calls,
             maximum_output_tokens=request.max_tokens,
-            maximum_output_tokens_parameter="max_tokens",
+            maximum_output_tokens_parameter="max_tokens"
+            if request.max_tokens is not None
+            else None,
             stop=_stop_sequences(request.stop_sequences),
             temperature=request.temperature,
             top_p=request.top_p,
@@ -424,13 +463,10 @@ def decode_messages(
             stream=request.stream,
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
-            # The raw payload value, not the re-serialized wire model, so the
-            # provider receives the caller's thinking config byte-for-byte.
-            provider_thinking_config=(
-                cast(JsonObject, payload["thinking"]) if request.thinking is not None else None
-            ),
+            provider_thinking_config=channels.thinking_config,
             context_management=_context_management(payload),
             diagnostics=_diagnostics(payload),
+            safeguards=_safeguards(payload),
             speed=request.speed,
             # Raw payload value, mirroring thinking: the provider receives the
             # caller's cache marker byte-for-byte on Anthropic rungs.
@@ -441,57 +477,24 @@ def decode_messages(
             ),
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
-            ignored_parameters=dropped_beta_disclosures,
-            reasoning_effort=_output_config_effort(request.output_config),
-            provider_output_config=(
-                cast(JsonObject, payload["output_config"])
-                if request.output_config is not None
-                else None
+            ignored_parameters=(
+                *unknown_disclosures,
+                *dropped_beta_disclosures,
+                *tool_change_disclosures,
+                *channels.disclosures,
             ),
+            gateway=request.gateway,
+            zdr_requested=request.provider is not None and request.provider.demands_zdr,
+            provider_preferences=(
+                cast(JsonObject, payload["provider"]) if request.provider is not None else None
+            ),
+            reasoning_effort=channels.effort,
+            reasoning_effort_parameter=channels.effort_parameter,
+            provider_output_config=channels.output_config,
         )
     except ValidationError as exc:
-        raise _validation_error(exc.errors(include_url=False)[0]) from exc
+        raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _require_served_server_tool_types(tools: tuple[_Tool | _ServerTool, ...]) -> None:
-    """Reject any server tool type the gateway cannot serve truthfully.
-
-    Acceptance means the data plane carries every block the tool makes the
-    provider stream (see the decision tables in ``manifest.py``); an
-    unclassified type stays rejected until the SDK drift gate forces its
-    decision, so a new provider tool never half-works silently.
-
-    Raises:
-        OpenAIProtocolError: A tool entry names an unserved server tool type.
-    """
-    for tool_index, tool in enumerate(tools):
-        if isinstance(tool, _ServerTool) and tool.type not in MESSAGES_SERVER_TOOL_TYPES_ACCEPTED:
-            supported = ", ".join(sorted(MESSAGES_SERVER_TOOL_TYPES_ACCEPTED))
-            raise invalid_field(
-                f"tools.{tool_index}.type",
-                f"the server tool type '{tool.type}' is not supported by this gateway. "
-                f"Supported server tool types: {supported}. Remove the tool or use a "
-                "supported type.",
-            )
-
-
-def _output_config_effort(config: JsonObject | None) -> ReasoningEffort | None:
-    """Map a canonical caller ``output_config.effort`` into the shared field.
-
-    A canonical ladder value rides ``reasoning_effort`` so route narrowing,
-    the coercion policy, and non-Anthropic rungs all see it; the raw object
-    still forwards verbatim on Anthropic rungs with the caller's keys
-    winning, so an unrecognized future effort value stays provider-decided
-    instead of gateway-rejected.
-    """
-    if config is None:
-        return None
-    effort = config.get("effort")
-    if isinstance(effort, str) and effort in REASONING_EFFORTS:
-        # The membership check above is the narrowing proof for this cast.
-        return cast("ReasoningEffort", effort)
-    return None
 
 
 def _context_management(payload: JsonObject) -> JsonObject | None:
@@ -531,13 +534,32 @@ def _diagnostics(payload: JsonObject) -> JsonObject | None:
     return cast(JsonObject, value)
 
 
+def _safeguards(payload: JsonObject) -> tuple[JsonObject, ...] | None:
+    """Validate Claude Code's auto-mode safeguards as an array of objects.
+
+    Each entry is an evolving provider object forwarded byte-for-byte on
+    Anthropic rungs, so validation stays shallow.
+
+    Raises:
+        OpenAIProtocolError: The field is present but not an array of objects.
+    """
+    value = payload.get("safeguards")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(entry, dict) for entry in value):
+        raise invalid_field("safeguards", "safeguards must be an array of JSON objects.")
+    return tuple(cast(JsonObject, entry) for entry in value)
+
+
 def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Partition a caller ``anthropic-beta`` header into forward and drop sets.
 
     Forwarding is an exact allowlist (:data:`MESSAGES_BETA_TOKENS_FORWARDED`):
     a caller header is operator-trust surface and is never blind-forwarded.
     Dropped tokens are disclosed per token, never rejected, because the
-    provider itself tolerates unknown beta tokens.
+    provider itself tolerates unknown beta tokens. Field-bound tokens
+    (:data:`MESSAGES_BETA_TOKENS_FIELD_BOUND`) land in neither set: the
+    gateway injects them itself beside their field.
 
     Args:
         header: Raw comma-separated header value, or ``None``.
@@ -558,6 +580,8 @@ def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
         token = raw_token.strip()
         if not token:
             continue
+        if token in MESSAGES_BETA_TOKENS_FIELD_BOUND:
+            continue
         if token in MESSAGES_BETA_TOKENS_FORWARDED:
             if token not in forwarded:
                 forwarded.append(token)
@@ -566,164 +590,6 @@ def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
             if disclosure not in dropped:
                 dropped.append(disclosure)
     return tuple(forwarded), tuple(dropped)
-
-
-def _validate_manifest(payload: JsonObject) -> None:
-    """Reject unsupported and unknown top-level fields before decoding."""
-    decisions = disposition_map(MESSAGES_MANIFEST)
-    for field in payload:
-        disposition = decisions.get(field)
-        if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
-            raise unsupported_field(field)
-
-
-def _validate_wire(payload: JsonObject) -> _MessagesRequest:
-    """Validate the strict wire model with a field-specific public error."""
-    try:
-        return _MessagesRequest.model_validate(payload)
-    except ValidationError as exc:
-        first = exc.errors(include_url=False)[0]
-        hint = _rejected_block_hint(payload)
-        if hint is not None:
-            raise invalid_field("messages", hint) from exc
-        raise _validation_error(first) from exc
-
-
-def _validation_error(first: ErrorDetails) -> OpenAIProtocolError:
-    """Convert one Pydantic error location into a stable dotted field error.
-
-    The public message keeps the expected-vs-got shape: it names the field
-    and states what the decoder expected there (Pydantic's own expectation
-    text, which never echoes the caller's value), so a rejected request says
-    what to fix instead of only where it failed.
-    """
-    location = first["loc"]
-    cleaned: list[str] = []
-    for part in location:
-        text = str(part)
-        # Union member class names in pydantic locations are noise for callers.
-        if isinstance(part, str) and (part.startswith("_") or "[" in text):
-            continue
-        cleaned.append(text)
-    param = ".".join(cleaned) or "body"
-    if first["type"] == "extra_forbidden":
-        return invalid_field(
-            param,
-            f"Unknown parameter '{param}'. Remove the field and resend the request.",
-        )
-    if param == "body" and first["type"] == "value_error":
-        # A whole-request rule (such as the attachment count ceiling) has no
-        # field of its own, so its own wording is the only useful message.
-        return invalid_field(param, first["msg"].removeprefix("Value error, ") + ".")
-    return invalid_field(param, f"Invalid value for '{param}': {first['msg']}.")
-
-
-def _rejected_block_hint(payload: JsonObject) -> str | None:
-    """Return a targeted message when a known-but-unsupported block is present."""
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return None
-    for message in messages:
-        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
-            continue
-        for block in cast(list[object], message["content"]):
-            if not isinstance(block, dict):
-                continue
-            block_object = cast(JsonObject, block)
-            hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
-            if hint is not None:
-                return hint
-            if block_object.get("type") == "tool_result" and isinstance(
-                block_object.get("content"), list
-            ):
-                for inner in cast(list[object], block_object["content"]):
-                    if not isinstance(inner, dict):
-                        continue
-                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(
-                        str(cast(JsonObject, inner).get("type"))
-                    )
-                    if hint is not None:
-                        return hint
-    return None
-
-
-def _image_part(block: _ImageBlock, param: str) -> ImageContentPart:
-    """Convert one Anthropic image block into the canonical image part.
-
-    Args:
-        block: Validated caller image block.
-        param: Public parameter path used to report an invalid image.
-
-    Returns:
-        The canonical image part carrying the caller's bytes or URL.
-
-    Raises:
-        OpenAIProtocolError: The source is not a supported image.
-    """
-    source = block.source
-    marker = (
-        block.cache_control.model_dump(mode="json", exclude_none=True)
-        if block.cache_control is not None
-        else None
-    )
-    try:
-        if source.type == "url":
-            part = image_part_from_url(source.url or "")
-            return part.model_copy(update={"cache_control": marker})
-        return ImageContentPart(
-            media_type=IMAGE_MEDIA_TYPES[source.media_type or ""],
-            data=source.data,
-            cache_control=marker,
-        )
-    except (KeyError, ValueError) as exc:
-        raise invalid_field(
-            f"{param}.source",
-            f"'{param}.source' must carry an http(s) URL or base64 data "
-            "for a PNG, JPEG, GIF, or WebP image.",
-        ) from exc
-
-
-def _document_part(block: _DocumentBlock, param: str) -> DocumentContentPart:
-    """Convert one Anthropic document block into the canonical document part.
-
-    Args:
-        block: Validated caller document block.
-        param: Public parameter path used to report an invalid document.
-
-    Returns:
-        The canonical document part carrying the caller's bytes or URL.
-
-    Raises:
-        OpenAIProtocolError: The source is not a PDF this gateway forwards,
-            or the block enables citations.
-    """
-    if block.citations is not None and block.citations.enabled:
-        raise invalid_field(
-            f"{param}.citations",
-            "document citations are not supported over this gateway; "
-            "send citations.enabled as false or omit the field.",
-        )
-    source = block.source
-    marker = (
-        block.cache_control.model_dump(mode="json", exclude_none=True)
-        if block.cache_control is not None
-        else None
-    )
-    try:
-        if source.type == "url":
-            return DocumentContentPart(url=source.url, name=block.title, cache_control=marker)
-        return DocumentContentPart(
-            media_type=DOCUMENT_MEDIA_TYPES[source.media_type or ""],
-            data=source.data,
-            name=block.title,
-            cache_control=marker,
-        )
-    except (KeyError, ValueError) as exc:
-        raise invalid_field(
-            f"{param}.source",
-            f"'{param}.source' must carry an http(s) URL or base64 data for a PDF "
-            "(media_type application/pdf).",
-        ) from exc
 
 
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
@@ -735,6 +601,8 @@ def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
 
 def _marked_text_blocks(
     blocks: str | tuple[_TextBlock, ...] | None,
+    *,
+    text_only: bool = True,
 ) -> tuple[JsonObject, ...]:
     """Rebuild a text-block run verbatim when any block carries a cache marker.
 
@@ -749,6 +617,18 @@ def _marked_text_blocks(
         return ()
     if all(block.cache_control is None for block in blocks):
         return ()
+    if text_only:
+        retain_multimodal_cache_boundaries(
+            tuple(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+                for block in blocks
+            )
+        )
     rebuilt: list[JsonObject] = []
     for block in blocks:
         entry: JsonObject = {"type": "text", "text": block.text}
@@ -756,6 +636,44 @@ def _marked_text_blocks(
             entry["cache_control"] = block.cache_control.model_dump(mode="json", exclude_none=True)
         rebuilt.append(entry)
     return tuple(rebuilt)
+
+
+def _require_thinking_budget_below_max_tokens(
+    thinking_config: JsonObject | None,
+    max_tokens: int | None,
+) -> None:
+    """Refuse a thinking budget that leaves no room for the reply.
+
+    Anthropic requires ``thinking.budget_tokens < max_tokens`` (its own 400 reads
+    "max_tokens must be greater than thinking budget_tokens"), and the same
+    arithmetic holds on every route: a budget at or above the ceiling can only
+    end as thinking cut off at ``max_tokens`` with no text, so the request is
+    refused here, before a reservation or a provider round trip, exactly like
+    the sibling ``reasoning.max_tokens`` channel. A budget BELOW Anthropic's
+    1024 minimum is not refused: on an Anthropic rung route shaping replaces
+    it with the derived legal budget (disclosed), and on an effort rung it is
+    only a depth hint read through the tier table, so nothing about it can
+    fail. A ``count_tokens`` body carries no ``max_tokens`` and is not checked.
+    The check reads the RESOLVED thinking channel, after reasoning-channel
+    precedence: a ``thinking`` config that an explicit ``reasoning`` effort
+    supersedes is discarded, and a discarded budget cannot starve anything.
+
+    Args:
+        thinking_config: The thinking config the canonical request will carry.
+        max_tokens: The caller's reply ceiling, ``None`` for ``count_tokens``.
+
+    Raises:
+        OpenAIProtocolError: The budget is not below ``max_tokens``.
+    """
+    if thinking_config is None or max_tokens is None:
+        return
+    budget = thinking_config.get("budget_tokens")
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= max_tokens:
+        raise invalid_field(
+            "thinking.budget_tokens",
+            "thinking.budget_tokens must be below max_tokens so the reply has room after "
+            "thinking. Raise max_tokens or lower the budget.",
+        )
 
 
 def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -766,25 +684,6 @@ def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:
     if any(not sequence for sequence in deduped):
         raise invalid_field("stop_sequences", "stop_sequences entries must be non-empty strings.")
     return deduped
-
-
-def _gateway_tool(tool: _Tool) -> GatewayToolDefinition:
-    """Convert one Anthropic custom tool to the canonical tool definition."""
-    return GatewayToolDefinition(
-        name=tool.name,
-        description=tool.description,
-        parameters=tool.input_schema,
-        strict=tool.strict,
-        cache_control=(
-            tool.cache_control.model_dump(mode="json", exclude_none=True)
-            if tool.cache_control is not None
-            else None
-        ),
-        eager_input_streaming=tool.eager_input_streaming,
-        defer_loading=tool.defer_loading,
-        allowed_callers=tool.allowed_callers,
-        input_examples=tool.input_examples,
-    )
 
 
 def _gateway_tool_choice(
@@ -841,32 +740,90 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
     content_parts: list[MessageContentPart] = []
     tool_calls: list[ToolCall] = []
     reasoning: list[ProviderReasoningBlock] = []
+    # The segment's blocks as the caller sent them: an assistant turn carrying
+    # thinking replays in this order on the Anthropic wire so its signatures
+    # still verify (empty text drops at emission, its cache marker migrated).
+    ordered_blocks: list[JsonObject] = []
 
     def flush() -> None:
         """Emit the pending content, tool calls, and reasoning as one message."""
         content = "".join(part.text for part in text_parts) if text_parts else None
         attachments = any(part.kind != "text" for part in content_parts)
         if content is None and not tool_calls and not reasoning and not attachments:
+            ordered_blocks.clear()
             return
+        capture_only_reasoning = ()
+        if any(block.kind == "sealed_reasoning_content" for block in reasoning):
+            # A gateway tool turn returned its reasoning twice: the unsigned
+            # display block that streamed live and the sealed carrier that
+            # holds the same text authenticated. Only the carrier replays;
+            # retain the already-visible copy separately for trace capture.
+            capture_only_reasoning = tuple(
+                block for block in reasoning if block.kind == "exposed_reasoning_content"
+            )
+            reasoning[:] = [
+                block for block in reasoning if block.kind != "exposed_reasoning_content"
+            ]
+        else:
+            reasoning[:] = merge_exposed_reasoning(reasoning, f"{param}.content")
+        # The verbatim block order exists for Anthropic-signed history, whose
+        # signatures the provider verifies in place; gateway-issued blocks
+        # (unsigned plaintext, sealed carriers) never replay on that wire.
+        anthropic_thinking = any(
+            block.kind in {"thinking", "redacted_thinking"} for block in reasoning
+        )
+        retained = retain_multimodal_cache_boundaries(content_parts)[0] if attachments else ()
+        marked_text = (
+            multimodal_text_cache_blocks(retained)
+            if attachments
+            else _marked_text_blocks(tuple(text_parts), text_only=not (reasoning or tool_calls))
+        )
         out.append(
             GatewayMessage(
                 role=message.role,
                 content=content or ("" if attachments else None),
-                content_parts=tuple(content_parts) if attachments else (),
+                content_parts=retained,
                 tool_calls=tuple(tool_calls),
                 provider_reasoning=tuple(reasoning),
+                capture_only_reasoning=capture_only_reasoning,
                 # The marked run is carried alongside the retained parts: its
                 # blocks are the same text in the same order, so a multimodal
                 # turn keeps its cache markers when it re-emits.
-                provider_text_blocks=_marked_text_blocks(tuple(text_parts)),
+                provider_text_blocks=marked_text,
+                provider_anthropic_blocks=tuple(ordered_blocks) if anthropic_thinking else None,
             )
         )
         text_parts.clear()
         content_parts.clear()
         tool_calls.clear()
         reasoning.clear()
+        ordered_blocks.clear()
 
+    previous_change = False
     for block_index, block in enumerate(message.content):
+        if isinstance(block, (ToolAdditionBlock, ToolRemovalBlock)):
+            block_param = f"{param}.content.{block_index}"
+            if message.role != "system":
+                raise invalid_field(
+                    block_param,
+                    f"{block.type} blocks are only valid in system messages.",
+                )
+            # The change applies to the request's tools (``tools_after_changes``)
+            # and is stated here, where it happened, as one instruction line.
+            separator = (
+                "\n" if previous_change else "\n\n" if any(part.text for part in text_parts) else ""
+            )
+            block = _TextBlock(
+                type="text",
+                text=separator + tool_change_text(decode_tool_change(block, block_param)),
+                cache_control=tool_change_marker(block, block_param),
+            )
+            previous_change = True
+        else:
+            if previous_change and isinstance(block, _TextBlock) and block.text:
+                # Caller text after a change line starts its own paragraph.
+                block = block.model_copy(update={"text": "\n\n" + block.text})
+            previous_change = False
         if isinstance(block, _TextBlock):
             if block.citations:
                 if message.role != "assistant":
@@ -890,35 +847,65 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             # carries no information and drops; a cache marker on the block
             # survives through the marked-run carrier.
             text_parts.append(block)
-            # An empty text block cannot ride a multimodal turn: Anthropic
-            # rejects a standalone empty block, so it never becomes a part.
-            if block.text:
-                content_parts.append(TextContentPart(text=block.text))
-        elif isinstance(block, _ImageBlock):
+            # Keep empty checkpoints until the complete media order is known;
+            # flush relocates the marker before dropping the unsupported text.
+            content_parts.append(
+                TextContentPart(
+                    text=block.text,
+                    cache_control=block.cache_control.model_dump(mode="json", exclude_none=True)
+                    if block.cache_control is not None
+                    else None,
+                )
+            )
+            # The ordered replay keeps an empty text block only for the cache
+            # marker it may carry; emission drops the block and migrates the
+            # marker (``ordered_blocks_with_markers``).
+            if block.text or block.cache_control is not None:
+                ordered_blocks.append(
+                    block.model_dump(mode="json", exclude_none=True, exclude={"citations"})
+                )
+        elif isinstance(block, ImageBlock):
             if message.role != "user":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
                     "image blocks are only valid in user messages.",
                 )
-            content_parts.append(_image_part(block, f"{param}.content.{block_index}"))
-        elif isinstance(block, _DocumentBlock):
+            content_parts.append(image_part_from_block(block, f"{param}.content.{block_index}"))
+        elif isinstance(block, DocumentBlock):
             if message.role != "user":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
                     "document blocks are only valid in user messages.",
                 )
-            content_parts.append(_document_part(block, f"{param}.content.{block_index}"))
+            text = plain_document_text(block, f"{param}.content.{block_index}")
+            if text is None:
+                content_parts.append(
+                    document_part_from_block(block, f"{param}.content.{block_index}")
+                )
+                continue
+            # A plain-text document is the caller's text: it joins the turn as
+            # a text block, so every wire serves it and a cache marker on the
+            # block survives through the marked-run carrier.
+            text_parts.append(_TextBlock(type="text", text=text, cache_control=block.cache_control))
+            content_parts.append(
+                TextContentPart(text=text, cache_control=cache_marker(block.cache_control))
+            )
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
                     "thinking blocks are only valid in assistant messages.",
                 )
-            reasoning.append(
-                ThinkingBlock(text=block.thinking, signature=block.signature)
-                if isinstance(block, _ThinkingBlock)
-                else RedactedThinkingBlock(data=block.data)
-            )
+            gateway_block = gateway_reasoning_block(block, f"{param}.content.{block_index}")
+            if gateway_block is None:
+                reasoning.append(
+                    ThinkingBlock(text=block.thinking, signature=block.signature)
+                    if isinstance(block, _ThinkingBlock)
+                    else RedactedThinkingBlock(data=block.data)
+                )
+                ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+            elif gateway_block is not EMPTY_GATEWAY_BLOCK:
+                reasoning.append(gateway_block)
         elif isinstance(block, _ToolUseBlock):
             if message.role != "assistant":
                 raise invalid_field(
@@ -940,7 +927,8 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     ),
                 )
             )
-        elif isinstance(block, (_ServerToolUseBlock, _WebSearchToolResultBlock)):
+            ordered_blocks.append(block.model_dump(mode="json", exclude_none=True))
+        elif isinstance(block, (ServerToolUseBlock, _WebSearchToolResultBlock)):
             if message.role != "assistant":
                 raise invalid_field(
                     f"{param}.content.{block_index}",
@@ -965,16 +953,19 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             out.append(
                 GatewayMessage(
                     role="tool",
-                    content=_tool_result_text(block),
+                    content=tool_result_text(block.content, f"{param}.content.{block_index}"),
+                    content_parts=tool_result_parts(
+                        block.content, f"{param}.content.{block_index}"
+                    ),
+                    tool_references=tool_result_references(block.content),
                     tool_call_id=block.tool_use_id,
                     tool_is_error=block.is_error,
                     # The marker Claude Code puts on its conversation
                     # breakpoints usually lands on a tool_result block; it
-                    # re-emits with the block on Anthropic rungs.
-                    cache_control=(
-                        block.cache_control.model_dump(mode="json", exclude_none=True)
-                        if block.cache_control is not None
-                        else None
+                    # re-emits with the block on Anthropic rungs. A marker on
+                    # a reference sub-block bounds the same prefix.
+                    cache_control=cache_marker(
+                        block.cache_control or tool_reference_cache_marker(block.content)
                     ),
                 )
             )
@@ -986,12 +977,3 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             "or tool_result content.",
         )
     return out
-
-
-def _tool_result_text(block: _ToolResultBlock) -> str:
-    """Flatten one tool result into the canonical tool-message text."""
-    if block.content is None:
-        return ""
-    if isinstance(block.content, str):
-        return block.content
-    return "".join(part.text for part in block.content)

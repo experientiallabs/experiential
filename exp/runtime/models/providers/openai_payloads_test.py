@@ -1,1 +1,639 @@
-"""OpenAI-family payload builders are exercised in streaming_requests_test.py."""
+"""Instruction-role emission per OpenAI-family wire; the rest of the builders
+are exercised in streaming_requests_test.py."""
+
+from __future__ import annotations
+
+from typing import cast
+
+import pytest
+
+from exp.common.core.artifacts import JsonObject
+from exp.common.models.model import ToolCall
+from exp.runtime.gateway.contracts import (
+    ExposedReasoningContentBlock,
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
+from exp.runtime.models.providers.openai_payloads import (
+    _replayable_native_item,
+    openai_compatible_stream_payload,
+    openai_responses_stream_payload,
+)
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
+
+
+def _developer_conversation() -> GatewayRequest:
+    """Build one request with a leading and a mid-conversation developer turn."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="developer", content="Follow policy."),
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(role="assistant", content="hello"),
+            GatewayMessage(role="developer", content="Now be terse."),
+            GatewayMessage(role="user", content="go"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_chat_wire_emits_developer_instructions_as_system() -> None:
+    """The Chat Completions wire folds ``developer`` into ``system`` losslessly.
+
+    OpenAI defines both roles identically (developer-provided instructions the
+    model follows regardless of user messages), and the third-party
+    OpenAI-compatible servers behind this dialect enumerate only the classic
+    roles (an Azure AI Foundry DeepSeek rung answered ``developer is not one of
+    ['system', 'assistant', 'user', 'tool', 'function']`` in production), so
+    the fold needs no disclosure and applies to every provider on the wire.
+    """
+    payload = openai_compatible_stream_payload("deepseek-v4-flash", _developer_conversation())
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "system",
+        "user",
+    ]
+    assert messages[0]["content"] == "Follow policy."
+    assert messages[3]["content"] == "Now be terse."
+    assert "developer" not in str(payload)
+
+
+def test_responses_wire_keeps_the_developer_role_it_defines() -> None:
+    """The native Responses wire owns the ``developer`` role: leading instructions
+    ride ``instructions`` and a later developer turn keeps its role verbatim."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.4", _developer_conversation(), supports_temperature=True
+    )
+    assert payload["instructions"] == "Follow policy."
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert {"role": "developer", "content": "Now be terse."} in items
+
+
+def test_replayed_responses_items_drop_the_output_only_status_field() -> None:
+    """A replayed input MESSAGE loses the output-only ``status`` a client copied
+    from a prior response (OpenAI: "Unknown parameter: 'input[N].status'");
+    every other item, hosted tool echoes included, re-emits verbatim."""
+    replayed: JsonObject = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "run it again"}],
+        "status": "completed",
+    }
+    hosted: JsonObject = {"type": "web_search_call", "id": "ws_1", "status": "completed"}
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="run it"),
+            GatewayMessage(role="user", provider_native_item=replayed),
+            GatewayMessage(role="assistant", provider_native_item=hosted),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-6-astra", request, supports_temperature=False)
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "run it again"}],
+    } in items
+    # A hosted tool echo keeps its status: that schema defines the field.
+    assert hosted in items
+    # The caller's own item object is left untouched.
+    assert replayed["status"] == "completed"
+
+
+def test_replayed_items_with_foreign_ids_are_repaired_for_the_openai_wire() -> None:
+    """An ``item_``-prefixed id (another gateway's emulation) is dropped from a
+    replayed message and function call, a reasoning item carrying one is dropped
+    whole, and OpenAI's own ids pass untouched."""
+    foreign_message: JsonObject = {
+        "type": "message",
+        "role": "assistant",
+        "id": "item_4762e0563d44cba8b5696951",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+    }
+    foreign_call: JsonObject = {
+        "type": "function_call",
+        "id": "item_9f1c",
+        "call_id": "call_1",
+        "name": "read",
+        "arguments": "{}",
+    }
+    foreign_reasoning: JsonObject = {"type": "reasoning", "id": "item_ab12", "summary": []}
+    own_reasoning: JsonObject = {"type": "reasoning", "id": "rs_1", "summary": []}
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(role="assistant", provider_native_item=foreign_reasoning),
+            GatewayMessage(role="assistant", provider_native_item=foreign_message),
+            GatewayMessage(role="assistant", provider_native_item=foreign_call),
+            GatewayMessage(role="assistant", provider_native_item=own_reasoning),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.6-sol", request, supports_temperature=False)
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert foreign_reasoning not in items
+    assert {key: value for key, value in foreign_message.items() if key != "id"} in items
+    assert {key: value for key, value in foreign_call.items() if key != "id"} in items
+    assert own_reasoning in items
+    assert all("item_" not in str(item.get("id", "")) for item in items if isinstance(item, dict))
+
+
+def _agent_loop(*, reasoning: tuple[str | None, ...]) -> GatewayRequest:
+    """One tools request whose history holds two assistant tool-call turns and a final text turn.
+
+    ``reasoning`` gives the ``reasoning_content`` each assistant turn replays
+    (``None`` = the field was absent, the shape an OpenAI-compatible SDK or a
+    history started on another provider produces).
+    """
+    turns: tuple[tuple[str | None, tuple[str, JsonObject] | None], ...] = (
+        ("", ("call-1", {"path": "a.txt"})),
+        (None, ("call-2", {"path": "b.txt"})),
+        ("Done reading.", None),
+    )
+    messages: list[GatewayMessage] = [GatewayMessage(role="user", content="read a and b")]
+    for (content, call), replayed in zip(turns, reasoning, strict=True):
+        blocks = (ExposedReasoningContentBlock(content=replayed),) if replayed is not None else ()
+        if call is None:
+            messages.append(
+                GatewayMessage(role="assistant", content=content, provider_reasoning=blocks)
+            )
+            continue
+        call_id, arguments = call
+        messages.append(
+            GatewayMessage(
+                role="assistant",
+                content=content or None,
+                tool_calls=(ToolCall(call_id=call_id, name="read_file", arguments=arguments),),
+                provider_reasoning=blocks,
+            )
+        )
+        messages.append(GatewayMessage(role="tool", content="ok", tool_call_id=call_id))
+    messages.append(GatewayMessage(role="user", content="now summarize"))
+    return GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=tuple(messages),
+        tools=(
+            GatewayToolDefinition(
+                name="read_file",
+                description="Read one file.",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def _assistant_turns(payload: JsonObject) -> list[JsonObject]:
+    messages = cast("list[JsonObject]", payload["messages"])
+    return [message for message in messages if message["role"] == "assistant"]
+
+
+def test_deepseek_origin_backfills_empty_reasoning_on_every_assistant_turn() -> None:
+    """Every assistant message with no reasoning gets ``reasoning_content: ""``, text turns too.
+
+    DeepSeek's thinking mode 400s a tools request unless every assistant
+    message of the current turn carries the field (``The `reasoning_content`
+    in the thinking mode must be passed back to the API.``) and accepts an
+    empty string exactly like real reasoning, on exempt turns included
+    (verified live 2026-09-10). The builder does not track turn boundaries:
+    the empty string is harmless where the provider does not require it.
+    """
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash", _agent_loop(reasoning=(None, None, None)), deepseek_reasoning_history=True
+    )
+    first_call, second_call, final_text = _assistant_turns(payload)
+    assert first_call["tool_calls"] and first_call["reasoning_content"] == ""
+    assert second_call["tool_calls"] and second_call["reasoning_content"] == ""
+    assert "tool_calls" not in final_text
+    assert final_text["reasoning_content"] == ""
+
+
+def test_deepseek_origin_backfills_a_text_message_before_a_tool_call_and_an_explicit_null() -> None:
+    """The residual production shape: a text-only assistant message, then a tool-call one.
+
+    0.7.61 backfilled tool-call turns alone; DeepSeek still 400'd
+    ``text-asst(no rc) + toolcall-asst(rc "") + tool`` (org cc2023new's agent
+    emits a text message and then a tool-call message in one turn). An
+    explicit ``reasoning_content: null`` on the wire decodes to no block and
+    is backfilled exactly like an absent field.
+    """
+    decoded = decode_chat(
+        {
+            "model": "deepseek-flash",
+            "messages": [
+                {"role": "user", "content": "read a.txt"},
+                {"role": "assistant", "content": "Let me read it.", "reasoning_content": None},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_foreign_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_foreign_1", "content": "hello"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read one file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        }
+    )
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash", decoded.request, deepseek_reasoning_history=True
+    )
+    text_message, tool_call_message = _assistant_turns(payload)
+    assert text_message["content"] == "Let me read it."
+    assert text_message["reasoning_content"] == ""
+    assert tool_call_message["tool_calls"] and tool_call_message["reasoning_content"] == ""
+    # Off the DeepSeek origin the same request is untouched.
+    generic = openai_compatible_stream_payload("deepseek-v4-flash", decoded.request)
+    assert all("reasoning_content" not in turn for turn in _assistant_turns(generic))
+
+
+def test_deepseek_origin_forwards_caller_reasoning_verbatim_without_the_exposure_stamp() -> None:
+    """Caller plaintext replays byte-for-byte on plain AND tool-call turns, empty included.
+
+    No ``reasoning_output_exposed`` stamp is involved: the platform's DeepSeek
+    lane is not stamped, and replay is what the provider REQUIRES, not what the
+    catalog chose to expose.
+    """
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash",
+        _agent_loop(reasoning=("", "I should read b next.", "Both files are read.")),
+        deepseek_reasoning_history=True,
+    )
+    first_call, second_call, final_text = _assistant_turns(payload)
+    assert first_call["reasoning_content"] == ""
+    assert second_call["reasoning_content"] == "I should read b next."
+    assert final_text["reasoning_content"] == "Both files are read."
+
+
+def test_deepseek_origin_backfills_a_tool_less_conversation_harmlessly() -> None:
+    """A plain conversation on the DeepSeek origin is backfilled too.
+
+    DeepSeek accepts ``reasoning_content: ""`` on a request with no tools
+    (verified live), so one rule covers every shape and the builder never has
+    to know whether a later turn will add tools.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="hi"),
+            GatewayMessage(role="assistant", content="hello"),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_compatible_stream_payload(
+        "deepseek-flash", request, deepseek_reasoning_history=True
+    )
+    (assistant,) = _assistant_turns(payload)
+    assert assistant == {"role": "assistant", "content": "hello", "reasoning_content": ""}
+
+
+def test_other_compatible_origins_keep_the_exposure_gated_behaviour() -> None:
+    """Off the DeepSeek origin nothing changes: no backfill, plaintext still exposure-gated."""
+    request = _agent_loop(reasoning=("", "I should read b next.", None))
+    stripped = openai_compatible_stream_payload("deepseek-v4-flash", request)
+    assert all("reasoning_content" not in turn for turn in _assistant_turns(stripped))
+    exposed = openai_compatible_stream_payload(
+        "hy4-preview", request, reasoning_output_exposed=True
+    )
+    first_call, second_call, final_text = _assistant_turns(exposed)
+    assert first_call["reasoning_content"] == ""
+    assert second_call["reasoning_content"] == "I should read b next."
+    assert "reasoning_content" not in final_text
+
+
+def _claude_code_shape() -> GatewayRequest:
+    """Claude Code's live shape: leading system, user turn, trailing system reminder, tools."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="You are Claude Code."),
+            GatewayMessage(role="user", content="Diagnose the regression."),
+            GatewayMessage(role="system", content="# Environment\nPlatform: linux"),
+        ),
+        tools=(
+            GatewayToolDefinition(
+                name="Read", description="Read a file.", parameters={"type": "object"}
+            ),
+        ),
+        reasoning_effort="high",
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_deepseek_rungs_fold_a_trailing_system_turn_into_the_user_turn() -> None:
+    """DeepSeek V4 ends a tools+reasoning turn empty when the conversation ends on system."""
+    payload = openai_compatible_stream_payload(
+        "deepseek/deepseek-v4-flash",
+        _claude_code_shape(),
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert messages[1]["content"] == "Diagnose the regression.\n\n# Environment\nPlatform: linux"
+
+
+def test_deepseek_origin_folds_too_and_other_rungs_keep_the_trailing_system_turn() -> None:
+    folded = openai_compatible_stream_payload(
+        "deepseek-chat", _claude_code_shape(), deepseek_reasoning_history=True
+    )
+    assert [m["role"] for m in cast(list[JsonObject], folded["messages"])] == ["system", "user"]
+    kept = openai_compatible_stream_payload("tencent/hy4-preview", _claude_code_shape())
+    assert [m["role"] for m in cast(list[JsonObject], kept["messages"])] == [
+        "system",
+        "user",
+        "system",
+    ]
+
+
+def _claude_code_tool_loop_shape() -> GatewayRequest:
+    """Claude Code one tool loop later: Environment prompt mid-turn, reminder after the result."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="system", content="You are Claude Code."),
+            GatewayMessage(role="user", content="Diagnose the regression."),
+            GatewayMessage(role="system", content="# Environment\nPlatform: linux"),
+            GatewayMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(ToolCall(call_id="call-1", name="Read", arguments={"path": "a"}),),
+            ),
+            GatewayMessage(role="tool", content="ok", tool_call_id="call-1"),
+            GatewayMessage(role="system", content="<total_tokens>1</total_tokens>"),
+        ),
+        tools=(
+            GatewayToolDefinition(
+                name="Read", description="Read a file.", parameters={"type": "object"}
+            ),
+        ),
+        stream=True,
+        include_usage=True,
+    )
+
+
+def test_leading_only_rungs_fold_every_instruction_turn_past_the_first() -> None:
+    """The Qwen3.6+ template 400s any non-first system turn; a declared rung sees none.
+
+    The Environment prompt joins the preceding user turn and the post-tool
+    reminder is re-roled as a user turn in place (the template accepts
+    consecutive user turns), so the provider reads every instruction where the
+    caller put it. The buffered and streaming builders share the rule.
+    """
+    payload = openai_compatible_stream_payload(
+        "qwen3.8-27b", _claude_code_tool_loop_shape(), system_messages_leading_only=True
+    )
+    messages = cast(list[JsonObject], payload["messages"])
+    assert [message["role"] for message in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert messages[0]["content"] == "You are Claude Code."
+    assert messages[1]["content"] == "Diagnose the regression.\n\n# Environment\nPlatform: linux"
+    assert messages[4]["content"] == "<total_tokens>1</total_tokens>"
+
+
+def test_undeclared_rungs_keep_their_mid_conversation_system_turns() -> None:
+    """Without the declaration no message is rewritten, on any origin."""
+    payload = openai_compatible_stream_payload("qwen3.8-27b", _claude_code_tool_loop_shape())
+    roles = [m["role"] for m in cast(list[JsonObject], payload["messages"])]
+    assert roles == ["system", "user", "system", "assistant", "tool", "system"]
+
+
+def test_responses_wire_emits_instruction_only_requests_as_input_items() -> None:
+    """A request that is only instructions still sends a non-empty ``input``.
+
+    The provider refuses an empty ``input`` ("One of 'input' or
+    'previous_response_id' ... must be provided") but serves the same
+    instructions as input items (probed live 2026-09-15, api.openai.com);
+    845 Responses attempts for one organization were billed as provider
+    rejections in three days for exactly this shape.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are terse."),
+            GatewayMessage(role="developer", content="Answer in French."),
+        ),
+        stream=True,
+    )
+    payload = openai_responses_stream_payload("gpt-5.4", request, supports_temperature=True)
+    assert payload["input"] == [
+        {"role": "system", "content": "You are terse."},
+        {"role": "developer", "content": "Answer in French."},
+    ]
+    assert "instructions" not in payload
+    # With a conversation present, leading instructions keep riding the field.
+    conversational = openai_responses_stream_payload(
+        "gpt-5.4", _developer_conversation(), supports_temperature=True
+    )
+    assert conversational["instructions"] == "Follow policy."
+
+
+def test_replayed_message_strips_only_output_text_probabilities() -> None:
+    """Strip model probability metadata while retaining opaque customer tool fields."""
+    item: JsonObject = {
+        "type": "message",
+        "id": "msg_1",
+        "content": [
+            {"type": "output_text", "text": "ok", "logprobs": []},
+            {"type": "tool_result", "logprobs": {"customer": "keep"}},
+        ],
+    }
+    replayed = _replayable_native_item(item)
+    assert replayed is not None
+    content = replayed.get("content")
+    assert isinstance(content, list)
+    first, second = content
+    assert isinstance(first, dict) and "logprobs" not in first
+    assert isinstance(second, dict)
+    assert second.get("logprobs") == {"customer": "keep"}
+
+
+def test_replayed_reasoning_loses_only_its_output_status() -> None:
+    """A replayed reasoning item keeps its id and content but not ``status``.
+
+    Production 2026-10-09 (gpt-5.6-sol): a store=false web search turn's
+    reasoning item came back with ``status: "completed"`` and no encrypted
+    content; replaying the output verbatim was refused 400 "Unknown parameter:
+    'input[1].status'". OpenAI serves the same item without the status (probed
+    live), so only that key is removed.
+    """
+    replayed = _replayable_native_item(
+        {"type": "reasoning", "id": "rs_1", "summary": [], "status": "completed"}
+    )
+    assert replayed == {"type": "reasoning", "id": "rs_1", "summary": []}
+    encrypted = _replayable_native_item(
+        {"type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "blob=="}
+    )
+    assert encrypted == {
+        "type": "reasoning",
+        "id": "rs_2",
+        "summary": [],
+        "encrypted_content": "blob==",
+    }
+
+
+def _reasoning_request(**overrides: object) -> GatewayRequest:
+    """Build one streaming Responses request for reasoning-summary checks."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        stream=True,
+        include_usage=True,
+    )
+    return request.model_copy(update=dict(overrides))
+
+
+def test_a_caller_summary_wins_over_the_auto_default() -> None:
+    """The caller's ``detailed`` selector forwards instead of the ``auto`` default."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high", reasoning_summary="detailed"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+
+def test_a_reasoning_route_with_no_effort_still_asks_for_a_summary() -> None:
+    """Readable reasoning is requested even when no effort is pinned."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"summary": "auto"}
+
+
+def test_effort_none_asks_for_no_summary() -> None:
+    """A request that turns reasoning off is never asked for a summary."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="none"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    reasoning = cast("JsonObject", payload["reasoning"])
+    assert "summary" not in reasoning
+
+
+def test_the_display_kill_switch_stops_asking_for_a_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` restores the provider's no-summary default."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"effort": "high"}
+
+
+def test_a_customer_managed_rung_is_never_asked_for_a_summary() -> None:
+    """A BYOK key may belong to an unverified organization, which 400s on summaries."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=False,
+    )
+    assert payload["reasoning"] == {"effort": "high"}
+
+
+def test_client_minted_item_ids_never_reach_the_openai_wire() -> None:
+    """A ``msg_<uuid>`` or foreign call id is dropped; OpenAI-shaped ids replay exactly.
+
+    OpenAI refused 124 requests a day with "Expected an ID that begins with
+    'msg'" for client-minted ids such as ``msg_dffbfe65-bdcc-...``.
+    """
+    decoded = decode_responses(
+        {
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "go"},
+                {
+                    "type": "message",
+                    "id": "msg_dffbfe65-bdcc-4ff9-a512-7878504afb85",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "first", "annotations": []}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-7b1e",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {
+                    "type": "message",
+                    "id": "msg_9f86d081884c7d659a2feaa0c55ad015",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "second", "annotations": []}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-6-luna", decoded.request, supports_temperature=False
+    )
+    items = cast("list[JsonObject]", payload["input"])
+    ids = [item.get("id") for item in items]
+    assert "msg_dffbfe65-bdcc-4ff9-a512-7878504afb85" not in ids
+    assert "call-7b1e" not in ids
+    assert "msg_9f86d081884c7d659a2feaa0c55ad015" in ids
+    assert {"role": "assistant", "content": "first"} in items
+    call = next(item for item in items if item.get("type") == "function_call")
+    assert call["call_id"] == "call_1"

@@ -1,11 +1,14 @@
 """End-to-end image-generation tests against the served native engine.
 
 One shared native serving subprocess (the driver from ``native_messages_test``)
-serves a seeded root with a chat alias (``coding``) and an image alias
-(``painter``) on one OpenAI-compatible loopback connection whose
-``/images/generations`` route answers base64 images with token usage. The
-tests drive ``POST /v1/images/generations`` through the real Rust data plane
-and shared python control plane with the official OpenAI client and raw HTTP.
+serves a seeded root with a chat alias (``coding``), a token-priced image
+alias (``painter``), and two per-image priced aliases (``per-image`` with a
+flat rate and an ``hd/1024x1024`` variant, ``per-image-strict`` with only the
+variant) on one OpenAI-compatible loopback connection whose
+``/images/generations`` route answers base64 images with or without token
+usage. The tests drive ``POST /v1/images/generations`` through the real Rust
+data plane and shared python control plane with the official OpenAI client and
+raw HTTP, reading the money back from the ledger.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import base64
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -28,8 +32,10 @@ from openai.types import ImagesResponse
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
+    BilledUnitKind,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
+    GatewayUnitPrices,
     ModelCapabilities,
 )
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
@@ -44,6 +50,9 @@ from exp.runtime.gateway.tests.native_messages_test import (
 pytest.importorskip("exp_gateway_native")
 
 _PIXEL = base64.b64encode(b"\x89PNG\r\n\x1a\nfake-pixels").decode()
+_IMAGE_RATE = 20_000_000  # $0.02 per image (xAI Grok Imagine).
+_HD_RATE = 80_000_000  # $0.08 per image (dall-e-3 HD 1024x1024).
+_ALIASES = ["coding", "painter", "per-image", "per-image-strict"]
 
 
 class _ImagesUpstream(BaseHTTPRequestHandler):
@@ -134,8 +143,8 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         capabilities=ModelCapabilities(supports_image_generation=True),
         gateway_capabilities=GatewayDeploymentCapabilities(),
         prices=GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=5_000_000,
-            output_micro_usd_per_million_tokens=40_000_000,
+            input_nano_usd_per_million_tokens=5_000_000,
+            output_nano_usd_per_million_tokens=40_000_000,
         ),
         pricing_source=None,
         replace=False,
@@ -149,6 +158,34 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         catalog_sha256=normalized.identity_sha256(),
     )
     manager.add_grant(identity_id="default", alias_id="painter")
+    for alias, rates in (
+        ("per-image", {"": _IMAGE_RATE, "hd/1024x1024": _HD_RATE}),
+        ("per-image-strict", {"hd/1024x1024": _HD_RATE}),
+    ):
+        normalized, snapshot, _changed = upsert_singleton_deployment(
+            root,
+            deployment_alias=alias,
+            connection_name="provider-main",
+            provider_model=f"{alias}-model",
+            exact_model_id=f"{alias}-exact",
+            revision=None,
+            capabilities=ModelCapabilities(supports_image_generation=True),
+            gateway_capabilities=GatewayDeploymentCapabilities(),
+            prices=GatewayTokenPrices(
+                units=GatewayUnitPrices(kind=BilledUnitKind.IMAGE, rates=rates)
+            ),
+            pricing_source=None,
+            replace=False,
+        )
+        manager.activate_direct_alias(
+            alias_id=alias,
+            alias_name=alias,
+            revision_id=f"revision-{alias}",
+            pool_id=alias,
+            snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+            catalog_sha256=normalized.identity_sha256(),
+        )
+        manager.add_grant(identity_id="default", alias_id=alias)
     driver = root / "native_images_driver.py"
     driver.write_text(_DRIVER_SOURCE + "\n")
     config = json.dumps({"root": str(root), "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS})
@@ -183,9 +220,10 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
                         headers={"authorization": f"Bearer {raw_key}"},
                         timeout=2.0,
                     )
-                    if models.status_code == 200 and sorted(
-                        item["id"] for item in models.json()["data"]
-                    ) == ["coding", "painter"]:
+                    if (
+                        models.status_code == 200
+                        and sorted(item["id"] for item in models.json()["data"]) == _ALIASES
+                    ):
                         break
                 except (httpx.HTTPError, ValueError, KeyError, TypeError):
                     pass
@@ -321,3 +359,59 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
     assert response.json()["error"]["code"] == "all_routes_failed"
     assert expected_fragment in response.json()["error"]["message"]
     assert _terminal_attempts(engine.base, "failed") == failed_before + 1
+
+
+def _last_attempt(engine: _ServingEngine) -> tuple[object, ...]:
+    """Read the newest attempt's state, reservation, settlement, cost, and units."""
+    with sqlite3.connect(engine.root / "gateway" / "gateway.db") as connection:
+        row = connection.execute(
+            """
+            SELECT state, budget_reserved_nano_usd, budget_settled_nano_usd,
+                   estimated_cost_nano_usd, billed_unit_kind, billed_unit_variant,
+                   billed_quantity_milli, input_tokens
+            FROM gateway_attempts ORDER BY rowid DESC LIMIT 1
+            """
+        ).fetchone()
+    return tuple(row)
+
+
+@pytest.mark.parametrize("prompt", ["unbilled", "a usage-reporting provider"])
+def test_a_per_image_lane_bills_the_images_returned(engine: _ServingEngine, prompt: str) -> None:
+    """A per-image lane settles n images at its flat rate, never the reported tokens."""
+    response = _post(engine, {"model": "per-image", "prompt": prompt, "n": 2})
+    assert response.status_code == 200, response.text
+    assert len(response.json()["data"]) == 2
+    assert ("usage" in response.json()) is (prompt != "unbilled")
+    assert _last_attempt(engine) == (
+        "completed",
+        2 * _IMAGE_RATE,
+        2 * _IMAGE_RATE,
+        2 * _IMAGE_RATE,
+        "image",
+        "",
+        2_000,
+        None,
+    )
+
+
+def test_quality_and_size_select_the_priced_variant(engine: _ServingEngine) -> None:
+    """``quality/size`` names the variant: HD 1024x1024 bills its own rate."""
+    response = _post(
+        engine,
+        {"model": "per-image", "prompt": "unbilled", "size": "1024x1024", "quality": "hd"},
+    )
+    assert response.status_code == 200, response.text
+    state, reserved, _settled, cost, kind, variant, quantity, _tokens = _last_attempt(engine)
+    assert (state, kind, variant, quantity) == ("completed", "image", "hd/1024x1024", 1_000)
+    assert reserved == cost == _HD_RATE
+
+
+def test_an_unpriced_variant_is_refused_before_dispatch(engine: _ServingEngine) -> None:
+    """A per-image card with no rate for the request's variant answers a 400 on size."""
+    with _ImagesUpstream.payloads_lock:
+        before = len(_ImagesUpstream.payloads)
+    response = _post(engine, {"model": "per-image-strict", "prompt": "unbilled"})
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "size"
+    with _ImagesUpstream.payloads_lock:
+        assert len(_ImagesUpstream.payloads) == before

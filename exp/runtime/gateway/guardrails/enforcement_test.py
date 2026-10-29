@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import threading
 import time
-from collections.abc import Coroutine
+import weakref
+from collections.abc import Coroutine, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from typing import Never
 
 import httpx
 import pytest
+from pydantic import JsonValue
 
+from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
@@ -22,9 +29,9 @@ from exp.runtime.gateway.contracts import (
     OpaqueReasoningContentBlock,
     SealedReasoningContentBlock,
 )
-from exp.runtime.gateway.guardrails.bounded import BoundedInspect
+from exp.runtime.gateway.guardrails import enforcement, observation
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect, start_on_native_loop
 from exp.runtime.gateway.guardrails.classifiers import (
-    BoundedSyncClassifier,
     ClassifierRegistry,
     ScriptedClassifier,
 )
@@ -36,14 +43,30 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
+    OutputGuardrailMode,
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
+from exp.runtime.gateway.guardrails.observation import ObservationAdmission, ObservationLease
+from exp.runtime.gateway.guardrails.regex import (
+    BuiltinPattern,
+    RegexAdapterDocument,
+    RegexClassifier,
+)
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.store_test import _authorization
+from exp.runtime.gateway.guardrails.subjects import ObservedSubjects, observation_subject_bytes
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ready_observation_scheduler() -> None:
+    """Qualify engine decisions on a running scheduler; cold admission has separate coverage."""
+    start_on_native_loop(asyncio.sleep(0)).result(timeout=2)
 
 
 class _Clock:
@@ -154,44 +177,6 @@ class _BlockingBeforeAwaitClassifier:
         return ClassifierVerdict(flagged=False)
 
 
-class _HungSyncClassifier:
-    """Leftover synchronous adapter that blocks until the test releases it."""
-
-    def __init__(self) -> None:
-        """Start with empty call counts and a closed gate."""
-        self.input_calls = 0
-        self.output_calls = 0
-        self._block = threading.Event()
-
-    def release(self) -> None:
-        """Unblock every waiting worker thread."""
-        self._block.set()
-
-    def inspect_input(
-        self,
-        *,
-        request: GatewayRequest,
-        check: GuardrailCheck,
-    ) -> ClassifierVerdict:
-        """Block the private executor thread."""
-        del request, check
-        self.input_calls += 1
-        self._block.wait(timeout=5.0)
-        return ClassifierVerdict(flagged=False)
-
-    def inspect_output(
-        self,
-        *,
-        completion: GuardrailCompletion,
-        check: GuardrailCheck,
-    ) -> ClassifierVerdict:
-        """Block the private executor thread."""
-        del completion, check
-        self.output_calls += 1
-        self._block.wait(timeout=5.0)
-        return ClassifierVerdict(flagged=False)
-
-
 def _awaited[T](coro: Coroutine[object, object, T]) -> T:
     """Run one enforcement coroutine on a private loop."""
     return asyncio.run(coro)
@@ -258,6 +243,400 @@ def _request(*contents: str) -> GatewayRequest:
     )
 
 
+class _ObservationAdmissionEngine(GuardrailEngine):
+    """Expose content-free admission records under small actual owner limits.
+
+    Attributes:
+        policy: One read-only observer with the configured complete subject limit.
+        records: Recorded check identities and outcomes, populated off the request path.
+        clock: Controllable admission deadline clock.
+    """
+
+    def __init__(self, *, max_jobs: int = 8, max_bytes: int = 65_536) -> None:
+        """Build the real engine with a prompt-free scripted inspection result."""
+        self.policy = GuardrailPolicy(
+            policy_id="observer",
+            protected=True,
+            mode="observe",
+            max_request_bytes=max_bytes,
+            checks=(_check("input"),),
+        )
+        self.records: list[tuple[str | None, GuardrailOutcome]] = []
+        self.clock = _Clock()
+        super().__init__(
+            store=MappingGuardrailStore((self.policy,)),
+            client=DirectClassifierClient(ClassifierRegistry({"scripted": ScriptedClassifier()})),
+            monotonic=self.clock,
+            max_observations=max_jobs,
+            max_observation_bytes=max_bytes,
+        )
+
+    def _record_observation(
+        self,
+        policy: GuardrailPolicy,
+        check: GuardrailCheck | None,
+        outcome: GuardrailOutcome,
+        latency_seconds: float,
+    ) -> None:
+        """Keep only immutable admission or inspection metadata for assertions."""
+        del policy, latency_seconds
+        self.records.append((None if check is None else check.check_id, outcome))
+
+    def observe(self, request: GatewayRequest, observed: ObservedSubjects) -> None:
+        """Exercise the same request-session entry point with the original deadline."""
+        self.observe_inputs(
+            policies=(self.policy,), request=request, deadline_monotonic=200, observed=observed
+        )
+
+
+def _mutable_observation_subject(field: str) -> tuple[GatewayRequest, list[JsonValue]]:
+    """Expose a caller-owned nested list within one ordinary or private subject field."""
+    request = _request("visible")
+    nested: dict[str, JsonValue] = {"items": ["original"]}
+    match field:
+        case "metadata":
+            request = request.model_copy(update={"metadata": nested})
+            items = request.metadata["items"]
+        case "provider_native_item":
+            message = request.messages[0].model_copy(update={field: nested})
+            request = request.model_copy(update={"messages": (message,)})
+            assert message.provider_native_item is not None
+            items = message.provider_native_item["items"]
+        case "tool_parameters":
+            tool = GatewayToolDefinition(name="fixture", parameters=nested)
+            request = request.model_copy(update={"tools": (tool,)})
+            items = tool.parameters["items"]
+        case "tool_input_examples":
+            tool = GatewayToolDefinition(
+                name="fixture", parameters={"type": "object"}, input_examples=(nested,)
+            )
+            request = request.model_copy(update={"tools": (tool,)})
+            assert tool.input_examples is not None
+            items = tool.input_examples[0]["items"]
+        case _:
+            raise AssertionError(f"unknown fixture field: {field}")
+    assert isinstance(items, list)
+    return request, items
+
+
+@pytest.mark.parametrize(
+    "field", ["metadata", "provider_native_item", "tool_parameters", "tool_input_examples"]
+)
+@pytest.mark.parametrize("replacement", ["modified", "x" * 100_000], ids=["same-size", "oversized"])
+def test_observation_retains_the_subject_hashed_before_caller_mutation(
+    field: str, replacement: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Queued classifiers inspect their admitted copy despite later nested caller mutations."""
+    engine = _ObservationAdmissionEngine(max_jobs=1)
+    request, caller_items = _mutable_observation_subject(field)
+    original = request.model_copy(deep=True)
+    expected = observation_subject_bytes(original)
+    observed = ObservedSubjects()
+    started = threading.Event()
+    release = threading.Event()
+    captured: list[bytes] = []
+
+    async def inspect(
+        *,
+        policy: GuardrailPolicy,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+        retention: ObservationLease | None = None,
+    ) -> GatewayRequest:
+        """Pause the real queued engine job before reading its complete input."""
+        del policy, deadline_monotonic
+        assert retention is not None
+        started.set()
+        await _wait_hold(release)
+        captured.append(observation_subject_bytes(request))
+        return request
+
+    monkeypatch.setattr(engine, "_inspect_input", inspect)
+    try:
+        engine.observe(request, observed)
+        assert started.wait(2)
+        caller_items[0] = replacement
+        assert observation_subject_bytes(request) != expected
+        assert engine._observations._bytes == len(expected)
+        engine.observe(original, observed)
+        assert len(observed.fingerprints) == 1
+        assert len(engine._observations._jobs) == 1
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+    assert captured == [expected]
+    assert not engine._observations._jobs
+    assert engine._observations._bytes == 0
+
+
+def test_observation_scheduler_failure_is_unavailable_and_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable loop is distinct from a skip and cannot consume the next subject slot."""
+    engine = _ObservationAdmissionEngine(max_jobs=1)
+    original = observation.try_start_on_native_loop
+    attempts: list[bool] = []
+
+    def fail(_coroutine: Coroutine[object, object, None]) -> Never:
+        """Fail before the native callback loop can own the observation coroutine."""
+        attempts.append(True)
+        raise RuntimeError("synthetic scheduler startup failure")
+
+    monkeypatch.setattr(observation, "try_start_on_native_loop", fail)
+    try:
+        engine.observe(_request("first"), ObservedSubjects())
+        assert attempts == [True]
+        assert engine.input_invocations == 0
+        assert not engine._observations._jobs
+        assert engine._observations._bytes == 0
+        assert engine._observations._idle.is_set()
+        monkeypatch.setattr(observation, "try_start_on_native_loop", original)
+        engine.observe(_request("second"), ObservedSubjects())
+    finally:
+        engine.close(timeout_seconds=2)
+    assert engine.records == [
+        (None, GuardrailOutcome.UNAVAILABLE),
+        ("input", GuardrailOutcome.ALLOW),
+    ]
+
+
+@pytest.mark.parametrize("unavailable", ["jobs", "bytes", "closed", "deadline"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_new_observation_rejects_before_serialization_when_admission_is_unavailable(
+    unavailable: str, oversized: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full, closed and expired sessions cannot allocate another near-cap encoded subject."""
+    engine = _ObservationAdmissionEngine(max_jobs=1 if unavailable == "jobs" else 8)
+    release = threading.Event()
+    started = threading.Event()
+    observed = ObservedSubjects()
+    size = engine._observations.max_subject_bytes
+    content_bytes = size - len(observation_subject_bytes(_request(""))) - 16
+    request = _request("x" * (size * 2 if oversized else content_bytes))
+
+    async def hold(_lease: ObservationLease) -> None:
+        """Retain an existing subject while concurrent requests test unavailable capacity."""
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.001)
+
+    def forbidden(_request: GatewayRequest) -> bytes:
+        """Fail if rejection performs any complete subject encoding."""
+        pytest.fail("unavailable admission serialized an input subject")
+
+    def forbidden_bound(_request: GatewayRequest, _limit: int) -> bool:
+        """Admission rejection has priority over an unknown oversized classification."""
+        pytest.fail("unavailable admission projected an input subject")
+
+    if unavailable in {"jobs", "bytes"}:
+        assert (
+            engine._observations.submit(
+                hold,
+                subject_bytes=size if unavailable == "bytes" else 1,
+                on_interrupted=lambda _: None,
+            )
+            is ObservationAdmission.ACCEPTED
+        )
+        assert started.wait(2)
+    elif unavailable == "closed":
+        engine._observations.close(timeout_seconds=0)
+    else:
+        engine.clock.now = 201
+    monkeypatch.setattr(enforcement, "observation_subject_bytes", forbidden)
+    monkeypatch.setattr(enforcement, "observation_subject_exceeds", forbidden_bound)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            futures = [workers.submit(engine.observe, request, observed) for _ in range(4)]
+            for future in futures:
+                future.result(timeout=2)
+        engine.observe(request.model_copy(deep=True), observed)
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+    assert observed.closed_reason == "preparation_unavailable"
+    assert observed.fingerprints == set()
+    assert engine.records == [(None, GuardrailOutcome.SKIPPED)]
+
+
+@pytest.mark.parametrize("same_session", [False, True])
+def test_concurrent_preparation_has_one_near_cap_encoder_and_no_waiting_requests(
+    same_session: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contending sessions return without serializing and record coverage once each."""
+    engine = _ObservationAdmissionEngine()
+    original = enforcement.observation_subject_bytes
+    release = threading.Event()
+    started = threading.Event()
+    prepared: list[int] = []
+    size = engine._observations.max_subject_bytes
+    request = _request("x" * (size - len(original(_request(""))) - 16))
+
+    def blocked(payload: GatewayRequest) -> bytes:
+        """Hold one real encoded allocation while other request threads enter the engine."""
+        subject = original(payload)
+        prepared.append(len(subject))
+        if len(prepared) == 1:
+            started.set()
+            assert release.wait(3)
+        return subject
+
+    monkeypatch.setattr(enforcement, "observation_subject_bytes", blocked)
+    first_state = ObservedSubjects()
+    with ThreadPoolExecutor(max_workers=5) as workers:
+        first = workers.submit(engine.observe, request, first_state)
+        try:
+            assert started.wait(2)
+            rejected = [first_state if same_session else ObservedSubjects() for _ in range(4)]
+            futures = [workers.submit(engine.observe, request, state) for state in rejected]
+            for future in futures:
+                future.result(timeout=1)
+            assert prepared == [size - 16]
+            assert engine._observations._preparing
+            assert all(state.closed_reason == "preparation_unavailable" for state in rejected)
+            for state in rejected:
+                engine.observe(request.model_copy(deep=True), state)
+        finally:
+            release.set()
+            first.result(timeout=2)
+            engine.close(timeout_seconds=2)
+    assert engine.records.count((None, GuardrailOutcome.SKIPPED)) == (1 if same_session else 4)
+    assert engine.records.count(("input", GuardrailOutcome.ALLOW)) == 1
+
+
+def test_known_subject_deduplicates_after_deadline_with_a_free_preparation_permit() -> None:
+    """An exact private-context deep copy does not acquire a second expired outcome."""
+    engine = _ObservationAdmissionEngine()
+    request = _request("original").model_copy(update={"context_management": {"private": "value"}})
+    observed = ObservedSubjects()
+    try:
+        engine.observe(request, observed)
+        assert engine._observations._idle.wait(2)
+        engine.clock.now = 201
+        engine.observe(request.model_copy(deep=True), observed)
+    finally:
+        engine.close(timeout_seconds=2)
+    assert engine.records == [("input", GuardrailOutcome.ALLOW)]
+    assert not observed.closed
+
+
+def test_contended_known_subject_reports_terminal_admission_not_a_distinct_verdict() -> None:
+    """An unavailable preparation cannot identify an equal copy, so coverage ends once."""
+    engine = _ObservationAdmissionEngine()
+    request = _request("original")
+    observed = ObservedSubjects()
+    try:
+        engine.observe(request, observed)
+        assert engine._observations._idle.wait(2)
+        with engine._observations.preparation() as admitted:
+            assert admitted
+            engine.observe(request.model_copy(deep=True), observed)
+            engine.observe(request, observed)
+        assert observed.closed_reason == "preparation_unavailable"
+        assert len(observed.fingerprints) == 1
+    finally:
+        engine.close(timeout_seconds=2)
+    assert engine.records == [("input", GuardrailOutcome.ALLOW), (None, GuardrailOutcome.SKIPPED)]
+
+
+def test_engine_close_does_not_revoke_an_inflight_encoded_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded close leaves the actual encoder charged and rejects later preparation."""
+    engine = _ObservationAdmissionEngine()
+    original = enforcement.observation_subject_bytes
+    started = threading.Event()
+    release = threading.Event()
+    prepared: list[int] = []
+
+    def blocked(request: GatewayRequest) -> bytes:
+        """Retain a real subject allocation beyond the engine's close deadline."""
+        encoded = original(request)
+        prepared.append(len(encoded))
+        started.set()
+        assert release.wait(3)
+        return encoded
+
+    monkeypatch.setattr(enforcement, "observation_subject_bytes", blocked)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(engine.observe, _request("original"), ObservedSubjects())
+        try:
+            assert started.wait(2)
+            before = time.monotonic()
+            engine.close(timeout_seconds=0.02)
+            assert time.monotonic() - before < 0.5
+            assert engine._observations._preparing
+            assert not engine._observations._idle.is_set()
+            engine.observe(_request("new context"), ObservedSubjects())
+            assert len(prepared) == 1
+        finally:
+            release.set()
+            pending.result(timeout=2)
+            engine.close(timeout_seconds=2)
+    assert not engine._observations._preparing
+    assert engine._observations._idle.is_set()
+    assert not engine._observations._jobs
+    assert engine.records == []
+    assert engine.observation_recording_dropped == 2
+
+
+@pytest.mark.parametrize("stage", ["bound", "snapshot", "encode", "hash"])
+def test_failed_preparation_drops_temporary_traceback_before_releasing_the_permit(
+    stage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Projection and hashing failures cannot leak a transient allocation past admission."""
+
+    class Temporary:
+        """Represent a private allocation retained only by a failing preparation frame."""
+
+    engine = _ObservationAdmissionEngine()
+    original = engine._observations.preparation
+    retained: list[weakref.ReferenceType[Temporary]] = []
+
+    def fail(_payload: GatewayRequest | bytes) -> Never:
+        """Raise with an observable transient object in the traceback's local frame."""
+        temporary = Temporary()
+        retained.append(weakref.ref(temporary))
+        raise ValueError("synthetic preparation failure")
+
+    def fail_bound(payload: GatewayRequest, _limit: int) -> Never:
+        """Fail the allocation-free projection before canonical encoding can begin."""
+        fail(payload)
+
+    def fail_snapshot(payload: GatewayRequest, *, deep: bool) -> Never:
+        """Fail while allocating the detached nested subject."""
+        assert deep
+        fail(payload)
+
+    @contextmanager
+    def checked(*, deduplicating: bool = False) -> Iterator[bool]:
+        """Verify the temporary is gone before granting any other preparation permission."""
+        with original(deduplicating=deduplicating) as admitted:
+            yield admitted
+            gc.collect()
+            assert engine._observations._preparing
+            assert retained and retained[0]() is None
+
+    monkeypatch.setattr(engine._observations, "preparation", checked)
+    if stage == "bound":
+        monkeypatch.setattr(enforcement, "observation_subject_exceeds", fail_bound)
+    elif stage == "snapshot":
+        monkeypatch.setattr(GatewayRequest, "model_copy", fail_snapshot)
+    else:
+        monkeypatch.setattr(
+            enforcement, "observation_subject_bytes" if stage == "encode" else "sha256", fail
+        )
+    observed = ObservedSubjects()
+    try:
+        engine.observe(_request("original"), observed)
+        assert not engine._observations._preparing
+        assert engine._observations._idle.is_set()
+    finally:
+        engine.close(timeout_seconds=2)
+    assert observed.closed_reason == "preparation_unavailable"
+    assert engine.records == [(None, GuardrailOutcome.UNAVAILABLE)]
+
+
 def test_input_chain_runs_once_and_can_transform_the_request() -> None:
     """A modify action replaces messages for every later consumer of the request."""
     replacement = (GatewayMessage(role="user", content="redacted"),)
@@ -267,7 +646,7 @@ def test_input_chain_runs_once_and_can_transform_the_request() -> None:
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -318,7 +697,7 @@ def test_input_modifier_rejects_carrier_removal_with_bound_tool_history() -> Non
         ),
         checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -361,7 +740,7 @@ def test_input_modifier_may_redact_after_an_exact_sealed_turn() -> None:
         ),
         checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -400,7 +779,7 @@ def test_input_modifier_may_fully_redact_carrier_bound_history() -> None:
         ),
         checks=(_check("input-modify", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -462,7 +841,7 @@ def test_input_modify_can_redact_only_history_after_authenticated_reasoning() ->
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -481,7 +860,7 @@ def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -558,7 +937,7 @@ def test_input_modify_restores_carrier_omitted_from_classifier_projection() -> N
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -613,7 +992,7 @@ def test_input_modify_restores_hidden_tool_authority_without_reasoning() -> None
         ),
         checks=(_check("input-one", action=GuardrailAction.MODIFY),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -628,7 +1007,7 @@ def test_input_block_is_terminal_and_content_free() -> None:
         classifier=ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True)),
         checks=(_check("input-one"),),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
@@ -652,7 +1031,7 @@ def test_protected_identity_fail_closes_on_adapter_error() -> None:
         checks=(_check("input-one"),),
         protected=True,
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected) as raised:
@@ -675,7 +1054,7 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
         checks=(_check("input-one"),),
         protected=False,
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     result = _awaited(
@@ -699,7 +1078,7 @@ def test_expired_deadline_fail_closes_for_protected_identities() -> None:
         protected=True,
         clock=clock,
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -726,7 +1105,7 @@ def test_output_modify_never_rewrites_tool_call_arguments() -> None:
             ),
         ),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     completion = GuardrailCompletion(
         text="call a tool",
@@ -752,7 +1131,7 @@ def test_oversized_payload_is_a_terminal_error() -> None:
         checks=(_check("input-one"),),
         max_request_bytes=4,
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -765,8 +1144,202 @@ def test_oversized_payload_is_a_terminal_error() -> None:
         )
 
     assert classifier.input_calls == 0
-    assert engine.policy_for("organization-one", "identity-two") is None
-    assert engine.policy_for("organization-two", "identity-one") is None
+    assert engine.policies_for(_authorization("organization-one", "identity-two")) == ()
+    assert engine.policies_for(_authorization("organization-two", "identity-one")) == ()
+
+
+class _WindowedClassifier(ScriptedClassifier):
+    """Scripted adapter that declares it sends only its own bounded request window."""
+
+    def __init__(self, digest: str = "a" * 64) -> None:
+        """Bind one configuration digest.
+
+        Args:
+            digest: Content-free digest of the adapter's verdict settings.
+        """
+        super().__init__()
+        self._digest = digest
+
+    @property
+    def configuration_digest(self) -> str:
+        """Return the bound configuration digest."""
+        return self._digest
+
+
+def test_windowed_checks_inspect_requests_beyond_the_complete_request_bound() -> None:
+    """Only adapters that receive the complete request are refused for its total size."""
+    windowed, window_adapter = _engine(
+        classifier=_WindowedClassifier(),
+        checks=(_check("classify"),),
+        protected=True,
+        max_request_bytes=4,
+    )
+    complete, complete_adapter = _engine(
+        classifier=ScriptedClassifier(),
+        checks=(_check("classify"),),
+        protected=True,
+        max_request_bytes=4,
+    )
+    request = _request("a long agent transcript")
+
+    allowed = _awaited(
+        windowed.enforce_input(
+            policy=windowed.policies_for(_authorization())[0],
+            request=request,
+            deadline_monotonic=200.0,
+        )
+    )
+    with pytest.raises(GuardrailRejected):
+        _awaited(
+            complete.enforce_input(
+                policy=complete.policies_for(_authorization())[0],
+                request=request,
+                deadline_monotonic=200.0,
+            )
+        )
+
+    assert allowed == request
+    assert window_adapter.input_calls == 1
+    assert complete_adapter.input_calls == 0
+
+
+def test_window_configuration_digests_join_the_replay_revision() -> None:
+    """Changing a windowed adapter's verdict settings changes the policy revision."""
+    revisions = {
+        _engine(classifier=classifier, checks=(_check("classify"),))[0].revision_for(
+            _authorization()
+        )
+        for classifier in (
+            _WindowedClassifier("a" * 64),
+            _WindowedClassifier("b" * 64),
+            ScriptedClassifier(),
+        )
+    }
+
+    assert len(revisions) == 3
+
+
+def test_windowed_observation_records_large_requests_instead_of_unsupported() -> None:
+    """Observe mode measures large agent requests when the check sends a bounded window."""
+    recorded = threading.Event()
+    outcomes: list[GuardrailOutcome] = []
+
+    class Recording(GuardrailEngine):
+        """Capture observation outcomes off the request path."""
+
+        def _record_observation(
+            self,
+            policy: GuardrailPolicy,
+            check: GuardrailCheck | None,
+            outcome: GuardrailOutcome,
+            latency_seconds: float,
+        ) -> None:
+            """Keep the content-free outcome for assertions."""
+            del policy, check, latency_seconds
+            outcomes.append(outcome)
+            recorded.set()
+
+    policy = GuardrailPolicy(
+        policy_id="observer",
+        protected=True,
+        mode="observe",
+        max_request_bytes=4,
+        checks=(_check("classify", timeout_ms=1000),),
+    )
+    adapter = _WindowedClassifier()
+    engine = Recording(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"scripted": adapter})),
+        monotonic=time.monotonic,
+    )
+    try:
+        engine.observe_inputs(
+            policies=(policy,),
+            request=_request("a long agent transcript"),
+            deadline_monotonic=time.monotonic() + 5,
+        )
+        assert recorded.wait(2)
+    finally:
+        engine.close(timeout_seconds=2)
+
+    assert outcomes == [GuardrailOutcome.ALLOW]
+    assert adapter.input_calls == 1
+
+
+class _ProjectingClassifier(_WindowedClassifier):
+    """Windowed adapter that reads only the last message, and records what it read."""
+
+    def __init__(self) -> None:
+        """Start with no inspected subjects."""
+        super().__init__()
+        self.projected = 0
+        self.seen: list[GatewayRequest] = []
+
+    def project_input(self, request: GatewayRequest) -> GatewayRequest:
+        """Keep only the last message."""
+        self.projected += 1
+        return GatewayRequest(surface=request.surface, messages=request.messages[-1:])
+
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Record the subject the observer handed over."""
+        self.seen.append(request)
+        return await super().inspect_input(request=request, check=check)
+
+
+def test_projected_observation_never_copies_or_encodes_the_complete_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large agent request is observed through its bounded projection only."""
+    recorded = threading.Event()
+
+    class Recording(GuardrailEngine):
+        """Signal when the observation finished."""
+
+        def _record_observation(
+            self,
+            policy: GuardrailPolicy,
+            check: GuardrailCheck | None,
+            outcome: GuardrailOutcome,
+            latency_seconds: float,
+        ) -> None:
+            """Wake the test."""
+            del policy, check, outcome, latency_seconds
+            recorded.set()
+
+    def refuse_deep_copy(self: GatewayRequest, **kwargs: object) -> GatewayRequest:
+        """The projected path must not detach the complete request."""
+        raise AssertionError("observation deep-copied the complete request")
+
+    policy = GuardrailPolicy(
+        policy_id="observer",
+        protected=True,
+        mode="observe",
+        checks=(_check("classify", timeout_ms=1000),),
+    )
+    adapter = _ProjectingClassifier()
+    # Retained capacity far below the complete request: only the projection fits.
+    engine = Recording(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"scripted": adapter})),
+        monotonic=time.monotonic,
+        max_observation_bytes=4_096,
+    )
+    request = _request(*("x" * 1_000 for _ in range(50)), "the latest turn")
+    monkeypatch.setattr(GatewayRequest, "model_copy", refuse_deep_copy)
+    try:
+        engine.observe_inputs(
+            policies=(policy,), request=request, deadline_monotonic=time.monotonic() + 5
+        )
+        assert recorded.wait(2)
+    finally:
+        engine.close(timeout_seconds=2)
+
+    assert adapter.projected == 1
+    assert [message.content for item in adapter.seen for message in item.messages] == [
+        "the latest turn"
+    ]
 
 
 def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None:
@@ -792,7 +1365,7 @@ def test_oversized_tool_schema_is_rejected_without_calling_the_adapter() -> None
         checks=(_check("input-one"),),
         max_request_bytes=subject_bytes - 1,
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     with pytest.raises(GuardrailRejected):
@@ -816,7 +1389,7 @@ def test_blocking_classifier_times_out_without_waiting_for_return() -> None:
         protected=True,
         clock=_Clock(),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     started = time.monotonic()
@@ -846,7 +1419,7 @@ def test_blocking_classifier_leaves_the_event_loop_free() -> None:
             protected=True,
             clock=_Clock(),
         )
-        policy = engine.policy_for("organization-one", "identity-one")
+        policy = engine.policies_for(_authorization())[0]
         assert policy is not None
         progressed = False
 
@@ -878,7 +1451,7 @@ def test_blocking_before_await_classifier_times_out_without_freezing_enforcement
         protected=True,
         clock=_Clock(),
     )
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
 
     try:
@@ -949,61 +1522,6 @@ def test_repeated_blocked_adapter_does_not_starve_a_healthy_adapter() -> None:
         assert healthy.input_calls == 1
         assert hung.input_calls >= 1
         assert elapsed < 0.2
-
-    asyncio.run(scenario())
-
-
-def test_hung_sync_compat_adapter_cannot_starve_healthy_async_adapters() -> None:
-    """A blocked leftover sync wrapper keeps its private workers, not async slots."""
-
-    async def scenario() -> None:
-        """Time out a hung sync wrapper, then succeed on a healthy async adapter."""
-        hung_inner = _HungSyncClassifier()
-        hung = BoundedSyncClassifier(hung_inner, max_workers=2)
-        healthy = ScriptedClassifier()
-        hung_policy = GuardrailPolicy(
-            policy_id="sync-blocked-policy",
-            organization_id="organization-one",
-            identity_id="identity-sync",
-            protected=True,
-            checks=(_check("sync-input", adapter_id="sync-blocked", timeout_ms=40),),
-        )
-        healthy_policy = GuardrailPolicy(
-            policy_id="async-healthy-policy",
-            organization_id="organization-one",
-            identity_id="identity-async",
-            checks=(_check("async-input", adapter_id="async-healthy", timeout_ms=200),),
-        )
-        engine = GuardrailEngine(
-            store=MappingGuardrailStore((hung_policy, healthy_policy)),
-            client=DirectClassifierClient(
-                ClassifierRegistry({"sync-blocked": hung, "async-healthy": healthy})
-            ),
-            monotonic=time.monotonic,
-            inspects=BoundedInspect(max_inflight=2),
-        )
-        try:
-            for _ in range(4):
-                with pytest.raises(GuardrailRejected):
-                    await engine.enforce_input(
-                        policy=hung_policy,
-                        request=_request("hello"),
-                        deadline_monotonic=time.monotonic() + 30,
-                    )
-
-            started = time.monotonic()
-            result = await engine.enforce_input(
-                policy=healthy_policy,
-                request=_request("hello"),
-                deadline_monotonic=time.monotonic() + 30,
-            )
-            elapsed = time.monotonic() - started
-
-            assert result.messages[0].content == "hello"
-            assert healthy.input_calls == 1
-            assert elapsed < 0.2
-        finally:
-            hung_inner.release()
 
     asyncio.run(scenario())
 
@@ -1124,3 +1642,303 @@ def test_cancel_swallowing_adapter_fail_closes_without_starving_others() -> None
             assert inspects.detached_inspect_count() == 0
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("limit_offset", [-1, 0])
+def test_signed_tool_ids_count_toward_output_subject_limit(limit_offset: int) -> None:
+    """The complete serialized subject is bounded before classifier dispatch."""
+    completion = GuardrailCompletion(
+        tool_calls=(
+            GuardrailToolCall(
+                call_id="toolu~sig1:" + "é" * 1_000,
+                name="terminal",
+                arguments="{}",
+            ),
+        ),
+    )
+    subject_bytes = len(canonical_json_bytes(completion))
+    engine, classifier = _engine(
+        classifier=ScriptedClassifier(),
+        checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
+        max_response_bytes=subject_bytes + limit_offset,
+    )
+    policy = engine.policies_for(_authorization())[0]
+    assert policy is not None
+    if limit_offset < 0:
+        with pytest.raises(GuardrailRejected):
+            _awaited(
+                engine.enforce_output(
+                    policy=policy,
+                    completion=completion,
+                    deadline_monotonic=200.0,
+                )
+            )
+        assert classifier.output_calls == 0
+    else:
+        _awaited(
+            engine.enforce_output(
+                policy=policy,
+                completion=completion,
+                deadline_monotonic=200.0,
+            )
+        )
+        assert classifier.output_calls == 1
+
+
+def _regex_engine(
+    *,
+    action: GuardrailAction = GuardrailAction.MODIFY,
+    extra: tuple[GuardrailCheck, ...] = (),
+    max_response_bytes: int = 1_048_576,
+) -> tuple[GuardrailEngine, GuardrailPolicy]:
+    """Compose one engine whose output chain uses the deterministic detector.
+
+    Args:
+        action: Action of the deterministic output check.
+        extra: Additional output checks appended to the chain.
+        max_response_bytes: Completion bound for the identity.
+
+    Returns:
+        The engine and its resolved policy.
+    """
+    detector = RegexClassifier(
+        RegexAdapterDocument(adapter_id="scripted", builtin_patterns=(BuiltinPattern.EMAIL,))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(
+            _check("output-one", stage=GuardrailCheckStage.OUTPUT, action=action),
+            *extra,
+        ),
+        max_response_bytes=max_response_bytes,
+    )
+    policy = engine.policies_for(_authorization())[0]
+    assert policy is not None
+    return engine, policy
+
+
+def test_deterministic_modify_chain_streams() -> None:
+    """One deterministic modify check on a plain stream releases incrementally."""
+    engine, policy = _regex_engine()
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.STREAM
+    )
+
+
+def test_an_authored_regex_chain_keeps_the_buffered_path() -> None:
+    """An expression of unknown span offers no redactor, so the stream buffers."""
+    detector = RegexClassifier(
+        RegexAdapterDocument(adapter_id="scripted", patterns=(r"SECRET-[0-9]+",))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
+    )
+    policy = engine.policies_for(_authorization())[0]
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+@pytest.mark.parametrize(
+    ("streaming", "tools_offered", "reasoning_text_requested"),
+    [(False, False, False), (True, True, False), (True, False, True)],
+)
+def test_request_shape_keeps_the_buffered_path(
+    streaming: bool,
+    tools_offered: bool,
+    reasoning_text_requested: bool,
+) -> None:
+    """Unary, tool-offering, and reasoning-text requests stay buffered."""
+    engine, policy = _regex_engine()
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=streaming,
+            tools_offered=tools_offered,
+            reasoning_text_requested=reasoning_text_requested,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_blocking_check_keeps_the_buffered_path() -> None:
+    """A check that can block cannot run after bytes are already out."""
+    engine, policy = _regex_engine(action=GuardrailAction.BLOCK)
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_nondeterministic_adapter_keeps_the_buffered_path() -> None:
+    """An adapter with no streaming redactor needs the whole completion."""
+    engine, _ = _engine(
+        classifier=ScriptedClassifier(),
+        checks=(
+            _check(
+                "output-one",
+                stage=GuardrailCheckStage.OUTPUT,
+                action=GuardrailAction.MODIFY,
+            ),
+        ),
+    )
+    policy = engine.policies_for(_authorization())[0]
+    assert policy is not None
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_second_output_check_keeps_the_buffered_path() -> None:
+    """A chain cannot compose redactions over partially released text."""
+    engine, policy = _regex_engine(
+        extra=(
+            _check(
+                "output-two",
+                stage=GuardrailCheckStage.OUTPUT,
+                action=GuardrailAction.MODIFY,
+            ),
+        )
+    )
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.BUFFER
+    )
+
+
+def test_unguarded_identity_reports_no_output_work() -> None:
+    """An identity with no output check runs neither path."""
+    engine, _ = _engine(classifier=ScriptedClassifier(), checks=(_check("input-one"),))
+    policy = engine.policies_for(_authorization())[0]
+    assert (
+        engine.output_mode(
+            policy,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.OFF
+    )
+    assert (
+        engine.output_mode(
+            None,
+            streaming=True,
+            tools_offered=False,
+            reasoning_text_requested=False,
+        )
+        is OutputGuardrailMode.OFF
+    )
+
+
+def test_released_segment_is_redacted_and_bounded() -> None:
+    """The released prefix is redacted and the unsettled tail stays buffered."""
+    engine, policy = _regex_engine()
+    segment = engine.release_output_segment(
+        policy=policy,
+        pending="write to ada@example.com " + "x" * 600 + " done",
+        final=False,
+        settled_bytes=0,
+        deadline_monotonic=1e12,
+    )
+    assert "ada@example.com" not in segment.release
+    assert segment.flagged
+    assert segment.pending
+
+
+def test_oversized_stream_fails_closed_and_releases_nothing() -> None:
+    """A completion past the identity bound is terminal, as it is when buffered."""
+    engine, policy = _regex_engine(max_response_bytes=16)
+    with pytest.raises(GuardrailRejected) as failure:
+        engine.release_output_segment(
+            policy=policy,
+            pending="x" * 64,
+            final=True,
+            settled_bytes=0,
+            deadline_monotonic=1e12,
+        )
+    assert failure.value.failure.safe_details.get("action") == GuardrailAction.ERROR.value
+
+
+class _FailingDetector(RegexClassifier):
+    """Deterministic adapter whose redactor faults instead of deciding."""
+
+    def release_boundary(self, text: str) -> int:
+        """Fail instead of naming a boundary."""
+        del text
+        raise RuntimeError("detector unavailable")
+
+    def redact(self, text: str) -> tuple[bool, str]:
+        """Fail instead of redacting."""
+        del text
+        raise RuntimeError("detector unavailable")
+
+
+def test_adapter_failure_mid_stream_fails_closed() -> None:
+    """An adapter error releases nothing, for protected and open identities alike."""
+    detector = _FailingDetector(
+        RegexAdapterDocument(adapter_id="scripted", builtin_patterns=(BuiltinPattern.EMAIL,))
+    )
+    engine, _ = _engine(
+        classifier=detector,
+        checks=(_check("output-one", stage=GuardrailCheckStage.OUTPUT),),
+    )
+    policy = engine.policies_for(_authorization())[0]
+    assert policy is not None
+    with pytest.raises(GuardrailRejected):
+        engine.release_output_segment(
+            policy=policy,
+            pending="anything",
+            final=True,
+            settled_bytes=0,
+            deadline_monotonic=1e12,
+        )
+
+
+@pytest.mark.parametrize("deadline", [0.0, 1e12])
+def test_stream_segment_never_releases_after_its_budget(deadline: float) -> None:
+    """Expired admission and an over-budget scan both release no text."""
+    engine, policy = _regex_engine()
+    ticks = iter((0.0, 10.0))
+
+    def clock() -> float:
+        """Advance past the authored check timeout during inspection."""
+        return next(ticks)
+
+    engine._monotonic = clock
+    with pytest.raises(GuardrailRejected):
+        engine.release_output_segment(
+            policy=policy,
+            pending="ada@example.com ",
+            final=True,
+            settled_bytes=0,
+            deadline_monotonic=deadline,
+        )

@@ -7,6 +7,8 @@ mode.  A concrete simulator validates the settings it consumes before it starts 
 from __future__ import annotations
 
 import math
+from functools import partial
+from operator import eq, not_
 from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
@@ -28,6 +30,11 @@ class WorldModelSettings(ContractModel):
 
     The settings retain the normal artifact envelope so a selected prompt and provider alias can
     be compared across immutable runs without introducing a second configuration file format.
+
+    Attributes:
+        maximum_transition_attempts: Positive limit on simulator responses per candidate action.
+            Defaults to one; new evaluations explicitly freeze three. Rejected replies remain
+            in simulation accounting and never consume another candidate turn.
     """
 
     world_model_alias: ArtifactId
@@ -35,6 +42,8 @@ class WorldModelSettings(ContractModel):
     prompt_version: str = Field(min_length=1, max_length=256)
     query_embedding: EmbeddingCostReservation | None = None
     maximum_output_tokens: int = Field(default=16_000, ge=256)
+    json_object_output: bool = Field(default=False, exclude_if=not_)
+    maximum_transition_attempts: int = Field(default=1, ge=1, exclude_if=partial(eq, 1))
     allow_tools: Literal[False] = False
 
 
@@ -63,7 +72,7 @@ class MixedRealitySettings(ContractModel):
 class SimulationSpec(ArtifactEnvelope):
     """One immutable sparse selection of evaluation cells and exactly one simulator mode.
 
-    Args:
+    Attributes:
         simulation_id: Stable identity for the persisted simulation specification.
         evaluation_plan_id: Immutable plan whose cells this run explicitly selects.
         cell_ids: Sorted exact simulated plan cell IDs.  The simulator never expands this set.
@@ -74,6 +83,9 @@ class SimulationSpec(ArtifactEnvelope):
         mixed_reality: Reserved settings for an intentionally unimplemented future mode.
         seed: Pinned random seed preserved in each rollout artifact.
         maximum_steps: Strict upper bound on candidate model turns per episode.
+        continuation_of: Exact parent simulation to continue, or None for a fresh run.
+        maximum_rollout_output_tokens: Positive cumulative candidate output allowance,
+            including reasoning tokens, default 1,000,000. The world model is bounded separately.
         maximum_concurrency: Maximum number of episode workers allowed at once.
         maximum_cost_usd: Optional run-wide provider spend ceiling in US dollars.
         stop_on_overspend: When true, reconciled spend reaching ``maximum_cost_usd`` blocks
@@ -90,6 +102,8 @@ class SimulationSpec(ArtifactEnvelope):
     mixed_reality: MixedRealitySettings | None = None
     seed: int
     maximum_steps: int = Field(ge=1)
+    continuation_of: ArtifactInput | None = None
+    maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(default=1, ge=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
     stop_on_overspend: bool = False

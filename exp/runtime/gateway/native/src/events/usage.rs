@@ -1,0 +1,677 @@
+//! Provider usage parsing shared by every dialect normalizer: bounded
+//! ledger counts, the OpenAI/Gemini/Bedrock usage mappers, and the reasoning
+//! subset-folding rules documented on `crate::events`.
+
+use serde_json::{Map, Value};
+
+use super::Usage;
+use cache_subsets::{cache_subsets, fit_cache_subsets, separate_written_reads};
+
+#[path = "usage/cache_subsets.rs"]
+mod cache_subsets;
+#[path = "usage/cache_ttl.rs"]
+mod cache_ttl;
+#[path = "usage/gemini_modalities.rs"]
+mod gemini_modalities;
+use gemini_modalities::gemini_image_candidates;
+pub use gemini_modalities::gemini_output_covering_image;
+
+impl Usage {
+    /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
+    pub(crate) fn unreported_token_details(&self) -> Vec<&'static str> {
+        [
+            ("cached_tokens", self.cached_input_tokens),
+            ("cache_write_tokens", self.cache_creation_input_tokens),
+            ("reasoning_tokens", self.reasoning_tokens),
+        ]
+        .into_iter()
+        .filter_map(|(name, count)| count.is_none().then_some(name))
+        .collect()
+    }
+
+    pub fn has_token_counts(&self) -> bool {
+        self.input_tokens.is_some() && self.output_tokens.is_some()
+    }
+
+    /// Coalesce cumulative reports from one attempt, never adding snapshots or
+    /// replacing an observed count with an absent leg. A lower stale snapshot
+    /// cannot reduce an already witnessed count; explicit zero stays known.
+    pub(crate) fn merge_observed(&mut self, newer: &Usage) {
+        let writes = self.cache_creation_input_tokens;
+        let next_writes = newer.cache_creation_input_tokens;
+        let next_hour = newer
+            .cache_creation_1h_input_tokens
+            .filter(|hour| next_writes.or(writes).is_some_and(|total| *hour <= total));
+        let next_half_day = newer.cache_creation_12h_input_tokens.filter(|half_day| {
+            next_writes
+                .or(writes)
+                .is_some_and(|total| *half_day <= total)
+        });
+        if next_writes.is_some() && next_writes > writes {
+            // Only growth invalidates the earlier allocation. An equal total
+            // with no breakdown adds no evidence, and a lower total is stale.
+            self.cache_creation_1h_input_tokens = next_hour;
+            self.cache_creation_12h_input_tokens = next_half_day;
+        } else if next_writes.is_none() || next_writes == writes {
+            self.cache_creation_1h_input_tokens =
+                self.cache_creation_1h_input_tokens.max(next_hour);
+            self.cache_creation_12h_input_tokens =
+                self.cache_creation_12h_input_tokens.max(next_half_day);
+        }
+        self.input_tokens = self.input_tokens.max(newer.input_tokens);
+        self.output_tokens = self.output_tokens.max(newer.output_tokens);
+        self.cached_input_tokens = self.cached_input_tokens.max(newer.cached_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .max(newer.cache_creation_input_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+        self.image_output_tokens = self.image_output_tokens.max(newer.image_output_tokens);
+        self.cache_writes_read_back |= newer.cache_writes_read_back;
+    }
+
+    /// The `cached_tokens` an OpenAI-shape response reports: the disjoint
+    /// read leg, plus the writes when the provider read them back in-call.
+    /// Absent stays absent; billing never reads this.
+    pub fn reported_cached_input_tokens(&self) -> Option<u64> {
+        match (self.cached_input_tokens, self.cache_creation_input_tokens) {
+            (cached, Some(written)) if self.cache_writes_read_back => {
+                Some(cached.unwrap_or(0).saturating_add(written))
+            }
+            (cached, _) => cached,
+        }
+    }
+}
+
+/// Largest count the durable ledger can persist: usage lands in signed
+/// 64-bit SQLite INTEGER columns, so anything above `i64::MAX` could never
+/// settle and is treated as a provider contract violation at the parser.
+pub const MAXIMUM_LEDGER_COUNT: u64 = i64::MAX as u64;
+
+/// Read an optional non-negative count, mirroring `require_integer`: absent
+/// or null counts as zero because providers omit zero-valued usage fields,
+/// while a present non-integer (or unpersistably large) value is a provider
+/// contract violation.
+pub fn count_or_zero(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
+            .ok_or_else(|| format!("{label} must be a non-negative integer")),
+    }
+}
+
+/// Read one count only when its key is present and non-null: an absent key
+/// yields `None` so a partial usage report never overwrites an earlier leg
+/// with an invented zero.
+pub fn count_if_present(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
+            .map(Some)
+            .ok_or_else(|| format!("{label}.{key} must be a non-negative integer")),
+    }
+}
+
+/// Read one optional token subset, mirroring `_optional_usage_detail`: an
+/// absent detail object stays unknown instead of zero.
+fn optional_usage_detail(
+    object: &Map<String, Value>,
+    detail_key: &str,
+    field_name: &str,
+    label: &str,
+) -> Result<Option<u64>, String> {
+    let details = match object.get(detail_key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| format!("{label} details must be an object"))?,
+    };
+    match details.get(field_name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
+            .map(Some)
+            .ok_or_else(|| format!("{label} must be a non-negative integer")),
+    }
+}
+
+/// Sum persistable legs into one ledger count. Individually persistable legs
+/// whose total is not are a provider contract violation, never a clamped or
+/// wrapped total.
+pub fn bounded_ledger_sum(legs: &[u64], label: &str) -> Result<u64, String> {
+    legs.iter()
+        .try_fold(0u64, |total, leg| total.checked_add(*leg))
+        .filter(|total| *total <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| format!("{label} token total overflows a persistable count"))
+}
+
+/// Accounting established by a provider total within one completion attempt.
+#[derive(Clone, Copy)]
+enum ReasoningAccounting {
+    Subset,
+    Additive,
+}
+
+/// A positive reasoning count distinguishes the two possible total shapes.
+fn openai_reasoning_accounting(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+) -> Option<ReasoningAccounting> {
+    let reasoning = reasoning_tokens.filter(|reasoning| *reasoning > 0)?;
+    let subset_total = input_tokens?.checked_add(output_tokens?)?;
+    match total_tokens? {
+        total if total == subset_total => Some(ReasoningAccounting::Subset),
+        total if Some(total) == subset_total.checked_add(reasoning) => {
+            Some(ReasoningAccounting::Additive)
+        }
+        _ => None,
+    }
+}
+
+/// Fold additive reasoning once, leaving undecided reports on the count heuristic.
+fn fold_openai_shaped_reasoning(
+    output_tokens: u64,
+    reasoning_tokens: Option<u64>,
+    accounting: Option<ReasoningAccounting>,
+    label: &str,
+) -> Result<u64, String> {
+    let Some(reasoning) = reasoning_tokens.filter(|reasoning| *reasoning > 0) else {
+        return Ok(output_tokens);
+    };
+    let additive = match accounting {
+        Some(ReasoningAccounting::Subset) => false,
+        Some(ReasoningAccounting::Additive) => true,
+        None => reasoning > output_tokens,
+    };
+    if additive {
+        bounded_ledger_sum(&[output_tokens, reasoning], label)
+    } else {
+        Ok(output_tokens)
+    }
+}
+
+/// Parse an OpenAI-shaped usage object from a terminal Responses payload: an
+/// omitted object is unknown usage, while a malformed one fails the stream.
+/// `output_tokens_details.reasoning_tokens` folds into `output_tokens` when
+/// the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
+pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
+    let value = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value,
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "OpenAI usage must be an object".to_string())?;
+    OpenAiUsageAccumulator::default()
+        .update(object, false)
+        .map(Some)
+}
+
+/// Raw per-dial counters retained before additive reasoning normalization.
+/// Sparse reports must be combined before deciding whether reasoning is extra.
+///
+/// `writes_within_reads` selects the rung's cache-write accounting. By default
+/// reads and writes are disjoint slices of input. A rung whose provider creates
+/// the cache and then reads the written tokens back in the same call (Google
+/// explicit caching relayed by OpenRouter reports `cached_tokens` and
+/// `cache_write_tokens` over the same prefix) reports writes as a subset of
+/// reads; its counts are normalized to the disjoint contract, so written
+/// tokens leave the read leg and are priced once at the cache-write rate.
+/// The provider bills both legs for those tokens, so that rung's authored
+/// cache-write rate must be its write rate plus its read rate.
+#[derive(Clone, Default)]
+pub(crate) struct OpenAiUsageAccumulator {
+    reported: Usage,
+    reasoning_accounting: Option<ReasoningAccounting>,
+    reasoning_accounting_confirmed: bool,
+    reasoning_counters_changed: bool,
+    input_tokens_changed: bool,
+    initial_total_tokens: Option<u64>,
+    writes_within_reads: bool,
+    // Sparse TTL evidence stays private until a write total can cover it.
+    pending_cache_creation_1h_input_tokens: Option<u64>,
+    // The rung asked OpenAI for 12-hour cache writes.
+    twelve_hour_writes_requested: bool,
+}
+
+impl OpenAiUsageAccumulator {
+    /// Select the rung's cache-write accounting before any usage arrives.
+    pub(crate) fn set_writes_within_reads(&mut self, writes_within_reads: bool) {
+        self.writes_within_reads = writes_within_reads;
+    }
+
+    /// Record that the rung asked for 12-hour cache writes before usage arrives.
+    pub(crate) fn set_twelve_hour_writes_requested(&mut self, requested: bool) {
+        self.twelve_hour_writes_requested = requested;
+    }
+
+    pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
+        let object = value
+            .as_object()
+            .ok_or("OpenAI-compatible usage must be an object")?;
+        self.update(object, true)
+    }
+
+    pub(crate) fn update_responses(
+        &mut self,
+        value: Option<&Value>,
+    ) -> Result<Option<Usage>, String> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => {
+                let object = value.as_object().ok_or("OpenAI usage must be an object")?;
+                self.update(object, false).map(Some)
+            }
+        }
+    }
+
+    fn update(&mut self, object: &Map<String, Value>, chat: bool) -> Result<Usage, String> {
+        let (input_key, output_key, input_details, output_details) = if chat {
+            (
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+                "completion_tokens_details",
+            )
+        } else {
+            (
+                "input_tokens",
+                "output_tokens",
+                "input_tokens_details",
+                "output_tokens_details",
+            )
+        };
+        let input_tokens = count_if_present(object, input_key, "OpenAI usage")?;
+        let output_tokens = count_if_present(object, output_key, "OpenAI usage")?;
+        let unreported = unreported_token_details(object, input_details, output_details)?;
+        let nested_reasoning = optional_usage_detail(
+            object,
+            output_details,
+            "reasoning_tokens",
+            "OpenAI reasoning_tokens",
+        )?;
+        // Azure AI Foundry's DeepSeek models report the Chat reasoning subset
+        // as a top-level count; the nested placement wins when both appear.
+        let top_level_reasoning = if chat {
+            count_if_present(object, "reasoning_tokens", "OpenAI usage")?
+        } else {
+            None
+        };
+        if unreported[3] && top_level_reasoning.is_some_and(|count| count != 0) {
+            return Err("an unreported token detail cannot contain a positive count".into());
+        }
+        let reasoning_tokens = nested_reasoning
+            .or(top_level_reasoning)
+            .filter(|_| !unreported[3]);
+        // OpenRouter reports generated-image tokens inside the completion
+        // total. A reported 0 is a real count (a text answer billed at the
+        // text rate); only an absent key leaves the subset unknown.
+        let image_output_tokens = optional_usage_detail(
+            object,
+            output_details,
+            "image_tokens",
+            "OpenAI image_tokens",
+        )?;
+        let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
+        let (cached_input_tokens, cache_creation_input_tokens) =
+            cache_subsets(object, input_details)?;
+        let cached_input_tokens = cached_input_tokens.filter(|_| !unreported[0]);
+        let cache_creation_input_tokens = cache_creation_input_tokens.filter(|_| !unreported[1]);
+        let cache_creation_1h_input_tokens = optional_usage_detail(
+            object,
+            input_details,
+            "cache_write_1h_tokens",
+            "cache_write_1h_tokens",
+        )?
+        .filter(|_| !unreported[2])
+        .max(self.pending_cache_creation_1h_input_tokens);
+        let covering_writes =
+            cache_creation_input_tokens.or(self.reported.cache_creation_input_tokens);
+        let cache_creation_12h_input_tokens = cache_ttl::resolve_twelve_hour_writes(
+            cache_ttl::twelve_hour_writes(object, input_details)?.filter(|_| !unreported[1]),
+            cache_creation_input_tokens,
+            self.twelve_hour_writes_requested,
+        );
+        if let (Some(half_day), Some(written)) = (cache_creation_12h_input_tokens, covering_writes)
+        {
+            if half_day > written {
+                return Err("12-hour cache writes exceed total cache writes".into());
+            }
+        }
+        if let (Some(hour), Some(written)) = (cache_creation_1h_input_tokens, covering_writes) {
+            if hour > written {
+                return Err("one-hour cache writes exceed total cache writes".into());
+            }
+        }
+        let mut candidate = self.clone();
+        let input_changed = self
+            .reported
+            .input_tokens
+            .zip(input_tokens)
+            .is_some_and(|(old, new)| old != new);
+        candidate.input_tokens_changed |= input_changed;
+        candidate.reasoning_counters_changed |= input_changed
+            || [
+                (self.reported.output_tokens, output_tokens),
+                (self.reported.reasoning_tokens, reasoning_tokens),
+                (self.initial_total_tokens, total_tokens),
+            ]
+            .into_iter()
+            .any(|(old, new)| old.zip(new).is_some_and(|(old, new)| old != new));
+        candidate.initial_total_tokens = (!candidate.reasoning_counters_changed)
+            .then_some(self.initial_total_tokens.or(total_tokens))
+            .flatten();
+        candidate.pending_cache_creation_1h_input_tokens = covering_writes
+            .is_none()
+            .then_some(cache_creation_1h_input_tokens)
+            .flatten();
+        candidate.reported.merge_observed(&Usage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
+            cache_creation_12h_input_tokens: covering_writes.and(cache_creation_12h_input_tokens),
+            reasoning_tokens,
+            billed_units: None,
+            cache_writes_read_back: false,
+            image_output_tokens,
+        });
+        // Initial split fragments support a provisional mode until counters
+        // change. A coherent raw output/reasoning/total sample may correct it;
+        // an established coherent mode then survives sparse and stale updates.
+        // Only an unchanged input count may be reused by a coherent sample.
+        if !candidate.reasoning_accounting_confirmed {
+            let coherent = openai_reasoning_accounting(
+                input_tokens.or_else(|| {
+                    (!candidate.input_tokens_changed)
+                        .then_some(self.reported.input_tokens)
+                        .flatten()
+                }),
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+            );
+            if coherent.is_some() {
+                candidate.reasoning_accounting = coherent;
+                candidate.reasoning_accounting_confirmed = true;
+            } else if !candidate.reasoning_counters_changed {
+                candidate.reasoning_accounting = openai_reasoning_accounting(
+                    candidate.reported.input_tokens,
+                    candidate.reported.output_tokens,
+                    candidate.reported.reasoning_tokens,
+                    candidate.initial_total_tokens,
+                );
+            }
+        }
+        let mut normalized = candidate.reported.clone();
+        if self.writes_within_reads {
+            separate_written_reads(&mut normalized)?;
+        }
+        fit_cache_subsets(&mut normalized)?;
+        normalized.output_tokens = normalized
+            .output_tokens
+            .map(|output| {
+                fold_openai_shaped_reasoning(
+                    output,
+                    normalized.reasoning_tokens,
+                    candidate.reasoning_accounting,
+                    "OpenAI output",
+                )
+            })
+            .transpose()?;
+        *self = candidate;
+        Ok(normalized)
+    }
+}
+
+/// Restore missing meter evidence without rejecting required integer wire fields.
+fn unreported_token_details(
+    object: &Map<String, Value>,
+    input_details: &str,
+    output_details: &str,
+) -> Result<[bool; 4], String> {
+    let mut unreported = [false; 4];
+    // A gateway upstream's estimated reasoning count (`reasoning_estimate`)
+    // is display only: read it as unreported, never as a billed subset.
+    if let Some(raw) = object.get(crate::reasoning_estimate::ESTIMATED_TOKEN_DETAILS) {
+        let fields = raw
+            .as_array()
+            .ok_or("estimated_token_details must be an array")?;
+        if fields
+            .iter()
+            .any(|field| field.as_str() != Some("reasoning_tokens"))
+        {
+            return Err("estimated_token_details may only name reasoning_tokens".into());
+        }
+        unreported[3] = !fields.is_empty();
+    }
+    let Some(raw) = object.get("unreported_token_details") else {
+        return Ok(unreported);
+    };
+    let fields = raw
+        .as_array()
+        .ok_or("unreported_token_details must be an array")?;
+    for field in fields {
+        let name = field
+            .as_str()
+            .ok_or("unreported_token_details entries must be strings")?;
+        let index = match name {
+            "cached_tokens" => 0,
+            "cache_write_tokens" => 1,
+            "cache_write_1h_tokens" => 2,
+            "reasoning_tokens" => 3,
+            _ => return Err("unreported_token_details contains an unknown field".into()),
+        };
+        if unreported[index] {
+            return Err("unreported_token_details contains a duplicate field".into());
+        }
+        let group = if index == 3 {
+            output_details
+        } else {
+            input_details
+        };
+        if optional_usage_detail(object, group, name, name)?.is_some_and(|value| value != 0) {
+            return Err("an unreported token detail cannot contain a positive count".into());
+        }
+        unreported[index] = true;
+    }
+    Ok(unreported)
+}
+
+/// Parse a Chat Completions usage object: a malformed object fails the stream
+/// instead of silently dropping token accounting.
+/// `completion_tokens_details.reasoning_tokens` folds into `output_tokens`
+/// when the provider's `total_tokens` shows it was reported additively.
+#[cfg(test)]
+pub fn openai_compatible_usage(value: &Value) -> Result<Usage, String> {
+    OpenAiUsageAccumulator::default().update_chat(value)
+}
+
+/// Parse a present Gemini `usageMetadata`: its non-optional proto3 int32
+/// fields have implicit presence, so omitted scalar counts mean zero.
+/// See google/ai/generativelanguage/v1beta/generative_service.proto in
+/// https://github.com/googleapis/googleapis and ProtoJSON default-value rules:
+/// https://protobuf.dev/programming-guides/json/#presence-and-default-values
+/// The dialect keeps an absent usage object unknown. This provider-specific
+/// scalar rule also covers an omitted thinking count, without asserting that
+/// any reasoning tokens were generated.
+///
+/// Google defines thinking tokens as ADDITIVE to `candidatesTokenCount`
+/// (`totalTokenCount` = prompt + candidates + thoughts, and response pricing
+/// is the sum of output and thinking tokens), so a reported
+/// `thoughtsTokenCount` is folded into `output_tokens`; `reasoning_tokens`
+/// names the subset the ledger prices at the reasoning rate.
+pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Gemini usageMetadata must be an object".to_string())?;
+    let reasoning_tokens =
+        count_or_zero(object, "thoughtsTokenCount", "Gemini thoughtsTokenCount")?;
+    let candidates_tokens = count_or_zero(
+        object,
+        "candidatesTokenCount",
+        "Gemini candidatesTokenCount",
+    )?;
+    let image_output_tokens = gemini_image_candidates(object)?;
+    let output_tokens = gemini_output_covering_image(
+        bounded_ledger_sum(&[candidates_tokens, reasoning_tokens], "Gemini output")?,
+        image_output_tokens,
+    )?;
+    Ok(Usage {
+        input_tokens: Some(count_or_zero(
+            object,
+            "promptTokenCount",
+            "Gemini promptTokenCount",
+        )?),
+        output_tokens: Some(output_tokens),
+        cached_input_tokens: Some(count_or_zero(
+            object,
+            "cachedContentTokenCount",
+            "Gemini cachedContentTokenCount",
+        )?),
+        cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
+        reasoning_tokens: Some(reasoning_tokens),
+        billed_units: None,
+        cache_writes_read_back: false,
+        image_output_tokens,
+    })
+}
+
+/// Parse Bedrock `metadata.usage`: cache read and write legs fold into total
+/// input, cached input reports the read leg, and omitted cache legs mean
+/// zero. Primary omissions stay unknown. Legs and the folded total beyond the
+/// persistable ledger range are provider contract violations and fail the
+/// stream rather than reaching settlement as a value the ledger could never
+/// write. Converse bills a reasoning model's thinking inside `outputTokens`
+/// and publishes no separate count, so `reasoning_tokens` stays unknown.
+pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
+    let usage = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Bedrock metadata.usage must be an object".to_string())?;
+    let fresh = count_if_present(usage, "inputTokens", "Bedrock usage")?;
+    let cache_read = count_or_zero(
+        usage,
+        "cacheReadInputTokens",
+        "Bedrock cacheReadInputTokens",
+    )?;
+    let cache_write = count_or_zero(
+        usage,
+        "cacheWriteInputTokens",
+        "Bedrock cacheWriteInputTokens",
+    )?;
+    let input_tokens = fresh
+        .map(|fresh| bounded_ledger_sum(&[fresh, cache_read, cache_write], "Bedrock input"))
+        .transpose()?;
+    Ok(Usage {
+        input_tokens,
+        output_tokens: count_if_present(usage, "outputTokens", "Bedrock usage")?,
+        cached_input_tokens: Some(cache_read),
+        cache_creation_input_tokens: count_if_present(
+            usage,
+            "cacheWriteInputTokens",
+            "Bedrock usage",
+        )?,
+        cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
+        cache_creation_12h_input_tokens: None,
+        reasoning_tokens: None,
+        billed_units: None,
+        cache_writes_read_back: false,
+        image_output_tokens: None,
+    })
+}
+
+/// Return the one-hour subset of Bedrock cache writes from `cacheDetails`
+/// (one `{ttl, inputTokens}` entry per TTL, `5m` or `1h`) only when the entries
+/// cover the reported write total exactly. An absent, empty, partial, or
+/// unrecognized-TTL breakdown stays unknown so the ledger prices it at the
+/// 5-minute rate; a malformed or over-total breakdown fails the stream.
+fn bedrock_cache_hour_subset(
+    usage: &Map<String, Value>,
+    total: u64,
+) -> Result<Option<u64>, String> {
+    let details = match usage.get("cacheDetails") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "Bedrock cacheDetails must be an array".to_string())?,
+    };
+    if total == 0 {
+        return Ok(None);
+    }
+    let (mut five, mut hour, mut recognized) = (0u64, 0u64, true);
+    for detail in details {
+        let detail = detail
+            .as_object()
+            .ok_or_else(|| "Bedrock cacheDetails entry must be an object".to_string())?;
+        let tokens = require_u64(detail, "inputTokens", "Bedrock cacheDetails inputTokens")?;
+        match detail.get("ttl").and_then(Value::as_str) {
+            Some("5m") => five = bounded_ledger_sum(&[five, tokens], "Bedrock cacheDetails")?,
+            Some("1h") => hour = bounded_ledger_sum(&[hour, tokens], "Bedrock cacheDetails")?,
+            _ => recognized = false,
+        }
+    }
+    let covered = bounded_ledger_sum(&[five, hour], "Bedrock cacheDetails")?;
+    if covered > total {
+        return Err("Bedrock cacheDetails TTL counts exceed cacheWriteInputTokens".to_string());
+    }
+    Ok((recognized && covered == total).then_some(hour))
+}
+
+/// Fetch a required string field from a provider JSON object.
+pub fn require_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{label} must be text"))
+}
+
+/// Fetch a required provider identity with the public contract's character bound.
+pub fn require_bounded_string(
+    object: &Map<String, Value>,
+    key: &str,
+    label: &str,
+    maximum_chars: usize,
+) -> Result<String, String> {
+    let value = require_string(object, key, label)?;
+    let length = value.chars().count();
+    if length == 0 || length > maximum_chars {
+        return Err(format!(
+            "{label} must contain between 1 and {maximum_chars} characters"
+        ));
+    }
+    Ok(value)
+}
+
+/// Fetch a required non-negative integer field from a provider JSON object,
+/// bounded like every parsed count so no downstream consumer can receive a
+/// value outside the persistable signed 64-bit range.
+pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Result<u64, String> {
+    object
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|count| *count <= MAXIMUM_LEDGER_COUNT)
+        .ok_or_else(|| format!("{label} must be a non-negative integer"))
+}
+
+#[cfg(test)]
+#[path = "usage/sparse_tests.rs"]
+mod sparse_tests;

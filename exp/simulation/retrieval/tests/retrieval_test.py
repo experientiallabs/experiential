@@ -14,6 +14,7 @@ import pytest
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
+    JsonValue,
     SourceIdentity,
     canonical_json_bytes,
     sha256_json,
@@ -34,8 +35,9 @@ from exp.common.project import (
     ProjectPaths,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
-from exp.simulation.ingest import (
+from exp.common.traces.ingest import (
     TraceNormalizationResult,
     persist_trace_dataset,
 )
@@ -49,7 +51,9 @@ from exp.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
-from exp.simulation.retrieval.transitions import render_rag_key
+from exp.simulation.retrieval.embedding import RAGEmbeddingCache
+from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
+from exp.simulation.retrieval.transitions import extract_fit_transitions, render_rag_key
 
 _CREATED_AT = datetime(2026, 8, 13, tzinfo=UTC)
 SourceKind = Literal["file", "otlp", "production", "simulation", "manual", "generated"]
@@ -183,6 +187,54 @@ def test_held_out_only_index_is_not_a_supported_fit_evidence_artifact(tmp_path: 
         )
 
 
+def test_shared_embedding_cache_preserves_fit_exclusions_and_complete_tool_results(
+    tmp_path: Path,
+) -> None:
+    """Sharing pure text vectors neither admits held-out examples nor embeds target responses."""
+    store = _store(tmp_path, "shared-cache")
+    traces = (_tool_trace(with_result=True), _tool_trace(with_result=True, index=2))
+    source_input, _ = _persist_trace_values(store, traces)
+    bindings = (
+        RAGLineageBinding(trace_id=traces[0].trace_id, lineage_id="fit", partition="fit"),
+        RAGLineageBinding(trace_id=traces[1].trace_id, lineage_id="held", partition="held_out"),
+    )
+    binding = _constant_binding()
+    cache = RAGEmbeddingCache(binding, maximum_chunk_bytes=2_048)
+    serving = persist_trace_rag(
+        store,
+        (source_input,),
+        bindings,
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        embedder=binding,
+        embedding_cache=cache,
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    vectors_before = dict(cache.vectors)
+    fit = persist_trace_rag(
+        store,
+        (source_input,),
+        bindings,
+        created_at=_CREATED_AT,
+        code_revision="revision-a",
+        embedder=binding,
+        embedding_cache=cache,
+    )
+    loaded = load_rag_index(store, fit.index.rag_id)
+
+    assert cache.vectors == vectors_before
+    assert len(serving.transitions) == 2
+    assert len(loaded.transitions) == 1
+    assert loaded.transitions[0].lineage_id == "fit"
+    assert loaded.transitions[0].observation.content == "account found"
+    assert all("account found" not in text for text in cache.vectors)
+    assert loaded.vectors == tuple(
+        vector
+        for vector in serving.vectors
+        if vector.transition_id == loaded.transitions[0].transition_id
+    )
+
+
 def test_retrieve_filters_lineage_before_stable_tie_break_and_never_mutates(
     tmp_path: Path,
 ) -> None:
@@ -261,7 +313,7 @@ def test_fit_loader_pins_manifest_embedder_price_retry_and_query_economics(
     economics = retriever.estimate_query_economics(query, reservation)
 
     assert economics.cost_usd == NumericMeasurement(
-        value=len(key.encode("utf-8")) * 3 * 2.0 / 1_000_000,
+        value=plan_rag_embedding_inputs((key,)).maximum_input_tokens * 3 * 2.0 / 1_000_000,
         provenance="estimated",
     )
     with pytest.raises(ValueError, match="manifest digest"):
@@ -409,7 +461,7 @@ def test_non_real_trace_provenance_is_forbidden(tmp_path: Path, kind: SourceKind
 
 def test_loader_fails_closed_on_payload_hash_change(tmp_path: Path) -> None:
     store, rag_id = _built_index(tmp_path, "bad-hash")
-    path = store.project_directory / "artifacts" / rag_id / "transitions.jsonl"
+    path = RawArtifact(store._paths, rag_id) / "transitions.jsonl"
     path.write_bytes(path.read_bytes() + b"\n")
 
     with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
@@ -463,7 +515,7 @@ def test_loader_fails_closed_on_vector_dimension_change(tmp_path: Path) -> None:
 
 def test_loader_fails_closed_on_nan_vector(tmp_path: Path) -> None:
     store, rag_id = _built_index(tmp_path, "bad-nan")
-    directory = store.project_directory / "artifacts" / rag_id
+    directory = RawArtifact(store._paths, rag_id)
     vector_path = directory / "vectors.jsonl"
     value = json.loads(vector_path.read_text(encoding="utf-8").splitlines()[0])
     value["values"][0] = float("nan")
@@ -638,6 +690,104 @@ def _tool_trace(*, with_result: bool, index: int = 1) -> Trace:
             semantic_convention_version="1.37.0",
         ),
     )
+
+
+@pytest.mark.parametrize("reply", ["", " \n", "  account found\n", None, False, 0])
+def test_tool_transition_preserves_every_recorded_reply(reply: JsonValue) -> None:
+    """Empty replies are observations too; text whitespace is evidence, not formatting."""
+    trace = _tool_trace(with_result=True)
+    call, result = trace.spans
+    result = result.model_copy(
+        update={"attributes": {**result.attributes, "gen_ai.tool.message": reply}}
+    )
+    trace = trace.model_copy(update={"spans": (call, result)})
+    transitions = extract_fit_transitions(
+        (trace,),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+    )
+    assert len(transitions) == 1
+    expected = reply if isinstance(reply, str) else json.dumps(reply)
+    assert transitions[0].observation.content == expected
+
+
+def test_zero_duration_tool_pair_does_not_depend_on_span_id_sort_order() -> None:
+    """A matched result at the call's end must survive span ID renumbering."""
+    trace = _tool_trace(with_result=True)
+    call, result = trace.spans
+    call = call.model_copy(update={"span_id": "z-call", "ended_at": call.started_at})
+    result = result.model_copy(update={"span_id": "a-result", "started_at": call.started_at})
+    trace = trace.model_copy(update={"spans": (call, result)})
+    transitions = extract_fit_transitions(
+        (trace,),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+    )
+    assert len(transitions) == 1
+    assert transitions[0].observation.content == "account found"
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_idless_pairing_requires_one_outstanding_call(parallel: bool) -> None:
+    """Programmatic and OTLP traces cannot bypass the vendor pairing boundary."""
+    first = _tool_trace(with_result=True, index=1)
+    second = _tool_trace(with_result=True, index=2)
+    spans = []
+    for span in (*first.spans, *second.spans):
+        attributes = {
+            key: value for key, value in span.attributes.items() if key != "gen_ai.tool.call.id"
+        }
+        if parallel:
+            start = first.spans[0].started_at
+            is_result = attributes.get("gen_ai.operation.name") == "execute_tool"
+            offset = 2 if is_result else 0
+            span = span.model_copy(
+                update={
+                    "started_at": start + timedelta(seconds=offset),
+                    "ended_at": start + timedelta(seconds=offset + 1),
+                }
+            )
+        spans.append(span.model_copy(update={"attributes": attributes}))
+    trace = first.model_copy(update={"spans": tuple(spans)})
+    bindings = (
+        RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),
+    )
+    if parallel:
+        with pytest.raises(ValueError, match="ambiguous"):
+            extract_fit_transitions((trace,), bindings)
+    else:
+        transitions = extract_fit_transitions((trace,), bindings)
+        assert len(transitions) == 2
+        assert {(row.action_span_id, row.observation_span_id) for row in transitions} == {
+            (first.spans[0].span_id, first.spans[1].span_id),
+            (second.spans[0].span_id, second.spans[1].span_id),
+        }
+
+
+def test_idless_call_does_not_steal_an_explicit_pair() -> None:
+    """A later explicit call can finish first without making the remaining result ambiguous."""
+    first = _tool_trace(with_result=True, index=1)
+    second = _tool_trace(with_result=True, index=2)
+    call, result = (
+        span.model_copy(
+            update={
+                "attributes": {
+                    k: v for k, v in span.attributes.items() if k != "gen_ai.tool.call.id"
+                }
+            }
+        )
+        for span in first.spans
+    )
+    result = result.model_copy(
+        update={"started_at": second.spans[1].ended_at, "ended_at": second.spans[1].ended_at}
+    )
+    trace = first.model_copy(update={"spans": (call, result, *second.spans)})
+    transitions = extract_fit_transitions(
+        (trace,),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+    )
+    assert {(row.action_span_id, row.observation_span_id) for row in transitions} == {
+        (call.span_id, result.span_id),
+        (second.spans[0].span_id, second.spans[1].span_id),
+    }
 
 
 def _constant_binding(

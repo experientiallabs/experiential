@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.guardrails.classification_test import _document as _decision_adapter
 from exp.runtime.gateway.guardrails.config import engine_from_document, load_guardrail_engine
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -26,6 +27,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailToolCall,
 )
 from exp.runtime.gateway.guardrails.preset import STANDARD_DEFAULT_TIMEOUT_MS, STANDARD_PRESET_STEPS
+from exp.runtime.gateway.guardrails.store_test import _authorization
 
 _BINDINGS = {
     "pii": "hosted-pii",
@@ -85,7 +87,7 @@ def test_unrelated_top_level_fields_are_accepted_by_the_loader() -> None:
     document = _standard_document()
     document["retention"] = "operator-owned"
     engine = engine_from_document(document)
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     assert policy.policy_id == "standard-member"
 
@@ -122,15 +124,15 @@ def test_document_registers_keyword_adapters_and_identity_policies() -> None:
         }
     )
 
-    assert engine.policy_for("organization-one", "identity-one") is not None
-    assert engine.policy_for("organization-one", "identity-two") is None
-    assert engine.policy_for("organization-two", "identity-one") is None
+    assert engine.policies_for(_authorization()) != ()
+    assert engine.policies_for(_authorization("organization-one", "identity-two")) == ()
+    assert engine.policies_for(_authorization("organization-two", "identity-one")) == ()
 
 
 def test_standard_preset_document_binds_hosted_adapters_in_order() -> None:
     """The standard pack expands only for the opted-in identity."""
     engine = engine_from_document(_standard_document())
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
 
     assert policy is not None
     assert policy.protected is True
@@ -138,20 +140,20 @@ def test_standard_preset_document_binds_hosted_adapters_in_order() -> None:
         step.check_id for step in STANDARD_PRESET_STEPS
     ]
     assert all(check.timeout_ms == STANDARD_DEFAULT_TIMEOUT_MS for check in policy.checks)
-    assert engine.policy_for("organization-one", "identity-two") is None
+    assert engine.policies_for(_authorization("organization-one", "identity-two")) == ()
 
 
 def test_standard_preset_never_enables_a_global_policy() -> None:
     """Other organizations and identities stay on the unguarded hot path."""
     engine = engine_from_document(_standard_document())
 
-    assert engine.policy_for("organization-two", "identity-one") is None
-    assert engine.policy_for("organization-one", "identity-two") is None
+    assert engine.policies_for(_authorization("organization-two", "identity-one")) == ()
+    assert engine.policies_for(_authorization("organization-one", "identity-two")) == ()
 
 
 def test_unknown_adapter_kind_is_rejected() -> None:
-    """Built-in kinds are keyword and http_json; other kinds are injected in code."""
-    with pytest.raises(ValueError, match="keyword or http_json"):
+    """Unknown adapter kinds cannot become silently unconfigured checks."""
+    with pytest.raises(ValueError, match="keyword, regex, http_json, or decision_model"):
         engine_from_document(
             {
                 "adapters": [{"adapter_id": "hosted", "kind": "hosted", "needles": ["x"]}],
@@ -216,9 +218,39 @@ def test_standard_preset_file_round_trip(tmp_path: Path) -> None:
 
     engine = load_guardrail_engine(tmp_path)
     assert engine is not None
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     assert len(policy.checks) == 7
+
+
+def test_standard_preset_revision_invalidates_replay_after_reload(tmp_path: Path) -> None:
+    """Changing a hosted detector rollout token invalidates its frozen replay identity."""
+    document = _standard_document()
+    policies = document["policies"]
+    assert isinstance(policies, list)
+    authored = policies[0]
+    assert isinstance(authored, dict)
+    authored["revision"] = "detector-v1"
+    path = tmp_path / "gateway"
+    path.mkdir()
+    config_path = path / "guardrails.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    original = load_guardrail_engine(tmp_path)
+    assert original is not None
+    original_policies = original.policies_for(_authorization())
+
+    authored["revision"] = "detector-v2"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    reloaded = load_guardrail_engine(tmp_path)
+    assert reloaded is not None
+    reloaded_policies = reloaded.policies_for(_authorization())
+
+    assert original_policies[0].revision == "detector-v1"
+    assert reloaded_policies[0].revision == "detector-v2"
+    assert original_policies[0].checks == reloaded_policies[0].checks
+    assert original.policy_revision(original_policies) != reloaded.policy_revision(
+        reloaded_policies
+    )
 
 
 def test_protected_standard_preset_blocks_flagged_prompt_injection() -> None:
@@ -232,7 +264,7 @@ def test_protected_standard_preset_blocks_flagged_prompt_injection() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     engine = engine_from_document(_standard_document(), http_client=client)
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -269,7 +301,7 @@ def test_output_secret_modify_blocks_tool_calls_instead_of_rewriting() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     engine = engine_from_document(_standard_document(), http_client=client)
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     completion = GuardrailCompletion(
         text="looked up a value",
@@ -292,7 +324,7 @@ def test_output_secret_modify_blocks_tool_calls_instead_of_rewriting() -> None:
 def test_standard_pii_checks_use_modify_on_input_and_output() -> None:
     """Hosted PII redaction is modify, not block, on both stages."""
     engine = engine_from_document(_standard_document())
-    policy = engine.policy_for("organization-one", "identity-one")
+    policy = engine.policies_for(_authorization())[0]
     assert policy is not None
     pii_checks = [
         check for check in policy.checks if check.capability is GuardrailCapabilityKind.PII
@@ -302,3 +334,146 @@ def test_standard_pii_checks_use_modify_on_input_and_output() -> None:
         GuardrailCheckStage.OUTPUT,
     ]
     assert all(check.action is GuardrailAction.MODIFY for check in pii_checks)
+
+
+def _mixed_regex_document() -> JsonObject:
+    """Configure independent enforcing and observing rules through the real file loader."""
+    return {
+        "adapters": [
+            {"adapter_id": mode, "kind": "regex", "patterns": [mode]}
+            for mode in ("enforce", "observe")
+        ],
+        "policies": [
+            {
+                "policy_id": mode,
+                "mode": mode,
+                "protected": True,
+                "organization_id": "organization-one" if mode == "enforce" else None,
+                "identity_id": "identity-one" if mode == "enforce" else None,
+                "checks": [
+                    {
+                        "check_id": "input",
+                        "capability": "content_safety",
+                        "stage": "input",
+                        "action": "block",
+                        "adapter_id": mode,
+                        "timeout_ms": 500,
+                    }
+                ],
+            }
+            for mode in ("enforce", "observe")
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["observer_rule", "observer_added", "enforcing_rule", "shared_rule", "unrelated_identity_rule"],
+)
+def test_replay_hashes_only_rules_referenced_by_applicable_enforcement(change: str) -> None:
+    """Observer-only and other-tenant regex edits preserve the current identity's replay."""
+    document = _mixed_regex_document()
+    adapters, policies = document["adapters"], document["policies"]
+    assert isinstance(adapters, list) and isinstance(policies, list)
+    observed_policy = policies[1]
+    assert isinstance(observed_policy, dict)
+    if change == "shared_rule":
+        checks = observed_policy["checks"]
+        assert isinstance(checks, list) and isinstance(checks[0], dict)
+        checks[0]["adapter_id"] = "enforce"
+    if change == "unrelated_identity_rule":
+        observed_policy.update(
+            {
+                "mode": "enforce",
+                "organization_id": "organization-one",
+                "identity_id": "identity-two",
+            }
+        )
+    original = engine_from_document(document)
+    original_revision = original.policy_revision(original.policies_for(_authorization()))
+    assert original_revision is not None
+    if change == "observer_added":
+        adapters.append({"adapter_id": "extra", "kind": "regex", "patterns": ["additional"]})
+        policies.append(
+            {
+                **observed_policy,
+                "policy_id": "extra",
+                "checks": [
+                    {
+                        "check_id": "input",
+                        "capability": "content_safety",
+                        "stage": "input",
+                        "action": "block",
+                        "adapter_id": "extra",
+                        "timeout_ms": 500,
+                    }
+                ],
+            }
+        )
+    else:
+        changed_adapter = adapters[0 if change in {"enforcing_rule", "shared_rule"} else 1]
+        assert isinstance(changed_adapter, dict)
+        changed_adapter["patterns"] = ["changed"]
+    reloaded = engine_from_document(document)
+    try:
+        actual = reloaded.policy_revision(reloaded.policies_for(_authorization()))
+        if change in {"enforcing_rule", "shared_rule"}:
+            assert actual != original_revision
+        else:
+            assert actual == original_revision
+    finally:
+        original.close(timeout_seconds=0)
+        reloaded.close(timeout_seconds=0)
+
+
+def _classification_document(*, stage: str = "input", action: str = "block") -> JsonObject:
+    """Return one pool-scoped global classification policy over a decision-model adapter."""
+    return {
+        "adapters": [_decision_adapter()],
+        "policies": [
+            {
+                "policy_id": "classify-requests",
+                "protected": True,
+                "input_execution": "parallel",
+                "target_pool_ids": ["pool-one"],
+                "checks": [
+                    {
+                        "check_id": "classify-input",
+                        "capability": "content_safety",
+                        "stage": stage,
+                        "action": action,
+                        "adapter_id": "request-classifier",
+                        "timeout_ms": 2000,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_decision_model_policy_applies_only_to_its_scoped_pool() -> None:
+    """A file-configured classification policy guards its pool and leaves others unguarded."""
+    engine = engine_from_document(_classification_document())
+    try:
+        assert [p.policy_id for p in engine.policies_for(_authorization())] == ["classify-requests"]
+        assert engine.policies_for(_authorization(pool_id="pool-two")) == ()
+    finally:
+        engine.close(timeout_seconds=0)
+
+
+@pytest.mark.parametrize(("stage", "action"), [("output", "block"), ("input", "modify")])
+def test_decision_model_adapters_bind_only_to_read_only_input_checks(
+    stage: str, action: str
+) -> None:
+    """Output and modify bindings fail at load instead of failing every request."""
+    with pytest.raises(ValueError, match="classify input only"):
+        engine_from_document(_classification_document(stage=stage, action=action))
+
+
+def test_malformed_decision_model_adapter_names_the_invalid_field() -> None:
+    """Load errors point at the field to fix without echoing authored values."""
+    document = _classification_document()
+    document["adapters"] = [_decision_adapter(window={"prior_messages": 9})]
+
+    with pytest.raises(ValueError, match=r"window\.prior_messages"):
+        engine_from_document(document)

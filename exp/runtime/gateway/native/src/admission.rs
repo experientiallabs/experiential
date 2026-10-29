@@ -10,16 +10,23 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::bridge::Bridge;
+use crate::dispatch_capacity::DispatchPermit;
 use crate::encode_responses::ResponsesEnvelope;
+use crate::errors::empty_completion_headers;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
 use crate::guardrails;
+use crate::guardrails::plan::OutputPlan;
 use crate::metrics::METRICS;
+use crate::reasoning_display::ReasoningOutput;
+use crate::replay_repair::replay_repair_headers;
 use crate::respond::error_response;
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
-use crate::waterfall::{DeploymentWire, RoutePolicy};
+use crate::throttle_backoff::ThrottleRedial;
+use crate::tool_search::{ToolSearchAdmission, ToolSearchRound};
+use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
+use crate::web_search::{WebSearchAdmission, WebSearchMeter};
 
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
@@ -41,25 +48,198 @@ pub(crate) struct Admission {
     pub maximum_total_attempts: u32,
     pub maximum_same_deployment_attempts: u32,
     #[serde(default)]
+    pub physical_route_cap: Option<u32>,
+    #[serde(default)]
+    pub backoff: Option<crate::request_policy::Backoff>,
+    #[serde(default)]
     pub refusal_failover: bool,
+    /// The pool's backoff-and-redial schedule for throttled rungs; absent on
+    /// pools that keep throttles failover-only, so their waterfall is
+    /// unchanged.
+    #[serde(default)]
+    pub throttle_redial: Option<ThrottleRedial>,
     /// Responses-only request-reflecting envelope fields; chat admissions
     /// omit it.
     #[serde(default)]
     pub envelope: Option<ResponsesEnvelope>,
-    /// When true, buffer the winning completion and call `enforce_output` once
-    /// before any caller byte or replay retention. Unguarded admissions omit
-    /// the flag (default false) and never invoke that callback.
+    /// How the identity's output chain must be enforced for this request.
+    /// Unguarded admissions omit the field and never call a guardrail
+    /// callback. See [`OutputGuardrailMode`].
     #[serde(default)]
-    pub output_guardrail: bool,
+    pub output_guardrail: OutputGuardrailMode,
+    /// Generation may start before input classification, but no output can be released.
+    #[serde(default)]
+    pub guardrail_input_pending: bool,
+    /// The resolved output chain when every check binds a deterministic
+    /// detector. The data plane enforces it in place, so the request pays no
+    /// python callback. A chain with any non-deterministic adapter omits the
+    /// plan and sets `output_guardrail` instead.
+    #[serde(default)]
+    pub guardrail_output_plan: Option<OutputPlan>,
+    /// The control plane's pre-dispatch count of the prompt (the reservation
+    /// estimator without its headroom). Messages admissions carry it so the
+    /// caller's `message_start` shows a real input figure when the upstream
+    /// reports nothing before its final chunk; display-only, never settled.
+    #[serde(default)]
+    pub input_token_estimate: Option<u64>,
+    /// The caller's own output cap (`max_tokens`, `max_completion_tokens`
+    /// or `max_output_tokens`, normalized by the control plane), absent when
+    /// the request is uncapped. The waterfall reads it to classify a `stop`
+    /// that carried no output and no usage report: on a capped request that
+    /// is a budget the provider's hidden reasoning exhausted (an honest
+    /// `length`), never a completed empty answer.
+    #[serde(default)]
+    pub maximum_output_tokens: Option<u64>,
+    /// The host-vouched request class (0..8, higher first) a configured
+    /// permit queue orders waiting requests by (`permit_queue`). Absent on
+    /// every request whose host sends no class.
+    #[serde(default, rename = "priority_class")]
+    pub class: Option<u8>,
+    /// The caller's stable identity (organization and identity ids), the
+    /// scope of the data plane's per-caller replay-repair memory. The
+    /// request's own bearer cannot serve: in a hosted worker it is the
+    /// front's ephemeral exchanged token, different on every request.
+    /// Absent from an older control plane, which disables that memory.
+    #[serde(default)]
+    pub caller_scope: Option<String>,
+    /// The ONE web search the control plane executed before dispatch for a
+    /// request that asked for it on a route unable to serve it natively:
+    /// the query, the billed request count, and the ranked results it
+    /// injected into the prompt. Absent when no search ran, which leaves
+    /// every response byte exactly as before.
+    #[serde(default)]
+    pub web_search: Option<WebSearchAdmission>,
+    /// The gateway-run tool search for this request: the function tool the
+    /// model was given in place of the deferred catalog, and the round
+    /// budget. Absent when the gateway runs no search (no deferred tools, or
+    /// a route that searches natively), which leaves every byte as before.
+    #[serde(default)]
+    pub tool_search: Option<ToolSearchAdmission>,
+    /// The search rounds the waterfall completed for this request, moved
+    /// here from the winning attempt (`tool_search::adopt_outcome`) so every
+    /// response surface renders them ahead of the answer. Never on the wire.
+    #[serde(skip)]
+    pub tool_search_rounds: Vec<ToolSearchRound>,
+}
+
+/// How one admission's output chain is enforced on the data plane.
+///
+/// `Buffer` collects the whole winning completion and calls `enforce_output`
+/// once before any caller byte or replay retention: the only safe shape for a
+/// check that can block or for a detector that needs the full text. `Stream`
+/// releases the completion incrementally through `enforce_output_segment`,
+/// holding back only the bounded trailing window the detector cannot yet
+/// decide about. The control plane picks the mode at admit time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputGuardrailMode {
+    #[default]
+    Off,
+    Buffer,
+    Stream,
+}
+
+impl OutputGuardrailMode {
+    /// Whether this admission runs any output guardrail work at all.
+    pub(crate) fn enforces(self) -> bool {
+        !matches!(self, Self::Off)
+    }
 }
 
 impl Admission {
+    /// Reject a control-plane mismatch before reserving or dispatching an attempt.
+    pub(crate) fn preserves_chat_probabilities(&self) -> bool {
+        self.route.iter().all(|wire| {
+            wire.upstream_payload.get("logprobs") != Some(&Value::Bool(true))
+                || (wire.dialect == "openai_compatible"
+                    && !self.output_guardrail.enforces()
+                    && wire.stop_sequences.is_empty())
+        })
+    }
+
     pub(crate) fn policy(&self) -> RoutePolicy {
         RoutePolicy {
-            maximum_total_attempts: self.maximum_total_attempts.max(1),
-            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
+            maximum_total_attempts: self.maximum_total_attempts,
+            maximum_same_deployment_attempts: self.maximum_same_deployment_attempts,
             refusal_failover: self.refusal_failover,
+            throttle_redial: self.throttle_redial,
+            physical_route_cap: self.physical_route_cap,
+            backoff: self.backoff,
         }
+    }
+
+    /// The full web-search meter (count, results returned, vendor cost) the
+    /// finalizing settlement bills; all zero when the control plane ran none.
+    pub(crate) fn web_search_meter(&self) -> WebSearchMeter {
+        self.web_search
+            .as_ref()
+            .map_or_else(WebSearchMeter::default, |web_search| WebSearchMeter {
+                requests: web_search.requests,
+                results: u32::try_from(web_search.results.len()).unwrap_or(u32::MAX),
+                cost_nano_usd: web_search.cost_nano_usd,
+            })
+    }
+
+    /// Whether the winning completion must be buffered for an output chain,
+    /// natively or across the python boundary.
+    pub(crate) fn buffers_output(&self) -> bool {
+        self.output_guardrail.enforces() || self.guardrail_output_plan.is_some()
+    }
+
+    /// Whether the rung at `depth` returns plaintext reasoning to the caller.
+    pub(crate) fn reasoning_exposed_at(&self, depth: usize) -> bool {
+        self.route
+            .get(depth)
+            .is_some_and(|wire| wire.reasoning_output_exposed)
+    }
+
+    /// Both reasoning facts of the rung at `depth`.
+    pub(crate) fn reasoning_output_at(&self, depth: usize) -> ReasoningOutput {
+        ReasoningOutput {
+            exposed: self.reasoning_exposed_at(depth),
+            displayed: self.reasoning_displayed_at(depth),
+        }
+    }
+
+    /// Whether the rung at `depth` renders its reasoning text as display copy.
+    ///
+    /// On unless the rung opts out. An output guardrail turns it off for the
+    /// whole request: guardrails judge content, not reasoning, so display copy
+    /// would carry text the chain never saw.
+    pub(crate) fn reasoning_displayed_at(&self, depth: usize) -> bool {
+        !self.output_guardrail.enforces()
+            && self.guardrail_output_plan.is_none()
+            && self
+                .route
+                .get(depth)
+                .is_some_and(|wire| !wire.reasoning_output_hidden)
+    }
+
+    /// The Responses envelope for the attempt that won at `depth`, carrying
+    /// that rung's plaintext-reasoning exposure and display.
+    pub(crate) fn responses_envelope_at(&self, depth: usize) -> ResponsesEnvelope {
+        let mut envelope = self.envelope.clone().unwrap_or_default();
+        envelope.reasoning_output_exposed = self.reasoning_exposed_at(depth);
+        envelope.reasoning_displayed = self.reasoning_displayed_at(depth);
+        envelope.reasoning_withheld = !envelope.reasoning_displayed;
+        envelope
+    }
+
+    /// Whether the attempt at `depth` may enforce its output chain as bytes
+    /// stream, instead of buffering the whole completion first.
+    ///
+    /// Admission already proved the chain is one deterministic modify-only
+    /// check over a streamed request that offers no tools and asks for no
+    /// reasoning text. The remaining fact belongs to the winning rung: a
+    /// deployment that returns plaintext reasoning to the caller keeps the
+    /// buffered path, where a rewrite still drops that channel wholesale.
+    pub(crate) fn stream_incremental(&self, depth: usize) -> bool {
+        self.output_guardrail == OutputGuardrailMode::Stream
+            && self.stream
+            && self.web_search.is_none()
+            && self.tool_search.is_none()
+            && self.tool_search_rounds.is_empty()
+            && !self.reasoning_exposed_at(depth)
     }
 
     /// The per-chunk transport bound of the deployment serving `depth`.
@@ -73,7 +253,7 @@ impl Admission {
     }
 }
 
-/// Commit-independent headers, mirroring `commit_independent_headers`,
+/// Headers every admitted response carries whatever rung serves it,
 /// including the caller's echoed request identity when one was supplied.
 pub(crate) fn commit_independent(
     admission: &Admission,
@@ -93,18 +273,22 @@ pub(crate) fn commit_independent(
     headers
 }
 
-/// Commit-dependent headers, mirroring `commit_dependent_headers`: the
+/// Headers that depend on the committed rung: the
 /// deployment identity and route depth that actually served the request.
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
-    let (provider, deployment_id) = admission
-        .route
-        .get(depth)
+    let served = admission.route.get(depth);
+    let (provider, deployment_id) = served
         .map(|wire| (wire.provider.clone(), wire.deployment_id.clone()))
         .unwrap_or_default();
-    vec![
+    let mut headers = vec![
         (
             "x-gateway-canonical-model".to_string(),
-            admission.exact_model_id.clone(),
+            admission
+                .route
+                .get(depth)
+                .filter(|wire| !wire.exact_model_id.is_empty())
+                .map(|wire| wire.exact_model_id.clone())
+                .unwrap_or_else(|| admission.exact_model_id.clone()),
         ),
         ("x-gateway-provider".to_string(), provider),
         ("x-gateway-deployment".to_string(), deployment_id),
@@ -113,7 +297,29 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
             "x-gateway-route-reason".to_string(),
             admission.route_reason.clone(),
         ),
-    ]
+    ];
+    // A rung dispatched under OpenRouter's zero-data-retention constraint
+    // says so, so the host can attest the answer as ZDR-served; absent on
+    // every ordinary rung rather than a literal `false`.
+    if served.is_some_and(|wire| wire.zdr_constrained) {
+        headers.push(("x-gateway-zdr-constrained".to_string(), "true".to_string()));
+    }
+    headers
+}
+
+/// Every header one served attempt carries: the request identity, the rung
+/// that served, and any data-plane repair of the replayed input.
+pub(crate) fn served_headers(
+    admission: &Admission,
+    client_request_id: Option<&str>,
+    served: Served,
+) -> Vec<(String, String)> {
+    let mut headers = commit_independent(admission, client_request_id);
+    headers.extend(commit_dependent(admission, served.depth));
+    headers.extend(replay_repair_headers(served.encrypted_reasoning_stripped));
+    headers.extend(empty_completion_headers(served.empty_completion));
+    headers.extend(served.rate_limit_headers);
+    headers
 }
 
 /// Build one request guard bound to this server's settlement bookkeeping.
@@ -149,6 +355,29 @@ pub(crate) async fn wire_drift_response(
     error_response(&PublicError::internal())
 }
 
+/// Take one data-plane permit before the body is read (no admission or attempt
+/// guard exists yet), under the same request deadline.
+pub(crate) async fn pre_admission_permit(
+    state: &AppState,
+    deadline: Instant,
+) -> Result<DispatchPermit, PublicError> {
+    let acquire = state.dispatch_capacity.acquire(
+        state.bridge.execution.as_ref(),
+        &state.permits,
+        &state.permit_queue,
+        None,
+    );
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(Failure::new(
+            FailureClass::Timeout,
+            "gateway execution queue deadline exceeded",
+        )
+        .public_error()),
+    }
+}
+
 /// Wait for one bounded active-dispatch permit after admission, like the
 /// python executor: protocol and authority errors answer immediately even at
 /// capacity, and a queue-deadline expiry terminalizes the accepted request.
@@ -156,21 +385,29 @@ pub(crate) async fn acquire_permit(
     state: &AppState,
     guard: &mut AttemptGuard,
     deadline: Instant,
-) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+    priority_class: Option<u8>,
+) -> Result<crate::dispatch_capacity::DispatchPermit, Box<Response>> {
     let permit_wait_started = Instant::now();
-    match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await {
+    let acquire = state.dispatch_capacity.acquire(
+        guard.bridge.execution.as_ref(),
+        &state.permits,
+        &state.permit_queue,
+        priority_class,
+    );
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => {
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
+            guard.hold_dispatch(permit.clone());
             Ok(permit)
         }
-        Ok(Err(_)) => {
-            guard
-                .abandon(&Failure::new(
-                    FailureClass::Cancelled,
-                    "gateway is draining and is not accepting new requests",
-                ))
-                .await;
-            Err(Box::new(error_response(&PublicError::draining())))
+        Ok(Err(error)) => {
+            let class = match error.code.as_str() {
+                "invalid_key" => FailureClass::Authentication,
+                "gateway_draining" => FailureClass::Cancelled,
+                _ => FailureClass::Internal,
+            };
+            guard.abandon(&Failure::new(class, &error.message)).await;
+            Err(Box::new(error_response(&error)))
         }
         Err(_) => {
             let failure = Failure::new(
@@ -184,13 +421,111 @@ pub(crate) async fn acquire_permit(
     }
 }
 
+/// Inspect generated search content and the winning completion as one output subject.
+///
+/// Deterministic checks use the native plan; other checks use the shared Python session.
+/// Generated metadata must remain unchanged because protocol encoders synthesize it from
+/// admission. Return only provider events after verifying the complete subject so encoders
+/// can add the approved metadata exactly once.
 pub(crate) async fn apply_output_guardrail(
+    state: &AppState,
     admission: &Admission,
-    bridge: &Bridge,
     events: Vec<Event>,
+    deadline: Instant,
+    responses: bool,
 ) -> Result<Vec<Event>, Failure> {
-    if !admission.output_guardrail {
+    if !admission.buffers_output() {
         return Ok(events);
     }
-    guardrails::enforce_collected_output(bridge, &admission.request_id, events).await
+    let mut subject = crate::waterfall::OutputGuardrailContext {
+        web_search: admission.web_search.as_ref(),
+        responses,
+    }
+    .events(&admission.request_id, &admission.tool_search_rounds);
+    let prefix_len = subject.len();
+    let prefix =
+        (prefix_len > 0).then(|| guardrails::output_argument(&admission.request_id, &subject));
+    subject.extend(events);
+    let mut inspected = if let Some(plan) = admission.guardrail_output_plan.as_ref() {
+        guardrails::plan::enforce(plan, &state.guardrail_detectors, subject, deadline)?
+    } else {
+        guardrails::enforce_collected_output(&state.bridge, &admission.request_id, subject).await?
+    };
+    if prefix.is_some_and(|expected| {
+        inspected.len() < prefix_len
+            || guardrails::output_argument(&admission.request_id, &inspected[..prefix_len])
+                != expected
+    }) {
+        return Err(Failure::new(
+            FailureClass::Guardrail,
+            "The request was blocked by a gateway guardrail.",
+        ));
+    }
+    drop(inspected.drain(..prefix_len));
+    Ok(inspected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admission(zdr_constrained: bool) -> Admission {
+        serde_json::from_value(serde_json::json!({
+            "request_id": "req",
+            "alias": "public-model",
+            "alias_revision_id": "rev",
+            "stream": true,
+            "include_usage": true,
+            "exact_model_id": "exact",
+            "route_reason": "direct",
+            "route": [{
+                "provider": "openrouter",
+                "deployment_id": "or-rung",
+                "dialect": "openai_compatible",
+                "url": "https://openrouter.ai/api/v1/chat/completions",
+                "headers": {},
+                "model_id": "anthropic/claude-opus-5",
+                "billing_customer_managed": false,
+                "timeout_seconds": 60.0,
+                "upstream_payload": {},
+                "upstream_body": null,
+                "idempotency_key": "op",
+                "zdr_constrained": zdr_constrained,
+            }],
+            "maximum_total_attempts": 1,
+            "maximum_same_deployment_attempts": 1,
+        }))
+        .expect("admission decodes")
+    }
+
+    #[test]
+    fn a_zdr_constrained_rung_names_the_constraint_on_its_served_headers() {
+        let headers = commit_dependent(&admission(true), 0);
+        assert!(headers.contains(&("x-gateway-zdr-constrained".to_string(), "true".to_string())));
+        assert!(headers.contains(&("x-gateway-deployment".to_string(), "or-rung".to_string())));
+    }
+
+    #[test]
+    fn served_headers_carry_the_relayed_rate_limits() {
+        let served = Served {
+            rate_limit_headers: vec![(
+                "x-ratelimit-remaining-tokens".to_string(),
+                "149000".to_string(),
+            )],
+            ..Served::default()
+        };
+        let headers = served_headers(&admission(false), None, served);
+        assert!(headers.contains(&(
+            "x-ratelimit-remaining-tokens".to_string(),
+            "149000".to_string()
+        )));
+    }
+
+    #[test]
+    fn an_ordinary_rung_carries_no_constraint_header_at_all() {
+        let headers = commit_dependent(&admission(false), 0);
+        assert!(headers
+            .iter()
+            .all(|(name, _)| name != "x-gateway-zdr-constrained"));
+    }
 }

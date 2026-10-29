@@ -5,18 +5,23 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from exp.common.core.artifacts import stable_id
 from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
+from exp.common.sqlite.connection import connect_database, persistent_connection
 from exp.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
-from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayUsage, ProjectTarget
+from exp.runtime.gateway.contracts import ProjectTarget
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import require_gateway_servable_provider
+from exp.runtime.gateway.model_chain_authority import (
+    refuse_local_chain_snapshot,
+    serving_snapshot_limit,
+)
 from exp.runtime.gateway.platform import (
     ActivateAliasRevisionCommand,
     AliasMutationCommand,
@@ -26,7 +31,6 @@ from exp.runtime.gateway.platform import (
     AttemptSettlementRecord,
     AttemptSettlementRequest,
     AttemptTerminalState,
-    AttemptUsageSource,
     BillingSourceUsageAttribution,
     CreateIdentityCommand,
     DisableAliasCommand,
@@ -58,18 +62,12 @@ from exp.runtime.gateway.platform import (
     VirtualKeyRecord,
 )
 from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
-from exp.runtime.gateway.sqlite.migrations import connect_database
+from exp.runtime.gateway.sqlite.alias_activation import reactivate_alias_revision
 from exp.runtime.gateway.sqlite.platform_records import (
     alias_record as _alias_record,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     key_record as _key_record,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
-    optional_datetime as _optional_datetime,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
-    optional_int as _optional_int,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     provider_binding as _provider_binding,
@@ -78,16 +76,19 @@ from exp.runtime.gateway.sqlite.platform_records import (
     require_reservation_replay as _require_reservation_replay,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
-    require_settlement_replay as _require_settlement_replay,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
     required_datetime as _datetime,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     reservation_record as _reservation_record,
 )
+from exp.runtime.gateway.sqlite.platform_records import (
+    settle_attempt_in_transaction as _settle_attempt_in_transaction,
+)
 from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+
+if TYPE_CHECKING:
+    from exp.common.models.catalog import SubscriptionKind
 
 
 class SQLiteGatewayPlatform:
@@ -102,24 +103,50 @@ class SQLiteGatewayPlatform:
         pool_revisions: ExactPoolRevisionAuthority | None = None,
         pepper_path: Path | None = None,
         busy_timeout_ms: int = 5_000,
+        serving_snapshot_max_bytes: int | None = None,
     ) -> None:
-        """Compose existing authorities, constructing defaults when omitted."""
+        """Compose authorities with one serving cap, inheriting an injected ledger's cap."""
+        self._serving_snapshot_max_bytes = serving_snapshot_limit(
+            attempts.serving_snapshot_max_bytes
+            if attempts is not None and serving_snapshot_max_bytes is None
+            else serving_snapshot_max_bytes
+        )
+        if (
+            attempts is not None
+            and attempts.serving_snapshot_max_bytes != self._serving_snapshot_max_bytes
+        ):
+            raise ValueError(
+                "SQLite platform control and ledger serving snapshot limits must match"
+            )
         if budgets is None:
             budgets = SQLiteBudgetStore(database_path, busy_timeout_ms=busy_timeout_ms)
+        self._owns_attempts = attempts is None
         if attempts is None:
-            attempts = SQLiteAttemptLedger(database_path, busy_timeout_ms=busy_timeout_ms)
+            attempts = SQLiteAttemptLedger(
+                database_path,
+                busy_timeout_ms=busy_timeout_ms,
+                serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
+            )
         self.database_path = database_path
         self._busy_timeout_ms = busy_timeout_ms
         self.control = SQLiteGatewayStore(
             database_path,
             pepper_path=pepper_path,
             busy_timeout_ms=busy_timeout_ms,
+            serving_snapshot_max_bytes=self._serving_snapshot_max_bytes,
+            classification_memo=attempts.classification_memo,
         )
         if budgets.database_path != database_path or attempts.database_path != database_path:
             raise ValueError("SQLite platform components must share one database path")
         self.budgets = budgets
         self.attempts = attempts
         self._pool_revisions = pool_revisions
+
+    def close(self) -> None:
+        """Release owned parsing resources without closing an externally supplied ledger."""
+        self.control.close()
+        if self._owns_attempts:
+            self.attempts.close()
 
     def execute(self, command: CreateIdentityCommand) -> ManagementReceipt:
         """Execute or atomically replay one identity creation command."""
@@ -227,6 +254,11 @@ class SQLiteGatewayPlatform:
                     alias_id=command.alias_id,
                 ),
             )
+        refuse_local_chain_snapshot(
+            self.database_path.parent,
+            command.snapshot_ref,
+            maximum_bytes=self._serving_snapshot_max_bytes,
+        )
         existing = self._alias_revision(
             organization_id=command.organization_id,
             revision_id=command.revision_id,
@@ -242,7 +274,9 @@ class SQLiteGatewayPlatform:
                     raise ValueError(
                         "disabled project alias revisions require a new activation revision"
                     )
-                changed = self._reactivate_alias_revision(
+                changed = reactivate_alias_revision(
+                    connect=self.control._connect,
+                    maximum_bytes=self._serving_snapshot_max_bytes,
                     organization_id=command.organization_id,
                     alias_id=command.alias_id,
                     revision_id=command.revision_id,
@@ -295,7 +329,7 @@ class SQLiteGatewayPlatform:
                 pool_id=command.scope.pool_id,
                 deployment_id=command.scope.deployment_id,
             ),
-            limit_micro_usd=command.limit_micro_usd,
+            limit_nano_usd=command.limit_nano_usd,
             replace=command.replace,
         )
         return NaturalMutationOutcome(
@@ -437,6 +471,13 @@ class SQLiteGatewayPlatform:
                         'Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"])
                     )
                 ),
+                trusted_custom_origin=bool(row["trusted_custom_origin"]),
+                # The column's CHECK admits only the plan kinds, so the value is one.
+                subscription=(
+                    None
+                    if row["subscription"] is None
+                    else cast("SubscriptionKind", str(row["subscription"]))
+                ),
                 connection_sha256=str(row["connection_sha256"]),
                 active=bool(row["active"]) and row["active_revision_id"] == row["revision_id"],
                 created_at=_datetime(row["created_at"]),
@@ -529,10 +570,10 @@ class SQLiteGatewayPlatform:
                     pool_id=item.budget.scope.pool_id,
                     deployment_id=item.budget.scope.deployment_id,
                 ),
-                limit_micro_usd=item.budget.limit_micro_usd,
-                reserved_micro_usd=item.reserved_micro_usd,
-                settled_micro_usd=item.settled_micro_usd,
-                remaining_micro_usd=item.remaining_micro_usd,
+                limit_nano_usd=item.budget.limit_nano_usd,
+                reserved_nano_usd=item.reserved_nano_usd,
+                settled_nano_usd=item.settled_nano_usd,
+                remaining_nano_usd=item.remaining_nano_usd,
                 unknown_cost_attempts=item.unknown_cost_attempts,
                 exhausted=item.exhausted,
                 created_at=item.budget.created_at,
@@ -558,7 +599,7 @@ class SQLiteGatewayPlatform:
                 deployment=request.deployment,
                 attempt_ordinal=request.attempt_ordinal,
                 route_depth=request.route_depth,
-                maximum_cost_micro_usd=request.maximum_cost_micro_usd,
+                maximum_cost_nano_usd=request.maximum_cost_nano_usd,
             )
         except sqlite3.IntegrityError:
             concurrent = self._attempt_for_reservation(request)
@@ -574,57 +615,29 @@ class SQLiteGatewayPlatform:
         self,
         request: AttemptSettlementRequest,
     ) -> AttemptSettlementRecord:
-        """Settle only an attempt proven to belong to the requested tenant."""
-        self._reservation(
-            organization_id=request.organization_id,
-            attempt_id=request.attempt_id,
-        )
-        self.attempts.finish_attempt(
-            attempt_id=request.attempt_id,
-            terminal_event=request.terminal_event,
-            failure=request.failure,
-            finalize_request=request.finalize_request,
-            first_token_at=request.first_token_at,
-        )
-        row = self._attempt_row(
-            organization_id=request.organization_id,
-            attempt_id=request.attempt_id,
-        )
-        if request.finalize_request and str(row["request_terminal_state"]) != str(row["state"]):
-            raise ValueError(
-                "attempt settlement replay cannot finalize its non-terminal parent request"
-            )
-        usage = (
-            None
-            if row["input_tokens"] is None or row["output_tokens"] is None
-            else GatewayUsage(
-                input_tokens=int(row["input_tokens"]),
-                cached_input_tokens=(
-                    None if row["cached_input_tokens"] is None else int(row["cached_input_tokens"])
-                ),
-                output_tokens=int(row["output_tokens"]),
-                reasoning_tokens=(
-                    None if row["reasoning_tokens"] is None else int(row["reasoning_tokens"])
-                ),
-            )
-        )
-        settlement = AttemptSettlementRecord(
-            reservation=_reservation_record(row, organization_id=request.organization_id),
-            state=AttemptTerminalState(str(row["state"])),
-            terminal_at=_datetime(row["terminal_at"]),
-            failure_class=(
-                None
-                if row["failure_class"] is None
-                else GatewayFailureClass(str(row["failure_class"]))
-            ),
-            usage=usage,
-            usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
-            estimated_cost_micro_usd=_optional_int(row["estimated_cost_micro_usd"]),
-            settled_micro_usd=_optional_int(row["budget_settled_micro_usd"]),
-            first_token_at=_optional_datetime(row["first_token_at"]),
-        )
-        _require_settlement_replay(settlement, request=request)
-        return settlement
+        """Settle a tenant's attempt and verify exact replay against durable evidence.
+
+        Args:
+            request: Tenant-scoped terminal outcome and provider usage.
+
+        Returns:
+            The persisted outcome with all frozen rates and observed token subsets.
+
+        Raises:
+            ValueError: Tenant ownership or replay evidence differs from the row.
+        """
+        with persistent_connection(
+            self.database_path, busy_timeout_ms=self._busy_timeout_ms
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                settlement = _settle_attempt_in_transaction(connection, self.attempts, request)
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+                return settlement
 
     def usage_attribution(
         self,
@@ -649,7 +662,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     total_latency_ms=item.total_latency_ms,
                     average_latency_ms=item.average_latency_ms,
@@ -671,7 +684,7 @@ class SQLiteGatewayPlatform:
                     cached_input_tokens=item.cached_input_tokens,
                     output_tokens=item.output_tokens,
                     reasoning_tokens=item.reasoning_tokens,
-                    known_estimated_cost_micro_usd=item.known_estimated_cost_micro_usd,
+                    known_estimated_cost_nano_usd=item.known_estimated_cost_nano_usd,
                     unknown_cost_attempts=item.unknown_cost_attempts,
                     terminal_counts=tuple(
                         UsageTerminalCount(
@@ -745,84 +758,6 @@ class SQLiteGatewayPlatform:
         ):
             raise ValueError("alias revision ID was reused with different input")
         return record
-
-    def _reactivate_alias_revision(
-        self,
-        *,
-        organization_id: str,
-        alias_id: str,
-        revision_id: str,
-    ) -> bool:
-        """Conditionally reactivate a disabled revision with current provider bindings."""
-        connection = connect_database(
-            self.database_path,
-            busy_timeout_ms=self._busy_timeout_ms,
-        )
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            alias = connection.execute(
-                """
-                SELECT active, active_revision_id FROM gateway_aliases
-                WHERE organization_id = ? AND alias_id = ?
-                """,
-                (organization_id, alias_id),
-            ).fetchone()
-            if alias is None:
-                raise ValueError("alias revision cannot be reactivated")
-            current_revision = str(alias["active_revision_id"])
-            if bool(alias["active"]):
-                if current_revision == revision_id:
-                    connection.rollback()
-                    return False
-                raise ValueError("alias activation advanced to another revision")
-            if current_revision != revision_id:
-                raise ValueError("disabled alias no longer points at the requested revision")
-            bindings = connection.execute(
-                """
-                SELECT b.connection_id, b.connection_revision_id,
-                       b.connection_sha256, c.active, c.active_revision_id,
-                       r.connection_sha256 AS current_sha256
-                FROM alias_revision_provider_connections AS b
-                LEFT JOIN provider_connections AS c
-                  ON c.organization_id = b.organization_id
-                 AND c.connection_id = b.connection_id
-                LEFT JOIN provider_connection_revisions AS r
-                  ON r.organization_id = c.organization_id
-                 AND r.connection_id = c.connection_id
-                 AND r.revision_id = c.active_revision_id
-                WHERE b.organization_id = ? AND b.alias_id = ?
-                  AND b.alias_revision_id = ?
-                """,
-                (organization_id, alias_id, revision_id),
-            ).fetchall()
-            for binding in bindings:
-                if (
-                    not bool(binding["active"])
-                    or str(binding["active_revision_id"]) != str(binding["connection_revision_id"])
-                    or str(binding["current_sha256"]) != str(binding["connection_sha256"])
-                ):
-                    raise ValueError(
-                        "alias revision provider bindings are no longer active and current"
-                    )
-            result = connection.execute(
-                """
-                UPDATE gateway_aliases
-                SET active = 1, active_revision_id = ?,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
-                WHERE organization_id = ? AND alias_id = ? AND active = 0
-                  AND active_revision_id = ?
-                """,
-                (revision_id, organization_id, alias_id, revision_id),
-            )
-            if result.rowcount != 1:
-                raise ValueError("alias revision cannot be reactivated")
-            connection.commit()
-            return True
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def _ensure_catalog_snapshot(self, *, command: ActivateAliasRevisionCommand) -> None:
         """Register a missing exact snapshot while preserving replay safety."""

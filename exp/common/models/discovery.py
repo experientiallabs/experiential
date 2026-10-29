@@ -48,6 +48,9 @@ class DiscoveredModel(ContractModel):
 
     Every optional field carries provider-published metadata. An omitted field means the provider
     published nothing for it, never that the capability, limit, or price is absent.
+
+    Attributes:
+        supported_reasoning_efforts: Published caller choices, or ``None`` when not declared.
     """
 
     provider: str = Field(min_length=1, max_length=128)
@@ -64,6 +67,7 @@ class DiscoveredModel(ContractModel):
     supports_presence_penalty: bool | None = None
     supports_reasoning: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
     sampling_requires_reasoning_none: bool | None = None
     chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -179,10 +183,17 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
         discovered.supports_top_k,
         known.supports_top_k if known else None,
     )
-    supports_reasoning = _proven(
-        discovered.supports_reasoning,
-        known.supports_reasoning_effort if known else None,
-    )
+    # An explicit known.supports_reasoning wins (a budgeted-enabled model
+    # reasons without an effort ladder); absent it, the historical derivation
+    # from supports_reasoning_effort is preserved for backward compatibility.
+    known_reasoning: bool | None = None
+    if known is not None:
+        known_reasoning = (
+            known.supports_reasoning
+            if known.supports_reasoning is not None
+            else known.supports_reasoning_effort
+        )
+    supports_reasoning = _proven(discovered.supports_reasoning, known_reasoning)
     capabilities = ModelCapabilities(
         supports_tools=_proven(
             discovered.supports_tools,

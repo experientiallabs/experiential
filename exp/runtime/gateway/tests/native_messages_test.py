@@ -6,10 +6,9 @@ alias points at a local OpenAI-compatible SSE mock upstream. The tests drive
 ``POST /v1/messages`` with Anthropic-shaped requests through the real Rust
 data plane and shared python control plane.
 
-The Anthropic passthrough upstream dialect is deliberately not driven here:
-``anthropic`` is a fixed-origin provider whose connection config rejects a
-custom ``base_url``, so it cannot be pointed at a loopback mock without
-weakening that production invariant.
+Budget tests redirect only an already-admitted fixed-origin destination to
+loopback. Decoding, route validation, frozen payloads, dispatch and settlement
+remain real; provider configuration still enforces its production origin.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -30,10 +30,13 @@ from typing import cast
 
 import httpx
 import pytest
+from openai import OpenAI
+from websockets.sync.client import connect
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.management import GatewayManagement
 
 pytest.importorskip("exp_gateway_native")
 
@@ -70,9 +73,24 @@ _DRIVER_SOURCE = textwrap.dedent(
             Path(config["root"]),
             environment=environment,
         )
-        control_plane = NativeControlPlane(
+        control_plane_type = NativeControlPlane
+        if "mock_destination" in config:
+            class LoopbackControlPlane(NativeControlPlane):
+                """Redirect only the admitted network destination to the local mock."""
+
+                def admit(self, argument: str) -> str:
+                    """Keep real decoding, admission and frozen payloads; replace the URL."""
+                    admitted = json.loads(super().admit(argument))
+                    for rung in admitted["route"]:
+                        assert rung["url"] == config["expected_destination"]
+                        rung["url"] = config["mock_destination"]
+                    return json.dumps(admitted)
+
+            control_plane_type = LoopbackControlPlane
+        control_plane = control_plane_type(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
+            default_lane_bound=config.get("default_lane_bound"),
         )
         last_error = None
         for _attempt in range(5):
@@ -120,21 +138,101 @@ def _content_chunk(text: str) -> bytes:
     )
 
 
-def _terminal_frames(finish_reason: str) -> bytes:
-    """Encode the finishing chunk, usage chunk, and done sentinel."""
+def _terminal_frames(finish_reason: str, *, cached: bool = True) -> bytes:
+    """Encode the finishing chunk, usage chunk, and done sentinel.
+
+    Args:
+        finish_reason: The provider finish reason on the closing choice.
+        cached: Whether the usage chunk reports a cached prefix through
+            ``prompt_tokens_details.cached_tokens`` (an uncached completion
+            omits the details object entirely, as OpenAI-compatible servers do).
+    """
+    usage: JsonObject = {"prompt_tokens": 9, "completion_tokens": 4}
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": 2}
     return b"".join(
         (
             _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]}),
+            _sse_frame({"choices": [], "usage": usage}),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _reasoning_only_stop_frames() -> bytes:
+    """Encode the live OpenRouter DeepSeek reasoning-only turn (2026-09-12).
+
+    Hidden reasoning streams on OpenRouter's ``reasoning`` delta field, the
+    content stays empty, the choice finishes ``stop``, and usage bills the
+    reasoning as completion tokens. This unexposed rung strips the reasoning,
+    so nothing semantic reaches the caller while the tokens are billed.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "", "reasoning": "Let me"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "", "reasoning": " read the logs first."},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame(
+                {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+            ),
             _sse_frame(
                 {
                     "choices": [],
                     "usage": {
                         "prompt_tokens": 9,
-                        "completion_tokens": 4,
+                        "completion_tokens": 147,
+                        "total_tokens": 156,
                         "prompt_tokens_details": {"cached_tokens": 2},
+                        "completion_tokens_details": {"reasoning_tokens": 148},
                     },
                 }
             ),
+            b"data: [DONE]\n\n",
+        )
+    )
+
+
+def _silent_stop_frames() -> bytes:
+    """Encode the live Meta muse-spark budget-exhausted turn (2026-09-15).
+
+    The model reasons privately and the reasoning counts toward ``max_tokens``;
+    when the cap is below that reasoning the wire is a role delta, an empty
+    delta finishing ``stop`` and ``[DONE]`` with NO usage frame at all, so the
+    gateway sees a completed turn with nothing sent and nothing accounted.
+    """
+    return b"".join(
+        (
+            _sse_frame(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            ),
+            _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
             b"data: [DONE]\n\n",
         )
     )
@@ -160,6 +258,40 @@ def _zero_output_terminal_frames(finish_reason: str) -> bytes:
     )
 
 
+def _anthropic_budget_frames(model: str) -> bytes:
+    """Return a complete Anthropic text stream with terminal usage."""
+    events = (
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg-budget",
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": None,
+                "usage": {"input_tokens": 9, "output_tokens": 0},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hello world"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": 4},
+        },
+        {"type": "message_stop"},
+    )
+    return b"".join(
+        b"event: " + str(event["type"]).encode() + b"\n" + _sse_frame(event) for event in events
+    )
+
+
 class _SseUpstream(BaseHTTPRequestHandler):
     """OpenAI-compatible SSE mock whose shape is selected by the prompt."""
 
@@ -172,6 +304,38 @@ class _SseUpstream(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length))
         with self.payloads_lock:
             self.payloads.append(payload)
+        if self.path == "/v1/gemini":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(
+                _sse_frame(
+                    {
+                        "candidates": [
+                            {
+                                "content": {"role": "model", "parts": [{"text": "hello world"}]},
+                                "finishReason": "STOP",
+                                "index": 0,
+                            }
+                        ],
+                        "usageMetadata": {
+                            "promptTokenCount": 9,
+                            "candidatesTokenCount": 4,
+                            "thoughtsTokenCount": 2,
+                            "totalTokenCount": 15,
+                        },
+                    }
+                )
+            )
+            self.wfile.flush()
+            return
+        if self.path == "/v1/messages":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(_anthropic_budget_frames(payload["model"]))
+            self.wfile.flush()
+            return
         prompt = payload["messages"][-1]["content"]
         if prompt in {"reject-param-token", "reject-dump-token"}:
             # A client error the caller can act on, and one whose message is a
@@ -248,8 +412,16 @@ class _SseUpstream(BaseHTTPRequestHandler):
                 self.wfile.write(_terminal_frames("tool_calls"))
             elif prompt == "empty-token":
                 self.wfile.write(_zero_output_terminal_frames("stop"))
+            elif prompt == "reasoning-only-token":
+                self.wfile.write(_reasoning_only_stop_frames())
+            elif prompt == "silent-stop-token":
+                self.wfile.write(_silent_stop_frames())
             elif prompt == "truncated-token":
                 self.wfile.write(_zero_output_terminal_frames("length"))
+            elif prompt == "uncached-token":
+                self.wfile.write(_content_chunk("hello "))
+                self.wfile.write(_content_chunk("world"))
+                self.wfile.write(_terminal_frames("stop", cached=False))
             else:
                 self.wfile.write(_content_chunk("hello "))
                 self.wfile.write(_content_chunk("world"))
@@ -270,6 +442,12 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
     payloads_lock = threading.Lock()
     raw_arguments = '{ "query" : "λ" }'
     encrypted_content = "provider-opaque-state"
+    web_search_item: JsonObject = {
+        "id": "ws_provider",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract.
         """Return a tool turn first and visible text after its function output."""
@@ -292,10 +470,331 @@ class _ResponsesUpstream(BaseHTTPRequestHandler):
             isinstance(item, dict) and item.get("type") == "additional_tools"
             for item in input_items
         )
+        raw_tools = payload.get("tools", [])
+        web_search_declared = any(
+            isinstance(tool, dict) and tool.get("type") == "web_search"
+            for tool in (raw_tools if isinstance(raw_tools, list) else ())
+        )
+        hosted_echoed = any(
+            isinstance(item, dict) and item.get("type") == "web_search_call" for item in input_items
+        )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
         try:
+            if "count-only" in json.dumps(payload):
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_count",
+                            "content_index": 0,
+                            "delta": "count",
+                            "logprobs": [],
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": "msg_count",
+                            "content_index": 0,
+                            "text": "count",
+                            "logprobs": [],
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "id": "msg_count",
+                                        "type": "message",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "count",
+                                                "logprobs": [],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            include = payload.get("include", [])
+            if "probability-regression" in json.dumps(payload) or (
+                isinstance(include, list) and "message.output_text.logprobs" in include
+            ):
+                terminal_status = (
+                    "incomplete" if "probability-incomplete" in json.dumps(payload) else "completed"
+                )
+                terminal_event = f"response.{terminal_status}"
+                records = [{"token": "OK", "logprob": -0.125, "bytes": [79, 75]}]
+                text_done_records = [{"token": "OK", "logprob": -0.1250001, "bytes": [79, 75]}]
+                item_done_records = [{"token": "OK", "logprob": -0.1250002, "bytes": [79, 75]}]
+                terminal_records = [{"token": "OK", "logprob": -0.125000123, "bytes": [79, 75]}]
+                if "probability-empty-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "delta": "",
+                                "logprobs": [],
+                            }
+                        )
+                    )
+                if "probability-done-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "text": "",
+                                "logprobs": records,
+                            }
+                        )
+                    )
+                if "probability-first" in json.dumps(payload):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "item_id": "msg_probability",
+                                "content_index": 0,
+                                "delta": "",
+                                "logprobs": records,
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "delta": "OK",
+                            "logprobs": []
+                            if "probability-first" in json.dumps(payload)
+                            else records,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.done",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "text": "OK",
+                            "logprobs": text_done_records,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.content_part.done",
+                            "output_index": 0,
+                            "item_id": "msg_probability",
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": "OK",
+                                "logprobs": None
+                                if "probability-null" in json.dumps(payload)
+                                else [],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
+                                "id": "msg_probability",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "OK",
+                                        "logprobs": None
+                                        if "probability-null" in json.dumps(payload)
+                                        else item_done_records,
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": terminal_event,
+                            "response": {
+                                "status": terminal_status,
+                                "incomplete_details": {"reason": "max_output_tokens"},
+                                "output": [
+                                    {
+                                        "id": "msg_probability",
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "output_text",
+                                                "text": "OK",
+                                                "logprobs": None
+                                                if "probability-null" in json.dumps(payload)
+                                                else terminal_records,
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            if hosted_echoed:
+                # Turn 2 of the hosted lane: the continuation replayed the
+                # verbatim web_search_call item, so answer with plain text.
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "item_id": "msg_hosted_continued",
+                            "content_index": 0,
+                            "delta": "hosted-continued",
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {"input_tokens": 21, "output_tokens": 3},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            if web_search_declared:
+                # Documented Responses web_search lifecycle: the added item,
+                # its status frames, the final item with its action, and a
+                # cited answer (openai-python 3.x stream-event union).
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": "ws_provider",
+                                "type": "web_search_call",
+                                "status": "in_progress",
+                            },
+                        }
+                    )
+                )
+                for status_event in (
+                    "response.web_search_call.in_progress",
+                    "response.web_search_call.searching",
+                    "response.web_search_call.completed",
+                ):
+                    self.wfile.write(
+                        _sse_frame(
+                            {
+                                "type": status_event,
+                                "item_id": "ws_provider",
+                                "output_index": 0,
+                                "sequence_number": 3,
+                            }
+                        )
+                    )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": self.web_search_item,
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.delta",
+                            "output_index": 1,
+                            "item_id": "msg_cited",
+                            "content_index": 0,
+                            "delta": "Python 3.14.7.",
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.output_text.annotation.added",
+                            "output_index": 1,
+                            "item_id": "msg_cited",
+                            "content_index": 0,
+                            "annotation_index": 0,
+                            "annotation": {
+                                "type": "url_citation",
+                                "url": "https://www.python.org/doc/versions/",
+                                "title": "Python versions",
+                                "start_index": 0,
+                                "end_index": 14,
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(
+                    _sse_frame(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {"input_tokens": 320, "output_tokens": 41},
+                            },
+                        }
+                    )
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             if custom_tools:
                 # Exact live event shapes for a freeform custom tool call
                 # (captured from api.openai.com, 2026-08-30).
@@ -513,25 +1012,52 @@ def _messages_body(prompt: str, *, stream: bool = False, tools: bool = False) ->
 
 
 @pytest.fixture(scope="module", name="engine")
-def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine]:
+def _engine(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_ServingEngine]:
     """Serve one shared native engine subprocess over a seeded root.
 
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
     """
+    variant = str(getattr(request, "param", ""))
+    qwen_budget = variant.startswith("qwen-budget")
+    qwen_model = variant.partition(":")[2] or "qwen3.8-max"
+    gemini_budget = variant == "gemini-budget"
+    anthropic_route = variant.startswith("anthropic:")
     root = tmp_path_factory.mktemp("native-messages-root")
     with _SseUpstream.payloads_lock:
         _SseUpstream.payloads.clear()
     upstream = ThreadingHTTPServer((_HOST, 0), _SseUpstream)
     upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
     upstream_thread.start()
+    mock_url = f"http://{_HOST}:{upstream.server_address[1]}/v1"
     _manager, raw_key = _configured_gateway(
         root,
-        base_url=f"http://{_HOST}:{upstream.server_address[1]}/v1",
+        base_url=(
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+            if qwen_budget
+            else mock_url
+        ),
+        provider="anthropic"
+        if anthropic_route
+        else "gemini"
+        if gemini_budget
+        else "openai-compatible",
+        provider_model=(
+            variant.partition(":")[2]
+            if anthropic_route
+            else "gemini-2.5-flash"
+            if gemini_budget
+            else qwen_model
+            if qwen_budget
+            else "provider-model-exact"
+        ),
         capabilities=ModelCapabilities(
             chat_max_tokens_field="max_completion_tokens",
-            maximum_output_tokens=128,
+            maximum_output_tokens=8192 if anthropic_route or qwen_budget or gemini_budget else 128,
             maximum_temperature=1.0,
+            supports_reasoning=qwen_budget or anthropic_route or gemini_budget,
         ),
     )
     driver = root / "native_messages_driver.py"
@@ -540,6 +1066,30 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         {
             "root": str(root),
             "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+            **(
+                {
+                    "mock_destination": f"{mock_url}/chat/completions",
+                    "expected_destination": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+                }
+                if qwen_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/gemini",
+                    "expected_destination": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+                }
+                if gemini_budget
+                else {}
+            ),
+            **(
+                {
+                    "mock_destination": f"{mock_url}/messages",
+                    "expected_destination": "https://api.anthropic.com/v1/messages",
+                }
+                if anthropic_route
+                else {}
+            ),
         }
     )
     stderr_log = root / "driver-stderr.log"
@@ -635,10 +1185,13 @@ def _responses_engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Ser
             supports_reasoning=True,
             supports_tools=True,
             supports_temperature=False,
+            maximum_output_tokens=128_000,
+            supports_logprobs=True,
         ),
         gateway_capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,
             supports_streaming_tool_arguments=True,
+            supports_responses_logprobs=True,
         ),
         prices=GatewayTokenPrices(),
         pricing_source=None,
@@ -761,7 +1314,12 @@ def test_non_streaming_message_answers_the_anthropic_shape_and_accounts(
         "content": [{"type": "text", "text": "hello world"}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
-        "usage": {"input_tokens": 7, "output_tokens": 4, "cache_read_input_tokens": 2},
+        "usage": {
+            "input_tokens": 7,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 2,
+            "output_tokens": 4,
+        },
     }
     assert _completed_attempts(engine.base) == completed_before + 1
 
@@ -828,11 +1386,199 @@ def test_streaming_message_emits_the_full_anthropic_lifecycle(
     assert text == "hello world"
     message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+    # OpenAI-wire ``prompt_tokens_details.cached_tokens`` comes back as the
+    # cache-read leg with ``input_tokens`` the uncached remainder; the
+    # creation leg is present at 0 (nothing on this wire reports cache writes).
     assert message_delta["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 4,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 4,
     }
+    # An OpenAI-wire upstream reports nothing before its final chunk, so the
+    # start frame carries the gateway's pre-dispatch prompt estimate (what a
+    # client that reads input from message_start, e.g. Claude Code, shows)
+    # in Anthropic's start shape: both cache legs 0 (nothing is cached before
+    # dispatch) and the ``output_tokens: 1`` placeholder; the authoritative
+    # meters stay on message_delta above and are what the ledger bills.
+    message_start = next(payload for payload in payloads if payload["type"] == "message_start")
+    start_usage = message_start["message"]["usage"]
+    assert isinstance(start_usage["input_tokens"], int) and start_usage["input_tokens"] > 0
+    assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+
+
+def _claude_code_body(prompt: str, *, stream: bool = False) -> JsonObject:
+    """Return a Claude Code-shaped Messages body: system array, tools, many turns.
+
+    Several thousand tokens of prompt, so a start-frame estimate that missed
+    the system blocks, the tool definitions, or the earlier turns would be
+    off by an order of magnitude rather than by tokenizer drift. ``prompt``
+    is the final user turn, which also selects the loopback upstream's reply.
+    """
+    system_block = (
+        "You are Claude Code, an interactive CLI tool that helps users with software "
+        "engineering tasks. Use the instructions below and the tools available to you. "
+    ) * 40
+    tools: list[JsonObject] = [
+        {
+            "name": f"Tool{index}",
+            "description": f"Tool {index}. " + "Reads a file from the local filesystem. " * 8,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "The absolute path"},
+                    "offset": {"type": "number", "description": "The first line to read"},
+                    "limit": {"type": "number", "description": "How many lines to read"},
+                },
+                "required": ["file_path"],
+                "additionalProperties": False,
+            },
+        }
+        for index in range(12)
+    ]
+    messages: list[JsonObject] = []
+    for turn in range(6):
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Turn {turn}: " + "explain the module layout in detail. " * 10,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading the file now. " * 5},
+                    {
+                        "type": "tool_use",
+                        "id": f"toolu_{turn:03d}",
+                        "name": "Tool0",
+                        "input": {"file_path": "/repo/src/main.py"},
+                    },
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"toolu_{turn:03d}",
+                        "content": [{"type": "text", "text": "def main():\n    pass\n" * 20}],
+                    }
+                ],
+            }
+        )
+    messages.append({"role": "user", "content": prompt})
+    payload: JsonObject = {
+        "model": "coding",
+        "max_tokens": 64,
+        "system": [
+            {"type": "text", "text": system_block, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Project instructions: " + system_block[:2000]},
+        ],
+        "messages": messages,
+        "tools": tools,
+        "metadata": {"user_id": "harbor"},
+    }
+    if stream:
+        payload["stream"] = True
+    return payload
+
+
+def _stream_payloads(engine: _ServingEngine, body: JsonObject) -> list[JsonObject]:
+    """Stream one Messages request and return its decoded SSE data payloads."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=body,
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200, response.read()
+        raw = b"".join(response.iter_bytes()).decode()
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def test_start_frame_estimate_counts_the_whole_claude_code_prompt(
+    engine: _ServingEngine,
+) -> None:
+    """The pre-dispatch estimate covers system, every turn, and the tools.
+
+    Harbor's Claude Code (2026-09-11) read a ``message_start`` of
+    ``input_tokens: 10`` as a stub. The start frame's estimate is the same
+    count ``count_tokens`` answers for the same prompt, so a Claude Code
+    session of several thousand tokens shows thousands there, in Anthropic's
+    start shape (both cache legs 0, ``output_tokens: 1``).
+    """
+    payloads = _stream_payloads(engine, _claude_code_body("fast-token", stream=True))
+    message_start = next(payload for payload in payloads if payload["type"] == "message_start")
+    message = message_start["message"]
+    assert isinstance(message, dict)
+    start_usage = message["usage"]
+    assert isinstance(start_usage, dict)
+    input_tokens = start_usage["input_tokens"]
+    assert isinstance(input_tokens, int) and input_tokens > 1_000, start_usage
+    assert {k: v for k, v in start_usage.items() if k != "input_tokens"} == {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+    }
+
+    count_body = {
+        k: v for k, v in _claude_code_body("fast-token").items() if k not in {"max_tokens"}
+    }
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=count_body,
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    assert counted.json()["input_tokens"] == input_tokens
+
+
+def test_uncached_completion_reports_both_cache_legs_as_zero(engine: _ServingEngine) -> None:
+    """A provider reporting no cached tokens yields zero legs, not missing keys.
+
+    Anthropic's shape carries ``cache_creation_input_tokens`` and
+    ``cache_read_input_tokens`` on every usage object; the official SDK
+    accumulators and Claude Code read them by key, so an uncached completion
+    renders them as 0 on ``message_delta`` and on the non-streamed body.
+    """
+    expected = {
+        "input_tokens": 9,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 4,
+    }
+    payloads = _stream_payloads(engine, _messages_body("uncached-token", stream=True))
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["usage"] == expected
+
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("uncached-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200
+    assert response.json()["usage"] == expected
 
 
 def test_tool_calls_translate_to_tool_use_blocks(engine: _ServingEngine) -> None:
@@ -883,14 +1629,68 @@ def test_protocol_and_key_failures_are_anthropic_shaped(engine: _ServingEngine) 
     assert unknown_field.json()["error"]["type"] == "invalid_request_error"
     assert "unknown_field" in unknown_field.json()["error"]["message"]
 
-    count_tokens = httpx.post(
+    malformed_count = httpx.post(
         f"{engine.base}/v1/messages/count_tokens",
         headers={"x-api-key": engine.raw_key},
         json={},
         timeout=10.0,
     )
-    assert count_tokens.status_code == 404
-    assert count_tokens.json()["error"]["type"] == "not_found_error"
+    assert malformed_count.status_code == 400
+    assert malformed_count.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_count_tokens_answers_anthropic_shape_from_the_gateway_estimate(
+    engine: _ServingEngine,
+) -> None:
+    """``POST /v1/messages/count_tokens`` counts the prompt without a ledger row.
+
+    Anthropic's shape (``{"input_tokens": N}``) with the gateway's own
+    tokenizer estimate for a foreign rung, disclosed through the shared body
+    field; an ungranted alias answers the same no-oracle 404 as the model
+    listing; an unknown key answers 401 in the Anthropic envelope.
+    """
+
+    def counted_requests() -> int:
+        report = httpx.get(
+            f"{engine.base}/usage.json", headers={"x-api-key": engine.raw_key}, timeout=10.0
+        ).json()
+        return int(report["totals"]["requests"])
+
+    before = counted_requests()
+    # Anthropic's count body carries no max_tokens.
+    count_body = {k: v for k, v in _messages_body("fast-token").items() if k != "max_tokens"}
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=count_body,
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    body = counted.json()
+    assert isinstance(body["input_tokens"], int) and body["input_tokens"] > 0
+    assert body["x-experiential-ignored-parameters"] == [
+        "input_tokens->estimated(gateway_tokenizer)"
+    ]
+    # A count is a read: no request is accepted, reserved, or charged.
+    assert counted_requests() == before
+
+    ungranted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json={**count_body, "model": "not-granted"},
+        timeout=10.0,
+    )
+    assert ungranted.status_code == 404
+    assert ungranted.json()["error"]["type"] == "not_found_error"
+
+    bad_key = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": "exp_vk_invalid"},
+        json=_messages_body("fast-token"),
+        timeout=10.0,
+    )
+    assert bad_key.status_code == 401
+    assert bad_key.json()["error"]["type"] == "authentication_error"
 
 
 def test_native_serves_an_effort_on_a_reasoning_less_route_by_dropping_it(
@@ -944,33 +1744,56 @@ def test_native_drops_unsupported_top_k_with_disclosure(
     )
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    (("temperature", 1.1), ("max_tokens", 129)),
-)
-def test_native_enforces_catalog_generation_limits_before_dispatch(
+def test_native_clamps_an_output_ceiling_above_the_catalog_maximum(
     engine: _ServingEngine,
-    field: str,
-    value: float | int,
 ) -> None:
-    """Model-specific sampling and output ceilings fail locally, with no upstream dispatch."""
-    payload = _messages_body("must-not-dispatch")
-    payload[field] = value
-    headers = {"x-api-key": engine.raw_key}
+    """A ``max_tokens`` above the route maximum dispatches at that maximum, disclosed.
+
+    Claude Code sends 64000 or 128000 to every model; refusing it failed 2,137
+    requests a day. Lowering the ceiling can only reduce what the caller pays.
+    """
+    payload = _messages_body("fast-token")
+    payload["max_tokens"] = 129
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
-
     native = httpx.post(
         f"{engine.base}/v1/messages",
-        headers=headers,
+        headers={"x-api-key": engine.raw_key},
         json=payload,
         timeout=10.0,
     )
-
-    assert native.status_code == 400
-    assert field in native.json()["error"]["message"]
+    assert native.status_code == 200
+    assert "max_tokens->128(route_maximum)" in native.json()["x-experiential-ignored-parameters"]
     with _SseUpstream.payloads_lock:
-        assert len(_SseUpstream.payloads) == dispatched_before
+        dispatched = _SseUpstream.payloads[dispatched_before:]
+    assert dispatched
+    assert all(
+        sent.get("max_tokens", sent.get("max_completion_tokens")) == 128 for sent in dispatched
+    )
+
+
+def test_native_clamps_a_temperature_above_the_route_maximum(engine: _ServingEngine) -> None:
+    """A temperature above the route's maximum dispatches at that maximum, disclosed.
+
+    Sampling is a preference: Claude's thinking lanes accept only 1.0, and
+    refusing a caller's 0.1 failed 56 requests a day (2026-10-17).
+    """
+    payload = _messages_body("fast-token")
+    payload["temperature"] = 1.1
+    with _SseUpstream.payloads_lock:
+        dispatched_before = len(_SseUpstream.payloads)
+    native = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=payload,
+        timeout=10.0,
+    )
+    assert native.status_code == 200
+    assert "temperature->1.0(route_maximum)" in native.json()["x-experiential-ignored-parameters"]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[dispatched_before:]
+    assert dispatched
+    assert all(sent.get("temperature") == 1.0 for sent in dispatched)
 
 
 _ZERO_OUTPUT_CHAT_CASES = (
@@ -1103,6 +1926,184 @@ def test_responses_stream_zero_output_keeps_terminal_usage(
     assert usage["output_tokens"] == 0
 
 
+def test_responses_sdk_stream_preserves_probability_phases_and_final_json(
+    responses_engine: _ServingEngine,
+) -> None:
+    """The served native SSE path retains rich phase observations and final records."""
+    client = OpenAI(
+        base_url=f"{responses_engine.base}/v1",
+        api_key=responses_engine.raw_key,
+    )
+    with client.responses.stream(
+        model="responses",
+        input="probability-regression",
+        include=["message.output_text.logprobs"],
+        top_logprobs=0,
+        store=False,
+    ) as stream:
+        events = list(stream)
+        final = stream.get_final_response()
+    event_types = [event.type for event in events]
+    assert "response.output_text.delta" in event_types
+    assert "response.output_text.done" in event_types
+    assert "response.output_item.done" in event_types
+    delta_event = next(
+        event.model_dump() for event in events if event.type == "response.output_text.delta"
+    )
+    assert delta_event["logprobs"][0]["bytes"] == [79, 75]
+    text_done = next(
+        event.model_dump() for event in events if event.type == "response.output_text.done"
+    )
+    assert text_done["logprobs"][0]["token"] == "OK"
+    item_done = next(
+        event.model_dump() for event in events if event.type == "response.output_item.done"
+    )
+    assert item_done["item"]["content"][0]["logprobs"][0]["token"] == "OK"
+    assert item_done["item"]["content"][0]["logprobs"][0]["logprob"] == -0.1250002
+    body = final.model_dump()
+    assert body["output"][0]["content"][0]["text"] == "OK"
+    assert body["output"][0]["content"][0]["logprobs"]
+    assert body["output"][0]["content"][0]["logprobs"][0]["token"] == "OK"
+    assert body["output"][0]["content"][0]["logprobs"][0]["bytes"] == [79, 75]
+    assert body["output"][0]["content"][0]["logprobs"][0]["logprob"] == -0.125000123
+
+
+def test_responses_count_only_does_not_add_include_or_records(
+    responses_engine: _ServingEngine,
+) -> None:
+    """A count alone forwards no selector and returns no probability records."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={"model": "responses", "input": "count-only", "top_logprobs": 2},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["output"][0]["content"][0]["logprobs"] == []
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = tuple(_ResponsesUpstream.payloads)
+    assert dispatched
+    include = dispatched[-1].get("include", [])
+    assert isinstance(include, list)
+    assert "message.output_text.logprobs" not in include
+    assert dispatched[-1]["top_logprobs"] == 2
+
+
+def test_responses_ws_probability_generation_preserves_phases(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Generating Responses WebSocket retains delta and terminal probabilities."""
+    with connect(
+        f"ws://{responses_engine.base.removeprefix('http://')}/v1/responses",
+        additional_headers={"Authorization": f"Bearer {responses_engine.raw_key}"},
+    ) as socket:
+        socket.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "model": "responses",
+                    "input": "probability-regression",
+                    "include": ["message.output_text.logprobs"],
+                    "top_logprobs": 0,
+                }
+            )
+        )
+        events: list[JsonObject] = []
+        while True:
+            event = json.loads(socket.recv(timeout=30))
+            assert isinstance(event, dict)
+            events.append(event)
+            if event["type"] in {"response.completed", "response.incomplete"}:
+                break
+    delta = next(event for event in events if event["type"] == "response.output_text.delta")
+    delta_records = delta.get("logprobs")
+    assert isinstance(delta_records, list) and isinstance(delta_records[0], dict)
+    assert delta_records[0].get("bytes") == [79, 75]
+    done = next(event for event in events if event["type"] == "response.output_text.done")
+    done_records = done.get("logprobs")
+    assert isinstance(done_records, list) and isinstance(done_records[0], dict)
+    assert done_records[0].get("logprob") == -0.1250001
+    terminal = events[-1]
+    response = terminal.get("response")
+    assert isinstance(response, dict)
+    output = response.get("output")
+    assert isinstance(output, list) and isinstance(output[0], dict)
+    content = output[0].get("content")
+    assert isinstance(content, list) and isinstance(content[0], dict)
+    terminal_records = content[0].get("logprobs")
+    assert isinstance(terminal_records, list) and isinstance(terminal_records[0], dict)
+    record = terminal_records[0]
+    assert record["logprob"] == -0.125000123
+    assert record["bytes"] == [79, 75]
+
+
+def test_responses_probability_incomplete_nonstream_preserves_terminal_records(
+    responses_engine: _ServingEngine,
+) -> None:
+    """A nonstream incomplete terminal still carries provider probabilities."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "probability-incomplete",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "incomplete", body
+    record = body["output"][0]["content"][0]["logprobs"][0]
+    assert record == {"token": "OK", "logprob": -0.125000123, "bytes": [79, 75]}
+
+
+def test_responses_probability_continuation_replays_history_without_logprobs(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Continuation history keeps text and bytes while omitting provider metadata."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "input": "probability-regression",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": "probability-regression-continue",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 0,
+        },
+        timeout=30.0,
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["output"][0]["content"][0]["logprobs"][0]["bytes"] == [79, 75]
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = tuple(_ResponsesUpstream.payloads)
+    assert len(dispatched) == 2
+    replayed = cast(list[JsonObject], dispatched[1]["input"])
+    assert all("logprobs" not in json.dumps(item) for item in replayed), replayed
+
+
 @pytest.mark.parametrize(("prompt", "stop_reason"), _ZERO_OUTPUT_MESSAGES_CASES)
 def test_messages_non_stream_zero_output_keeps_real_input_tokens(
     engine: _ServingEngine,
@@ -1122,8 +2123,9 @@ def test_messages_non_stream_zero_output_keeps_real_input_tokens(
     assert body["stop_reason"] == stop_reason
     assert body["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 0,
     }
 
 
@@ -1152,17 +2154,285 @@ def test_messages_stream_zero_output_keeps_real_input_tokens(
     assert message_delta["delta"]["stop_reason"] == stop_reason
     assert message_delta["usage"] == {
         "input_tokens": 7,
-        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
+        "output_tokens": 0,
     }
 
 
-def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
+def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str | None]]:
+    """Read the most recent request's settled attempt rows (ordinal, state, failure class).
+
+    An exhausted ladder answers with the bare Anthropic error envelope and no
+    request-id header, so the request is found as the newest accepted row.
+    """
+    database_path = GatewayManagement(engine.root).database_path
+    deadline = time.monotonic() + 10.0
+    while True:
+        with sqlite3.connect(database_path) as connection:
+            latest = connection.execute(
+                "SELECT request_id FROM gateway_requests ORDER BY accepted_at DESC, rowid DESC"
+                " LIMIT 1"
+            ).fetchone()
+            rows = (
+                connection.execute(
+                    "SELECT attempt_ordinal, state, failure_class FROM gateway_attempts"
+                    " WHERE request_id = ? ORDER BY attempt_ordinal",
+                    (latest[0],),
+                ).fetchall()
+                if latest is not None
+                else []
+            )
+        if rows and all(state not in {"dispatched", "running"} for _, state, _ in rows):
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    return [(int(ordinal), str(state), failure) for ordinal, state, failure in rows]
+
+
+def test_messages_non_stream_billed_empty_stop_is_a_typed_empty_end_turn(
     engine: _ServingEngine,
 ) -> None:
-    """Thinking config and history need an Anthropic-only route; the seeded
-    OpenAI-compatible route rejects both in the Anthropic envelope with no
-    upstream dispatch."""
+    """A ``stop`` that billed reasoning yet rendered no block is a TYPED empty turn.
+
+    Production 2026-09-12 (deepseek-v4-flash via OpenRouter, Claude Code's
+    body): ``message_start`` then ``message_delta`` with ``end_turn``, zero
+    content blocks, and 42 to 750 billed output tokens, settled as a completed
+    success. The single rung here is redialed once (its bounded cap) and both
+    dispatches settle ``failed`` as ``empty_completion`` at $0; a route with a
+    second rung would fail over instead. The ladder exhausted on empty turns
+    answers the caller a 200 ``end_turn`` with no content under
+    ``x-gateway-warning: empty_completion`` -- never a 5xx, which every SDK
+    auto-retries (2026-09-15: one Claude Code session re-sent a 44k-token
+    prompt every minute for an hour against the earlier 502).
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["stop_reason"] == "end_turn"
+    assert body["content"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_messages_stream_billed_empty_stop_is_a_typed_empty_end_turn_stream(
+    engine: _ServingEngine,
+) -> None:
+    """The streamed request opens only after the ladder settled: a typed empty stream.
+
+    Nothing semantic was ever committed, so the exhausted ladder's settled
+    events encode as one ``message_start`` / ``message_delta end_turn`` /
+    ``message_stop`` stream with no content block and the warning header on
+    the response (a settled stream still builds its headers before its first
+    frame), never an ``error`` event.
+    """
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("reasoning-only-token", stream=True),
+        timeout=30.0,
+    ) as response:
+        status = response.status_code
+        warning = response.headers.get("x-gateway-warning")
+        raw = b"".join(response.iter_bytes()).decode()
+    assert status == 200, raw
+    assert warning == "empty_completion"
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ")
+    ]
+    kinds = [payload["type"] for payload in payloads]
+    assert "message_start" in kinds and "message_stop" in kinds
+    assert "error" not in kinds
+    assert "content_block_start" not in kinds
+    message_delta = next(payload for payload in payloads if payload["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_chat_capped_silent_stop_is_a_length_truncation_not_an_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """A ``stop`` with no output and no usage on a capped request answers ``length``.
+
+    Production 2026-09-15 (Meta muse-spark under ``max_tokens`` below the
+    model's private reasoning): 200 with ``content: null``, ``finish_reason:
+    stop`` and ``usage: null``, settled ``completed`` -- 895 such answers to
+    ~60 organizations in seven days. The only benign reading of that wire on a
+    capped request is a budget the hidden reasoning exhausted before the
+    first visible token, so the caller now sees the truncation it can act on
+    and the ledger records ``incomplete``.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["choices"][0]["message"]["content"] is None
+    assert body["usage"] is None
+    assert _latest_attempt_states(engine) == [(0, "incomplete", None)]
+
+
+def test_chat_capped_silent_stop_stream_ends_with_length(engine: _ServingEngine) -> None:
+    """The streamed capped request finishes ``length`` on its one choice chunk."""
+    with httpx.stream(
+        "POST",
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_completion_tokens": 40,
+            "stream": True,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    ) as response:
+        assert response.status_code == 200
+        raw = b"".join(response.iter_bytes()).decode()
+    payloads = [
+        json.loads(line.removeprefix("data: "))
+        for line in raw.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    finish_reasons = [
+        choice["finish_reason"]
+        for payload in payloads
+        for choice in payload.get("choices", [])
+        if choice.get("finish_reason") is not None
+    ]
+    assert finish_reasons == ["length"]
+
+
+def test_chat_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """Without a cap the same wire is the provider delivering nothing: a typed empty turn.
+
+    No budget could have been exhausted, nothing was sent and nothing was
+    accounted, so the attempt takes the ladder like the billed empty stop:
+    the single rung is redialed once and both dispatches settle ``failed`` as
+    ``empty_completion`` at $0; the exhausted ladder then answers the empty
+    turn as a 200 ``stop`` with null content under the warning header.
+    """
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "messages": [{"role": "user", "content": "silent-stop-token"}]},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"]["content"] is None
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_responses_uncapped_silent_stop_is_a_typed_empty_completion(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the exhausted empty ladder as a completed empty output."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token"},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-gateway-warning"] == "empty_completion"
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"] == []
+    assert _latest_attempt_states(engine) == [
+        (0, "failed", "empty_completion"),
+        (1, "failed", "empty_completion"),
+    ]
+
+
+def test_capped_length_truncation_carries_no_empty_completion_warning(
+    engine: _ServingEngine,
+) -> None:
+    """An honest budget truncation is not an empty completion: no warning header."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "max_tokens": 40,
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "x-gateway-warning" not in response.headers
+
+
+def test_responses_capped_silent_stop_is_incomplete_max_output_tokens(
+    engine: _ServingEngine,
+) -> None:
+    """The Responses surface renders the same truncation as ``incomplete``."""
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "silent-stop-token", "max_output_tokens": 40},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "incomplete", body
+    assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert body["output"] == []
+
+
+def test_messages_silent_stop_is_a_max_tokens_stop(engine: _ServingEngine) -> None:
+    """Messages always carries ``max_tokens``, so the wire is a ``max_tokens`` stop."""
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key},
+        json=_messages_body("silent-stop-token"),
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["stop_reason"] == "max_tokens"
+    assert body["content"] == []
+    assert _latest_attempt_states(engine) == [(0, "incomplete", None)]
+
+
+def test_replayed_thinking_history_serves_with_disclosure_on_a_foreign_route(
+    engine: _ServingEngine,
+) -> None:
+    """Preserve replayable history while refusing an unenforceable numeric budget.
+
+    Thinking history is disclosed and omitted on a non-Anthropic wire. A live
+    numeric thinking budget is a constraint, not permission to drop the field.
+    """
     with _SseUpstream.payloads_lock:
         dispatched_before = len(_SseUpstream.payloads)
 
@@ -1170,26 +2440,30 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         f"{engine.base}/v1/messages",
         headers={"x-api-key": engine.raw_key},
         json={
-            **_messages_body("must-not-dispatch"),
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            **_messages_body("thinking-config-serves"),
+            # This wire cannot enforce a numeric thinking budget, even one
+            # below the caller's total output ceiling.
+            "thinking": {"type": "enabled", "budget_tokens": 32},
         },
         timeout=10.0,
     )
     assert config.status_code == 400
-    assert config.json()["error"]["type"] == "invalid_request_error"
     assert "thinking" in config.json()["error"]["message"]
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == dispatched_before
 
     history = httpx.post(
         f"{engine.base}/v1/messages",
         headers={"x-api-key": engine.raw_key},
         json={
-            **_messages_body("must-not-dispatch"),
+            **_messages_body("thinking-history-serves"),
             "messages": [
                 {"role": "user", "content": "go"},
                 {
                     "role": "assistant",
                     "content": [
                         {"type": "thinking", "thinking": "private", "signature": "sig=="},
+                        {"type": "redacted_thinking", "data": "opaque=="},
                         {"type": "text", "text": "done"},
                     ],
                 },
@@ -1198,17 +2472,29 @@ def test_thinking_carriers_reject_non_anthropic_routes_before_dispatch(
         },
         timeout=10.0,
     )
-    assert history.status_code == 400
-    assert "thinking" in history.json()["error"]["message"]
-
+    assert history.status_code == 200
+    assert (
+        "messages.thinking->dropped(unsupported_by_provider)"
+        in history.json()["x-experiential-ignored-parameters"]
+    )
     with _SseUpstream.payloads_lock:
-        assert len(_SseUpstream.payloads) == dispatched_before
+        dispatched_history = _SseUpstream.payloads[dispatched_before:]
+    assert len(dispatched_history) == 1
+    sent = json.dumps(dispatched_history[0])
+    assert "private" not in sent
+    assert "opaque==" not in sent
+    assert "done" in sent
 
 
-def test_encrypted_reasoning_include_rejects_non_responses_routes(
+def test_encrypted_reasoning_include_drops_on_routes_without_a_carrier(
     engine: _ServingEngine,
 ) -> None:
-    """The encrypted reasoning include selector needs a native Responses route."""
+    """A route that cannot seal reasoning answers without those items, disclosed.
+
+    The selector asks to RECEIVE encrypted reasoning; refusing it failed 575
+    requests a day on Claude routes. Without a carrier the answer is exactly
+    what an omitted selector produces.
+    """
     response = httpx.post(
         f"{engine.base}/v1/responses",
         headers={"authorization": f"Bearer {engine.raw_key}"},
@@ -1219,10 +2505,13 @@ def test_encrypted_reasoning_include_rejects_non_responses_routes(
         },
         timeout=10.0,
     )
-    assert response.status_code == 400
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert body["error"]["param"] == "include"
-    assert body["error"]["code"] == "unsupported_parameter"
+    assert (
+        "include.reasoning.encrypted_content->dropped(no_reasoning_carrier)"
+        in body["x-experiential-ignored-parameters"]
+    )
+    assert not any(item["type"] == "reasoning" for item in body["output"])
 
 
 def _responses_result(
@@ -1455,7 +2744,9 @@ def test_provider_400_keeps_the_generic_message_for_a_body_dump(
     """A multi-line provider message is a payload, not an explanation.
 
     The mock provider's 400 message spans lines and names an internal
-    deployment and account; nothing from it may reach the caller.
+    deployment and account; nothing from it may reach the caller. Only the
+    provider's documented code token (``unknown_parameter``) is relayed in its
+    place, so the caller still learns which rejection it was.
     """
     rejected = httpx.post(
         f"{engine.base}/v1/chat/completions",
@@ -1470,8 +2761,7 @@ def test_provider_400_keeps_the_generic_message_for_a_body_dump(
     assert "internal-deployment-7" not in json.dumps(rejected.json())
     assert "4711" not in json.dumps(rejected.json())
     assert rejected.json()["error"]["message"] == (
-        "provider rejected the request; verify the request fields against "
-        "the model alias capabilities"
+        "provider rejected the request: unknown_parameter"
     )
 
 
@@ -1528,3 +2818,708 @@ def test_custom_tool_calls_round_trip_through_the_native_responses_lane(
     assert len(upstream) == 1
     upstream_input = cast(list[JsonObject], upstream[0]["input"])
     assert upstream_input[0] == additional_tools
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_hosted_web_search_serves_and_continues_through_the_native_responses_lane(
+    responses_engine: _ServingEngine,
+    stream: bool,
+) -> None:
+    """Hosted web search serves end to end: the native web_search declaration
+    forwards verbatim, the provider's web_search_call item and its lifecycle
+    frames reach the caller intact with the answer's URL citation attached,
+    and a previous_response_id continuation replays the verbatim item.
+
+    Production incident (2026-09-04): the web_search_call output item killed
+    the stream as malformed_response post-dispatch across three orgs."""
+    with _ResponsesUpstream.payloads_lock:
+        _ResponsesUpstream.payloads.clear()
+    headers = {"authorization": f"Bearer {responses_engine.raw_key}"}
+    first = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "input": "what is the current stable Python?",
+            "stream": stream,
+            "tools": [{"type": "web_search"}],
+        },
+        timeout=30.0,
+    )
+    first_body, first_events = _responses_result(first, stream=stream)
+    assert first_body["status"] == "completed"
+    first_output = cast(list[JsonObject], first_body["output"])
+    assert first_output[0] == _ResponsesUpstream.web_search_item
+    message = next(item for item in first_output if item["type"] == "message")
+    content = cast(list[JsonObject], message["content"])[0]
+    assert content["text"] == "Python 3.14.7."
+    annotations = cast(list[JsonObject], content["annotations"])
+    assert annotations[0]["type"] == "url_citation"
+    usage = cast(JsonObject, first_body["usage"])
+    assert usage["input_tokens"] == 320
+    if stream:
+        types = [payload["type"] for payload in first_events]
+        for lifecycle in (
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
+            "response.output_text.annotation.added",
+        ):
+            assert lifecycle in types, types
+        searching = next(
+            payload
+            for payload in first_events
+            if payload["type"] == "response.web_search_call.searching"
+        )
+        assert searching["item_id"] == "ws_provider"
+
+    second = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers=headers,
+        json={
+            "model": "responses",
+            "previous_response_id": first_body["id"],
+            "input": "thanks, summarize",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    second_body, _second_events = _responses_result(second, stream=stream)
+    assert second_body["status"] == "completed"
+    second_output = cast(list[JsonObject], second_body["output"])
+    assert any(
+        content.get("text") == "hosted-continued"
+        for item in second_output
+        if item["type"] == "message"
+        for content in cast(list[JsonObject], item["content"])
+    )
+    with _ResponsesUpstream.payloads_lock:
+        upstream = tuple(_ResponsesUpstream.payloads)
+    assert len(upstream) == 2
+    assert cast(list[JsonObject], upstream[0]["tools"])[-1] == {"type": "web_search"}
+    replay = cast(list[JsonObject], upstream[1]["input"])
+    hosted_replays = [item for item in replay if item.get("type") == "web_search_call"]
+    assert hosted_replays == [_ResponsesUpstream.web_search_item]
+    hosted_position = replay.index(_ResponsesUpstream.web_search_item)
+    message_echo = cast(JsonObject, replay[hosted_position + 1])
+    assert message_echo["type"] == "message"
+    assert message_echo["id"] == "msg_cited"
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_reaches_the_native_responses_provider(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve Chat verbosity through the gateway and retain it on the provider wire."""
+    with _ResponsesUpstream.payloads_lock:
+        before = len(_ResponsesUpstream.payloads)
+    response = httpx.post(
+        f"{responses_engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "look up a result"}],
+            "verbosity": "high",
+            "stream": stream,
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert "x-experiential-ignored-parameters" not in response.text
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = _ResponsesUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert dispatched[0]["text"] == {"verbosity": "high"}
+    assert "verbosity" not in dispatched[0]
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_verbosity_serves_with_disclosure_on_a_compatible_provider(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Serve an unsupported hint without forwarding it or losing its public disclosure."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "low",
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            chunk.get("x-experiential-ignored-parameters") == ["verbosity"] for chunk in chunks
+        )
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+        assert response.json()["x-experiential-ignored-parameters"] == ["verbosity"]
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert "verbosity" not in dispatched[0]
+    assert "text" not in dispatched[0]
+
+
+def test_invalid_chat_verbosity_is_rejected_before_provider_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """Reject an invalid hint as a named client error without paying for an attempt."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "fast-token"}],
+            "verbosity": "verbose",
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "verbosity"
+    assert response.json()["error"]["code"] == "invalid_parameter"
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == before
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_ordinary_responses_rung_ignores_unrequested_probability_fields(
+    responses_engine: _ServingEngine, surface: str, stream: bool
+) -> None:
+    """Standard empty upstream probability arrays never break cross-surface output."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/{surface}",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "messages": [{"role": "user", "content": "count-only"}],
+            "max_tokens": 64,
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "count" in response.text
+    assert "invalid_provider_stream" not in response.text
+    assert "server_error" not in response.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "first", ["probability-first", "probability-empty-first", "probability-done-first"]
+)
+def test_probability_only_delta_binds_identity_for_later_text_and_completion(
+    responses_engine: _ServingEngine, stream: bool, first: str
+) -> None:
+    """A populated probability-only first frame does not double-start its message."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": first,
+            "include": ["message.output_text.logprobs"],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+    else:
+        assert response.json()["output"][0]["content"][0]["text"] == "OK"
+        assert response.json()["output"][0]["content"][0]["logprobs"][0]["token"] == "OK"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_nullable_completed_probability_phases_are_preserved(
+    responses_engine: _ServingEngine, stream: bool
+) -> None:
+    """Optional final-part arrays remain null without erasing distinct delta observations."""
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "probability-null",
+            "include": ["message.output_text.logprobs"],
+            "stream": stream,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "response.failed" not in response.text
+        assert '"logprobs":null' in response.text
+    else:
+        assert response.json()["output"][0]["content"][0]["logprobs"] is None
+
+
+@pytest.mark.parametrize("surface", ["chat/completions", "responses", "messages"])
+@pytest.mark.parametrize("length", [119_825, 262_145])
+def test_large_tool_description_reaches_provider_unchanged(
+    engine: _ServingEngine, surface: str, length: int
+) -> None:
+    """The served endpoints forward full descriptions without writing them to diagnostics."""
+    marker = f"tool-description-canary-{surface}-{length}"
+    description = marker + "x" * (length - len(marker) - 1) + "界"
+    function: JsonObject = {
+        "name": "lookup",
+        "description": description,
+        "parameters": {"type": "object"},
+    }
+    body: JsonObject = {"model": "coding"}
+    if surface == "responses":
+        body.update(input=marker, tools=[{"type": "function", **function}])
+    else:
+        body["messages"] = [{"role": "user", "content": marker}]
+        if surface == "messages":
+            body.update(
+                max_tokens=64,
+                tools=[
+                    {
+                        "name": "lookup",
+                        "description": description,
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            )
+        else:
+            body["tools"] = [{"type": "function", "function": function}]
+    response = httpx.post(
+        f"{engine.base}/v1/{surface}",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        matching = [
+            payload
+            for payload in _SseUpstream.payloads
+            if marker in json.dumps(payload["messages"])
+        ]
+    assert len(matching) == 1
+    tools = cast(list[JsonObject], matching[0]["tools"])
+    forwarded = cast(JsonObject, tools[0]["function"])
+    assert forwarded["description"] == description
+    assert marker not in (engine.root / "driver-stderr.log").read_text()
+
+
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_responses_spelling_of_output_limit_serves(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """The Chat endpoint accepts max_output_tokens and retains length-stop semantics."""
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "silent-stop-token"}],
+            "max_output_tokens": 40,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert any(
+            choice.get("finish_reason") == "length"
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.parametrize("engine", ("qwen-budget",), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_chat_thinking_budget_survives_native_http_dispatch(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Both client modes deliver the exact budget and total cap to the mock Qwen server."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": 32,
+            "enable_thinking": True,
+            "max_output_tokens": 64,
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "qwen3.8-max"
+    assert captured[0]["thinking_budget"] == 32
+    assert captured[0]["enable_thinking"] is True
+    assert captured[0]["max_completion_tokens"] == 64
+    assert "max_tokens" not in captured[0]
+    assert "max_output_tokens" not in captured[0]
+    assert "reasoning_effort" not in captured[0]
+    assert "reasoning" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
+def test_sonnet_55_between_tools_survives_native_http_dispatch(
+    engine: _ServingEngine, stream: bool, effort: str | None
+) -> None:
+    """The served Messages endpoint preserves mode and effort through native dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "between_tools"},
+        "reasoning": {"exclude": True},
+        "stream": stream,
+    }
+    if effort is not None:
+        body["output_config"] = {"effort": effort}
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "event: message_stop" in response.text
+        assert "hello world" in response.text
+    else:
+        assert response.json()["content"] == [{"type": "text", "text": "hello world"}]
+        assert response.json()["stop_reason"] == "end_turn"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "claude-sonnet-5-5"
+    assert captured[0]["thinking"] == {"type": "between_tools"}
+    if effort is not None:
+        assert captured[0]["output_config"] == {"effort": effort}
+    else:
+        assert captured[0].get("output_config", {}) in ({}, {"effort": "high"})
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
+@pytest.mark.parametrize(
+    "controls",
+    (
+        {"thinking": {"type": "disabled"}},
+        {"thinking": {"type": "between_tools"}, "output_config": {"effort": "xhigh"}},
+        {"thinking": {"type": "between_tools"}, "output_config": {"effort": "max"}},
+        {"thinking": {"type": "between_tools"}, "reasoning": {"effort": "max"}},
+        {"thinking": {"type": "between_tools", "display": "omitted"}},
+        {
+            "messages": [
+                {"role": "user", "content": "Say a colour."},
+                {"role": "assistant", "content": "The colour is"},
+            ]
+        },
+    ),
+)
+def test_sonnet_55_invalid_input_never_dispatches(
+    engine: _ServingEngine, controls: JsonObject
+) -> None:
+    """Invalid thinking controls and assistant prefills fail before upstream dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "coding",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}],
+            **controls,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),), indirect=True
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("output_limit", (None, 8192))
+def test_chat_nested_budget_survives_native_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    output_limit: int | None,
+) -> None:
+    """The served Chat endpoint delivers the exact budget on the Anthropic wire."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 4096},
+        "stream": stream,
+    }
+    if output_limit is not None:
+        body["max_tokens"] = output_limit
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        assert "hello world" in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert captured[0]["model"] == "claude-sonnet-4-6"
+    assert captured[0]["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert captured[0]["max_tokens"] == 8192
+    assert "reasoning_effort" not in captured[0]
+    assert "thinking_budget" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),), indirect=True
+)
+def test_chat_nested_budget_above_rung_default_never_dispatches(engine: _ServingEngine) -> None:
+    """An omitted caller cap cannot bypass the selected rung's output bound."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking.budget_tokens"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []
+
+
+@pytest.mark.parametrize(
+    "engine",
+    (
+        pytest.param("anthropic:claude-sonnet-4-6", id="anthropic-budget"),
+        "gemini-budget",
+        "qwen-budget",
+        "qwen-budget:qwen3.8-27b",
+        "qwen-budget:glm-5.2",
+        "qwen-budget:kimi-k2.5",
+    ),
+    indirect=True,
+)
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("control", ("thinking_budget", "thinking"))
+def test_numeric_budget_cross_provider_http_dispatch(
+    engine: _ServingEngine,
+    stream: bool,
+    control: str,
+) -> None:
+    """The same client budget is frozen into each provider's exact native control."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        "model": "coding",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8192,
+        "stream": stream,
+    }
+    body[control] = (
+        2048 if control == "thinking_budget" else {"type": "enabled", "budget_tokens": 2048}
+    )
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "data: [DONE]" in response.text
+        chunks = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            "".join(
+                choice.get("delta", {}).get("content", "")
+                for chunk in chunks
+                for choice in chunk.get("choices", [])
+            )
+            == "hello world"
+        )
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    payload = captured[0]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    elif "thinking" in payload:
+        assert payload["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+        assert payload["max_tokens"] == 8192
+    else:
+        assert payload["thinking_budget"] == 2048
+        if payload["model"] == "qwen3.8-max":
+            assert payload["max_completion_tokens"] == 8192
+            assert "max_tokens" not in payload
+        else:
+            assert payload["max_tokens"] == 6144
+            assert "max_completion_tokens" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget",), indirect=True)
+@pytest.mark.parametrize("budget", (0, -1, 24576))
+def test_gemini_sentinels_survive_native_http(engine: _ServingEngine, budget: int) -> None:
+    """Zero and dynamic thinking remain explicit controls rather than omissions."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    assert payload["generationConfig"] == {
+        "thinkingConfig": {"thinkingBudget": budget},
+        "maxOutputTokens": 8192,
+    }
+
+
+@pytest.mark.parametrize("engine", ("gemini-budget", "qwen-budget:kimi-k2.5"), indirect=True)
+@pytest.mark.parametrize("stream", (False, True))
+def test_messages_budget_crosses_native_non_anthropic_routes(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """Messages clients preserve nested budgets when the selected native wire supports them."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={"x-api-key": engine.raw_key, "anthropic-version": "2023-06-01"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8192,
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "stream": stream,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    if stream:
+        events = [
+            json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+        ]
+        assert "".join(event.get("delta", {}).get("text", "") for event in events) == "hello world"
+        assert events[-1]["type"] == "message_stop"
+    else:
+        assert response.json()["content"][0]["text"] == "hello world"
+    with _SseUpstream.payloads_lock:
+        payload = _SseUpstream.payloads[-1]
+    if "generationConfig" in payload:
+        assert payload["generationConfig"] == {
+            "thinkingConfig": {"thinkingBudget": 2048},
+            "maxOutputTokens": 8192,
+        }
+    else:
+        assert payload["thinking_budget"] == 2048
+        assert payload["max_tokens"] == 6144
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize(
+    "engine,budget",
+    (("gemini-budget", 24577), ("qwen-budget:kimi-k3", 2048), ("qwen-budget:glm-5.3", 2048)),
+    indirect=("engine",),
+)
+def test_incapable_numeric_budget_never_reaches_upstream(
+    engine: _ServingEngine, budget: int
+) -> None:
+    """An invalid range or a model that ignores budgets fails before network dispatch."""
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {engine.raw_key}"},
+        json={
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_budget": budget,
+            "max_tokens": 8192,
+        },
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "thinking_budget"
+    with _SseUpstream.payloads_lock:
+        assert _SseUpstream.payloads == []

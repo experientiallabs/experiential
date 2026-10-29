@@ -6,7 +6,7 @@ import errno
 import os
 import pty
 import re
-import select
+import selectors
 import shutil
 import signal
 import subprocess
@@ -14,35 +14,67 @@ import sys
 import tarfile
 import termios
 import time
+import tomllib
 import zipfile
+from email.parser import Parser
 from pathlib import Path, PurePosixPath
 from typing import cast
+from unittest.mock import Mock
 
 from click import unstyle
 
+from exp.common.core.artifacts import canonical_json_bytes
+from exp.runtime.gateway.client_apps import CLIENT_APP_LABELS, ClientApp
+
+if sys.platform != "win32":
+    import fcntl
+    import resource
+
 if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
-FORBIDDEN_REQUIREMENT = re.compile(
-    r"(?mi)^Requires-Dist:\s*(?:anthropic|environment-capture|gepa|mlx-lm|"
-    r"opentelemetry-proto|scikit-learn|transformers)(?:\s|[<>=;~!])"
+FORBIDDEN_REQUIREMENTS = frozenset(
+    {
+        "anthropic",
+        "environment-capture",
+        "gepa",
+        "mlx-lm",
+        "opentelemetry-proto",
+        "scikit-learn",
+        "transformers",
+    }
 )
 REQUIRED_CORE_REQUIREMENTS = frozenset(
     {
+        "anyio",
         "boto3",
         "botocore",
         "click",
+        "exp-gateway-native",
         "filelock",
+        "google-auth",
+        "google-re2",
         "httpx",
+        "httpx2",
+        "ijson",
+        "jsonschema",
         "numpy",
         "openai",
         "posthog",
         "pydantic",
         "rich",
+        "tiktoken",
         "tomli-w",
+        "truststore",
         "typer",
     }
+)
+REQUIRED_CAPTURE_REQUIREMENTS = frozenset(
+    {"brotli", "cryptography", "exp-mitmproxy", "exp-mitmproxy-rs", "zstandard"}
 )
 REQUIRED_WHEEL_MODULES = frozenset(
     {
@@ -62,6 +94,12 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "exp/runtime/models/registry.py",
         "exp/runtime/router/application.py",
         "exp/simulation/comparison.py",
+        "exp/common/evaluations/reconstruction.py",
+        "exp/runtime/models/providers/admitted_transport.py",
+        "exp/runtime/sessions/store.py",
+        "exp/simulation/reconstruction/workflow.py",
+        "exp/simulation/reconstruction/prompts/reconstruct.txt",
+        "exp/simulation/world_model/durable.py",
         "exp/simulation/engines/sandbox.py",
         "exp/optimize/router/automatic/service.py",
         "exp/optimize/router/composition.py",
@@ -74,9 +112,12 @@ REQUIRED_WHEEL_MODULES = frozenset(
 )
 REQUIRED_SDIST_MEMBERS = frozenset(
     {
+        "LICENSE",
         "README.md",
         "assets/experiential-workflow.png",
         "docs/reference/gateway-architecture.md",
+        "docs/reference/gateway-egress.md",
+        "docs/reference/gateway-request-policy.md",
         "docs/release-scope.md",
         "docs/usage.md",
         "pyproject.toml",
@@ -175,16 +216,146 @@ def _sdist_metadata(archive: tarfile.TarFile) -> str:
     return extracted.read().decode("utf-8")
 
 
+def _metadata_requirements(metadata: str) -> tuple[tuple[str, str], ...]:
+    """Return normalized dependency names and markers from metadata headers only.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Dependency names paired with their environment-marker text.
+    """
+    requirements: list[tuple[str, str]] = []
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for requirement in headers.get_all("Requires-Dist", []):
+        name = re.split(r"[<>=;~!\[\s(]", requirement, maxsplit=1)[0]
+        name = re.sub(r"[-_.]+", "-", name).casefold()
+        marker = requirement.partition(";")[2].strip()
+        requirements.append((name, marker))
+    return tuple(requirements)
+
+
+def _assert_allowed_requirements(metadata: str) -> None:
+    """Reject forbidden dependencies, permitting Anthropic solely in the dev extra.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Raises:
+        AssertionError: A forbidden dependency appears outside the sole dev SDK exception.
+    """
+    for name, marker in _metadata_requirements(metadata):
+        allowed_dev_sdk = name == "anthropic" and re.fullmatch(r"extra\s*==\s*(['\"])dev\1", marker)
+        assert name not in FORBIDDEN_REQUIREMENTS or allowed_dev_sdk, (
+            f"forbidden release requirement: {name}; {marker}"
+        )
+
+
 def _core_requirement_names(metadata: str) -> frozenset[str]:
-    """Return normalized non-extra dependency names from package metadata."""
-    names: set[str] = set()
-    for line in metadata.splitlines():
-        if not line.startswith("Requires-Dist:") or "; extra ==" in line:
+    """Return dependencies unless gated solely by one named extra equality.
+
+    Args:
+        metadata: Complete wheel METADATA or sdist PKG-INFO text.
+
+    Returns:
+        Normalized names, conservatively retaining mixed or runtime-capable markers.
+    """
+    return frozenset(
+        name
+        for name, marker in _metadata_requirements(metadata)
+        if not re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker)
+    )
+
+
+def _assert_core_requirements(metadata: str) -> None:
+    """Check SDK requirements, exact pins (extras too), HTTPX2 floor and Python-gated Capture."""
+    _assert_allowed_requirements(metadata)
+    requirements: dict[str, str] = {}
+    for name, marker in _metadata_requirements(metadata):
+        if re.fullmatch(r"extra\s*==\s*(['\"])[A-Za-z0-9][A-Za-z0-9._-]*\1", marker):
             continue
-        requirement = line.removeprefix("Requires-Dist:").strip()
-        name = re.split(r"[<>=;~!\s]", requirement, maxsplit=1)[0].casefold()
-        names.add(name)
-    return frozenset(names)
+        assert name not in requirements, f"duplicate core dependency: {name}"
+        requirements[name] = re.sub(r"\s+", "", marker).replace("'", '"')
+    assert frozenset(requirements) == REQUIRED_CORE_REQUIREMENTS | REQUIRED_CAPTURE_REQUIREMENTS
+    for name, marker in requirements.items():
+        expected = 'python_version>="3.13"' if name in REQUIRED_CAPTURE_REQUIREMENTS else ""
+        assert marker == expected, f"unexpected dependency marker for {name}: {marker!r}"
+    headers = Parser().parsestr(metadata, headersonly=True)
+    for value in headers.get_all("Requires-Dist", []):
+        requirement = Requirement(re.sub(r"\s+", " ", value))
+        name = requirement.name.casefold()
+        if name == "experiential":
+            # The dev extra's experiential[sft] names this same release.
+            assert not requirement.specifier, f"self-reference carries a version: {value}"
+            continue
+        if name == "openai":
+            # Callers' own code imports the SDK, so it alone stays a certified range.
+            assert requirement.specifier == SpecifierSet(">=3.0,<4"), (
+                f"unexpected OpenAI SDK range: {requirement.specifier}"
+            )
+            continue
+        specifiers = list(requirement.specifier)
+        assert (
+            len(specifiers) == 1
+            and specifiers[0].operator == "=="
+            and "*" not in specifiers[0].version
+        ), f"release requirement is not an exact pin: {value}"
+        if name == "httpx2":
+            assert Version(specifiers[0].version) >= Version("2.12"), (
+                f"HTTPX2 pin is below its security floor: {requirement.specifier}"
+            )
+
+
+def test_core_dependency_markers_preserve_sdk_python_312() -> None:
+    """Gate Capture's TLS dependencies without silently narrowing SDK compatibility."""
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    assert project["requires-python"] == ">=3.12"
+    metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
+    _assert_core_requirements(metadata)
+    _assert_core_requirements(metadata + "\n\nRequires-Dist: anthropic>=1.2")
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic==1.2.0; extra == "dev"')
+    for marker in ("", '; python_version >= "3.13"'):
+        with pytest.raises(AssertionError, match="forbidden release requirement"):
+            _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
+
+
+def _published_requires_dist() -> list[str]:
+    """Return the Requires-Dist values the built metadata lists, extras included.
+
+    Returns:
+        Core requirements, then each extra's requirements with its marker.
+    """
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    values = list(project["dependencies"])
+    for extra, requirements in project["optional-dependencies"].items():
+        for requirement in requirements:
+            spec, _, marker = requirement.partition(";")
+            marker = f"({marker.strip()}) and " if marker else ""
+            values.append(f'{spec.strip()}; {marker}extra == "{extra}"')
+    return values
+
+
+def test_release_requirements_reject_ranges_wildcards_and_versioned_self_reference() -> None:
+    """The published set passes; one wildcard, extra range or pinned self-reference fails.
+
+    The cases loop inside one test: the installed-release driver imports this module
+    without pytest, so module-level pytest decorators cannot appear here.
+    """
+    published = _published_requires_dist()
+    _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in published))
+    cases = (
+        ("filelock==", "filelock==3.*", "not an exact pin"),
+        ("tinker==", 'tinker>=0.23; extra == "sft"', "not an exact pin"),
+        ("experiential[sft]", 'experiential[sft]==0.7.216; extra == "dev"', "self-reference"),
+    )
+    for original, replacement, message in cases:
+        values = list(published)
+        index = next(i for i, value in enumerate(values) if value.startswith(original))
+        values[index] = replacement
+        with pytest.raises(AssertionError, match=message):
+            _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in values))
 
 
 def _assert_current_archive_members(
@@ -226,9 +397,12 @@ def _tracked_sdist_members() -> frozenset[str]:
             "git",
             "ls-files",
             ".gitignore",
+            "LICENSE",
             "README.md",
             "assets",
             "docs/reference/gateway-architecture.md",
+            "docs/reference/gateway-egress.md",
+            "docs/reference/gateway-request-policy.md",
             "docs/release-scope.md",
             "docs/usage.md",
             "pyproject.toml",
@@ -352,9 +526,11 @@ def _run_tty_child(
     completion_seen = completion_marker is None
     terminal_closed = False
     deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
     try:
+        selector.register(master, selectors.EVENT_READ)
         while process.poll() is None and time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.1)
+            readable = selector.select(timeout=0.1)
             if readable:
                 try:
                     chunk = os.read(master, 65_536)
@@ -410,7 +586,7 @@ def _run_tty_child(
             raise AssertionError(f"interactive CLI timed out:\n{transcript}")
         if not terminal_closed:
             while True:
-                readable, _, _ = select.select([master], [], [], 0)
+                readable = selector.select(timeout=0)
                 if not readable:
                     break
                 try:
@@ -423,10 +599,13 @@ def _run_tty_child(
                     break
                 transcript += chunk.decode(errors="replace")
     finally:
+        selector.close()
         os.close(master)
     assert process.returncode == 0, transcript
     assert not pending, f"unanswered prompts {pending}:\n{transcript}"
-    assert completion_seen, f"missing completion marker {completion_marker!r}:\n{transcript}"
+    assert completion_marker is None or completion_marker in transcript, (
+        f"missing completion marker {completion_marker!r}:\n{transcript}"
+    )
     return transcript
 
 
@@ -457,6 +636,7 @@ def _installed_release_driver() -> None:
 
     import exp
     from exp.cli.gateway.key_output import key_output_marker_path
+    from exp.common.core.locks import file_write_lock
     from exp.common.models import (
         BillingSource,
         CandidateTokenPrice,
@@ -487,7 +667,8 @@ def _installed_release_driver() -> None:
     from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from exp.optimize.router.judging.service import prepare_manual_judge_calibration
     from exp.runtime.gateway.catalog_authority import (
-        upsert_certified_pool,
+        apply_certified_pool_update,
+        plan_certified_pool_update,
         upsert_connection,
         upsert_singleton_deployment,
     )
@@ -1334,7 +1515,7 @@ def _installed_release_driver() -> None:
                 SELECT attempt_id, request_id, attempt_ordinal, route_depth,
                        deployment_id, billing_source, state, failure_class,
                        input_tokens, cached_input_tokens, output_tokens,
-                       reasoning_tokens, estimated_cost_micro_usd
+                       reasoning_tokens, estimated_cost_nano_usd
                 FROM gateway_attempts
                 ORDER BY started_at, request_id, attempt_ordinal, attempt_id
                 """
@@ -1353,7 +1534,7 @@ def _installed_release_driver() -> None:
             Billing source and attributed cost keyed by attempt ID.
         """
         return {
-            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_micro_usd"])
+            str(row["attempt_id"]): (row["billing_source"], row["estimated_cost_nano_usd"])
             for row in rows
         }
 
@@ -1377,7 +1558,11 @@ def _installed_release_driver() -> None:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 output = process.stdout.read() if process.stdout is not None else ""
-                raise AssertionError(f"exp gateway exited before startup:\n{output}")
+                errors = process.stderr.read() if process.stderr is not None else ""
+                raise AssertionError(
+                    f"exp gateway exited before startup (exit {process.returncode}):\n"
+                    f"{output}\n--- stderr ---\n{errors}"
+                )
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                     return
@@ -1386,7 +1571,7 @@ def _installed_release_driver() -> None:
         raise AssertionError(f"exp gateway did not listen on port {port}")
 
     def start_gateway(root: Path) -> tuple[subprocess.Popen[str], int, str]:
-        """Start one installed gateway subprocess on an unused loopback port.
+        """Start the accounting-only privacy canary with explicit content opt-out.
 
         Args:
             root: Configured gateway root.
@@ -1398,6 +1583,7 @@ def _installed_release_driver() -> None:
         process = subprocess.Popen(
             [
                 str(executable),
+                "--ghost",
                 "--root",
                 str(root),
                 "--port",
@@ -1536,14 +1722,15 @@ def _installed_release_driver() -> None:
             "--supports-streaming-tool-arguments",
             "--maximum-output-tokens",
             "4096",
+            # nano-USD per million tokens: $1 / $0.50 / $2 / $3.
             "--input-price",
-            "1000000",
+            "1000000000",
             "--cached-input-price",
-            "500000",
+            "500000000",
             "--output-price",
-            "2000000",
+            "2000000000",
             "--reasoning-price",
-            "3000000",
+            "3000000000",
             "--pricing-source",
             "deterministic loopback fixture",
             "--billing-source",
@@ -1710,10 +1897,11 @@ def _installed_release_driver() -> None:
         ]
         assert [row["state"] for row in auth_attempts] == ["failed", "completed"]
         assert auth_attempts[0]["failure_class"] == "provider_authentication"
-        assert auth_attempts[0]["estimated_cost_micro_usd"] is None
+        assert auth_attempts[0]["estimated_cost_nano_usd"] is None
         assert auth_attempts[1]["input_tokens"] == 3
         assert auth_attempts[1]["output_tokens"] == 2
-        assert auth_attempts[1]["estimated_cost_micro_usd"] == 7
+        # 3 input tokens at $1/M + 2 output tokens at $2/M = $0.000007 = 7_000 nano-USD.
+        assert auth_attempts[1]["estimated_cost_nano_usd"] == 7_000
 
         with OpenAI(api_key=raw_key, base_url=base_url, timeout=10) as client:
             assert [model.id for model in client.models.list().data] == ["coding"]
@@ -2035,11 +2223,11 @@ def _installed_release_driver() -> None:
         usage_json_body = usage_json_response.text
         usage_html_body = usage_html_response.text
         usage_payload = usage_json_response.json()
-        assert usage_payload["schema_version"] == 2
+        assert usage_payload["schema_version"] == 3
         identity_usage = usage_payload["identities"][0]
         assert usage_payload["totals"]["requests"] >= 14
         assert usage_payload["totals"]["attempts"] > usage_payload["totals"]["requests"]
-        assert usage_payload["totals"]["known_estimated_cost_micro_usd"] > 0
+        assert usage_payload["totals"]["known_estimated_cost_nano_usd"] > 0
         terminal_counts = {
             item["state"]: item["attempts"] for item in usage_payload["totals"]["terminal_counts"]
         }
@@ -2066,11 +2254,11 @@ def _installed_release_driver() -> None:
             == (usage_payload["totals"]["reasoning_tokens"])
         )
         assert (
-            sum(cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in attempt_rows)
-            == (usage_payload["totals"]["known_estimated_cost_micro_usd"])
+            sum(cast(int | None, row["estimated_cost_nano_usd"]) or 0 for row in attempt_rows)
+            == (usage_payload["totals"]["known_estimated_cost_nano_usd"])
         )
         assert (
-            sum(row["estimated_cost_micro_usd"] is None for row in attempt_rows)
+            sum(row["estimated_cost_nano_usd"] is None for row in attempt_rows)
             == (usage_payload["totals"]["unknown_cost_attempts"])
         )
         source_buckets = usage_payload["by_billing_source"]
@@ -2098,11 +2286,11 @@ def _installed_release_driver() -> None:
             assert bucket["reasoning_tokens"] == sum(
                 cast(int | None, row["reasoning_tokens"]) or 0 for row in source_rows
             )
-            assert bucket["known_estimated_cost_micro_usd"] == sum(
-                cast(int | None, row["estimated_cost_micro_usd"]) or 0 for row in source_rows
+            assert bucket["known_estimated_cost_nano_usd"] == sum(
+                cast(int | None, row["estimated_cost_nano_usd"]) or 0 for row in source_rows
             )
             assert bucket["unknown_cost_attempts"] == sum(
-                row["estimated_cost_micro_usd"] is None for row in source_rows
+                row["estimated_cost_nano_usd"] is None for row in source_rows
             )
             expected_source_terminals = {
                 state: sum(row["state"] == state for row in source_rows)
@@ -2119,7 +2307,7 @@ def _installed_release_driver() -> None:
             identity_usage["cached_input_tokens"],
             identity_usage["output_tokens"],
             identity_usage["reasoning_tokens"],
-            identity_usage["known_estimated_cost_micro_usd"],
+            identity_usage["known_estimated_cost_nano_usd"],
             identity_usage["unknown_cost_attempts"],
             identity_usage["total_latency_ms"],
             ", ".join(
@@ -2136,15 +2324,34 @@ def _installed_release_driver() -> None:
                 bucket["cached_input_tokens"],
                 bucket["output_tokens"],
                 bucket["reasoning_tokens"],
-                bucket["known_estimated_cost_micro_usd"],
+                bucket["known_estimated_cost_nano_usd"],
                 bucket["unknown_cost_attempts"],
                 ", ".join(
                     f"{item['state']}: {item['attempts']}" for item in bucket["terminal_counts"]
                 ),
             )
         )
+        # The test drives the gateway with the OpenAI SDK and plain httpx, which carry no app
+        # identity, so every request lands under one of those two caller kinds.
+        app_buckets = usage_payload["by_client_app"]
+        assert {bucket["client_app"] for bucket in app_buckets} <= {"openai_sdk", "custom_code"}
+        assert sum(bucket["requests"] for bucket in app_buckets) == identity_usage["requests"]
+        assert sum(bucket["attempts"] for bucket in app_buckets) == identity_usage["attempts"]
+        expected_app_cells = tuple(
+            value
+            for bucket in app_buckets
+            for value in (
+                CLIENT_APP_LABELS[ClientApp(bucket["client_app"])],
+                bucket["requests"],
+                bucket["attempts"],
+                bucket["input_tokens"],
+                bucket["output_tokens"],
+                bucket["known_estimated_cost_nano_usd"],
+                bucket["unknown_cost_attempts"],
+            )
+        )
         assert tuple(re.findall(r"<td>(.*?)</td>", usage_html_body)) == tuple(
-            str(value) for value in (*expected_cells, *expected_source_cells)
+            str(value) for value in (*expected_cells, *expected_source_cells, *expected_app_cells)
         )
 
         invalid_auth = httpx.get(
@@ -2221,31 +2428,35 @@ def _installed_release_driver() -> None:
             provider_model=provider_model,
             exact_model_id="project-exact-model",
             revision=None,
-            capabilities=ModelCapabilities(),
+            capabilities=ModelCapabilities(maximum_output_tokens=32_000),
             gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=2_000_000,
+                # $1 / $2 per million tokens, in nano-USD.
+                input_nano_usd_per_million_tokens=1_000_000_000,
+                output_nano_usd_per_million_tokens=2_000_000_000,
             ),
             pricing_source="installed project fixture",
             billing_source=billing_source,
             replace=False,
         )
     assert project_catalog is not None
-    project_catalog, project_snapshot, _changed = upsert_certified_pool(
-        project_root,
-        pool_id="project-pool",
-        exact_model_id="project-exact-model",
-        deployment_aliases=("cheap", "baseline"),
-        certification=GatewayEquivalenceCertification(
-            certification_id="installed-project-certification",
-            provenance="installed deterministic exact-model fixture",
-            evidence_sha256="c" * 64,
-            certified_at=datetime(2026, 8, 19, tzinfo=UTC),
-        ),
-        expected_catalog_sha256=project_catalog.identity_sha256(),
-        replace=False,
-    )
+    with file_write_lock(project_root / "models.toml", what="the installed project pool catalog"):
+        pool_update = plan_certified_pool_update(
+            project_root,
+            pool_id="project-pool",
+            exact_model_id="project-exact-model",
+            deployment_aliases=("cheap", "baseline"),
+            certification=GatewayEquivalenceCertification(
+                certification_id="installed-project-certification",
+                provenance="installed deterministic exact-model fixture",
+                evidence_sha256="c" * 64,
+                certified_at=datetime(2026, 8, 19, tzinfo=UTC),
+            ),
+            expected_catalog_sha256=project_catalog.identity_sha256(),
+            replace=False,
+        )
+        apply_certified_pool_update(project_root, pool_update)
+    project_catalog, project_snapshot = pool_update.normalized, pool_update.snapshot
     project_manager.activate_project_alias(
         alias_id="project-coding",
         alias_name="project-coding",
@@ -2390,7 +2601,6 @@ def _installed_release_driver() -> None:
     assert state.count_containing("project-secondary-model") == project_secondary_before + 1
     assert learned_client.embed_calls == 0
     assert learned_client.complete_calls == 0
-    assert learned_runtime.records_decisions is False
     assert not (project_root / "projects").exists()
     with sqlite3.connect(project_manager.database_path) as connection:
         project_attempts = connection.execute(
@@ -2547,7 +2757,7 @@ def _installed_release_driver() -> None:
             "world model  core-model (core-model)",
             "embedder     core-model (core-model)",
             "embedding    at most $0.000000",
-            "ceiling      $5.000000",
+            "budget       $5.000000",
         ):
             assert expected in plain_build_output, build_output
         assert "Proceed?" not in plain_build_output
@@ -2593,7 +2803,7 @@ def _installed_release_driver() -> None:
             session.id,
             {"role": "assistant", "content": "What account email is associated?"},
         )
-        assert observation.message == {
+        assert observation.messages[0] == {
             "role": "user",
             "content": "P17 generated world observation",
         }
@@ -2721,10 +2931,13 @@ def _installed_release_driver() -> None:
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output
         assert "Complete" in optimization_output
-        optimized_artifacts = directory_digest(support_store.paths.artifacts_directory)
+        optimized_artifacts = tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        )
         optimized_catalog = (root / "models.toml").read_bytes()
-        optimized_project = support_store.paths.project_toml.read_bytes()
-        optimized_review = support_store.paths.review_json.read_bytes()
+        optimized_project = canonical_json_bytes(support_store.load_project())
+        optimized_review = canonical_json_bytes(support_store.read_review())
         optimized_provider_requests = state.snapshot()
         replay_result = run_cli(
             *optimize_arguments[:-1],
@@ -2733,9 +2946,15 @@ def _installed_release_driver() -> None:
         assert "replay: verified completed optimization" in replay_result.stdout
         assert state.snapshot() == optimized_provider_requests
         assert (root / "models.toml").read_bytes() == optimized_catalog
-        assert support_store.paths.project_toml.read_bytes() == optimized_project
-        assert support_store.paths.review_json.read_bytes() == optimized_review
-        assert directory_digest(support_store.paths.artifacts_directory) == optimized_artifacts
+        assert canonical_json_bytes(support_store.load_project()) == optimized_project
+        assert canonical_json_bytes(support_store.read_review()) == optimized_review
+        assert (
+            tuple(
+                (artifact_id, support_store.artifacts.read(artifact_id))
+                for artifact_id in support_store.artifacts.list_ids()
+            )
+            == optimized_artifacts
+        )
 
         router_port = unused_loopback_port()
         provider_calls_before_run = state.snapshot()
@@ -2855,8 +3074,11 @@ def _installed_release_driver() -> None:
         events_before_public_replay = journal.read_events()
         provider_before_public_replay = state.snapshot()
         gateway_database = root / "gateway" / "gateway.db"
-        artifacts_before_public_replay = directory_digest(support_store.paths.artifacts_directory)
-        project_before_public_replay = support_store.paths.project_toml.read_bytes()
+        artifacts_before_public_replay = tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        )
+        project_before_public_replay = canonical_json_bytes(support_store.load_project())
         with sqlite3.connect(gateway_database) as connection:
             gateway_requests_before_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
@@ -2898,10 +3120,11 @@ def _installed_release_driver() -> None:
             assert duplicate_second.choices[0].message.content == "Duplicate routed target"
         assert journal.read_events() == events_before_public_replay
         assert state.snapshot() != provider_before_public_replay
-        assert support_store.paths.project_toml.read_bytes() == project_before_public_replay
-        assert directory_digest(support_store.paths.artifacts_directory) == (
-            artifacts_before_public_replay
-        )
+        assert canonical_json_bytes(support_store.load_project()) == project_before_public_replay
+        assert tuple(
+            (artifact_id, support_store.artifacts.read(artifact_id))
+            for artifact_id in support_store.artifacts.list_ids()
+        ) == (artifacts_before_public_replay)
         with sqlite3.connect(gateway_database) as connection:
             gateway_requests_after_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
@@ -2946,6 +3169,44 @@ def _installed_release_driver() -> None:
         assert not server_thread.is_alive()
 
 
+def test_tty_child_checks_marker_after_draining_exited_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check the final transcript when a child exits before the first poll.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture forcing child exit before the interactive polling loop.
+    """
+    for output in ("NO MARKER", "COMPLETE"):
+        process = Mock(returncode=0)
+        process.poll.return_value = 0
+        selector = Mock()
+        selector.select.return_value = [(None, selectors.EVENT_READ)]
+        monkeypatch.setattr(subprocess, "Popen", Mock(return_value=process))
+        monkeypatch.setattr(selectors, "DefaultSelector", Mock(return_value=selector))
+        monkeypatch.setattr(os, "read", Mock(side_effect=[output.encode(), b""]))
+        command = [sys.executable, "-c", "pass"]
+        if output == "NO MARKER":
+            with pytest.raises(AssertionError, match="missing completion marker"):
+                _run_tty_child(
+                    command,
+                    cwd=tmp_path,
+                    environment=os.environ.copy(),
+                    answers=[],
+                    completion_marker="COMPLETE",
+                )
+        else:
+            transcript = _run_tty_child(
+                command,
+                cwd=tmp_path,
+                environment=os.environ.copy(),
+                answers=[],
+                completion_marker="COMPLETE",
+            )
+            assert "COMPLETE" in transcript
+
+
 def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
     """Treat terminal closure before child reaping as a clean bounded exit.
 
@@ -2987,6 +3248,47 @@ def test_tty_child_exit_survives_terminal_close_races(tmp_path: Path) -> None:
     assert all("COMPLETE" in transcript for transcript in transcripts)
 
 
+def test_tty_child_supports_descriptors_above_select_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive a real pseudo-terminal whose master is above select's descriptor ceiling.
+
+    Args:
+        tmp_path: Isolated child working directory.
+        monkeypatch: Fixture replacing only pseudo-terminal descriptor allocation.
+    """
+    if sys.platform == "win32":
+        pytest.skip("High-numbered pseudo-terminal descriptors require POSIX.")
+
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1024:
+        pytest.skip("The process descriptor limit does not allow a high-numbered terminal.")
+    openpty = pty.openpty
+
+    def high_descriptor_pty() -> tuple[int, int]:
+        """Duplicate the real terminal master above FD_SETSIZE without opening many files."""
+        master, slave = openpty()
+        try:
+            high_master = fcntl.fcntl(master, fcntl.F_DUPFD, 1024)
+        except OSError:
+            os.close(slave)
+            raise
+        finally:
+            os.close(master)
+        return high_master, slave
+
+    monkeypatch.setattr(pty, "openpty", high_descriptor_pty)
+    transcript = _run_tty_child(
+        [sys.executable, "-c", "assert input('Prompt: ') == 'yes'; print('COMPLETE', flush=True)"],
+        cwd=tmp_path,
+        environment=os.environ.copy(),
+        answers=[("Prompt:", "yes")],
+        completion_marker="COMPLETE",
+        timeout=5,
+    )
+    assert "COMPLETE" in transcript
+
+
 def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
     tmp_path: Path,
 ) -> None:
@@ -3026,14 +3328,113 @@ def test_gateway_canary_scanner_covers_every_persistent_and_observable_channel(
             )
 
 
+def _ci_job(area: str, name: str) -> str:
+    """Return the raw YAML block of one top-level job in a GitLab CI file.
+
+    Args:
+        area: File path under ``.gitlab/ci`` without the ``.yml`` suffix, such as
+            ``python-package``.
+        name: Top-level job or hidden key.
+
+    Returns:
+        The job's indented block, without the job name line.
+    """
+    repository = Path(__file__).resolve().parent.parent.parent
+    text = (repository / ".gitlab" / "ci" / f"{area}.yml").read_text(encoding="utf-8")
+    block = text.split(f"\n{name}:\n", 1)[1]
+    return re.split(r"\n(?=\S)", block, maxsplit=1)[0]
+
+
 def test_package_workflow_installs_the_exact_certified_openai_sdk() -> None:
     """The archive smoke lane constrains the SDK version claimed by certification."""
-    repository = Path(__file__).resolve().parent.parent.parent
-    workflow = (repository / ".github" / "workflows" / "python-package.yml").read_text(
-        encoding="utf-8"
-    )
+    assert 'dist/*.whl "openai==3.0.0"' in _ci_job("python-package", "python-package-build")
 
-    assert 'dist/*.whl "openai==3.0.0"' in workflow
+
+def test_capture_release_imports_cannot_modify_the_publish_artifact() -> None:
+    """Public Capture dependencies execute only against an isolated artifact copy."""
+    build = _ci_job("python-package", "python-package-build")
+    smoke = _ci_job("python-package", "python-package-capture-smoke")
+    publish = _ci_job("python-package", "python-package-publish")
+    assert "uv venv --python 3.12 /tmp/exp-wheel-smoke" in build
+    assert "import mitmproxy" not in build
+    assert "    - job: python-package-build\n" in smoke
+    assert "$CI_COMMIT_TAG =~ /^v" in smoke
+    assert '$PYTHON_PACKAGE_PUBLISH == "true"' in smoke
+    assert "import mitmproxy, mitmproxy_rs" in smoke
+    assert "artifacts:" not in smoke
+    assert "id_tokens" not in smoke
+    assert "    - job: python-package-build\n" in publish
+    assert "    - job: python-package-capture-smoke\n      artifacts: false\n" in publish
+
+
+def test_release_publishes_only_from_protected_tags_with_every_wheel() -> None:
+    """A release publishes only from a protected ref, with every wheel and the stored token."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    text = (repository / ".gitlab" / "ci" / "python-package.yml").read_text(encoding="utf-8")
+    wheels = re.findall(r"^(python-package-wheel-[a-z0-9_-]+):\n", text, re.MULTILINE)
+    assert len(wheels) == 5
+    publish = _ci_job("python-package", "python-package-publish")
+    for wheel in wheels:
+        assert "  rules: !reference [.python-package-rules, rules]\n" in _ci_job(
+            "python-package", wheel
+        )
+        assert f"    - job: {wheel}\n" in publish
+        assert f"    - job: {wheel}\n      optional: true" not in publish
+    for job in ("python-package-capture-smoke", "python-package-publish"):
+        tag_rule = next(
+            line for line in _ci_job("python-package", job).splitlines() if "CI_COMMIT_TAG" in line
+        )
+        assert '$CI_COMMIT_REF_PROTECTED == "true"' in tag_rule
+    assert "id_tokens" not in publish
+    assert "    name: pypi\n" in publish
+    native_upload = publish.index('UV_PUBLISH_TOKEN="${PYPI_TOKEN_EXP_GATEWAY_NATIVE}"')
+    flagship_upload = publish.index('UV_PUBLISH_TOKEN="${PYPI_TOKEN_EXPERIENTIAL}"')
+    assert native_upload < flagship_upload, "experiential must not precede its native release"
+    assert "dist/exp_gateway_native-*\n" in publish[native_upload:flagship_upload]
+    assert publish.count("--trusted-publishing never") == 2
+    # The token's environment scope is pypi, so only the job in that environment
+    # receives it.
+    assert re.findall(r"^  environment:\n    name: (\S+)$", text, re.MULTILINE) == ["pypi"]
+
+
+def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture() -> None:
+    """Windows needs executed kernel tests, while whole-package Capture stays on 3.13."""
+    repository = Path(__file__).resolve().parent.parent.parent
+    workflow = (repository / ".github" / "workflows" / "gate.yml").read_text()
+    windows = workflow.split("  windows-snapshot-authority:\n", 1)[1].split(
+        "  w16-darwin-evidence:\n", 1
+    )[0]
+    assert "runs-on: windows-latest" in windows
+    assert 'UV_PYTHON: "3.12"' in windows
+    assert 'EXP_TELEMETRY: "0"' in windows
+    job_configuration = windows.split("    steps:\n", 1)[0]
+    assert "runner." not in job_configuration, "runner context is unavailable before job routing"
+    test_step = windows.split("      - name: Verify real Windows snapshot authority\n", 1)[1]
+    test_step = test_step.split("      - name:", 1)[0]
+    assert (
+        "        env:\n          XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth"
+        in test_step
+    )
+    assert "pytest --noconftest" in windows
+    selectors = tuple(
+        line.strip() for line in test_step.splitlines() if line.strip().startswith("exp/")
+    )
+    assert selectors == (
+        "exp/runtime/gateway/snapshot_file_windows_test.py",
+        "exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer",
+        "exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth",
+        "exp/runtime/gateway/snapshot_file_test.py::test_growth_after_initial_stat_still_obeys_the_read_budget",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_resource_override_and_reachable_authority",
+        "exp/runtime/gateway/budget_authority_test.py::test_pinned_graph_file_refuses_unauthorized_targets",
+        "exp/runtime/gateway/budget_authority_test.py::test_snapshot_bound_accepts_exact_limit_and_rejects_digest_mismatch",
+        "exp/common/config/settings_test.py",
+    )
+    assert "exp/cli/" not in windows, "Windows authority proof does not import the Unix-only CLI"
+    assert "assert len(kernel) == 25" in windows
+    assert '("skipped", "failure", "error")' in windows
+    for job in ("  gate:\n", "  w16-darwin-evidence:\n"):
+        assert 'UV_PYTHON: "3.13"' in workflow.split(job, 1)[1].split("    steps:", 1)[0]
+    assert "uv run pytest -q exp/runtime/capture exp/cli/capture" in workflow
 
 
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
@@ -3079,6 +3480,17 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         environment=environment,
     )
     installed_python = virtual_environment / "bin" / "python"
+    # Exercise the exact prerelease forks in the isolated installation. The publishing
+    # workflow separately requires their normal PyPI requirements to resolve on 3.13.
+    capture_sources: list[str] = []
+    if sys.version_info >= (3, 13):
+        project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
+        for name in ("exp-mitmproxy", "exp-mitmproxy-rs"):
+            source = project["tool"]["uv"]["sources"][name]
+            location = f"git+{source['git']}@{source['rev']}"
+            if "subdirectory" in source:
+                location += f"#subdirectory={source['subdirectory']}"
+            capture_sources.append(f"{name} @ {location}")
     _run_checked(
         [
             uv,
@@ -3087,6 +3499,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             "--python",
             str(installed_python),
             *(str(wheel) for wheel in wheels),
+            *capture_sources,
             "openai==3.0.0",
         ],
         cwd=execution,
@@ -3110,6 +3523,65 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
         environment=driver_environment,
         timeout=600,
     )
+
+
+def test_release_requirements_allow_anthropic_only_in_the_dev_extra() -> None:
+    """Permit the SDK drift check without admitting Anthropic to installed runtime extras."""
+    for marker in ('extra == "dev"', "extra == 'dev'"):
+        _assert_allowed_requirements(f"Requires-Dist: anthropic<2,>=1.2; {marker}\n\n")
+    for marker in (
+        "",
+        'extra == "sft"',
+        'extra == "dev" or extra == "sft"',
+        'extra == "dev" or python_version >= "3.12"',
+        'extra != "dev"',
+    ):
+        metadata = f"Requires-Dist: anthropic<2,>=1.2{'; ' + marker if marker else ''}\n\n"
+        with pytest.raises(AssertionError, match="forbidden release requirement: anthropic"):
+            _assert_allowed_requirements(metadata)
+
+
+def test_release_requirements_keep_other_forbidden_dependencies_out_of_extras() -> None:
+    """The dev SDK exception never admits other removed dependencies or spelling aliases."""
+    for name in FORBIDDEN_REQUIREMENTS - {"anthropic"}:
+        for spelling in (name, name.replace("-", "_").upper()):
+            for marker in ("", '; extra == "dev"', '; extra == "sft"'):
+                metadata = f"Requires-Dist: {spelling}>=1{marker}\n\n"
+                with pytest.raises(AssertionError, match="forbidden release requirement"):
+                    _assert_allowed_requirements(metadata)
+
+
+def test_release_requirement_headers_ignore_description_body() -> None:
+    """Folded headers count as dependencies while README text never changes the contract."""
+    metadata = (
+        "Metadata-Version: 2.5\n"
+        "Requires-Dist: google_auth>=2\n"
+        'Requires-Dist: click>=8; python_version >= "3.12"\n'
+        "Requires-Dist: anthropic<2,>=1.2;\n"
+        ' extra == "dev"\n'
+        "\nRequires-Dist: transformers>=4\n"
+        "Requires-Dist: imaginary-core-package>=1\n"
+    )
+    _assert_allowed_requirements(metadata)
+    assert _core_requirement_names(metadata) == {"google-auth", "click"}
+
+
+def test_release_core_requirements_retain_runtime_capable_extra_markers() -> None:
+    """Runtime-active OR and empty-extra markers cannot hide a new core dependency."""
+    core_headers = "\n".join(f"Requires-Dist: {name}" for name in REQUIRED_CORE_REQUIREMENTS)
+    for marker in (
+        'extra == "dev" or python_version >= "3.12"',
+        'python_version >= "3.12" or extra == "dev"',
+        'extra == ""',
+        'extra != "dev"',
+    ):
+        metadata = f"{core_headers}\nRequires-Dist: unexpected-runtime-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS | {
+            "unexpected-runtime-package"
+        }
+    for marker in ('extra == "dev"', "extra == 'sft'"):
+        metadata = f"{core_headers}\nRequires-Dist: optional-package; {marker}\n\n"
+        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
 
 
 def test_built_archives_match_current_package_contract() -> None:
@@ -3144,8 +3616,7 @@ def test_built_archives_match_current_package_contract() -> None:
             if not name.startswith("exp/") and ".dist-info/" not in name
         )
         assert not outside_package, f"wheel carries members outside the package: {outside_package}"
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
     with tarfile.open(sdists[0], mode="r:gz") as sdist:
         names = tuple(
@@ -3156,8 +3627,7 @@ def test_built_archives_match_current_package_contract() -> None:
         assert frozenset(name for name in names if name and not name.endswith("/")) == (
             _tracked_sdist_members() | {"PKG-INFO"}
         )
-        assert FORBIDDEN_REQUIREMENT.search(metadata) is None
-        assert _core_requirement_names(metadata) == REQUIRED_CORE_REQUIREMENTS
+        _assert_core_requirements(metadata)
 
 
 def test_w16_public_evidence_apis_resolve_from_release_owners() -> None:
@@ -3191,7 +3661,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "exp config gateway pool certify" in usage
     assert "exp --root ROOT" in usage
     assert "OpenAI `3.0.0`" in usage
-    assert "schema-v2" in usage
+    assert "schema-v3" in usage
     assert "by_billing_source" in usage
     assert "exp optimize route" not in usage.replace("exp optimize router", "")
     assert "exp auth" not in usage
@@ -3212,11 +3682,11 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
 
     architecture = (docs / "reference" / "gateway-architecture.md").read_text(encoding="utf-8")
     assert "GET /v1/models" in architecture
-    assert "micro-USD-per-million-token" in architecture
+    assert "nano-USD-per-million-token" in architecture
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
     assert "provider_certification.py" in architecture
-    assert "schema-v2" in architecture
+    assert "schema-v3" in architecture
     assert "by_billing_source" in architecture
     assert "inert contracts" not in architecture
     assert "does not claim that a gateway server" not in architecture
@@ -3228,3 +3698,19 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
 
 if __name__ == "__main__" and os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") == "1":
     _installed_release_driver()
+
+
+def test_buffer_advisory_exception_is_bound_to_the_reviewed_source() -> None:
+    """Changing the dependency invalidates the narrow false-positive exception."""
+    root = Path(__file__).resolve().parents[2]
+    policy = tomllib.loads((root / ".gitlab/ci/osv-scanner.toml").read_text())
+    if not any(item["id"] == "GHSA-qwgh-2vcv-g2f7" for item in policy["IgnoredVulns"]):
+        return
+    lock = tomllib.loads((root / "exp/runtime/gateway/native/Cargo.lock").read_text())
+    buffers = [item for item in lock["package"] if item["name"] == "block-buffer"]
+    assert len(buffers) == 1
+    assert buffers[0]["version"] == "0.10.4"
+    assert buffers[0]["source"] == "registry+https://github.com/rust-lang/crates.io-index"
+    assert (
+        buffers[0]["checksum"] == "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+    )

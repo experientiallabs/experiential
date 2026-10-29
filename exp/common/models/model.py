@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Sequence
 from enum import StrEnum
+from operator import not_
 from typing import Final, Literal
 
 from pydantic import (
@@ -32,6 +33,22 @@ _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
 ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
+ToolArgumentsTreatment = Literal[
+    "double_encoded_json", "truncated_json", "non_object_json", "invalid_json"
+]
+"""How a replayed call's ``arguments`` object stands in for raw text that encodes no object.
+
+``double_encoded_json``: the text is a JSON string whose value encodes the object.
+``truncated_json``: the text is a cut-off object prefix, closed without inventing content.
+``non_object_json``: the text is a JSON value that is not an object, kept verbatim in a wrapper.
+``invalid_json``: the text is not JSON at all, kept verbatim in a wrapper.
+"""
+
+MAXIMUM_TOOL_CALL_ID_CHARACTERS: Final = 65_536
+"""Bound opaque tool identifiers, including provider-carried reasoning signatures."""
+
+MAXIMUM_THOUGHT_SIGNATURE_CHARACTERS: Final = 1_048_576
+"""Bound one Gemini thought signature, matching the gateway's 1 MiB evidence bound."""
 
 DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
 """Reasoning effort pinned by default for models known to accept the parameter.
@@ -78,12 +95,35 @@ class Usage(ContractModel):
 
     Cache-read and cache-write counts are subsets of ``input_tokens`` when present. They never
     replace the total input count and must not be added a second time by callers.
+    ``output_tokens`` is total generated usage, including provider-reported reasoning tokens;
+    reasoning is a subset and must not be added again.
+
+    Attributes:
+        input_tokens: Total observed input, including cache-read and cache-write subsets.
+        output_tokens: Total observed generated tokens, including reasoning.
+        cached_input_tokens: Observed read subset, or None when unreported.
+        cache_write_input_tokens: Observed write subset, or None when unreported.
+        cache_write_1h_input_tokens: Observed one-hour portion of writes; zero and None differ.
+        cache_write_12h_input_tokens: Observed OpenAI 12-hour portion of writes, disjoint
+            from the one-hour portion; None when the provider reported no lifetime split.
+        reasoning_tokens: Observed reasoning portion of output, or None when unreported.
+        service_tier: Explicitly returned processing tier; None uses the ordinary request basis.
     """
 
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_write_input_tokens: int | None = Field(default=None, ge=0)
+    cache_write_1h_input_tokens: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    cache_write_12h_input_tokens: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    reasoning_tokens: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
+    service_tier: str | None = Field(
+        default=None, min_length=1, max_length=64, exclude_if=lambda value: value is None
+    )
 
 
 class NumericMeasurement(ContractModel):
@@ -101,11 +141,31 @@ class NumericMeasurement(ContractModel):
 
 
 class OperationEconomics(ContractModel):
-    """Usage, cost, and latency observed for one isolated operation."""
+    """Usage, cost, and latency observed for one isolated operation.
 
+    Attributes:
+        provider_attempts: Observed dispatch attempts, or None when not reported.
+        unbilled_attempts: Trusted pre-dispatch refusals included in provider_attempts. Zero is
+            omitted from serialized evidence to preserve artifacts without admission retries.
+        usage: Successful-response token accounting, when available.
+        cost_usd: Observed or conservatively estimated provider charge.
+        latency_seconds: Observed or estimated operation duration.
+    """
+
+    provider_attempts: int | None = Field(default=None, ge=1)
+    unbilled_attempts: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     latency_seconds: NumericMeasurement | None = None
+
+    @model_validator(mode="after")
+    def validate_unbilled_attempts(self) -> OperationEconomics:
+        """Require a complete observed attempt count before releasing known unpaid retries."""
+        if self.unbilled_attempts and (
+            self.provider_attempts is None or self.unbilled_attempts > self.provider_attempts
+        ):
+            raise ValueError("unbilled attempts require a matching observed total attempt count")
+        return self
 
 
 def combine_economics(
@@ -162,6 +222,27 @@ def _sum_usage(values: Sequence[Usage]) -> Usage:
         output_tokens=sum(value.output_tokens for value in values),
         cached_input_tokens=cached_total,
         cache_write_input_tokens=written_total,
+        cache_write_1h_input_tokens=_sum_optional_counts(
+            tuple(value.cache_write_1h_input_tokens for value in values)
+        ),
+        cache_write_12h_input_tokens=_sum_optional_counts(
+            tuple(value.cache_write_12h_input_tokens for value in values)
+        ),
+        reasoning_tokens=_sum_optional_counts(tuple(value.reasoning_tokens for value in values)),
+        service_tier=(
+            values[0].service_tier
+            if all(value.service_tier == values[0].service_tier for value in values)
+            else None
+        ),
+    )
+
+
+def _sum_optional_counts(values: Sequence[int | None]) -> int | None:
+    """Sum one observed subset only when every constituent reports it."""
+    return (
+        sum(value for value in values if value is not None)
+        if all(value is not None for value in values)
+        else None
     )
 
 
@@ -198,7 +279,7 @@ class ToolCall(ContractModel):
     immutable artifacts but join gateway idempotency identity explicitly.
     """
 
-    call_id: str = Field(min_length=1, max_length=256)
+    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     name: str = Field(min_length=1, max_length=256)
     arguments: JsonObject = Field(default_factory=dict)
     raw_arguments: str | None = Field(
@@ -206,6 +287,16 @@ class ToolCall(ContractModel):
         max_length=4_000_000,
         exclude=True,
     )
+    arguments_treatment: ToolArgumentsTreatment | None = Field(default=None, exclude=True)
+    """Set when ``raw_arguments`` is a replayed call's exact text that encodes no JSON object.
+
+    Agent sessions replay calls the model itself emitted malformed or cut off
+    at ``max_tokens``; OpenAI's own API treats such text as opaque. The raw
+    text then stays verbatim for wires that take it, and ``arguments`` is the
+    faithful object stand-in every object wire receives (see
+    ``exp.runtime.models.providers.history_tool_arguments``). Excluded from
+    serialization like the other replay fields.
+    """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching hint attached to this tool call.
 
@@ -222,6 +313,61 @@ class ToolCall(ContractModel):
         default=None,
         exclude=True,
     )
+    provider_namespace: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude=True,
+    )
+    """Nested tool tree (OpenAI Responses ``namespace``) that declared this call.
+
+    Set when a Responses caller replays a ``function_call`` item carrying
+    ``namespace``, or when the provider emits one; the field must round-trip
+    verbatim because the provider rejects a namespaced call replayed without
+    it. The tree itself is declared through ``GatewayProviderNativeTool``
+    ``namespace`` entries; this is the per-item linkage back to it. Excluded
+    from serialization like the other replay fields, and joins gateway replay
+    identity explicitly.
+    """
+    provider_caller: JsonObject | None = Field(default=None, exclude=True)
+    custom: bool = Field(default=False, exclude=True)
+    """Whether this call targets a freeform OpenAI Responses ``custom`` tool.
+
+    Set when a Codex ``custom`` tool declaration was translated to a function
+    tool for a foreign wire; the Responses response inverts it back to a
+    ``custom_tool_call`` whose ``input`` is the freeform text. Excluded from
+    serialization like the other replay carriers; it rides on the live
+    response only and never on an immutable artifact."""
+    """Opaque SDK 3.0 ``caller`` attribution on a Responses tool-call item.
+
+    Programmatic tool calling attributes a ``function_call`` or
+    ``custom_tool_call`` to the program that invoked it (for example
+    ``{"type": "program", "id": ...}``). The object's internal shape is an
+    evolving provider surface, so it is validated only as an object and
+    round-trips verbatim like ``provider_namespace``: set when a Responses
+    caller replays an item carrying ``caller`` or when the provider emits
+    one. Excluded from serialization like the other replay fields, and joins
+    gateway replay identity explicitly.
+    """
+    provider_thought_signature: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAXIMUM_THOUGHT_SIGNATURE_CHARACTERS,
+        exclude=True,
+    )
+    """Gemini's opaque ``thoughtSignature`` for this call.
+
+    Gemini signs a function call (the first one of a parallel batch) and
+    expects the signature back with that call on the next turn; without it,
+    the replayed call carries Google's documented placeholder, which Google
+    warns may degrade reasoning. Chat and Responses callers round-trip it as
+    ``extra_content.google.thought_signature``, the shape Google's own
+    OpenAI-compatible endpoint uses; a Chat tool call also accepts it as a
+    top-level ``thought_signature``. Only the Gemini and Vertex wires read it;
+    every other wire ignores it (a Chat route with no such rung discloses it).
+    Excluded from serialization like the other replay fields, and joins
+    gateway replay identity explicitly.
+    """
 
     @model_validator(mode="after")
     def _require_matching_raw_arguments(self) -> ToolCall:
@@ -231,9 +377,17 @@ class ToolCall(ContractModel):
             The validated tool call.
 
         Raises:
-            ValueError: Raw arguments are invalid JSON, not an object, or change the parsed value.
+            ValueError: Untreated raw arguments are invalid JSON, not an object, or change the
+                parsed value, or a treatment names no raw text.
         """
-        if self.raw_arguments is not None:
+        if self.arguments_treatment is not None:
+            # The raw text deliberately encodes no object; ``arguments`` is
+            # the decoder's stand-in for it, so the two cannot match.
+            if self.raw_arguments is None:
+                raise ValueError(
+                    "a tool arguments treatment requires the raw text it stands in for"
+                )
+        elif self.raw_arguments is not None:
             try:
                 parsed = _JSON_OBJECT_ADAPTER.validate_json(self.raw_arguments)
             except ValidationError as exc:
@@ -277,22 +431,22 @@ class AssistantAction(ContractModel):
 
 
 class ModelMessage(ContractModel):
-    """One request-visible message exchanged with a model."""
+    """One request-visible message exchanged with a model.
 
-    role: Literal["system", "user", "assistant", "tool"]
+    Attributes:
+        role: Required system, developer, user, assistant, or tool author role.
+        content: Optional visible text; required unless an assistant action is supplied.
+        tool_call_id: Optional tool-result linkage, allowed only for tool messages.
+        assistant_action: Optional structured output, allowed only for assistant messages.
+        content_parts: Ordered text/media content, empty by default and excluded from serialization.
+            Text parts concatenate to content; supported providers retain the exact interleaving.
+    """
+
+    role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
     tool_call_id: str | None = None
     assistant_action: AssistantAction | None = None
     content_parts: tuple[MessageContentPart, ...] = Field(default=(), exclude=True)
-    """Ordered caller content parts when a user message carries attachments.
-
-    Empty on every text-only message. The text parts concatenate to
-    ``content``, so selectors, simulators, and persisted artifacts keep
-    seeing exactly the text they saw before media existed; provider clients
-    that can carry media read the parts and emit the caller's exact
-    interleaving. Excluded from serialization so identities of text-only
-    requests are byte-identical to pre-media traffic.
-    """
 
     @model_validator(mode="after")
     def _require_message_payload(self) -> ModelMessage:
@@ -305,8 +459,16 @@ class ModelMessage(ContractModel):
         if self.role == "tool" and self.tool_call_id is None:
             raise ValueError("tool messages require tool_call_id")
         if self.content_parts:
-            if self.role != "user":
-                raise ValueError("content parts are valid only for user messages")
+            # Tool results carry screenshots too (Bedrock toolResult image
+            # blocks); the Gemini and Bedrock wires build from this contract.
+            if self.role not in ("user", "tool", "assistant"):
+                raise ValueError(
+                    "content parts are valid only for user, tool, and assistant messages"
+                )
+            if self.role in ("tool", "assistant") and any(
+                part.kind not in ("text", "image") for part in self.content_parts
+            ):
+                raise ValueError(f"{self.role} messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -408,7 +570,7 @@ class ModelCapabilities(ContractModel):
     temperature capability for ``top_p`` and omit the less portable controls. Reasoning models
     that pin their sampling reject temperature and nucleus sampling, so clients omit both when
     the route says they are unsupported. ``supports_logprobs`` remains provider metadata, but
-    public logprob requests fail locally until normalized responses can expose their values.
+    direct model responses cannot return probabilities; gateway Chat has its own lossless contract.
     ``supports_reasoning`` is an explicit wire capability, not an inference from
     ``reasoning_effort``. ``reasoning_effort`` pins an explicit reasoning-effort level only when
     that capability is true.
@@ -419,6 +581,10 @@ class ModelCapabilities(ContractModel):
     # Image generation is served only on a positive claim, like embeddings:
     # ``None`` is unknown and never dispatches to the images surface.
     supports_image_generation: bool | None = None
+    # Mixed text/image output on Chat Completions. This drives native output
+    # admission and stream bounds independently of the dedicated Images API,
+    # whose admission is controlled by supports_image_generation.
+    emits_images: bool = False
     supports_structured_output: bool = False
     supports_completions: bool | None = None
     supports_temperature: bool = True
@@ -431,6 +597,50 @@ class ModelCapabilities(ContractModel):
     reasoning_effort: ReasoningEffort | None = None
     sampling_requires_reasoning_none: bool = False
     """Whether temperature and top-p are valid only with ``reasoning_effort='none'``."""
+    reasoning_output_exposed: bool = False
+    """Whether this rung's native plaintext reasoning is surfaced to the caller.
+
+    Off by default so hidden-reasoning providers (OpenAI o-series) never leak
+    chain-of-thought. Turned on per rung only for the exposable-plaintext
+    category (e.g. Tencent Hunyuan) so the caller sees the thinking it is already
+    billed for; the tool-loop round-trip token always stays the domain-separated
+    opaque carrier regardless of this flag. Exposure is additionally gated at the
+    wire on a carrier-route identity, so an absent capability fails closed and
+    reasoning stays stripped even on an otherwise-exposable endpoint.
+    """
+    reasoning_output_hidden: bool = False
+    """Whether this rung withholds its model's reasoning text from the caller.
+
+    Off by default: every rung returns the readable reasoning its provider
+    streams (plaintext reasoning, thinking, and reasoning summaries) as display
+    copy beside the content. Display never changes replay or the sealed
+    carrier. Stamping it is the per-rung operator opt-out.
+    """
+    reasoning_content_native: bool = False
+    """Whether this OpenAI-compatible rung speaks the native ``reasoning_content`` contract.
+
+    The origin returns the model's chain-of-thought in the standard
+    ``reasoning_content`` response field and accepts it back on assistant turns
+    (Tencent Hunyuan's contract, and a self-hosted vLLM origin started with a
+    reasoning parser). Declaring it makes the rung a preserved-thinking carrier
+    route regardless of its hostname, so the same model self-hosted keeps the
+    contract Tencent's own origins carry by recognition. Off by default: an
+    undeclared origin never gets a carrier route, and exposure still requires
+    ``reasoning_output_exposed`` on top.
+    """
+    system_messages_leading_only: bool = False
+    """Whether this rung's chat template accepts a system message only as the first message.
+
+    The official Qwen3.6+ ``chat_template.jinja`` raises ``System message must
+    be at the beginning.`` for any system turn that is not the first message
+    (a second leading system turn included), so a vLLM origin serving that
+    template 400s the whole request when a coding agent injects a system turn
+    mid-conversation. On a declared rung the Chat wire builder folds every
+    instruction turn past the first into user text in place; an undeclared
+    rung's messages are never rewritten. A per-rung serving-stack fact, so it
+    is an operator declaration and stays out of the frozen identity like the
+    other gateway flags.
+    """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
     maximum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -444,6 +654,18 @@ class ModelCapabilities(ContractModel):
     output_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
     cached_input_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
     cache_write_cost_per_million_tokens_usd: float | None = Field(default=None, ge=0)
+    service_tier_pricing_enabled: bool = False
+    """Whether this model carries per-provider-tier PASS-THROUGH pricing.
+
+    When set, a HOST-funded rung forwards ``service_tier`` to the provider for a
+    tier it carries a card for (see ``GatewayWireProfile.forwards_tier``) and
+    settlement bills the REQUESTED tier at that card's per-tier rates (v1 prices
+    the requested tier; billing the served tier the provider reports back is a
+    follow-up). A flex/priority request to a model with no card for that tier
+    fails closed at admission. BYOK rungs forward regardless. Additive and
+    excluded from the capability identity digest: tier pricing propagates
+    through the catalog publish, not the digest.
+    """
 
     @field_validator(
         "input_cost_per_million_tokens_usd",
@@ -511,6 +733,10 @@ class ModelCapabilities(ContractModel):
             "supports_reasoning",
             "reasoning_effort",
             "sampling_requires_reasoning_none",
+            "reasoning_output_exposed",
+            "reasoning_output_hidden",
+            "reasoning_content_native",
+            "system_messages_leading_only",
             "chat_max_tokens_field",
             "minimum_temperature",
             "maximum_temperature",
@@ -522,6 +748,10 @@ class ModelCapabilities(ContractModel):
             "output_cost_per_million_tokens_usd",
             "cached_input_cost_per_million_tokens_usd",
             "cache_write_cost_per_million_tokens_usd",
+            # Pricing/policy, not a protocol-boundary capability: kept out of the
+            # identity like the cost fields so enabling per-tier pass-through
+            # pricing propagates through the catalog publish, not a re-digest.
+            "service_tier_pricing_enabled",
         }
         excluded.add("supports_completions")
         # Image generation is admitted fail-closed on its own surface, so the
@@ -529,6 +759,9 @@ class ModelCapabilities(ContractModel):
         # it out of the identity like supports_completions so existing traces
         # and frozen catalogs keep their digests.
         excluded.add("supports_image_generation")
+        # Same reasoning: emitting images changes how the data plane settles an
+        # output-less turn, never what a dispatch may do.
+        excluded.add("emits_images")
         return sha256_json(self.model_dump(mode="json", exclude=excluded))
 
 
@@ -548,13 +781,17 @@ class ModelRequest(ContractModel):
         temperature: Optional sampling temperature.
         top_p: Optional nucleus-sampling probability mass in ``[0, 1]``.
         top_k: Optional maximum number of candidate tokens considered during sampling.
-        logprobs: Optional request for token log probabilities. Gateway serving rejects a true
-            request until normalized responses can return them losslessly.
+        logprobs: Optional probability control, unsupported by direct ModelResponse projection.
+            Gateway Chat serving uses a separate lossless response contract.
         top_logprobs: Optional count for alternate token probabilities, subject to the same
             lossless-response requirement as ``logprobs``.
         reasoning_effort: Optional caller-selected reasoning effort, preserved only on routes that
             explicitly declare support.
         maximum_output_tokens: Optional upper bound for generated tokens.
+        json_object_output: Request one JSON object, without a JSON schema. Chat, Responses,
+            and Gemini use native JSON mode; other adapters add an explicit instruction.
+            Callers must still validate the response. Omitted when false to retain ordinary
+            saved request identities.
     """
 
     messages: tuple[ModelMessage, ...] = Field(min_length=1)
@@ -567,6 +804,7 @@ class ModelRequest(ContractModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
     reasoning_effort: ReasoningEffort | None = None
     maximum_output_tokens: int | None = Field(default=None, gt=0)
+    json_object_output: bool = Field(default=False, exclude_if=not_)
 
     @model_validator(mode="after")
     def _require_coherent_tools_and_messages(self) -> ModelRequest:

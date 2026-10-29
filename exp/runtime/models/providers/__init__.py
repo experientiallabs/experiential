@@ -25,6 +25,8 @@ from exp.runtime.models.providers.protocol import (
     AsyncCompletedModelClient,
     BoundedSyncModelClientAdapter,
     SyncModelClientAdapter,
+    emulated_gateway_capabilities,
+    emulated_stop_sequences,
     preflight_gateway_request,
     require_gateway_provider,
 )
@@ -65,6 +67,8 @@ __all__ = [
     "TinkerSamplingClient",
     "TinkerSdkSampler",
     "create_tinker_sampler",
+    "emulated_gateway_capabilities",
+    "emulated_stop_sequences",
     "preflight_gateway_request",
     "require_gateway_provider",
 ]

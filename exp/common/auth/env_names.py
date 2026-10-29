@@ -13,6 +13,7 @@ CANONICAL_API_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
     "azure": "AZURE_OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
     "tinker": "TINKER_API_KEY",

@@ -1,13 +1,23 @@
 //! Upstream provider HTTP transport over one shared pooled client.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
-use crate::param_attribution::{rejected_detail, rejected_model_not_found, rejected_parameter};
+use crate::param_attribution::{
+    bounded_masked_line, content_filtered_completion, generic_error_code,
+    rejected_by_account_quota, rejected_by_lane_limitation, rejected_by_routing_gate,
+    rejected_caller_reference_not_found, rejected_code, rejected_detail,
+    rejected_encrypted_reasoning, rejected_model_not_found, rejected_parameter,
+    rejected_via_decode_failure, sanitized_detail,
+};
+use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
+
+mod network;
+pub(crate) use network::UpstreamClient;
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a
@@ -16,14 +26,40 @@ use crate::param_attribution::{rejected_detail, rejected_model_not_found, reject
 /// `connect_timeout` bounds only the TCP+TLS connect phase; a dead lane whose
 /// host never accepts the connection fails over after this window instead of
 /// hanging on the per-deployment request timeout.
-pub fn build_client(connect_timeout: Duration) -> Result<reqwest::Client, String> {
+///
+/// A public-only (hosted) client also carries a tenant-origin sibling whose
+/// sockets additionally refuse the platform's own infrastructure and any port
+/// outside the tenant set ([`UpstreamClient::for_origin`]).
+pub fn build_client(
+    connect_timeout: Duration,
+    public_only: bool,
+) -> Result<UpstreamClient, String> {
+    let failed = |error: reqwest::Error| format!("upstream client construction failed: {error}");
+    if !public_only {
+        return client_builder(connect_timeout)
+            .build()
+            .map(|inner| UpstreamClient::new(inner, false))
+            .map_err(failed);
+    }
+    let policy = std::sync::Arc::new(network::TenantPolicy::from_env());
+    let public = network::restrict(client_builder(connect_timeout))
+        .build()
+        .map_err(failed)?;
+    let tenant = network::restrict_tenant(client_builder(connect_timeout), policy.clone())
+        .build()
+        .map_err(failed)?;
+    Ok(UpstreamClient::new(public, true).with_tenant(tenant, policy))
+}
+
+/// One transport configuration shared by production and protocol-level tests.
+fn client_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .pool_max_idle_per_host(64)
         .connect_timeout(connect_timeout)
         .redirect(reqwest::redirect::Policy::none())
+        // The waterfall owns every physical retry and its reservation, including H2 nacks.
+        .retry(reqwest::retry::never())
         .use_rustls_tls()
-        .build()
-        .map_err(|error| format!("upstream client construction failed: {error}"))
 }
 
 /// Classify one sanitized HTTP or connection failure by status only,
@@ -106,6 +142,17 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
     Failure::new(class, message).with_retry(retryable, failover)
 }
 
+/// Pin TypeSafe rejection evidence to the received status, never an inferred class.
+pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failure {
+    failure.decision_provider_rejected = matches!(status, 400 | 401 | 403 | 404 | 422);
+    // Zero-work accounting evidence does not itself authorize another call.
+    // Only a rejected credential may try an independently credentialed rung;
+    // every other status ends this request without automatic dispatch.
+    failure.retryable_same_deployment = false;
+    failure.failover_eligible = status == 401;
+    failure
+}
+
 /// Classify a lead that connected but never completed the request/response-header
 /// phase within `phase_timeout`. A deployment that accepted the connection but
 /// stalled awaiting response headers is the same dead-lane signal as a stalled
@@ -116,11 +163,15 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
 /// keeps a stalled lead's cost near one fail-fast window. It stays a
 /// `FailureClass::Timeout`, so it feeds the health circuit like other timeouts.
 fn open_timeout_failure() -> Failure {
-    Failure::new(
+    let mut failure = Failure::new(
         FailureClass::Timeout,
         "provider did not send response headers in time",
     )
-    .with_retry(false, true)
+    .with_retry(false, true);
+    // The rung's own allowance until the waterfall learns the shared budget
+    // cut the wait (`waterfall::attribute_header_timeout`).
+    failure.header_timeout = Some(crate::errors::HeaderTimeout::Allowance);
+    failure
 }
 
 /// Open one streaming POST and return the response on HTTP success. The
@@ -131,8 +182,143 @@ fn open_timeout_failure() -> Failure {
 /// (Bedrock SigV4): its signature covers those exact bytes, so it is sent
 /// verbatim with the signed headers instead of re-serializing `payload`.
 #[allow(clippy::too_many_arguments)]
+async fn open_upstream(
+    client: &UpstreamClient,
+    url: &str,
+    headers: &HashMap<String, String>,
+    idempotency_key: &str,
+    payload: &Value,
+    raw_body: Option<&str>,
+    phase_timeout: Duration,
+    dialect: Dialect,
+    decision_surface: bool,
+) -> Result<reqwest::Response, Failure> {
+    let mut request = client.post(url)?;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("idempotency-key") {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    // SystemOne defines no idempotency contract, so neither configured nor
+    // synthesized replay keys may imply protection against duplicate billing.
+    if dialect != Dialect::TypesafeSystemone {
+        request = request.header("Idempotency-Key", idempotency_key);
+    }
+    let send = match raw_body {
+        Some(body) => request.body(body.to_string()).send(),
+        None => request.json(payload).send(),
+    };
+    classify_open(send, payload, phase_timeout, dialect, decision_surface).await
+}
+
+/// POST one opaque binary body (a hand-encoded multipart upload) and classify
+/// the open exactly like [`open_stream`]: the same timeouts, status mapping,
+/// rate-limit harvesting, and provider-detail attribution. `attribution`
+/// carries the request's text fields so a provider sentence naming the
+/// caller's own model id is not redacted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_upload(
+    client: &UpstreamClient,
+    url: &str,
+    headers: &HashMap<String, String>,
+    idempotency_key: &str,
+    body: Vec<u8>,
+    content_type: &str,
+    attribution: &Value,
+    phase_timeout: Duration,
+) -> Result<reqwest::Response, Failure> {
+    let mut request = client.post(url)?;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("idempotency-key") || name.eq_ignore_ascii_case("content-type")
+        {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    let send = request
+        .header("Idempotency-Key", idempotency_key)
+        .header("Content-Type", content_type)
+        .body(body)
+        .send();
+    classify_open(
+        send,
+        attribution,
+        phase_timeout,
+        Dialect::OpenAiCompatible,
+        false,
+    )
+    .await
+}
+
+/// Await one upstream send under the header-phase bound and classify a
+/// non-success open into the engine's failure taxonomy (`decision_surface`
+/// selects the decisions surface's status-pinned rejection semantics).
+async fn classify_open(
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    payload: &Value,
+    phase_timeout: Duration,
+    dialect: Dialect,
+    decision_surface: bool,
+) -> Result<reqwest::Response, Failure> {
+    let phase_started = Instant::now();
+    let response = match tokio::time::timeout(phase_timeout, send).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            if error.is_timeout() {
+                return Err(open_timeout_failure());
+            }
+            // The failure stays a content-free transport class on the wire;
+            // the engine's own account of WHICH transport fault (never
+            // provider text) rides to the ledger so the row is diagnosable.
+            let mut failure = transport_failure(None)
+                .with_provider_detail(Some(transport_error_detail("open", &error)));
+            failure.graceful_transport_retirement = graceful_transport_retirement(&error);
+            return Err(failure);
+        }
+        Err(_) => return Err(open_timeout_failure()),
+    };
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let failure = non_success_failure(
+            response,
+            status,
+            payload,
+            phase_timeout,
+            phase_started,
+            dialect,
+        )
+        .await;
+        // A decision is billed whether or not a chat-style envelope explains
+        // the refusal: its HTTP status alone decides pre-execution rejection
+        // and the only failover (a rejected credential).
+        return Err(if decision_surface {
+            decision_http_failure(failure, status)
+        } else {
+            failure
+        });
+    }
+    Ok(response)
+}
+
+/// Recognize graceful connection retirement for health, never zero-work accounting.
+/// Hyper can substitute a connection-wide GOAWAY after enqueueing a request,
+/// so even this typed open error does not establish per-request non-processing.
+fn graceful_transport_retirement(error: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        if let Some(h2) = inner.downcast_ref::<h2::Error>() {
+            return h2.is_remote() && h2.is_go_away() && h2.reason() == Some(h2::Reason::NO_ERROR);
+        }
+        source = inner.source();
+    }
+    false
+}
+
+/// Open one streaming POST on any wire; see [`open_upstream`].
+#[allow(clippy::too_many_arguments)]
 pub async fn open_stream(
-    client: &reqwest::Client,
+    client: &UpstreamClient,
     url: &str,
     headers: &HashMap<String, String>,
     idempotency_key: &str,
@@ -141,64 +327,439 @@ pub async fn open_stream(
     phase_timeout: Duration,
     dialect: Dialect,
 ) -> Result<reqwest::Response, Failure> {
-    let mut request = client.post(url);
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("idempotency-key") {
-            continue;
-        }
-        request = request.header(name, value);
+    let decision_surface = dialect == Dialect::TypesafeSystemone;
+    open_upstream(
+        client,
+        url,
+        headers,
+        idempotency_key,
+        payload,
+        raw_body,
+        phase_timeout,
+        dialect,
+        decision_surface,
+    )
+    .await
+}
+
+/// Open one decisions-surface POST: the dialect parses the provider's error
+/// envelope, while the decision rejection semantics (status-pinned evidence,
+/// failover only on a rejected credential) apply whatever the dialect.
+pub(crate) async fn open_decision_stream(
+    client: &UpstreamClient,
+    url: &str,
+    headers: &HashMap<String, String>,
+    idempotency_key: &str,
+    payload: &Value,
+    phase_timeout: Duration,
+    dialect: Dialect,
+) -> Result<reqwest::Response, Failure> {
+    open_upstream(
+        client,
+        url,
+        headers,
+        idempotency_key,
+        payload,
+        None,
+        phase_timeout,
+        dialect,
+        true,
+    )
+    .await
+}
+
+/// Classify one non-success response from its status and bounded body.
+async fn non_success_failure(
+    response: reqwest::Response,
+    status: u16,
+    payload: &Value,
+    phase_timeout: Duration,
+    phase_started: Instant,
+    dialect: Dialect,
+) -> Failure {
+    // Rate-limit facts are read off the headers before anything consumes
+    // the response: a 429's `retry-after` and remaining-quota counts ride
+    // the failure into settlement (never to the caller), where the
+    // control plane sizes throttle windows and persists them per attempt.
+    let rate_limit = harvest_rate_limit_headers(response.headers());
+    let retry_after = retry_after_seconds(response.headers());
+    let failure =
+        transport_failure(Some(status)).with_rate_limit_facts(rate_limit.clone(), retry_after);
+    // Only the generic client-error class may carry attribution: the body
+    // is read bounded, and the relayable facts are a validated parameter
+    // path plus the provider's own bounded explanation of what the caller
+    // got wrong; every other class stays content-free. A 403 is read too,
+    // only to tell an aggregator routing gate from a credential verdict,
+    // a 404 to tell a caller's dangling reference from a missing model,
+    // and a 429 to tell an exhausted ACCOUNT from a throttle and to file
+    // the provider's code token (never its sentence) in the ledger.
+    // Every status-only classification carries the status itself as its
+    // ledger detail (`http 503`): the class alone could not tell a 502
+    // relay from a 500 model fault, and none of these classes relays
+    // detail to the caller.
+    let failure = if failure.failure_class == FailureClass::InvalidRequest {
+        failure
+    } else {
+        failure.with_provider_detail(Some(status_detail(status)))
+    };
+    if dialect == Dialect::TypesafeSystemone {
+        // This non-conversational wire has no documented chat error
+        // envelope. Its actual HTTP status, not provider prose or a
+        // guessed error class, establishes pre-execution rejection.
+        return failure;
     }
-    request = request.header("Idempotency-Key", idempotency_key);
-    let send = match raw_body {
-        Some(body) => request.body(body.to_string()).send(),
-        None => request.json(payload).send(),
+    if failure.failure_class != FailureClass::InvalidRequest
+        && status != 403
+        && status != 404
+        && status != 429
+    {
+        return failure;
+    }
+    // The attribution read never outlives the rung's own header-phase
+    // budget: a provider that answers its status and then stalls the body
+    // costs at most what was left of that window, never a further two
+    // seconds past the caller's deadline. A throttle is the hot path
+    // under load and its failover must stay near-immediate, so its read
+    // gets only the short budget: the small envelope normally arrives
+    // with the headers, and a provider that stalls after a 429 simply
+    // fails over content-free as before.
+    let read_timeout = if status == 429 {
+        THROTTLE_BODY_READ_TIMEOUT
+    } else {
+        ERROR_BODY_READ_TIMEOUT
     };
-    let response = match tokio::time::timeout(phase_timeout, send).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            if error.is_timeout() {
-                return Err(open_timeout_failure());
-            }
-            return Err(transport_failure(None));
-        }
-        Err(_) => return Err(open_timeout_failure()),
+    let body_budget = read_timeout.min(phase_timeout.saturating_sub(phase_started.elapsed()));
+    let body = match tokio::time::timeout(body_budget, bounded_error_body(response)).await {
+        Ok(Some(body)) => Some(body),
+        _ => None,
     };
-    let status = response.status().as_u16();
-    if !(200..300).contains(&status) {
-        let failure = transport_failure(Some(status));
-        // Only the generic client-error class may carry attribution: the body
-        // is read bounded, and the relayable facts are a validated parameter
-        // path plus the provider's own bounded explanation of what the caller
-        // got wrong; every other class stays content-free.
-        if failure.failure_class != FailureClass::InvalidRequest {
-            return Err(failure);
+    if body
+        .as_deref()
+        .is_some_and(crate::rejection_shapes::names_account_policy_block)
+    {
+        // An account-level policy block is the provider's verdict on the
+        // ACCOUNT, under whatever status the relay chose (OpenRouter answers
+        // 403 or a 400 `invalid_prompt`): the credential class, so the ladder
+        // fails over and the lane can be demoted. Ledger detail only.
+        return transport_failure(Some(403))
+            .with_provider_detail(Some(format!(
+                "{}: account_policy_block",
+                status_detail(status)
+            )))
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
+    if status == 429 {
+        // OpenAI answers an out-of-quota account with 429
+        // `insufficient_quota`, the same status as a throttle. A status-
+        // only read filed both as `throttled`, so the house exhaustion
+        // sweep (which reads `provider_quota`) never saw the account die.
+        // Any other code token rides the failure into the ledger only
+        // (a throttle's public error never relays detail): Novita's
+        // `RATE_LIMIT_EXCEEDED` versus `TOKEN_LIMIT_EXCEEDED` names which
+        // window closed, which its headers do not (2026-09-14: 205
+        // Novita 429s with 992-999 of 1000 requests remaining and no
+        // Retry-After).
+        let code = body
+            .as_deref()
+            .and_then(|body| rejected_code(dialect, body));
+        let detail = code
+            .as_deref()
+            .filter(|token| !generic_error_code(token))
+            .map(|token| format!("{}: {token}", status_detail(status)));
+        if crate::stream_errors::is_quota_code(code.as_deref()) {
+            return transport_failure(Some(402))
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after);
         }
-        let body = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, bounded_error_body(response))
-            .await
-        {
-            Ok(Some(body)) => Some(body),
-            _ => None,
+        return match detail {
+            Some(detail) => failure.with_provider_detail(Some(detail)),
+            None => failure,
         };
-        // A client-error status whose body names a missing model is the
-        // catalog's fault, not the caller's: it takes the 404 policy so the
-        // ladder advances instead of surfacing one dead rung as a 400.
+    }
+    if status == 404 {
+        // OpenAI answers 404 for an `item_reference`, `conversation`, or
+        // similar handle the caller sent but the provider does not hold
+        // (store=false items are never persisted). The catalog is fine and
+        // every rung would answer the same, so it is the caller's 400 with
+        // the provider's sentence, never a lane 404 that walks the ladder.
         if body
             .as_deref()
-            .is_some_and(|body| rejected_model_not_found(dialect, body))
+            .is_some_and(|body| rejected_caller_reference_not_found(dialect, body))
         {
-            return Err(transport_failure(Some(404)));
-        }
-        let parameter = body
-            .as_deref()
-            .and_then(|body| rejected_parameter(dialect, body));
-        let detail = body
-            .as_deref()
-            .and_then(|body| rejected_detail(dialect, body));
-        return Err(failure
+            let request_words: Vec<&str> = payload
+                .get("model")
+                .and_then(Value::as_str)
+                .into_iter()
+                .collect();
+            let detail = body
+                .as_deref()
+                .and_then(|body| rejected_detail(dialect, body, &request_words));
+            let parameter = body
+                .as_deref()
+                .and_then(|body| rejected_parameter(dialect, body));
+            return Failure::new(
+                FailureClass::InvalidRequest,
+                "the request references a provider-side item, response, or conversation \
+                 the provider does not hold; resend that content inline",
+            )
+            .with_retry(false, false)
             .with_rejected_parameter(parameter)
-            .with_provider_detail(detail));
+            .with_provider_detail(detail)
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+        }
+        return failure;
     }
-    Ok(response)
+    if status == 403 {
+        if body
+            .as_deref()
+            .is_some_and(|body| rejected_by_routing_gate(dialect, body))
+        {
+            return Failure::new(
+                FailureClass::ProviderNotFound,
+                "provider does not route this model for the gateway's account; ask \
+                 the gateway operator to change or disable the lane",
+            )
+            .with_retry(false, true)
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+        }
+        // A reseller's balance verdict under a 403 (Novita answers an
+        // unfunded account `403 NOT_ENOUGH_BALANCE`) is the ACCOUNT's
+        // funding state, not a credential one: it takes the quota class
+        // the house exhaustion sweep and pool rotation read, with the
+        // status and token as its ledger detail like every other
+        // operator-facing class.
+        let code = body
+            .as_deref()
+            .and_then(|body| rejected_code(dialect, body));
+        if crate::stream_errors::is_quota_code(code.as_deref()) {
+            let token = code.unwrap_or_default();
+            return transport_failure(Some(402))
+                .with_provider_detail(Some(format!("{}: {token}", status_detail(status))))
+                .with_rate_limit_facts(rate_limit.clone(), retry_after);
+        }
+        // A compatible relay can put Gemini's content verdict under 403.
+        // Read only the raw error envelope, never sanitized or echoed text.
+        let refusal = body.as_deref().and_then(|body| {
+            if !matches!(
+                dialect,
+                Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+            ) {
+                return None;
+            }
+            let value = crate::error_envelope::parse_error_document(body)?;
+            let envelope = crate::error_envelope::openai_family_envelope(&value)?;
+            let reason = crate::stream_errors::relayed_gemini_refusal(
+                envelope.code.as_deref(),
+                envelope.message,
+            )?;
+            let detail = envelope
+                .message
+                .and_then(|message| sanitized_detail(message, &[]));
+            Some((reason, detail))
+        });
+        if let Some((reason, detail)) = refusal {
+            return Failure::refusal(reason)
+                .with_provider_detail(detail)
+                .with_rate_limit_facts(rate_limit.clone(), retry_after);
+        }
+        return failure;
+    }
+    // A client-error status whose body names a missing model is the
+    // catalog's fault, not the caller's: it takes the 404 policy so the
+    // ladder advances instead of surfacing one dead rung as a 400.
+    if body
+        .as_deref()
+        .is_some_and(|body| rejected_model_not_found(dialect, body))
+    {
+        return transport_failure(Some(404))
+            .with_provider_detail(Some(format!("{}: model_not_found", status_detail(status))))
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
+    let parameter = body
+        .as_deref()
+        .and_then(|body| rejected_parameter(dialect, body));
+    // The payload's own model id is a caller-known word: a provider
+    // sentence naming it unquoted (Anthropic's client-version gate does)
+    // must not be redacted as infrastructure.
+    let request_words: Vec<&str> = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .into_iter()
+        .collect();
+    // A 4xx whose body is a COMPLETION finished `content_filter` (Azure
+    // Foundry's DeepSeek lanes answer their output filter this way, with
+    // no error envelope at all) is the model's verdict on the content:
+    // file and answer it as a refusal, the blocked label kept ledger-only,
+    // never as a request-shape error and never a failover (the next rung
+    // refuses the same content or, worse, serves it).
+    if let Some(filtered) = body
+        .as_deref()
+        .and_then(|body| content_filtered_completion(dialect, body))
+    {
+        let reason =
+            crate::stream_errors::refusal_reason(Some(&filtered.code), filtered.message.as_deref());
+        let detail = filtered
+            .message
+            .as_deref()
+            .and_then(|message| sanitized_detail(message, &request_words))
+            .or(Some(filtered.code));
+        return Failure::refusal(reason)
+            .with_provider_detail(detail)
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
+    let code = body
+        .as_deref()
+        .and_then(|body| rejected_code(dialect, body));
+    let detail = body
+        .as_deref()
+        .and_then(|body| rejected_detail(dialect, body, &request_words))
+        // A sentence the identifier screen dropped still leaves the
+        // provider's own code token: "invalid_value" beats "verify the
+        // request fields" for the caller and the ledger alike. A generic
+        // family type or bare status adds nothing and is not relayed.
+        .or_else(|| code.clone().filter(|token| !generic_error_code(token)));
+    // A relay that could not decode the UPSTREAM error it received (Novita's
+    // Go relay on a numeric `error.code`) answers its own 400 whose
+    // sentence embeds that upstream document: the class and the sentence
+    // the caller needs are the upstream's, so a relayed throttle or quota
+    // fails over as such and a relayed caller error keeps its real sentence
+    // instead of the decoder's noise.
+    let (code, detail) = match body
+        .as_deref()
+        .and_then(|body| rejected_via_decode_failure(dialect, body))
+    {
+        Some((upstream_code, upstream_sentence)) => {
+            let kind = crate::stream_errors::classify_stream_error(
+                upstream_code.as_deref(),
+                Some(&upstream_sentence),
+            );
+            let sanitized = sanitized_detail(&upstream_sentence, &request_words);
+            // The relay answered a client-error status, so an upstream
+            // sentence the classifier cannot place (its default is the
+            // provider-fault class) keeps this status's caller class with
+            // the upstream sentence; only a positively classified throttle,
+            // quota, credential, not-found or refusal verdict overrides it.
+            if !matches!(
+                kind,
+                crate::stream_errors::StreamErrorKind::InvalidRequest
+                    | crate::stream_errors::StreamErrorKind::ProviderInternal
+            ) {
+                let ledger_detail =
+                    sanitized.map(|text| format!("{}: {text}", status_detail(status)));
+                return crate::stream_errors::stream_failure(kind, ledger_detail)
+                    .with_rate_limit_facts(rate_limit.clone(), retry_after);
+            }
+            (upstream_code, sanitized)
+        }
+        None => (code, detail),
+    };
+    // A client-error status whose CODE or SENTENCE says the provider
+    // ACCOUNT cannot pay (Novita `400 "Insufficient quota available for
+    // instant inference"` on a drained prepaid balance) is the house
+    // account's funding state, never the caller's request: it takes the
+    // quota class the exhaustion sweep and pool rotation read, fails over,
+    // and keeps the sentence ledger-only like every operator-facing class.
+    if crate::stream_errors::is_quota_code(code.as_deref())
+        || body
+            .as_deref()
+            .is_some_and(|body| rejected_by_account_quota(dialect, body))
+    {
+        let ledger_detail = detail.as_deref().map_or_else(
+            || status_detail(status),
+            |text| format!("{}: {text}", status_detail(status)),
+        );
+        return transport_failure(Some(402))
+            .with_provider_detail(Some(ledger_detail))
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
+    // A content-filter CODE under a 4xx is the model's verdict on the
+    // content (Azure and Gemini answer 400 for it), not a request-shape
+    // error: file and answer it as a refusal naming its bounded category,
+    // detail kept ledger-only. Only the authoritative code decides here; a
+    // sentence saying "blocked by" could be about a firewall or a limit.
+    if crate::stream_errors::is_refusal_code(code.as_deref()) {
+        let reason = crate::stream_errors::refusal_reason(code.as_deref(), None);
+        return Failure::refusal(reason)
+            .with_provider_detail(detail)
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
+    // A sentence naming a limitation of THIS lane's serving stack (a chat
+    // template that rejects a mid-conversation system turn the OpenAI
+    // contract allows) keeps the caller's class and detail but fails over:
+    // another rung serves the same request, and only a route with no other
+    // rung surfaces the 400.
+    let lane_limitation = body
+        .as_deref()
+        .is_some_and(|body| rejected_by_lane_limitation(dialect, body));
+    // A refused replayed reasoning payload keeps the caller's class too,
+    // but the waterfall re-dials this rung once without those items
+    // before the class is allowed to surface.
+    let encrypted_reasoning = body
+        .as_deref()
+        .is_some_and(|body| rejected_encrypted_reasoning(dialect, body));
+    failure
+        .with_retry(false, lane_limitation)
+        .with_rejected_parameter(parameter)
+        .with_provider_detail(detail)
+        .with_encrypted_reasoning_rejected(encrypted_reasoning)
+}
+
+/// The ledger detail of one status-only classification.
+fn status_detail(status: u16) -> String {
+    format!("http {status}")
+}
+
+/// Longest transport cause text kept in a ledger detail.
+const TRANSPORT_CAUSE_LIMIT: usize = 120;
+
+/// The engine's own account of one connection-level failure, for the ledger.
+///
+/// A bare `transport` class hid what actually broke (2026-09-15: ~150
+/// transport settlements a day with no cause recorded), so the failure names
+/// the phase (`open` before headers, `stream` mid-body), reqwest's fault kind,
+/// and the innermost cause's own sentence (an OS error such as "Connection
+/// reset by peer (os error 54)", a TLS alert, hyper's "connection closed
+/// before message completed"). The reqwest layer's own text is skipped
+/// because it names the request URL; the cause text is then held to the same
+/// identifier mask as a provider sentence and bounded, so nothing shaped like
+/// a host or handle crosses. This is engine vocabulary about the engine's own
+/// socket, never provider body content, and no class it rides on relays
+/// detail to callers.
+pub(crate) fn transport_error_detail(phase: &str, error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "connect failed"
+    } else if error.is_body() {
+        "body read failed"
+    } else if error.is_decode() {
+        "decode failed"
+    } else if error.is_request() {
+        "request failed"
+    } else if error.is_redirect() {
+        "redirect refused"
+    } else {
+        "failed"
+    };
+    let mut cause: Option<String> = None;
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        cause = Some(inner.to_string());
+        source = inner.source();
+    }
+    let mut detail = format!("{phase} {kind}");
+    if let Some(cause) = cause {
+        let collapsed = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bounded: String = bounded_masked_line(&collapsed, &[])
+            .chars()
+            .take(TRANSPORT_CAUSE_LIMIT)
+            .collect();
+        if !bounded.is_empty() {
+            detail.push_str(": ");
+            detail.push_str(&bounded);
+        }
+    }
+    detail
 }
 
 /// Longest provider error body read for parameter attribution.
@@ -207,6 +768,11 @@ const ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
 /// Bound on the whole attribution body read; a stalling error stream is
 /// abandoned and the failure stays content-free.
 const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on a 429 body read: only the code token is wanted, the envelope
+/// normally rides in the same segment as the headers, and a throttle's
+/// failover must not wait on a provider that dribbles its error body.
+const THROTTLE_BODY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Read at most `ERROR_BODY_READ_LIMIT` bytes of one error response body.
 async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
@@ -221,109 +787,11 @@ async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn transport_failure_flags_mirror_the_python_taxonomy() {
-        // (status, retryable_same_deployment, failover_eligible)
-        let table = [
-            (Some(401), false, true),
-            (Some(403), false, true),
-            (Some(404), false, true),
-            (Some(429), false, true),
-            (Some(402), false, true),
-            (Some(408), true, true),
-            (Some(500), true, true),
-            (Some(503), true, true),
-            (Some(409), true, true),
-            (Some(425), true, true),
-            (Some(400), false, false),
-            (Some(422), false, false),
-            (Some(301), false, true),
-            (None, true, true),
-        ];
-        for (status, retryable, failover) in table {
-            let failure = transport_failure(status);
-            assert_eq!(
-                failure.retryable_same_deployment, retryable,
-                "retryable for {status:?}"
-            );
-            assert_eq!(
-                failure.failover_eligible, failover,
-                "failover for {status:?}"
-            );
-        }
-    }
+#[cfg(test)]
+#[path = "upstream_reseller_tests.rs"]
+mod reseller_tests;
 
-    #[tokio::test]
-    async fn a_402_with_the_literal_tokenhub_body_classes_provider_quota() {
-        // TokenHub (the Tencent relay) answers HTTP 402 with provider code
-        // 401008 on EVERY request shape once the account's free trial is
-        // exhausted and postpaid billing is off. Classing that invalid_request
-        // blamed 652 callers' request fields for the provider's billing state
-        // (2026-09 incident): the class must be the provider-side quota family,
-        // the rung must fail over, and the body must never be relayed.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut buffer = [0u8; 8192];
-            let _ = socket.read(&mut buffer).await;
-            let body = "{\"error\":{\"code\":401008,\"message\":\"free trial quota exhausted \
-                        and postpaid billing is not enabled - enable in Console > Online \
-                        Inference Service\",\"type\":\"payment_required\"}}";
-            let response = format!(
-                "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body,
-            );
-            socket.write_all(response.as_bytes()).await.expect("write");
-        });
-        let client = build_client(Duration::from_secs(2)).expect("client");
-        let failure = open_stream(
-            &client,
-            &format!("http://{addr}/v1/chat/completions"),
-            &HashMap::new(),
-            "idem-402",
-            &serde_json::json!({"model": "m", "messages": []}),
-            None,
-            Duration::from_secs(5),
-            Dialect::OpenAiCompatible,
-        )
-        .await
-        .expect_err("a 402 must classify as a failure");
-        assert_eq!(failure.failure_class, FailureClass::ProviderQuota);
-        assert!(failure.failover_eligible, "an unfunded rung must fail over");
-        assert!(!failure.retryable_same_deployment);
-        assert!(
-            failure.provider_detail.is_none() && failure.rejected_parameter.is_none(),
-            "a billing failure must stay content-free"
-        );
-        assert!(
-            !failure.safe_message.contains("request fields"),
-            "the caller must never be told to fix their fields for a provider billing state"
-        );
-    }
-
-    #[test]
-    fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
-        // A lead that connects but never completes the response-header phase must
-        // skip straight to the next rung (failover-eligible) instead of redialing
-        // the same stalled deployment for another full header-timeout window.
-        let failure = open_timeout_failure();
-        assert_eq!(failure.failure_class, FailureClass::Timeout);
-        assert!(
-            !failure.retryable_same_deployment,
-            "a header-phase stall must not redial the same deployment"
-        );
-        assert!(
-            failure.failover_eligible,
-            "a header-phase stall must fail over to the next certified rung"
-        );
-    }
-}
+#[cfg(test)]
+mod retirement_tests;

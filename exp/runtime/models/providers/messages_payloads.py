@@ -2,15 +2,23 @@
 
 Split from ``streaming_requests`` for the module line budget: the Anthropic,
 Gemini, and Bedrock builders live here; ``dialect_stream_payload`` in
-``streaming_requests`` remains the single dispatch seam.
+``dialect_dispatch`` remains the single dispatch seam.
 """
 
 from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayNamedToolChoice,
     GatewayRequest,
+)
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
+from exp.runtime.models.providers.anthropic_tool_compat import (
+    anthropic_input_schema,
+    anthropic_rejects_forced_tool_choice,
+    anthropic_strict_schema_unsupported,
 )
 from exp.runtime.models.providers.bedrock_requests import converse_body
 from exp.runtime.models.providers.errors import (
@@ -19,8 +27,21 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
-from exp.runtime.models.providers.reasoning_compat import anthropic_reasoning_effort
-from exp.runtime.models.providers.wire_messages import anthropic_blocks
+from exp.runtime.models.providers.generation_parameter_validation import require_output_bound
+from exp.runtime.models.providers.reasoning_compat import (
+    MINIMUM_THINKING_BUDGET_TOKENS,
+    anthropic_budgeted_enabled_only,
+    anthropic_reasoning_effort,
+    anthropic_thinking_budget_tokens,
+    anthropic_thinks_without_config,
+    bedrock_adaptive_thinking_model,
+    reasoning_display_enabled,
+)
+from exp.runtime.models.providers.wire_messages import (
+    anthropic_blocks,
+    fold_tool_result_attachments,
+    retained_cache_marked_blocks,
+)
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
 
 
@@ -34,17 +55,25 @@ def anthropic_messages_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    maximum_output_tokens: int | None = None,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Messages JSON.
 
     Args:
         model_id: Exact Anthropic model identifier.
         request: Canonical gateway request.
+        maximum_output_tokens: Declared ceiling for this exact model, required
+            when the caller omits the cap. No default is guessed.
 
     Returns:
         Native Messages request with streaming enabled.
 
     Raises:
+        ProviderCapabilityError: A ``strict`` tool schema uses a keyword the
+            provider's strict validator rejects (``strict_tools``), or the
+            request forces a tool the model or its thinking mode cannot force
+            (``forced_tool_choice``); both let route admission prefer a rung
+            that honors the request and otherwise coerce with disclosure.
         ProviderResponseError: Instruction or message content is malformed.
     """
     # Anthropic Messages has no compatible logprob request/response surface in
@@ -53,29 +82,51 @@ def anthropic_messages_stream_payload(
     del supports_logprobs
     system_parts: list[tuple[str, tuple[JsonObject, ...]]] = []
     messages: list[JsonObject] = []
+    displaced_marker: JsonObject | None = None
     for message in request.messages:
         if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ProviderResponseError("instruction messages require text")
-            # Leading instructions ride the top-level system field; a system
-            # turn after conversation began is a first-class mid-conversation
-            # message on this wire (the provider enforces its own placement
-            # rules), so its position is preserved verbatim.
+            # Leading instructions ride the top-level system field. A system
+            # turn after conversation began rides as USER text at its position:
+            # Anthropic accepts a `system` role inside `messages` only directly
+            # before an assistant turn or as the final message, and haiku-4-5
+            # not at all (live 2026-09-07: "role 'system' must precede an
+            # 'assistant' message or end the array" / "role 'system' is not
+            # supported on this model"), while every current model accepts the
+            # same text as a user block, which is also how Anthropic's own
+            # clients carry mid-conversation instructions. The builder below
+            # merges it into an adjacent user turn.
             if messages:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            list(message.provider_text_blocks)
-                            if message.provider_text_blocks
-                            else [{"type": "text", "text": message.content}]
-                        ),
-                    }
+                instruction_blocks: list[JsonObject] = (
+                    list(message.provider_text_blocks)
+                    if message.provider_text_blocks
+                    else [{"type": "text", "text": message.content}]
                 )
+                previous = messages[-1]
+                previous_content = previous.get("content")
+                if previous.get("role") == "user" and isinstance(previous_content, list):
+                    previous_content.extend(instruction_blocks)
+                else:
+                    messages.append({"role": "user", "content": instruction_blocks})
             else:
                 system_parts.append((message.content, message.provider_text_blocks))
             continue
         role, blocks = anthropic_blocks(message)
+        if not blocks:
+            # An assistant turn with no readable text dispatches as an empty
+            # array (accepted live) and so has no block of its own to carry a
+            # caller cache marker. The breakpoint migrates across the turn
+            # boundary by the same rule the block-run helper applies within a
+            # turn: onto the closest retained block before it (the empty turn
+            # adds no readable bytes, so the cached prefix is the same one),
+            # else onto the first retained block after it.
+            marker = _cache_marker(message.provider_text_blocks)
+            if marker is not None and not _mark_last_block(messages, marker):
+                displaced_marker = marker
+        elif displaced_marker is not None:
+            blocks = _mark_first_block(blocks, displaced_marker)
+            displaced_marker = None
         if messages and messages[-1].get("role") == role:
             existing = messages[-1].get("content")
             if not isinstance(existing, list):
@@ -83,10 +134,19 @@ def anthropic_messages_stream_payload(
             existing.extend(blocks)
         else:
             messages.append({"role": role, "content": blocks})
+    if request.json_object_output:
+        # Anthropic has no schema-free JSON mode, so the caller's intent rides
+        # the system prompt as a trailing instruction.
+        system_parts.append((JSON_OBJECT_SYSTEM_INSTRUCTION, ()))
+    output_limit = (
+        request.maximum_output_tokens
+        if request.maximum_output_tokens is not None
+        else require_output_bound(request, maximum_output_tokens)
+    )
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
-        "max_tokens": request.maximum_output_tokens or 4096,
+        "max_tokens": output_limit,
         "stream": True,
     }
     if system_parts:
@@ -122,21 +182,42 @@ def anthropic_messages_stream_payload(
                         dict(block),
                         separated=(part_leads if position == 0 else inner_separated),
                     )
-            payload["system"] = system_blocks
+            # The wire rejects an empty system text block anywhere and a
+            # system prompt whose text is all whitespace ("system: text
+            # content blocks must be non-empty" / "must contain non-whitespace
+            # text", verified live 2026-09-05). Empty blocks drop with their
+            # breakpoints migrated; a prompt left with no readable text is
+            # omitted, since an absent system field is what it says.
+            retained_system = retained_cache_marked_blocks(system_blocks)
+            if any(str(block.get("text", "")).strip() for block in retained_system):
+                payload["system"] = retained_system
         else:
-            payload["system"] = "\n\n".join(content for content, _ in system_parts)
+            joined_system = "\n\n".join(content for content, _ in system_parts)
+            if joined_system.strip():
+                payload["system"] = joined_system
     if request.tools:
         tools: list[JsonObject] = []
         for tool in request.tools:
+            # Root combinators and a missing root type are reshaped into the
+            # object Anthropic accepts (disclosed at admission); everything
+            # else is the caller's schema verbatim.
+            input_schema = anthropic_input_schema(tool.parameters)
             translated: JsonObject = {
                 "name": tool.name,
-                "input_schema": tool.parameters,
+                "input_schema": input_schema,
             }
             # Anthropic rejects an explicit null description ("Input should
             # be a valid string"), so an absent description stays absent.
             if tool.description is not None:
                 translated["description"] = tool.description
             if tool.strict:
+                # The strict validator compiles the schema into a grammar and
+                # 400s by name on keywords it cannot express (verified live
+                # 2026-09-05: ``maxItems`` on every current model). Declining
+                # here keeps the schema intact and lets admission drop only
+                # ``strict`` when no rung can honor it.
+                if anthropic_strict_schema_unsupported(input_schema) is not None:
+                    raise ProviderCapabilityError(capability="strict_tools")
                 translated["strict"] = True
             # Anthropic-native tool annotations forward verbatim on this
             # wire only; the provider owns their validity rules. An absent
@@ -167,6 +248,13 @@ def anthropic_messages_stream_payload(
     if request.tool_choice is not None:
         if isinstance(request.tool_choice, GatewayNamedToolChoice):
             tool_choice = {"type": "tool", "name": request.tool_choice.name}
+        elif isinstance(request.tool_choice, (GatewayAllowedToolsChoice, GatewayCustomToolChoice)):
+            # Route shaping restricts the tools (or names the translated
+            # custom tool's function) before any Messages payload.
+            raise ValueError(
+                "allowed-tools and custom-tool selectors must be translated "
+                "before Messages encoding"
+            )
         else:
             mapping = {"auto": "auto", "none": "none", "required": "any"}
             tool_choice = {"type": mapping[request.tool_choice]}
@@ -201,29 +289,89 @@ def anthropic_messages_stream_payload(
         payload["diagnostics"] = request.diagnostics
     if request.speed is not None:
         payload["speed"] = request.speed
+    if request.safeguards is not None:
+        # Claude Code auto-mode safeguards forward byte-for-byte on this
+        # dialect only; the beta header joins via anthropic_request_headers.
+        # Every other dialect's builder never emits the field, so a failover
+        # onto a non-Anthropic rung drops it per attempt.
+        payload["safeguards"] = list(request.safeguards)
     if request.provider_cache_control is not None:
         # The top-level automatic caching marker forwards byte-for-byte; the
         # provider accepts it bare (verified live 2026-08-30).
         payload["cache_control"] = request.provider_cache_control
     if request.inference_geo is not None:
         payload["inference_geo"] = request.inference_geo
+    end_user = _messages_end_user(request)
+    if end_user is not None:
+        # Anthropic's one defined metadata key attributes abuse signals to the
+        # caller's end user rather than the whole account behind the rung.
+        payload["metadata"] = {"user_id": end_user}
+    # A budgeted-enabled-only model (haiku-4-5) rejects ``thinking.type:
+    # adaptive`` and ``output_config.effort`` by NAME: its reasoning dial is a
+    # token budget, not the effort ladder. An effort reaching this seam is the
+    # caller's depth intent, so it is realized as a derived budget — the same
+    # wire realization the effort generation gets via the adaptive object.
+    budgeted_only = supports_reasoning and anthropic_budgeted_enabled_only(model_id)
+    if budgeted_only and "effort" in output_config and request.reasoning_effort is not None:
+        # A recognized caller effort rides request.reasoning_effort too (decode
+        # maps it) and is realized as the token budget below, so the by-name-
+        # rejected output_config key comes off the wire. An UNRECOGNIZED effort
+        # never mapped, has no budget realization, and stays verbatim — the
+        # provider's own by-name rejection is the honest outcome, never a
+        # silent thinking-off answer.
+        output_config.pop("effort")
     if request.provider_thinking_config is not None:
         # The caller's exact thinking configuration wins over the catalog's
         # adaptive default and travels verbatim, so budget semantics are
         # never reinterpreted by the gateway. An adaptive config (caller-sent
         # or route-translated) still composes with the route's pinned effort,
         # exactly like a request that carried no thinking config.
-        payload["thinking"] = request.provider_thinking_config
+        thinking = dict(request.provider_thinking_config)
+        if thinking.get("type") == "enabled":
+            budget = thinking.get("budget_tokens")
+            if budget is None:
+                budget = anthropic_thinking_budget_tokens(output_limit)
+                thinking["budget_tokens"] = budget
+            if (
+                not isinstance(budget, int)
+                or isinstance(budget, bool)
+                or not MINIMUM_THINKING_BUDGET_TOKENS <= budget < output_limit
+            ):
+                raise ProviderParameterError(
+                    message=(
+                        "The enabled thinking budget must be at least 1024 tokens and below "
+                        f"the output limit of {output_limit}. Raise the output limit, lower "
+                        "thinking.budget_tokens, or explicitly disable thinking."
+                    ),
+                    param="thinking.budget_tokens",
+                    code="invalid_parameter",
+                )
+        payload["thinking"] = thinking
         if (
-            request.provider_thinking_config.get("type") == "adaptive"
+            request.provider_thinking_config.get("type") in {"adaptive", "between_tools"}
             and supports_reasoning
+            and not budgeted_only
             and effective_reasoning_effort is not None
             and "effort" not in output_config
         ):
             output_config["effort"] = anthropic_reasoning_effort(
                 model_id, effective_reasoning_effort
             )
-    elif supports_reasoning and effective_reasoning_effort is not None:
+    elif budgeted_only and effective_reasoning_effort not in (None, "none"):
+        budget = anthropic_thinking_budget_tokens(output_limit)
+        if budget is None and request.reasoning_effort not in (None, "none"):
+            raise ProviderParameterError(
+                message=(
+                    "The requested reasoning effort needs a thinking budget of at least 1024 "
+                    f"tokens, below the output limit of {output_limit}. Raise max_tokens above "
+                    "1024 or explicitly disable thinking."
+                ),
+                param=request.caller_effort_parameter,
+                code="invalid_parameter",
+            )
+        if budget is not None:
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    elif supports_reasoning and not budgeted_only and effective_reasoning_effort is not None:
         payload["thinking"] = {"type": "adaptive"}
         if "effort" not in output_config:
             output_config["effort"] = anthropic_reasoning_effort(
@@ -238,7 +386,133 @@ def anthropic_messages_stream_payload(
         payload["output_config"] = output_config
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
+    if supports_reasoning and reasoning_display_enabled():
+        _display_summarized_thinking(model_id, payload)
+    _require_forced_tool_choice_support(model_id, request, payload)
     return payload
+
+
+def _display_summarized_thinking(model_id: str, payload: JsonObject) -> None:
+    """Ask for readable thinking wherever adaptive thinking runs.
+
+    Current Claude generations default ``thinking.display`` to ``omitted`` and
+    stream thinking blocks with empty text. Adaptive thinking without an
+    explicit display, including the implicit adaptive thinking of generations
+    that think without a config, is asked for ``summarized`` so the caller gets
+    the reasoning it pays for. An explicit caller display is kept, and budgeted,
+    disabled and ``between_tools`` configs (which take no display) are
+    untouched.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+        payload: The built Messages payload, updated in place.
+    """
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "adaptive" and "display" not in thinking:
+            payload["thinking"] = {**thinking, "display": "summarized"}
+    elif (
+        thinking is None
+        and anthropic_thinks_without_config(model_id)
+        and not any(key in payload for key in ("temperature", "top_p", "top_k"))
+    ):
+        # A request carrying sampling controls keeps its exact shape: an
+        # explicit thinking config beside them is a different request.
+        payload["thinking"] = {"type": "adaptive", "display": "summarized"}
+
+
+_UNMARKABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+"""Content block types the wire refuses to carry a ``cache_control`` marker on."""
+
+
+def _messages_end_user(request: GatewayRequest) -> str | None:
+    """Return the caller's Messages ``metadata.user_id``, if one was sent.
+
+    Only the Messages surface defines ``metadata.user_id``; Chat and Responses
+    ``metadata`` is the caller's own key-value store and never reaches a
+    provider.
+    """
+    if request.surface != GatewayApiSurface.MESSAGES:
+        return None
+    user_id = request.metadata.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+def _cache_marker(blocks: tuple[JsonObject, ...]) -> JsonObject | None:
+    """Return the first caller cache marker in a block run, if any."""
+    for block in blocks:
+        marker = block.get("cache_control")
+        if isinstance(marker, dict):
+            return marker
+    return None
+
+
+def _mark_last_block(messages: list[JsonObject], marker: JsonObject) -> bool:
+    """Attach ``marker`` to the closest earlier emitted block that can carry one.
+
+    Collapsed (empty) turns are skipped on the way back: consecutive empty
+    assistant turns all sit on the same cache boundary, so every marker they
+    carried collapses onto the same retained block instead of deferring to a
+    later one, which would cache a larger prefix than the caller asked for.
+
+    Returns:
+        Whether a block took the marker; a block already marked counts, since
+        one marker per boundary suffices.
+    """
+    for emitted in reversed(messages):
+        content = emitted.get("content")
+        if not isinstance(content, list):
+            return False
+        if not content:
+            continue
+        last = content[-1]
+        if not isinstance(last, dict) or last.get("type") in _UNMARKABLE_BLOCK_TYPES:
+            return False
+        if "cache_control" not in last:
+            content[-1] = {**last, "cache_control": marker}
+        return True
+    return False
+
+
+def _mark_first_block(blocks: list[JsonObject], marker: JsonObject) -> list[JsonObject]:
+    """Return ``blocks`` with ``marker`` on the first block that can carry one."""
+    for index, block in enumerate(blocks):
+        if block.get("type") in _UNMARKABLE_BLOCK_TYPES:
+            continue
+        if "cache_control" not in block:
+            return [*blocks[:index], {**block, "cache_control": marker}, *blocks[index + 1 :]]
+        return blocks
+    return blocks
+
+
+def _require_forced_tool_choice_support(
+    model_id: str,
+    request: GatewayRequest,
+    payload: JsonObject,
+) -> None:
+    """Decline a forced ``tool_choice`` this rung is known to reject.
+
+    Two provider rules apply (both verified live 2026-09-05). Fable 5.1 and
+    Mythos 5.1 answer ``any`` and ``tool`` with a 400 on every request, even
+    with no thinking config. Every model rejects a forced choice beside a
+    budgeted ``thinking: enabled`` config ("Thinking may not be enabled when
+    tool_choice forces tool use"), whether the caller sent that config or the
+    rung derived it from an effort; adaptive thinking carries a forced choice
+    fine. ``auto`` and ``none`` are never affected.
+
+    Raises:
+        ProviderCapabilityError: ``forced_tool_choice`` when the built payload
+            would be rejected.
+    """
+    forced = request.tool_choice == "required" or isinstance(
+        request.tool_choice, GatewayNamedToolChoice
+    )
+    if not forced:
+        return
+    thinking = payload.get("thinking")
+    budgeted_thinking = isinstance(thinking, dict) and thinking.get("type") == "enabled"
+    if budgeted_thinking or anthropic_rejects_forced_tool_choice(model_id):
+        raise ProviderCapabilityError(capability="forced_tool_choice")
 
 
 def gemini_generate_content_stream_payload(
@@ -273,10 +547,20 @@ def gemini_generate_content_stream_payload(
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
+    # Gemini's functionResponse carries JSON text; a tool screenshot or a
+    # tool-returned document rides a following user content (one content per
+    # message, no role alternation rule on this wire). The native
+    # ``functionResponse.parts`` carrier is documented for the Gemini 3
+    # series only and is not adopted unprobed.
+    folded = request.model_copy(
+        update={
+            "messages": fold_tool_result_attachments(request.messages, kinds=("image", "document"))
+        }
+    )
     try:
         return gemini_generate_request(
             model_id,
-            gateway_model_request(request),
+            gateway_model_request(folded),
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
@@ -287,6 +571,8 @@ def gemini_generate_content_stream_payload(
             response_json_schema=(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
+            json_object_output=request.json_object_output,
+            default_maximum_output_tokens=None,
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise
@@ -302,19 +588,23 @@ def bedrock_converse_stream_payload(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
-    The body is built by the exact converter the Bedrock provider client
-    uses (canonical request through the shared model adapter, then the shared
-    Converse body builder), so both engines send one identical document. On
+    The body uses the shared Converse builder directly, retaining canonical
+    cache markers instead of losing them in a model-client projection. On
     the REST route the model travels in the URL path, never the body, and
     streaming is selected by the ``converse-stream`` route itself.
 
     Args:
         model_id: Exact Bedrock model or inference-profile identifier; it
-            travels in the wire profile URL and keeps the dispatch signature.
+            travels in the wire profile URL and selects the thinking contract.
         request: Canonical gateway request.
+        supports_reasoning: Whether this rung declares a reasoning control.
+        reasoning_effort: The rung's required default effort, used only when
+            the caller sent none.
 
     Returns:
         Native Converse request body for the streaming REST route.
@@ -327,10 +617,16 @@ def bedrock_converse_stream_payload(
         ProviderResponseError: A message cannot be represented without
             dropping tool context.
     """
-    del model_id
+    # A tool-returned document rides a following user turn: this wire's
+    # toolResult carries text, image, and JSON blocks, and a user turn carries
+    # the document natively (see the fold's docstring). A native toolResult
+    # document block is the unprobed follow-up this fold stands in for.
+    request = request.model_copy(
+        update={"messages": fold_tool_result_attachments(request.messages, kinds=("document",))}
+    )
     try:
-        return converse_body(
-            gateway_model_request(request),
+        payload = converse_body(
+            request,
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
             supports_top_k=supports_top_k,
@@ -346,8 +642,58 @@ def bedrock_converse_stream_payload(
                 request.structured_text.json_schema if request.structured_text is not None else None
             ),
             strict_tool_names=tuple(tool.name for tool in request.tools if tool.strict),
+            json_object_instruction=(
+                JSON_OBJECT_SYSTEM_INSTRUCTION if request.json_object_output else None
+            ),
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
+    if supports_reasoning and bedrock_adaptive_thinking_model(model_id):
+        thinking = _bedrock_claude_thinking_fields(
+            model_id, request.reasoning_effort or reasoning_effort, payload
+        )
+        if thinking:
+            fields = payload.get("additionalModelRequestFields")
+            merged: JsonObject = dict(fields) if isinstance(fields, dict) else {}
+            merged.update(thinking)
+            payload["additionalModelRequestFields"] = merged
+    return payload
+
+
+def _bedrock_claude_thinking_fields(
+    model_id: str, effort: str | None, payload: JsonObject
+) -> JsonObject:
+    """Return the Anthropic thinking fields one Converse request carries.
+
+    Converse merges ``additionalModelRequestFields`` into the Anthropic body,
+    so the adaptive generation takes the same ``thinking`` object and
+    ``output_config.effort`` the Messages builder sends. A caller effort turns
+    adaptive thinking on at that effort; with no effort, a generation that
+    thinks without a config is still asked for a readable display (and
+    nothing else) unless the request carries sampling controls. Display
+    follows the reasoning display kill switch, exactly like the Messages wire:
+    without it the provider streams signature-only thinking.
+
+    Args:
+        model_id: Exact Bedrock Claude inference-profile identifier.
+        effort: The caller's effort, else the rung's required default.
+        payload: The built Converse body, read for sampling controls.
+
+    Returns:
+        The fields to merge, or an empty object when none apply.
+    """
+    display = {"display": "summarized"} if reasoning_display_enabled() else {}
+    if effort is not None and effort != "none":
+        return {
+            "thinking": {"type": "adaptive", **display},
+            "output_config": {"effort": anthropic_reasoning_effort(model_id, effort)},
+        }
+    inference = payload.get("inferenceConfig")
+    sampled = isinstance(inference, dict) and any(
+        key in inference for key in ("temperature", "topP")
+    )
+    if effort is None and display and anthropic_thinks_without_config(model_id) and not sampled:
+        return {"thinking": {"type": "adaptive", **display}}
+    return {}

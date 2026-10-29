@@ -206,16 +206,19 @@ class BatchControlPlane:
             organization_id, _ = self._identity(payload)
             limit = payload.get("limit")
             after = payload.get("after")
-            jobs = self._engine.list_jobs(
+            page = self._engine.list_jobs(
                 organization_id=organization_id,
                 limit=limit if isinstance(limit, int) else 20,
                 after=after if isinstance(after, str) and after else None,
             )
+            data = [job.public_object() for job in page.jobs]
             return self._envelope(
                 {
                     "object": "list",
-                    "data": [job.public_object() for job in jobs],
-                    "has_more": False,
+                    "data": data,
+                    "first_id": data[0]["id"] if data else None,
+                    "last_id": data[-1]["id"] if data else None,
+                    "has_more": page.has_more,
                 }
             )
         except BatchSubmitError as error:

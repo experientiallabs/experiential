@@ -10,7 +10,9 @@ from exp.common.core.artifacts import ArtifactInput, stable_id
 from exp.common.judging import (
     HumanLabelSet,
     HumanScoreReview,
+    JudgeCalibration,
     JudgeCalibrationService,
+    JudgeDefinition,
     JudgeScoreObservation,
     RouterLineageAssignment,
     RouterLineageSplit,
@@ -83,6 +85,7 @@ from exp.optimize.router.judging.template_bind import (
     DEFAULT_JUDGE_TEMPLATE,
     bind_prompt_template,
     default_judge_dimensions,
+    judge_template,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -140,6 +143,7 @@ def prepare_manual_judge_setup(
     catalog: ModelCatalog,
     *,
     judge_alias: str | None = None,
+    definition: JudgeDefinition | None = None,
     dimensions: Sequence[RubricDimension] | None = None,
     prompt_template: JudgePromptTemplate = DEFAULT_JUDGE_TEMPLATE,
     preview_count: int = 3,
@@ -152,6 +156,7 @@ def prepare_manual_judge_setup(
         store: Existing project with completed deterministic build evidence.
         catalog: Local secret-free model catalog.
         judge_alias: Optional explicit alias, otherwise the configured judge role.
+        definition: Reusable named syllabus and axes, mutually exclusive with custom raw fields.
         dimensions: Optional complete rubric replacement.
         prompt_template: Versioned prompt, variable mapping, and response schema.
         preview_count: Maximum number of distinct fit-lineage traces to render.
@@ -166,9 +171,16 @@ def prepare_manual_judge_setup(
     """
     if preview_count < 1:
         raise ManualJudgeError("judge setup preview count must be positive")
+    if definition is not None:
+        if dimensions is not None or prompt_template != DEFAULT_JUDGE_TEMPLATE:
+            raise ManualJudgeError("supply a judge definition or raw dimensions/template, not both")
+        dimensions = definition.dimensions
+        prompt_template = judge_template(definition)
     project = store.load_project()
     build = _load_build_review(store)
-    if build.project_config != project.model_copy(update={"build": None}):
+    if build.project_config.model_copy(update={"hosted_judge": None}) != project.model_copy(
+        update={"build": None, "hosted_judge": None}
+    ):
         raise ManualJudgeError("completed build belongs to a different project configuration")
     selected_alias = judge_alias or catalog.roles.judge
     if selected_alias is None:
@@ -563,25 +575,16 @@ def calibrate_manual_judge(
         )
         for task, reference in zip(plan.tasks, plan.reference_traces, strict=True)
     )
-    split = _write_lineage_split(store, setup, plan, rollout_inputs, created_at, code_revision)
+    split = write_lineage_split(store, setup, plan, rollout_inputs, created_at, code_revision)
     label_review = HumanScoreReview.open(store)
-    provisional = find_provisional_calibration(store, setup, split.split_id)
-    if provisional is None:
-        empty_labels = label_review.finalize(
-            rubric_id=setup.rubric.artifact_id,
-            code_revision=code_revision,
-            created_at=created_at,
-        )
-        provisional = JudgeCalibrationService().bootstrap_provisional(
-            store,
-            rubric_id=setup.rubric.artifact_id,
-            label_set_id=empty_labels.label_set_id,
-            router_lineage_split_id=split.split_id,
-            judge_model=setup.judge_model,
-            judge_prompt=setup.prompt_template.prompt,
-            created_at=created_at,
-            code_revision=code_revision,
-        )
+    provisional = find_or_bootstrap_provisional_calibration(
+        store,
+        setup,
+        split_id=split.split_id,
+        label_review=label_review,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
     provisional_input = artifact_input(store.artifacts.read(provisional.calibration_id).manifest)
     rubric, rubric_input = read_artifact_json(
         store,
@@ -794,7 +797,49 @@ def _validate_labels(
         raise ManualJudgeError("judge calibration label set is incomplete: " + "; ".join(details))
 
 
-def _write_lineage_split(
+def find_or_bootstrap_provisional_calibration(
+    store: ProjectStore,
+    setup: ManualJudgeSetupArtifact,
+    *,
+    split_id: str,
+    label_review: HumanScoreReview,
+    created_at: datetime,
+    code_revision: str,
+) -> JudgeCalibration:
+    """Return the split's provisional calibration, bootstrapping an empty-label one if absent.
+
+    Args:
+        store: Project-local immutable artifact store.
+        setup: Finalized setup binding the rubric, judge model, and prompt template.
+        split_id: Persisted lineage split the calibration is bound to.
+        label_review: Open human score review used to finalize an empty label set.
+        created_at: Artifact completion time.
+        code_revision: Exact producer revision.
+
+    Returns:
+        The existing or newly bootstrapped provisional judge calibration.
+    """
+    provisional = find_provisional_calibration(store, setup, split_id)
+    if provisional is not None:
+        return provisional
+    empty_labels = label_review.finalize(
+        rubric_id=setup.rubric.artifact_id,
+        code_revision=code_revision,
+        created_at=created_at,
+    )
+    return JudgeCalibrationService().bootstrap_provisional(
+        store,
+        rubric_id=setup.rubric.artifact_id,
+        label_set_id=empty_labels.label_set_id,
+        router_lineage_split_id=split_id,
+        judge_model=setup.judge_model,
+        judge_prompt=setup.prompt_template.prompt,
+        created_at=created_at,
+        code_revision=code_revision,
+    )
+
+
+def write_lineage_split(
     store: ProjectStore,
     setup: ManualJudgeSetupArtifact,
     plan: ManualJudgeCalibrationPlan,
@@ -835,6 +880,7 @@ def _write_lineage_split(
     split_id = stable_id(
         "router-lineage-split",
         {
+            "setup_id": setup.setup_id,
             "task_set": setup.task_set.model_dump(mode="json"),
             "fit": list(fit),
             "held_out": list(held_out),
@@ -852,6 +898,17 @@ def _write_lineage_split(
         held_out_lineage_ids=held_out,
         assignments=assignments,
     )
+    if store.artifacts.exists(split_id):
+        existing, _ = read_artifact_json(
+            store,
+            artifact_id=split_id,
+            expected_artifact_type="router-lineage-split",
+            relative_path="split.json",
+            model_type=RouterLineageSplit,
+        )
+        # Reusing identical partitions retains their original producer provenance.
+        # The writer still verifies every input, assignment, and persisted payload.
+        split = split.model_copy(update={"code_revision": existing.code_revision})
     return write_router_lineage_split(store, split)
 
 

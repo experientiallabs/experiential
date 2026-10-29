@@ -1,34 +1,172 @@
 # Gateway guardrails
 
-Identity-scoped guardrails inspect a request after authentication and, when
-configured, inspect the winning completion before any caller byte is delivered.
-They are default-off. Lookup is by authenticated `organization_id` plus
-`identity_id`. A pair with no assigned policy keeps the existing gateway hot
-path: no classifier call, no stream buffering, and no extra native callback.
+## One policy engine and request lifecycle
 
-## Data flow
+Every guardrail uses `GuardrailPolicy`, the same policy store, and a request-owned
+`GuardrailSession` created by `GuardrailEngine`. Scope determines which checks apply;
+it does not select a different execution pipeline. A policy without organization
+and identity IDs applies to all identities and must be protected. Identity assignments
+add checks and cannot replace or disable platform checks.
 
-1. Authenticate the virtual key and expand an optional Responses continuation.
-2. Look up at most one immutable policy by organization and identity. Missing
-   policies stop here.
-3. Run the input chain once. The validated or transformed canonical request is
-   reused for route resolution, provider preflight, acceptance, and every
-   waterfall attempt.
-4. Dispatch the provider waterfall. Provider failures remain failover-eligible.
-   A guardrail block, error, or protected-identity fail-closed outcome is
-   terminal and does not advance the waterfall.
-5. Buffer the winning normalized completion when the policy has output checks.
-   Run the output chain once, including tool-call arguments. Then encode,
-   remember a Responses continuation, and publish replay.
-6. Return a sanitized OpenAI-shaped error on failure. Partial blocked output is
-   never exposed.
+```python
+engine = GuardrailEngine(
+    store=MappingGuardrailStore((
+        GuardrailPolicy(
+            policy_id="criminal-abuse",
+            revision="policy-v1:detector-revision",
+            protected=True,
+            input_execution="parallel",
+            checks=(GuardrailCheck(
+                check_id="criminal-abuse-input",
+                capability="content_safety",
+                stage="input",
+                action="block",
+                adapter_id="criminal-abuse",
+                timeout_ms=1000,
+            ),),
+        ),
+    )),
+    client=DirectClassifierClient(classifier_registry),
+    monotonic=time.monotonic,
+)
+control = NativeControlPlane(components, guardrails=engine)
+```
 
-The native data plane follows the same order. Input enforcement runs after
-Responses continuation expansion and before route resolution, provider
-preflight, ledger acceptance, and attempt start. A block never reaches routing.
-When admission sets `output_guardrail`, Rust buffers the completion and calls
-`enforce_output` once. Unguarded admissions omit that flag and never invoke
-the callback.
+The gateway resolves `policies_for(authorization)` once for admission. The
+`AuthorizationSnapshot` carries the organization, identity, alias, and frozen alias
+target, so a host store can scope a policy to exact-model pools as well as identities.
+`MappingGuardrailStore` scopes by organization and identity, and by exact-model pool when
+a policy sets `target_pool_ids`.
+The session captures every applicable policy, the original deadline, approval state,
+and output requirements. Continuation expansion, rewrites, gateway search rounds,
+response delivery, cancellation, and settlement all use that session. No later
+lookup changes a request's policy midway through execution.
+
+Policies run in resolved scope order, with platform policies before identity policies.
+Within each input or output stage, checks run in authored order, so earlier privacy
+rewrites feed later checks. Each check retains the subject it accepted or produced.
+If a later rewrite changes that subject, the earlier check independently validates
+the final result; conflicting rewrites fail closed even if they restore the original
+text. Checks that already accepted the final result are not repeated. Recovered
+plaintext reasoning and gateway-expanded conversation context are inspected before
+the next provider dispatch. Exact duplicate subjects share work only within one
+request. All policies use the same classifier executor, bounds, verdict actions,
+and content-free decision recorder. Deterministic native detectors are an execution
+strategy of that pipeline, with the same input and completion contracts.
+
+Embeddings, image generation, and native Decisions cannot yet use that normalized
+inspection contract. An applicable platform or identity policy rejects those
+endpoints before request acceptance, reservation, or provider dispatch. Identities
+with no applicable policy retain access to those surfaces.
+
+## Input inspection alongside generation
+
+`input_execution="parallel"` allows input classification to overlap generation.
+Overlap requires every applicable input policy to select parallel execution and
+no input check to modify the request. Any privacy rewrite keeps the combined input
+chain before dispatch. The execution mode never adds an output check: the example
+above only classifies the prompt.
+
+Host-managed generation on direct aliases may start while approval is pending.
+Native Chat, Responses, and Messages hold all response content until approval,
+including reasoning and client function calls. Replay publication and continuation
+retention also wait. Approval releases the pending prefix and resumes normal
+streaming, without waiting for full completion. Function declarations supplied by
+clients do not execute remote tools.
+
+A block, classifier error, or timeout cancels the provider request and discards its
+response. The trusted `input_guardrail_denied` settlement detail requires zero
+customer charge while retaining available provider usage. Missing final usage uses
+the existing estimated or unknown-cost accounting contract. The platform bears
+provider work that already occurred; cancellation cannot undo it.
+
+Provider-native or provider-server tools, gateway web or tool search, explicit cache
+operations, service tiers, and routes with customer-managed credentials require
+approval before dispatch. These are execution constraints of the same session.
+Customers cannot choose the operator policy's mode or forge its settlement detail.
+
+Project aliases complete input inspection before learned routing. Selection may
+send the initial user message to a separately billed embedding provider, so it
+cannot overlap pending approval. Responses continuations retain their selection
+episode and inspect expanded history before routing.
+
+When provider first-token latency exceeds classifier latency, overlap can hide most
+of the inspection delay. Otherwise the first response content waits for the check.
+Measure this with the actual detector and workload. Local scripted classifiers
+validate gateway ordering and overhead, not GPU inference latency or model quality.
+
+## Output policies
+
+Configured output checks use the same session and engine. Blocking and model-backed
+output checks buffer a complete normalized completion. Pure deterministic redaction
+may stream a proven-safe prefix when the request shape permits it. There is no
+incremental model-output classifier API. Input-only policies do not buffer complete
+responses or invoke output classifiers.
+
+The shared completion projection includes assistant text, refusal text, readable
+reasoning, retrieved content, and complete tool arguments. Checks inspect original
+output and any rewrite before release. A text rewrite suppresses alternate output
+channels, and replacing a typed refusal converts its refusal terminal to completion.
+Other provider failures remain failures. Tool arguments are inspected but cannot be rewritten. Generated
+gateway-owned tool calls are checked before execution. Gateway-generated metadata
+and the provider answer are inspected together as one completion, with one combined
+response-size limit. Output policies buffer requests with gateway web or tool search,
+including deterministic redactors. Terminal responses are checked while the same
+accounting entry still owns the session. A rewrite that would change or remove generated
+metadata fails closed because protocol encoders cannot apply it safely.
+
+## Failure, replay, and integration
+
+A confirmed violation returns a sanitized guardrail failure. Protected classifier
+outages and timeouts return `unavailable`, without exposing detector diagnostics or
+claiming that content violated policy. Queues and inflight work remain bounded;
+request removal cancels its pending inspection. Unprotected identity checks may
+observe and continue after uncertain classifier results. Platform policies are
+always protected.
+
+Replay keys include the full applicable policy set, execution settings, and revision.
+A keyed admission compares its frozen policy revision with the replay claim before
+inspection, acceptance, search, or model dispatch. A reload between claim and admission
+returns `409`; retrying takes a new snapshot. Change `revision` whenever the detector
+or external rollout configuration changes.
+Policies are immutable; compose a new engine snapshot when changing adapters.
+Default inspection bounds are 1 MiB, and the same absolute request deadline applies
+throughout inspection and provider execution. An adapter that sends only its own bounded
+window of the request (a `WindowedClassifier`) declares a configuration digest. That digest
+joins the replay revision, and a policy whose input checks are all windowed is not refused
+for its total request size.
+
+Startup requires `GUARDRAIL_CONTRACT_VERSION=3`. Publish coordinated engine and
+native packages before a downstream host updates its exact release pins. There
+are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
+package-version fallbacks.
+
+A host ledger must implement `finish_request(..., web_search_requests=...)` for
+completed gateway searches when admission fails before any model attempt, including
+guardrail, routing, capability, dispatch-construction, and cache-binding failures.
+Persist that meter atomically with the request failure, with zero customer charge;
+it is provider expense evidence, not a model dispatch. Never certify such work as
+having no paid effects. The local ledger stores the meter on `gateway_requests`.
+Accounting retains failed terminal writes for its existing retry sweep and refuses
+new paid admission work on every native endpoint until the retained request writes commit.
+Hosted ledgers must
+adopt this contract before enabling the coordinated release.
+
+This integration covers native Chat Completions, Responses (including WebSocket
+admission), and Messages. Native Decisions rejects identities with applicable policies
+because its decision payload does not implement the inspection contract.
+Other unsupported surfaces and modalities require explicit
+host fencing before enforcement is enabled. Encrypted reasoning and signatures
+remain opaque. This machinery supplies neither a hosted detector nor evidence of
+model quality, GPU latency, or production rollout.
+
+## Identity policy configuration
+
+An optional identity policy uses the same schema with both `organization_id` and
+`identity_id` set. An unassigned identity still receives every platform policy.
+Only a request with no applicable policies takes the unguarded path, with no
+classifier call, buffering, or guardrail callback. Local file configuration and
+hosted policy stores must implement the same scoped policy-store contract.
 
 ## Classifier adapters
 
@@ -48,6 +186,13 @@ Capability kinds name the inspection job, not a vendor:
 
 Built-in adapter kinds:
 
+- `regex`: local RE2 matching and deterministic text replacement. Configure
+  custom expressions or the `email`, `credit_card`, and `api_key` built-in
+  families. Card candidates require a valid Luhn checksum. Space- or hyphen-separated
+  digit groups are inspected for adjacent cards; overlapping valid spans are
+  redacted together. A valid card followed by another numeric group is still
+  redacted, while uninterrupted numbers longer than 19 digits are not split. These rules find
+  specific patterns, not all personal information or every secret format.
 - `keyword`: coarse, test-oriented needle matching. Case-folded substrings of
   message text, completion text, or tool-call arguments. This is not a
   production prompt-injection or content-safety classifier.
@@ -55,8 +200,55 @@ Built-in adapter kinds:
   a dedicated classifier endpoint. It never calls `POST /v1/chat/completions`
   or `POST /v1/responses`. Operators bind replaceable hosted adapters,
   including a hosted PII redactor, by `adapter_id`.
+- `decision_model`: input classification with a decision model on the SystemOne
+  wire. It sends a bounded window of the conversation, scores operator categories
+  against thresholds, and caches verdicts. A policy whose input checks are all
+  windowed is not refused for its total request size. See
+  [Classification guardrails](gateway-classification-guardrails.md).
 
 Other adapters may still be injected in code when composing a `GuardrailEngine`.
+
+### Regex rules
+
+For example, redact emails, card candidates, and an internal account format
+before provider dispatch and before delivering the completion:
+
+```json
+{
+  "adapters": [{
+    "adapter_id": "sensitive-patterns",
+    "kind": "regex",
+    "builtin_patterns": ["email", "credit_card"],
+    "patterns": ["ACCT-[0-9]{8}"],
+    "replacement": "[REDACTED]"
+  }],
+  "policies": [{
+    "policy_id": "redact-patterns",
+    "organization_id": "organization-one",
+    "identity_id": "identity-one",
+    "protected": true,
+    "checks": [
+      {"check_id": "redact-input", "capability": "pii", "stage": "input",
+       "action": "modify", "adapter_id": "sensitive-patterns", "timeout_ms": 250},
+      {"check_id": "redact-output", "capability": "pii", "stage": "output",
+       "action": "modify", "adapter_id": "sensitive-patterns", "timeout_ms": 250}
+    ]
+  }]
+}
+```
+
+`block` refuses a match instead of replacing it. Replacements are literal
+strings, not capture-group substitutions. Overlapping spans are combined
+before replacement. Zero-length matches do not flag text. Tool arguments are
+inspected but never rewritten: a flagged input tool argument under `modify`
+is refused, and output modifications with tool calls are blocked.
+
+RE2 does not support backreferences or look-around. Each custom pattern is
+limited to 1,024 UTF-8 bytes, with at most 32 patterns per adapter and 256 KiB
+of compile memory per expression. Each inspected text is limited to 1 MiB
+and 4,096 matches or card candidates across its patterns. Exceeding these bounds is classifier
+uncertainty, governed by the policy's fail-closed setting. Use a model-backed
+PII detector for contextual entities such as names and addresses.
 
 Each check has an action (`allow`, `modify`, `block`, `error`), a per-check
 timeout, and an adapter identity. `modify` may rewrite request messages or
@@ -69,8 +261,8 @@ failed check and continue the remaining chain.
 
 ## Latency
 
-Input enforcement is on the request critical path after continuation expansion
-and before dispatch. Output enforcement for a protected identity delays the
+With `input_execution="before_dispatch"`, input inspection follows continuation
+expansion and delays dispatch. Parallel input inspection uses the overlap rules above. Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
 chain returns.
 
@@ -92,12 +284,9 @@ do not start another worker. Other adapters keep any remaining isolation
 workers. `http_json` still reuses one keep-alive client per isolation loop.
 Native callbacks submit enforcement onto one shared daemon loop so a Rust
 worker can return while an abandoned inspect still occupies an isolation
-worker. Leftover synchronous test adapters, when still needed, run only
-through a private bounded compatibility wrapper. Exhaustion of that wrapper
-cannot take async capacity from healthy adapters. Request bounds count the
+worker. Adapters implement the async contract directly. Request bounds count the
 compact JSON request subject sent to classifiers, including tool definitions,
-structured schemas, and metadata. Response bounds count completion text and
-tool-call arguments.
+structured schemas, and metadata. Response bounds count the serialized completion, including context and tool-call arguments.
 
 ## Privacy
 
@@ -202,6 +391,7 @@ individual checks by check ID (`standard-input-pii`) or `stage.capability`
       "identity_id": "identity-one",
       "protected": true,
       "preset": "standard",
+      "revision": "detector-rollout-v1",
       "timeout_ms": 250,
       "capability_adapters": {
         "pii": "hosted-pii",

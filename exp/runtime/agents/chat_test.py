@@ -244,3 +244,25 @@ def _response(
         economics=OperationEconomics(usage=usage),
         finish_reason=finish_reason,
     )
+
+
+def test_captured_system_and_developer_roles_precede_the_scenario() -> None:
+    """Imported instruction roles remain ordered and are not repeated inside the user prompt."""
+    task = _task().model_copy(
+        update={
+            "initial_context": {
+                "instruction_messages": [
+                    {"role": "system", "content": "Follow company policy."},
+                    {"role": "developer", "content": "Cite every source."},
+                ],
+                "company": "Acme",
+            }
+        }
+    )
+    model = _Model((_response(AssistantAction(content="done")),))
+    ChatAgentRuntime().run(task, model=model, environment=_Environment())
+    messages = model.requests[0].messages
+    assert [message.role for message in messages] == ["system", "developer", "user"]
+    assert messages[1].content == "Cite every source."
+    assert "instruction_messages" not in (messages[-1].content or "")
+    assert "Acme" in (messages[-1].content or "")

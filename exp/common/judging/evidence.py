@@ -6,6 +6,8 @@ visible outputs, tool calls, tool responses, structured failures, and the final 
 provider request payloads (the per-turn message histories repeated inside every model-call span)
 and candidate reasoning or chain-of-thought content never reach the judge. The projection is a
 pure function of the immutable rollout, so rendered requests stay deterministic and digest-stable.
+Simulator spans contribute only explicitly delivered observations. Rejected replies and private
+environment state stay in diagnostic traces and do not become evidence of worker performance.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from typing import Final, cast
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.rollouts import RolloutArtifact, RolloutSpan
+from exp.common.rollouts import RolloutArtifact, RolloutEventKind, RolloutSpan
 
 DEFAULT_JUDGE_OUTPUT_TOKENS: Final = 16_384
 """Per-call output-token budget reserved for every LM judge dispatch.
@@ -66,7 +68,11 @@ def visible_rollout_evidence(rollout: RolloutArtifact) -> JsonObject:
             if rollout.final_output is not None
             else None
         ),
-        "spans": [_visible_span_evidence(span) for span in rollout.spans],
+        "spans": [
+            _visible_span_evidence(span)
+            for span in rollout.spans
+            if span.kind != RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL or span.failure is None
+        ],
     }
 
 
@@ -80,11 +86,20 @@ def _visible_span_evidence(span: RolloutSpan) -> JsonObject:
         Span identity, kind, tool name, structured failure, and the span payload with every
         hidden provider-input and reasoning key removed recursively.
     """
+    payload = span.payload
+    if span.kind == RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL:
+        messages = span.payload.get("visible_messages")
+        if not isinstance(messages, list):
+            raise ValueError(
+                "world-model evidence lacks recorded delivered observations; "
+                "run a new evaluation before judging this artifact"
+            )
+        payload = {"messages": messages}
     return {
         "span_id": span.span_id,
         "kind": span.kind.value,
         "tool_name": span.tool_name,
-        "payload": _without_hidden_evidence(cast(JsonValue, span.payload)),
+        "payload": _without_hidden_evidence(cast(JsonValue, payload)),
         "failure": span.failure.model_dump(mode="json") if span.failure is not None else None,
     }
 
@@ -105,6 +120,8 @@ def _task_context(spans: tuple[RolloutSpan, ...]) -> list[JsonValue]:
         hidden keys removed, or an empty list when no span records a request.
     """
     for span in spans:
+        if span.kind == RolloutEventKind.SIMULATOR_WORLD_MODEL_CALL:
+            continue
         request = span.payload.get("request")
         if not isinstance(request, dict):
             continue

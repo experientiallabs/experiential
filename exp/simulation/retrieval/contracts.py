@@ -20,7 +20,7 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelSnapshot
 
 RAG_ARTIFACT_TYPE = "trace-rag-index"
-RAG_KEY_SCHEMA_VERSION = "observed-transition-key-v1"
+RAG_KEY_SCHEMA_VERSION = "observed-transition-key-v2"
 RAG_TRANSITIONS_PATH = "transitions.jsonl"
 RAG_VECTORS_PATH = "vectors.jsonl"
 RAG_INDEX_PATH = "rag-index.json"
@@ -86,7 +86,14 @@ class RAGObservation(ContractModel):
     """One real user or environment observation following an agent action."""
 
     kind: Literal["message", "tool_result"]
-    content: str = Field(min_length=1)
+    content: str
+
+    @model_validator(mode="after")
+    def visible_message(self) -> RAGObservation:
+        """An empty tool result is recorded evidence; a message needs visible content."""
+        if self.kind == "message" and not self.content:
+            raise ValueError("message observations need content")
+        return self
 
 
 class RAGTransition(ContractModel):
@@ -127,7 +134,7 @@ class RAGIndex(ArtifactEnvelope):
     """Completed immutable observed-transition index and its exact embedding identity."""
 
     rag_id: ArtifactId
-    key_schema_version: Literal["observed-transition-key-v1"] = RAG_KEY_SCHEMA_VERSION
+    key_schema_version: Literal["observed-transition-key-v2"] = RAG_KEY_SCHEMA_VERSION
     sources: tuple[RAGSourceRef, ...] = Field(min_length=1)
     embedder: ModelSnapshot
     transitions_path: str = RAG_TRANSITIONS_PATH
@@ -139,6 +146,7 @@ class RAGIndex(ArtifactEnvelope):
     included_lineage_ids: tuple[ArtifactId, ...] = ()
     included_partitions: tuple[Literal["fit", "held_out"], ...] = ("fit",)
     embedding_dimension: int = Field(gt=0)
+    embedding_chunk_bytes: int = Field(default=2_048, ge=4, le=2_048)
     transition_count: int = Field(gt=0)
     default_top_k: int = Field(default=5, gt=0)
 

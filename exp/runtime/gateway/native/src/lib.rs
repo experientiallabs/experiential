@@ -2,45 +2,84 @@
 //!
 //! `serve` blocks the calling Python thread (with the GIL released) while the
 //! tokio server owns the socket; the Python control plane is reached through
-//! bounded callbacks. The fixture functions expose the Rust SSE encoder and
-//! failure taxonomy for byte-level parity tests against the Python engine.
+//! bounded callbacks. The fixture functions expose the Rust SSE encoder, stream
+//! normalizer and failure taxonomy to the Python SDK-conformance and taxonomy
+//! tests.
 
 mod admission;
+mod audio_duration;
+mod audio_elevenlabs;
+mod audio_upload;
 mod bridge;
+mod capture;
+mod codex_native_inversion;
 mod dialects;
+mod dispatch_capacity;
 mod encode;
 mod encode_messages;
 mod encode_responses;
+mod error_envelope;
 mod errors;
 mod events;
 mod eventstream;
+mod execution_binding;
+mod execution_context;
+mod first_token_bound;
 mod guardrails;
+mod image_output;
+mod logprobs;
+#[cfg(test)]
+mod logprobs_tests;
 mod memory;
 mod metrics;
+mod output_pacing;
 mod param_attribution;
+mod permit_queue;
+mod rate_limit_headers;
+mod reasoning_display;
+mod reasoning_estimate;
+mod rejection_shapes;
 mod relay;
 mod replay;
+mod replay_repair;
+mod request_policy;
 mod respond;
 mod responses_retention;
+mod retained;
+mod route_audio;
 mod route_batches;
 mod route_chat;
+mod route_decisions;
 mod route_embeddings;
+mod route_image_edits;
 mod route_images;
 mod route_messages;
 mod route_responses;
 mod route_responses_ws;
+mod route_videos;
 mod server;
+mod service_tier;
 mod settlement;
 mod sse;
+mod stop_sequences;
+mod stream_errors;
+mod throttle_backoff;
+mod tool_search;
+mod tool_serialization;
 mod upstream;
 mod waterfall;
+mod web_search;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::bridge::Bridge;
+use crate::guardrails::detector::{Detector, DetectorSpec};
+use crate::guardrails::plan::DetectorMap;
 use crate::server::ServeConfig;
 
 /// Embedder-owned stop signal for one `serve` call.
@@ -74,6 +113,74 @@ impl ShutdownHandle {
     }
 }
 
+/// One compiled deterministic guardrail rule, owned by the control plane.
+///
+/// The control plane compiles each authored `regex` adapter once at policy
+/// load and reuses the handle for every request: in python for the input
+/// chain, and inside the data plane for a deterministic output chain. A rule
+/// the native detector cannot express raises at construction, and the caller
+/// keeps the python adapter for it.
+#[pyclass]
+pub struct RegexDetector {
+    inner: Arc<Detector>,
+}
+
+#[pymethods]
+impl RegexDetector {
+    /// Compile one authored rule from its JSON specification.
+    ///
+    /// `spec_json` carries `patterns`, `builtin_patterns`, and the literal
+    /// `replacement`.
+    #[new]
+    fn new(spec_json: &str) -> PyResult<Self> {
+        let spec: DetectorSpec = serde_json::from_str(spec_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid detector spec: {error}")))?;
+        let detector = Detector::compile(&spec).map_err(PyValueError::new_err)?;
+        Ok(Self {
+            inner: Arc::new(detector),
+        })
+    }
+
+    /// Redact one subject, returning `None` when nothing matched.
+    ///
+    /// The scan runs with the GIL released. A subject over the inspection
+    /// ceiling, or one that produces more matches than the ceiling allows,
+    /// raises so the caller fails closed.
+    fn redact(&self, py: Python<'_>, text: &str) -> PyResult<Option<String>> {
+        let detector = self.inner.clone();
+        py.detach(|| detector.redact(text))
+            .map_err(|limit| PyValueError::new_err(limit.message()))
+    }
+
+    /// Whether one subject matches at all, without building a replacement.
+    fn matches(&self, py: Python<'_>, text: &str) -> PyResult<bool> {
+        let detector = self.inner.clone();
+        py.detach(|| detector.matches(text))
+            .map_err(|limit| PyValueError::new_err(limit.message()))
+    }
+}
+
+impl RegexDetector {
+    /// Share the compiled rule with the serving runtime.
+    fn compiled(&self) -> Arc<Detector> {
+        self.inner.clone()
+    }
+}
+
+/// Snapshot the adapter-keyed detectors supplied by one execution owner.
+fn collect_detectors(detectors: Option<&Bound<'_, PyDict>>) -> PyResult<DetectorMap> {
+    let mut compiled: DetectorMap = HashMap::new();
+    let Some(mapping) = detectors else {
+        return Ok(compiled);
+    };
+    for (key, value) in mapping.iter() {
+        let adapter_id: String = key.extract()?;
+        let detector: PyRef<'_, RegexDetector> = value.extract()?;
+        compiled.insert(adapter_id, detector.compiled());
+    }
+    Ok(compiled)
+}
+
 /// Create one stop handle to pass to `serve`.
 #[pyfunction]
 fn shutdown_handle() -> ShutdownHandle {
@@ -89,34 +196,56 @@ fn shutdown_handle() -> ShutdownHandle {
 ///
 /// `control_plane` is a Python object exposing `authenticate`, `admit`,
 /// `start_attempt`, `sign_dispatch`, `settle`, `abandon`, `remember`,
-/// `enforce_output`, `models`, `model_detail`, `usage_json`, `usage_page`,
+/// `enforce_output`, `enforce_output_segment`, `models`, `model_detail`,
+/// `usage_json`, `usage_page`,
 /// `metrics_json`, `metrics_text`, `readiness`, and
 /// `close_thread_resources`, each taking and returning one JSON string.
 /// `config_json` carries host, port, and concurrency bounds.
-/// `enforce_output` is called only when admission sets `output_guardrail`;
+/// `enforce_output` is called only when admission sets `output_guardrail` to
+/// `buffer`, and `enforce_output_segment` only when it sets `stream`;
 /// `close_thread_resources` is called once per bridge worker thread as it
 /// exits so per-thread caches release with the pool.
+/// `guardrail_detectors` maps a policy `adapter_id` to one compiled
+/// `RegexDetector`, so an admission whose output chain is deterministic runs
+/// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None, execution_bindings=None))]
+// Keep the public Python positional ABI; Python is an implicit eighth argument.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
     config_json: &str,
     shutdown: Option<&ShutdownHandle>,
     on_listening: Option<Py<PyAny>>,
+    guardrail_detectors: Option<&Bound<'_, PyDict>>,
+    capture: Option<&capture::python::CaptureCollector>,
+    execution_bindings: Option<&execution_binding::ExecutionBindings>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
+    retained::configure(config.maximum_retained_output_bytes);
+    let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let bridge = Arc::new(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
     );
+    let execution_bindings = execution_bindings.cloned();
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
+    let capture = capture.map(|collector| collector.inner.clone());
     let outcome = py.detach(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("tokio runtime construction failed: {error}"))?;
-        runtime.block_on(server::run(bridge, config, stop, on_listening))
+        runtime.block_on(server::run(
+            bridge,
+            config,
+            stop,
+            on_listening,
+            detectors,
+            capture,
+            execution_bindings,
+        ))
     });
     outcome.map_err(PyRuntimeError::new_err)
 }
@@ -172,7 +301,7 @@ fn metrics_snapshot_json() -> String {
 fn encode_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<Vec<String>> {
@@ -195,12 +324,12 @@ fn encode_responses_fixture(
 }
 
 /// Build one non-streaming Responses body fixture through the Rust
-/// aggregation for byte parity tests against the python `completed_body`.
+/// aggregation for the SDK-conformance tests.
 #[pyfunction]
 fn completed_responses_fixture(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<String> {
@@ -214,63 +343,8 @@ fn completed_responses_fixture(
     Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
 }
 
-/// Encode one normalized event fixture through the Rust Anthropic Messages
-/// SSE encoder for byte parity tests. `events_json` is a list of simplified
-/// event objects.
-#[pyfunction]
-fn encode_messages_fixture(
-    request_id: &str,
-    model: &str,
-    events_json: &str,
-) -> PyResult<Vec<String>> {
-    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
-    let mut encoder = encode_messages::MessagesSseEncoder::new(request_id, model);
-    let mut frames = encoder
-        .start()
-        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
-    for event in &events {
-        frames.extend(
-            encoder
-                .feed(event)
-                .map_err(|error| PyValueError::new_err(error_payload(&error)))?,
-        );
-    }
-    Ok(frames)
-}
-
-/// Build one non-streaming Anthropic message body fixture through the Rust
-/// aggregation for byte parity tests against `completed_messages_body`.
-#[pyfunction]
-fn completed_messages_fixture(
-    request_id: &str,
-    model: &str,
-    events_json: &str,
-) -> PyResult<String> {
-    let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
-    let aggregated = encode_messages::completed_messages_body(request_id, model, &events)
-        .map_err(|error| PyValueError::new_err(error_payload(&error)))?;
-    if let Some(failure) = aggregated.failure {
-        return Err(PyValueError::new_err(error_payload(
-            &failure.public_error(),
-        )));
-    }
-    Ok(serde_json::to_string(&aggregated.body).unwrap_or_else(|_| "null".to_string()))
-}
-
-/// Render one OpenAI-shaped public error as the Anthropic error envelope for
-/// translation parity tests against `anthropic_error_body`.
-#[pyfunction]
-fn anthropic_error_fixture(public_error_json: &str) -> PyResult<String> {
-    let error: errors::PublicError = serde_json::from_str(public_error_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid public error: {error}")))?;
-    Ok(
-        serde_json::to_string(&encode_messages::anthropic_error_body(&error))
-            .unwrap_or_else(|_| "null".to_string()),
-    )
-}
-
 /// Normalize one raw provider stream fixture through the Rust frame decoder
-/// and dialect normalizer for parity tests against the python event mappers.
+/// and dialect normalizer for the SDK-conformance and normalizer tests.
 ///
 /// `chunks_json` is a JSON array of latin-1 encoded chunk strings (one
 /// character per raw byte, so binary framings round-trip losslessly). The
@@ -368,11 +442,6 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 item_id: item_id.ok_or("provider text delta requires item_id")?,
                 delta: text,
             },
-            "provider_refusal_delta" => events::Event::ProviderRefusalDelta {
-                output_index,
-                item_id: item_id.ok_or("provider refusal delta requires item_id")?,
-                delta: text,
-            },
             "provider_output_item_started" => events::Event::ProviderOutputItemStarted {
                 output_index,
                 item_id,
@@ -387,6 +456,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 status,
                 phase,
             },
+            "reasoning_text_delta" => events::Event::ReasoningTextDelta(text),
             "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
                 output_index: object
                     .get("output_index")
@@ -402,23 +472,6 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .unwrap_or("")
                     .to_string(),
                 delta: text,
-            },
-            "thinking_delta" => events::Event::ThinkingDelta { index, delta: text },
-            "thinking_signature" => events::Event::ThinkingSignature {
-                index,
-                signature: object
-                    .get("signature")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            },
-            "redacted_thinking" => events::Event::RedactedThinking {
-                index,
-                data: object
-                    .get("data")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
             },
             "encrypted_reasoning" => events::Event::EncryptedReasoning {
                 output_index: object
@@ -437,6 +490,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .to_string(),
             },
             "tool_call_started" => events::Event::ToolCallStarted {
+                custom: object
+                    .get("custom")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
                 index,
                 call_id: object
                     .get("call_id")
@@ -448,6 +505,18 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                namespace: object
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                caller: object
+                    .get("caller")
+                    .filter(|value| value.is_object())
+                    .cloned(),
+                thought_signature: object
+                    .get("thought_signature")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             },
             "tool_arguments_delta" => events::Event::ToolArgumentsDelta { index, delta: text },
             "tool_call_completed" => events::Event::ToolCallCompleted {
@@ -463,6 +532,18 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    namespace: object
+                        .get("namespace")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    caller: object
+                        .get("caller")
+                        .filter(|value| value.is_object())
+                        .cloned(),
+                    thought_signature: object
+                        .get("thought_signature")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     provider_item_id: object
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)
@@ -480,6 +561,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 input_tokens: object
                     .get("input_tokens")
                     .and_then(serde_json::Value::as_u64),
+                cache_creation_1h_input_tokens: object
+                    .get("cache_creation_1h_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
                 cache_creation_input_tokens: object
                     .get("cache_creation_input_tokens")
                     .and_then(serde_json::Value::as_u64),
@@ -492,66 +576,96 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 reasoning_tokens: object
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
+                billed_units: None,
+                cache_writes_read_back: false,
+                image_output_tokens: object
+                    .get("image_output_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_12h_input_tokens: object
+                    .get("cache_creation_12h_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
             }),
-            "server_tool_use_started" => events::Event::ServerToolUseStarted {
-                index,
-                call_id: object
-                    .get("call_id")
+            "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                name: object
-                    .get("name")
+                item_type: object
+                    .get("item_type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-            },
-            "server_tool_arguments_delta" => {
-                events::Event::ServerToolArgumentsDelta { index, delta: text }
-            }
-            "server_tool_use_completed" => events::Event::ServerToolUseCompleted {
-                index,
-                call: events::CompletedToolCall {
-                    call_id: object
-                        .get("call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    name: object
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    raw_arguments: object
-                        .get("raw_arguments")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    custom: false,
-                },
-            },
-            "server_tool_result" => events::Event::ServerToolResult {
-                index,
-                block: object
-                    .get("block")
+                item: object
+                    .get("item")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
             },
-            "text_block_started" => events::Event::TextBlockStarted { index },
-            "citation_delta" => events::Event::CitationDelta {
-                index,
-                citation: object
-                    .get("citation")
+            "hosted_tool_item_progress" => events::Event::HostedToolItemProgress {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                event_type: object
+                    .get("event_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                payload: object
+                    .get("payload")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "hosted_tool_item_completed" => events::Event::HostedToolItemCompleted {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item_type: object
+                    .get("item_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                item: object
+                    .get("item")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "provider_text_annotation" => events::Event::ProviderTextAnnotation {
+                output_index: object
+                    .get("output_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                item_id: object
+                    .get("item_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                annotation: object
+                    .get("annotation")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string(),
             },
             "completed" => events::Event::Completed,
             "incomplete" => events::Event::Incomplete,
-            "paused_turn" => events::Event::PausedTurn,
             "failed" => events::Event::Failed(errors::Failure::new(
                 errors::FailureClass::ProviderInternal,
                 if text.is_empty() {
@@ -571,21 +685,67 @@ fn error_payload(error: &errors::PublicError) -> String {
     serde_json::to_string(error).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Contract 1 consumes each deployment's actual canonical model identity and
+/// stage-local throttle-redial schedule. Funding, authorization and recovery
+/// remain Python/host contracts; this marker makes no claims about those.
+const MODEL_STAGE_CONTRACT_VERSION: u32 = 1;
+
 /// The exp_gateway_native extension module.
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
+    module.add_class::<execution_binding::ExecutionHandle>()?;
+    module.add_class::<execution_binding::ExecutionBindings>()?;
+    module.add_class::<RegexDetector>()?;
+    module.add_class::<capture::python::CaptureCollector>()?;
+    module.add_class::<capture::python::CaptureResponse>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;
-    module.add_function(wrap_pyfunction!(encode_messages_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(encode_responses_fixture, module)?)?;
-    module.add_function(wrap_pyfunction!(completed_messages_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(completed_responses_fixture, module)?)?;
-    module.add_function(wrap_pyfunction!(anthropic_error_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(normalize_stream_fixture, module)?)?;
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add("AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION", 1)?;
+    module.add("GUARDRAIL_CONTRACT_VERSION", 3)?;
+    module.add("MODEL_STAGE_CONTRACT_VERSION", MODEL_STAGE_CONTRACT_VERSION)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_digest_buffer_keeps_cursor_valid_after_compression_panic() {
+        use sha2::digest::{block_buffer::EagerBuffer, consts::U4};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // GHSA-qwgh-2vcv-g2f7 requires an inline position byte. Our pinned
+        // implementation keeps its position separate from the input buffer.
+        let mut buffer = EagerBuffer::<U4>::new(&[1, 2]);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            buffer.digest_blocks(&[3, 0xff], |_| panic!("compression failure"));
+        }));
+        assert!(failure.is_err());
+        assert_eq!(buffer.get_pos(), 2);
+        buffer.digest_blocks(&[4, 5], |_| {});
+        assert_eq!(buffer.get_pos(), 0);
+    }
+
+    #[test]
+    fn exports_compiled_model_stage_contract() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "exp_gateway_native").expect("module");
+            exp_gateway_native(&module).expect("register module");
+            let contract = module
+                .getattr("MODEL_STAGE_CONTRACT_VERSION")
+                .expect("compiled contract");
+            assert!(contract.is_exact_instance_of::<pyo3::types::PyInt>());
+            assert_eq!(contract.extract::<u32>().expect("integer contract"), 1);
+        });
+    }
 }

@@ -46,6 +46,7 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.project.store_test import _store
+from exp.common.project.testing import RawArtifact
 from exp.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
@@ -57,6 +58,8 @@ from exp.common.rollouts import (
 )
 from exp.common.tasks import TaskCase, TaskSet
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.dataset import persist_trace_dataset
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.model.sft.builder import (
     SFTBuildError,
     SFTBuildSpec,
@@ -79,8 +82,6 @@ from exp.optimize.model.sft.contracts import (
     TeacherAcceptanceRule,
     TeacherSFTSource,
 )
-from exp.simulation.ingest.dataset import persist_trace_dataset
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
@@ -756,7 +757,11 @@ def test_store_backed_source_rejects_corrupt_transcript_and_cross_store_pointer(
     source_store = _store(tmp_path / "source")
     source = _write_production_source(source_store, "corrupt")
     transcript_path = (
-        source_store.artifacts.read(source.acceptance_evidence_id).directory / "transcript.json"
+        RawArtifact(
+            source_store.artifacts._paths,
+            source_store.artifacts.read(source.acceptance_evidence_id).manifest.artifact_id,
+        )
+        / "transcript.json"
     )
     transcript_path.write_text('{"events":[]}\n', encoding="utf-8")
 
@@ -901,7 +906,13 @@ def test_teacher_rejects_corrupt_full_task_case_and_preserves_task_set_lineage(
     """Task IDs alone never authorize teacher data, task bytes and task-set inputs are verified."""
     store = _store(tmp_path)
     fixture = _write_teacher_source(store)
-    task_path = store.artifacts.read(fixture.task_set_input.artifact_id).directory / "tasks.jsonl"
+    task_path = (
+        RawArtifact(
+            store.artifacts._paths,
+            store.artifacts.read(fixture.task_set_input.artifact_id).manifest.artifact_id,
+        )
+        / "tasks.jsonl"
+    )
     task_path.write_text('{"task_id":"task-teacher"}\n', encoding="utf-8")
 
     with pytest.raises(SFTBuildError, match="not accepted evidence"):

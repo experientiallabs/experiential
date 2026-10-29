@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
@@ -15,6 +16,8 @@ from exp.common.models import (
     ToolChoice,
     Usage,
 )
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_MAXIMUM_OUTPUT_TOKENS,
@@ -37,6 +40,54 @@ from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolic
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
+
+
+def anthropic_official_origin(url: str) -> bool:
+    """Whether ``url`` is an endpoint on Anthropic's own Messages API.
+
+    The ``anthropic_messages`` dialect also serves Azure AI Foundry Claude and
+    connections with a custom base URL; this is the exact origin check that
+    tells Anthropic's own API (where provider-only betas are known to exist)
+    apart from those compatible hosts.
+
+    Args:
+        url: Full upstream endpoint URL of one wire profile.
+
+    Returns:
+        True only for an ``https`` URL on the official host and port whose
+        path lies under :data:`ANTHROPIC_BASE_URL`.
+    """
+    official = urlsplit(ANTHROPIC_BASE_URL)
+    candidate = urlsplit(url)
+    return (
+        candidate.scheme == official.scheme
+        and candidate.username is None
+        and candidate.password is None
+        and candidate.hostname == official.hostname
+        and candidate.port in (None, 443)
+        and candidate.path.startswith(f"{official.path}/")
+    )
+
+
+def safeguards_for_upstream(url: str, request: GatewayRequest) -> GatewayRequest:
+    """Drop Claude Code auto-mode ``safeguards`` unless ``url`` is Anthropic's own API.
+
+    Only the official API is known to run the server-side review behind the
+    ``dangerous-tool-use`` beta; a compatible host (Azure AI Foundry, a proxy
+    origin) may refuse the unknown field or beta. The drop is silent, so that
+    attempt answers like an ordinary turn and the caller reviews tool calls
+    itself. Applied per attempt, so a failover onto such a rung is covered.
+
+    Args:
+        url: Full upstream endpoint URL of the rung about to be dispatched.
+        request: Canonical request for that rung.
+
+    Returns:
+        ``request`` unchanged, or a copy with ``safeguards`` cleared.
+    """
+    if request.safeguards is None or anthropic_official_origin(url):
+        return request
+    return request.model_copy(update={"safeguards": None})
 
 
 def anthropic_messages_request(
@@ -64,13 +115,15 @@ def anthropic_messages_request(
     system_parts: list[str] = []
     messages: list[JsonObject] = []
     for message in request.messages:
-        if message.role == "system":
+        if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append(message.content)
             continue
         role, blocks = _anthropic_blocks(message)
         _append_anthropic_message(messages, role, blocks)
+    if request.json_object_output:
+        system_parts.append(JSON_OBJECT_SYSTEM_INSTRUCTION)
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
@@ -193,6 +246,7 @@ class AnthropicClient(ProviderHttpClient):
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
         authorization_bearer: bool = False,
+        inference_geo: Literal["us"] | None = None,
     ) -> None:
         """Create an Anthropic client with explicit generation capability gates.
 
@@ -219,6 +273,7 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_reasoning = supports_reasoning
         self._reasoning_effort = reasoning_effort
         self._authorization_bearer = authorization_bearer
+        self._inference_geo = inference_geo
 
     def _headers(self) -> dict[str, str]:
         """Build native Anthropic Messages headers with the connection's auth scheme."""
@@ -237,6 +292,7 @@ class AnthropicClient(ProviderHttpClient):
         """Return the native Messages wire profile for this connection."""
         return GatewayWireProfile(
             dialect="anthropic_messages",
+            inference_geo=self._inference_geo,
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
             headers=self._headers(),
             model_id=self._model.model_id,
@@ -259,7 +315,7 @@ class AnthropicClient(ProviderHttpClient):
 
     def _build_request(self, request: ModelRequest) -> JsonObject:
         """Convert one typed request into a native Messages payload."""
-        return anthropic_messages_request(
+        payload = anthropic_messages_request(
             self._model.model_id,
             request,
             supports_temperature=self._supports_temperature,
@@ -268,6 +324,10 @@ class AnthropicClient(ProviderHttpClient):
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
         )
+
+        if self._inference_geo is not None:
+            payload["inference_geo"] = self._inference_geo
+        return payload
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
         """Convert one completed Messages payload into the shared response contract."""
@@ -370,9 +430,40 @@ def _anthropic_usage(payload: JsonObject) -> Usage | None:
     cache_write = require_integer(
         usage.get("cache_creation_input_tokens"), "Anthropic usage.cache_creation_input_tokens"
     )
+    hour = _anthropic_write_hour_subset(usage, total=cache_write)
     return Usage(
         input_tokens=input_tokens + cache_read + cache_write,
         output_tokens=require_integer(usage.get("output_tokens"), "Anthropic usage.output_tokens"),
         cached_input_tokens=cache_read,
         cache_write_input_tokens=cache_write,
+        cache_write_1h_input_tokens=hour,
     )
+
+
+def _anthropic_write_hour_subset(usage: JsonObject, *, total: int) -> int | None:
+    """Preserve only a complete, consistent TTL split, matching the native normalizer.
+
+    Missing or partial evidence remains unknown. Every present count is validated
+    even when its counterpart is absent, so malformed partial usage cannot hide.
+
+    Raises:
+        ProviderResponseError: A TTL count is malformed or contradicts the write total.
+    """
+    raw = usage.get("cache_creation")
+    if raw is None:
+        return None
+    details = require_object(raw, "Anthropic usage.cache_creation")
+    counts = tuple(
+        None
+        if details.get(key) is None
+        else require_integer(details[key], f"Anthropic usage.cache_creation.{key}")
+        for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+    )
+    if any(count is not None and (count > total or count > 2**63 - 1) for count in counts):
+        raise ProviderResponseError("Anthropic usage.cache_creation TTL count exceeds total")
+    five, hour = counts
+    if five is None or hour is None:
+        return None
+    if five + hour > 2**63 - 1 or five + hour != total:
+        raise ProviderResponseError("Anthropic usage.cache_creation TTL counts differ from total")
+    return hour

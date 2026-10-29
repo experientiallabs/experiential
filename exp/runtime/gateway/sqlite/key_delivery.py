@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from exp.common.core.artifacts import Sha256
-from exp.runtime.gateway.sqlite.migrations import connect_database
+from exp.common.sqlite.connection import connect_database
 
 
 @dataclass(frozen=True, slots=True)

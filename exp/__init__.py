@@ -11,6 +11,10 @@ if TYPE_CHECKING:
         build_fidelity_evaluation_plan as build_fidelity_evaluation_plan,
     )
     from exp.common.evaluations import build_fidelity_report as build_fidelity_report
+    from exp.common.evaluations.model_report import ModelEvaluationReport as ModelEvaluationReport
+    from exp.common.judging import JudgeDefinition as JudgeDefinition
+    from exp.common.judging import RubricDimension as RubricDimension
+    from exp.common.judging import ScoreAnchor as ScoreAnchor
     from exp.common.models import BillingSource as BillingSource
     from exp.common.models import ConnectionConfig as ConnectionConfig
     from exp.common.models import DiscoveredModel as DiscoveredModel
@@ -34,6 +38,21 @@ if TYPE_CHECKING:
     )
     from exp.common.project import export_project_bundle as export_project_bundle
     from exp.common.project import restore_project_bundle as restore_project_bundle
+    from exp.optimize.evaluation.contracts import EvaluationBudget as EvaluationBudget
+    from exp.optimize.evaluation.contracts import EvaluationServices as EvaluationServices
+    from exp.optimize.evaluation.contracts import EvaluationSetup as EvaluationSetup
+    from exp.optimize.evaluation.planning import EvaluationCostPlan as EvaluationCostPlan
+    from exp.optimize.evaluation.planning import (
+        estimate_model_evaluation as estimate_model_evaluation,
+    )
+    from exp.optimize.evaluation.prepare import ModelEvaluationOptions as ModelEvaluationOptions
+    from exp.optimize.evaluation.prepare import PreparedModelEvaluation as PreparedModelEvaluation
+    from exp.optimize.evaluation.prepare import prepare_model_evaluation as prepare_model_evaluation
+    from exp.optimize.evaluation.runtime import (
+        run_prepared_model_evaluation as run_prepared_model_evaluation,
+    )
+    from exp.optimize.evaluation.service import ModelEvaluationResult as ModelEvaluationResult
+    from exp.optimize.evaluation.service import evaluate_models as evaluate_models
     from exp.optimize.router.activation import load_project_router as load_project_router
     from exp.optimize.router.activation import load_router as load_router
     from exp.optimize.router.attempt_authority import (
@@ -92,11 +111,37 @@ if TYPE_CHECKING:
     from exp.optimize.router.hosted_preflight import (
         HostedRouterPreflightError as HostedRouterPreflightError,
     )
+    from exp.optimize.router.judging.contracts import (
+        JudgeCalibrationBudget as JudgeCalibrationBudget,
+    )
+    from exp.optimize.router.judging.contracts import (
+        ManualJudgeCalibrationResult as ManualJudgeCalibrationResult,
+    )
+    from exp.optimize.router.judging.contracts import ManualJudgeLabel as ManualJudgeLabel
+    from exp.optimize.router.judging.service import (
+        ManualJudgeCalibrationPlan as ManualJudgeCalibrationPlan,
+    )
+    from exp.optimize.router.judging.service import ManualJudgeSetupPlan as ManualJudgeSetupPlan
+    from exp.optimize.router.judging.service import calibrate_manual_judge as calibrate_manual_judge
+    from exp.optimize.router.judging.service import (
+        commit_manual_judge_setup as commit_manual_judge_setup,
+    )
+    from exp.optimize.router.judging.service import (
+        estimate_manual_judge_budget as estimate_manual_judge_budget,
+    )
+    from exp.optimize.router.judging.service import (
+        prepare_manual_judge_calibration as prepare_manual_judge_calibration,
+    )
+    from exp.optimize.router.judging.service import (
+        prepare_manual_judge_setup as prepare_manual_judge_setup,
+    )
+    from exp.optimize.router.judging.template_bind import judge_template as judge_template
     from exp.optimize.router.spend import ProviderSpendComponent as ProviderSpendComponent
     from exp.optimize.router.spend import ProviderSpendEntry as ProviderSpendEntry
     from exp.optimize.router.spend import ProviderSpendLedger as ProviderSpendLedger
     from exp.optimize.router.spend import ProviderSpendStatus as ProviderSpendStatus
     from exp.runtime.models import RuntimeModelCatalog as RuntimeModelCatalog
+    from exp.runtime.models.budget import SpendLimitReached as SpendLimitReached
     from exp.runtime.router.economics import (
         BillingSourceEconomics as BillingSourceEconomics,
     )
@@ -143,6 +188,33 @@ if TYPE_CHECKING:
     from exp.simulation.world_model.application import load_world_model as load_world_model
 
 _EXPORT_MODULES = {
+    "ModelEvaluationReport": "exp.common.evaluations.model_report",
+    "EvaluationBudget": "exp.optimize.evaluation.contracts",
+    "EvaluationServices": "exp.optimize.evaluation.contracts",
+    "EvaluationSetup": "exp.optimize.evaluation.contracts",
+    "EvaluationCostPlan": "exp.optimize.evaluation.planning",
+    "estimate_model_evaluation": "exp.optimize.evaluation.planning",
+    "ModelEvaluationOptions": "exp.optimize.evaluation.prepare",
+    "PreparedModelEvaluation": "exp.optimize.evaluation.prepare",
+    "prepare_model_evaluation": "exp.optimize.evaluation.prepare",
+    "run_prepared_model_evaluation": "exp.optimize.evaluation.runtime",
+    "SpendLimitReached": "exp.runtime.models.budget",
+    "ModelEvaluationResult": "exp.optimize.evaluation.service",
+    "evaluate_models": "exp.optimize.evaluation.service",
+    "ManualJudgeSetupPlan": "exp.optimize.router.judging.service",
+    "ManualJudgeCalibrationPlan": "exp.optimize.router.judging.service",
+    "prepare_manual_judge_setup": "exp.optimize.router.judging.service",
+    "commit_manual_judge_setup": "exp.optimize.router.judging.service",
+    "prepare_manual_judge_calibration": "exp.optimize.router.judging.service",
+    "estimate_manual_judge_budget": "exp.optimize.router.judging.service",
+    "calibrate_manual_judge": "exp.optimize.router.judging.service",
+    "ManualJudgeLabel": "exp.optimize.router.judging.contracts",
+    "JudgeCalibrationBudget": "exp.optimize.router.judging.contracts",
+    "ManualJudgeCalibrationResult": "exp.optimize.router.judging.contracts",
+    "JudgeDefinition": "exp.common.judging",
+    "RubricDimension": "exp.common.judging",
+    "ScoreAnchor": "exp.common.judging",
+    "judge_template": "exp.optimize.router.judging.template_bind",
     "BillingSource": "exp.common.models",
     "ConnectionConfig": "exp.common.models",
     "DiscoveredModel": "exp.common.models",

@@ -22,7 +22,7 @@ from exp.common.judging import (
 )
 from exp.common.judging.evidence import DEFAULT_JUDGE_OUTPUT_TOKENS
 from exp.common.judging.lm import PORTABLE_RATIONALE_JSON_SCHEMA
-from exp.common.models import ModelSnapshot, OperationEconomics, PricingSource
+from exp.common.models import ModelResponse, ModelSnapshot, OperationEconomics, PricingSource
 
 
 class ManualJudgeError(ValueError):
@@ -30,12 +30,20 @@ class ManualJudgeError(ValueError):
 
 
 class ManualJudgeLabel(ContractModel):
-    """One human score or typed pairwise preference for real trace evidence."""
+    """One human score or typed pairwise preference for real trace evidence.
+
+    Attributes:
+        trace_id: Assessed trace identity, from 1 through 512 characters.
+        reference_trace_id: Distinct comparison trace for pairwise labels, otherwise None.
+        dimension_id: Axis whose rubric defines the score range.
+        score: Signed scalar score, or None when winner is supplied.
+        winner: Pairwise preference, or None when score is supplied.
+    """
 
     trace_id: str = Field(min_length=1, max_length=512)
     reference_trace_id: str | None = Field(default=None, min_length=1, max_length=512)
     dimension_id: ArtifactId
-    score: int | None = Field(default=None, ge=0)
+    score: int | None = None
     winner: Literal["winner_a", "winner_b", "tie"] | None = None
 
     @model_validator(mode="after")
@@ -282,10 +290,18 @@ class JudgeRunEvidence(ContractModel):
 
 
 class JudgeAxisProposal(ContractModel):
-    """One configured-judge proposal retained before a human decision."""
+    """One configured-judge proposal retained before a human decision.
+
+    Attributes:
+        dimension_id: Proposed rubric axis.
+        proposed_score: Signed score checked against the configured axis at review.
+        proposed_judgment: Proposed explanation, empty when omitted.
+        cited_trace_evidence: Unique nonempty trace-span IDs, empty when omitted.
+        cited_reference_trace_evidence: Corresponding pairwise-reference citations.
+    """
 
     dimension_id: ArtifactId
-    proposed_score: int = Field(ge=0, le=10)
+    proposed_score: int
     proposed_judgment: str = ""
     cited_trace_evidence: tuple[str, ...] = ()
     cited_reference_trace_evidence: tuple[str, ...] = ()
@@ -328,16 +344,30 @@ class JudgeAxisProposal(ContractModel):
 
 
 class HumanJudgeCorrection(ContractModel):
-    """A human-authored replacement for one judge score and judgment."""
+    """A human-authored replacement for one judge score and judgment.
 
-    corrected_score: int = Field(ge=0, le=10)
+    Attributes:
+        corrected_score: Signed replacement score checked against the configured axis.
+        corrected_judgment: Nonempty replacement explanation, or None to retain the proposal.
+    """
+
+    corrected_score: int
     corrected_judgment: str | None = Field(default=None, min_length=1)
 
 
 class FinalAcceptedJudgeLabel(ContractModel):
-    """The label authorized by a human after reviewing a judge proposal."""
+    """The label authorized by a human after reviewing a judge proposal.
 
-    score: int = Field(ge=0, le=10)
+    Attributes:
+        score: Accepted signed score within the configured axis.
+        judgment: Accepted explanation, empty when omitted.
+        cited_trace_evidence: Unique nonempty supporting span IDs, empty when omitted.
+        cited_reference_trace_evidence: Corresponding pairwise-reference citations.
+        score_source: Whether the score came from the judge or a human correction.
+        judgment_source: Whether the explanation came from the judge or a human correction.
+    """
+
+    score: int
     judgment: str = ""
     cited_trace_evidence: tuple[str, ...] = ()
     cited_reference_trace_evidence: tuple[str, ...] = ()
@@ -625,7 +655,12 @@ class ManualJudgeTraceReviewArtifact(ArtifactEnvelope):
 
 
 class JudgeProtocolProbeArtifact(ArtifactEnvelope):
-    """One immutable schema-valid provider probe used by manual calibration."""
+    """One immutable provider probe, including retained unpriceable paid evidence.
+
+    Attributes:
+        pricing_error: Explicit valuation failure; this probe cannot become a judgment.
+        unpriced_response: Paid output and usage retained before that failure is raised.
+    """
 
     probe_id: ArtifactId
     setup: ArtifactInput
@@ -635,6 +670,10 @@ class JudgeProtocolProbeArtifact(ArtifactEnvelope):
     response: JsonObject
     model: ModelSnapshot
     economics: OperationEconomics
+    pricing_error: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    unpriced_response: ModelResponse | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _require_complete_probe_inputs(self) -> JudgeProtocolProbeArtifact:
@@ -664,6 +703,15 @@ class JudgeProtocolProbeArtifact(ArtifactEnvelope):
             raise ValueError("single judge probes cannot bind a reference rollout")
         if self.order != "single" and self.reference_rollout is None:
             raise ValueError("counterbalanced judge probes require a reference rollout")
+        if (self.pricing_error is None) != (self.unpriced_response is None):
+            raise ValueError("unpriceable judge probes must retain both the response and error")
+        if self.unpriced_response is not None and (
+            self.unpriced_response.model != self.model
+            or self.unpriced_response.economics != self.economics
+            or self.economics.cost_usd is not None
+            or self.response
+        ):
+            raise ValueError("unpriceable judge probe evidence must match its unknown economics")
         return self
 
 

@@ -15,6 +15,8 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from exp.common.core.artifacts import Sha256, sha256_json
+from exp.common.judging import Rubric
+from exp.common.judging.provenance import read_artifact_json
 from exp.common.project import ProjectStore
 from exp.optimize.router.judging.artifacts import require_review_state, update_review_state
 from exp.optimize.router.judging.contracts import (
@@ -24,6 +26,7 @@ from exp.optimize.router.judging.contracts import (
     ManualJudgeReviewState,
     ManualJudgeSetupArtifact,
 )
+from exp.optimize.router.judging.setup_store import read_setup_artifact
 
 _LabelKey = tuple[str, str | None, str]
 
@@ -70,8 +73,13 @@ def read_label_draft(
     Raises:
         ManualJudgeError: Review state is missing or malformed.
     """
-    draft = _sample_draft(require_review_state(store).label_drafts, setup, sample_sha256)
-    return () if draft is None else draft.labels
+    state = require_review_state(store)
+    if read_setup_artifact(store, state.setup) != setup:
+        raise ManualJudgeError("label draft setup differs from the finalized contract")
+    draft = _sample_draft(state.label_drafts, setup, sample_sha256)
+    labels = () if draft is None else draft.labels
+    _validate_draft_scores(store, setup, labels)
+    return labels
 
 
 def save_label_draft(
@@ -99,6 +107,9 @@ def save_label_draft(
     state = require_review_state(store)
     if state.setup.artifact_id != setup.setup_id:
         raise ManualJudgeError("label draft setup differs from the current review state")
+    if read_setup_artifact(store, state.setup) != setup:
+        raise ManualJudgeError("label draft setup differs from the finalized contract")
+    _validate_draft_scores(store, setup, labels)
     saved: list[ManualJudgeLabelDraft] = []
 
     def mutate(current: ManualJudgeReviewState) -> ManualJudgeReviewState:
@@ -127,6 +138,33 @@ def save_label_draft(
 
     update_review_state(store, state.setup, mutate)
     return saved[-1]
+
+
+def _validate_draft_scores(
+    store: ProjectStore,
+    setup: ManualJudgeSetupArtifact,
+    labels: Sequence[ManualJudgeLabel],
+) -> None:
+    """Validate partial draft labels against the exact finalized rubric before persistence."""
+    rubric, pointer = read_artifact_json(
+        store,
+        artifact_id=setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+    if pointer != setup.rubric:
+        raise ManualJudgeError("label draft rubric differs from the finalized setup")
+    for label in labels:
+        try:
+            axis = rubric.axis(label.dimension_id)
+        except ValueError as exc:
+            raise ManualJudgeError("label draft names an unknown rubric axis") from exc
+        if label.score is not None and not axis.contains_score(label.score):
+            raise ManualJudgeError(
+                f"label score for {axis.dimension_id} must be from "
+                f"{axis.min_score} through {axis.max_score}"
+            )
 
 
 def _sample_draft(

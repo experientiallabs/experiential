@@ -30,6 +30,7 @@ use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collection_public_error, remaining};
 use crate::respond::{
     bearer_key, error_response, escalation_error, json_response, latin1_header, read_body,
+    with_app_identity,
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -58,6 +59,9 @@ impl EmbeddingsAdmission {
             maximum_total_attempts: self.maximum_total_attempts.max(1),
             maximum_same_deployment_attempts: self.maximum_same_deployment_attempts.max(1),
             refusal_failover: false,
+            throttle_redial: None,
+            physical_route_cap: None,
+            backoff: None,
         }
     }
 }
@@ -96,7 +100,9 @@ pub(crate) async fn embeddings(
     };
     let client_request_id = latin1_header(&headers, "x-client-request-id");
 
-    let admit_argument = compact_json(&json!({"raw_key": raw_key, "body": body_text}));
+    let mut admit_value = json!({"raw_key": raw_key, "body": body_text});
+    with_app_identity(&mut admit_value, &headers);
+    let admit_argument = compact_json(&admit_value);
     let admission_text = match state.bridge.call("admit_embeddings", admit_argument).await {
         Ok(text) => text,
         Err(error) => return error_response(&error),
@@ -109,14 +115,14 @@ pub(crate) async fn embeddings(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // The accepted request is already finalized control-plane side;
         // startup validation guarantees native servability, so fail closed.
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission: EmbeddingsAdmission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -198,7 +204,9 @@ async fn run_ladder(
                     "all exact-model deployments are unavailable",
                 )
             });
-            return Err(collection_public_error(&failure.boundary()));
+            let mut error = collection_public_error(&failure.boundary());
+            error.known_unbilled = started.known_unbilled;
+            return Err(error);
         }
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
             guard
@@ -226,20 +234,23 @@ async fn run_ladder(
         guard.rebind(attempt_id);
         total_attempts += 1;
         counts[depth] += 1;
-        match dispatch(&state.http, wire, deadline, admission).await {
+        let http = state.http.for_origin(wire.tenant_origin);
+        match dispatch(http, wire, deadline, admission).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err((failure, opened)) => {
+                let failure = failure.with_tenant_origin(wire.tenant_origin);
                 if opened {
                     guard.mark_opened();
                 }
                 let boundary = failure.clone().boundary();
                 let possible = successor_possible(
                     policy,
-                    admission.route.len(),
+                    &admission.route,
                     deadline,
                     total_attempts,
                     counts[depth],
                     depth,
+                    &counts,
                     &failure,
                     false,
                 );
@@ -264,7 +275,7 @@ async fn run_ladder(
 /// carries whether the provider dispatch opened (for deployment-health
 /// recording); a rejected open never opened.
 async fn dispatch(
-    http: &reqwest::Client,
+    http: &crate::upstream::UpstreamClient,
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &EmbeddingsAdmission,
@@ -424,7 +435,12 @@ fn public_embeddings(
         output_tokens: Some(0),
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
+        cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
+        billed_units: None,
+        cache_writes_read_back: false,
+        image_output_tokens: None,
     };
     Ok((Value::Object(public), usage))
 }

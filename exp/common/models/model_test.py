@@ -26,9 +26,28 @@ from exp.common.models import (
     Usage,
     combine_economics,
 )
+from exp.common.models.content import ImageContentPart, TextContentPart, VideoContentPart
 from exp.common.tasks import ToolSchema
 
 _CAPABILITIES_DIGEST = "a" * 64
+
+
+def test_absent_unbilled_counter_preserves_existing_economics_serialization() -> None:
+    """Adding admission evidence does not change the canonical bytes of existing receipts."""
+    legacy = {"provider_attempts": 1, "usage": None, "cost_usd": None, "latency_seconds": None}
+    economics = OperationEconomics.model_validate(legacy)
+    assert economics.unbilled_attempts == 0
+    assert economics.model_dump(mode="json") == legacy
+    assert sha256_json(economics) == sha256_json(legacy)
+
+
+@pytest.mark.parametrize("attempts,unbilled", [(None, 1), (1, 2), (2, -1)])
+def test_unbilled_attempts_require_a_complete_consistent_wire_count(
+    attempts: int | None, unbilled: int
+) -> None:
+    """Incomplete or contradictory counters cannot release retry reservations."""
+    with pytest.raises(ValidationError):
+        OperationEconomics(provider_attempts=attempts, unbilled_attempts=unbilled)
 
 
 def test_actions_need_payload_and_measurements_are_finite() -> None:
@@ -106,6 +125,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_tools": True,
         "supports_embeddings": None,
         "supports_image_generation": None,
+        "emits_images": False,
         "supports_structured_output": False,
         "supports_completions": None,
         "supports_temperature": True,
@@ -117,6 +137,10 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "supports_reasoning": False,
         "reasoning_effort": None,
         "sampling_requires_reasoning_none": False,
+        "reasoning_output_exposed": False,
+        "reasoning_output_hidden": False,
+        "reasoning_content_native": False,
+        "system_messages_leading_only": False,
         "chat_max_tokens_field": None,
         "minimum_temperature": None,
         "maximum_temperature": None,
@@ -130,6 +154,7 @@ def test_model_request_keeps_tool_contract_and_capabilities_deterministic() -> N
         "output_cost_per_million_tokens_usd": None,
         "cached_input_cost_per_million_tokens_usd": None,
         "cache_write_cost_per_million_tokens_usd": None,
+        "service_tier_pricing_enabled": False,
     }
     with pytest.raises(ValidationError, match="named tool_choice"):
         ModelRequest(
@@ -202,6 +227,38 @@ def test_model_messages_reject_tool_and_assistant_fields_on_the_wrong_roles() ->
         ModelMessage(role="tool", content="missing linkage")
 
 
+def test_model_messages_carry_images_on_user_tool_and_assistant_roles() -> None:
+    """Tool screenshots and generated assistant images preserve their content parts."""
+    image = ImageContentPart(media_type="image/png", data="aGk=")
+    tool = ModelMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert tool.images == (image,)
+    assistant = ModelMessage(
+        role="assistant",
+        content="shot",
+        content_parts=(TextContentPart(text="shot"), image),
+    )
+    assert assistant.images == (image,)
+    with pytest.raises(ValidationError, match="valid only for user, tool, and assistant messages"):
+        ModelMessage(
+            role="system", content="shot", content_parts=(TextContentPart(text="shot"), image)
+        )
+    with pytest.raises(ValidationError, match="tool messages carry only text and image parts"):
+        ModelMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="clip",
+            content_parts=(
+                TextContentPart(text="clip"),
+                VideoContentPart(media_type="video/mp4", data="aGk="),
+            ),
+        )
+
+
 def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payloads() -> None:
     """Raw provider JSON replays exactly but stays outside semantic artifact payloads."""
     legacy = ToolCall(call_id="call-1", name="lookup", arguments={"a": 1, "b": 2})
@@ -228,6 +285,30 @@ def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payl
             arguments={"a": 1},
             raw_arguments='{"a":2}',
         )
+
+
+def test_a_treated_tool_call_keeps_raw_text_beside_its_object_stand_in() -> None:
+    """A replayed call whose text names no object keeps both; artifacts see only the object."""
+    treated = ToolCall(
+        call_id="call-1",
+        name="lookup",
+        arguments={"_unparsed_arguments": "not json"},
+        raw_arguments="not json",
+        arguments_treatment="invalid_json",
+    )
+    assert treated.arguments_json() == "not json"
+    assert treated.arguments_json(sort_keys=True) == '{"_unparsed_arguments": "not json"}'
+    assert treated.model_dump(mode="json") == {
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": {"_unparsed_arguments": "not json"},
+    }
+    with pytest.raises(ValidationError, match="requires the raw text"):
+        ToolCall(
+            call_id="call-1", name="lookup", arguments={}, arguments_treatment="truncated_json"
+        )
+    with pytest.raises(ValidationError, match="must encode one JSON object"):
+        ToolCall(call_id="call-1", name="lookup", arguments={}, raw_arguments="not json")
 
 
 def test_combine_economics_reports_partial_totals_only_when_asked() -> None:
@@ -432,3 +513,43 @@ def test_generation_parameter_contract_rejects_inverted_ranges() -> None:
         ModelCapabilities(minimum_top_k=10, maximum_top_k=5)
     with pytest.raises(ValidationError, match="conditional sampling requires reasoning support"):
         ModelCapabilities(sampling_requires_reasoning_none=True)
+
+
+def test_reasoning_content_native_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The native reasoning_content declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().reasoning_content_native is False
+    assert (
+        ModelCapabilities(reasoning_content_native=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_reasoning_output_hidden_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The reasoning display opt-out defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().reasoning_output_hidden is False
+    assert (
+        ModelCapabilities(reasoning_output_hidden=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_system_messages_leading_only_is_a_gateway_flag_outside_the_frozen_identity() -> None:
+    """The leading-only system declaration defaults off and never re-digests a catalog."""
+    assert ModelCapabilities().system_messages_leading_only is False
+    assert (
+        ModelCapabilities(system_messages_leading_only=True).identity_sha256()
+        == ModelCapabilities().identity_sha256()
+    )
+
+
+def test_emits_images_stays_out_of_the_capability_identity() -> None:
+    """Emitting images is a data-plane settlement fact, never a dispatch contract.
+
+    Like ``supports_image_generation`` it is excluded from the capability
+    identity, so projecting it onto the text+image chat lanes leaves every
+    pinned ``capabilities_sha256`` where it was.
+    """
+    plain = ModelCapabilities(supports_tools=True)
+    emitting = ModelCapabilities(supports_tools=True, emits_images=True)
+    assert plain.identity_sha256() == emitting.identity_sha256()
+    assert emitting.emits_images is True and plain.emits_images is False

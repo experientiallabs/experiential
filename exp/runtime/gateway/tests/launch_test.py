@@ -40,18 +40,20 @@ exp_gateway_native = pytest.importorskip("exp_gateway_native")
 class _ServedGateway:
     """One native gateway served on a loopback port in a background thread."""
 
-    def __init__(self, root: Path, port: int) -> None:
+    def __init__(self, root: Path, port: int, *, default_lane_bound: int | None = None) -> None:
         """Load components over the seeded root and bind the serving facts.
 
         Args:
             root: Initialized EXP root whose granted aliases are served.
             port: Loopback port the native plane will bind.
+            default_lane_bound: Maximum concurrent attempts in one physical lane.
         """
         self.port = port
         self.components = load_gateway_components(root)
         self.control_plane = NativeControlPlane(
             self.components,
             data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
+            default_lane_bound=default_lane_bound,
         )
         self.shutdown = exp_gateway_native.shutdown_handle()
         self.error: BaseException | None = None
@@ -409,7 +411,7 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                     "--period",
                     budget_period,
                     *budget_arguments,
-                    "--limit-micro-usd",
+                    "--limit-nano-usd",
                     "1000000",
                     "--root",
                     str(tmp_path),
@@ -455,7 +457,7 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
         primary_budget = next(
             row for row in budget_rows if row["budget"]["scope"].get("deployment_id") == "primary"
         )
-        assert primary_budget["charged_micro_usd"] > 0
+        assert primary_budget["charged_nano_usd"] > 0
         exhausted_primary = runner.invoke(
             app,
             [
@@ -473,8 +475,8 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                 "coding",
                 "--deployment",
                 "primary",
-                "--limit-micro-usd",
-                str(primary_budget["charged_micro_usd"]),
+                "--limit-nano-usd",
+                str(primary_budget["charged_nano_usd"]),
                 "--replace",
                 "--root",
                 str(tmp_path),
@@ -553,8 +555,8 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
                 "identity",
                 "--identity",
                 "default",
-                "--limit-micro-usd",
-                str(identity_budget["charged_micro_usd"]),
+                "--limit-nano-usd",
+                str(identity_budget["charged_nano_usd"]),
                 "--replace",
                 "--root",
                 str(tmp_path),
@@ -610,7 +612,9 @@ async def _exercise_async_sdk(base_url: str, raw_key: str, prompt: str) -> None:
     assert events[-1].type == "response.completed"
 
 
-def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement, str]:
+def _configure_gateway(
+    root: Path, *, base_url: str, supports_tools: bool = False
+) -> tuple[GatewayManagement, str]:
     """Create explicit launch state against one real loopback provider."""
     manager = GatewayManagement(root)
     manager.initialize()
@@ -631,11 +635,15 @@ def _configure_gateway(root: Path, *, base_url: str) -> tuple[GatewayManagement,
         provider_model="provider-model-exact",
         exact_model_id="model-revision-exact",
         revision=None,
-        capabilities=ModelCapabilities(),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        capabilities=ModelCapabilities(
+            supports_tools=supports_tools, maximum_output_tokens=128_000
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_streaming_tool_arguments=supports_tools
+        ),
         prices=GatewayTokenPrices(
-            input_micro_usd_per_million_tokens=1_000_000,
-            output_micro_usd_per_million_tokens=2_000_000,
+            input_nano_usd_per_million_tokens=1_000_000,
+            output_nano_usd_per_million_tokens=2_000_000,
         ),
         pricing_source="loopback-test",
         replace=False,

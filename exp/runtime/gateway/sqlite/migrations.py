@@ -5,18 +5,28 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 15
+from exp.common.sqlite.connection import connect_database
+from exp.runtime.gateway.sqlite.cache_write_migration import migrate_cache_write
+from exp.runtime.gateway.sqlite.nano_usd_migration import (
+    NanoUsdMigrationError,
+    migrate_money_to_nano_usd,
+)
+
+SCHEMA_VERSION = 32
 
 
 class GatewaySchemaError(RuntimeError):
     """The gateway database schema cannot be opened safely."""
 
+
+MigrationStep = str | Callable[[sqlite3.Connection], None]
+"""One forward-migration step: a plain SQL statement, or a callable for a step
+that must read before it writes (the v20 money-unit move guards every amount
+before scaling it)."""
 
 _MIGRATION_1 = (
     """
@@ -567,12 +577,8 @@ _GATEWAY_REQUESTS_V10_SQL = """CREATE TABLE gateway_requests (
     ) STRICT"""
 
 _MIGRATION_10 = (
-    # SQLite cannot alter a CHECK constraint in place, and gateway_requests is
-    # the foreign-key parent of gateway_attempts, so the copy-and-rename
-    # rebuild used by migration 6 would trip immediate foreign keys inside
-    # this exclusive transaction. A CHECK-only change does not affect the
-    # on-disk record format, so the documented lightweight procedure rewrites
-    # the stored schema text in place instead.
+    # A CHECK-only schema rewrite preserves row layout and avoids rebuilding
+    # gateway_requests while gateway_attempts holds immediate foreign keys.
     "PRAGMA writable_schema = ON",
     (
         "UPDATE sqlite_master SET sql = '"
@@ -604,10 +610,9 @@ _MIGRATION_12 = (
     """,
 )
 
-# Long-context tier rates freeze on the attempt exactly like the base
-# rates, so settlement prices with the schedule that was live at dispatch.
-# The threshold column selects the schedule once provider-reported input
-# tokens reach it; NULL means the deployment had no tier.
+# Long-context rates freeze on the attempt like base rates. Settlement selects
+# the frozen tier once reported input tokens reach its threshold; NULL means
+# the deployment had no tier.
 _MIGRATION_13 = (
     """
     ALTER TABLE gateway_attempts
@@ -659,7 +664,48 @@ _MIGRATION_15 = (
     "DROP TABLE gateway_schema_refresh_v15",
 )
 
-_MIGRATIONS = {
+# v16: persist the provider's own sanitized one-sentence explanation of a failed attempt (the
+# credential-free text the Rust upstream's param_attribution extracts and the caller already
+# receives), so an operator sees WHY a provider rejected the call without re-deriving it from logs.
+_MIGRATION_16 = ("ALTER TABLE gateway_attempts ADD COLUMN failure_message TEXT",)
+
+# v17: cost-optimality disclosure for policy-routed dispatches. When a rung dispatch policy or an
+# affinity pool bypasses the route's preferred rung, dispatch_reason names why the chosen rung
+# serves (affinity, fair_share_shed, queue_bound, rung_dead, saturated_overflow) and preferred_*
+# freeze the bypassed rung's identity and base rates at reservation, so settle prices the SAME
+# usage counterfactually (counterfactual_cost_micro_usd, renamed ..._nano_usd at v20).
+_MIGRATION_17 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN dispatch_reason TEXT",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_deployment_id TEXT",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_input_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_cached_input_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_output_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN preferred_reasoning_rate INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN counterfactual_cost_micro_usd INTEGER",
+)
+
+# v18: a native provider may carry a custom base_url when trusted_custom_origin is set, so the
+# flag rides the revision beside base_url (else a reload defaults it to 0 and is rejected).
+_MIGRATION_18 = (
+    """
+    ALTER TABLE provider_connection_revisions
+    ADD COLUMN trusted_custom_origin INTEGER NOT NULL DEFAULT 0
+    CHECK (trusted_custom_origin IN (0, 1))
+    """,
+)
+
+# v19: per-attempt rate-limit observability. The data plane harvests the allowlisted rate-limit
+# headers (retry-after, x-ratelimit-*, anthropic-ratelimit-*) on every attempt; these columns keep
+# the normalized integers so throttle calibration is auditable. Numbers only, no content.
+_MIGRATION_19 = (
+    "ALTER TABLE gateway_attempts ADD COLUMN retry_after_seconds INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_requests INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_requests INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_limit_tokens INTEGER",
+    "ALTER TABLE gateway_attempts ADD COLUMN ratelimit_remaining_tokens INTEGER",
+)
+
+_MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     1: _MIGRATION_1,
     2: _MIGRATION_2,
     3: _MIGRATION_3,
@@ -675,98 +721,94 @@ _MIGRATIONS = {
     13: _MIGRATION_13,
     14: _MIGRATION_14,
     15: _MIGRATION_15,
+    16: _MIGRATION_16,
+    17: _MIGRATION_17,
+    18: _MIGRATION_18,
+    19: _MIGRATION_19,
+    20: (migrate_money_to_nano_usd,),
+    21: (
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''embeddings'', ''images'')', '''embeddings'', ''images'', ''decisions'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v21 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v21",
+    ),
+    22: ("ALTER TABLE gateway_attempts ADD COLUMN upstream_provider TEXT",),  # aggregator label
+    23: (migrate_cache_write,),
+    25: (
+        "ALTER TABLE gateway_attempts ADD COLUMN service_tier_admission TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN service_tier_settlement TEXT",
+    ),
+    26: (
+        "ALTER TABLE gateway_requests ADD COLUMN failed_without_effects INTEGER NOT NULL "
+        "DEFAULT 0 CHECK (failed_without_effects IN (0, 1))",
+    ),
+    27: (  # content-free calling-application attribution (client_apps.py)
+        "ALTER TABLE gateway_requests ADD COLUMN client_app TEXT",
+        "ALTER TABLE gateway_requests ADD COLUMN user_agent TEXT",
+    ),
+    28: (
+        "ALTER TABLE gateway_requests ADD COLUMN web_search_requests INTEGER NOT NULL "
+        "DEFAULT 0 CHECK (web_search_requests >= 0)",
+    ),
+    29: (  # media surfaces and the per-unit billing ledger (catalog_prices.GatewayUnitPrices)
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''images'', ''decisions'')', "
+        "'''images'', ''decisions'', ''speech'', ''transcription'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v29 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v29",
+        # The unit card frozen at reservation (JSON, as authored), so settlement
+        # prices observed units against the rates the reservation was sized on.
+        "ALTER TABLE gateway_attempts ADD COLUMN unit_prices TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_kind TEXT CHECK ("
+        "billed_unit_kind IS NULL OR billed_unit_kind IN "
+        "('character', 'audio_second', 'video_second', 'image'))",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_variant TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_quantity_milli INTEGER CHECK ("
+        "billed_quantity_milli IS NULL OR billed_quantity_milli >= 0)",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_rate INTEGER CHECK ("
+        "billed_unit_rate IS NULL OR billed_unit_rate >= 0)",
+    ),
+    30: (  # asynchronous video jobs (exp.runtime.gateway.video.store)
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''speech'', ''transcription'')', '''speech'', ''transcription'', ''video'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v30 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v30",
+        "CREATE TABLE gateway_video_jobs (video_id TEXT PRIMARY KEY, "
+        "organization_id TEXT NOT NULL, identity_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "settled INTEGER NOT NULL CHECK (settled IN (0, 1)), "
+        "deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)), job TEXT NOT NULL) STRICT",
+        "CREATE INDEX gateway_video_jobs_owner "
+        "ON gateway_video_jobs (organization_id, identity_id, created_at)",
+        "CREATE INDEX gateway_video_jobs_open ON gateway_video_jobs (created_at) WHERE settled = 0",
+    ),
+    31: (  # the Azure Responses surface (azure_endpoints.AzureApiSurface), CHECK-only rewrite
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''openai_deployments'', ''model_inference'')', "
+        "'''openai_deployments'', ''model_inference'', ''responses'')') "
+        "WHERE type = 'table' AND name = 'provider_connection_revisions'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v31 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v31",
+    ),
+    32: (  # trusted local cleanup, distinct from an immutable provider failure
+        "ALTER TABLE gateway_attempts ADD COLUMN accounting_recovery INTEGER NOT NULL "
+        "DEFAULT 0 CHECK (accounting_recovery IN (0, 1))",
+    ),
+    24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
+        "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "
+        "CHECK (subscription IN ('chatgpt', 'anthropic'))",
+    ),
 }
-
-
-def connect_database(
-    path: Path, *, busy_timeout_ms: int = 5_000, enable_wal: bool = True
-) -> sqlite3.Connection:
-    """Open one configured SQLite connection with mandatory safety pragmas.
-
-    Args:
-        path: Gateway database path.
-        busy_timeout_ms: Bounded lock wait in milliseconds.
-        enable_wal: Whether to assert the supported journal mode after version checks.
-
-    Returns:
-        Configured connection with row-name access.
-    """
-    connection = sqlite3.connect(path, timeout=busy_timeout_ms / 1_000, isolation_level=None)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
-    if enable_wal:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-    return connection
-
-
-class _ThreadConnectionCache(threading.local):
-    """Per-thread idle SQLite connections keyed by path and busy timeout."""
-
-    def __init__(self) -> None:
-        """Start each thread with an empty idle-connection map."""
-        self.idle: dict[tuple[str, int], sqlite3.Connection] = {}
-
-
-_connection_cache = _ThreadConnectionCache()
-
-
-@contextmanager
-def persistent_connection(
-    path: Path, *, busy_timeout_ms: int = 5_000
-) -> Iterator[sqlite3.Connection]:
-    """Yield one reusable per-thread connection for repeated gateway operations.
-
-    Opening a SQLite connection pays file open, pragma, and WAL setup costs on
-    every call, which dominates hot request paths. This checkout keeps one idle
-    connection per thread, path, and timeout so sequential operations reuse it,
-    while overlapping checkouts on the same thread fall back to a fresh
-    connection instead of sharing an in-flight transaction.
-
-    Args:
-        path: Gateway database path.
-        busy_timeout_ms: Bounded lock wait in milliseconds.
-
-    Yields:
-        A configured connection; it returns to the idle cache on clean exit.
-    """
-    key = (str(path), busy_timeout_ms)
-    connection = _connection_cache.idle.pop(key, None)
-    if connection is None:
-        connection = connect_database(path, busy_timeout_ms=busy_timeout_ms)
-    try:
-        yield connection
-    except BaseException:
-        connection.close()
-        raise
-    if connection.in_transaction:
-        connection.close()
-        return
-    previous = _connection_cache.idle.get(key)
-    if previous is not None:
-        connection.close()
-        return
-    _connection_cache.idle[key] = connection
-
-
-def close_idle_connections() -> int:
-    """Close and forget the calling thread's cached idle connections.
-
-    A long-lived worker thread that stops servicing gateway operations calls
-    this before it exits, so the database descriptors held by its
-    ``persistent_connection`` cache release with the worker instead of
-    lingering for the life of the interpreter.
-
-    Returns:
-        Number of connections closed.
-    """
-    idle = _connection_cache.idle
-    closed = len(idle)
-    for connection in idle.values():
-        connection.close()
-    idle.clear()
-    return closed
 
 
 def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | None:
@@ -804,8 +846,14 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
             if 0 < version < SCHEMA_VERSION:
                 backup = _backup_database(path, version)
             for next_version in range(version + 1, SCHEMA_VERSION + 1):
-                for statement in _MIGRATIONS[next_version]:
-                    connection.execute(statement)
+                for step in _MIGRATIONS[next_version]:
+                    if isinstance(step, str):
+                        connection.execute(step)
+                    else:
+                        try:
+                            step(connection)
+                        except NanoUsdMigrationError as exc:
+                            raise GatewaySchemaError(str(exc)) from exc
                 connection.execute(f"PRAGMA user_version = {next_version}")
             _require_schema_objects(connection)
             connection.execute("COMMIT")
@@ -902,6 +950,7 @@ def _require_schema_objects(connection: sqlite3.Connection) -> None:
         "gateway_attempts",
         "gateway_monthly_budgets",
         "gateway_requests",
+        "gateway_video_jobs",
         "identities",
         "identity_alias_grants",
         "operation_receipts",

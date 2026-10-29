@@ -9,18 +9,11 @@ from pydantic import ValidationError
 from rich.console import Console
 
 from exp.cli.judge.rubric import (
-    axis_score_choices,
     build_axis,
     edit_rubric_axes,
-    rebind_prompt_template,
 )
 from exp.common.core.artifacts import JsonObject
-from exp.common.judging import PromptDefinition, default_task_success_axis
-from exp.optimize.router.judging.contracts import (
-    JudgePromptTemplate,
-    JudgeScoreProjection,
-    judge_feedback_schema,
-)
+from exp.common.judging import default_task_success_axis
 from exp.optimize.router.judging.template_bind import default_judge_template
 
 
@@ -58,7 +51,6 @@ def test_build_axis_requires_unique_endpoint_meanings() -> None:
     )
 
     assert axis == default_task_success_axis()
-    assert axis_score_choices(axis) == "0-1"
     with pytest.raises(ValidationError, match="inclusive range endpoints"):
         build_axis(
             "quality",
@@ -89,31 +81,6 @@ def test_default_template_schema_follows_selected_axis_bounds() -> None:
     )
     wide_schema = default_judge_template((wide,)).response_schema
     assert _raw_score_bounds(wide_schema) == (0, 4)
-
-    custom = JudgePromptTemplate(
-        prompt=PromptDefinition.from_text("custom-judge-v1", "Follow the saved contract exactly."),
-        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
-        response_schema=judge_feedback_schema("scalar", min_score=0, max_score=1),
-    )
-    rebound = rebind_prompt_template(custom, (wide,))
-    assert rebound.prompt.prompt_id == "custom-judge-v1"
-    assert _raw_score_bounds(rebound.response_schema) == (0, 4)
-
-    boolean = JudgePromptTemplate(
-        prompt=PromptDefinition.from_text("custom-bool-v1", "Return passed."),
-        response_shape="boolean",
-        variable_mapping={"rubric": "RULES_CUSTOM", "rollout": "TRACE_CUSTOM"},
-        response_schema=judge_feedback_schema("boolean"),
-        score_projection=JudgeScoreProjection(boolean_scores={"false": 0, "true": 4}),
-    )
-    with pytest.raises(ValueError, match="boolean score projections"):
-        rebind_prompt_template(boolean, (default_task_success_axis(),))
-    assert rebind_prompt_template(boolean, (wide,)) is boolean
-    stale = boolean.model_copy(
-        update={"score_projection": JudgeScoreProjection(boolean_scores={"false": 0, "true": 1})}
-    )
-    with pytest.raises(ValueError, match="include 0 and 4"):
-        rebind_prompt_template(stale, (wide,))
 
 
 def test_edit_done_keeps_the_current_axes() -> None:

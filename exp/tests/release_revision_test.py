@@ -24,7 +24,7 @@ def exact_checkout_revision() -> str:
     """Return one verified 40-hex checkout revision or fail closed."""
     revision = _git("rev-parse", "HEAD")
     _require_revision(revision, label="checked-out revision")
-    for variable in ("EXP_RELEASE_REVISION", "GITHUB_SHA"):
+    for variable in ("EXP_RELEASE_REVISION", "CI_COMMIT_SHA"):
         configured = os.environ.get(variable)
         if configured is None:
             continue
@@ -178,7 +178,7 @@ def test_exact_checkout_revision_rejects_untracked_checkout_inputs(
     untracked.write_text("untracked\n", encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "_REPOSITORY_ROOT", repository)
     monkeypatch.delenv("EXP_RELEASE_REVISION", raising=False)
-    monkeypatch.delenv("GITHUB_SHA", raising=False)
+    monkeypatch.delenv("CI_COMMIT_SHA", raising=False)
 
     with pytest.raises(RuntimeError, match="untracked files"):
         exact_checkout_revision()

@@ -42,7 +42,12 @@ class EvaluationProtocol(ContractModel):
 
 
 class EvaluationRow(ContractModel):
-    """One sparse, explicit task, candidate, and repeat measurement."""
+    """One sparse, explicit task, candidate, and repeat measurement.
+
+    Attributes:
+        status: Observed production, completed scored, failed, incomplete or unrun evidence.
+            Failed and incomplete rows retain their execution costs but cannot carry scores.
+    """
 
     cell_id: ArtifactId
     task_id: ArtifactId
@@ -51,7 +56,7 @@ class EvaluationRow(ContractModel):
     protocol_id: ArtifactId
     source_run_id: str | None = Field(default=None, max_length=512)
     purpose: Literal["fit", "held_out", "fidelity"]
-    status: Literal["observed", "completed", "failed", "not_run"]
+    status: Literal["observed", "completed", "failed", "incomplete", "not_run"]
     rollout_id: ArtifactId | None = None
     judgment_id: ArtifactId | None = None
     score: float | None = Field(default=None, ge=0, le=1)
@@ -91,8 +96,12 @@ class EvaluationRow(ContractModel):
             raise ValueError("started evaluation rows require a source_run_id")
         if (self.judgment_id is None) != (self.score is None):
             raise ValueError("evaluation scores and judgment IDs must be set together")
-        if self.status == "failed" and (self.judgment_id is not None or self.score is not None):
-            raise ValueError("failed evaluation rows must not contain a judgment or score")
+        if self.status in {"failed", "incomplete"} and (
+            self.judgment_id is not None or self.score is not None
+        ):
+            raise ValueError(
+                "failed or incomplete evaluation rows must not contain a judgment or score"
+            )
         if self.status == "not_run":
             mutable_fields = (
                 self.rollout_id,

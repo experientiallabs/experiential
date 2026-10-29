@@ -4,6 +4,10 @@
 //! The chat, Responses, and Messages surfaces live in their `route_*`
 //! modules; unknown routes answer the native 404 in the OpenAI envelope.
 
+#[cfg(test)]
+#[path = "server_usage_tests.rs"]
+mod usage_tests;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,21 +24,29 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::audio_upload::transcription_body_limit;
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
+use crate::guardrails::plan::DetectorMap;
 use crate::replay::ReplayStore;
 use crate::respond::{bearer_key, error_response, json_response, unknown_route_error};
+use crate::route_audio::{speech, transcriptions};
 use crate::route_batches::{
     batches_cancel, batches_create, batches_list, batches_retrieve, files_body_limit,
     files_content, files_create, files_retrieve,
 };
 use crate::route_chat::chat;
+use crate::route_decisions::{decisions, openai_decisions};
 use crate::route_embeddings::embeddings;
+use crate::route_image_edits::{image_edits, image_edits_body_limit};
 use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
 use crate::route_responses_ws::responses_ws;
+use crate::route_videos::{
+    videos_body_limit, videos_content, videos_create, videos_delete, videos_list, videos_retrieve,
+};
 
 /// Serve-time configuration passed from `exp --engine rust`.
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +60,10 @@ pub struct ServeConfig {
     /// Fail-fast bound on the TCP+TLS connect phase of every provider call.
     #[serde(default = "default_connect_timeout_seconds")]
     pub connect_timeout_seconds: f64,
+    /// Restrict native provider sockets to public HTTPS destinations. Local
+    /// embedders retain access to their own loopback/private model servers.
+    #[serde(default)]
+    pub public_upstreams_only: bool,
     /// Fail-fast bound on the wait for a provider's first streamed byte. This
     /// never caps total generation time: once the first byte arrives, reads
     /// are paced by the deployment's own per-chunk timeout.
@@ -58,12 +74,39 @@ pub struct ServeConfig {
     /// a very large prompt's prefill is not misread as a dead lane.
     #[serde(default = "default_time_to_first_byte_seconds_per_million_input_tokens")]
     pub time_to_first_byte_seconds_per_million_input_tokens: f64,
+    /// Fail-fast bound on the wait for a provider's first TOKEN (the first
+    /// semantic event) after its headers arrived, flat part; the same
+    /// per-million-input-tokens slope as the first-byte allowance is added.
+    #[serde(default = "default_time_to_first_token_seconds")]
+    pub time_to_first_token_seconds: f64,
+    /// Bound on everything before the caller's first byte, across every
+    /// attempt and failover, measured from the request's start. Kept under
+    /// the edge proxy's 100 s origin timeout; zero or negative disables it.
+    #[serde(default = "default_pre_first_byte_budget_seconds")]
+    pub pre_first_byte_budget_seconds: f64,
+    /// What a request's budget keeps beyond its route's longest AUTHORED
+    /// first-byte allowance when that allowance raises the budget
+    /// (`waterfall::pre_first_byte_budget`).
+    #[serde(default = "default_pre_first_byte_reserve_seconds")]
+    pub pre_first_byte_reserve_seconds: f64,
+    /// The most an authored allowance may raise a request's budget to; zero
+    /// or negative removes the ceiling.
+    #[serde(default = "default_pre_first_byte_max_seconds")]
+    pub pre_first_byte_max_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
+    /// Worker-wide bound on provider output retained across streams.
+    #[serde(default = "default_maximum_retained_output_bytes")]
+    pub maximum_retained_output_bytes: usize,
     #[serde(default = "default_native_usage_enabled")]
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
+    /// Release waiting requests by class (`Admission::priority_class`) with
+    /// one class of aging per this many seconds (`permit_queue`). Absent
+    /// keeps the FIFO semaphore.
+    #[serde(default)]
+    pub permit_priority_aging_seconds: Option<f64>,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -82,6 +125,28 @@ fn default_time_to_first_byte_seconds_per_million_input_tokens() -> f64 {
     240.0
 }
 
+/// A thinking model on a chat wire streams nothing until its first content
+/// token; production p99s (2026-09-19, 7 days) sat at 27-94 s on healthy
+/// lanes while the stalled lane's medians were 120 s+, so two minutes
+/// separates "thinking" from "stalled" without cutting real work.
+fn default_time_to_first_token_seconds() -> f64 {
+    120.0
+}
+
+/// Cloudflare answers its own 504 page when an origin sends no response
+/// within 100 s; stopping new attempts at 90 s keeps our retryable error.
+fn default_pre_first_byte_budget_seconds() -> f64 {
+    90.0
+}
+
+fn default_pre_first_byte_max_seconds() -> f64 {
+    crate::waterfall::PRE_FIRST_BYTE_MAX.as_secs_f64()
+}
+
+fn default_pre_first_byte_reserve_seconds() -> f64 {
+    crate::waterfall::PRE_FIRST_BYTE_RESERVE.as_secs_f64()
+}
+
 fn default_max_active_requests() -> usize {
     64
 }
@@ -94,6 +159,16 @@ fn default_callback_permits() -> usize {
     4
 }
 
+fn default_maximum_retained_output_bytes() -> usize {
+    crate::retained::DEFAULT_WORKER_RETAINED_OUTPUT_BYTES
+}
+
+/// The serde default the server config uses, for the retained-output tests.
+#[cfg(test)]
+pub(crate) fn default_retained_for_tests() -> usize {
+    default_maximum_retained_output_bytes()
+}
+
 fn default_native_usage_enabled() -> bool {
     true
 }
@@ -102,14 +177,28 @@ fn default_native_usage_enabled() -> bool {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) bridge: Arc<Bridge>,
-    pub(crate) http: reqwest::Client,
+    pub(crate) http: crate::upstream::UpstreamClient,
     pub(crate) permits: Arc<Semaphore>,
+    pub(crate) dispatch_capacity: Arc<crate::dispatch_capacity::DispatchCapacity>,
+    /// The order waiting requests take `permits` in (FIFO unless configured).
+    pub(crate) permit_queue: Arc<crate::permit_queue::PermitQueue>,
     pub(crate) request_timeout: Duration,
-    /// Fail-fast flat bound on the wait for the first provider byte per attempt.
+    /// Fail-fast flat bound on the wait for the provider's response headers
+    /// per attempt.
     pub(crate) time_to_first_byte: Duration,
-    /// Default input-scaled first-byte allowance in seconds per million
-    /// approximate input tokens.
+    /// Default input-scaled allowance in seconds per million approximate
+    /// input tokens, added to both the header and the first-token bounds.
     pub(crate) time_to_first_byte_slope_seconds_per_million_input_tokens: f64,
+    /// Fail-fast flat bound on the wait for the first TOKEN (the first
+    /// semantic event) once the headers arrived; keepalive comments and
+    /// role-only frames do not satisfy it.
+    pub(crate) time_to_first_token: Duration,
+    /// The pre-first-byte budget (`None`: disabled).
+    pub(crate) pre_first_byte_budget: Option<Duration>,
+    /// The reserve kept past the longest authored first-byte allowance.
+    pub(crate) pre_first_byte_reserve: Duration,
+    /// The ceiling on a raised budget (`None`: no ceiling).
+    pub(crate) pre_first_byte_max: Option<Duration>,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -118,6 +207,11 @@ pub(crate) struct AppState {
     /// Bounded in-process keyed-response replay, the native mirror of the
     /// python engine's `BoundedReplayStore`.
     pub(crate) replays: Arc<ReplayStore>,
+    pub(crate) capture: Option<Arc<crate::capture::collector::Collector>>,
+    /// Deterministic guardrail rules compiled once by the control plane,
+    /// keyed by policy `adapter_id`. An admission whose output chain names
+    /// only these adapters is enforced here instead of in python.
+    pub(crate) guardrail_detectors: Arc<DetectorMap>,
 }
 
 /// Run the data plane until shutdown; returns after graceful stop.
@@ -129,9 +223,12 @@ pub async fn run(
     config: ServeConfig,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     on_listening: Option<Py<PyAny>>,
+    guardrail_detectors: Arc<DetectorMap>,
+    capture: Option<Arc<crate::capture::collector::Collector>>,
+    execution_bindings: Option<crate::execution_binding::ExecutionBindings>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
-    let http = crate::upstream::build_client(connect_timeout)?;
+    let http = crate::upstream::build_client(connect_timeout, config.public_upstreams_only)?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
     let handled_requests = Arc::new(AtomicUsize::new(0));
@@ -139,14 +236,34 @@ pub async fn run(
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
+        dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new()),
+        permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
+            config.permit_priority_aging_seconds,
+        )),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
         time_to_first_byte: Duration::from_secs_f64(config.time_to_first_byte_seconds.max(0.001)),
         time_to_first_byte_slope_seconds_per_million_input_tokens: config
             .time_to_first_byte_seconds_per_million_input_tokens
             .max(0.0),
+        // Clamped under the request budget so a default stall can still fail
+        // over (first_token_bound.rs): equal defaults would let the request
+        // deadline win every race and end the stall as a terminal timeout.
+        time_to_first_token: crate::first_token_bound::first_token_bound(
+            config.time_to_first_token_seconds,
+            config.request_timeout_seconds,
+        ),
+        pre_first_byte_budget: (config.pre_first_byte_budget_seconds > 0.0)
+            .then(|| Duration::from_secs_f64(config.pre_first_byte_budget_seconds)),
+        pre_first_byte_reserve: Duration::from_secs_f64(
+            config.pre_first_byte_reserve_seconds.max(0.0),
+        ),
+        pre_first_byte_max: (config.pre_first_byte_max_seconds > 0.0)
+            .then(|| Duration::from_secs_f64(config.pre_first_byte_max_seconds)),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
+        capture: capture.clone(),
+        guardrail_detectors,
     };
     tokio::spawn(crate::memory::reclaim_when_idle(
         state.permits.clone(),
@@ -159,7 +276,18 @@ pub async fn run(
         .route("/v1/models/{model_id}", get(model_detail))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/systemone", post(decisions))
+        .route("/v1/decisions", post(openai_decisions))
         .route("/v1/images/generations", post(images))
+        .route(
+            "/v1/images/edits",
+            post(image_edits).layer(image_edits_body_limit()),
+        )
+        .route("/v1/audio/speech", post(speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcriptions).layer(transcription_body_limit()),
+        )
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
@@ -169,6 +297,17 @@ pub async fn run(
         .route("/v1/files", post(files_create).layer(files_body_limit()))
         .route("/v1/files/{file_id}", get(files_retrieve))
         .route("/v1/files/{file_id}/content", get(files_content))
+        .route(
+            "/v1/videos",
+            post(videos_create)
+                .layer(videos_body_limit())
+                .get(videos_list),
+        )
+        .route(
+            "/v1/videos/{video_id}",
+            get(videos_retrieve).delete(videos_delete),
+        )
+        .route("/v1/videos/{video_id}/content", get(videos_content))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/metrics.json", get(metrics_json))
@@ -179,7 +318,22 @@ pub async fn run(
     } else {
         app
     };
-    let app = app.fallback(unknown_route).with_state(state);
+    let permits = state.permits.clone();
+    let permit_queue = state.permit_queue.clone();
+    let app = app.fallback(unknown_route);
+    let bindings_enabled = execution_bindings.is_some();
+    let app = if let Some(bindings) = execution_bindings {
+        app.layer(axum::middleware::from_fn_with_state(
+            bindings,
+            crate::execution_context::bind_execution,
+        ))
+    } else {
+        app
+    };
+    let app = app.with_state(crate::execution_context::ServerState {
+        base: state,
+        bindings_enabled,
+    });
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?
@@ -195,14 +349,22 @@ pub async fn run(
             .map_err(|error| format!("on_listening callback failed: {error}"))?;
     }
     let graceful = Duration::from_secs_f64(config.graceful_timeout_seconds.max(0.1));
-    let server =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown.clone()));
+    let server_shutdown = shutdown.clone();
+    let drain_permits = permits.clone();
+    let drain_queue = permit_queue.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_requested(server_shutdown).await;
+        drain_permits.close();
+        drain_queue.close();
+    });
     // A stop request starts the graceful drain above; the arm below bounds
     // it, so a stuck stream cannot hold shutdown past the configured timeout.
     let outcome = tokio::select! {
         outcome = server => outcome.map_err(|error| format!("gateway server failed: {error}")),
         _ = async {
             shutdown_requested(shutdown).await;
+            permits.close();
+            permit_queue.close();
             tokio::time::sleep(graceful).await;
         } => Ok(()),
     };
@@ -211,6 +373,11 @@ pub async fn run(
     let drain_deadline = Instant::now() + graceful;
     while pending_settlements.load(Ordering::SeqCst) > 0 && Instant::now() < drain_deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if let Some(capture) = capture {
+        if !capture.close_until(drain_deadline) {
+            eprintln!("capture delivery exceeded the graceful shutdown deadline");
+        }
     }
     outcome
 }
@@ -395,5 +562,33 @@ async fn model_detail(
             Err(_) => error_response(&PublicError::internal()),
         },
         Err(error) => error_response(&error),
+    }
+}
+
+impl AppState {
+    /// The request's absolute pre-first-byte deadline: its start (the
+    /// request deadline minus the request budget) plus its budget
+    /// (`waterfall::pre_first_byte_budget`: the configured budget raised to
+    /// the route's longest authored header allowance plus a reserve), never
+    /// past the request deadline itself, and never raised past the ceiling.
+    /// `body` is the raw request body, approximated without its base64 media
+    /// (`waterfall::approximate_input_tokens`, the same estimate the dials use).
+    pub(crate) fn first_byte_budget(
+        &self,
+        deadline: Instant,
+        route: &[crate::waterfall::DeploymentWire],
+        body: &str,
+    ) -> Option<Instant> {
+        let budget = crate::waterfall::pre_first_byte_budget(
+            self.pre_first_byte_budget,
+            self.pre_first_byte_reserve,
+            self.pre_first_byte_max,
+            route,
+            self.time_to_first_byte,
+            self.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            crate::waterfall::approximate_input_tokens(body),
+        )?;
+        let start = deadline.checked_sub(self.request_timeout)?;
+        Some((start + budget).min(deadline))
     }
 }

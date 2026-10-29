@@ -7,7 +7,12 @@ from collections.abc import Callable
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import ImageContentPart, image_part_from_url
+from exp.common.models.content import (
+    GEMINI_FILE_URI_PREFIX,
+    ImageContentPart,
+    MediaHandle,
+    image_part_from_url,
+)
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.images import (
     anthropic_image_block,
@@ -99,3 +104,83 @@ def test_inline_only_wires_reject_a_remote_url_as_a_capability(
     with pytest.raises(ProviderCapabilityError) as error:
         encode(_REMOTE)
     assert error.value.capability == "image_url_input"
+
+
+_OPENAI_HANDLE = ImageContentPart(
+    handle=MediaHandle(provider="openai", reference="file-abc"), detail="low"
+)
+_ANTHROPIC_HANDLE = ImageContentPart(handle=MediaHandle(provider="anthropic", reference="file_abc"))
+_GEMINI_HANDLE = ImageContentPart(
+    handle=MediaHandle(provider="gemini", reference=f"{GEMINI_FILE_URI_PREFIX}abc")
+)
+_VERTEX_HANDLE = ImageContentPart(
+    handle=MediaHandle(provider="vertex", reference="gs://bkt/cat.png"), media_type="image/png"
+)
+_BEDROCK_HANDLE = ImageContentPart(
+    handle=MediaHandle(
+        provider="bedrock", reference="s3://bkt/cat.jpg", bucket_owner="123456789012"
+    ),
+    media_type="image/jpeg",
+)
+
+
+def test_responses_carries_an_openai_handle_as_file_id() -> None:
+    """An OpenAI Files handle rides ``file_id`` with the detail hint preserved."""
+    assert responses_image_part(_OPENAI_HANDLE) == {
+        "type": "input_image",
+        "file_id": "file-abc",
+        "detail": "low",
+    }
+
+
+def test_openai_chat_defines_no_image_handle() -> None:
+    """Chat ``image_url`` has no ``file_id``, so a handle is a capability refusal."""
+    with pytest.raises(ProviderCapabilityError, match="media_handle_input"):
+        openai_chat_image_part(_OPENAI_HANDLE)
+
+
+def test_anthropic_carries_a_files_api_handle_as_a_file_source() -> None:
+    """An Anthropic Files handle becomes ``source.type: file``."""
+    assert anthropic_image_block(_ANTHROPIC_HANDLE) == {
+        "type": "image",
+        "source": {"type": "file", "file_id": "file_abc"},
+    }
+
+
+def test_gemini_carries_files_and_gcs_handles_as_file_data() -> None:
+    """Gemini Files URIs ride bare; a ``gs://`` object carries its MIME type."""
+    assert gemini_image_part(_GEMINI_HANDLE) == {
+        "file_data": {"file_uri": f"{GEMINI_FILE_URI_PREFIX}abc"}
+    }
+    assert gemini_image_part(_VERTEX_HANDLE) == {
+        "file_data": {"file_uri": "gs://bkt/cat.png", "mime_type": "image/png"}
+    }
+
+
+def test_bedrock_carries_an_s3_handle_with_its_owner() -> None:
+    """A Bedrock handle becomes ``s3Location`` beside the derived format."""
+    assert bedrock_image_block(_BEDROCK_HANDLE) == {
+        "image": {
+            "format": "jpeg",
+            "source": {"s3Location": {"uri": "s3://bkt/cat.jpg", "bucketOwner": "123456789012"}},
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("encode", "image"),
+    [
+        (responses_image_part, _ANTHROPIC_HANDLE),
+        (anthropic_image_block, _OPENAI_HANDLE),
+        (gemini_image_part, _BEDROCK_HANDLE),
+        (bedrock_image_block, _VERTEX_HANDLE),
+    ],
+)
+def test_a_handle_from_another_provider_never_reaches_a_wire(
+    encode: Callable[[ImageContentPart], JsonObject], image: ImageContentPart
+) -> None:
+    """Every encoder refuses a foreign handle as a provider capability error."""
+    with pytest.raises(ProviderCapabilityError, match="media_handle_provider") as error:
+        encode(image)
+    assert error.value.detail is not None
+    assert "uploaded to" in error.value.detail

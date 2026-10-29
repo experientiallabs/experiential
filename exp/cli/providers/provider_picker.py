@@ -16,7 +16,7 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from getpass import getpass
-from typing import Literal, cast
+from typing import cast, get_args
 
 from rich.console import Console
 from rich.prompt import Prompt
@@ -62,6 +62,7 @@ from exp.common.models import (
     resolve_discovered_model,
     served_roles,
 )
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.runtime.models.credentials import resolve_or_prompt_connection_api_key
 from exp.runtime.models.providers import (
     ProviderEndpoint,
@@ -130,7 +131,11 @@ class ProviderSetupResult:
 
 @dataclass(frozen=True)
 class AvailableModel:
-    """One model the user can configure, either already in the catalog or newly discovered."""
+    """One model the user can configure, either already in the catalog or newly discovered.
+
+    Attributes:
+        supported_reasoning_efforts: Saved discovery choices, separate from capability identity.
+    """
 
     alias: str
     connection: str
@@ -141,6 +146,7 @@ class AvailableModel:
     configured: bool
     retainable_roles: frozenset[SetupRole] = frozenset()
     published: DiscoveredModel | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
 
     def label(self) -> str:
         """Describe this model as one picker row by its shorthand alias."""
@@ -286,10 +292,10 @@ def select_providers(
             PickerOption(
                 value=_CONFIGURED_ONLY,
                 label="Keep the models already configured",
-                detail="roles only",
+                detail="choose models and roles",
             ),
         )
-    preselected = list(session.providers)
+    preselected = list(session.providers) or ([_CONFIGURED_ONLY] if configured else [])
     while True:
         result = _select_provider_rows(
             console,
@@ -364,7 +370,7 @@ def collect_provider_connection(
         return hosted_connection(environment).catalog_config()
     base_url = None
     api_version = None
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region = None
     aws_access_key_id_env = None
     bedrock_auth_mode = None
@@ -390,9 +396,9 @@ def collect_provider_connection(
         )
         if not selected_surface:
             return None
-        if selected_surface not in ("openai_deployments", "model_inference"):
+        if selected_surface not in get_args(AzureApiSurface):
             raise ValueError(f"unsupported Azure API surface {selected_surface!r}")
-        azure_api_surface = cast(Literal["openai_deployments", "model_inference"], selected_surface)
+        azure_api_surface = cast(AzureApiSurface, selected_surface)
     if provider == "bedrock":
         region = (
             ask_text(
@@ -739,6 +745,7 @@ def _discover_models(
         provider=runtime_provider,
         api_key=endpoint.api_key,
         base_url=endpoint.connection.base_url,
+        catalog="experiential" if provider == HOSTED_SETUP_PICKER else None,
     )
     aliases = set(taken_aliases)
     while True:
@@ -768,6 +775,7 @@ def _discover_models(
                         provider=runtime_provider,
                         api_key=api_key,
                         base_url=endpoint.connection.base_url,
+                        catalog="experiential" if provider == HOSTED_SETUP_PICKER else None,
                     )
                 continue
             return _ProviderDiscoveryResult(endpoint, ()) if recovery == _RECOVERY_SKIP else None
@@ -804,9 +812,7 @@ def _discover_models(
         if not fresh_verified and not fresh_unknown:
             console.print(f"  [green]\u2713[/green] {label}: models already configured")
             return _ProviderDiscoveryResult(endpoint, ())
-        console.print(
-            _discovery_status(label, verified=len(fresh_verified), unknown=len(fresh_unknown))
-        )
+        console.print(_discovery_status(label, verified=len(verified), unknown=len(unknown)))
         models = []
         for model in (*fresh_verified, *fresh_unknown):
             alias = derive_model_alias(runtime_provider, model.model, frozenset(aliases))
@@ -824,6 +830,9 @@ def _discover_models(
                     ),
                     configured=False,
                     published=published.get(model.model),
+                    supported_reasoning_efforts=(
+                        published[model.model].supported_reasoning_efforts
+                    ),
                 )
             )
         return _ProviderDiscoveryResult(endpoint, tuple(models))
@@ -862,15 +871,15 @@ def _discovery_status(label: str, *, verified: int, unknown: int) -> str:
 
     Args:
         label: Readable provider name.
-        verified: Newly listed models with role-proven metadata.
-        unknown: Newly listed identities that still need operator declaration.
+        verified: Listed models with role-proven metadata, including configured aliases.
+        unknown: Listed identities that still need operator declaration.
 
     Returns:
         One compact status line for the discovery transcript.
     """
     if verified and unknown:
         return (
-            f"  [green]\u2713[/green] {label}: {verified} models, "
+            f"  [green]\u2713[/green] {label}: {verified + unknown} models, "
             f"{unknown} with {UNKNOWN_METADATA_LABEL}"
         )
     if unknown:

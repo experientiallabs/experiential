@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
 
-from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot
+from exp.common.models import (
+    BilledUnitKind,
+    BillingSource,
+    GatewayUnitPrices,
+    ModelCapabilities,
+    ModelSnapshot,
+)
 from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
+    GatewayServiceTierPrices,
     GatewayTokenPrices,
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway import execution_resolution, native_execution
 from exp.runtime.gateway.execution_resolution import (
     GatewayWireContractError,
     _require_deployment_identity,
@@ -20,6 +29,11 @@ from exp.runtime.gateway.execution_resolution import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.registry import ModelClient, ResolvedModel
+
+
+def test_alias_servability_export_retains_the_same_function() -> None:
+    """The public native execution import delegates to the exact wire-resolution owner."""
+    assert native_execution.alias_native_blockers is execution_resolution.alias_native_blockers
 
 
 def _snapshot() -> ModelSnapshot:
@@ -111,6 +125,27 @@ def test_profile_ranges_intersect_with_the_catalog_contract() -> None:
     assert resolved.maximum_output_tokens == 128
     assert resolved.token_limit_key == "max_completion_tokens"
     assert resolved.model_id == "provider-model"
+
+
+def test_profile_resolution_carries_the_declared_output_floor() -> None:
+    """The catalog's ``minimum_output_tokens`` lane fact reaches the wire
+    profile untouched (a client profile cannot know it: one relay wire serves
+    floored and unfloored models), and an undeclared lane carries none."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible", url="https://example.test/v1/chat/completions"
+    )
+    capabilities = ModelCapabilities()
+
+    floored = _resolved_wire_profile(
+        _deployment(capabilities, GatewayDeploymentCapabilities(minimum_output_tokens=16)),
+        _resolved(_NativeClient(profile), capabilities),
+    )
+    assert floored.minimum_output_tokens == 16
+
+    undeclared = _resolved_wire_profile(
+        _deployment(capabilities), _resolved(_NativeClient(profile), capabilities)
+    )
+    assert undeclared.minimum_output_tokens is None
 
 
 def test_profile_resolution_applies_exact_gateway_reasoning_values() -> None:
@@ -212,3 +247,131 @@ def test_profile_resolution_binds_the_deployment_billing_source() -> None:
     hosted = _deployment(None).model_copy(update={"billing_source": BillingSource.HOST_MANAGED})
     house = _resolved_wire_profile(hosted, _resolved(_NativeClient(base), ModelCapabilities()))
     assert house.billing_customer_managed is False
+    # A house rung stays untiered by default, so service_tier is not forwarded.
+    assert house.service_tier_pricing_enabled is False
+    assert house.forwards_service_tier is False
+
+
+def test_profile_resolution_binds_the_runtime_tenant_origin() -> None:
+    """The wire profile carries the resolved connection's tenant-origin policy."""
+    base = GatewayWireProfile(dialect="openai_compatible", url="https://tenant.example.test")
+    resolved = _resolved(_NativeClient(base), ModelCapabilities())
+    plain = _resolved_wire_profile(_deployment(None), resolved)
+    assert plain.tenant_origin is False
+    tenant = _resolved_wire_profile(_deployment(None), replace(resolved, tenant_origin=True))
+    assert tenant.tenant_origin is True
+
+
+def test_profile_resolution_forwards_service_tier_on_a_tier_priced_house_lane() -> None:
+    """A host-funded rung whose model carries a per-tier pass-through CARD
+    forwards that tier even though the caller does not pay the provider
+    directly; settlement bills the requested tier at the card's cost. The card
+    set is per-tier: a flex-carded lane forwards flex, not priority."""
+    base = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    hosted = _deployment(None).model_copy(update={"billing_source": BillingSource.HOST_MANAGED})
+    # Author a flex-only card on the deployment's gateway prices.
+    flex_carded = hosted.model_copy(
+        update={
+            "gateway": hosted.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1_000_000,
+                        output_nano_usd_per_million_tokens=4_000_000,
+                        flex=GatewayServiceTierPrices(
+                            input_nano_usd_per_million_tokens=500_000,
+                            output_nano_usd_per_million_tokens=2_000_000,
+                        ),
+                    )
+                }
+            )
+        }
+    )
+    tiered = _resolved_wire_profile(
+        flex_carded,
+        _resolved(_NativeClient(base), ModelCapabilities(service_tier_pricing_enabled=True)),
+    )
+    assert tiered.billing_customer_managed is False
+    assert tiered.service_tier_pricing_enabled is True
+    assert tiered.forwards_service_tier is True
+    # The card set is wired from the deployment prices, and forwarding is
+    # per-tier: flex bills (card present), priority strips (no card).
+    assert tiered.service_tier_cards == frozenset({"flex"})
+    assert tiered.forwards_tier("flex") is True
+    assert tiered.forwards_tier("priority") is False
+
+
+def test_audio_claims_without_an_endpoint_or_a_billable_meter_block_the_alias() -> None:
+    """A claimed audio surface the wire cannot carry or the card cannot bill is named at startup."""
+    claims = GatewayDeploymentCapabilities(supports_speech=True, supports_transcription=True)
+    bare = GatewayWireProfile(dialect="openai_compatible", url="https://example.test/v1/chat")
+    served = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://example.test/v1/chat",
+        speech_url="https://example.test/v1/audio/speech",
+        transcriptions_url="https://example.test/v1/audio/transcriptions",
+    )
+    unpriced = _deployment(None, claims)
+    assert execution_resolution._audio_claim_blockers(unpriced, bare) == (  # noqa: SLF001
+        "deployment 'primary' claims speech without a speech endpoint",
+        "deployment 'primary' claims transcription without a transcription endpoint",
+    )
+    assert execution_resolution._audio_claim_blockers(unpriced, served) == (  # noqa: SLF001
+        "deployment 'primary' claims speech without a single billable meter",
+        "deployment 'primary' claims transcription without a single billable meter",
+    )
+    priced = unpriced.model_copy(
+        update={
+            "capabilities": ModelCapabilities(maximum_output_tokens=2_000),
+            "gateway": unpriced.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1,
+                        output_nano_usd_per_million_tokens=1,
+                    )
+                }
+            ),
+        }
+    )
+    assert execution_resolution._audio_claim_blockers(priced, served) == ()  # noqa: SLF001
+    unclaimed = _deployment(None)
+    assert execution_resolution._audio_claim_blockers(unclaimed, bare) == ()  # noqa: SLF001
+
+
+def test_an_elevenlabs_audio_claim_must_bill_a_unit_card() -> None:
+    """ElevenLabs reports no token usage, so a token-priced ElevenLabs rung is blocked."""
+    claims = GatewayDeploymentCapabilities(supports_speech=True)
+    elevenlabs = GatewayWireProfile(
+        dialect="elevenlabs_audio",
+        url="https://example.test/v1/text-to-speech",
+        speech_url="https://example.test/v1/text-to-speech",
+    )
+    tokens = _deployment(None, claims).model_copy(
+        update={"capabilities": ModelCapabilities(maximum_output_tokens=2_000)}
+    )
+    tokens = tokens.model_copy(
+        update={
+            "gateway": tokens.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1,
+                        output_nano_usd_per_million_tokens=1,
+                    )
+                }
+            )
+        }
+    )
+    assert execution_resolution._audio_claim_blockers(tokens, elevenlabs) == (  # noqa: SLF001
+        "deployment 'primary' claims speech on ElevenLabs without a unit card",
+    )
+    units = tokens.model_copy(
+        update={
+            "gateway": tokens.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        units=GatewayUnitPrices(kind=BilledUnitKind.CHARACTER, rates={"": 40_000})
+                    )
+                }
+            )
+        }
+    )
+    assert execution_resolution._audio_claim_blockers(units, elevenlabs) == ()  # noqa: SLF001

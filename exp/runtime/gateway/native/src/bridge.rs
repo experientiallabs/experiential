@@ -12,15 +12,18 @@
 //! would track every blocking thread that ever ran a callback. A fixed set of
 //! workers pins the cache to exactly `worker_count` threads for the life of
 //! the bridge, and each worker releases its cached resources through the
-//! control plane's `close_thread_resources` callback before it exits.
+//! control plane's `close_thread_resources` callback before it exits. Bound
+//! targets share these workers, so their thread-local resources close after
+//! every callback, before its execution lease can retire.
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use pyo3::prelude::*;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
+use crate::execution_binding::ExecutionLease;
 
 /// One queued control-plane call and the responder that hands its outcome
 /// back to the awaiting request task.
@@ -28,6 +31,10 @@ struct Job {
     method: &'static str,
     argument: String,
     responder: oneshot::Sender<Result<String, PublicError>>,
+    // Cancellation of the awaiting request cannot release queued/running capacity.
+    _permit: OwnedSemaphorePermit,
+    _execution_permit: Option<OwnedSemaphorePermit>,
+    execution: Option<Arc<ExecutionLease>>,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -36,9 +43,17 @@ struct Job {
 /// its `close_thread_resources` cleanup, and joins the threads, so a stopped
 /// server leaves no cached per-thread connection behind.
 pub struct Bridge {
+    pool: Arc<WorkerPool>,
+    pub(crate) execution: Option<Arc<ExecutionLease>>,
+}
+
+/// One process owns the workers; bound request views share them without adding threads.
+struct WorkerPool {
     queue: Mutex<Option<mpsc::Sender<Job>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     permits: Arc<Semaphore>,
+    settlement_queue: Mutex<Option<mpsc::Sender<Job>>>,
+    settlement_permits: Arc<Semaphore>,
 }
 
 impl Bridge {
@@ -48,7 +63,8 @@ impl Bridge {
     /// has an idle worker and never queues behind another call after its
     /// permit is granted.
     pub fn new(object: Py<PyAny>, maximum_concurrent_calls: usize) -> Result<Self, String> {
-        let worker_count = maximum_concurrent_calls.max(1);
+        let worker_count = maximum_concurrent_calls.clamp(1, 256);
+        let settlement_count = (worker_count / 4).max(2);
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(worker_count);
@@ -61,10 +77,45 @@ impl Bridge {
                 .map_err(|error| format!("failed to start bridge worker {index}: {error}"))?;
             workers.push(handle);
         }
+        let (settlement_sender, settlement_receiver) = mpsc::channel::<Job>();
+        let settlement_receiver = Arc::new(Mutex::new(settlement_receiver));
+        for index in 0..settlement_count {
+            let receiver = settlement_receiver.clone();
+            let object = Python::attach(|py| object.clone_ref(py));
+            let handle = std::thread::Builder::new()
+                .name(format!("gateway-settlement-{index}"))
+                .spawn(move || worker_loop(&receiver, &object))
+                .map_err(|error| format!("failed to start settlement worker {index}: {error}"))?;
+            workers.push(handle);
+        }
         Ok(Self {
-            queue: Mutex::new(Some(sender)),
-            workers: Mutex::new(workers),
-            permits: Arc::new(Semaphore::new(worker_count)),
+            pool: Arc::new(WorkerPool {
+                settlement_queue: Mutex::new(Some(settlement_sender)),
+                settlement_permits: Arc::new(Semaphore::new(settlement_count)),
+                queue: Mutex::new(Some(sender)),
+                workers: Mutex::new(workers),
+                permits: Arc::new(Semaphore::new(worker_count)),
+            }),
+            execution: None,
+        })
+    }
+
+    /// Bind a request to the host's supplied target and resources, without new workers.
+    pub(crate) fn bind(&self, execution: Arc<ExecutionLease>) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            execution: Some(execution),
+        }
+    }
+
+    /// Keep learned input repairs with their execution owner, including the process owner.
+    pub(crate) fn replay_repair_scope(&self, caller: Option<&str>) -> Option<String> {
+        caller.map(|caller| {
+            let namespace = self
+                .execution
+                .as_ref()
+                .map_or(0, |execution| execution.resources.replay_namespace);
+            format!("{namespace}:{caller}")
         })
     }
 
@@ -74,22 +125,54 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
-        let _permit = self
-            .permits
-            .acquire()
+        let settlement = matches!(method, "settle" | "abandon");
+        // Supplied capacity is acquired before a shared worker. Individual
+        // execution has no additional pool, identity lookup or allocation policy.
+        let execution_permit = if let Some(execution) = &self.execution {
+            let capacity = if settlement {
+                &execution.resources.settlement
+            } else {
+                &execution.resources.serving
+            };
+            Some(
+                capacity
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| PublicError::internal())?,
+            )
+        } else {
+            None
+        };
+        let pool = if settlement {
+            &self.pool.settlement_permits
+        } else {
+            &self.pool.permits
+        };
+        let queue = if settlement {
+            &self.pool.settlement_queue
+        } else {
+            &self.pool.queue
+        };
+        let permit = pool
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| PublicError::internal())?;
         // Latency is measured from permit grant so it reflects the python
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
         let (responder, outcome) = oneshot::channel();
-        let submitted = match self.queue.lock() {
+        let submitted = match queue.lock() {
             Ok(guard) => match guard.as_ref() {
                 Some(sender) => sender
                     .send(Job {
                         method,
                         argument,
                         responder,
+                        _permit: permit,
+                        _execution_permit: execution_permit,
+                        execution: self.execution.clone(),
                     })
                     .is_ok(),
                 None => false,
@@ -110,7 +193,7 @@ impl Bridge {
     }
 }
 
-impl Drop for Bridge {
+impl Drop for WorkerPool {
     /// Close the queue and join every worker after its per-thread cleanup.
     ///
     /// Joining waits for each worker to reacquire the interpreter and run its
@@ -119,6 +202,9 @@ impl Drop for Bridge {
     /// and dies inside its detached serving closure.
     fn drop(&mut self) {
         if let Ok(mut guard) = self.queue.lock() {
+            guard.take();
+        }
+        if let Ok(mut guard) = self.settlement_queue.lock() {
             guard.take();
         }
         if let Ok(mut workers) = self.workers.lock() {
@@ -153,10 +239,29 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
             // A panic maps to the shared internal error and never poisons
             // the receive lock, so one poisoned call cannot take down the
             // pool.
+            let target = job
+                .execution
+                .as_ref()
+                .map_or(object, |execution| &execution.resources.target);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control_plane_call(py, object, job.method, job.argument)
+                control_plane_call(py, target, job.method, &job.argument)
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
+            // Shared workers must not retain a departed target's per-path
+            // caches. Run cleanup even after a failed callback or cancelled
+            // waiter, while the job still owns its target and both permits.
+            // The individual process bridge retains its fixed-worker cache.
+            if job.execution.is_some() {
+                let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    control_plane_call(py, target, "close_thread_resources", "{}")
+                }))
+                .unwrap_or_else(|_| Err(PublicError::internal()));
+                if cleanup.is_err() {
+                    // Cleanup cannot change a committed accounting outcome.
+                    // Never print the callback's exception or target identity.
+                    eprintln!("bound gateway callback thread-resource cleanup failed");
+                }
+            }
             let _ = job.responder.send(outcome);
         }
         // The control plane caches one SQLite connection per worker thread;
@@ -177,7 +282,7 @@ fn control_plane_call(
     py: Python<'_>,
     object: &Py<PyAny>,
     method: &'static str,
-    argument: String,
+    argument: &str,
 ) -> Result<String, PublicError> {
     let bound = object.bind(py);
     match bound.call_method1(method, (argument,)) {
@@ -222,6 +327,15 @@ class Plane:
         self.call_threads = set()
         self.closed_threads = []
         self.barrier = threading.Barrier(2, timeout=10.0)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.fail_close = False
+
+    def block(self, argument):
+        self.started.set()
+        if not self.release.wait(timeout=10.0):
+            raise RuntimeError("blocked callback was not released")
+        return argument
 
     def echo(self, argument):
         with self.lock:
@@ -235,9 +349,14 @@ class Plane:
     def boom(self, argument):
         raise RuntimeError("unsanitized failure")
 
+    def settle(self, argument):
+        return argument
+
     def close_thread_resources(self, argument):
         with self.lock:
             self.closed_threads.append(threading.get_ident())
+        if self.fail_close:
+            raise RuntimeError("cleanup failure with private target information")
         return "{}"
 "#;
 
@@ -310,6 +429,248 @@ class Plane:
     }
 
     #[test]
+    fn cancelled_waiter_keeps_capacity_until_its_callback_finishes() {
+        let object = plane();
+        let observer = Python::attach(|py| object.clone_ref(py));
+        let bridge = Arc::new(Bridge::new(object, 1).expect("bridge starts"));
+        block_on(async {
+            let caller = bridge.clone();
+            let task = tokio::spawn(async move { caller.call("block", "first".into()).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let started = Python::attach(|py| {
+                        observer
+                            .bind(py)
+                            .getattr("started")
+                            .unwrap()
+                            .call_method0("is_set")
+                            .unwrap()
+                            .extract::<bool>()
+                            .unwrap()
+                    });
+                    if started {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("callback starts");
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let free_while_running = bridge.pool.permits.available_permits();
+            Python::attach(|py| {
+                observer
+                    .bind(py)
+                    .getattr("release")
+                    .unwrap()
+                    .call_method0("set")
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while bridge.pool.permits.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed callback releases capacity");
+            assert_eq!(
+                free_while_running, 0,
+                "the job, not its waiter, owns capacity"
+            );
+            assert_eq!(bridge.call("echo", "next".into()).await.unwrap(), "next");
+        });
+    }
+
+    #[test]
+    fn bound_job_keeps_its_target_after_the_request_and_front_leave() {
+        use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+        let process = plane();
+        let process_observer = Python::attach(|py| process.clone_ref(py));
+        let target = plane();
+        let observer = Python::attach(|py| target.clone_ref(py));
+        let handle = Python::attach(|py| {
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+        })
+        .unwrap();
+        let bindings = ExecutionBindings::new(1).unwrap();
+        let token = "x".repeat(32);
+        bindings.register(token.clone(), &handle).unwrap();
+        let bridge = Bridge::new(process, 2).unwrap();
+        let bound = bridge.bind(bindings.claim(&token).unwrap());
+        block_on(async {
+            let request = tokio::spawn(async move { bound.call("block", "accepted".into()).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !Python::attach(|py| {
+                    observer
+                        .bind(py)
+                        .getattr("started")
+                        .unwrap()
+                        .call_method0("is_set")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                }) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            bindings.remove(&token).unwrap();
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert!(handle.in_use());
+            assert_eq!(bridge.pool.permits.available_permits(), 1);
+            // The original process target remains available while another target blocks.
+            assert_eq!(
+                bridge.call("echo", "process".into()).await.unwrap(),
+                "process"
+            );
+            Python::attach(|py| {
+                observer
+                    .bind(py)
+                    .getattr("release")
+                    .unwrap()
+                    .call_method0("set")
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while handle.in_use() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        // The callback is cancelled, but its target is cleaned before its
+        // lease becomes idle, without stopping the shared process bridge.
+        assert_eq!(attribute_length(&observer, "closed_threads"), 1);
+        drop(bridge);
+        assert_eq!(attribute_length(&process_observer, "closed_threads"), 4);
+    }
+
+    #[test]
+    fn bound_target_churn_closes_sqlite_on_serving_and_cleanup_workers() {
+        use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+        const SOURCE: &std::ffi::CStr = cr#"
+import sqlite3
+import tempfile
+import threading
+from pathlib import Path
+
+
+class DatabasePlane:
+    def __init__(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "gateway.db"
+        self.local = threading.local()
+        self.closed = 0
+
+    def echo(self, argument):
+        if not hasattr(self.local, "connection"):
+            self.local.connection = sqlite3.connect(self.path)
+        self.local.connection.execute("SELECT 1").fetchone()
+        return argument
+
+    def settle(self, argument):
+        return self.echo(argument)
+
+    def boom(self, argument):
+        self.echo(argument)
+        raise RuntimeError("callback failed after opening its database")
+
+    def close_thread_resources(self, argument):
+        connection = self.local.connection
+        connection.close()
+        del self.local.connection
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            self.closed += 1
+        else:
+            raise AssertionError("database descriptor remains usable")
+        return "{}"
+"#;
+        let bridge = Bridge::new(plane(), 2).unwrap();
+        let bindings = ExecutionBindings::new(1).unwrap();
+        for index in 0..16 {
+            let target = Python::attach(|py| {
+                pyo3::types::PyModule::from_code(py, SOURCE, c"database.py", c"database")
+                    .unwrap()
+                    .getattr("DatabasePlane")
+                    .unwrap()
+                    .call0()
+                    .unwrap()
+                    .unbind()
+            });
+            let observer = Python::attach(|py| target.clone_ref(py));
+            let handle = Python::attach(|py| {
+                ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+            })
+            .unwrap();
+            let token = format!("{index:032}");
+            bindings.register(token.clone(), &handle).unwrap();
+            let bound = bridge.bind(bindings.claim(&token).unwrap());
+            block_on(async {
+                assert_eq!(
+                    bound.call("echo", "request".into()).await.unwrap(),
+                    "request"
+                );
+                assert_eq!(
+                    bound.call("settle", "receipt".into()).await.unwrap(),
+                    "receipt"
+                );
+                assert!(bound.call("boom", "failure".into()).await.is_err());
+            });
+            Python::attach(|py| {
+                assert_eq!(
+                    observer
+                        .bind(py)
+                        .getattr("closed")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    3,
+                    "every target's actual SQLite connection closes before its callback returns"
+                );
+            });
+            drop(bound);
+        }
+        // Churn never stops the pool or consumes the process target's capacity.
+        assert_eq!(
+            block_on(bridge.call("echo", "alive".into())).unwrap(),
+            "alive"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_cannot_change_an_acknowledged_accounting_result() {
+        use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+        let target = plane();
+        Python::attach(|py| target.bind(py).setattr("fail_close", true).unwrap());
+        let observer = Python::attach(|py| target.clone_ref(py));
+        let handle = Python::attach(|py| {
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+        })
+        .unwrap();
+        let bindings = ExecutionBindings::new(1).unwrap();
+        let token = "c".repeat(32);
+        bindings.register(token.clone(), &handle).unwrap();
+        let bridge = Bridge::new(plane(), 2).unwrap();
+        let bound = bridge.bind(bindings.claim(&token).unwrap());
+        assert_eq!(
+            block_on(bound.call("settle", "durable receipt".into())).unwrap(),
+            "durable receipt"
+        );
+        assert_eq!(attribute_length(&observer, "closed_threads"), 1);
+        assert!(block_on(bound.call("boom", "{}".into())).is_err());
+        assert_eq!(attribute_length(&observer, "closed_threads"), 2);
+    }
+
+    #[test]
     fn dropping_the_bridge_releases_every_worker_thread() {
         let object = plane();
         let observer = Python::attach(|py| object.clone_ref(py));
@@ -323,7 +684,7 @@ class Plane:
         drop(bridge);
         // Drop joins the workers, so every one of them has already run its
         // `close_thread_resources` cleanup, including idle workers.
-        assert_eq!(attribute_length(&observer, "closed_threads"), 3);
+        assert_eq!(attribute_length(&observer, "closed_threads"), 5);
     }
 
     #[test]

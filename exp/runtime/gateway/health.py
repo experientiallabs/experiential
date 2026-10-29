@@ -1,13 +1,20 @@
-"""Bounded per-deployment circuit and throttle state for exact-model waterfalls."""
+"""Bounded per-deployment circuit and throttle state for exact-model waterfalls.
+
+The registry also owns the per-lane dead-box ejection (``lane_ejection``): the
+same settled outcomes feed it, and claim walks read it to order an ejected
+lane last (``order``).
+"""
 
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.lane_ejection import LaneEjectionPolicy, LaneEjections, LaneKey
 
 DeploymentHealthKey = tuple[str, str, str]
 
@@ -26,6 +33,46 @@ _OPERATIONAL_FAILURES = {
     GatewayFailureClass.MALFORMED_RESPONSE,
     GatewayFailureClass.PROVIDER_INTERNAL,
 }
+
+# Clamp on a provider-stated Retry-After when it sizes a throttle window. The
+# floor keeps a degenerate "0"/"1" from thrashing the rung; the ceiling keeps
+# one absurd header from suppressing a lane for days while still letting a
+# daily-quota reset (hours) mark the rung dead-for-hours so the waterfall
+# skips it for the whole window.
+RETRY_AFTER_WINDOW_MINIMUM_SECONDS = 5.0
+RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
+# A plan's usage window resets on the provider's own clock, and the longest one
+# (the weekly window) can be days away. Suppression follows the stated reset up
+# to one week plus a day of slack; the ceiling only guards a garbage reset.
+PLAN_WINDOW_MAXIMUM_SECONDS = 8.0 * 24.0 * 3_600.0
+
+
+def health_failure_cause(
+    failure_class: GatewayFailureClass,
+) -> Literal["transport", "credential", "throttle"] | None:
+    """Classify deployment-affecting failures for circuits and scoped recovery.
+
+    Args:
+        failure_class: Normalized provider or gateway failure category.
+
+    Returns:
+        Transport for operational failures, credential for operator-actionable
+        account failures, throttle for explicit backoff, or None when the outcome
+        says nothing about deployment health. Customer ownership does not change
+        the provider failure's health effect.
+    """
+    if failure_class == GatewayFailureClass.THROTTLED:
+        return "throttle"
+    if failure_class in _HARD_FAILURES:
+        return "credential"
+    if failure_class in _OPERATIONAL_FAILURES:
+        return "transport"
+    return None
+
+
+def _lane(key: DeploymentHealthKey) -> LaneKey:
+    """The physical lane behind a health key: ``(deployment_id, connection_sha256)``."""
+    return (key[1], key[2])
 
 
 @dataclass
@@ -49,6 +96,7 @@ class DeploymentHealthRegistry:
         failure_threshold: int = 2,
         open_seconds: float = 30.0,
         throttle_seconds: float = 30.0,
+        lane_ejection: LaneEjectionPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize finite in-process deployment health policy.
@@ -57,6 +105,8 @@ class DeploymentHealthRegistry:
             failure_threshold: Consecutive operational failures that open one circuit.
             open_seconds: Circuit cooldown before one half-open probe.
             throttle_seconds: Independent suppression window after provider throttling.
+            lane_ejection: Per-lane dead-box ejection thresholds; ``None`` reads
+                the operator's environment overrides over the defaults.
             clock: Injectable monotonic clock.
 
         Raises:
@@ -71,7 +121,33 @@ class DeploymentHealthRegistry:
         self._throttle_seconds = throttle_seconds
         self._clock = clock
         self._states: dict[DeploymentHealthKey, _DeploymentHealth] = {}
+        self._lanes = LaneEjections(lane_ejection or LaneEjectionPolicy.from_environ())
         self._lock = threading.Lock()
+
+    def order(self, keys: tuple[DeploymentHealthKey, ...], candidates: Sequence[int]) -> list[int]:
+        """Return ``candidates`` with every ejected lane moved last, order otherwise kept.
+
+        Args:
+            keys: One health key per ordered route deployment.
+            candidates: Route indexes in the walk's preference order.
+
+        Returns:
+            The same indexes, live lanes first, ejected lanes after them.
+        """
+        now = self._clock()
+        with self._lock:
+            ejected = {
+                index for index in candidates if self._lanes.ejected(_lane(keys[index]), now)
+            }
+        return [index for index in candidates if index not in ejected] + [
+            index for index in candidates if index in ejected
+        ]
+
+    def lane_ejected(self, key: DeploymentHealthKey) -> bool:
+        """Whether the lane behind ``key`` is ejected on this worker right now."""
+        now = self._clock()
+        with self._lock:
+            return self._lanes.ejected(_lane(key), now)
 
     def claim(self, key: DeploymentHealthKey) -> bool:
         """Reserve one eligible route or half-open probe.
@@ -90,10 +166,12 @@ class DeploymentHealthRegistry:
             if state.open_until > now:
                 return False
             if state.consecutive_failures < self._failure_threshold:
+                self._lanes.claimed(_lane(key), now)
                 return True
             if state.half_open_probe:
                 return False
             state.half_open_probe = True
+            self._lanes.claimed(_lane(key), now)
             return True
 
     def claim_last_resort(self, key: DeploymentHealthKey) -> bool:
@@ -119,6 +197,7 @@ class DeploymentHealthRegistry:
             if state.last_resort_probe:
                 return False
             state.last_resort_probe = True
+            self._lanes.claimed(_lane(key), now)
             return True
 
     def claim_forced(self, key: DeploymentHealthKey) -> bool:
@@ -141,7 +220,31 @@ class DeploymentHealthRegistry:
         now = self._clock()
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
-            return state.throttle_until <= now
+            if state.throttle_until > now:
+                return False
+            self._lanes.claimed(_lane(key), now)
+            return True
+
+    def claim_throttle_redial(self, key: DeploymentHealthKey) -> bool:
+        """Admit one post-backoff redial of a rung inside its own throttle window.
+
+        The throttle window is the fleet-shared "leave this rung alone"
+        signal for OTHER requests; the request that was throttled and has
+        already waited the pool's backoff is the one deliberately probing the
+        rung back, so its redial passes the window. An open circuit (some
+        other failure class marked the rung dead meanwhile) still refuses,
+        because a dead rung has no cache worth the wait.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the redial may dispatch this deployment now.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            return state.open_until <= now
 
     def dispatch_opened(self, key: DeploymentHealthKey) -> None:
         """Restore admission once one provider dispatch opens successfully.
@@ -159,6 +262,7 @@ class DeploymentHealthRegistry:
             state.open_until = 0.0
             state.half_open_probe = False
             state.last_resort_probe = False
+            self._lanes.succeeded(_lane(key))
 
     def succeeded(self, key: DeploymentHealthKey) -> None:
         """Close one circuit after a successful terminal provider result.
@@ -172,6 +276,7 @@ class DeploymentHealthRegistry:
             state.open_until = 0.0
             state.half_open_probe = False
             state.last_resort_probe = False
+            self._lanes.succeeded(_lane(key))
 
     def failed(self, key: DeploymentHealthKey, failure: GatewayFailure) -> None:
         """Apply one normalized provider outcome to circuit or throttle state.
@@ -181,27 +286,121 @@ class DeploymentHealthRegistry:
             failure: Sanitized provider failure classification.
         """
         now = self._clock()
+        cause = health_failure_cause(failure.failure_class)
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.half_open_probe = False
             state.last_resort_probe = False
-            if failure.failure_class == GatewayFailureClass.THROTTLED:
+            self._lanes.failed(_lane(key), failure, now)
+            if cause == "throttle":
                 state.throttle_until = max(
                     state.throttle_until,
-                    now + self._throttle_seconds,
+                    now + self._throttle_window_seconds(failure),
                 )
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
                 return
-            if failure.failure_class in _HARD_FAILURES:
+            if cause == "credential":
                 state.consecutive_failures = self._failure_threshold
                 state.open_until = now + self._open_seconds
                 return
-            if failure.failure_class in _OPERATIONAL_FAILURES:
+            if cause == "transport":
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds
+
+    def exhausted(self, key: DeploymentHealthKey, reset_after_seconds: float) -> None:
+        """Suppress one deployment until its provider-stated usage window resets.
+
+        A plan rung reports its rolling usage windows on every response, so a
+        window that reaches 100 percent is known BEFORE the next request would
+        429: the rung is throttled until the reset the provider stated, however
+        many days away (a weekly window), and the waterfall moves on to the next
+        plan in the pool. A success on the same response leaves the circuit closed.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+            reset_after_seconds: Provider-stated seconds until the window reopens.
+        """
+        now = self._clock()
+        window = min(
+            max(float(reset_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
+            PLAN_WINDOW_MAXIMUM_SECONDS,
+        )
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            state.throttle_until = max(state.throttle_until, now + window)
+
+    def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
+        """Size one throttle window from the provider's own stated wait.
+
+        A throttled failure carrying a parsed ``Retry-After`` sizes the window
+        from it, clamped to the bounded range, so a long provider backoff (an
+        exhausted daily quota) actually suppresses the rung for the wait the
+        provider asked for instead of re-attempting every fixed default. An
+        absent or unparseable wait keeps the fixed default window.
+
+        Args:
+            failure: Sanitized throttled failure.
+
+        Returns:
+            The window length in seconds.
+        """
+        if failure.retry_after_seconds is None:
+            return self._throttle_seconds
+        return min(
+            max(float(failure.retry_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
+            RETRY_AFTER_WINDOW_MAXIMUM_SECONDS,
+        )
+
+    def suppressed(self, key: DeploymentHealthKey) -> bool:
+        """Whether one deployment currently sits inside any suppression window.
+
+        A read-only probe (unlike :meth:`claim` it never reserves a half-open
+        slot), used by sticky-affinity admission to bypass and clear a binding
+        whose rung is throttled or circuit-open right now.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the deployment is throttle- or circuit-suppressed.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return False
+            return state.throttle_until > now or state.open_until > now
+
+    def throttled_remaining_seconds(self, keys: tuple[DeploymentHealthKey, ...]) -> float | None:
+        """Return the longest remaining throttle window when EVERY key is inside one.
+
+        A route with no claimable deployment and no classified failure of its
+        own can only be throttle-suppressed (forced claims admit any
+        non-throttled circuit), so this names that condition explicitly: the
+        provider asked for backoff, which is caller-facing rate limiting, not
+        platform deadness.
+
+        Args:
+            keys: One health key per ordered route deployment.
+
+        Returns:
+            The longest remaining window in seconds, or ``None`` when the
+            route is empty or any deployment is outside a throttle window.
+        """
+        if not keys:
+            return None
+        now = self._clock()
+        remaining = 0.0
+        with self._lock:
+            for key in keys:
+                state = self._states.get(key)
+                if state is None or state.throttle_until <= now:
+                    return None
+                remaining = max(remaining, state.throttle_until - now)
+        return remaining
 
     def release_probe(self, key: DeploymentHealthKey) -> None:
         """Release a claimed half-open probe that never reached provider dispatch.
@@ -214,3 +413,4 @@ class DeploymentHealthRegistry:
             if state is not None:
                 state.half_open_probe = False
                 state.last_resort_probe = False
+            self._lanes.released(_lane(key))

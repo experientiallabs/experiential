@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from exp.common.models import BillingSource
+from exp.common.models.catalog_prices import BilledUnitKind
 from exp.runtime.gateway.auth import utc_text
-from exp.runtime.gateway.contracts import DirectTarget, GatewayFailureClass, ProjectTarget
+from exp.runtime.gateway.contracts import (
+    DirectTarget,
+    GatewayFailureClass,
+    GatewayUsage,
+    ProjectTarget,
+)
+from exp.runtime.gateway.ledger_valuation import usage_source_label
 from exp.runtime.gateway.platform import (
     AliasRevisionRecord,
     AttemptReservationRecord,
@@ -20,6 +28,72 @@ from exp.runtime.gateway.platform import (
     VirtualKeyRecord,
 )
 from exp.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
+from exp.runtime.gateway.stream_contracts import BilledUnits
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+
+
+def settle_attempt_in_transaction(
+    connection: sqlite3.Connection,
+    attempts: SQLiteAttemptLedger,
+    request: AttemptSettlementRequest,
+) -> AttemptSettlementRecord:
+    """Apply and verify public settlement under the caller's immediate write transaction.
+
+    Public terminal replays are exact comparisons, never an entry point to the
+    internal recovery ledger's late-meter reconciliation. Validation also runs
+    before an initial write commits, so a rejected public settlement changes
+    neither the attempt nor its budget allocations.
+    """
+    row = _settlement_row(connection, request)
+    if request.terminal_event is not None and request.terminal_event.accounting_recovery:
+        raise ValueError("public settlement cannot declare internal accounting recovery")
+    if row["state"] == "dispatched":
+        attempts.apply_finish_attempt(
+            connection,
+            attempt_id=request.attempt_id,
+            terminal_event=request.terminal_event,
+            failure=request.failure,
+            finalize_request=request.finalize_request,
+            first_token_at=request.first_token_at,
+        )
+        row = _settlement_row(connection, request)
+    if request.finalize_request and str(row["request_terminal_state"]) != str(row["state"]):
+        raise ValueError(
+            "attempt settlement replay cannot finalize its non-terminal parent request"
+        )
+    settlement = AttemptSettlementRecord(
+        reservation=reservation_record(row, organization_id=request.organization_id),
+        state=AttemptTerminalState(str(row["state"])),
+        terminal_at=required_datetime(row["terminal_at"]),
+        failure_class=(
+            None if row["failure_class"] is None else GatewayFailureClass(str(row["failure_class"]))
+        ),
+        usage=usage_record(row),
+        usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
+        estimated_cost_nano_usd=optional_int(row["estimated_cost_nano_usd"]),
+        settled_nano_usd=optional_int(row["budget_settled_nano_usd"]),
+        first_token_at=optional_datetime(row["first_token_at"]),
+    )
+    require_settlement_replay(settlement, request=request)
+    return settlement
+
+
+def _settlement_row(
+    connection: sqlite3.Connection, request: AttemptSettlementRequest
+) -> sqlite3.Row:
+    """Read the exact tenant-owned attempt and parent within the settlement transaction."""
+    row = connection.execute(
+        "SELECT a.*, r.identity_id, r.alias_id, r.alias_revision_id, "
+        "r.terminal_state AS request_terminal_state FROM gateway_attempts AS a "
+        "JOIN gateway_requests AS r ON r.organization_id = a.organization_id "
+        "AND r.request_id = a.request_id WHERE a.organization_id = ? AND a.attempt_id = ?",
+        (request.organization_id, request.attempt_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("attempt does not belong to the requested organization")
+    return row
 
 
 def key_record(
@@ -74,7 +148,12 @@ def require_settlement_replay(
             raise ValueError("attempt settlement needs a terminal event or failure")
         state = AttemptTerminalState(request.terminal_event.kind.value)
         failure_class = None
-    usage_source = AttemptUsageSource.OBSERVED if usage is not None else AttemptUsageSource.UNKNOWN
+    usage_source = AttemptUsageSource(
+        usage_source_label(
+            usage,
+            estimated=request.terminal_event is not None and request.terminal_event.usage_estimated,
+        )
+    )
     if (
         settlement.state is not state
         or settlement.failure_class is not failure_class
@@ -115,7 +194,15 @@ def reservation_record(
     *,
     organization_id: str,
 ) -> AttemptReservationRecord:
-    """Decode one reservation from the existing atomic attempt row."""
+    """Decode one reservation and every frozen pricing dimension.
+
+    Args:
+        row: Durable attempt joined to its accepted request.
+        organization_id: Tenant already checked against the row.
+
+    Returns:
+        The exact persisted reservation, including unknown prices as None.
+    """
     return AttemptReservationRecord(
         organization_id=organization_id,
         attempt_id=str(row["attempt_id"]),
@@ -131,17 +218,25 @@ def reservation_record(
         billing_source=BillingSource(str(row["billing_source"])),
         input_rate=optional_int(row["input_rate"]),
         cached_input_rate=optional_int(row["cached_input_rate"]),
+        cache_creation_input_rate=optional_int(row["cache_creation_input_rate"]),
+        cache_creation_1h_input_rate=optional_int(row["cache_creation_1h_input_rate"]),
         output_rate=optional_int(row["output_rate"]),
         reasoning_rate=optional_int(row["reasoning_rate"]),
         long_context_threshold_tokens=optional_int(row["long_context_threshold_tokens"]),
         long_context_input_rate=optional_int(row["long_context_input_rate"]),
         long_context_cached_input_rate=optional_int(row["long_context_cached_input_rate"]),
+        long_context_cache_creation_input_rate=optional_int(
+            row["long_context_cache_creation_input_rate"]
+        ),
+        long_context_cache_creation_1h_input_rate=optional_int(
+            row["long_context_cache_creation_1h_input_rate"]
+        ),
         long_context_output_rate=optional_int(row["long_context_output_rate"]),
         long_context_reasoning_rate=optional_int(row["long_context_reasoning_rate"]),
         attempt_ordinal=int(row["attempt_ordinal"]),
         route_depth=int(row["route_depth"]),
         period=str(row["budget_period_start"])[:7],
-        reserved_micro_usd=optional_int(row["budget_reserved_micro_usd"]),
+        reserved_nano_usd=optional_int(row["budget_reserved_nano_usd"]),
         started_at=required_datetime(row["started_at"]),
     )
 
@@ -151,9 +246,21 @@ def require_reservation_replay(
     *,
     request: AttemptReservationRequest,
 ) -> AttemptReservationRecord:
-    """Return an exact natural-key replay or reject changed accounting input."""
+    """Return an exact natural-key replay or reject changed accounting input.
+
+    Args:
+        row: Existing durable attempt joined to its accepted request.
+        request: Requested reservation to compare with frozen evidence.
+
+    Returns:
+        The original reservation when every accounting input matches.
+
+    Raises:
+        ValueError: Any identity, pricing, or reservation input differs.
+    """
     record = reservation_record(row, organization_id=request.organization_id)
     authorization = request.snapshot.authorization
+    stage = request.snapshot.stage_for_depth(request.route_depth)
     prices = request.deployment.gateway.prices
     expected = (
         authorization.request_id,
@@ -164,8 +271,8 @@ def require_reservation_replay(
         authorization.canonical_request_sha256,
         authorization.caller_operation_sha256,
         authorization.catalog_sha256,
-        request.snapshot.pool_id,
-        request.snapshot.exact_model_id,
+        stage.pool_id,
+        stage.exact_model_id,
         request.deployment.deployment_id,
         request.deployment.provider,
         request.deployment.billing_source,
@@ -175,34 +282,47 @@ def require_reservation_replay(
             if request.deployment.gateway.pricing_effective_at is None
             else utc_text(request.deployment.gateway.pricing_effective_at)
         ),
-        prices.input_micro_usd_per_million_tokens,
-        prices.cached_input_micro_usd_per_million_tokens,
-        prices.output_micro_usd_per_million_tokens,
-        prices.reasoning_micro_usd_per_million_tokens,
+        prices.input_nano_usd_per_million_tokens,
+        prices.cached_input_nano_usd_per_million_tokens,
+        prices.cache_creation_input_nano_usd_per_million_tokens,
+        prices.cache_creation_1h_input_nano_usd_per_million_tokens,
+        prices.output_nano_usd_per_million_tokens,
+        prices.reasoning_nano_usd_per_million_tokens,
         (None if prices.long_context is None else prices.long_context.input_threshold_tokens),
         (
             None
             if prices.long_context is None
-            else prices.long_context.input_micro_usd_per_million_tokens
+            else prices.long_context.input_nano_usd_per_million_tokens
         ),
         (
             None
             if prices.long_context is None
-            else prices.long_context.cached_input_micro_usd_per_million_tokens
+            else prices.long_context.cached_input_nano_usd_per_million_tokens
         ),
         (
             None
             if prices.long_context is None
-            else prices.long_context.output_micro_usd_per_million_tokens
+            else prices.long_context.cache_creation_input_nano_usd_per_million_tokens
         ),
         (
             None
             if prices.long_context is None
-            else prices.long_context.reasoning_micro_usd_per_million_tokens
+            else prices.long_context.cache_creation_1h_input_nano_usd_per_million_tokens
         ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.output_nano_usd_per_million_tokens
+        ),
+        (
+            None
+            if prices.long_context is None
+            else prices.long_context.reasoning_nano_usd_per_million_tokens
+        ),
+        None if prices.units is None else prices.units.model_dump_json(),
         request.attempt_ordinal,
         request.route_depth,
-        request.maximum_cost_micro_usd,
+        request.maximum_cost_nano_usd,
     )
     actual = (
         record.request_id,
@@ -222,16 +342,21 @@ def require_reservation_replay(
         (None if row["pricing_effective_at"] is None else str(row["pricing_effective_at"])),
         record.input_rate,
         record.cached_input_rate,
+        record.cache_creation_input_rate,
+        record.cache_creation_1h_input_rate,
         record.output_rate,
         record.reasoning_rate,
         record.long_context_threshold_tokens,
         record.long_context_input_rate,
         record.long_context_cached_input_rate,
+        record.long_context_cache_creation_input_rate,
+        record.long_context_cache_creation_1h_input_rate,
         record.long_context_output_rate,
         record.long_context_reasoning_rate,
+        None if row["unit_prices"] is None else str(row["unit_prices"]),
         record.attempt_ordinal,
         record.route_depth,
-        record.reserved_micro_usd,
+        record.reserved_nano_usd,
     )
     if actual != expected:
         raise ValueError("attempt reservation replay differs from durable accounting input")
@@ -253,3 +378,35 @@ def optional_datetime(value: object) -> datetime | None:
 def optional_int(value: object) -> int | None:
     """Decode one optional SQLite integer."""
     return None if value is None else int(str(value))
+
+
+def usage_record(row: sqlite3.Row) -> GatewayUsage | None:
+    """Recover every observed usage leg for idempotent settlement comparison.
+
+    Args:
+        row: Durable attempt row including the cache-write total and TTL subset.
+
+    Returns:
+        Observed usage, preserving a missing primary leg, or None without either
+        token total or billed media units.
+    """
+    billed = (
+        None
+        if row["billed_unit_kind"] is None or row["billed_quantity_milli"] is None
+        else BilledUnits(
+            kind=BilledUnitKind(str(row["billed_unit_kind"])),
+            variant=str(row["billed_unit_variant"] or ""),
+            quantity_milli=int(row["billed_quantity_milli"]),
+        )
+    )
+    if row["input_tokens"] is None and row["output_tokens"] is None and billed is None:
+        return None
+    return GatewayUsage(
+        input_tokens=optional_int(row["input_tokens"]),
+        output_tokens=optional_int(row["output_tokens"]),
+        cached_input_tokens=optional_int(row["cached_input_tokens"]),
+        cache_creation_input_tokens=optional_int(row["cache_creation_input_tokens"]),
+        cache_creation_1h_input_tokens=optional_int(row["cache_creation_1h_input_tokens"]),
+        reasoning_tokens=optional_int(row["reasoning_tokens"]),
+        billed_units=billed,
+    )

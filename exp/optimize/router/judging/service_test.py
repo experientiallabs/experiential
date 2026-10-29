@@ -25,6 +25,7 @@ from exp.common.judging import (
     HumanScore,
     HumanScoreHistory,
     HumanScoreReview,
+    JudgeDefinition,
     PromptDefinition,
     RubricDimension,
     RubricReview,
@@ -52,7 +53,9 @@ from exp.common.project import (
     ProjectStoreError,
     artifact_input,
 )
+from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
     JudgeScoreProjection,
@@ -73,7 +76,6 @@ from exp.optimize.router.judging.service import (
 )
 from exp.runtime.models.registry import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.simulation.build import ProjectBuild, build_project, select_completed_build
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 from exp.simulation.mining.service import MiningSpec
 
 _TIME = datetime(2026, 8, 13, tzinfo=UTC)
@@ -146,7 +148,6 @@ class _RuntimeCatalog:
         self.preflight_calls = 0
 
     def preflight(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        del role
         """Return the fake judge only for its configured alias.
 
         Args:
@@ -155,6 +156,7 @@ class _RuntimeCatalog:
         Returns:
             Injected resolved judge.
         """
+        del role
         self.preflight_calls += 1
         assert alias == self.resolved.alias
         return self.resolved
@@ -258,27 +260,29 @@ def _catalog() -> ModelCatalog:
     )
 
 
-def _trace(index: int) -> Trace:
+def _trace(index: int, *, case: int | None = None) -> Trace:
     """Build one distinct real normalized trace with captured model output.
 
     Args:
         index: Unique trace and lineage fixture index.
+        case: Request identity, allowing independent captures of the same task.
 
     Returns:
         Complete normalized successful production trace.
     """
     started_at = _TIME + timedelta(minutes=index)
+    case = index if case is None else case
     return Trace(
         trace_id=f"trace-{index}",
         conversation_id=f"conversation-{index}",
-        task=f"Resolve support case {index}",
+        task=f"Resolve support case {case}",
         spans=(
             TraceSpan(
                 span_id=f"span-{index}",
                 name="agent.model_call",
                 started_at=started_at,
                 ended_at=started_at + timedelta(seconds=1),
-                attributes={"output": f"Resolved case {index}."},
+                attributes={"output": f"Resolved case {case}."},
                 model=_model(),
             ),
         ),
@@ -380,11 +384,12 @@ def _persist_grounded_build(
     return completed
 
 
-def _built_store(tmp_path: Path) -> ProjectStore:
-    """Create a completed build with three fit lineages and one held-out lineage.
+def _built_store(tmp_path: Path, *, paired: bool = False) -> ProjectStore:
+    """Create a completed build with distinct cases or exact repeated requests.
 
     Args:
         tmp_path: Isolated test directory.
+        paired: Include two captured outputs per identical request for pairwise calibration.
 
     Returns:
         Initialized project store with deterministic build readiness.
@@ -392,7 +397,12 @@ def _built_store(tmp_path: Path) -> ProjectStore:
     store = ProjectStore(tmp_path / ".exp", "support")
     store.initialize(ProjectConfig(project_id="support"))
     built = build_project(
-        TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
+        TraceNormalizationResult(
+            traces=tuple(
+                _trace(index, case=index // 2 if paired else index) for index in range(100)
+            ),
+            issues=(),
+        ),
         store,
         created_at=_TIME,
         code_revision="test-revision",
@@ -533,11 +543,41 @@ def test_setup_failure_is_read_only_and_setup_never_calls_a_model(tmp_path: Path
     assert store.artifacts.list_ids() == before_artifacts
 
 
+def test_named_judge_definition_binds_syllabus_and_axes_to_persisted_setup(tmp_path: Path) -> None:
+    """A reusable judge keeps its exact syllabus and mixed ranges when bound to a project."""
+    store = _built_store(tmp_path)
+    definition = JudgeDefinition(
+        name="Support",
+        syllabus="Assess whether the user's issue was resolved.",
+        dimensions=(
+            *JudgeDefinition.task_success().dimensions,
+            scored_axis("quality", "Quality", "Helpfulness.", min_score=-2, max_score=2),
+        ),
+    )
+    plan = prepare_manual_judge_setup(
+        store, _catalog(), definition=definition, created_at=_TIME, code_revision="test-revision"
+    )
+    assert plan.dimensions == definition.dimensions
+    assert definition.syllabus in plan.prompt_template.prompt.text
+    committed = commit_manual_judge_setup(store, plan, confirmed=True)
+    assert committed.prompt_template == plan.prompt_template
+    assert commit_manual_judge_setup(store, plan, confirmed=True) == committed
+    with pytest.raises(ManualJudgeError, match="not both"):
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            definition=definition,
+            dimensions=_wide_axes(),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+
+
 def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale judge setup cannot cross an interrupted replacement selection.
+    """Interrupted replacement rolls back both pointers; old evidence stays valid until commit.
 
     Args:
         tmp_path: Isolated project and immutable artifact root.
@@ -611,7 +651,7 @@ def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
     builder = Thread(target=run_builder, daemon=True)
     builder.start()
     assert selection_paused.wait(timeout=5)
-    assert store.load_project().build == completed_b
+    assert store.load_project().build == selected_a
     stale_review = store.read_review()
     assert isinstance(stale_review, dict)
     assert stale_review["build_review"]["readiness_id"] == stale_plan.build.readiness_id
@@ -628,14 +668,15 @@ def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
     assert not judge.is_alive()
     assert len(builder_errors) == 1
     assert "injected interruption" in str(builder_errors[0])
-    assert len(judge_errors) == 1
-    assert isinstance(judge_errors[0], ManualJudgeError)
-    assert "not synchronized" in str(judge_errors[0])
-    assert store.load_project().build == completed_b
+    assert judge_errors == []
+    assert store.load_project().build == selected_a
     assert store.read_review() == stale_review
 
     monkeypatch.setattr(simulation_build, "select_build_review", original_select_review)
     select_completed_build(store, completed_b, replacement.review)
+    assert store.load_project().build == completed_b
+    with pytest.raises(ManualJudgeError):
+        commit_manual_judge_setup(store, stale_plan, confirmed=True)
     recovered_review = store.read_review()
     assert isinstance(recovered_review, dict)
     assert recovered_review["build_review"]["readiness_id"] == replacement.review.readiness_id
@@ -1099,7 +1140,12 @@ def test_completed_audit_tamper_fails_before_replay_or_approval(tmp_path: Path) 
         created_at=_TIME,
         code_revision="test-revision",
     )
-    audit_path = store.artifacts.read(result.audit.audit_id).directory / "audit.json"
+    audit_path = (
+        RawArtifact(
+            store.artifacts._paths, store.artifacts.read(result.audit.audit_id).manifest.artifact_id
+        )
+        / "audit.json"
+    )
     audit_path.write_text("{}", encoding="utf-8")
 
     with pytest.raises(ManualJudgeError, match="audit is unavailable"):
@@ -1222,7 +1268,7 @@ def test_non_scalar_calibration_executes_saved_contract(
 
 def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path: Path) -> None:
     """Pairwise calibration freezes typed labels, both orders, and direct bias counts."""
-    store = _built_store(tmp_path)
+    store = _built_store(tmp_path, paired=True)
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),
@@ -1235,6 +1281,8 @@ def test_pairwise_calibration_uses_same_task_and_counterbalances_order(tmp_path:
     plan = prepare_manual_judge_calibration(store, sample_size=1)
     reference = plan.reference_traces[0]
     assert reference is not None
+    assert plan.traces[0].task == reference.task
+    assert plan.traces[0].trace_id != reference.trace_id
     labels = (
         ManualJudgeLabel(
             trace_id=plan.traces[0].trace_id,
@@ -1320,7 +1368,10 @@ def test_pairwise_calibration_fails_before_labels_or_calls_without_same_task_pai
     assert store.artifacts.list_ids() == before_artifacts
 
 
-def test_interrupted_calibration_reuses_completed_probes_at_later_time(tmp_path: Path) -> None:
+@pytest.mark.parametrize("retry_revision", ["test-revision", "upgraded-revision"])
+def test_interrupted_calibration_reuses_completed_probes_at_later_time(
+    tmp_path: Path, retry_revision: str
+) -> None:
     """Retrying later reuses completed rows and dispatches only missing provider probes."""
     store = _built_store(tmp_path)
     _setup(store)
@@ -1378,7 +1429,7 @@ def test_interrupted_calibration_reuses_completed_probes_at_later_time(tmp_path:
         approve=False,
         accept_insufficient_labels=True,
         created_at=_TIME + timedelta(minutes=10),
-        code_revision="test-revision",
+        code_revision=retry_revision,
     )
 
     assert result.provider_calls_made == 2
@@ -1538,7 +1589,7 @@ def test_retry_reuses_audit_when_review_pointer_write_was_interrupted(
 
 def test_interrupted_pairwise_probe_reuses_forward_order(tmp_path: Path) -> None:
     """A reverse-order interruption reuses the frozen forward probe on retry."""
-    store = _built_store(tmp_path)
+    store = _built_store(tmp_path, paired=True)
     setup_plan = prepare_manual_judge_setup(
         store,
         _catalog(),

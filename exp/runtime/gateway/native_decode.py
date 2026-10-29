@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
+from exp.runtime.openai_protocol.audio_requests import (
+    DecodedSpeechRequest,
+    DecodedTranscriptionRequest,
+    decode_speech,
+    decode_transcription,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.image_edits_requests import decode_image_edits
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
     DecodedEmbeddingsRequest,
@@ -69,6 +76,34 @@ def decode_native_body(
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
         )
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_count_tokens_body(
+    body: str,
+    *,
+    anthropic_beta: str | None = None,
+) -> DecodedGatewayRequest:
+    """Decode one raw ``/v1/messages/count_tokens`` body for prompt counting.
+
+    Anthropic's count body carries no ``max_tokens``, so it decodes through
+    the count-specific Messages entrypoint rather than the generation one.
+
+    Args:
+        body: Raw request body text.
+        anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+
+    Returns:
+        The public alias and the canonical request to count.
+
+    Raises:
+        NativeDecodeError: The body is not JSON, not an object, or fails
+            shared protocol validation.
+    """
+    payload = _load_object_body(body)
+    try:
+        return decode_messages_count_tokens(payload, anthropic_beta=anthropic_beta)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
 
@@ -137,5 +172,70 @@ def decode_native_images_body(body: str) -> DecodedImagesRequest:
     payload = _load_object_body(body)
     try:
         return decode_images(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_image_edits_upload(upload: str) -> DecodedImagesRequest:
+    """Decode the data plane's parsed ``/images/edits`` multipart upload.
+
+    The data plane parses the multipart body itself; ``upload`` is its JSON
+    object of the text ``fields`` plus the base64 image ``files``.
+
+    Args:
+        upload: JSON text of the parsed upload.
+
+    Returns:
+        The public alias and canonical image-edit request.
+
+    Raises:
+        NativeDecodeError: The upload fails shared protocol validation.
+    """
+    payload = _load_object_body(upload)
+    try:
+        return decode_image_edits(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_speech_body(body: str) -> DecodedSpeechRequest:
+    """Decode one raw ``/audio/speech`` body with the shared speech decoder.
+
+    Args:
+        body: Raw request body text.
+
+    Returns:
+        The public alias and canonical speech request.
+
+    Raises:
+        NativeDecodeError: The body is not JSON, not an object, or fails shared
+            protocol validation.
+    """
+    payload = _load_object_body(body)
+    try:
+        return decode_speech(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_transcription_upload(upload: str) -> DecodedTranscriptionRequest:
+    """Decode the data plane's parsed ``/audio/transcriptions`` upload.
+
+    The data plane parses the multipart (or JSON ``input_audio``) body itself
+    and keeps the audio bytes; ``upload`` is its JSON object of the text fields
+    plus the measured ``file`` facts.
+
+    Args:
+        upload: JSON text of the parsed upload.
+
+    Returns:
+        The public alias and canonical transcription request.
+
+    Raises:
+        NativeDecodeError: The upload fails shared protocol validation.
+    """
+    payload = _load_object_body(upload)
+    try:
+        return decode_transcription(payload)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc

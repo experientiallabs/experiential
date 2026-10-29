@@ -180,6 +180,20 @@ def shared_http_json_client() -> httpx.AsyncClient:
         return client
 
 
+async def close_shared_http_json_client() -> None:
+    """Close only the shared client owned by the running event loop.
+
+    Loop owners call this after inspection stops and before destroying their
+    loop. Injected clients and other loops' pools retain their existing owners.
+    No client is created when this loop has never used the shared transport.
+    """
+    loop = asyncio.get_running_loop()
+    with _clients_lock:
+        client = _clients.pop(loop, None)
+    if client is not None:
+        await client.aclose()
+
+
 class HttpJsonClassifier:
     """POST one inspect request to a dedicated classifier HTTP endpoint.
 
@@ -256,7 +270,7 @@ class HttpJsonClassifier:
     ) -> ClassifierVerdict:
         """POST the inspect envelope and validate the classifier contract."""
         headers = {"accept": "application/json", "content-type": "application/json"}
-        authorization = _authorization_header(self._bearer_env)
+        authorization = bearer_authorization_header(self._bearer_env)
         if authorization is not None:
             headers["authorization"] = authorization
         client = self._client or shared_http_json_client()
@@ -277,7 +291,7 @@ class HttpJsonClassifier:
                 )
                 if status < 200 or status >= 300:
                     raise ClassifierProtocolError(f"classifier returned HTTP {status}")
-                body = await _read_bounded(response, self._max_response_bytes)
+                body = await read_bounded_body(response, self._max_response_bytes)
         except ClassifierProtocolError:
             raise
         except asyncio.CancelledError:
@@ -351,7 +365,7 @@ def _classifier_visible_message(message: GatewayMessage) -> JsonObject:
     return message.model_dump(mode="json", by_alias=True, exclude_none=False)
 
 
-def _authorization_header(bearer_env: str | None) -> str | None:
+def bearer_authorization_header(bearer_env: str | None) -> str | None:
     """Resolve optional bearer auth from the process environment.
 
     Args:
@@ -395,7 +409,7 @@ def _inspect_payload(
     return payload
 
 
-async def _read_bounded(response: httpx.Response, limit: int) -> bytes:
+async def read_bounded_body(response: httpx.Response, limit: int) -> bytes:
     """Read a response body and reject oversized payloads.
 
     Args:

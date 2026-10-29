@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Mapping
-from typing import Literal
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+from uuid import UUID
 
 from exp.common.auth import (
     ProviderAuthStore,
     ProviderAuthStoreError,
     StoredCredentialBinding,
-    StoredCredentialEndpointMismatch,
-    StoredCredentialStatus,
 )
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import ConnectionConfig
@@ -28,13 +28,43 @@ class ModelCredentialError(ValueError):
     """A configured model connection could not resolve its credential."""
 
 
+@dataclass(frozen=True, repr=False)
+class DispatchCredentialReceipt:
+    """Worker-private opaque identity returned with one exact credential binding.
+
+    Attributes:
+        binding_id: Immutable credential-generation receipt, never a secret or public identity.
+    """
+
+    binding_id: UUID
+
+    def __repr__(self) -> str:
+        """Never disclose the binding identity in logs or exception context."""
+        return "DispatchCredentialReceipt([REDACTED])"
+
+
+@runtime_checkable
+class CredentialEnvironment(Protocol):
+    """Atomic credential-and-receipt lookup; a missing result is authoritative."""
+
+    def resolve_credential(self, name: str) -> CredentialResolution | None:
+        """Resolve once without a separate current-generation lookup."""
+        ...
+
+
 class CredentialResolution:
     """One resolved API key plus the source that supplied it.
 
     The secret is omitted from ``repr`` and ``str``.
     """
 
-    def __init__(self, value: str, source: CredentialSource) -> None:
+    def __init__(
+        self,
+        value: str,
+        source: CredentialSource,
+        *,
+        receipt: DispatchCredentialReceipt | None = None,
+    ) -> None:
         """Bind one non-empty secret and its source.
 
         Args:
@@ -43,6 +73,7 @@ class CredentialResolution:
         """
         self._value = value
         self.source = source
+        self.receipt = receipt
 
     @property
     def value(self) -> str:
@@ -84,69 +115,23 @@ def lookup_connection_credential(
     """
     if connection.provider == "bedrock" and connection.api_key_env is None:
         return None
+    if connection.subscription is not None:
+        # A plan sign-in is not an API key; its bearer is minted per dispatch from the
+        # connection's subscription token source.
+        return None
     values = os.environ if environment is None else environment
     if connection.api_key_env is not None:
+        if isinstance(values, CredentialEnvironment):
+            resolved = values.resolve_credential(connection.api_key_env)
+            return resolved if resolved is not None and resolved.value.strip() else None
         env_value = (values.get(connection.api_key_env) or "").strip()
         if env_value:
             return CredentialResolution(env_value, "environment")
     auth_store = store if store is not None else ProviderAuthStore()
-    stored = auth_store.get(connection_id, binding=_credential_binding(connection))
+    stored = auth_store.get(connection_id, binding=connection_credential_binding(connection))
     if stored:
         return CredentialResolution(stored, "stored")
     return None
-
-
-def describe_connection_credential(
-    connection: ConnectionConfig,
-    *,
-    connection_id: str,
-    environment: Mapping[str, str] | None = None,
-    store: ProviderAuthStore | None = None,
-) -> StoredCredentialStatus:
-    """Return public credential metadata for one connection without the secret.
-
-    Args:
-        connection: Secret-free connection metadata.
-        connection_id: Exact catalog or gateway connection name.
-        environment: Optional mapping used instead of the process environment.
-        store: Optional credential store. When omitted, the platform user-data file is used.
-
-    Returns:
-        Connection identity, provider, source, and environment-variable name.
-    """
-    if connection.provider == "bedrock" and connection.api_key_env is None:
-        return StoredCredentialStatus(
-            connection_id=connection_id,
-            provider=connection.provider,
-            source="aws_chain",
-        )
-    try:
-        resolved = lookup_connection_credential(
-            connection,
-            connection_id=connection_id,
-            environment=environment,
-            store=store,
-        )
-    except StoredCredentialEndpointMismatch:
-        return StoredCredentialStatus(
-            connection_id=connection_id,
-            provider=connection.provider,
-            source="mismatch",
-            environment_variable=connection.api_key_env,
-        )
-    source: Literal["environment", "stored", "missing"]
-    if resolved is None:
-        source = "missing"
-    elif resolved.source == "environment":
-        source = "environment"
-    else:
-        source = "stored"
-    return StoredCredentialStatus(
-        connection_id=connection_id,
-        provider=connection.provider,
-        source=source,
-        environment_variable=connection.api_key_env,
-    )
 
 
 class MissingModelCredentialError(ModelCredentialError):
@@ -193,12 +178,31 @@ def read_connection_api_key(
     """
     if connection.provider == "bedrock" and connection.api_key_env is None:
         raise ModelCredentialError("bedrock ambient authentication has no stored secret access key")
+    if connection.subscription is not None:
+        raise ModelCredentialError(
+            f"connection {connection_id!r} is a {connection.subscription} plan sign-in and has "
+            "no API key"
+        )
+    return read_connection_credential(
+        connection, connection_id=connection_id, environment=environment, store=store
+    ).value
+
+
+def read_connection_credential(
+    connection: ConnectionConfig,
+    *,
+    connection_id: str,
+    environment: Mapping[str, str] | None = None,
+    store: ProviderAuthStore | None = None,
+) -> CredentialResolution:
+    """Resolve exactly once and retain its receipt through client construction.
+
+    Authoritative environment misses never fall back to another credential store.
+    Uninstrumented environments preserve ordinary serving without a receipt.
+    """
     try:
         resolved = lookup_connection_credential(
-            connection,
-            connection_id=connection_id,
-            environment=environment,
-            store=store,
+            connection, connection_id=connection_id, environment=environment, store=store
         )
     except ProviderAuthStoreError as exc:
         raise ModelCredentialError(str(exc)) from exc
@@ -208,11 +212,8 @@ def read_connection_api_key(
                 f"no stored credential exists for connection {connection_id!r}; "
                 "run 'exp config providers' to supply one"
             )
-        raise MissingModelCredentialError(
-            connection.api_key_env,
-            connection_id=connection_id,
-        )
-    return resolved.value
+        raise MissingModelCredentialError(connection.api_key_env, connection_id=connection_id)
+    return resolved
 
 
 def resolve_or_prompt_connection_api_key(
@@ -259,11 +260,11 @@ def resolve_or_prompt_connection_api_key(
     if not key:
         return None
     if persist:
-        auth_store.put(connection_id, key, binding=_credential_binding(connection))
+        auth_store.put(connection_id, key, binding=connection_credential_binding(connection))
     return key
 
 
-def _credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
+def connection_credential_binding(connection: ConnectionConfig) -> StoredCredentialBinding:
     """Return the secret-free endpoint and credential-locator identity for one key.
 
     Args:

@@ -46,7 +46,6 @@ from exp.common.core.locks import file_write_lock
 from exp.common.models import (
     BillingSource,
     GatewayDeploymentCapabilities,
-    GatewayTokenPrices,
     ModelCapabilities,
 )
 from exp.common.progress import report
@@ -240,9 +239,7 @@ def interactive_gateway_setup(
     total_steps = len(session.endpoints) + 8
     completed_steps = 0
 
-    progress_context = (
-        progress_display(console, single_line=True) if console.is_interactive else nullcontext(None)
-    )
+    progress_context = progress_display(console) if console.is_interactive else nullcontext(None)
     with _command_budget_compensation(root, values.maximum_cost_usd):
         with guardrail_setup_compensation(root, values.guardrail_plan):
             with progress_context as progress:
@@ -285,7 +282,7 @@ def interactive_gateway_setup(
                             supports_streaming=True,
                             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
                         ),
-                        prices=GatewayTokenPrices(),
+                        prices=None,
                         pricing_source=None,
                         billing_source=(
                             BillingSource.HOST_MANAGED

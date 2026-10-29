@@ -5,95 +5,27 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
-use crate::encode::{compact_json, stable_public_id};
-use crate::errors::{Failure, FailureClass, PublicError};
+use crate::encode::{
+    compact_json, stable_public_id, ReasoningCarrierCandidate, ReasoningCarrierState,
+};
+use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
+use crate::reasoning_display::{DisplayJoiner, ReasoningOutput};
+use crate::tool_search::MessagesToolSearch;
+use crate::web_search::MessagesWebSearch;
 
-const REFUSAL_MESSAGE: &str = "provider refused the request";
-
-/// The sanitized failure for provider refusals on this surface, mirroring
-/// `refusal_failure` in the python encoder.
-pub fn refusal_failure() -> Failure {
-    Failure::new(FailureClass::Refusal, REFUSAL_MESSAGE)
-}
-
-/// Render one sanitized public error as the Anthropic error envelope,
-/// mirroring `anthropic_error_body`: status decides the Anthropic type
-/// first, then the OpenAI envelope type, and a present `param` pointer is
-/// folded into the message text.
-pub fn anthropic_error_body(error: &PublicError) -> Value {
-    let error_type = match error.status_code {
-        401 => "authentication_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        503 => "overloaded_error",
-        _ if error.error_type == "invalid_request_error" => "invalid_request_error",
-        _ => "api_error",
-    };
-    let message = match &error.param {
-        Some(param) if !param.is_empty() => format!("{} (param: {param})", error.message),
-        _ => error.message.clone(),
-    };
-    json!({
-        "type": "error",
-        "error": {"type": error_type, "message": message},
-    })
-}
+/// The provider block index under which an exposure-gated rung's plaintext
+/// reasoning (`ReasoningContentDelta`, an OpenAI-wire event with no block
+/// index of its own) is scheduled as one Messages thinking block. Anthropic
+/// dialects index their thinking blocks from zero and never share a stream
+/// with an OpenAI-wire rung, so the reserved value cannot collide.
+const EXPOSED_REASONING_BLOCK_INDEX: u32 = u32::MAX;
 
 fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
-}
-
-/// Map the terminal outcome to the Anthropic stop reason. Server tool use is
-/// provider-executed and deliberately never yields `tool_use`; a paused
-/// server-tool turn must keep `pause_turn` so the caller resumes it.
-pub(super) fn stop_reason(terminal: &Event, saw_tool_use: bool) -> &'static str {
-    match terminal {
-        Event::Incomplete => "max_tokens",
-        Event::PausedTurn => "pause_turn",
-        _ if saw_tool_use => "tool_use",
-        _ => "end_turn",
-    }
-}
-
-/// The Anthropic usage shape from `messages_usage`: cached reads come back
-/// out of the normalized input total, and unknown usage reports zero counts
-/// because the Anthropic shape requires both fields.
-pub(super) fn messages_usage(usage: Option<&Usage>) -> Value {
-    let usage = match usage {
-        Some(usage) if usage.has_token_counts() => usage,
-        _ => return json!({"input_tokens": 0, "output_tokens": 0}),
-    };
-    let cached = usage.cached_input_tokens.unwrap_or(0);
-    let creation = usage.cache_creation_input_tokens.unwrap_or(0);
-    let mut body = Map::new();
-    // Both cache legs come back out of the folded ledger total so callers
-    // see the provider's own shape: input_tokens excludes cached reads and
-    // cache writes, each reported on its own leg.
-    body.insert(
-        "input_tokens".to_string(),
-        json!(usage
-            .input_tokens
-            .unwrap_or(0)
-            .saturating_sub(cached)
-            .saturating_sub(creation)),
-    );
-    body.insert(
-        "output_tokens".to_string(),
-        json!(usage.output_tokens.unwrap_or(0)),
-    );
-    if cached > 0 {
-        body.insert("cache_read_input_tokens".to_string(), json!(cached));
-    }
-    if creation > 0 {
-        body.insert("cache_creation_input_tokens".to_string(), json!(creation));
-    }
-    Value::Object(body)
 }
 
 /// Frame one named, compact, UTF-8-preserving Anthropic SSE event.
@@ -160,7 +92,7 @@ impl PendingBlock {
 }
 
 /// Stateful Anthropic Messages SSE encoder with one open block and one
-/// terminal, emitting byte-identical frames to the python encoder.
+/// terminal.
 ///
 /// Blocks are scheduled in start order (see [`PendingBlock`]): the earliest
 /// block streams live while content for later blocks buffers within the
@@ -179,6 +111,8 @@ pub struct MessagesSseEncoder {
     open_position: Option<usize>,
     next_unopened: usize,
     buffered_bytes: usize,
+    /// `buffered_bytes`' share of the worker-wide retention budget.
+    retained: crate::retained::RetainedLease,
     tool_identities: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     tool_completed: HashSet<u32>,
@@ -188,10 +122,32 @@ pub struct MessagesSseEncoder {
     saw_tool_use: bool,
     refusal_seen: bool,
     usage: Option<Usage>,
+    /// Pre-dispatch prompt estimate shown on `message_start` when no upstream
+    /// start usage is known. Kept apart from `usage` so it can never reach
+    /// `message_delta`, whose meters are the provider's own report.
+    pre_dispatch_input_estimate: Option<u64>,
     ignored_parameters: Vec<String>,
+    reasoning: ReasoningCarrierState,
+    reasoning_content_carrier: Option<String>,
+    reasoning_output: ReasoningOutput,
+    /// Paragraph-joins provider units inside the unsigned thinking block.
+    reasoning_display: DisplayJoiner,
+    /// The gateway-executed web search, rendered as the leading blocks at
+    /// `start` and metered on every usage object; `None` changes nothing.
+    web_search: Option<MessagesWebSearch>,
+    /// The gateway-run tool-search rounds, rendered as leading blocks after
+    /// the web search and metered on every usage object; `None` changes
+    /// nothing.
+    tool_search: Option<MessagesToolSearch>,
+    /// How many leading blocks are the gateway's own, so the empty-completion
+    /// check still sees a provider that rendered nothing.
+    synthetic_blocks: usize,
+    /// Provider safeguard verdicts, relayed verbatim on `message_delta`.
+    safeguard_results: Option<Value>,
 }
 
 impl MessagesSseEncoder {
+    #[cfg(test)]
     pub fn new(request_id: &str, model: &str) -> Self {
         Self::new_with_ignored(request_id, model, Vec::new())
     }
@@ -215,6 +171,7 @@ impl MessagesSseEncoder {
             open_position: None,
             next_unopened: 0,
             buffered_bytes: 0,
+            retained: crate::retained::RetainedLease::default(),
             tool_identities: HashMap::new(),
             tool_arguments: HashMap::new(),
             tool_completed: HashSet::new(),
@@ -224,7 +181,81 @@ impl MessagesSseEncoder {
             saw_tool_use: false,
             refusal_seen: false,
             usage: None,
+            pre_dispatch_input_estimate: None,
+            reasoning: ReasoningCarrierState::default(),
+            reasoning_content_carrier: None,
+            reasoning_output: ReasoningOutput::default(),
+            reasoning_display: DisplayJoiner::default(),
+            web_search: None,
+            tool_search: None,
+            synthetic_blocks: 0,
+            safeguard_results: None,
         }
+    }
+
+    /// Render the gateway-run tool-search rounds ahead of every provider
+    /// block (see `tool_search::messages_tool_search`); set before `start`.
+    pub fn set_tool_search(&mut self, tool_search: Option<MessagesToolSearch>) {
+        self.tool_search = tool_search;
+    }
+
+    /// Render the gateway-executed web search ahead of every provider block
+    /// (see `web_search::messages_web_search`); set before `start`.
+    pub fn set_web_search(&mut self, web_search: Option<MessagesWebSearch>) {
+        self.web_search = web_search;
+    }
+
+    /// Seed the meters `message_start` reports from what the upstream already
+    /// said (an Anthropic upstream's own start frame). `None` keeps the zero
+    /// placeholder an OpenAI-wire upstream forces, whose final meters ride
+    /// `message_delta` (the official SDK accumulators copy them from there).
+    pub fn set_initial_usage(&mut self, usage: Option<Usage>) {
+        if let Some(usage) = usage {
+            if usage.has_token_counts() {
+                self.usage = Some(usage);
+            }
+        }
+    }
+
+    /// Seed `message_start` with the control plane's pre-dispatch prompt
+    /// count for an upstream that reports nothing before its final chunk.
+    ///
+    /// Anthropic's documented start frame carries the prompt's input count
+    /// with `output_tokens: 1`, and clients that read input from
+    /// `message_start` alone (Claude Code) otherwise display the zero
+    /// placeholder. The estimate is display-only: an upstream's own start
+    /// usage (`set_initial_usage`) outranks it whichever is set first, and
+    /// `message_delta` keeps the provider's report.
+    pub fn set_pre_dispatch_input_estimate(&mut self, estimate: Option<u64>) {
+        self.pre_dispatch_input_estimate = estimate;
+    }
+
+    /// Attach the authenticated carrier before the terminal is encoded.
+    ///
+    /// Mirrors `ChatSseEncoder::set_reasoning_content_carrier`: a tool turn's
+    /// hidden reasoning leaves only as the sealed carrier, here as one trailing
+    /// `redacted_thinking` block (Anthropic's opaque replay-verbatim shape).
+    pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
+        self.reasoning_content_carrier = Some(carrier);
+    }
+
+    /// Show the model's plaintext reasoning to the caller as a thinking block.
+    ///
+    /// Off by default. Exposure (rungs the catalog marks
+    /// `reasoning_output_exposed`, Tencent/DeepSeek) and display (every rung
+    /// that has not opted out) both render readable non-Anthropic reasoning
+    /// in one block carrying an EMPTY signature: Anthropic signs every
+    /// thinking block it issues, so an unsigned block is recognizably the
+    /// gateway's own plaintext when the caller replays it.
+    pub fn set_reasoning_output(&mut self, output: ReasoningOutput) {
+        self.reasoning_output = output;
+    }
+
+    /// Return the validated carrier candidate accumulated by a live stream.
+    pub fn reasoning_carrier_candidate(
+        &self,
+    ) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+        self.reasoning.candidate()
     }
 
     /// Emit the `message_start` and `ping` lifecycle events once.
@@ -243,24 +274,52 @@ impl MessagesSseEncoder {
             "content": [],
             "stop_reason": Value::Null,
             "stop_sequence": Value::Null,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": self.start_usage(),
         });
         // Same body-level disclosure as the Chat and Responses encoders: the
         // Anthropic envelope has no field for it, and the official SDK
         // tolerates extra keys, so a dropped control (an empty-ladder
         // `output_config.effort`, a dropped beta token) is never silent.
         disclose_ignored_parameters(&mut message, &self.ignored_parameters);
-        Ok(vec![
+        let mut frames = vec![
             event_frame(
                 "message_start",
                 &json!({"type": "message_start", "message": message}),
             ),
             event_frame("ping", &json!({"type": "ping"})),
-        ])
+        ];
+        // The gateway's own search blocks lead the content, exactly where a
+        // native rung would stream its server tool use: the pre-dispatch web
+        // search first, then the tool-search rounds in order.
+        let synthetic: Vec<Event> = self
+            .web_search
+            .iter()
+            .flat_map(|search| search.events.clone())
+            .chain(
+                self.tool_search
+                    .iter()
+                    .flat_map(|search| search.events.clone()),
+            )
+            .collect();
+        if !synthetic.is_empty() {
+            for event in &synthetic {
+                frames.extend(self.feed(event)?);
+            }
+            self.synthetic_blocks = self.blocks.len();
+        }
+        Ok(frames)
     }
 
     pub fn saw_terminal(&self) -> bool {
         self.terminal
+    }
+
+    /// Whether any content block has been scheduled so far: the route reads
+    /// this at a `Completed` terminal, because a committed stream whose only
+    /// events the surface cannot render (hidden reasoning on an unexposed
+    /// rung) would otherwise encode as `content: []` with `end_turn`.
+    pub fn has_content_blocks(&self) -> bool {
+        self.blocks.len() > self.synthetic_blocks
     }
 
     /// Encode one ordered normalized provider event into zero or more frames.
@@ -275,7 +334,17 @@ impl MessagesSseEncoder {
                 "Messages stream received an event after its terminal.",
             ));
         }
+        self.reasoning.observe(event)?;
         match event {
+            Event::ProviderResponsesLogprobs { .. } => Err(invalid_provider_stream(
+                "Responses probability events cannot be projected on this surface.",
+            )),
+            Event::ChoiceLogprobsDelta(_) => Err(invalid_provider_stream(
+                "Chat token probabilities cannot be projected on this surface.",
+            )),
+            Event::Image(_) => Err(invalid_provider_stream(
+                "Generated image output requires Chat Completions or the Images API.",
+            )),
             Event::TextDelta(text) => self.text_delta(text),
             Event::ProviderTextDelta { delta, .. } => self.text_delta(delta),
             Event::RefusalDelta(_) => {
@@ -284,6 +353,14 @@ impl MessagesSseEncoder {
                 self.refusal_seen = true;
                 Ok(Vec::new())
             }
+            // An exposure-gated or reasoning-displaying rung's plaintext
+            // reasoning (route reasoning, plaintext reasoning, OpenAI summaries)
+            // streams as one unsigned thinking block, the Messages twin of the
+            // Chat wire's reasoning fields; elsewhere it stays dropped. The
+            // sealed tool-turn carrier rides independently.
+            Event::ReasoningContentDelta { .. }
+            | Event::ReasoningTextDelta(_)
+            | Event::ReasoningSummaryDelta { .. } => self.displayed_thinking(event),
             Event::ProviderRefusalDelta { .. } => {
                 self.refusal_seen = true;
                 Ok(Vec::new())
@@ -291,9 +368,8 @@ impl MessagesSseEncoder {
             // OpenAI-only reasoning shapes have no Messages representation.
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
-            | Event::EncryptedReasoning { .. }
-            | Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
+            | Event::GeminiThoughtPart(_)
+            | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),
             Event::ThinkingSignature { index, signature } => {
                 self.thinking_signature(*index, signature)
@@ -303,6 +379,7 @@ impl MessagesSseEncoder {
                 index,
                 call_id,
                 name,
+                ..
             } => self.tool_started(*index, call_id, name),
             Event::ToolArgumentsDelta { index, delta } => self.tool_arguments_delta(*index, delta),
             Event::ToolCallCompleted { index, call } => {
@@ -373,28 +450,60 @@ impl MessagesSseEncoder {
                 Ok(self.advance())
             }
             Event::ServerToolResult { block, .. } => self.server_tool_result(block),
+            // Hosted tool items enter only through Responses-native tool
+            // declarations, which never admit on the Messages surface.
+            Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. } => Err(invalid_provider_stream(
+                "Messages cannot represent a provider-hosted Responses tool item.",
+            )),
+            // OpenAI text annotations have no Messages representation; the
+            // text itself streams through its delta events.
+            Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
+            Event::SafeguardResults(results) => {
+                self.safeguard_results = Some(results.clone());
+                Ok(Vec::new())
+            }
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
                     self.usage = Some(usage.clone());
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete | Event::PausedTurn => {
+            Event::Completed
+            | Event::Incomplete
+            | Event::StoppedAtSequence(_)
+            | Event::PausedTurn => {
                 self.terminal = true;
                 if self.refusal_seen {
                     return Ok(vec![error_frame(&refusal_failure())]);
                 }
+                let mut frames = Vec::new();
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                    && self.reasoning.candidate()?.is_some()
+                {
+                    // The carrier is known only once every tool call has
+                    // completed, after the sequential thinking block closed,
+                    // so it travels as one trailing opaque block.
+                    let carrier = self.reasoning_content_carrier.clone().ok_or_else(|| {
+                        invalid_provider_stream(
+                            "Messages reasoning content was not sealed by the gateway authority.",
+                        )
+                    })?;
+                    frames.extend(self.redacted_thinking(&carrier)?);
+                }
                 self.draining = true;
-                let mut frames = self.advance();
+                frames.extend(self.advance());
                 frames.push(event_frame(
                     "message_delta",
                     &json!({
                         "type": "message_delta",
-                        "delta": {
-                            "stop_reason": stop_reason(event, self.saw_tool_use),
-                            "stop_sequence": Value::Null,
-                        },
-                        "usage": messages_usage(self.usage.as_ref()),
+                        "delta": message_delta_body(
+                            event,
+                            self.saw_tool_use,
+                            self.safeguard_results.as_ref(),
+                        ),
+                        "usage": self.metered(messages_usage(self.usage.as_ref())),
                     }),
                 ));
                 frames.push(event_frame(
@@ -448,6 +557,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         self.blocks[position].pending_signature.push_str(signature);
         Ok(self.advance())
     }
@@ -460,6 +570,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         let mut block = PendingBlock::new(BlockKind::Redacted);
         block.redacted_data = Some(data.to_string());
         self.blocks.push(block);
@@ -471,9 +582,16 @@ impl MessagesSseEncoder {
         if let Some(position) = self
             .blocks
             .iter()
-            .position(|block| block.kind == BlockKind::Thinking(index))
+            .rposition(|block| block.kind == BlockKind::Thinking(index))
         {
-            return position;
+            // Display reasoning that resumes after a later block closed the
+            // unsigned block opens a fresh one; buffering into the closed
+            // block would never flush.
+            let open = self.blocks[position].anthropic_index.is_none()
+                || self.open_position == Some(position);
+            if open || index != EXPOSED_REASONING_BLOCK_INDEX {
+                return position;
+            }
         }
         self.blocks
             .push(PendingBlock::new(BlockKind::Thinking(index)));
@@ -489,6 +607,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         if serde_json::from_str::<Value>(citation).is_err() {
             return Err(invalid_provider_stream(
                 "Messages citation was not valid JSON.",
@@ -572,6 +691,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         if serde_json::from_str::<Value>(block).is_err() {
             return Err(invalid_provider_stream(
                 "Messages server tool result was not valid JSON.",
@@ -643,6 +763,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         self.blocks[position].pending.push_str(delta);
         Ok(())
     }
@@ -703,6 +824,7 @@ impl MessagesSseEncoder {
                 BlockKind::Redacted => {
                     let data = block.redacted_data.take().unwrap_or_default();
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(data.len());
+                    retention::release_buffered(&mut self.retained, self.buffered_bytes);
                     json!({"type": "redacted_thinking", "data": data})
                 }
                 BlockKind::Tool(tool_index) => {
@@ -732,6 +854,7 @@ impl MessagesSseEncoder {
                 BlockKind::ServerResult => {
                     let raw = block.server_result_block.take().unwrap_or_default();
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(raw.len());
+                    retention::release_buffered(&mut self.retained, self.buffered_bytes);
                     serde_json::from_str(&raw)
                         .expect("scheduled server result was validated as JSON")
                 }
@@ -757,6 +880,7 @@ impl MessagesSseEncoder {
         let anthropic_index = block.anthropic_index;
         for citation in block.pending_citations.drain(..) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(citation.len());
+            retention::release_buffered(&mut self.retained, self.buffered_bytes);
             let parsed: Value =
                 serde_json::from_str(&citation).expect("retained citation was validated as JSON");
             frames.push(event_frame(
@@ -787,6 +911,7 @@ impl MessagesSseEncoder {
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_sub(block.pending_signature.len());
+        retention::release_buffered(&mut self.retained, self.buffered_bytes);
         block.pending_signature.clear();
     }
 
@@ -822,13 +947,26 @@ impl MessagesSseEncoder {
             }),
         ));
         self.buffered_bytes = self.buffered_bytes.saturating_sub(block.pending.len());
+        retention::release_buffered(&mut self.retained, self.buffered_bytes);
         block.pending.clear();
     }
 }
 
 mod aggregate;
+mod display;
+mod errors;
+mod retention;
+mod terminal;
+mod usage;
 
-pub use aggregate::{completed_messages_body, completed_messages_body_with_ignored};
+pub use errors::{anthropic_error_body, refusal_failure};
+
+#[cfg(test)]
+pub use aggregate::completed_messages_body;
+pub use aggregate::{completed_messages_body_with_reasoning, AggregatedMessage};
+use terminal::message_delta_body;
+pub(super) use terminal::{last_safeguard_results, stop_reason, stop_sequence_value};
+pub(crate) use usage::messages_usage;
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
 /// object when any control was dropped; an empty list adds nothing.
@@ -847,3 +985,11 @@ pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameter
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_claude_code;
+#[cfg(test)]
+mod tests_safeguards;
+#[cfg(test)]
+mod tests_usage;
+#[cfg(test)]
+mod tests_wire;

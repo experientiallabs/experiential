@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
+import math
+from pathlib import Path
+from threading import TIMEOUT_MAX
 from typing import Literal
+from uuid import uuid4
 
+import httpx
 import pytest
 
+from exp.common.auth import ProviderAuthStore, StoredCredentialBinding, StoredOAuthTokens
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     AssistantAction,
@@ -20,17 +29,44 @@ from exp.common.models import (
     ModelSnapshot,
     Usage,
 )
-from exp.runtime.models.credentials import ModelCredentialError
+from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
+from exp.common.models.gateway_catalog import normalize_gateway_catalog
+from exp.common.models.pricing import completion_cost_reservation
+from exp.common.models.token_cost_test import prices
+from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
+from exp.runtime.models.credentials import (
+    CredentialResolution,
+    DispatchCredentialReceipt,
+    ModelCredentialError,
+)
+from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityError
+from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.anthropic import AnthropicClient
-from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.anthropic_subscription import AnthropicSubscriptionClient
+from exp.runtime.models.providers.async_transport import (
+    HttpxAsyncJsonTransport,
+    ScriptedAsyncJsonTransport,
+)
+from exp.runtime.models.providers.azure import AzureClient, AzureResponsesClient
+from exp.runtime.models.providers.base import ProviderHttpClient
+from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
+from exp.runtime.models.providers.openai import OpenAIClient
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSample,
     TinkerSampler,
 )
-from exp.runtime.models.providers.transport import ScriptedJsonTransport
-from exp.runtime.models.registry import ModelConnectionError, RuntimeModelCatalog
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    ScriptedJsonTransport,
+    is_known_unbilled_failure,
+)
+from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
+from exp.runtime.models.providers.vertex import VertexTokenProvider
+from exp.runtime.models.registry import CatalogRoleName, ModelConnectionError, RuntimeModelCatalog
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
     supports_tools=True,
@@ -38,6 +74,192 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
     context_window_tokens=128_000,
     maximum_output_tokens=16_000,
 )
+
+
+def test_complete_price_metadata_does_not_rebind_transport_or_capacities() -> None:
+    """A full tariff changes pricing authority only, preserving the explicit gateway route."""
+    catalog = _catalog(provider="openai-compatible", base_url="https://gateway.example.test/v1")
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    before = runtime.resolve("fixture-model")
+    record = catalog.models["fixture-model"].model_copy(
+        update={"gateway": GatewayDeploymentMetadata(prices=prices())}
+    )
+    after = runtime.with_catalog(
+        catalog.model_copy(update={"models": {"fixture-model": record}})
+    ).resolve("fixture-model")
+    assert before.snapshot == after.snapshot and before.capabilities == after.capabilities
+    assert isinstance(before.client, ProviderHttpClient) and isinstance(
+        after.client, ProviderHttpClient
+    )
+    assert before.client.gateway_wire_profile() == after.client.gateway_wire_profile()
+    assert before.token_prices is None and after.token_prices == prices()
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [0.0, -1.0, float("inf"), float("nan"), True, 1e20, math.nextafter(TIMEOUT_MAX, math.inf)],
+)
+def test_runtime_rejects_invalid_http_timeout_before_resolution(timeout: float) -> None:
+    """Invalid explicit deadlines fail before credentials or transports are resolved."""
+    with pytest.raises(ValueError, match="http_timeout_seconds must be finite and positive"):
+        RuntimeModelCatalog(_catalog(), environment={}, http_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("timeout", [None, 120.0, TIMEOUT_MAX])
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("openai", None),
+        ("anthropic", None),
+        ("gemini", None),
+        ("openrouter", None),
+        ("openai-compatible", "https://models.example.test/v1"),
+        ("azure", "https://resource.example.test"),
+    ],
+)
+def test_runtime_preserves_http_timeout_in_resolved_wire_profile(
+    provider: str, base_url: str | None, timeout: float | None
+) -> None:
+    """Default and explicit bounds survive resolution and catalog replacement."""
+    catalog = _catalog(
+        provider=provider, base_url=base_url, api_version="v1" if provider == "azure" else None
+    )
+    if timeout is None:
+        runtime = RuntimeModelCatalog(
+            catalog,
+            environment={"FIXTURE_API_KEY": "fixture-key"},
+            transport_factory=ScriptedJsonTransport,
+        )
+    else:
+        runtime = RuntimeModelCatalog(
+            catalog,
+            environment={"FIXTURE_API_KEY": "fixture-key"},
+            transport_factory=ScriptedJsonTransport,
+            http_timeout_seconds=timeout,
+        )
+    for selected in (runtime, runtime.with_catalog(catalog)):
+        client = selected.resolve("fixture-model").client
+        assert isinstance(client, ProviderHttpClient)
+        assert client.gateway_wire_profile().timeout_seconds == (timeout or 60.0)
+
+
+def test_resolution_carries_the_connection_tenant_origin() -> None:
+    """Only an alias whose connection is a tenant origin resolves with the flag."""
+    plain = _catalog(provider="openai-compatible", base_url="https://tenant.example.test/v1")
+    connection = plain.connections["primary"].model_copy(update={"tenant_origin": True})
+    tenant = plain.model_copy(update={"connections": {"primary": connection}})
+    environment = {"FIXTURE_API_KEY": "fixture-key"}
+    runtime = RuntimeModelCatalog(plain, environment=environment)
+    assert runtime.resolve("fixture-model").tenant_origin is False
+    assert runtime.with_catalog(tenant).resolve("fixture-model").tenant_origin is True
+
+
+def test_embedding_call_uses_explicit_runtime_http_timeout() -> None:
+    """An embedding dispatch receives the configured bound, including after catalog replacement."""
+    wire = ScriptedAsyncJsonTransport(
+        [
+            JsonHttpResponse(
+                200,
+                {
+                    "model": "fixture-model",
+                    "data": [{"index": 0, "embedding": [0.3, 0.7]}],
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                },
+            )
+        ]
+    )
+    catalog = _catalog(provider="openai-compatible", base_url="https://models.example.test/v1")
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=lambda: wire,
+        http_timeout_seconds=120.0,
+    ).with_catalog(catalog)
+    client = runtime.resolve("fixture-model").embedding_client
+    assert client is not None
+    assert len(client.embed(("a short retrieval query",))) == 1
+    assert len(wire.requests) == 1
+    assert 119.0 < wire.timeouts[0] <= 120.0
+
+
+def test_vertex_maas_uses_explicit_runtime_http_timeout() -> None:
+    """The separate Vertex OpenAI constructor preserves the same configured bound."""
+    catalog = _catalog(
+        provider="vertex",
+        base_url="https://aiplatform.googleapis.com/v1/projects/test/locations/global",
+    )
+    catalog.models["fixture-model"] = catalog.models["fixture-model"].model_copy(
+        update={"model": "deepseek-ai/deepseek-v3.2-maas"}
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        vertex_token_provider_factory=lambda credentials_json: lambda: "fixture-bearer",
+        http_timeout_seconds=123.0,
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, ProviderHttpClient)
+    assert client.gateway_wire_profile().timeout_seconds == 123.0
+
+
+def test_native_vertex_retains_atomic_source_receipt_across_bearer_refresh_and_rotation() -> None:
+    """The service-account binding survives OAuth refresh, not credential rotation."""
+    first, second = DispatchCredentialReceipt(uuid4()), DispatchCredentialReceipt(uuid4())
+    environment = AtomicEnvironment(
+        CredentialResolution("source-one", "environment", receipt=first)
+    )
+    tokens = {"source-one": "token-one", "source-two": "token-two"}
+
+    def factory(*, credentials_json: str) -> VertexTokenProvider:
+        """Resolve a synthetic bearer using the exact source supplied to this client."""
+        return lambda: tokens[credentials_json]
+
+    catalog = ModelCatalog(
+        connections={
+            "vertex": ConnectionConfig(
+                provider="vertex",
+                base_url="https://aiplatform.googleapis.com/v1/projects/fruit-project/locations/global",
+                api_key_env="VERTEX_TEST",
+            )
+        },
+        models={
+            "gemini-test": ModelRecord(
+                connection="vertex",
+                model="gemini-2.5-pro",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True),
+            )
+        },
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment=environment,
+        vertex_token_provider_factory=factory,
+        http_timeout_seconds=123.0,
+    )
+    deployment = normalize_gateway_catalog(catalog).deployments[0]
+    resolved = runtime.resolve("gemini-test")
+    original = _resolved_wire_profile(deployment, resolved)
+    assert original.credential_receipt is first
+    assert original.timeout_seconds == 123.0
+    assert original.headers["authorization"] == "Bearer token-one"
+    tokens["source-one"] = "token-one-refreshed"
+    refreshed = _resolved_wire_profile(deployment, resolved)
+    assert refreshed.credential_receipt is first
+    assert refreshed.headers["authorization"] == "Bearer token-one-refreshed"
+    environment.resolved = CredentialResolution("source-two", "environment", receipt=second)
+    rotated = _resolved_wire_profile(deployment, runtime.resolve("gemini-test"))
+    assert rotated.credential_receipt is second
+    assert rotated.headers["authorization"] == "Bearer token-two"
+    assert original.credential_receipt is first
+    assert original.headers["authorization"] == "Bearer token-one"
+    assert environment.calls == 2
+    assert "source-one" not in repr(original)
+    assert str(first.binding_id) not in repr(original)
 
 
 class _FakeTinkerSampler:
@@ -87,6 +309,101 @@ def _catalog(
         },
         roles=ModelRoles(candidates=("fixture-model",), incumbent="fixture-model"),
     )
+
+
+@pytest.mark.parametrize("role", ["world_model", "judge", "candidate"])
+@pytest.mark.parametrize(
+    "base_url,explicit_transport,expected",
+    [
+        ("https://api.experientiallabs.ai/v1", False, True),
+        ("https://api.experientiallabs.ai:443/v1", False, True),
+        ("https://api.experientiallabs.ai:444/v1", False, False),
+        ("https://api.experientiallabs.ai.attacker.test/v1", False, False),
+        ("http://api.experientiallabs.ai/v1", False, False),
+        ("https://api.experientiallabs.ai/v1", True, False),
+    ],
+)
+def test_default_catalog_trusts_only_official_authenticated_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    role: CatalogRoleName,
+    base_url: str,
+    explicit_transport: bool,
+    expected: bool,
+) -> None:
+    """All inference roles use exact origin trust while injected factories remain caller-owned."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a trusted-shaped refusal with a wait exceeding the request deadline."""
+        requests.append(request)
+        return httpx.Response(
+            429, json={}, headers={"Retry-After": "10000", "x-gateway-admission-refused": "true"}
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(async_transport, "_pooled_client", lambda: http_client)
+    catalog = _catalog(provider="openai-compatible", base_url=base_url)
+    if explicit_transport:
+        runtime = RuntimeModelCatalog(
+            catalog,
+            environment={"FIXTURE_API_KEY": "fixture"},
+            transport_factory=lambda: HttpxAsyncJsonTransport(),
+        )
+    else:
+        runtime = RuntimeModelCatalog(catalog, environment={"FIXTURE_API_KEY": "fixture"})
+    with pytest.raises(ProviderTransportError) as caught:
+        runtime.resolve("fixture-model", role=role).client.complete(
+            ModelRequest(messages=(ModelMessage(role="user", content="hello"),))
+        )
+    assert len(requests) == 1
+    assert caught.value.known_unbilled is expected
+    assert is_known_unbilled_failure(caught.value) is expected
+    asyncio.run(http_client.aclose())
+
+
+def test_typesafe_resolves_native_client_without_changing_capability_identity() -> None:
+    """The registry adds a decision client, not conversational or embedding support."""
+    declared = ModelCapabilities(supports_completions=False, supports_embeddings=False)
+    runtime = RuntimeModelCatalog(
+        _catalog(provider="typesafe", capabilities=declared),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = runtime.resolve("fixture-model")
+    assert isinstance(resolved.client, TypeSafeClient)
+    assert resolved.client.gateway_wire_profile().url == f"{TYPESAFE_BASE_URL}/systemone"
+    assert resolved.embedding_client is None
+    assert resolved.capabilities == declared
+    assert resolved.snapshot.capabilities_sha256 == declared.identity_sha256()
+    assert "provider-secret-canary" not in repr(resolved)
+
+
+def test_typesafe_preserves_fixed_origin_policy_and_trusted_https_override() -> None:
+    """Custom endpoints stay denied unless the existing explicit trust opt-in is present."""
+    with pytest.raises(ValueError, match="built-in official endpoint"):
+        _catalog(provider="typesafe", base_url="https://example.test/v1")
+    with pytest.raises(ValueError, match="https base_url"):
+        ConnectionConfig(
+            provider="typesafe",
+            base_url="http://127.0.0.1:9/v1",
+            api_key_env="FIXTURE_API_KEY",
+            trusted_custom_origin=True,
+        )
+    catalog = _catalog(provider="typesafe")
+    connection = ConnectionConfig(
+        provider="typesafe",
+        base_url="https://example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
+        trusted_custom_origin=True,
+    )
+    runtime = RuntimeModelCatalog(
+        catalog.model_copy(update={"connections": {"primary": connection}}),
+        environment={"FIXTURE_API_KEY": "provider-secret-canary"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, TypeSafeClient)
+    assert client.gateway_wire_profile().url == "https://example.test/v1/systemone"
 
 
 def test_snapshot_is_credential_free_and_records_capability_digest() -> None:
@@ -161,6 +478,7 @@ def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_w
         catalog,
         environment={"FIXTURE_API_KEY": "foundry-secret"},
         transport_factory=ScriptedJsonTransport,
+        http_timeout_seconds=123.0,
     )
 
     resolved = runtime.resolve("opus")
@@ -168,6 +486,7 @@ def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_w
     assert isinstance(resolved.client, AnthropicClient)
     profile = resolved.client.gateway_wire_profile()
     assert profile.dialect == "anthropic_messages"
+    assert profile.timeout_seconds == 123.0
     assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
     assert profile.headers["Authorization"] == "Bearer foundry-secret"
     assert "x-api-key" not in profile.headers
@@ -202,6 +521,67 @@ def test_azure_non_anthropic_model_keeps_the_openai_deployments_wire() -> None:
     )
 
     assert isinstance(runtime.resolve("glm").client, AzureClient)
+
+
+def _foundry_deployment_catalog(
+    deployment: str, served_model_id: str | None
+) -> RuntimeModelCatalog:
+    """One customer Foundry deployment, named by the operator, on a resource root."""
+    catalog = ModelCatalog(
+        connections={
+            "primary": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com",
+                api_key_env="FIXTURE_API_KEY",
+                api_version="2024-10-21",
+            )
+        },
+        models={
+            "opus": ModelRecord(
+                connection="primary",
+                model=deployment,
+                served_model_id=served_model_id,
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True),
+            )
+        },
+        roles=ModelRoles(candidates=("opus",), incumbent="opus"),
+    )
+    return RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+
+def test_azure_claude_deployment_under_any_name_routes_by_its_served_model() -> None:
+    """A Claude deployment named by the operator still rides the Anthropic Messages wire.
+
+    Foundry deployment names are free text (a customer deployed claude-opus-5-5
+    as ``claude-opus-5-5-fast``); keyed on the name alone, the client fell to the
+    OpenAI-deployments wire, which never serves Claude, and every request failed.
+    The served model names the model; the request still addresses the deployment.
+    """
+    resolved = _foundry_deployment_catalog("claude-opus-5-5-fast", "claude-opus-5-5").resolve(
+        "opus"
+    )
+
+    assert isinstance(resolved.client, AnthropicClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "anthropic_messages"
+    assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
+    assert profile.model_id == "claude-opus-5-5-fast"
+    assert resolved.served_model_id == "claude-opus-5-5"
+
+
+def test_azure_deployment_without_an_anthropic_identity_keeps_the_openai_wire() -> None:
+    """Neither the deployment name nor a served model names Claude: the Azure wire stays."""
+    assert isinstance(
+        _foundry_deployment_catalog("my-opus", None).resolve("opus").client, AzureClient
+    )
+    assert isinstance(
+        _foundry_deployment_catalog("my-gpt", "gpt-5.5").resolve("opus").client, AzureClient
+    )
 
 
 def test_snapshots_preserve_per_model_billing_source_on_one_connection() -> None:
@@ -524,3 +904,347 @@ def test_tinker_resolution_reports_a_missing_optional_dependency(
 
     with pytest.raises(ModelConnectionError, match="uv sync --extra sft"):
         catalog.resolve("fixture-model")
+
+
+def test_resolution_threads_reasoning_content_native_to_compatible_rungs() -> None:
+    """A flagged openai-compatible rung on any origin resolves a preserved-thinking route."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://hy4-preview--serve.modal.run/v1",
+            capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                reasoning_output_exposed=True,
+                reasoning_content_native=True,
+            ),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.hunyuan_reasoning_route_sha256 is not None
+    assert profile.reasoning_output_exposed is True
+    assert profile.forwards_prompt_cache_key is False
+
+
+def test_openrouter_resolution_forwards_the_prompt_cache_key_hint() -> None:
+    """The catalog's openrouter provider resolves to a rung that routes by the hint."""
+    catalog = RuntimeModelCatalog(
+        _catalog(provider="openrouter"),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().forwards_prompt_cache_key is True
+    # OpenRouter's relay is not proven to carry OpenAI's 12-hour cache lifetime.
+    assert resolved.client.gateway_wire_profile().forwards_prompt_cache_ttl is False
+
+
+def test_openai_resolution_carries_the_twelve_hour_cache_lifetime() -> None:
+    """OpenAI's own Responses rung is the one wire that sends ``prompt_cache_options``."""
+    catalog = RuntimeModelCatalog(
+        _catalog(provider="openai"),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAIClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "openai_responses"
+    assert profile.forwards_prompt_cache_ttl is True
+
+
+def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -> None:
+    """A flagged openai-compatible rung resolves a profile that folds non-leading system turns."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://gateway.xplabs.ai/qwen/v1",
+            capabilities=ModelCapabilities(system_messages_leading_only=True),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().system_messages_leading_only is True
+
+
+def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
+    """Catalog construction supplies both gateway and ordinary completion constraints."""
+    catalog = _catalog(provider="anthropic")
+    catalog = catalog.model_copy(
+        update={
+            "connections": {
+                "primary": ConnectionConfig(
+                    provider="anthropic", api_key_env="FIXTURE_API_KEY", inference_geo="us"
+                )
+            }
+        }
+    )
+    runtime = RuntimeModelCatalog(
+        catalog, environment={"FIXTURE_API_KEY": "fixture"}, transport_factory=ScriptedJsonTransport
+    )
+    resolved = runtime.resolve(next(iter(catalog.models)))
+    assert isinstance(resolved.client, AnthropicClient)
+    assert resolved.client.gateway_wire_profile().inference_geo == "us"
+    payload = resolved.client._build_request(
+        ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    )
+    assert payload["inference_geo"] == "us"
+
+
+def test_subscription_connection_resolves_to_a_plan_client_that_signs_each_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A chatgpt plan connection needs no environment key; its client mints bearers itself."""
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    plan = ConnectionConfig(provider="openai", subscription="chatgpt")
+    access = _plan_jwt(exp_seconds=4_000_000_000, account="acct-plan")
+    store.put_oauth(
+        "plan",
+        StoredOAuthTokens(
+            access_token=access,
+            refresh_token="refresh",
+            expires_at_ms=4_000_000_000_000,
+            account_id="acct-plan",
+        ),
+        binding=StoredCredentialBinding(provider="openai", endpoint_sha256=plan.identity_sha256()),
+    )
+    catalog = ModelCatalog(
+        connections={"plan": plan},
+        models={
+            "codex": ModelRecord(
+                connection="plan",
+                model="gpt-5.6-sol",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=_DEFAULT_CAPABILITIES,
+            )
+        },
+        roles=ModelRoles(candidates=("codex",), incumbent="codex"),
+    )
+
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={},
+        transport_factory=lambda: ScriptedJsonTransport([]),
+        auth_store=store,
+        http_timeout_seconds=123.0,
+    ).resolve("codex")
+
+    assert isinstance(resolved.client, ChatGptSubscriptionClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.url == "https://chatgpt.com/backend-api/codex/responses"
+    assert profile.timeout_seconds == 123.0
+    assert profile.headers["chatgpt-account-id"] == "acct-plan"
+    assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
+        "Authorization": f"Bearer {access}"
+    }
+    assert resolved.embedding_client is None
+
+
+def _plan_jwt(*, exp_seconds: int, account: str) -> str:
+    """Return an unsigned JWT carrying a ChatGPT account claim and ``exp``."""
+    payload = json.dumps(
+        {"exp": exp_seconds, "https://api.openai.com/auth": {"chatgpt_account_id": account}}
+    ).encode()
+    segment = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    return f"header.{segment}.signature"
+
+
+def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispatch() -> None:
+    """A Claude plan refuses without the operator's Anthropic app.
+
+    With one, the injected token source mints the bearer and the app's headers ride the wire
+    profile.
+    """
+    plan = ConnectionConfig(provider="anthropic", subscription="anthropic")
+    catalog = ModelCatalog(
+        connections={"claude-plan": plan},
+        models={
+            "claude": ModelRecord(
+                connection="claude-plan",
+                model="claude-sonnet-5",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=_DEFAULT_CAPABILITIES,
+            )
+        },
+        roles=ModelRoles(candidates=("claude",), incumbent="claude"),
+    )
+    tokens = StoredOAuthTokens(access_token="injected", refresh_token="r", expires_at_ms=1)
+
+    class _Source:
+        """An embedder-supplied token source."""
+
+        connection_id = "claude-plan"
+
+        def current(self) -> StoredOAuthTokens:
+            """Return the injected sign-in."""
+            return tokens
+
+    built: list[str] = []
+
+    def factory(*, connection_id: str, connection: ConnectionConfig) -> _Source:
+        """Record which connection asked for a source."""
+        built.append(f"{connection_id}:{connection.subscription}")
+        return _Source()
+
+    with pytest.raises(ModelConnectionError, match="OAuth app Anthropic issued"):
+        RuntimeModelCatalog(catalog, environment={}).resolve("claude")
+
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={
+            "EXP_ANTHROPIC_OAUTH_CLIENT_ID": "experiential-issued",
+            "EXP_ANTHROPIC_OAUTH_REDIRECT_URI": "https://platform.example.test/cb",
+            "EXP_ANTHROPIC_OAUTH_BETA": "oauth-2025-04-20",
+        },
+        transport_factory=lambda: ScriptedJsonTransport([]),
+        subscription_token_source_factory=factory,
+        http_timeout_seconds=123.0,
+    ).resolve("claude")
+
+    assert isinstance(resolved.client, AnthropicSubscriptionClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert profile.timeout_seconds == 123.0
+    assert "Authorization" not in profile.headers
+    assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
+        "Authorization": "Bearer injected"
+    }
+    assert built == ["claude-plan:anthropic"]
+
+
+@pytest.mark.parametrize("card", [None, GatewayTokenPrices()])
+def test_runtime_preserves_absent_or_explicit_unknown_tariffs(
+    card: GatewayTokenPrices | None,
+) -> None:
+    """Runtime binding shares catalog pricing authority after complete JSON persistence."""
+    catalog = _catalog()
+    metadata = (
+        GatewayDeploymentMetadata() if card is None else GatewayDeploymentMetadata(prices=card)
+    )
+    record = catalog.models["fixture-model"].model_copy(update={"gateway": metadata})
+    catalog = ModelCatalog.model_validate_json(
+        catalog.model_copy(update={"models": {"fixture-model": record}}).model_dump_json()
+    )
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    ).resolve("fixture-model")
+    assert resolved.token_prices == card
+
+
+@pytest.mark.parametrize("authored", [False, True])
+def test_capability_only_metadata_keeps_flat_budget_pricing(authored: bool) -> None:
+    """An absent tariff permits flat reservations; an explicit unknown card cannot be masked."""
+    catalog = _catalog()
+    metadata = (
+        GatewayDeploymentMetadata(prices=GatewayTokenPrices())
+        if authored
+        else GatewayDeploymentMetadata()
+    )
+    record = catalog.models["fixture-model"].model_copy(
+        update={
+            "gateway": metadata,
+            "capabilities": ModelCapabilities(
+                input_cost_per_million_tokens_usd=1,
+                output_cost_per_million_tokens_usd=2,
+                cached_input_cost_per_million_tokens_usd=0.25,
+                cache_write_cost_per_million_tokens_usd=1.25,
+            ),
+        }
+    )
+    catalog = ModelCatalog.model_validate_json(
+        catalog.model_copy(update={"models": {"fixture-model": record}}).model_dump_json()
+    )
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    ).resolve("fixture-model")
+
+    def reserve() -> float:
+        """Exercise the real pricing boundary without any provider dispatch."""
+        reservation = completion_cost_reservation(
+            model=resolved.snapshot,
+            input_usd_per_million_tokens=1,
+            output_usd_per_million_tokens=2,
+            cached_input_usd_per_million_tokens=0.25,
+            cache_write_usd_per_million_tokens=1.25,
+            maximum_attempts=1,
+            maximum_input_tokens=100,
+            maximum_output_tokens=20,
+            token_prices=resolved.token_prices,
+        )
+        return reservation.estimated_maximum_call_cost_usd
+
+    if authored:
+        with pytest.raises(
+            ValueError, match="flat prices differ from the complete token schedule base"
+        ):
+            reserve()
+    else:
+        assert reserve() == pytest.approx(0.000165)
+
+
+@pytest.mark.parametrize(
+    ("api_version", "url"),
+    [
+        ("v1", "https://silen-resource.services.ai.azure.com/openai/v1/responses"),
+        (
+            "2025-04-01-preview",
+            "https://silen-resource.services.ai.azure.com/openai/responses"
+            "?api-version=2025-04-01-preview",
+        ),
+    ],
+)
+def test_azure_responses_surface_dispatches_over_the_native_responses_wire(
+    api_version: str, url: str
+) -> None:
+    """An Azure connection declaring the Responses surface speaks Responses, not Chat.
+
+    GPT deployments on Foundry then receive Responses-only fields (``prompt_cache_key``,
+    reasoning, ``include``) instead of having them dropped by a Chat translation.
+    """
+    catalog = ModelCatalog(
+        connections={
+            "foundry": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com",
+                api_key_env="FIXTURE_API_KEY",
+                api_version=api_version,
+                azure_api_surface="responses",
+            )
+        },
+        models={
+            "gpt": ModelRecord(
+                connection="foundry",
+                model="gpt-5-6-deployment",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True, supports_reasoning=True),
+            )
+        },
+        roles=ModelRoles(candidates=("gpt",), incumbent="gpt"),
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = runtime.resolve("gpt")
+
+    assert isinstance(resolved.client, AzureResponsesClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "openai_responses"
+    assert profile.url == url
+    assert profile.model_id == "gpt-5-6-deployment"
+    assert profile.headers["api-key"] == "foundry-secret"
+    assert "Authorization" not in profile.headers
+    assert profile.forwards_prompt_cache_key is True
+    assert profile.forwards_prompt_cache_ttl is False

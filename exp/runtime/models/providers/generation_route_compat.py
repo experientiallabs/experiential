@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.codex_tools import declares_custom_grammar
 from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.generation_parameter_validation import serves_reasoning_summary
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 
@@ -36,13 +38,53 @@ def compatible_generation_parameter_profile_indexes(
     """
     if not profiles:
         raise ValueError("generation parameter selection requires at least one wire profile")
+    # A feature some rungs would degrade makes its carrying rungs outrank the
+    # rest, before any other preference: the route's one shaped request
+    # degrades it on every rung of a mixed route. A reasoning summary is
+    # dropped there; a custom tool's grammar is no longer enforced (a custom
+    # tool without one translates losslessly, so it keeps the whole route and
+    # its fallbacks). Rungs carrying both come first.
+    preferences: list[Callable[[GatewayWireProfile], bool]] = []
+    if request.reasoning_summary is not None:
+        preferences.append(serves_reasoning_summary)
+    if declares_custom_grammar(entry.tool for entry in request.provider_native_tools):
+        preferences.append(_enforces_custom_grammar)
+    attempts = [preferences, *([wanted] for wanted in preferences)] if preferences else []
+    for kept in attempts:
+        carrying = tuple(
+            index
+            for index, profile in enumerate(profiles)
+            if all(serves(profile) for serves in kept)
+        )
+        if carrying:
+            try:
+                ranked = _ranked_profile_indexes(
+                    tuple(profiles[index] for index in carrying), request
+                )
+            except ProviderParameterError:
+                continue
+            return tuple(carrying[index] for index in ranked)
+    return _ranked_profile_indexes(profiles, request)
+
+
+def _enforces_custom_grammar(profile: GatewayWireProfile) -> bool:
+    """Whether a rung forwards custom tools natively, so the provider enforces the grammar."""
+    return profile.dialect == "openai_responses"
+
+
+def _ranked_profile_indexes(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> tuple[int, ...]:
+    """Rank every rung by how exactly it preserves the request (see the caller)."""
     # Prefer rungs that HONOR the caller's sampling exactly over rungs that can
     # only serve it by dropping temperature/top_p (a reasoning route at an effort
     # other than none). Both are servable, but preserving the caller's intent
     # wins when a rung can — the drop is a last resort, not a peer of an exact
     # rung. Only if no rung honors it do the serve-with-drop rungs stand in.
     exact: list[int] = []
+    faithful: list[int] = []
     serviceable: list[int] = []
+    thinking_kept: list[int] = []
     rejections: list[ProviderParameterError] = []
     for index, profile in enumerate(profiles):
         try:
@@ -51,10 +93,28 @@ def compatible_generation_parameter_profile_indexes(
             rejections.append(exc)
             continue
         serviceable.append(index)
-        if _honors_requested_sampling(request, provider):
-            exact.append(index)
+        keeps_thinking = not _substitutes_thinking_off(request, provider)
+        if keeps_thinking:
+            thinking_kept.append(index)
+        if keeps_thinking and _honors_requested_sampling(request, provider):
+            faithful.append(index)
+            if _carries_exposed_reasoning(profile, request):
+                exact.append(index)
     if exact:
-        return tuple(exact)
+        # Plaintext reasoning only RANKS a route: a rung that cannot replay it
+        # drops it per rung at encoding, so every faithful rung stays as a
+        # fallback behind the carrying rung (`plaintext_reasoning_lead_order`
+        # puts the carriers first). Narrowing to the carriers alone left a
+        # one-rung route that could not fail over when its only rung timed
+        # out (glm-5.3-flash, 2026-10-20). Sampling and thinking stay hard:
+        # the route's one shaped request would degrade them on every rung.
+        return tuple(faithful)
+    # A rung that substitutes the caller's thinking config (an always-reasoning
+    # model's stand-in for "off") never shares a route with one that dispatches
+    # it verbatim: the route's one shaped request would carry the substitute
+    # onto the verbatim rung, which may refuse it (Haiku 4.5 rejects adaptive).
+    if thinking_kept:
+        return tuple(thinking_kept)
     if serviceable:
         return tuple(serviceable)
     # No rung can serve the request: raise the first rung's OWN rejection — it
@@ -75,3 +135,63 @@ def _honors_requested_sampling(request: GatewayRequest, provider_request: Gatewa
     if request.top_p is not None and provider_request.top_p is None:
         return False
     return not (request.top_k is not None and provider_request.top_k is None)
+
+
+def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
+    """Return whether a rung forwards the request's plaintext reasoning history.
+
+    Replayed plaintext ``reasoning_content`` reaches the provider only on an
+    exposure-gated rung or DeepSeek's own origin; any other rung serves the
+    turn by dropping it (a disclosed drop), so it is only a fallback behind a
+    rung that carries it — the same preference rule sampling controls follow.
+    """
+    if profile.replays_plaintext_reasoning:
+        return True
+    return not any(
+        block.kind == "exposed_reasoning_content"
+        for message in request.messages
+        for block in message.provider_reasoning
+    )
+
+
+def plaintext_reasoning_lead_order(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    stage_indexes: Sequence[int],
+) -> tuple[int, ...]:
+    """Return the dispatch order that puts plaintext-reasoning carriers first.
+
+    A request replaying plaintext ``reasoning_content`` is best served by a
+    rung that forwards it; the others serve the turn by dropping it, so they
+    follow as fallbacks. The partition is stable and never crosses a model
+    stage boundary (``stage_indexes`` is each rung's stage, nondecreasing in
+    route order), so the result is always a valid route permutation.
+
+    Args:
+        profiles: Ordered wire profiles of the narrowed route.
+        request: The admitted request.
+        stage_indexes: Each rung's model-chain stage index, in route order.
+
+    Returns:
+        A permutation of ``range(len(profiles))``; the identity when the
+        request carries no plaintext reasoning or the route is not mixed.
+    """
+    carries = [_carries_exposed_reasoning(profile, request) for profile in profiles]
+    identity = tuple(range(len(profiles)))
+    if all(carries) or not any(carries):
+        return identity
+    return tuple(sorted(identity, key=lambda index: (stage_indexes[index], not carries[index])))
+
+
+def _substitutes_thinking_off(request: GatewayRequest, provider_request: GatewayRequest) -> bool:
+    """Return whether a rung serves a caller's thinking-off with a substitute.
+
+    An always-reasoning model dispatches ``disabled`` as low-effort adaptive
+    thinking; a rung that dispatches it verbatim honors the caller exactly.
+    """
+    requested = request.provider_thinking_config
+    return (
+        requested is not None
+        and requested.get("type") == "disabled"
+        and provider_request.provider_thinking_config != requested
+    )

@@ -10,9 +10,24 @@ pub(super) struct ToolState {
     pub(super) output_index: usize,
     pub(super) call_id: String,
     pub(super) name: String,
+    /// Nested tool tree (Responses `namespace`) that declared this call;
+    /// re-emitted verbatim so the caller can round-trip the item (the
+    /// provider rejects a namespaced call replayed without it).
+    pub(super) namespace: Option<String>,
+    /// Opaque SDK 3.0 `caller` attribution re-emitted verbatim like
+    /// `namespace` so the item round-trips exactly as emitted.
+    pub(super) caller: Option<Value>,
+    /// Gemini's opaque thought signature, rendered as
+    /// `extra_content.google.thought_signature` (the Chat shape) so a caller
+    /// echoing the item returns it on the replayed `function_call`.
+    pub(super) thought_signature: Option<String>,
     pub(super) arguments: String,
     pub(super) status: Option<ProviderOutputItemStatus>,
     pub(super) done: bool,
+    /// Completed by the provider while an earlier output item was still open:
+    /// its `output_item.done` waits for `finish`, which closes items in
+    /// output order (see `ResponsesSseEncoder::tool_completed`).
+    pub(super) close_deferred: bool,
     /// Freeform custom tool call: renders the `custom_tool_call` item type
     /// with opaque `input` text and the custom input event names.
     pub(super) custom: bool,
@@ -35,11 +50,20 @@ impl ToolState {
         item.insert("type".to_string(), json!(item_type));
         item.insert("call_id".to_string(), json!(self.call_id));
         item.insert("name".to_string(), json!(self.name));
+        if let Some(namespace) = &self.namespace {
+            item.insert("namespace".to_string(), json!(namespace));
+        }
+        if let Some(caller) = &self.caller {
+            item.insert("caller".to_string(), caller.clone());
+        }
         item.insert(payload_key.to_string(), json!(self.arguments));
         item.insert(
             "status".to_string(),
             json!(self.status.unwrap_or(fallback_status).as_str()),
         );
-        Value::Object(item)
+        crate::encode::with_thought_signature(
+            Value::Object(item),
+            self.thought_signature.as_deref(),
+        )
     }
 }

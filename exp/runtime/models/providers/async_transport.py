@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import random
 import ssl
 import time
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -21,7 +23,15 @@ from exp.runtime.models.providers.transport import (
     RecordedRequest,
     RetryClassification,
     RetryPolicy,
+    certified_admission_refusal,
     classify_retry,
+    is_unbilled_attempt,
+    parse_retry_after,
+    provider_ssl_context,
+    retain_request_attempt_evidence,
+    retry_delay_seconds,
+    transport_error_message,
+    validated_admission_origin,
 )
 
 
@@ -47,7 +57,7 @@ def _default_ssl_context() -> ssl.SSLContext:
     """
     global _shared_ssl_context  # noqa: PLW0603 - one lazily built process-wide context.
     if _shared_ssl_context is None:
-        _shared_ssl_context = httpx.create_ssl_context()
+        _shared_ssl_context = provider_ssl_context()
     return _shared_ssl_context
 
 
@@ -150,8 +160,8 @@ class RequestDeadline:
 
     def __post_init__(self) -> None:
         """Reject a nonpositive absolute deadline that cannot bound execution."""
-        if self.expires_at_monotonic <= 0:
-            raise ValueError("expires_at_monotonic must be positive")
+        if not math.isfinite(self.expires_at_monotonic) or self.expires_at_monotonic <= 0:
+            raise ValueError("expires_at_monotonic must be finite and positive")
 
     @classmethod
     def after(
@@ -172,8 +182,8 @@ class RequestDeadline:
         Raises:
             ValueError: The budget is not positive.
         """
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
         now = time.monotonic() if now_monotonic is None else now_monotonic
         return cls(expires_at_monotonic=now + timeout_seconds)
 
@@ -242,52 +252,26 @@ class AsyncJsonHttpTransport(Protocol):
         ...
 
 
-@runtime_checkable
-class AsyncHttpByteStream(Protocol):
-    """One open provider response whose body is consumed incrementally."""
-
-    @property
-    def status_code(self) -> int:
-        """Return the provider HTTP status without reading response content."""
-        ...
-
-    def __aiter__(self) -> AsyncIterator[bytes]:
-        """Yield response bytes in upstream order without buffering the body."""
-        ...
-
-    async def aclose(self) -> None:
-        """Close the active response and any transport-owned client."""
-        ...
-
-
-@runtime_checkable
-class AsyncStreamingHttpTransport(Protocol):
-    """Cancellable transport seam for one incrementally consumed JSON request."""
-
-    async def stream(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> AsyncHttpByteStream:
-        """Open one bounded response stream without reading its body."""
-        ...
-
-
 class HttpxAsyncJsonTransport:
     """Production async transport backed by ``httpx.AsyncClient``."""
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        trusted_admission_origin: str | None = None,
+    ) -> None:
         """Use a caller-owned client or the shared per-event-loop pooled client.
 
         Args:
             client: Optional async client whose lifecycle remains with the caller.
                 When omitted, requests run on one process-wide keep-alive client
                 per event loop so connections and the TLS context are reused.
+            trusted_admission_origin: Explicit HTTPS origin whose authenticated pre-dispatch
+                refusal receipts may release billing reservations. Defaults to no trust.
         """
         self._client = client
+        self._trusted_admission_origin = validated_admission_origin(trusted_admission_origin)
 
     async def get(
         self,
@@ -317,10 +301,10 @@ class HttpxAsyncJsonTransport:
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
-        return _decoded_response(response)
+            raise ProviderTransportError(transport_error_message(exc)) from exc
+        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
 
     async def post(
         self,
@@ -353,96 +337,10 @@ class HttpxAsyncJsonTransport:
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
+            raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
-        return _decoded_response(response)
-
-    async def stream(
-        self,
-        url: str,
-        *,
-        headers: Mapping[str, str],
-        payload: JsonObject,
-        timeout_seconds: float,
-    ) -> AsyncHttpByteStream:
-        """Open one cancellable HTTP response without buffering provider events.
-
-        Args:
-            url: Absolute provider endpoint URL.
-            headers: Provider headers, including resolved authentication.
-            payload: Complete JSON request body.
-            timeout_seconds: Remaining bound for opening the response.
-
-        Returns:
-            An open byte stream whose lifecycle belongs to the caller.
-
-        Raises:
-            ProviderTransportError: The request cannot establish a response stream.
-        """
-        client = self._client if self._client is not None else _pooled_client()
-        try:
-            request = client.build_request(
-                "POST",
-                url,
-                headers=dict(headers),
-                json=payload,
-                timeout=timeout_seconds,
-            )
-            response = await client.send(request, stream=True)
-        except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider request timed out") from exc
-        except httpx.TransportError as exc:
-            raise ProviderTransportError("provider transport request failed") from exc
-        return _HttpxByteStream(response, None)
-
-
-class _HttpxByteStream:
-    """Incremental HTTPX response that closes an optionally owned client exactly once."""
-
-    def __init__(
-        self,
-        response: httpx.Response,
-        owned_client: httpx.AsyncClient | None,
-    ) -> None:
-        """Bind one response and its optional response-lifetime client.
-
-        Args:
-            response: Open streaming HTTPX response.
-            owned_client: Client created for this response, or ``None`` when pooled
-                or caller-owned.
-        """
-        self._response = response
-        self._owned_client = owned_client
-        self._closed = False
-
-    @property
-    def status_code(self) -> int:
-        """Return the response status without consuming the provider body."""
-        return self._response.status_code
-
-    def __aiter__(self) -> AsyncIterator[bytes]:
-        """Yield decoded-transfer bytes directly from HTTPX."""
-        return self._iter_bytes()
-
-    async def _iter_bytes(self) -> AsyncIterator[bytes]:
-        """Translate read-time HTTPX failures into the sanitized transport taxonomy."""
-        try:
-            async for chunk in self._response.aiter_bytes():
-                yield chunk
-        except httpx.TimeoutException as exc:
-            raise ProviderTransportError("provider response stream timed out") from exc
-        except httpx.TransportError as exc:
-            raise ProviderTransportError("provider response stream failed") from exc
-
-    async def aclose(self) -> None:
-        """Close the response and transport-owned client idempotently."""
-        if self._closed:
-            return
-        self._closed = True
-        await self._response.aclose()
-        if self._owned_client is not None:
-            await self._owned_client.aclose()
+            raise ProviderTransportError(transport_error_message(exc)) from exc
+        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
 
 
 class SyncJsonTransportAdapter:
@@ -477,12 +375,15 @@ class SyncJsonTransportAdapter:
         Returns:
             The legacy transport response.
         """
-        operation = asyncio.to_thread(
-            self._transport.get,
-            url,
-            headers=headers,
-            timeout_seconds=timeout_seconds,
-        )
+        deadline = RequestDeadline.after(timeout_seconds)
+
+        def dispatch() -> JsonHttpResponse:
+            """Recheck the original deadline after the worker leaves its queue."""
+            return self._transport.get(
+                url, headers=headers, timeout_seconds=deadline.attempt_timeout()
+            )
+
+        operation = asyncio.to_thread(dispatch)
         return await asyncio.wait_for(operation, timeout=timeout_seconds)
 
     async def post(
@@ -504,13 +405,18 @@ class SyncJsonTransportAdapter:
         Returns:
             The legacy transport response.
         """
-        operation = asyncio.to_thread(
-            self._transport.post,
-            url,
-            headers=headers,
-            payload=payload,
-            timeout_seconds=timeout_seconds,
-        )
+        deadline = RequestDeadline.after(timeout_seconds)
+
+        def dispatch() -> JsonHttpResponse:
+            """Do not start paid work whose deadline expired while queued."""
+            return self._transport.post(
+                url,
+                headers=headers,
+                payload=payload,
+                timeout_seconds=deadline.attempt_timeout(),
+            )
+
+        operation = asyncio.to_thread(dispatch)
         return await asyncio.wait_for(operation, timeout=timeout_seconds)
 
 
@@ -589,6 +495,8 @@ async def run_with_retry_async[ResultT](
     attempt_timeout_seconds: float | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     classify: Callable[[Exception], RetryClassification] = classify_retry,
+    random_sample: Callable[[], float] = random.random,
+    now_monotonic: Callable[[], float] = time.monotonic,
 ) -> ResultT:
     """Run one async attempt loop under a single absolute deadline.
 
@@ -599,6 +507,8 @@ async def run_with_retry_async[ResultT](
         attempt_timeout_seconds: Optional smaller provider-derived per-attempt bound.
         sleep: Async delay function, injectable for deterministic tests.
         classify: Retry classifier applied to each attempt error.
+        random_sample: Jitter source in [0, 1], injectable for deterministic tests.
+        now_monotonic: Clock for the fixed request deadline.
 
     Returns:
         The first successful result.
@@ -608,30 +518,60 @@ async def run_with_retry_async[ResultT](
         Exception: The first non-retryable error or last retryable error.
     """
     delay = policy.initial_delay_seconds
-    for attempt in range(1, policy.maximum_attempts + 1):
-        timeout_seconds = deadline.attempt_timeout(attempt_timeout_seconds)
-        try:
-            async with asyncio.timeout(timeout_seconds):
-                return await operation(timeout_seconds)
-        except TimeoutError as exc:
-            error: Exception
-            if deadline.remaining_seconds() <= 0:
-                error = ProviderDeadlineExceeded("provider request deadline exceeded")
-            else:
-                error = ProviderTransportError("provider request timed out")
-            error.__cause__ = exc
-        except Exception as exc:  # noqa: BLE001 - the injected classifier owns retry policy.
-            error = exc
-        classification = classify(error)
-        if not classification.retryable or attempt == policy.maximum_attempts:
-            raise error
-        remaining = deadline.remaining_seconds()
-        if remaining <= delay:
-            raise ProviderDeadlineExceeded("provider request deadline exceeded") from error
-        if delay > 0:
-            await sleep(delay)
-        delay = min(delay * 2, policy.maximum_delay_seconds)
-    raise RuntimeError("retry loop exhausted without running an attempt")
+    attempts = 0
+    unbilled_attempts = 0
+    try:
+        while True:
+            timeout_seconds = deadline.attempt_timeout(
+                attempt_timeout_seconds, now_monotonic=now_monotonic()
+            )
+            attempts += 1
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    return await operation(timeout_seconds)
+            except TimeoutError as exc:
+                error: Exception
+                if deadline.remaining_seconds(now_monotonic=now_monotonic()) <= 0:
+                    error = ProviderDeadlineExceeded("provider request deadline exceeded")
+                else:
+                    error = ProviderTransportError("provider request timed out")
+                error.__cause__ = exc
+            except Exception as exc:  # noqa: BLE001 - the injected classifier owns retry policy.
+                error = exc
+            unbilled = is_unbilled_attempt(error)
+            unbilled_attempts += int(unbilled)
+            classification = classify(error)
+            if (
+                not classification.retryable
+                or attempts - unbilled_attempts >= policy.maximum_attempts
+            ):
+                raise error
+            remaining = deadline.remaining_seconds(now_monotonic=now_monotonic())
+            wait = retry_delay_seconds(
+                error,
+                delay=delay,
+                policy=policy,
+                random_sample=random_sample,
+                server_wait_ceiling_seconds=remaining,
+            )
+            # Admission retries require positive pacing even when the caller selects immediate
+            # ordinary retries. A zero-delay policy cannot create a deadline-long busy loop.
+            if wait is None or (unbilled and wait <= 0):
+                raise error
+            if remaining <= wait:
+                raise ProviderDeadlineExceeded("provider request deadline exceeded") from error
+            if wait > 0:
+                try:
+                    async with asyncio.timeout(remaining):
+                        await sleep(wait)
+                except TimeoutError as exc:
+                    raise ProviderDeadlineExceeded("provider request deadline exceeded") from exc
+            delay = min(delay * 2, policy.maximum_delay_seconds)
+    except BaseException as failure:
+        retain_request_attempt_evidence(
+            failure, attempts=attempts, unbilled_attempts=unbilled_attempts
+        )
+        raise
 
 
 async def post_json_async(
@@ -701,21 +641,34 @@ def as_async_transport(
     return transport
 
 
-def _decoded_response(response: httpx.Response) -> JsonHttpResponse:
+def _decoded_response(
+    response: httpx.Response, *, trusted_origin: httpx.URL | None = None
+) -> JsonHttpResponse:
     """Decode one HTTPX response without retaining provider content in errors."""
+    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+    known_unbilled = certified_admission_refusal(response, trusted_origin)
     try:
         body = response.json()
     except ValueError as exc:
         raise ProviderTransportError(
             f"provider returned non-JSON HTTP {response.status_code}",
             status_code=response.status_code,
+            retry_after_seconds=retry_after,
+            known_unbilled=known_unbilled,
         ) from exc
     if not isinstance(body, dict):
         raise ProviderTransportError(
             f"provider returned non-object JSON HTTP {response.status_code}",
             status_code=response.status_code,
+            retry_after_seconds=retry_after,
+            known_unbilled=known_unbilled,
         )
-    return JsonHttpResponse(status_code=response.status_code, body=body)
+    return JsonHttpResponse(
+        status_code=response.status_code,
+        body=body,
+        retry_after_seconds=retry_after,
+        known_unbilled=known_unbilled,
+    )
 
 
 def _successful_body(response: JsonHttpResponse) -> JsonObject:
@@ -725,4 +678,6 @@ def _successful_body(response: JsonHttpResponse) -> JsonObject:
     raise ProviderTransportError(
         f"provider returned HTTP {response.status_code}",
         status_code=response.status_code,
+        retry_after_seconds=response.retry_after_seconds,
+        known_unbilled=response.known_unbilled,
     )

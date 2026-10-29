@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.28"
+version = "0.3.173"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -22,22 +22,24 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 tokio-stream = "0.1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 http = "1"
+httpdate = "1"
+h2 = "0.4"
 http-body-util = "0.1"
 base64 = "0.22"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 bytes = "1"
 futures-util = "0.3"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
+# Demux-only (no decoding): measures an uploaded audio file's duration from its
+# codec frame lengths so a transcription reservation bounds what the provider meters.
+symphonia = { version = "0.6.1", default-features = false, features = ["wav", "ogg", "mkv", "isomp4", "mp3", "flac", "id3v2"] }
 thiserror = "2"
+rusqlite = { version = "0.38", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-[dev-dependencies]
-# Frame-level HTTP/2 server control for the reset/goaway regression tests:
-# the production wire to fronting proxies negotiates h2, so mid-stream aborts
-# arrive as RST_STREAM/GOAWAY, a different reqwest path than h1 truncation.
-h2 = "0.4"

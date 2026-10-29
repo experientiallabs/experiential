@@ -1,0 +1,469 @@
+"""Anthropic Messages wire facts about tool selection and strict tool schemas.
+
+Two provider rules decide, before dispatch, whether one Anthropic rung can
+carry a tool request verbatim: which models reject a forced ``tool_choice``
+outright, and which JSON Schema keywords the grammar-constrained ``strict``
+validator refuses. Both are checked structurally here so route admission can
+prefer a rung that honors the request and otherwise fall back to the
+capability-preservation policy's disclosed coercion, instead of dispatching a
+call the provider is known to 400.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping
+
+from pydantic import JsonValue
+
+from exp.common.core.artifacts import JsonObject
+
+_ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES = (
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+)
+"""Exact point releases whose ``tool_choice`` ``any``/``tool`` return a 400 by name.
+
+Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 reject forced tool use with or
+without thinking. Manual budgeted thinking also excludes forced tools; the payload
+builder checks that independent per-request constraint. Older adaptive
+releases can force tools, so entries are exact releases rather than generation
+prefixes. A new point release must have its own verified contract. A dated
+snapshot id inherits its release's rule.
+
+Provider contract: https://platform.claude.com/docs/en/models/opus-5-5/migration-guide
+"""
+
+
+def anthropic_rejects_forced_tool_choice(model_id: str) -> bool:
+    """Return whether one Anthropic model rejects a forced ``tool_choice`` by name.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+
+    Returns:
+        ``True`` when the model answers ``tool_choice.type`` of ``any`` or
+        ``tool`` with a 400 regardless of the rest of the request.
+    """
+    # Matched as a whole id segment in ANY spelling: the native id, a dated
+    # snapshot, OpenRouter's `anthropic/claude-fable-5-1`, or a Bedrock/Vertex
+    # form. Relays forward Anthropic's rejection unchanged (live 2026-09-07:
+    # "Azure: tool_choice: type \"tool\" and \"any\" are not supported for this
+    # model" through OpenRouter, 154 attempts / 5 orgs in 12h), so the fact is
+    # the model's, not the wire's. A later point release never inherits.
+    return matches_anthropic_release(model_id, _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES)
+
+
+_ANTHROPIC_PREFILL_REJECTING_RELEASES = (
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-5-5",
+    "claude-opus-5",
+    "claude-fable-5",
+    "claude-fable-5-1",
+)
+"""Exact releases that answer a trailing assistant turn with a 400 by name.
+
+"This model does not support assistant message prefill. The conversation
+must end with a user message." Entries are exact releases matched as a whole
+id segment, so a dated snapshot and a Bedrock spelling inherit their release's
+rule but an unknown point release does not. Restricting known-invalid rungs
+before dispatch preserves a route's prefill-compatible alternatives.
+
+Sonnet 5.5's provider contract:
+https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide#migrating-from-sonnet-45"""
+
+
+def anthropic_rejects_assistant_prefill(model_id: str) -> bool:
+    """Return whether one Anthropic model refuses an assistant message as the final turn.
+
+    Args:
+        model_id: Exact provider model identifier, in any of the Anthropic,
+            Bedrock, or Vertex spellings.
+
+    Returns:
+        ``True`` when the model answers assistant prefill with a 400.
+    """
+    return matches_anthropic_release(model_id, _ANTHROPIC_PREFILL_REJECTING_RELEASES)
+
+
+def matches_anthropic_release(model_id: str, releases: tuple[str, ...]) -> bool:
+    """Match exact Claude releases across provider spellings and dated snapshots.
+
+    Args:
+        model_id: Provider identifier, optionally namespaced or snapshot-qualified.
+        releases: Normalized release IDs whose restrictions are known.
+
+    Returns:
+        Whether one release matches without claiming a later point release.
+    """
+    normalized = model_id.lower().replace(".", "-").replace("_", "-")
+    # A listed release matches as a whole segment: what follows may be the
+    # end, a non-alphanumeric separator, a dated snapshot (8+ digits), or a
+    # provider suffix (``-v1:0``), but never a SHORT digit group, which is a
+    # different point release (``claude-opus-5-1`` is not ``claude-opus-5``).
+    return any(
+        re.search(
+            rf"(?:^|[^a-z0-9]){re.escape(release)}(?![a-z0-9])(?!-\d{{1,7}}(?![0-9]))",
+            normalized,
+        )
+        is not None
+        for release in releases
+    )
+
+
+ANTHROPIC_STRICT_STRING_FORMATS = frozenset(
+    {
+        "date-time",
+        "time",
+        "date",
+        "duration",
+        "email",
+        "hostname",
+        "uri",
+        "ipv4",
+        "ipv6",
+        "uuid",
+    }
+)
+"""String ``format`` values the strict validator accepts (the provider's
+structured-outputs JSON Schema limitations, verified live 2026-09-05: ``uuid``
+passes, ``uri-reference`` is rejected by name)."""
+
+_UNSUPPORTED_SCHEMA_KEYWORDS = (
+    # Composition and conditionals: only anyOf and allOf are supported.
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    # Numeric constraints.
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    # Array constraints beyond minItems of 0 or 1.
+    "maxItems",
+    "uniqueItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "prefixItems",
+    # Object constraints beyond properties/required/additionalProperties.
+    "minProperties",
+    "maxProperties",
+    "propertyNames",
+    "patternProperties",
+    "dependentRequired",
+    "dependentSchemas",
+    "unevaluatedProperties",
+)
+"""Keywords the strict validator rejects by name wherever they appear, in the
+order a violation is reported.
+
+Every entry was verified live on 2026-09-05 (``tools.0.custom: ... property
+'<keyword>' is not supported``). ``minLength``, ``maxLength``, and ``pattern``
+are deliberately absent: the published limitations list the two length
+constraints as unsupported, but the live validator accepts all three, and a
+check stricter than the provider would degrade strict tools the provider
+honors. ``additionalProperties`` is not a keyword rejection either: the
+validator requires it to be ``false`` on every object, which admission
+satisfies by closing the schema (a tightening) rather than by dropping
+``strict``."""
+
+_SUBSCHEMA_MAP_KEYS = ("properties", "$defs", "definitions")
+"""Keys whose values map names to subschemas."""
+
+_SUBSCHEMA_LIST_KEYS = ("anyOf", "allOf")
+"""Supported keys whose values list subschemas."""
+
+_SUBSCHEMA_SINGLE_KEYS = ("items", "additionalProperties")
+"""Keys whose values are one subschema (when they are objects)."""
+
+
+def anthropic_strict_schema_unsupported(schema: JsonObject) -> str | None:
+    """Name the first strict-mode limitation one tool ``input_schema`` violates.
+
+    The walk is purely structural: it descends the standard container and
+    composition keywords and never resolves or rewrites anything. A schema
+    that passes here is not guaranteed to compile (the provider owns its
+    grammar), but a schema that fails here is a known pre-dispatch 400 on
+    every current Anthropic model.
+
+    Args:
+        schema: One caller tool ``parameters`` / ``input_schema`` object.
+
+    Returns:
+        A short caller-neutral reason (``keyword 'maxItems'``,
+        ``format 'uri-reference'``, ``recursive $ref``), or ``None`` when the
+        schema uses only supported features.
+    """
+    for reason in _schema_violations(schema):
+        return reason
+    if _has_circular_definitions(schema):
+        return "recursive $ref"
+    return None
+
+
+def _schema_violations(node: JsonObject) -> Iterator[str]:
+    """Yield strict-mode violations of one node and its subschemas, in order."""
+    for keyword in _UNSUPPORTED_SCHEMA_KEYWORDS:
+        if keyword in node:
+            yield f"keyword {keyword!r}"
+    min_items = node.get("minItems")
+    if min_items is not None and min_items not in (0, 1):
+        yield "keyword 'minItems' outside 0..1"
+    string_format = node.get("format")
+    if isinstance(string_format, str) and string_format not in ANTHROPIC_STRICT_STRING_FORMATS:
+        yield f"format {string_format!r}"
+    enum_values = node.get("enum")
+    if isinstance(enum_values, list) and any(
+        isinstance(value, (dict, list)) for value in enum_values
+    ):
+        yield "complex enum values"
+    reference = node.get("$ref")
+    if isinstance(reference, str) and not reference.startswith("#"):
+        yield "external $ref"
+    all_of = node.get("allOf")
+    if isinstance(all_of, list) and any(
+        isinstance(member, dict) and "$ref" in member for member in all_of
+    ):
+        yield "allOf member with $ref"
+    yield from _child_violations(node)
+
+
+def _child_violations(node: JsonObject) -> Iterator[str]:
+    """Yield violations from every subschema reachable through supported keys."""
+    for key in _SUBSCHEMA_MAP_KEYS:
+        children = node.get(key)
+        if isinstance(children, dict):
+            for child in children.values():
+                if isinstance(child, dict):
+                    yield from _schema_violations(child)
+    for key in _SUBSCHEMA_LIST_KEYS:
+        members = node.get(key)
+        if isinstance(members, list):
+            for member in members:
+                if isinstance(member, dict):
+                    yield from _schema_violations(member)
+    for key in _SUBSCHEMA_SINGLE_KEYS:
+        single = node.get(key)
+        if isinstance(single, dict):
+            yield from _schema_violations(single)
+
+
+def _has_circular_definitions(schema: JsonObject) -> bool:
+    """Return whether any local definition references itself, directly or not.
+
+    The provider rejects "self-referencing or mutually-referencing
+    definitions" (verified live 2026-09-05), so the check builds the
+    definition-to-definition reference graph over ``$defs`` and
+    ``definitions`` and looks for a cycle, plus a bare ``#`` reference to
+    the schema root, which is recursion by construction.
+    """
+    definitions: dict[str, JsonObject] = {}
+    for table_key in ("$defs", "definitions"):
+        table = schema.get(table_key)
+        if isinstance(table, dict):
+            for name, definition in table.items():
+                if isinstance(definition, dict):
+                    # Nodes are keyed by the full pointer to the definition:
+                    # ``$defs`` and legacy ``definitions`` are separate
+                    # namespaces, so a name present in both is two nodes.
+                    definitions[f"#/{table_key}/{_pointer_token(name)}"] = definition
+    if any(reference == "#" for reference in _references(schema)):
+        return True
+    graph = {
+        node: {
+            target
+            for target in (_definition_node(reference) for reference in _references(definition))
+            if target is not None
+        }
+        for node, definition in definitions.items()
+    }
+    visiting: set[str] = set()
+    settled: set[str] = set()
+
+    def cyclic(node: str) -> bool:
+        """Depth-first cycle probe over the definition reference graph."""
+        if node in settled:
+            return False
+        if node in visiting:
+            return True
+        visiting.add(node)
+        if any(cyclic(target) for target in graph.get(node, set())):
+            return True
+        visiting.discard(node)
+        settled.add(node)
+        return False
+
+    return any(cyclic(node) for node in graph)
+
+
+def _pointer_token(name: str) -> str:
+    """Encode one definition name as a JSON Pointer token (RFC 6901)."""
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+def _definition_node(reference: str) -> str | None:
+    """Return the full-pointer node a ``#/$defs/<name>...`` reference points into.
+
+    A pointer that descends past the definition (``#/$defs/node/properties/child``)
+    still depends on that definition, so the node is the pointer truncated to
+    its namespace and first token; a self-reference through such a pointer is
+    a cycle too. The token stays in its RFC 6901 encoded form (``~1`` for
+    ``/``, ``~0`` for ``~``), which is how the node table keys it, so
+    ``#/$defs/foo`` and ``#/definitions/foo`` remain distinct nodes.
+    """
+    for prefix in ("#/$defs/", "#/definitions/"):
+        if reference.startswith(prefix):
+            token = reference[len(prefix) :].split("/", 1)[0]
+            return f"{prefix}{token}" if token else None
+    return None
+
+
+def _references(node: Mapping[str, JsonValue]) -> Iterator[str]:
+    """Yield every ``$ref`` string inside one node, including nested ones."""
+    reference = node.get("$ref")
+    if isinstance(reference, str):
+        yield reference
+    for value in node.values():
+        if isinstance(value, dict):
+            yield from _references(value)
+        elif isinstance(value, list):
+            for member in value:
+                if isinstance(member, dict):
+                    yield from _references(member)
+
+
+_TOP_LEVEL_COMBINATORS = ("oneOf", "anyOf", "allOf")
+"""Combinators Anthropic refuses at the ROOT of ``input_schema`` (live 2026-09-08:
+"input_schema does not support oneOf, allOf, or anyOf at the top level"); the
+same keywords nest freely under ``properties``."""
+
+
+def anthropic_input_schema_reshaping(schema: Mapping[str, JsonValue]) -> str | None:
+    """Name the reshaping [`anthropic_input_schema`] would apply, or ``None``.
+
+    Returns:
+        ``"top_level_combinator_flattened"`` when the root carries oneOf /
+        anyOf / allOf, ``"type_object_added"`` when the root lacks ``type``,
+        else ``None`` (the schema is emitted verbatim).
+    """
+    if any(isinstance(schema.get(keyword), list) for keyword in _TOP_LEVEL_COMBINATORS):
+        return "top_level_combinator_flattened"
+    if "type" not in schema:
+        return "type_object_added"
+    return None
+
+
+def anthropic_input_schema(schema: JsonObject) -> JsonObject:
+    """Return one tool schema in the shape Anthropic's ``input_schema`` accepts.
+
+    Anthropic requires the root to be ``type: object`` and refuses oneOf /
+    anyOf / allOf there, while OpenAI's ``parameters`` takes both (a coding
+    agent that declares a tool as a union of parameter shapes works on every
+    OpenAI wire and 400s on every Anthropic rung: 7 days to 2026-09-08 saw
+    that rejection across a dozen orgs, after dispatch). The reshaping is the
+    provider-accepted equivalent, verified live:
+
+    * a root combinator is flattened into one object. ``properties`` is the
+      union of the variants' properties; a name two variants define
+      DIFFERENTLY (a ``mode`` discriminator with ``const: read`` in one and
+      ``const: write`` in the other) keeps every distinct definition: the
+      oneOf/anyOf variants' definitions become a nested ``anyOf`` (any may
+      hold), the root's and allOf variants' definitions stay conjunctive
+      (``allOf``), and both nest under ``properties``, where Anthropic
+      accepts them, so no alternative or constraint is lost. ``required``
+      keeps the names every oneOf/anyOf variant requires plus every name any
+      allOf variant requires, each combinator judged on its own variants. The
+      combinator keys are dropped.
+      What is lost is the variants' mutual exclusion, disclosed at admission
+      (``tools[i].parameters->reshaped(top_level_combinator_flattened)``);
+    * a root without ``type`` gains ``"type": "object"``.
+
+    A schema that needs neither is returned as the same object, so the
+    verbatim path stays byte-identical.
+    """
+    reshaping = anthropic_input_schema_reshaping(schema)
+    if reshaping is None:
+        return schema
+    if reshaping == "type_object_added":
+        return {**schema, "type": "object"}
+    # Per property: definitions that must ALL hold (root properties, allOf
+    # variants) and definitions of which ANY may hold (oneOf/anyOf variants).
+    # Alternatives are kept PER combinator: a root oneOf and a root anyOf on the
+    # same name are independent constraints (pick one of these AND at least one
+    # of those), so each becomes its own anyOf member rather than one pool.
+    conjunctive: dict[str, list[JsonValue]] = {}
+    disjunctive: dict[str, dict[str, list[JsonValue]]] = {}
+    order: list[str] = []
+
+    def record(bucket: dict[str, list[JsonValue]], name: str, subschema: JsonValue) -> None:
+        if name not in order:
+            order.append(name)
+        definitions = bucket.setdefault(name, [])
+        if subschema not in definitions:
+            definitions.append(subschema)
+
+    root_properties = schema.get("properties")
+    if isinstance(root_properties, dict):
+        for name, subschema in root_properties.items():
+            record(conjunctive, name, subschema)
+    required_names: set[str] = set()
+    for keyword in _TOP_LEVEL_COMBINATORS:
+        listed = schema.get(keyword)
+        if not isinstance(listed, list):
+            continue
+        variants = [variant for variant in listed if isinstance(variant, dict)]
+        requirement_sets: list[set[str]] = []
+        for variant in variants:
+            properties = variant.get("properties")
+            if isinstance(properties, dict):
+                for name, subschema in properties.items():
+                    if keyword == "allOf":
+                        record(conjunctive, name, subschema)
+                    else:
+                        record(disjunctive.setdefault(keyword, {}), name, subschema)
+            required = variant.get("required")
+            requirement_sets.append(
+                {name for name in required if isinstance(name, str)}
+                if isinstance(required, list)
+                else set()
+            )
+        if not requirement_sets:
+            continue
+        if keyword == "allOf":
+            required_names |= set().union(*requirement_sets)
+        else:
+            required_names |= set.intersection(*requirement_sets)
+    root_required = schema.get("required")
+    if isinstance(root_required, list):
+        required_names |= {name for name in root_required if isinstance(name, str)}
+    flattened: dict[str, JsonValue] = {
+        key: value for key, value in schema.items() if key not in _TOP_LEVEL_COMBINATORS
+    }
+    flattened["type"] = "object"
+    properties_out: dict[str, JsonValue] = {}
+    for name in order:
+        must = list(conjunctive.get(name, []))
+        for keyword in ("oneOf", "anyOf"):
+            may = disjunctive.get(keyword, {}).get(name, [])
+            if may:
+                # This combinator's alternatives fold into one anyOf member
+                # that joins the conjunctive definitions under allOf.
+                must.append(may[0] if len(may) == 1 else {"anyOf": may})
+        properties_out[name] = must[0] if len(must) == 1 else {"allOf": must}
+    flattened["properties"] = properties_out
+    ordered_required = [name for name in order if name in required_names]
+    if ordered_required:
+        flattened["required"] = ordered_required
+    else:
+        flattened.pop("required", None)
+    return flattened

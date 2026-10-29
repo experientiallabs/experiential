@@ -9,6 +9,7 @@ from datetime import UTC
 from exp.common.core.artifacts import stable_id
 from exp.common.core.text import normalize_durable_text
 from exp.common.traces import Trace
+from exp.common.traces.ingest.vendor_trace import SYNTHETIC_TIME_ATTRIBUTE
 
 DEFAULT_LINEAGE_TIME_BUCKET_SECONDS = 86_400
 
@@ -17,12 +18,13 @@ DEFAULT_LINEAGE_TIME_BUCKET_SECONDS = 86_400
 class LineageAssignment:
     """Auditable initial leakage lineage for one normalized source trace.
 
-    Args:
+    Attributes:
         trace_id: Canonical trace identity.
         lineage_group_id: Stable initial lineage identity before duplicate unions.
         customer_id: Stable customer boundary from source extensions or source identity.
         conversation_id: Captured conversation boundary, when supplied.
-        time_bucket: UTC bucket used when no conversation identity was supplied.
+        time_bucket: Observed UTC bucket without a conversation identity, or ``None`` when
+            only synthetic ordering timestamps are available.
     """
 
     trace_id: str
@@ -40,11 +42,13 @@ def assign_source_lineages(
     """Assign stable initial lineages from customer, conversation, and time boundaries.
 
     A captured conversation keeps all of its traces together. When a source has no conversation
-    ID, a customer-specific UTC time bucket is deliberately conservative, preventing adjacent
-    anonymous activity from being split before semantic duplicate checks run.
+    ID, an observed customer-specific UTC time bucket keeps adjacent anonymous activity together.
+    Synthetic ordering timestamps provide no temporal evidence, so traces without a measured
+    timestamp use their source-trace boundary. Exact and semantic duplicate unions still run
+    before partitioning.
 
     Args:
-        traces: Canonical traces with ordered source timestamps.
+        traces: Canonical traces with measured or explicitly synthetic timestamps.
         time_bucket_seconds: Positive UTC fallback boundary for traces lacking conversation IDs.
 
     Returns:
@@ -70,14 +74,30 @@ def assign_source_lineages(
                 "conversation_id": conversation_id,
             }
         else:
-            started_at = min(span.started_at for span in trace.spans).astimezone(UTC)
-            time_bucket = int(started_at.timestamp()) // time_bucket_seconds
-            material = {
-                "version": "source-lineage-v1",
-                "customer_id": customer_id,
-                "time_bucket_seconds": time_bucket_seconds,
-                "time_bucket": time_bucket,
-            }
+            started_at = min(
+                (
+                    span.started_at.astimezone(UTC)
+                    for span in trace.spans
+                    if span.attributes.get(SYNTHETIC_TIME_ATTRIBUTE) is not True
+                ),
+                default=None,
+            )
+            if started_at is None:
+                time_bucket = None
+                material = {
+                    "version": "source-lineage-v1",
+                    "customer_id": customer_id,
+                    "source_id": trace.source.identity.source_id,
+                    "trace_id": trace.trace_id,
+                }
+            else:
+                time_bucket = int(started_at.timestamp()) // time_bucket_seconds
+                material = {
+                    "version": "source-lineage-v1",
+                    "customer_id": customer_id,
+                    "time_bucket_seconds": time_bucket_seconds,
+                    "time_bucket": time_bucket,
+                }
         assignments.append(
             LineageAssignment(
                 trace_id=trace.trace_id,

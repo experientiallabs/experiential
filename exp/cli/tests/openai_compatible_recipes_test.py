@@ -219,6 +219,6 @@ def test_recipes_doc_pins_the_verified_constants_and_is_indexed() -> None:
     assert "does not write a local `gateway.db`" in doc
     assert "identity-only" in doc
     assert "unknown" in doc
-    assert "micro-USD prices" in doc
+    assert "nano-USD prices" in doc
     assert "exp/cli/tests/openai_compatible_recipes_test.py" in doc
     assert "`reference/openai-compatible-recipes.md`" in index

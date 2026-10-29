@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NoReturn
+from uuid import uuid4
 
 import pytest
 
@@ -10,16 +12,64 @@ from exp.common.auth import (
     ProviderAuthStore,
     StoredCredentialBinding,
     StoredCredentialEndpointMismatch,
+    StoredOAuthTokens,
 )
 from exp.common.models import ConnectionConfig
 from exp.runtime.models.credentials import (
     CredentialResolution,
+    DispatchCredentialReceipt,
     MissingModelCredentialError,
     ModelCredentialError,
     lookup_connection_credential,
     read_connection_api_key,
     resolve_or_prompt_connection_api_key,
 )
+
+
+class AtomicEnvironment(dict[str, str]):
+    """Synthetic environment proving the receipt and auth are returned together."""
+
+    def __init__(self, resolved: CredentialResolution | None) -> None:
+        """Keep a fallback mapping that authoritative lookup must never read."""
+        super().__init__({"OPENAI_API_KEY": "forbidden-fallback"})
+        self.resolved = resolved
+        self.calls = 0
+
+    def resolve_credential(self, name: str) -> CredentialResolution | None:
+        """Return one exact resolution or an authoritative missing result."""
+        self.calls += 1
+        return self.resolved
+
+    def get(self, key: object, default: object = None, /) -> NoReturn:
+        """Fail if the typed path falls back to a separate mutable lookup."""
+        raise AssertionError("mutable fallback lookup")
+
+
+def test_atomic_environment_returns_same_receipt_and_never_falls_back(tmp_path: Path) -> None:
+    """None from an authoritative resolver cannot bypass a revoked credential."""
+    receipt = DispatchCredentialReceipt(uuid4())
+    resolution = CredentialResolution("K1", "environment", receipt=receipt)
+    environment = AtomicEnvironment(resolution)
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put("openai", "stored-fallback", binding=_binding(_openai()))
+    assert (
+        lookup_connection_credential(
+            _openai(), connection_id="openai", environment=environment, store=store
+        )
+        is resolution
+    )
+    assert environment.calls == 1
+    environment.resolved = None
+    assert (
+        lookup_connection_credential(
+            _openai(), connection_id="openai", environment=environment, store=store
+        )
+        is None
+    )
+    assert environment.calls == 2
+    assert str(receipt.binding_id) not in repr(resolution)
+    assert str(receipt.binding_id) not in repr(receipt)
+
 
 _SECRET = "sk-resolver-stored-secret"
 _ENV_SECRET = "sk-resolver-env-secret"
@@ -389,3 +439,18 @@ def test_resolution_repr_never_includes_the_secret() -> None:
     assert _SECRET not in str(resolved)
     assert resolved.value == _SECRET
     assert resolved.source == "stored"
+
+
+def test_subscription_connection_never_resolves_as_an_api_key(tmp_path: Path) -> None:
+    """A plan connection resolves no key, even with a sign-in stored under its name."""
+    plan = ConnectionConfig(provider="openai", subscription="chatgpt")
+    store = ProviderAuthStore(tmp_path / "auth.json")
+    store.put_oauth(
+        "plan",
+        StoredOAuthTokens(access_token="a", refresh_token="r", expires_at_ms=1),
+        binding=_binding(plan),
+    )
+
+    assert lookup_connection_credential(plan, connection_id="plan", store=store) is None
+    with pytest.raises(ModelCredentialError, match="plan sign-in and has no API key"):
+        read_connection_api_key(plan, connection_id="plan", store=store)

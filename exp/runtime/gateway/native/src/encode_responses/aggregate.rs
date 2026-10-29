@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod usage_tests;
+
 /// Usage shape from `exp.runtime.openai_protocol.streaming._responses_usage`.
 pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     let usage = match usage {
@@ -10,13 +14,32 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     };
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    json!({
+    let mut input_details = json!({
+        // Responses stays disjoint: its parsers have no overlapping mode.
+        "cached_tokens": usage.cached_input_tokens.unwrap_or(0),
+        "cache_write_tokens": usage.cache_creation_input_tokens.unwrap_or(0),
+    });
+    if let Some(hour) = usage.cache_creation_1h_input_tokens {
+        input_details["cache_write_1h_tokens"] = json!(hour);
+    }
+    if let Some(split) = crate::encode::cache_write_lifetimes(usage) {
+        input_details["cache_write_tokens_details"] = split;
+    }
+    let mut wire = json!({
         "input_tokens": input,
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens.unwrap_or(0)},
+        // `cache_write_tokens` joined the official shape (openai-python 3.x
+        // marks it required), so SDK-strict callers need it present.
+        "input_tokens_details": input_details,
         "output_tokens": output,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
         "total_tokens": input + output,
-    })
+    });
+    crate::encode::annotate_image_tokens(&mut wire["output_tokens_details"], usage);
+    let unreported = usage.unreported_token_details();
+    if !unreported.is_empty() {
+        wire["unreported_token_details"] = json!(unreported);
+    }
+    wire
 }
 
 /// The aggregated non-streaming Responses outcome from one event stream.
@@ -32,7 +55,7 @@ pub struct AggregatedResponses {
 pub fn completed_responses_body(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     events: &[Event],
 ) -> Result<AggregatedResponses, PublicError> {
@@ -43,10 +66,61 @@ pub fn completed_responses_body(
 pub fn completed_responses_body_with_carrier(
     request_id: &str,
     model: &str,
-    created_at: f64,
+    created_at: i64,
     envelope: ResponsesEnvelope,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
+) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_web_search(
+        request_id,
+        model,
+        created_at,
+        envelope,
+        events,
+        reasoning_content_carrier,
+        None,
+    )
+}
+
+/// Build one non-streaming result that also cites and meters the
+/// gateway-executed web search; `None` renders exactly like the variants
+/// above.
+pub fn completed_responses_body_with_web_search(
+    request_id: &str,
+    model: &str,
+    created_at: i64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+    web_search: Option<&WebSearchAdmission>,
+) -> Result<AggregatedResponses, PublicError> {
+    completed_responses_body_with_gateway_tools(
+        request_id,
+        model,
+        created_at,
+        envelope,
+        events,
+        reasoning_content_carrier,
+        web_search,
+        None,
+    )
+}
+
+/// Build one non-streaming result that also renders the gateway-run
+/// tool-search rounds as hosted items ahead of the provider output and
+/// meters them on usage. The rounds are fed to the encoder alone, never
+/// scanned for `tool_names`: they are the gateway's own work, billed through
+/// `tool_search_requests`. `None` renders exactly like the variants above.
+#[allow(clippy::too_many_arguments)]
+pub fn completed_responses_body_with_gateway_tools(
+    request_id: &str,
+    model: &str,
+    created_at: i64,
+    envelope: ResponsesEnvelope,
+    events: &[Event],
+    reasoning_content_carrier: Option<&str>,
+    web_search: Option<&WebSearchAdmission>,
+    tool_search: Option<&ResponsesToolSearch>,
 ) -> Result<AggregatedResponses, PublicError> {
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
@@ -71,10 +145,21 @@ pub fn completed_responses_body_with_carrier(
     }
     let mut tool_names = Vec::new();
     for event in events {
-        if let Event::ToolCallCompleted { call, .. } = event {
-            if !tool_names.contains(&call.name) {
+        match event {
+            Event::ToolCallCompleted { call, .. } if !tool_names.contains(&call.name) => {
                 tool_names.push(call.name.clone());
             }
+            // Hosted tool INVOCATIONS are provider-executed but still
+            // invoked tools; their item type names the activity for the
+            // ledger, mirroring `track_event`. Results, approvals, and
+            // opaque conversation items never record a call.
+            Event::HostedToolItemCompleted { item_type, .. }
+                if crate::events::hosted_item_type_is_invocation(item_type)
+                    && !tool_names.contains(item_type) =>
+            {
+                tool_names.push(item_type.clone());
+            }
+            _ => {}
         }
     }
     if let Event::Failed(failure) = terminal {
@@ -87,6 +172,8 @@ pub fn completed_responses_body_with_carrier(
         });
     }
     let mut encoder = ResponsesSseEncoder::new(request_id, model, created_at, envelope);
+    encoder.set_web_search(web_search.cloned());
+    encoder.set_tool_search(tool_search.cloned());
     if let Some(carrier) = reasoning_content_carrier {
         encoder.set_reasoning_content_carrier(carrier.to_string())?;
     }

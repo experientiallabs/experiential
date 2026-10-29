@@ -477,7 +477,7 @@ def gateway_usage(
     totals = report.totals
     _console.print(
         f"requests={totals.requests} attempts={totals.attempts} "
-        f"attributed_estimated_cost_micro_usd={totals.known_estimated_cost_micro_usd} "
+        f"attributed_estimated_cost_nano_usd={totals.known_estimated_cost_nano_usd} "
         f"unknown_cost_attempts={totals.unknown_cost_attempts}"
     )
     emit_items("identity usage", report.identities, json_output=False)

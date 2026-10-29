@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -92,6 +94,117 @@ def test_openai_compatible_listing_uses_the_configured_base_url() -> None:
     assert transport.requests[0].url == "https://gateway.internal/v1/models"
 
 
+def test_cloud_listing_joins_catalog_pages_without_adding_unavailable_models() -> None:
+    """Bare OpenAI identities acquire default-route metadata without promotion discounts."""
+    entry: JsonObject = {
+        "model": {
+            "slug": "chat",
+            "output_modalities": ["text"],
+            "context_window": 128000,
+            "max_output_tokens": 32000,
+        },
+        "providers": [
+            {
+                "id": "default",
+                "status": "active",
+                "routable": True,
+                "input_nano_usd_per_million": 200000000,
+                "output_nano_usd_per_million": 1200000000,
+                "cached_input_nano_usd_per_million": 20000000,
+                "cache_write_input_nano_usd_per_million": 250000000,
+                "capabilities": {
+                    "supports_tools": True,
+                    "supports_structured_output": True,
+                    "supports_reasoning": True,
+                    "reasoning_default_effort": "high",
+                    "maximum_output_tokens": 16000,
+                },
+            }
+        ],
+        "default_provider_ids": ["default"],
+    }
+    transport = _transport(
+        _ok({"data": [{"id": "chat"}, {"id": "unmatched"}]}),
+        _ok({"models": [{"model": {"slug": "catalog-only"}}], "total": 2, "offset": 0}),
+        _ok(
+            {
+                "models": [entry],
+                "total": 2,
+                "offset": 1,
+                "promotions": [{"slugs": ["chat"], "free": True, "percent_off": 100}],
+            }
+        ),
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(
+            provider="openai-compatible",
+            api_key="secret-key",
+            base_url="https://preview.example.test/v1",
+            catalog="experiential",
+        )
+    )
+
+    assert [model.model for model in models] == ["chat", "unmatched"]
+    chat = models[0]
+    assert chat.supports_completions is True
+    assert chat.supports_structured_output is True
+    assert chat.supports_tools is True
+    assert chat.reasoning_effort == "high"
+    assert chat.input_cost_per_million_tokens_usd == 0.2
+    assert chat.output_cost_per_million_tokens_usd == 1.2
+    assert chat.cached_input_cost_per_million_tokens_usd == 0.02
+    assert chat.cache_write_cost_per_million_tokens_usd == 0.25
+    assert chat.context_window_tokens == 128000
+    assert chat.maximum_output_tokens == 16000
+    assert models[1].supports_completions is None
+    assert models[1].input_cost_per_million_tokens_usd is None
+    assert [request.url for request in transport.requests] == [
+        "https://preview.example.test/v1/models",
+        "https://preview.example.test/api/models?limit=1000&offset=0",
+        "https://preview.example.test/api/models?limit=1000&offset=1",
+    ]
+    assert all(
+        request.headers["Authorization"] == "Bearer secret-key" for request in transport.requests
+    )
+
+
+def test_cloud_catalog_failure_is_actionable_instead_of_a_metadata_questionnaire() -> None:
+    """A failed catalog read uses provider recovery rather than silently dropping metadata."""
+    transport = _transport(
+        _ok({"data": [{"id": "chat"}]}),
+        JsonHttpResponse(status_code=403, body={}),
+    )
+
+    with pytest.raises(ProviderListingError, match="rejected the configured credential"):
+        _lister(transport).list_models(
+            ProviderEndpoint(
+                provider="openai-compatible",
+                api_key="secret-key",
+                base_url="https://api.experientiallabs.ai/v1",
+                catalog="experiential",
+            )
+        )
+
+
+def test_cloud_catalog_rejects_truncated_pagination() -> None:
+    """An incomplete page cannot silently mark the remaining account models as unknown."""
+    transport = _transport(
+        _ok({"data": [{"id": "chat"}]}),
+        _ok({"models": [], "total": 1, "offset": 0}),
+    )
+
+    with pytest.raises(ProviderListingError, match="incomplete model catalog"):
+        _lister(transport).list_models(
+            ProviderEndpoint(
+                provider="openai-compatible",
+                api_key="secret-key",
+                base_url="https://api.experientiallabs.ai/v1",
+                catalog="experiential",
+            )
+        )
+
+
 def test_openai_listing_discards_optional_entry_metadata() -> None:
     """Official OpenAI listing stays identity-only even when extra keys are present."""
     transport = _transport(
@@ -103,7 +216,7 @@ def test_openai_listing_discards_optional_entry_metadata() -> None:
                         "supports_completions": True,
                         "supports_tools": True,
                         "maximum_output_tokens": 16_000,
-                        "pricing": {"input_micro_usd_per_million_tokens": 1_250_000},
+                        "pricing": {"input_nano_usd_per_million_tokens": 1_250_000_000},
                     }
                 ]
             }
@@ -124,7 +237,7 @@ def test_openai_listing_discards_optional_entry_metadata() -> None:
 
 
 def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> None:
-    """The hosted gateway contract supplies capabilities, limits, and micro-USD prices."""
+    """The hosted gateway contract supplies capabilities, limits, and nano-USD prices."""
     transport = _transport(
         _ok(
             {
@@ -156,9 +269,9 @@ def test_openai_compatible_listing_reads_validated_exp_gateway_metadata() -> Non
                         "maximum_top_k": 100,
                         "maximum_output_tokens": 16_000,
                         "pricing": {
-                            "input_micro_usd_per_million_tokens": 1_250_000,
-                            "output_micro_usd_per_million_tokens": 10_000_000,
-                            "cached_input_micro_usd_per_million_tokens": 125_000,
+                            "input_nano_usd_per_million_tokens": 1_250_000_000,
+                            "output_nano_usd_per_million_tokens": 10_000_000_000,
+                            "cached_input_nano_usd_per_million_tokens": 125_000_000,
                         },
                     }
                 ]
@@ -211,8 +324,8 @@ def test_openai_compatible_listing_preserves_unknowns_for_absent_or_invalid_fiel
                         "supports_structured_output": "true",
                         "maximum_output_tokens": 16_000.0,
                         "pricing": {
-                            "input_micro_usd_per_million_tokens": "1250000",
-                            "output_micro_usd_per_million_tokens": -1,
+                            "input_nano_usd_per_million_tokens": "1250000",
+                            "output_nano_usd_per_million_tokens": -1,
                         },
                     }
                 ]
@@ -246,7 +359,8 @@ def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
                 "data": [
                     {"id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"},
                     {"display_name": "no identity"},
-                ]
+                ],
+                "has_more": False,
             }
         )
     )
@@ -259,6 +373,97 @@ def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
     request = transport.requests[0]
     assert request.headers["x-api-key"] == "secret-key"
     assert request.headers["anthropic-version"]
+
+
+def test_anthropic_listing_follows_after_id_pages() -> None:
+    """Anthropic discovery follows the documented cursor until the final page."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [{"id": "claude-opus-5"}],
+                "has_more": True,
+                "last_id": "claude-opus-5",
+            }
+        ),
+        _ok(
+            {
+                "data": [{"id": "claude-haiku-4-5"}],
+                "has_more": False,
+                "last_id": "claude-haiku-4-5",
+            }
+        ),
+    )
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(provider="anthropic", api_key="secret-key")
+    )
+
+    assert [model.model for model in models] == ["claude-haiku-4-5", "claude-opus-5"]
+    assert len(transport.requests) == 2
+    assert transport.requests[0].url == "https://api.anthropic.com/v1/models?limit=1000"
+    assert transport.requests[1].url == (
+        "https://api.anthropic.com/v1/models?limit=1000&after_id=claude-opus-5"
+    )
+
+
+def test_anthropic_listing_encodes_the_opaque_page_cursor() -> None:
+    """Reserved cursor characters remain one exact after_id query value."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [{"id": "claude-opus-5"}],
+                "has_more": True,
+                "last_id": "cursor/with ?&=",
+            }
+        ),
+        _ok({"data": [], "has_more": False}),
+    )
+
+    _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+    assert transport.requests[1].url == (
+        "https://api.anthropic.com/v1/models?limit=1000&after_id=cursor%2Fwith+%3F%26%3D"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"data": [], "has_more": "yes"}, "boolean has_more"),
+        ({"data": [], "has_more": True}, "non-empty last_id"),
+    ],
+)
+def test_anthropic_listing_rejects_malformed_pagination(body: JsonObject, message: str) -> None:
+    """Malformed pagination fails instead of silently returning a partial catalog."""
+    transport = _transport(_ok(body))
+
+    with pytest.raises(ProviderListingError, match=message):
+        _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+
+def test_anthropic_listing_rejects_a_repeated_cursor() -> None:
+    """A provider cursor cycle fails before issuing the same page request again."""
+    transport = _transport(
+        _ok({"data": [], "has_more": True, "last_id": "repeat"}),
+        _ok({"data": [], "has_more": True, "last_id": "repeat"}),
+    )
+
+    with pytest.raises(ProviderListingError, match="repeated last_id"):
+        _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+    assert len(transport.requests) == 2
+
+
+def test_anthropic_listing_fails_instead_of_truncating_at_the_page_cap() -> None:
+    """The finite request ceiling cannot turn into a partial successful catalog."""
+    transport = _transport(
+        *(_ok({"data": [], "has_more": True, "last_id": f"cursor-{page}"}) for page in range(10))
+    )
+
+    with pytest.raises(ProviderListingError, match="exceeded 10 pages"):
+        _lister(transport).list_models(ProviderEndpoint(provider="anthropic", api_key="secret-key"))
+
+    assert len(transport.requests) == 10
 
 
 def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
@@ -369,6 +574,20 @@ def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     assert models[1].supports_embeddings is True
     assert transport.requests[0].headers["x-goog-api-key"] == "secret-key"
     assert transport.requests[1].url.endswith("&pageToken=page-2")
+
+
+def test_gemini_listing_preserves_an_opaque_page_token() -> None:
+    """Gemini pagination must encode reserved characters without changing the cursor."""
+    page_token = "page+2&cursor=%23fragment#tail"
+    transport = _transport(
+        _ok({"models": [], "nextPageToken": page_token}),
+        _ok({"models": []}),
+    )
+
+    _lister(transport).list_models(ProviderEndpoint(provider="gemini", api_key="secret-key"))
+
+    query = parse_qs(urlsplit(transport.requests[1].url).query)
+    assert query["pageToken"] == [page_token]
 
 
 def test_listing_rejects_an_invalid_credential_without_retrying() -> None:

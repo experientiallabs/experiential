@@ -447,7 +447,7 @@ class SandboxSimulator:
                 binding,
                 resolution_input,
                 phase="paid_cell_stale_lease",
-                message="a prior sandbox cell claim expired; EXP will not replay it",
+                message="a prior sandbox cell execution ended; EXP will not replay it",
                 spent=None,
             )
             return self._persist_rollout(rollout, cell, binding, resolution_input)
@@ -507,6 +507,8 @@ class SandboxSimulator:
         except BaseException:
             if not dispatch_intent_recorded:
                 self._leases.release(lease)
+            else:
+                self._leases.abandon(lease)
             raise
         else:
             self._leases.release(lease)

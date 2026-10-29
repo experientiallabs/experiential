@@ -17,7 +17,7 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
-    ModelCatalog,
+    read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
 from exp.optimize.router.activation import load_project_router
@@ -42,6 +42,11 @@ _EXACT_MODEL_OPTION = typer.Option(None, "--exact-model")
 _PROJECT_OPTION = typer.Option(None, "--project")
 _POLICY_OPTION = typer.Option(None, "--policy")
 _REVISION_OPTION = typer.Option(None, "--revision")
+_PRICE_HELP = "Integer nano-USD per million tokens ($1.25 per million is 1250000000)."
+_INPUT_PRICE_OPTION = typer.Option(None, "--input-price", min=0, help=_PRICE_HELP)
+_CACHED_INPUT_PRICE_OPTION = typer.Option(None, "--cached-input-price", min=0, help=_PRICE_HELP)
+_OUTPUT_PRICE_OPTION = typer.Option(None, "--output-price", min=0, help=_PRICE_HELP)
+_REASONING_PRICE_OPTION = typer.Option(None, "--reasoning-price", min=0, help=_PRICE_HELP)
 _PRICING_SOURCE_OPTION = typer.Option(None, "--pricing-source")
 _MAXIMUM_OUTPUT_OPTION = typer.Option(None, "--maximum-output-tokens", min=1)
 _REFUSAL_FAILOVER_OPTION = typer.Option(False, "--refusal-failover")
@@ -62,6 +67,7 @@ _PDF_URL_INPUT_OPTION = typer.Option(
 )
 
 _VIDEO_INPUT_OPTION = typer.Option(False, "--supports-video-input")
+_MEDIA_HANDLE_INPUT_OPTION = typer.Option(False, "--supports-media-handle-input")
 _VIDEO_URL_INPUT_OPTION = typer.Option(
     None,
     "--supports-video-url-input/--no-supports-video-url-input",
@@ -84,6 +90,16 @@ video input, so a route on those providers must not claim it."""
 
 VIDEO_URL_PROVIDERS = frozenset({"gemini", "openai-compatible", "openrouter", "vertex"})
 """Video providers whose wire fetches a caller video URL on the gateway's behalf."""
+
+MEDIA_HANDLE_PROVIDERS = frozenset({"anthropic", "bedrock", "gemini", "openai", "vertex"})
+"""Providers whose inference wire resolves a handle to media uploaded to that provider.
+
+OpenAI (``file_id`` on Chat ``file`` and Responses ``input_image`` /
+``input_file``), Anthropic (``file`` source), Gemini (Files API URI), Vertex
+(``gs://`` object), and Bedrock (``s3Location``). Azure OpenAI file ids live in
+a separate namespace that a bare ``file_id`` cannot name, and the
+OpenAI-compatible Chat wire (OpenRouter, Fireworks) defines no uploaded-media
+reference, so a route on those providers must not claim handle input."""
 
 AUDIO_PROVIDERS = frozenset({"azure", "gemini", "openai-compatible", "openrouter", "vertex"})
 """Providers whose wire defines a caller audio carrier some model serves.
@@ -181,6 +197,42 @@ def _declared_video_input(
     return True, supports_video_url_input
 
 
+def _declared_media_handle_input(
+    *,
+    provider: str,
+    supports_media_handle_input: bool,
+    supports_image_input: bool,
+    supports_video_input: bool,
+    supports_pdf_input: bool,
+) -> bool:
+    """Resolve the route's uploaded-media handle declaration.
+
+    Args:
+        provider: Provider adapter serving the deployment.
+        supports_media_handle_input: Explicit operator declaration.
+        supports_image_input: Whether the route carries image content.
+        supports_video_input: Whether the route carries video content.
+        supports_pdf_input: Whether the route carries PDF documents.
+
+    Returns:
+        Whether the route may forward a caller's provider media handle.
+
+    Raises:
+        ValueError: Handle input is claimed without any media input, or on a
+            provider whose wire resolves no uploaded-media reference.
+    """
+    if not supports_media_handle_input:
+        return False
+    if not (supports_image_input or supports_video_input or supports_pdf_input):
+        raise ValueError(
+            "--supports-media-handle-input requires --supports-image-input, "
+            "--supports-video-input, or --supports-pdf-input"
+        )
+    if provider not in MEDIA_HANDLE_PROVIDERS:
+        raise ValueError(f"provider {provider!r} resolves no uploaded-media handle")
+    return True
+
+
 def _declared_audio_input(
     *,
     provider: str,
@@ -273,11 +325,12 @@ def alias_create(
     supports_audio_input: bool = _AUDIO_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
+    supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
-    input_price: int | None = typer.Option(None, "--input-price", min=0),
-    cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
-    output_price: int | None = typer.Option(None, "--output-price", min=0),
-    reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
+    input_price: int | None = _INPUT_PRICE_OPTION,
+    cached_input_price: int | None = _CACHED_INPUT_PRICE_OPTION,
+    output_price: int | None = _OUTPUT_PRICE_OPTION,
+    reasoning_price: int | None = _REASONING_PRICE_OPTION,
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
     billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
@@ -309,12 +362,13 @@ def alias_create(
             supports_audio_input=supports_audio_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
+            supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                cached_input_micro_usd_per_million_tokens=cached_input_price,
-                output_micro_usd_per_million_tokens=output_price,
-                reasoning_micro_usd_per_million_tokens=reasoning_price,
+                input_nano_usd_per_million_tokens=input_price,
+                cached_input_nano_usd_per_million_tokens=cached_input_price,
+                output_nano_usd_per_million_tokens=output_price,
+                reasoning_nano_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
             billing_source=billing_source,
@@ -366,11 +420,12 @@ def alias_update(
     supports_audio_input: bool = _AUDIO_INPUT_OPTION,
     supports_pdf_input: bool = _PDF_INPUT_OPTION,
     supports_pdf_url_input: bool | None = _PDF_URL_INPUT_OPTION,
+    supports_media_handle_input: bool = _MEDIA_HANDLE_INPUT_OPTION,
     maximum_output_tokens: int | None = _MAXIMUM_OUTPUT_OPTION,
-    input_price: int | None = typer.Option(None, "--input-price", min=0),
-    cached_input_price: int | None = typer.Option(None, "--cached-input-price", min=0),
-    output_price: int | None = typer.Option(None, "--output-price", min=0),
-    reasoning_price: int | None = typer.Option(None, "--reasoning-price", min=0),
+    input_price: int | None = _INPUT_PRICE_OPTION,
+    cached_input_price: int | None = _CACHED_INPUT_PRICE_OPTION,
+    output_price: int | None = _OUTPUT_PRICE_OPTION,
+    reasoning_price: int | None = _REASONING_PRICE_OPTION,
     pricing_source: str | None = _PRICING_SOURCE_OPTION,
     billing_source: BillingSource | None = _BILLING_SOURCE_OPTION,
     refusal_failover: bool = _REFUSAL_FAILOVER_OPTION,
@@ -402,12 +457,13 @@ def alias_update(
             supports_audio_input=supports_audio_input,
             supports_pdf_input=supports_pdf_input,
             supports_pdf_url_input=supports_pdf_url_input,
+            supports_media_handle_input=supports_media_handle_input,
             maximum_output_tokens=maximum_output_tokens,
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=input_price,
-                cached_input_micro_usd_per_million_tokens=cached_input_price,
-                output_micro_usd_per_million_tokens=output_price,
-                reasoning_micro_usd_per_million_tokens=reasoning_price,
+                input_nano_usd_per_million_tokens=input_price,
+                cached_input_nano_usd_per_million_tokens=cached_input_price,
+                output_nano_usd_per_million_tokens=output_price,
+                reasoning_nano_usd_per_million_tokens=reasoning_price,
             ),
             pricing_source=pricing_source,
             billing_source=billing_source,
@@ -482,6 +538,7 @@ def _activate(
     supports_audio_input: bool,
     supports_pdf_input: bool,
     supports_pdf_url_input: bool | None,
+    supports_media_handle_input: bool,
     maximum_output_tokens: int | None,
     prices: GatewayTokenPrices,
     pricing_source: str | None,
@@ -565,6 +622,13 @@ def _activate(
                     supports_pdf_input=supports_pdf_input,
                     supports_pdf_url_input=supports_pdf_url_input,
                 ),
+                supports_media_handle_input=_declared_media_handle_input(
+                    provider=provider,
+                    supports_media_handle_input=supports_media_handle_input,
+                    supports_image_input=supports_image_input,
+                    supports_video_input=declared_video_input,
+                    supports_pdf_input=supports_pdf_input,
+                ),
             ),
             prices=prices,
             pricing_source=pricing_source,
@@ -572,7 +636,9 @@ def _activate(
             replace=replace,
             serving_connections=serving_connections,
         )
-        authored = ModelCatalog.model_validate_json(authored_snapshot_path(snapshot).read_bytes())
+        authored, _dropped = read_model_catalog_document(
+            authored_snapshot_path(snapshot).read_bytes()
+        )
         catalog_sha256 = normalized.identity_sha256()
         return (
             manager.activate_direct_alias(

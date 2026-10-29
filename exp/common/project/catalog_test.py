@@ -48,6 +48,9 @@ def test_project_catalog_persists_and_replays_as_one_exact_artifact(tmp_path: Pa
     catalog = ProjectModelCatalog(
         project_id="project-1",
         models=(_model("baseline"), _model("candidate")),
+        world_model_reasoning_effort="high",
+        judge_reasoning_effort="low",
+        candidate_reasoning_efforts={"candidate": "medium"},
     )
     ambient = store.model_catalog_path
     ambient.parent.mkdir(parents=True)
@@ -70,6 +73,16 @@ def test_project_catalog_persists_and_replays_as_one_exact_artifact(tmp_path: Pa
     assert replay == first
     assert load_project_model_catalog(store.artifacts, first) == catalog
     assert store.artifacts.list_ids() == (first.artifact_id,)
+
+
+def test_project_catalog_rejects_reasoning_for_unknown_models() -> None:
+    """Portable reasoning choices must identify models included in the same artifact."""
+    with pytest.raises(ValidationError, match="unknown model aliases"):
+        ProjectModelCatalog(
+            project_id="project-1",
+            models=(_model("baseline"),),
+            candidate_reasoning_efforts={"missing": "high"},
+        )
 
 
 def test_project_catalog_requires_sorted_unique_models_and_matching_capability_digest() -> None:
@@ -101,4 +114,7 @@ def test_project_catalog_has_no_credential_or_connection_reference_fields() -> N
         "schema_version",
         "project_id",
         "models",
+        "world_model_reasoning_effort",
+        "judge_reasoning_effort",
+        "candidate_reasoning_efforts",
     }

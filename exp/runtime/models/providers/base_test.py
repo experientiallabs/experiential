@@ -28,6 +28,7 @@ from exp.runtime.models.providers.base import (
     ProviderHttpClient,
     completion_timeout_seconds,
 )
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
@@ -121,6 +122,37 @@ def _client(
         base_url=base_url,
         transport=transport,
     )
+
+
+def test_completed_pricing_error_never_retries_the_http_request() -> None:
+    """Only a fresh uncapped rollout may retry; the completed HTTP operation runs once.
+
+    Raises:
+        AssertionError: A completed pricing failure causes more than one HTTP request.
+    """
+
+    class UnpriceableClient(_EchoClient):
+        """Reject a completed provider response with the typed pricing error."""
+
+        def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+            """Model a pricing failure after the provider has completed the HTTP request.
+
+            Args:
+                payload: Completed HTTP response body intentionally rejected by this fixture.
+                latency_seconds: Observed request duration supplied by the provider client.
+
+            Raises:
+                ProviderPricingUnavailableError: Every completed response has unknown metering.
+            """
+            raise ProviderPricingUnavailableError("saved response has unknown metering")
+
+    transport = _ok_transport()
+    client = UnpriceableClient(
+        model=_snapshot(), api_key="fixture", base_url="https://echo.test", transport=transport
+    )
+    with pytest.raises(ProviderPricingUnavailableError):
+        client.complete(ModelRequest(messages=(ModelMessage(role="user", content="hello"),)))
+    assert len(transport.requests) == 1
 
 
 def test_rejects_an_empty_api_key_naming_the_concrete_client() -> None:
@@ -323,3 +355,61 @@ def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
     assert len(transport.timeouts) == 2
     for observed, derived in zip(transport.timeouts, (480.0, DEFAULT_TIMEOUT_SECONDS), strict=True):
         assert derived - 1.0 < observed <= derived
+
+
+def test_forwards_tier_requires_a_card_and_a_tier_capable_dialect() -> None:
+    """`forwards_tier` is the single FORWARD == BILL gate: per-tier card AND a
+    tier-capable wire dialect, with BYOK forwarding any tier."""
+    # Host lane carded for flex on a tier-capable dialect: flex forwards,
+    # priority (no card) and auto/None do not.
+    flex_host = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://house.test",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"flex"}),
+    )
+    assert flex_host.forwards_tier("flex") is True
+    assert flex_host.forwards_tier("priority") is False
+    assert flex_host.forwards_tier("auto") is False
+    assert flex_host.forwards_tier(None) is False
+
+    # The SAME flex card on a non-tier dialect never forwards (the wire would
+    # strip or decline the tier) -> reprice must not fire either.
+    flex_on_anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://anthropic.test",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"flex"}),
+    )
+    assert flex_on_anthropic.forwards_tier("flex") is False
+
+    # BYOK forwards any tier on a tier-capable dialect without a platform card,
+    # but still not on a non-tier dialect.
+    byok = GatewayWireProfile(
+        dialect="openai_responses", url="https://byok.test", billing_customer_managed=True
+    )
+    assert byok.forwards_tier("flex") is True
+    assert byok.forwards_tier("priority") is True
+    byok_anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://byok.test", billing_customer_managed=True
+    )
+    assert byok_anthropic.forwards_tier("flex") is False
+
+
+@pytest.mark.parametrize("failures", [0, 1, 2])
+def test_success_reports_actual_provider_attempts(failures: int) -> None:
+    """Economics expose how many attempts actually happened, not the configured retry ceiling."""
+    transport = ScriptedJsonTransport(
+        [
+            *[JsonHttpResponse(status_code=503, body={}) for _ in range(failures)],
+            JsonHttpResponse(status_code=200, body={"answer": "ok"}),
+        ]
+    )
+    response = _client(transport).complete(
+        ModelRequest(
+            messages=(ModelMessage(role="user", content="hello"),),
+            maximum_output_tokens=100,
+        )
+    )
+    assert response.economics.provider_attempts == failures + 1
+    assert len(transport.requests) == failures + 1

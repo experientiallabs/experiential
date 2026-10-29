@@ -1,13 +1,17 @@
 //! Public Chat Completions encoding, the Rust mirror of `ChatSseEncoder` and
 //! the chat branch of `completed_body`.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, PublicError};
-use crate::events::{Event, Usage};
+use crate::events::{ChoiceLogprobs, Event, Usage};
+use crate::reasoning_display::{self, DisplayJoiner, ReasoningOutput};
+use crate::reasoning_estimate::ReasoningEstimate;
+use crate::tool_search::annotate_tool_search_usage_details;
+use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
 /// Derive one replay-stable public object ID, mirroring `stable_public_id`.
 pub fn stable_public_id(prefix: &str, request_id: &str) -> String {
@@ -37,8 +41,10 @@ pub struct ReasoningCarrierToolCall {
     pub raw_arguments: String,
 }
 
+/// Shared by the Chat and Messages encoders: both surfaces retain the same
+/// hidden-reasoning candidate and seal it under the same authority.
 #[derive(Default)]
-struct ReasoningCarrierState {
+pub(crate) struct ReasoningCarrierState {
     route_sha256: Option<String>,
     content: String,
     assistant_content: String,
@@ -48,7 +54,7 @@ struct ReasoningCarrierState {
 }
 
 impl ReasoningCarrierState {
-    fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
+    pub(crate) fn observe(&mut self, event: &Event) -> Result<(), PublicError> {
         match event {
             Event::TextDelta(delta) => self.assistant_content.push_str(delta),
             Event::ReasoningContentDelta {
@@ -77,6 +83,7 @@ impl ReasoningCarrierState {
                 index,
                 call_id,
                 name,
+                ..
             } => {
                 if self.tool_ids.contains_key(index)
                     || self
@@ -117,7 +124,7 @@ impl ReasoningCarrierState {
         Ok(())
     }
 
-    fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
+    pub(crate) fn candidate(&self) -> Result<Option<ReasoningCarrierCandidate>, PublicError> {
         if self.content.is_empty() || self.tool_ids.is_empty() {
             return Ok(None);
         }
@@ -125,6 +132,16 @@ impl ReasoningCarrierState {
             return Err(invalid_provider_stream(
                 "Chat reasoning content requires complete unique tool calls.",
             ));
+        }
+        // A custom (freeform) call returns to the gateway as an opaque
+        // `custom_tool_call` history item, never as a tool-call turn, so a
+        // carrier sealed over it could not be bound on the next request and its
+        // freeform input is no JSON object to digest. The turn serves without
+        // preserved reasoning, as a failover would (Codex `apply_patch` on
+        // Experiential Cloud failed every such completed turn at the terminal,
+        // production 2026-10-19).
+        if self.completed.values().any(|call| call.custom) {
+            return Ok(None);
         }
         let route_sha256 = self.route_sha256.clone().ok_or_else(|| {
             invalid_provider_stream("Chat reasoning content omitted provider route identity.")
@@ -174,9 +191,21 @@ pub struct ChatSseEncoder {
     terminal: bool,
     tool_indices: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
+    /// Indexes of custom (freeform) tool calls, rendered in OpenAI's Chat
+    /// `{"type": "custom", "custom": {"name", "input"}}` shape.
+    custom_tools: HashSet<u32>,
     usage: Option<Usage>,
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
+    reasoning_output_exposed: bool,
+    reasoning_displayed: bool,
+    reasoning_display: DisplayJoiner,
+    /// Visible output and thinking for the estimated reasoning count.
+    reasoning_estimate: ReasoningEstimate,
+    web_search: Option<ChatWebSearch>,
+    /// Gateway-run tool-search rounds metered on the usage chunk; zero
+    /// leaves every frame byte-identical.
+    tool_search_requests: u32,
 }
 
 impl ChatSseEncoder {
@@ -198,15 +227,62 @@ impl ChatSseEncoder {
             terminal: false,
             tool_indices: HashMap::new(),
             tool_arguments: HashMap::new(),
+            custom_tools: HashSet::new(),
             usage: None,
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
+            reasoning_output_exposed: false,
+            reasoning_displayed: false,
+            reasoning_display: DisplayJoiner::default(),
+            reasoning_estimate: ReasoningEstimate::default(),
+            web_search: None,
+            tool_search_requests: 0,
         }
+    }
+
+    /// Meter the gateway-run tool-search rounds on the usage chunk; the Chat
+    /// surface renders no item for them.
+    pub fn set_tool_search_requests(&mut self, requests: u32) {
+        self.tool_search_requests = requests;
     }
 
     /// Attach an authenticated carrier before the terminal is encoded.
     pub fn set_reasoning_content_carrier(&mut self, carrier: String) {
         self.reasoning_content_carrier = Some(carrier);
+    }
+
+    /// Cite the gateway-executed web search at the terminal: `None` (no
+    /// search) leaves every frame byte-identical.
+    pub fn set_web_search(&mut self, web_search: Option<WebSearchAdmission>) {
+        self.web_search = web_search.map(ChatWebSearch::new);
+    }
+
+    /// Set both reasoning facts of the winning rung; both are off by default.
+    ///
+    /// Exposure is on only for rungs the catalog marks
+    /// `reasoning_output_exposed`, so a Tencent/DeepSeek client sees the
+    /// `reasoning_content` deltas it replays. Display returns the model's
+    /// reasoning text as `choices[].delta.reasoning` copy (thinking,
+    /// summaries, and plaintext reasoning alike); the serving route turns it
+    /// on for every rung that has not opted out. The sealed round-trip carrier
+    /// at the terminal is independent of both.
+    pub fn set_reasoning_output(&mut self, output: ReasoningOutput) {
+        self.reasoning_output_exposed = output.exposed;
+        self.reasoning_displayed = output.displayed;
+    }
+
+    /// One `delta.reasoning` chunk for `event`'s display text, if any.
+    fn displayed_reasoning(&mut self, event: &Event) -> Vec<String> {
+        if !self.reasoning_displayed {
+            return Vec::new();
+        }
+        match self
+            .reasoning_display
+            .delta(event, self.reasoning_output_exposed)
+        {
+            Some(text) => vec![self.chunk(json!({"reasoning": text}), None)],
+            None => Vec::new(),
+        }
     }
 
     /// Return the validated candidate accumulated by a live stream.
@@ -240,7 +316,23 @@ impl ChatSseEncoder {
             ));
         }
         self.reasoning.observe(event)?;
+        self.reasoning_estimate.observe(event);
+        if let Some(web_search) = self.web_search.as_mut() {
+            web_search.observe(event);
+        }
         match event {
+            Event::ProviderResponsesLogprobs { .. } => Err(invalid_provider_stream(
+                "Responses probability events require the Responses encoder",
+            )),
+            Event::ChoiceLogprobsDelta(update) => Ok(vec![self.chunk_with_logprobs(
+                json!({}),
+                None,
+                update.logprobs.as_ref(),
+            )]),
+            Event::Image(url) => Ok(vec![self.chunk(
+                json!({"images": [crate::image_output::chat_image_value(url)]}),
+                None,
+            )]),
             Event::TextDelta(text) => Ok(vec![self.chunk(json!({"content": text}), None)]),
             Event::RefusalDelta(text) => Ok(vec![self.chunk(json!({"refusal": text}), None)]),
             Event::ProviderTextDelta { delta, .. } => {
@@ -249,19 +341,37 @@ impl ChatSseEncoder {
             Event::ProviderRefusalDelta { delta, .. } => {
                 Ok(vec![self.chunk(json!({"refusal": delta}), None)])
             }
-            Event::ReasoningContentDelta { .. } => Ok(Vec::new()),
-            // The Chat wire has no reasoning representation, so provider
-            // reasoning follows the summary path and is deliberately dropped.
+            Event::ReasoningContentDelta { delta, .. } => {
+                // On an exposure-gated rung (Tencent/DeepSeek), the model's
+                // plaintext reasoning is returned to the caller as
+                // `choices[].delta.reasoning_content`, the field it replays.
+                // Elsewhere it is display copy on `delta.reasoning` when the
+                // rung displays reasoning; the sealed round-trip carrier at the
+                // terminal is emitted independently regardless.
+                if self.reasoning_output_exposed && !delta.is_empty() {
+                    Ok(vec![self.chunk(json!({"reasoning_content": delta}), None)])
+                } else {
+                    Ok(self.displayed_reasoning(event))
+                }
+            }
+            // Readable reasoning in every provider form is display copy on
+            // `delta.reasoning` when the rung displays it.
+            Event::ReasoningTextDelta(_)
+            | Event::ReasoningSummaryDelta { .. }
+            | Event::ThinkingDelta { .. } => Ok(self.displayed_reasoning(event)),
+            // Opaque reasoning has no Chat representation and is dropped.
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
-            | Event::ThinkingDelta { .. }
+            | Event::GeminiThoughtPart(_)
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             // Anthropic text-block boundaries and citation metadata have no
             // Chat representation; the text itself streams through TextDelta.
             Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Safeguard verdicts answer a Messages-only request field; Chat
+            // has no slot for them, so they never reach a Chat caller.
+            Event::SafeguardResults(_) => Ok(Vec::new()),
             // Server tools enter only through a Messages request, which
             // never encodes on the Chat surface.
             Event::ServerToolUseStarted { .. }
@@ -270,10 +380,23 @@ impl ChatSseEncoder {
             | Event::ServerToolResult { .. } => Err(invalid_provider_stream(
                 "Chat cannot represent a provider server tool.",
             )),
+            // Hosted tool items enter only through Responses-native tool
+            // declarations, which never admit on the Chat surface.
+            Event::HostedToolItemStarted { .. }
+            | Event::HostedToolItemProgress { .. }
+            | Event::HostedToolItemCompleted { .. } => Err(invalid_provider_stream(
+                "Chat cannot represent a provider-hosted Responses tool item.",
+            )),
+            // OpenAI text annotations have no Chat representation; the text
+            // itself streams through its delta events.
+            Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
             Event::ToolCallStarted {
                 index,
                 call_id,
                 name,
+                custom,
+                thought_signature,
+                ..
             } => {
                 if self.tool_indices.contains_key(index) {
                     return Err(invalid_provider_stream(
@@ -283,43 +406,41 @@ impl ChatSseEncoder {
                 self.tool_indices
                     .insert(*index, (call_id.clone(), name.clone()));
                 self.tool_arguments.insert(*index, String::new());
-                Ok(vec![self.chunk(
+                let call = if *custom {
+                    self.custom_tools.insert(*index);
                     json!({
-                        "tool_calls": [
-                            {
-                                "index": index,
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": ""},
-                            }
-                        ]
-                    }),
-                    None,
-                )])
+                        "index": index,
+                        "id": call_id,
+                        "type": "custom",
+                        "custom": {"name": name, "input": ""},
+                    })
+                } else {
+                    json!({
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    })
+                };
+                let call = with_thought_signature(call, thought_signature.as_deref());
+                Ok(vec![self.chunk(json!({ "tool_calls": [call] }), None)])
             }
             Event::ToolArgumentsDelta { index, delta } => {
                 let accumulated = self.tool_arguments.get_mut(index).ok_or_else(|| {
                     invalid_provider_stream("Chat tool arguments arrived before tool-call start.")
                 })?;
                 accumulated.push_str(delta);
-                Ok(vec![self.chunk(
-                    json!({
-                        "tool_calls": [
-                            {
-                                "index": index,
-                                "function": {"arguments": delta},
-                            }
-                        ]
-                    }),
-                    None,
-                )])
+                let call = if self.custom_tools.contains(index) {
+                    json!({"index": index, "custom": {"input": delta}})
+                } else {
+                    json!({"index": index, "function": {"arguments": delta}})
+                };
+                Ok(vec![self.chunk(json!({ "tool_calls": [call] }), None)])
             }
             Event::ToolCallCompleted { index, call } => {
-                if call.custom {
-                    // Custom tools only enter through a Responses request,
-                    // which never encodes on the Chat surface.
+                if call.custom != self.custom_tools.contains(index) {
                     return Err(invalid_provider_stream(
-                        "Chat cannot represent a custom tool call.",
+                        "Chat tool completion changed its custom tool kind.",
                     ));
                 }
                 let identity = self.tool_indices.get(index).ok_or_else(|| {
@@ -341,7 +462,10 @@ impl ChatSseEncoder {
                 }
                 Ok(Vec::new())
             }
-            Event::Completed | Event::Incomplete | Event::PausedTurn => {
+            Event::Completed
+            | Event::Incomplete
+            | Event::StoppedAtSequence(_)
+            | Event::PausedTurn => {
                 self.terminal = true;
                 let finish_reason = if matches!(event, Event::Incomplete) {
                     "length"
@@ -351,13 +475,22 @@ impl ChatSseEncoder {
                     "stop"
                 };
                 let mut frames = Vec::new();
-                if matches!(event, Event::Completed) && self.reasoning.candidate()?.is_some() {
+                if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
+                    && self.reasoning.candidate()?.is_some()
+                    && !self.reasoning_output_exposed
+                {
                     let carrier = self.reasoning_content_carrier.as_ref().ok_or_else(|| {
                         invalid_provider_stream(
                             "Chat reasoning content was not sealed by the gateway authority.",
                         )
                     })?;
                     frames.push(self.chunk(json!({"reasoning_content": carrier}), None));
+                }
+                // Search citations ride one annotations delta immediately
+                // before the finish chunk, and only when a result URL appears.
+                let annotations = self.web_search.as_ref().map(ChatWebSearch::annotations);
+                if let Some(annotations) = annotations.filter(|found| !found.is_empty()) {
+                    frames.push(self.chunk(json!({"annotations": annotations}), None));
                 }
                 frames.push(self.chunk(json!({}), Some(finish_reason)));
                 if self.include_usage {
@@ -383,6 +516,15 @@ impl ChatSseEncoder {
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
+        self.chunk_with_logprobs(delta, finish_reason, None)
+    }
+
+    fn chunk_with_logprobs(
+        &self,
+        delta: Value,
+        finish_reason: Option<&str>,
+        logprobs: Option<&ChoiceLogprobs>,
+    ) -> String {
         let mut payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
@@ -393,7 +535,7 @@ impl ChatSseEncoder {
                     "index": 0,
                     "delta": delta,
                     "finish_reason": finish_reason,
-                    "logprobs": Value::Null,
+                    "logprobs": logprobs.map_or(Value::Null, |value| serde_json::to_value(value).unwrap_or(Value::Null)),
                 }
             ],
         });
@@ -410,16 +552,39 @@ impl ChatSseEncoder {
     }
 
     fn usage_chunk(&self, usage: &Usage) -> String {
+        let reported = usage;
+        let mut usage = streaming_chat_usage(reported);
+        self.reasoning_estimate
+            .annotate(&mut usage, Some(reported), "completion_tokens_details");
+        annotate_usage_details(
+            &mut usage,
+            self.web_search.as_ref().map(ChatWebSearch::admission),
+        );
+        annotate_tool_search_usage_details(&mut usage, self.tool_search_requests);
         let payload = json!({
             "id": self.completion_id,
             "object": "chat.completion.chunk",
             "created": self.created_at,
             "model": self.model,
             "choices": [],
-            "usage": streaming_chat_usage(usage),
+            "usage": usage,
         });
         chat_data(&payload)
     }
+}
+
+/// Attach Gemini's thought signature to one public tool call in the shape
+/// Google's own OpenAI-compatible endpoint uses,
+/// `extra_content.google.thought_signature`, so clients built for that
+/// endpoint echo it back unchanged. A call without one is left as it was.
+pub fn with_thought_signature(mut call: Value, thought_signature: Option<&str>) -> Value {
+    if let (Some(signature), Some(object)) = (thought_signature, call.as_object_mut()) {
+        object.insert(
+            "extra_content".to_string(),
+            json!({"google": {"thought_signature": signature}}),
+        );
+    }
+    call
 }
 
 /// Frame one compact UTF-8-preserving Chat SSE data event.
@@ -437,13 +602,64 @@ pub fn compact_json(payload: &Value) -> String {
 fn streaming_chat_usage(usage: &Usage) -> Value {
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    json!({
+    let mut wire = json!({
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input + output,
-        "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens.unwrap_or(0)},
+        "prompt_tokens_details": chat_input_details(usage, true),
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
-    })
+    });
+    annotate_image_tokens(&mut wire["completion_tokens_details"], usage);
+    let unreported = usage.unreported_token_details();
+    if !unreported.is_empty() {
+        wire["unreported_token_details"] = json!(unreported);
+    }
+    wire
+}
+
+/// Name the generated-image subset of the output as `image_tokens`
+/// (OpenRouter's field) inside an output-details object, when one was reported.
+pub(crate) fn annotate_image_tokens(details: &mut Value, usage: &Usage) {
+    if let (Some(image), Some(details)) = (usage.image_output_tokens, details.as_object_mut()) {
+        details.insert("image_tokens".to_string(), json!(image));
+    }
+}
+
+/// OpenAI's write-lifetime split (`ttl_30m_tokens`, `ttl_12h_tokens`), named
+/// only when a 12-hour count was observed: the two never overlap and sum to
+/// `cache_write_tokens` less any one-hour subset.
+pub(crate) fn cache_write_lifetimes(usage: &Usage) -> Option<Value> {
+    let half_day = usage.cache_creation_12h_input_tokens?;
+    let written = usage.cache_creation_input_tokens.unwrap_or(0);
+    let short = written
+        .saturating_sub(half_day)
+        .saturating_sub(usage.cache_creation_1h_input_tokens.unwrap_or(0));
+    Some(json!({"ttl_30m_tokens": short, "ttl_12h_tokens": half_day}))
+}
+
+/// Input subsets remain unknown when absent; cache writes are never invented.
+fn chat_input_details(usage: &Usage, streaming: bool) -> Value {
+    let mut details = serde_json::Map::new();
+    if let Some(cached) = usage
+        .reported_cached_input_tokens()
+        .or(streaming.then_some(0))
+    {
+        details.insert("cached_tokens".into(), json!(cached));
+    }
+    if let Some(written) = usage.cache_creation_input_tokens {
+        details.insert("cache_write_tokens".into(), json!(written));
+    }
+    if let Some(hour) = usage.cache_creation_1h_input_tokens {
+        details.insert("cache_write_1h_tokens".into(), json!(hour));
+    }
+    if let Some(split) = cache_write_lifetimes(usage) {
+        details.insert("cache_write_tokens_details".into(), split);
+    }
+    if details.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(details)
+    }
 }
 
 /// Non-streaming usage shape from `exp.runtime.openai_protocol.response.chat_usage`.
@@ -454,14 +670,13 @@ fn completed_chat_usage(usage: Option<&Usage>) -> Value {
     };
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    let details = match usage.cached_input_tokens {
-        Some(cached) => json!({"cached_tokens": cached}),
-        None => Value::Null,
-    };
-    let output_details = match usage.reasoning_tokens {
+    let details = chat_input_details(usage, false);
+    let mut output_details = match usage.reasoning_tokens {
         Some(reasoning) => json!({"reasoning_tokens": reasoning}),
+        None if usage.image_output_tokens.is_some() => json!({}),
         None => Value::Null,
     };
+    annotate_image_tokens(&mut output_details, usage);
     json!({
         "prompt_tokens": input,
         "completion_tokens": output,
@@ -487,6 +702,7 @@ pub fn completed_chat_body_with_ignored(
     created_at: i64,
     events: &[Event],
     ignored_parameters: &[String],
+    reasoning: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedCompletion, PublicError> {
     completed_chat_body_with_carrier(
         request_id,
@@ -495,6 +711,7 @@ pub fn completed_chat_body_with_ignored(
         events,
         ignored_parameters,
         None,
+        reasoning,
     )
 }
 
@@ -506,7 +723,10 @@ pub fn completed_chat_body_with_carrier(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
+    reasoning_output: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedCompletion, PublicError> {
+    let reasoning_output = reasoning_output.into();
+    let reasoning_output_exposed = reasoning_output.exposed;
     let terminal = events.iter().rev().find(|event| event.is_terminal());
     let terminal = match terminal {
         Some(event) => event,
@@ -566,14 +786,23 @@ pub fn completed_chat_body_with_carrier(
     let tool_calls: Vec<Value> = events
         .iter()
         .filter_map(|event| match event {
-            Event::ToolCallCompleted { call, .. } => Some(json!({
+            Event::ToolCallCompleted { call, .. } if call.custom => Some(json!({
                 "id": call.call_id,
-                "type": "function",
-                "function": {"name": call.name, "arguments": call.raw_arguments},
+                "type": "custom",
+                "custom": {"name": call.name, "input": call.raw_arguments},
             })),
+            Event::ToolCallCompleted { call, .. } => Some(with_thought_signature(
+                json!({
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.raw_arguments},
+                }),
+                call.thought_signature.as_deref(),
+            )),
             _ => None,
         })
         .collect();
+    let logprobs = crate::logprobs::aggregate(events);
     let reasoning = reasoning_carrier_candidate(events)?;
     let incomplete = matches!(terminal, Event::Incomplete);
     let finish_reason = if incomplete {
@@ -588,9 +817,36 @@ pub fn completed_chat_body_with_carrier(
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { Value::String(text) },
         "refusal": if refusal.is_empty() { Value::Null } else { Value::String(refusal) },
-        "tool_calls": if tool_calls.is_empty() { Value::Null } else { Value::Array(tool_calls) },
     });
-    if matches!(terminal, Event::Completed) && has_tool_calls && reasoning.is_some() {
+    let images: Vec<Value> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Image(url) => Some(crate::image_output::chat_image_value(url)),
+            _ => None,
+        })
+        .collect();
+    if !images.is_empty() {
+        message["images"] = Value::Array(images);
+    }
+    // OpenAI documents `tool_calls` as an optional array and omits it from a
+    // message that made no calls; it never serializes `null` there. Strict
+    // OpenAI-schema consumers (the OpenRouter SDK's response parser, for one)
+    // reject `"tool_calls": null` while accepting an absent key, so the key
+    // appears only when there is at least one call.
+    if has_tool_calls {
+        message
+            .as_object_mut()
+            .expect("chat message is an object")
+            .insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
+        && has_tool_calls
+        && reasoning.is_some()
+        && !reasoning_output_exposed
+    {
+        // A tool turn's reasoning round-trips as the sealed opaque carrier
+        // (never raw plaintext — that would be a CoT-injection vector on the
+        // way back in), so `reasoning_content` carries the carrier.
         let carrier = reasoning_content_carrier.ok_or_else(|| {
             invalid_provider_stream(
                 "Chat reasoning content was not sealed by the gateway authority.",
@@ -603,7 +859,44 @@ pub fn completed_chat_body_with_carrier(
                 "reasoning_content".to_string(),
                 Value::String(carrier.to_string()),
             );
+    } else if reasoning_output_exposed {
+        // A non-tool reasoning turn on an exposure-gated rung
+        // (Tencent/DeepSeek) has no carrier to round-trip, so the plaintext
+        // reasoning is returned for display only. The tokens are already
+        // billed; every other rung keeps reasoning stripped.
+        let reasoning_text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ReasoningContentDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !reasoning_text.is_empty() {
+            message
+                .as_object_mut()
+                .expect("chat message is an object")
+                .insert(
+                    "reasoning_content".to_string(),
+                    Value::String(reasoning_text),
+                );
+        }
     }
+    if reasoning_output.displayed {
+        // OpenRouter's `message.reasoning`: display copy of every readable
+        // reasoning form, beside (never instead of) the carrier above.
+        if let Some(text) = reasoning_display::flattened(events, reasoning_output_exposed) {
+            message
+                .as_object_mut()
+                .expect("chat message is an object")
+                .insert("reasoning".to_string(), Value::String(text));
+        }
+    }
+    let mut usage_wire = completed_chat_usage(usage.as_ref());
+    ReasoningEstimate::from_events(events).annotate(
+        &mut usage_wire,
+        usage.as_ref(),
+        "completion_tokens_details",
+    );
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
         "object": "chat.completion",
@@ -614,10 +907,10 @@ pub fn completed_chat_body_with_carrier(
                 "index": 0,
                 "message": message,
                 "finish_reason": finish_reason,
-                "logprobs": Value::Null,
+                "logprobs": logprobs.as_ref().map_or(Value::Null, |value| serde_json::to_value(value).unwrap_or(Value::Null)),
             }
         ],
-        "usage": completed_chat_usage(usage.as_ref()),
+        "usage": usage_wire,
     });
     if !ignored_parameters.is_empty() {
         body.as_object_mut()
@@ -637,175 +930,5 @@ pub fn completed_chat_body_with_carrier(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fireworks_tool_events() -> Vec<Event> {
-        vec![
-            Event::ReasoningContentDelta {
-                route_sha256: "a".repeat(64),
-                delta: "hidden provider reasoning".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-one".to_string(),
-                name: "lookup".to_string(),
-            },
-            Event::ToolArgumentsDelta {
-                index: 0,
-                delta: "{}".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-one".to_string(),
-                    name: "lookup".to_string(),
-                    raw_arguments: "{}".to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    custom: false,
-                },
-            },
-            Event::Completed,
-        ]
-    }
-
-    #[test]
-    fn fireworks_chat_reasoning_round_trips_only_as_sealed_carrier() {
-        let events = fireworks_tool_events();
-        let mut stream = ChatSseEncoder::new_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            false,
-            Vec::new(),
-        );
-        stream.set_reasoning_content_carrier("authenticated-carrier-v2".to_string());
-        let mut frames = stream.start().expect("stream start must encode");
-        for event in &events {
-            frames.extend(stream.feed(event).expect("event must encode"));
-        }
-        let public = frames.join("");
-        assert!(!public.contains("hidden provider reasoning"));
-        assert!(public.contains("authenticated-carrier-v2"));
-
-        let completed = completed_chat_body_with_carrier(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            &events,
-            &[],
-            Some("authenticated-carrier-v2"),
-        )
-        .expect("completed body must preserve the carrier");
-        assert_eq!(
-            completed.body["choices"][0]["message"]["reasoning_content"],
-            json!("authenticated-carrier-v2")
-        );
-        assert!(!completed
-            .body
-            .to_string()
-            .contains("hidden provider reasoning"));
-    }
-
-    #[test]
-    fn fireworks_chat_reasoning_fails_closed_without_carrier_or_unique_completion() {
-        let events = fireworks_tool_events();
-        assert!(completed_chat_body_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            &events,
-            &[],
-        )
-        .is_err());
-
-        let mut duplicate = events[..events.len() - 1].to_vec();
-        duplicate.push(events[3].clone());
-        duplicate.push(Event::Completed);
-        assert!(reasoning_carrier_candidate(&duplicate).is_err());
-    }
-
-    #[test]
-    fn reasoning_carrier_preserves_provider_tool_start_order() {
-        let events = vec![
-            Event::ReasoningContentDelta {
-                route_sha256: "a".repeat(64),
-                delta: "hidden".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 1,
-                call_id: "call-one".to_string(),
-                name: "first".to_string(),
-            },
-            Event::ToolCallStarted {
-                index: 0,
-                call_id: "call-zero".to_string(),
-                name: "second".to_string(),
-            },
-            Event::ToolCallCompleted {
-                index: 0,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-zero".to_string(),
-                    name: "second".to_string(),
-                    raw_arguments: "{\"order\":0}".to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    custom: false,
-                },
-            },
-            Event::ToolCallCompleted {
-                index: 1,
-                call: crate::events::CompletedToolCall {
-                    call_id: "call-one".to_string(),
-                    name: "first".to_string(),
-                    raw_arguments: "{\"order\":1}".to_string(),
-                    provider_item_id: None,
-                    provider_status: None,
-                    custom: false,
-                },
-            },
-        ];
-
-        let candidate = reasoning_carrier_candidate(&events)
-            .expect("provider events must validate")
-            .expect("reasoning plus tools must produce a carrier");
-
-        assert_eq!(
-            candidate
-                .tool_calls
-                .iter()
-                .map(|call| call.call_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["call-one", "call-zero"]
-        );
-    }
-
-    #[test]
-    fn ignored_generation_controls_are_disclosed_by_both_chat_encoders() {
-        let ignored = vec!["top_p".to_string(), "reasoning_effort".to_string()];
-        let mut stream = ChatSseEncoder::new_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            false,
-            ignored.clone(),
-        );
-        let frames = stream.start().expect("stream start must encode");
-        assert!(frames[0]
-            .contains("\"x-experiential-ignored-parameters\":[\"top_p\",\"reasoning_effort\"]"));
-
-        let completed = completed_chat_body_with_ignored(
-            "request-1",
-            "coding",
-            1_700_000_000,
-            &[Event::Completed],
-            &ignored,
-        )
-        .expect("completed body must encode");
-        assert_eq!(
-            completed.body["x-experiential-ignored-parameters"],
-            json!(["top_p", "reasoning_effort"])
-        );
-    }
-}
+#[path = "encode_tests.rs"]
+mod tests;

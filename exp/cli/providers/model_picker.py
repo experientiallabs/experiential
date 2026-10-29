@@ -1,13 +1,13 @@
-"""Role-first model assignment and confirmation screens for provider setup.
+"""Model pool selection, role assignment, and confirmation screens for provider setup.
 
-These screens run after every selected provider has been prepared. Setup asks for each model
-role in turn: world model, judge, embedder, then optional router candidates and their incumbent.
+These screens run after every selected provider has been prepared. Setup first selects any number
+of models per provider, then assigns world model, judge, embedder and optional router candidates.
 Every screen uses the shared picker with concise shorthand aliases, sorted so the recommended
 model for each role comes first. Verified metadata can be assigned immediately. Identity-only
 OpenAI-compatible models stay visible as unknown; selecting one collects an explicit operator
 declaration of the minimum capabilities and prices that role needs. Exact prior assignments remain
 retain-only choices. Each completion role then asks for a role-specific reasoning effort when the
-selected model already carries a reasoning pin, and the compact summary is shown before setup
+selected model declares supported choices, and the compact summary is shown before setup
 saves anything.
 """
 
@@ -36,6 +36,7 @@ from exp.cli.providers.provider_picker import (
     SetupSession,
     ask_text,
 )
+from exp.cli.providers.reasoning import model_reasoning_efforts
 from exp.cli.shared.picker import PickerAction, PickerOption, choose_many, choose_one
 from exp.common.models import (
     ModelCapabilities,
@@ -59,7 +60,6 @@ _CandidateAssignment = tuple[
     tuple[AvailableModel, ...],
 ]
 _MANUAL_MODEL_ROW = "declare-model-manually"
-_NO_REASONING_EFFORT = "__unset_reasoning_effort__"
 _REASONING_EFFORTS: tuple[ReasoningEffort, ...] = get_args(ReasoningEffort)
 
 
@@ -345,38 +345,6 @@ def _parse_reasoning_effort(value: str) -> ReasoningEffort | None:
     return next((effort for effort in _REASONING_EFFORTS if effort == value), None)
 
 
-def _ask_reasoning_effort(*, console: Console) -> ReasoningEffort | None:
-    """Choose an optional reasoning-effort pin for one manually declared completion model.
-
-    Args:
-        console: Terminal used for the screen.
-
-    Returns:
-        The chosen effort, or ``None`` so the parameter is never sent.
-
-    Raises:
-        SetupCancelled: The user cancelled setup.
-    """
-    result = choose_one(
-        console,
-        title="Reasoning effort (pin only for models accepting the OpenAI reasoning parameter)",
-        options=[
-            PickerOption(
-                value=_NO_REASONING_EFFORT,
-                label="unset",
-                detail="never send the reasoning parameter",
-            ),
-            *(PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS),
-        ],
-        default=_NO_REASONING_EFFORT,
-    )
-    if result.action is PickerAction.CANCEL:
-        raise SetupCancelled
-    if result.action is PickerAction.BACK:
-        return None
-    return _parse_reasoning_effort(result.values[0])
-
-
 class _RoleEffortBack:
     """Sentinel marking a back navigation from one role effort screen."""
 
@@ -394,8 +362,8 @@ def _ask_role_reasoning_effort(
 ) -> ReasoningEffort | None | _RoleEffortBack:
     """Choose the reasoning effort one completion role uses for its just-selected model.
 
-    The screen appears only when the selected model's verified capabilities carry a reasoning
-    pin; unsupported and unverified models are never asked and keep no role effort.
+    The screen appears only when the selected model has supported reasoning choices.
+    Stale defaults outside that model's contract are never reused.
 
     Args:
         chosen: Models the user selected.
@@ -412,13 +380,23 @@ def _ask_role_reasoning_effort(
         SetupCancelled: The user cancelled setup.
     """
     item = next((entry for entry in chosen if entry.alias == alias), None)
-    if item is None or item.capabilities is None or item.capabilities.reasoning_effort is None:
+    if item is None or item.capabilities is None:
+        return None
+    efforts = model_reasoning_efforts(item)
+    if not efforts:
         return None
     result = choose_one(
         console,
         title=f"{role_name.capitalize()} effort ({alias})",
-        options=[PickerOption(value=effort, label=effort) for effort in _REASONING_EFFORTS],
-        default=default or item.capabilities.reasoning_effort,
+        options=[PickerOption(value=effort, label=effort) for effort in efforts],
+        default=next(
+            (
+                effort
+                for effort in (default, item.capabilities.reasoning_effort)
+                if effort in efforts
+            ),
+            None,
+        ),
     )
     if result.action is PickerAction.CANCEL:
         raise SetupCancelled
@@ -850,6 +828,8 @@ def model_selection(item: AvailableModel) -> ProviderModelSelection:
         connection=item.connection,
         model=item.model,
         capabilities=capabilities,
+        supported_reasoning_efforts=item.supported_reasoning_efforts,
+        discovery=item.published,
     )
 
 
@@ -886,6 +866,15 @@ def configured_models(
                 pricing_source=PricingSource.CONFIGURED,
                 configured=True,
                 retainable_roles=roles,
+                published=model.discovery,
+                supported_reasoning_efforts=(
+                    model.supported_reasoning_efforts
+                    if model.supported_reasoning_efforts is not None
+                    else model.gateway.capabilities.supported_reasoning_efforts
+                    if model.gateway is not None
+                    and model.gateway.capabilities.declares_reasoning_contract
+                    else None
+                ),
             )
         )
     return tuple(records)

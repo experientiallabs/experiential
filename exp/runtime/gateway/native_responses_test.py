@@ -17,7 +17,10 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext, remember_turn
-from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
+from exp.runtime.gateway.reasoning_carrier import (
+    FIREWORKS_REASONING_CONTENT_PREFIX,
+    HUNYUAN_SCHEME,
+)
 from exp.runtime.models.providers.streaming_requests import openai_responses_stream_payload
 from exp.runtime.openai_protocol.state import (
     BoundedContinuationStore,
@@ -49,11 +52,42 @@ def _context() -> ContinuationContext:
     )
 
 
-def _carrier() -> str:
-    """Build one structurally valid sealed Fireworks carrier."""
-    deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
+def _carrier(prefix: str = FIREWORKS_REASONING_CONTENT_PREFIX) -> str:
+    """Build one structurally valid sealed carrier under ``prefix``'s scheme."""
+    deployment = base64.urlsafe_b64encode(b"provider-rung").rstrip(b"=").decode()
     envelope = base64.urlsafe_b64encode(b"opaque-envelope").rstrip(b"=").decode()
-    return f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment}:{envelope}"
+    return f"{prefix}{deployment}:{envelope}"
+
+
+def test_remember_turn_retains_a_hunyuan_carrier_under_its_own_scheme() -> None:
+    """The carrier prefix selects the scheme; a Hunyuan carrier is not a Fireworks one.
+
+    Production 2026-09-15: Responses + tools on the Tencent Hunyuan lanes answered
+    500 AFTER the attempt settled and charged, because continuation storage parsed
+    every carrier under the Fireworks default and rejected the Hunyuan prefix.
+    """
+    store = BoundedContinuationStore()
+    context = _context()
+    carrier = _carrier(HUNYUAN_SCHEME.prefix)
+
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "",
+            "refusal": False,
+            "reasoning_content_carrier": carrier,
+            "tool_calls": [{"call_id": "call-one", "name": "lookup", "arguments": "{}"}],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    block = state.messages[-1].provider_reasoning[0]
+    assert block.kind == "sealed_reasoning_content"
+    assert block.carrier == carrier
 
 
 def test_remember_turn_retains_the_sealed_responses_carrier() -> None:
@@ -112,13 +146,13 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
             "text": "",
             "refusal": False,
             "encrypted_reasoning": [
-                {"output_index": 2, "item_id": "rs-2", "encrypted_content": "second-opaque"},
-                {"output_index": 0, "item_id": "rs-0", "encrypted_content": "first-opaque"},
+                {"output_index": 2, "item_id": "rs_2", "encrypted_content": "second-opaque"},
+                {"output_index": 0, "item_id": "rs_0", "encrypted_content": "first-opaque"},
             ],
             "tool_calls": [
                 {
                     "output_index": 1,
-                    "item_id": "fc-1",
+                    "item_id": "fc_1",
                     "call_id": "call-one",
                     "name": "lookup",
                     "arguments": '{ "query" : "λ" }',
@@ -135,10 +169,10 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
     encrypted_blocks = tuple(
         cast(EncryptedReasoningBlock, block) for block in message.provider_reasoning
     )
-    assert tuple(block.id for block in encrypted_blocks) == ("rs-0", "rs-2")
+    assert tuple(block.id for block in encrypted_blocks) == ("rs_0", "rs_2")
     assert tuple(block.output_index for block in encrypted_blocks) == (0, 2)
     call = message.tool_calls[0]
-    assert call.provider_item_id == "fc-1"
+    assert call.provider_item_id == "fc_1"
     assert call.provider_output_index == 1
     assert call.raw_arguments == '{ "query" : "λ" }'
 
@@ -163,7 +197,7 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
         },
         {
             "type": "function_call",
-            "id": "fc-1",
+            "id": "fc_1",
             "call_id": "call-one",
             "name": "lookup",
             "arguments": '{ "query" : "λ" }',
@@ -189,15 +223,15 @@ def test_remember_turn_replays_assistant_preamble_at_its_provider_output_index()
         data={
             "text": "I will look that up.",
             "message_output_index": 1,
-            "message_item_id": "msg-1",
+            "message_item_id": "msg_1",
             "refusal": False,
             "encrypted_reasoning": [
-                {"output_index": 0, "item_id": "rs-0", "encrypted_content": "opaque"}
+                {"output_index": 0, "item_id": "rs_0", "encrypted_content": "opaque"}
             ],
             "tool_calls": [
                 {
                     "output_index": 2,
-                    "item_id": "fc-2",
+                    "item_id": "fc_2",
                     "call_id": "call-2",
                     "name": "lookup",
                     "arguments": '{ "query" : "λ" }',
@@ -225,8 +259,8 @@ def test_remember_turn_replays_assistant_preamble_at_its_provider_output_index()
     payload_input = cast(list[JsonObject], payload["input"])
     assert [(item["type"], item.get("id")) for item in payload_input[:-1]] == [
         ("reasoning", None),
-        ("message", "msg-1"),
-        ("function_call", "fc-2"),
+        ("message", "msg_1"),
+        ("function_call", "fc_2"),
     ]
     message_content = cast(list[JsonObject], payload_input[1]["content"])
     assert message_content[0]["text"] == "I will look that up."
@@ -250,14 +284,14 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
             "message_outputs": [
                 {
                     "output_index": 1,
-                    "item_id": "msg-commentary",
+                    "item_id": "msg_commentary",
                     "text": "Checking first.",
                     "status": "incomplete",
                     "phase": "commentary",
                 },
                 {
                     "output_index": 3,
-                    "item_id": "msg-final",
+                    "item_id": "msg_final",
                     "text": "Final answer.",
                     "status": "completed",
                     "phase": "final_answer",
@@ -266,7 +300,7 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
             "encrypted_reasoning": [
                 {
                     "output_index": 0,
-                    "item_id": "rs-incomplete",
+                    "item_id": "rs_incomplete",
                     "encrypted_content": "opaque-incomplete",
                     "status": "incomplete",
                 }
@@ -289,14 +323,14 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
         previous_response_id=context.response_id,
     )
     first, second = state.messages[-2:]
-    assert first.provider_item_id == "msg-commentary"
+    assert first.provider_item_id == "msg_commentary"
     assert first.provider_status == "incomplete"
     assert first.provider_phase == "commentary"
     assert cast(EncryptedReasoningBlock, first.provider_reasoning[0]).status == "incomplete"
     assert first.tool_calls[0].provider_item_id is None
     assert first.tool_calls[0].provider_output_index == 2
     assert first.tool_calls[0].provider_status == "incomplete"
-    assert second.provider_item_id == "msg-final"
+    assert second.provider_item_id == "msg_final"
     assert second.provider_phase == "final_answer"
 
     request = GatewayRequest(
@@ -375,10 +409,10 @@ def test_remember_turn_rejects_coerced_function_call_fields(field: str, value: o
     "encrypted",
     (
         "not-an-array",
-        [{"output_index": 0, "item_id": "rs-0", "encrypted_content": ""}],
+        [{"output_index": 0, "item_id": "rs_0", "encrypted_content": ""}],
         [
-            {"output_index": 0, "item_id": "rs-0", "encrypted_content": "one"},
-            {"output_index": 0, "item_id": "rs-1", "encrypted_content": "duplicate"},
+            {"output_index": 0, "item_id": "rs_0", "encrypted_content": "one"},
+            {"output_index": 0, "item_id": "rs_1", "encrypted_content": "duplicate"},
         ],
     ),
 )
@@ -424,3 +458,239 @@ def test_remember_turn_retains_an_output_less_turn_as_the_conversation_so_far() 
     )
     assert state.messages == context.messages
     assert state.episode_key == context.episode_key
+
+
+def test_remember_turn_retains_and_replays_a_tool_call_namespace() -> None:
+    """A namespaced call retained for continuation re-emits its namespace.
+
+    The provider rejects a namespaced function_call replayed without the
+    field, so the boundary payload's namespace must survive retention into
+    the rebuilt input item verbatim (a custom call keeps it on the verbatim
+    native item).
+    """
+    store = BoundedContinuationStore()
+    context = _context()
+    remember_turn(
+        store,
+        context=context,
+        route_binding=_binding(),
+        data={
+            "text": "",
+            "refusal": False,
+            "tool_calls": [
+                {
+                    "output_index": 0,
+                    "item_id": "fc_ns",
+                    "call_id": "call-ns",
+                    "name": "spawn_agent",
+                    "namespace": "collaboration",
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "output_index": 1,
+                    "item_id": "ctc-ns",
+                    "call_id": "call-custom",
+                    "name": "exec",
+                    "namespace": "code",
+                    "arguments": "const r = 1;",
+                    "status": "completed",
+                    "custom": True,
+                },
+            ],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    call = state.messages[0].tool_calls[0]
+    assert call.provider_namespace == "collaboration"
+    native = state.messages[1].provider_native_item
+    assert native is not None and native["namespace"] == "code"
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=state.messages,
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[0] == {
+        "id": "fc_ns",
+        "type": "function_call",
+        "call_id": "call-ns",
+        "name": "spawn_agent",
+        "arguments": "{}",
+        "namespace": "collaboration",
+        "status": "completed",
+    }
+    assert payload_input[1]["namespace"] == "code"
+
+
+def test_remember_turn_rejects_a_coerced_tool_call_namespace() -> None:
+    """A non-text or empty namespace is a boundary contract violation."""
+    for value in (7, ""):
+        with pytest.raises(ValueError, match="tool call fields"):
+            remember_turn(
+                BoundedContinuationStore(),
+                context=_context(),
+                route_binding=_binding(),
+                data={
+                    "text": "",
+                    "refusal": False,
+                    "tool_calls": [
+                        {
+                            "output_index": 0,
+                            "item_id": "fc_ns",
+                            "call_id": "call-ns",
+                            "name": "spawn_agent",
+                            "namespace": cast(JsonValue, value),
+                            "arguments": "{}",
+                            "status": "completed",
+                        }
+                    ],
+                },
+            )
+
+
+def test_remember_turn_replays_hosted_items_at_their_provider_positions() -> None:
+    """A hosted-tool turn retained for continuation replays its verbatim
+    items (web_search_call and friends) at their exact output positions, so
+    a ``previous_response_id`` turn re-serves the provider's own history
+    byte-for-byte on a native Responses rung."""
+    store = BoundedContinuationStore()
+    context = _context()
+    web_search: JsonObject = {
+        "id": "ws_1",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    remember_turn(
+        store,
+        context=context,
+        data={
+            "text": "",
+            "refusal": False,
+            "hosted_items": [{"output_index": 0, "item": web_search}],
+            "message_outputs": [
+                {
+                    "output_index": 1,
+                    "item_id": "msg_1",
+                    "text": "Python 3.14.7.",
+                    "status": "completed",
+                }
+            ],
+            "tool_calls": [],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    assert state.messages[0].provider_native_item == web_search
+    assert state.messages[1].content == "Python 3.14.7."
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=state.messages,
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[0] == web_search
+    assert payload_input[1]["id"] == "msg_1"
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"output_index": 0, "item": {"id": "x"}},
+        {"output_index": -1, "item": {"id": "x", "type": "web_search_call"}},
+        {"output_index": 0, "item": "not-an-object"},
+        {"item": {"id": "x", "type": "web_search_call"}},
+    ],
+)
+def test_remember_turn_rejects_malformed_hosted_items(item: JsonObject) -> None:
+    """Hosted-item retention fails closed on identity it cannot replay."""
+    store = BoundedContinuationStore()
+    with pytest.raises(ValueError, match="hosted item"):
+        remember_turn(
+            store,
+            context=_context(),
+            data={"text": "", "refusal": False, "hosted_items": [item], "tool_calls": []},
+        )
+
+
+def test_remember_turn_retains_and_replays_a_tool_call_caller() -> None:
+    """A caller-attributed call retained for continuation re-emits it verbatim.
+
+    SDK 3.0 programmatic tool calling attributes a call to the program that
+    invoked it; the item must replay exactly as emitted, so the boundary
+    payload's caller must survive retention into the rebuilt input item (a
+    custom call keeps it on the verbatim native item).
+    """
+    store = BoundedContinuationStore()
+    context = _context()
+    caller = {"type": "program", "caller_id": "call_prog"}
+    remember_turn(
+        store,
+        context=context,
+        route_binding=_binding(),
+        data={
+            "text": "",
+            "refusal": False,
+            "tool_calls": [
+                {
+                    "output_index": 0,
+                    "item_id": "fc_caller",
+                    "call_id": "call-caller",
+                    "name": "lookup",
+                    "caller": caller,
+                    "arguments": "{}",
+                    "status": "completed",
+                },
+                {
+                    "output_index": 1,
+                    "item_id": "ctc-caller",
+                    "call_id": "call-custom",
+                    "name": "exec",
+                    "caller": caller,
+                    "arguments": "const r = 1;",
+                    "status": "completed",
+                    "custom": True,
+                },
+            ],
+        },
+    )
+
+    state = store.resolve_now(
+        namespace=context.namespace,
+        previous_response_id=context.response_id,
+    )
+    call = state.messages[0].tool_calls[0]
+    assert call.provider_caller == caller
+    native = state.messages[1].provider_native_item
+    assert native is not None and native["caller"] == caller
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=state.messages,
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol",
+        request,
+        supports_temperature=False,
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    assert payload_input[0]["caller"] == caller
+    assert payload_input[1]["caller"] == caller

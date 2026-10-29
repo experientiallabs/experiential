@@ -15,6 +15,7 @@ from exp.common.core.artifacts import ContractModel
 from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.runtime.gateway import (
     ActivateAliasRevisionCommand,
     AliasRevisionRecord,
@@ -62,7 +63,8 @@ from exp.runtime.gateway import (
     UsageTerminalCount,
     VirtualKeyRecord,
 )
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, ExecutionSnapshot
+from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 
 def test_external_management_call_site_separates_receipts_from_one_time_secrets() -> None:
@@ -224,6 +226,92 @@ def _deployment() -> ExactModelDeployment:
     )
 
 
+def _staged_execution() -> ExecutionSnapshot:
+    """Freeze one root model followed by two deployments of an authorized child."""
+    return ExecutionSnapshot(
+        authorization=_authorization(),
+        exact_model_id="exact-one",
+        pool_id="pool-one",
+        deployment_ids=("deployment-one", "deployment-two", "deployment-three"),
+        model_stages=(
+            ModelExecutionStage(
+                stage_index=0,
+                exact_model_id="exact-one",
+                pool_id="pool-one",
+                deployment_ids=("deployment-one",),
+            ),
+            ModelExecutionStage(
+                stage_index=1,
+                exact_model_id="exact-two",
+                pool_id="pool-two",
+                deployment_ids=("deployment-two", "deployment-three"),
+                ancestry=("exact-one",),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("route_depth", [0, 1, 2])
+def test_attempt_reservation_accepts_exact_stage_without_replacing_root(route_depth: int) -> None:
+    """A destination stage owns the attempt while root identity and authority stay frozen."""
+    snapshot = _staged_execution()
+    frozen_snapshot = snapshot.model_dump_json()
+    stage = snapshot.stage_for_depth(route_depth)
+    reservation = AttemptReservationRequest(
+        organization_id="org-one",
+        snapshot=snapshot,
+        deployment=_deployment().model_copy(
+            update={
+                "deployment_id": snapshot.deployment_ids[route_depth],
+                "exact_model_id": stage.exact_model_id,
+            }
+        ),
+        attempt_ordinal=4,
+        route_depth=route_depth,
+    )
+
+    assert reservation.snapshot.model_dump_json() == frozen_snapshot
+    assert reservation.snapshot.exact_model_id == "exact-one"
+    assert reservation.snapshot.pool_id == "pool-one"
+    assert reservation.snapshot.authorization == _authorization()
+    assert reservation.deployment.exact_model_id == stage.exact_model_id
+    _round_trip(reservation)
+
+
+@pytest.mark.parametrize(
+    ("organization_id", "deployment_id", "exact_model_id", "route_depth", "error"),
+    [
+        ("org-two", "deployment-two", "exact-two", 1, "organization differs"),
+        ("org-one", "deployment-one", "exact-one", 1, "stage cursor"),
+        ("org-one", "deployment-two", "exact-two", 0, "stage cursor"),
+        ("org-one", "deployment-two", "exact-two", 2, "stage cursor"),
+        ("org-one", "deployment-two", "exact-one", 1, "stage exact model"),
+        ("org-one", "deployment-two", "exact-other", 1, "stage exact model"),
+        ("org-one", "deployment-one", "exact-one", 3, "route depth"),
+        ("org-one", "deployment-one", "exact-one", -1, "greater than or equal"),
+        ("org-one", "deployment-missing", "exact-two", 1, "absent"),
+    ],
+)
+def test_attempt_reservation_rejects_stage_or_tenant_drift(
+    organization_id: str,
+    deployment_id: str,
+    exact_model_id: str,
+    route_depth: int,
+    error: str,
+) -> None:
+    """Global membership cannot override the exact stage cursor, model, or tenant."""
+    with pytest.raises(ValidationError, match=error):
+        AttemptReservationRequest(
+            organization_id=organization_id,
+            snapshot=_staged_execution(),
+            deployment=_deployment().model_copy(
+                update={"deployment_id": deployment_id, "exact_model_id": exact_model_id}
+            ),
+            attempt_ordinal=4,
+            route_depth=route_depth,
+        )
+
+
 def _round_trip(model: ContractModel) -> None:
     """Require deterministic JSON serialization and exact typed reconstruction."""
     payload = model.model_dump_json()
@@ -251,7 +339,7 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
         attempt_ordinal=0,
         route_depth=0,
         period="2026-08",
-        reserved_micro_usd=10,
+        reserved_nano_usd=10,
         started_at=now,
     )
     terminal = UsageTerminalCount(state=AttemptTerminalState.COMPLETED, attempts=1)
@@ -329,10 +417,10 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
             organization_id="org-one",
             period="2026-08",
             scope=MonthlyBudgetScope(kind=MonthlyBudgetScopeKind.TEAM),
-            limit_micro_usd=100,
-            reserved_micro_usd=10,
-            settled_micro_usd=20,
-            remaining_micro_usd=70,
+            limit_nano_usd=100,
+            reserved_nano_usd=10,
+            settled_nano_usd=20,
+            remaining_nano_usd=70,
             unknown_cost_attempts=0,
             exhausted=False,
             created_at=now,
@@ -345,7 +433,7 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
             deployment=_deployment(),
             attempt_ordinal=0,
             route_depth=0,
-            maximum_cost_micro_usd=10,
+            maximum_cost_nano_usd=10,
         ),
         reservation,
         AttemptSettlementRequest(
@@ -362,8 +450,8 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
             terminal_at=now,
             usage=GatewayUsage(input_tokens=1, output_tokens=2),
             usage_source=AttemptUsageSource.OBSERVED,
-            estimated_cost_micro_usd=3,
-            settled_micro_usd=3,
+            estimated_cost_nano_usd=3,
+            settled_nano_usd=3,
         ),
         UsageAttribution(
             organization_id="org-one",
@@ -377,7 +465,7 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
                     cached_input_tokens=0,
                     output_tokens=2,
                     reasoning_tokens=0,
-                    known_estimated_cost_micro_usd=3,
+                    known_estimated_cost_nano_usd=3,
                     unknown_cost_attempts=0,
                     total_latency_ms=5,
                     average_latency_ms=5,
@@ -392,7 +480,7 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
                     cached_input_tokens=0,
                     output_tokens=2,
                     reasoning_tokens=0,
-                    known_estimated_cost_micro_usd=3,
+                    known_estimated_cost_nano_usd=3,
                     unknown_cost_attempts=0,
                     terminal_counts=(terminal,),
                 ),
@@ -480,7 +568,7 @@ def test_public_contract_categories_have_stable_json_round_trips() -> None:
             organization_id="org-one",
             period="2026-08",
             scope=MonthlyBudgetScope(kind=MonthlyBudgetScopeKind.TEAM),
-            limit_micro_usd=100,
+            limit_nano_usd=100,
         ),
         NaturalMutationOutcome(
             organization_id="org-one",

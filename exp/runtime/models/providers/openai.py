@@ -15,7 +15,7 @@ from openai.types.responses import (
 )
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import (
     AssistantAction,
     ModelMessage,
@@ -24,6 +24,10 @@ from exp.common.models import (
     ModelSnapshot,
     ToolCall,
     Usage,
+)
+from exp.common.models.usage_observability import (
+    fold_openai_shaped_reasoning,
+    unreported_token_details,
 )
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
@@ -36,8 +40,11 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalSignal,
     ProviderResponseError,
     ProviderRetryableResponseError,
+    require_integer,
+    require_object,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAIEmbeddingMixin
+from exp.runtime.models.providers.prompt_cache_options import openai_prompt_cache_origin
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -141,6 +148,8 @@ def openai_responses_request(
         }
     if request.maximum_output_tokens is not None:
         payload["max_output_tokens"] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["text"] = {"format": {"type": "json_object"}}
     return payload
 
 
@@ -149,6 +158,7 @@ def openai_responses_response(
     *,
     configured_model: ModelSnapshot,
     latency_seconds: float,
+    twelve_hour_writes_requested: bool = False,
 ) -> ModelResponse:
     """Convert one completed native Responses response into a shared EXP response.
 
@@ -156,6 +166,9 @@ def openai_responses_response(
         payload: Decoded completed OpenAI Responses payload.
         configured_model: Resolved catalog identity used for the request.
         latency_seconds: Observed duration of the successful request sequence.
+        twelve_hour_writes_requested: Whether the request carried
+            ``prompt_cache_options.ttl: "12h"``. Writes reported without their
+            lifetime split then meter as 12-hour writes, as the native parser does.
 
     Returns:
         The typed assistant action, served model identity, and observed economics.
@@ -213,7 +226,12 @@ def openai_responses_response(
         output=action,
         configured_model=configured_model,
         served_model_id=parsed.model,
-        usage=_usage(parsed.usage),
+        usage=_usage(
+            parsed.usage,
+            raw=payload.get("usage"),
+            service_tier=parsed.service_tier,
+            twelve_hour_writes_requested=twelve_hour_writes_requested,
+        ),
         latency_seconds=latency_seconds,
         hit_length_limit=status == "incomplete",
     )
@@ -282,6 +300,9 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
             embeddings_url=f"{self._base_url}/{self._request_path('embeddings')}",
             images_url=f"{self._base_url}/{self._request_path('images/generations')}",
+            openai_decisions_url=f"{self._base_url}/{self._request_path('decisions')}",
+            speech_url=f"{self._base_url}/{self._request_path('audio/speech')}",
+            transcriptions_url=f"{self._base_url}/{self._request_path('audio/transcriptions')}",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
@@ -289,12 +310,21 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             supports_top_p=self._supports_top_p,
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
+            supports_responses_logprobs=self._supports_logprobs,
             supports_frequency_penalty=self._supports_frequency_penalty,
             supports_presence_penalty=self._supports_presence_penalty,
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="openai_responses",
             reasoning_effort=self._reasoning_effort,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            # OpenAI documents prompt_cache_key as its prefix-cache routing hint.
+            forwards_prompt_cache_key=True,
+            # Responses prompt_cache_options.ttl (the 12-hour cache lifetime).
+            forwards_prompt_cache_ttl=True,
+            # prompt_cache_options.mode and prompt_cache_breakpoint, where the
+            # origin documents or relays them (a Novita or custom Responses root
+            # does not).
+            forwards_prompt_cache_options=openai_prompt_cache_origin(self._base_url),
         )
 
     def _completion_path(self) -> str:
@@ -332,10 +362,10 @@ def _responses_items_for_message(message: ModelMessage) -> list[JsonObject]:
                 "output": message.content or "",
             }
         ]
-    if message.role == "user":
+    if message.role in {"user", "developer"}:
         if message.content is None:
-            raise ValueError("user messages need text content")
-        return [{"role": "user", "content": message.content}]
+            raise ValueError(f"{message.role} messages need text content")
+        return [{"role": message.role, "content": message.content}]
     if message.role != "assistant":
         raise ValueError(f"unsupported Responses message role {message.role!r}")
     action = message.assistant_action
@@ -383,15 +413,69 @@ def _tool_call(item: ResponseFunctionToolCall, index: int) -> ToolCall:
         ) from exc
 
 
-def _usage(usage: ResponseUsage | None) -> Usage | None:
+def _usage(
+    usage: ResponseUsage | None,
+    *,
+    raw: JsonValue,
+    service_tier: str | None = None,
+    twelve_hour_writes_requested: bool = False,
+) -> Usage | None:
     """Map optional typed Responses usage without accepting negative token counts."""
     if usage is None:
         return None
     try:
+        unknown = unreported_token_details(require_object(raw, "usage"), responses=True)
+        input_extra = usage.input_tokens_details.model_extra or {}
+        raw_hour = input_extra.get("cache_write_1h_tokens")
+        hour = (
+            None if raw_hour is None else require_integer(raw_hour, "OpenAI cache_write_1h_tokens")
+        )
+        half_day = _twelve_hour_writes(input_extra.get("cache_write_tokens_details"))
+        if half_day is None and twelve_hour_writes_requested:
+            # A 12-hour request whose writes arrive without the split bills every
+            # write at 12 hours, never the cheaper default lifetime (the native
+            # parser's resolve_twelve_hour_writes).
+            half_day = usage.input_tokens_details.cache_write_tokens
+        reasoning = (
+            None if "reasoning_tokens" in unknown else usage.output_tokens_details.reasoning_tokens
+        )
         return Usage(
             input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            cached_input_tokens=usage.input_tokens_details.cached_tokens,
+            output_tokens=fold_openai_shaped_reasoning(
+                usage.input_tokens, usage.output_tokens, reasoning, usage.total_tokens
+            ),
+            cached_input_tokens=(
+                None if "cached_tokens" in unknown else usage.input_tokens_details.cached_tokens
+            ),
+            cache_write_input_tokens=(
+                None
+                if "cache_write_tokens" in unknown
+                else usage.input_tokens_details.cache_write_tokens
+            ),
+            cache_write_1h_input_tokens=(None if "cache_write_1h_tokens" in unknown else hour),
+            cache_write_12h_input_tokens=(None if "cache_write_tokens" in unknown else half_day),
+            reasoning_tokens=reasoning,
+            service_tier=service_tier,
         )
-    except ValidationError as exc:
-        raise ProviderResponseError("OpenAI Responses usage values must be non-negative") from exc
+    except ValueError as exc:
+        raise ProviderResponseError(
+            "OpenAI Responses usage values or observability are invalid"
+        ) from exc
+
+
+def _twelve_hour_writes(details: JsonValue | None) -> int | None:
+    """Read OpenAI's 12-hour cache-write subset from ``cache_write_tokens_details``.
+
+    OpenAI reports ``ttl_30m_tokens`` and ``ttl_12h_tokens`` on every Responses
+    usage of a model that takes ``prompt_cache_options``; the two never overlap
+    and sum to ``cache_write_tokens``. An absent object leaves the subset
+    unreported (no 12-hour write was possible).
+
+    Raises:
+        ProviderResponseError: The details value is not an object.
+        ValueError: The 12-hour count is not a non-negative integer.
+    """
+    if details is None:
+        return None
+    raw = require_object(details, "OpenAI cache_write_tokens_details").get("ttl_12h_tokens")
+    return None if raw is None else require_integer(raw, "OpenAI ttl_12h_tokens")

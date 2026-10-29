@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway.contracts import (
+    ChoiceLogprobs,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -15,8 +15,11 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.openai_protocol.cache_write_lifetimes import cache_write_lifetimes
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
+from exp.runtime.openai_protocol.reasoning_estimate import ReasoningEstimate
 from exp.runtime.openai_protocol.response_streaming_state import ResponseReasoningState
+from exp.runtime.openai_protocol.tool_choice import responses_tool_choice_echo
 
 
 def stable_public_id(prefix: str, request_id: str) -> str:
@@ -57,6 +60,7 @@ class ChatSseEncoder:
         self._tool_indices: dict[int, tuple[str, str]] = {}
         self._tool_arguments: dict[int, str] = {}
         self._usage: GatewayUsage | None = None
+        self._reasoning_estimate = ReasoningEstimate()
 
     def start(self) -> tuple[str, ...]:
         """Emit the single initial assistant-role chunk."""
@@ -78,12 +82,20 @@ class ChatSseEncoder:
             OpenAIProtocolError: Event order, tool identity, or terminal state is invalid.
         """
         self._require_event(event)
+        self._reasoning_estimate.observe(event)
         if event.usage is not None and event.usage.has_token_counts:
             self._usage = event.usage
         if event.kind == GatewayEventKind.TEXT_DELTA:
             return (self._chunk(delta={"content": event.text_delta}),)
         if event.kind == GatewayEventKind.REFUSAL_DELTA:
             return (self._chunk(delta={"refusal": event.text_delta}),)
+        if event.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            update = event.choice_logprobs_delta
+            if update is None:
+                raise self._state_error("Chat probability event omitted its payload.")
+            if update.choice_index != 0:
+                raise self._state_error("Chat probability events support choice index 0 only.")
+            return (self._chunk(delta={}, logprobs=_choice_logprobs_json(update.logprobs)),)
         if event.kind in {
             GatewayEventKind.REASONING_SUMMARY_DELTA,
             # The Chat wire has no reasoning representation, so provider
@@ -175,7 +187,13 @@ class ChatSseEncoder:
         frames.append("data: [DONE]\n\n")
         return tuple(frames)
 
-    def _chunk(self, *, delta: JsonObject, finish_reason: str | None = None) -> str:
+    def _chunk(
+        self,
+        *,
+        delta: JsonObject,
+        finish_reason: str | None = None,
+        logprobs: JsonObject | None = None,
+    ) -> str:
         """Build one official Chat completion chunk SSE frame."""
         payload: JsonObject = {
             "id": self.completion_id,
@@ -187,7 +205,7 @@ class ChatSseEncoder:
                     "index": 0,
                     "delta": delta,
                     "finish_reason": finish_reason,
-                    "logprobs": None,
+                    "logprobs": logprobs,
                 }
             ],
         }
@@ -203,7 +221,9 @@ class ChatSseEncoder:
             "created": self.created_at,
             "model": self.model,
             "choices": [],
-            "usage": _chat_usage(usage),
+            "usage": self._reasoning_estimate.annotate(
+                _chat_usage(usage), usage, "completion_tokens_details"
+            ),
         }
         return _chat_data(payload)
 
@@ -239,6 +259,7 @@ class _ResponseToolState:
         self.name = name
         self.arguments = ""
         self.done = False
+        self.close_deferred = False
 
     def item(self, *, completed: bool) -> JsonObject:
         """Return the current official Responses function-call item."""
@@ -260,7 +281,7 @@ class ResponsesSseEncoder:
         *,
         request_id: str,
         model: str,
-        created_at: float,
+        created_at: int,
         request: GatewayRequest,
     ) -> None:
         """Initialize one Responses stream and its request-reflecting envelope."""
@@ -282,6 +303,7 @@ class ResponsesSseEncoder:
         self._text_started = False
         self._refusal_started = False
         self._usage: GatewayUsage | None = None
+        self._reasoning_estimate = ReasoningEstimate()
 
     def start(self) -> tuple[str, ...]:
         """Emit required created and in-progress lifecycle events once."""
@@ -297,6 +319,12 @@ class ResponsesSseEncoder:
     def feed(self, event: GatewayEvent) -> tuple[str, ...]:
         """Encode one ordered normalized event into Responses lifecycle frames."""
         self._require_event(event)
+        self._reasoning_estimate.observe(event)
+        if event.kind == GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            raise self._state_error(
+                "Responses encoder received a Chat probability event; native Responses "
+                "probability observations are required."
+            )
         if event.usage is not None and event.usage.has_token_counts:
             self._usage = event.usage
         if event.kind == GatewayEventKind.TEXT_DELTA:
@@ -555,6 +583,16 @@ class ResponsesSseEncoder:
             or state.arguments.encode() != expected.encode()
         ):
             raise self._state_error("Responses tool completion changed streamed identity or bytes.")
+        slot = self._output_order.index(("tool", _required_index(event)))
+        if any(
+            kind != "tool" or not self._tools[index].done
+            for kind, index in self._output_order[:slot]
+        ):
+            # Item completion follows output order (the order the completed
+            # response lists): messages and reasoning close at the terminal,
+            # so a call after one completes there too (see the native encoder).
+            state.close_deferred = True
+            return ()
         state.done = True
         return self._close_tool(state)
 
@@ -761,7 +799,7 @@ class ResponsesSseEncoder:
             "temperature": self.request.temperature,
             "top_p": self.request.top_p,
             "reasoning": _reasoning_envelope(self.request),
-            "tool_choice": _responses_tool_choice(self.request),
+            "tool_choice": responses_tool_choice_echo(self.request),
             "tools": [
                 {
                     "type": "function",
@@ -774,7 +812,13 @@ class ResponsesSseEncoder:
             ],
             "max_output_tokens": self.request.maximum_output_tokens,
             "previous_response_id": self.request.previous_response_id,
-            "usage": _responses_usage(self._usage) if status != "in_progress" else None,
+            "usage": (
+                self._reasoning_estimate.annotate(
+                    _responses_usage(self._usage), self._usage, "output_tokens_details"
+                )
+                if status != "in_progress"
+                else None
+            ),
         }
         if self.request.ignored_parameters:
             payload["x-experiential-ignored-parameters"] = list(self.request.ignored_parameters)
@@ -793,7 +837,7 @@ class ResponsesSseEncoder:
         state = self._tools.get(index)
         if state is None:
             raise self._state_error("Responses tool event arrived before tool-call start.")
-        if state.done:
+        if state.done or state.close_deferred:
             raise self._state_error("Responses tool event arrived after item completion.")
         return state
 
@@ -818,40 +862,6 @@ class ResponsesSseEncoder:
         )
 
 
-def encode_chat_events(encoder: ChatSseEncoder, events: Iterable[GatewayEvent]) -> tuple[str, ...]:
-    """Encode one complete deterministic Chat event fixture.
-
-    Args:
-        encoder: Fresh Chat encoder.
-        events: Ordered provider events ending in one terminal.
-
-    Returns:
-        Complete SSE frame sequence.
-    """
-    frames = list(encoder.start())
-    for event in events:
-        frames.extend(encoder.feed(event))
-    return tuple(frames)
-
-
-def encode_responses_events(
-    encoder: ResponsesSseEncoder, events: Iterable[GatewayEvent]
-) -> tuple[str, ...]:
-    """Encode one complete deterministic Responses event fixture.
-
-    Args:
-        encoder: Fresh Responses encoder.
-        events: Ordered provider events ending in one terminal.
-
-    Returns:
-        Complete named SSE lifecycle.
-    """
-    frames = list(encoder.start())
-    for event in events:
-        frames.extend(encoder.feed(event))
-    return tuple(frames)
-
-
 def _required_index(event: GatewayEvent) -> int:
     """Return one required tool-call index or reject malformed provider state."""
     if event.tool_call_index is None:
@@ -864,6 +874,15 @@ def _required_text(value: str | None) -> str:
     if value is None:
         raise ChatSseEncoder._state_error("Provider event omitted required text.")
     return value
+
+
+def _choice_logprobs_json(value: ChoiceLogprobs | None) -> JsonObject | None:
+    """Serialize one typed Chat probability observation for an SSE choice."""
+    if value is None:
+        return None
+    # The event contract is a closed ContractModel, so this cast is confined
+    # to the JSON boundary and cannot admit arbitrary provider metadata.
+    return value.model_dump(mode="json")
 
 
 def _chat_data(payload: JsonObject) -> str:
@@ -881,8 +900,22 @@ def _chat_usage(usage: GatewayUsage) -> JsonObject:
         "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
-        "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens or 0},
+        "prompt_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens or 0,
+            **(
+                {"cache_write_tokens": usage.cache_creation_input_tokens}
+                if usage.cache_creation_input_tokens is not None
+                else {}
+            ),
+            **(
+                {"cache_write_1h_tokens": usage.cache_creation_1h_input_tokens}
+                if usage.cache_creation_1h_input_tokens is not None
+                else {}
+            ),
+            **_lifetime_split(usage),
+        },
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+        **_unreported_usage_details(usage),
     }
 
 
@@ -894,11 +927,43 @@ def _responses_usage(usage: GatewayUsage | None) -> JsonObject | None:
     assert usage.output_tokens is not None
     return {
         "input_tokens": usage.input_tokens,
-        "input_tokens_details": {"cached_tokens": usage.cached_input_tokens or 0},
+        # `cache_write_tokens` joined the official shape (openai-python 3.x
+        # marks it required), so SDK-strict callers need it present.
+        "input_tokens_details": {
+            "cached_tokens": usage.cached_input_tokens or 0,
+            "cache_write_tokens": usage.cache_creation_input_tokens or 0,
+            **(
+                {"cache_write_1h_tokens": usage.cache_creation_1h_input_tokens}
+                if usage.cache_creation_1h_input_tokens is not None
+                else {}
+            ),
+            **_lifetime_split(usage),
+        },
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
         "total_tokens": usage.input_tokens + usage.output_tokens,
+        **_unreported_usage_details(usage),
     }
+
+
+def _lifetime_split(usage: GatewayUsage) -> JsonObject:
+    """Return OpenAI's ``cache_write_tokens_details`` entry, or nothing without one."""
+    split = cache_write_lifetimes(usage)
+    return {} if split is None else {"cache_write_tokens_details": split}
+
+
+def _unreported_usage_details(usage: GatewayUsage) -> JsonObject:
+    """Disclose missing meters without violating required integer wire shapes."""
+    fields: list[JsonValue] = [
+        name
+        for name, count in (
+            ("cached_tokens", usage.cached_input_tokens),
+            ("cache_write_tokens", usage.cache_creation_input_tokens),
+            ("reasoning_tokens", usage.reasoning_tokens),
+        )
+        if count is None
+    ]
+    return {"unreported_token_details": fields} if fields else {}
 
 
 def _reasoning_envelope(request: GatewayRequest) -> JsonObject:
@@ -914,13 +979,3 @@ def _reasoning_envelope(request: GatewayRequest) -> JsonObject:
     if request.reasoning_context is not None:
         reasoning["context"] = request.reasoning_context
     return reasoning
-
-
-def _responses_tool_choice(request: GatewayRequest) -> JsonObject | str:
-    """Render canonical tool choice in official Responses wire form."""
-    choice = request.tool_choice
-    if choice is None:
-        return "auto"
-    if isinstance(choice, str):
-        return choice
-    return {"type": "function", "name": choice.name}

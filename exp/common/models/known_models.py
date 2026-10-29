@@ -36,6 +36,16 @@ class KnownModel:
     supports_frequency_penalty: bool | None = None
     supports_presence_penalty: bool | None = None
     supports_reasoning_effort: bool = False
+    supports_reasoning: bool | None = None
+    """Whether the model reasons at all, independent of effort-ladder control.
+
+    ``None`` defers to ``supports_reasoning_effort`` (the historical
+    derivation, kept for backward compatibility). An explicit ``True`` marks a
+    reasoning-capable model whose depth is NOT an OpenAI-style effort ladder —
+    for example an Anthropic budgeted-enabled model whose thinking is expressed
+    through ``budget_tokens`` — so its thinking config is honored even though
+    ``supports_reasoning_effort`` is ``False``.
+    """
     reasoning_effort: (
         Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] | None
     ) = None
@@ -69,6 +79,7 @@ def _chat(
     supports_logprobs: bool = False,
     supports_structured_output: bool = True,
     supports_reasoning_effort: bool = False,
+    supports_reasoning: bool | None = None,
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
     | None = None,
     sampling_requires_reasoning_none: bool = False,
@@ -96,6 +107,8 @@ def _chat(
         supports_structured_output: Whether the model supports structured outputs.
         supports_reasoning_effort: Whether the model accepts an explicit reasoning-effort
             parameter on the OpenAI Responses API.
+        supports_reasoning: Whether the model reasons at all when it does not accept an
+            effort ladder; ``None`` defers to ``supports_reasoning_effort``.
         reasoning_effort: Valid default effort for this exact model.
         sampling_requires_reasoning_none: Whether sampling controls require exact effort none.
         chat_max_tokens_field: Exact Chat Completions output-limit field, when applicable.
@@ -119,6 +132,7 @@ def _chat(
         supports_top_k=supports_top_k,
         supports_logprobs=supports_logprobs,
         supports_reasoning_effort=supports_reasoning_effort,
+        supports_reasoning=supports_reasoning,
         reasoning_effort=(reasoning_effort or "medium" if supports_reasoning_effort else None),
         sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         chat_max_tokens_field=chat_max_tokens_field,
@@ -146,8 +160,19 @@ def _anthropic_chat(
     context_window_tokens: int | None = None,
     maximum_output_tokens: int | None = None,
     adaptive_reasoning: bool = False,
+    supports_reasoning: bool | None = None,
+    sampling_requires_reasoning_none: bool = False,
 ) -> KnownModel:
-    """Describe one native Anthropic Messages model's exact generation controls."""
+    """Describe one native Anthropic Messages model's exact generation controls.
+
+    ``adaptive_reasoning`` is the xhigh-effort adaptive generation: it pins
+    temperature and top_p to their thinking-on values for the whole route. A
+    budgeted-enabled model instead passes ``supports_reasoning=True`` with
+    ``sampling_requires_reasoning_none=True`` and keeps ordinary sampling —
+    its thinking is optional, so a global temperature pin would reject every
+    legitimate thinking-off request; the srn hatch resolves the "temperature
+    must be 1 with thinking on" conflict per request instead.
+    """
     return _chat(
         input_usd=input_usd,
         output_usd=output_usd,
@@ -157,6 +182,8 @@ def _anthropic_chat(
         maximum_output_tokens=maximum_output_tokens,
         supports_top_k=not adaptive_reasoning,
         supports_reasoning_effort=adaptive_reasoning,
+        supports_reasoning=supports_reasoning,
+        sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         minimum_temperature=1.0 if adaptive_reasoning else 0.0,
         maximum_temperature=1.0,
         minimum_top_p=0.99 if adaptive_reasoning else 0.0,
@@ -206,6 +233,24 @@ def _embedding(*, input_usd: float, context_window_tokens: int | None = None) ->
 
 
 _OPENAI_MODELS: dict[str, KnownModel] = {
+    # gpt-6-astra (released 2026-09-03): the platform's live probe of 2026-09-04
+    # found reasoning.effort low/medium/high/xhigh/max ('none' and 'minimal'
+    # 400) and temperature/top_p rejected outright; the model page lists
+    # function_calling and structured_outputs among its supported features.
+    # Absence here left every openai gpt-6-astra rung with no strict-tools
+    # verdict (the platform's known-model gate fails closed on an unknown
+    # id), so a strict function tool was refused pre-dispatch on a lane that
+    # honors it (production, 2026-09-15: ~980 refusals a day).
+    "gpt-6-astra": _chat(
+        input_usd=10.0,
+        cached_input_usd=1.0,
+        cache_write_usd=12.5,
+        output_usd=50.0,
+        context_window_tokens=1_050_000,
+        maximum_output_tokens=128_000,
+        supports_temperature=False,
+        supports_reasoning_effort=True,
+    ),
     "gpt-5.6-sol": _chat(
         input_usd=5.0,
         cached_input_usd=0.5,
@@ -544,6 +589,19 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
         maximum_output_tokens=128_000,
         adaptive_reasoning=True,
     ),
+    # https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+    "claude-sonnet-5-5": replace(
+        _anthropic_chat(
+            input_usd=2.0,
+            cached_input_usd=0.2,
+            cache_write_usd=2.5,
+            output_usd=10.0,
+            context_window_tokens=1_000_000,
+            maximum_output_tokens=128_000,
+            adaptive_reasoning=True,
+        ),
+        reasoning_effort="high",
+    ),
     "claude-sonnet-5": _anthropic_chat(
         input_usd=2.0,
         cached_input_usd=0.2,
@@ -560,6 +618,13 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
         output_usd=5.0,
         context_window_tokens=200_000,
         maximum_output_tokens=64_000,
+        # Budgeted-enabled reasoning: haiku honors a caller thinking config
+        # (budget_tokens), but it is NOT the adaptive/effort-ladder generation,
+        # so its depth is not effort-controlled. srn carries the "temperature
+        # must be 1 with thinking on" conflict per request instead of pinning
+        # sampling for the whole route.
+        supports_reasoning=True,
+        sampling_requires_reasoning_none=True,
     ),
     "claude-opus-4-8": _anthropic_chat(
         input_usd=5.0,

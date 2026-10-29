@@ -120,6 +120,19 @@ def test_websocket_transport_mirrors_the_http_event_stream(
         with connect(
             ws_url, additional_headers={**headers, "Idempotency-Key": "connection-op"}
         ) as socket:
+            # Probability output cannot be requested on a non-generating prewarm.
+            provider_calls = _LoopbackProvider.calls
+            for probability_fields in (
+                {"include": ["message.output_text.logprobs"]},
+                {"top_logprobs": 0},
+                {"logprobs": True},
+            ):
+                socket.send(_request_frame(generate=False, input=[], **probability_fields))
+                probability_prewarm = _collect_stream(socket)
+                assert probability_prewarm[0]["type"] == "error"
+                assert probability_prewarm[0]["status"] == 400
+                assert _LoopbackProvider.calls == provider_calls
+
             # Prewarm completes an empty response without touching the provider.
             provider_calls = _LoopbackProvider.calls
             socket.send(_request_frame(generate=False, input=[]))
@@ -129,6 +142,8 @@ def test_websocket_transport_mirrors_the_http_event_stream(
             assert isinstance(terminal, dict)
             assert terminal["status"] == "completed"
             assert terminal["output"] == []
+            assert type(terminal["created_at"]) is int
+            assert type(terminal["completed_at"]) is int
             assert _LoopbackProvider.calls == provider_calls
 
             # A generating request streams the HTTP transport's exact events.
@@ -141,6 +156,8 @@ def test_websocket_transport_mirrors_the_http_event_stream(
             )
             completed = first[-1]["response"]
             assert isinstance(completed, dict)
+            assert type(completed["created_at"]) is int
+            assert type(completed["completed_at"]) is int
             output = completed["output"]
             assert isinstance(output, list)
             message = output[0]

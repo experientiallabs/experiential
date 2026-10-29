@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import tomli_w
@@ -30,40 +30,58 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.azure_endpoints import AzureApiSurface
+from exp.common.models.bedrock_connection import require_bedrock_connection_shape
+from exp.common.models.catalog_prices import (
+    MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS as MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
+)
+from exp.common.models.catalog_prices import (
+    GatewayLongContextTier as GatewayLongContextTier,
+)
+from exp.common.models.catalog_prices import (
+    GatewayOffPeakPrices as GatewayOffPeakPrices,
+)
+from exp.common.models.catalog_prices import (
+    GatewayPriceWindow as GatewayPriceWindow,
+)
+from exp.common.models.catalog_prices import (
+    GatewayServiceTierPrices as GatewayServiceTierPrices,
+)
+from exp.common.models.catalog_prices import (
+    GatewayTokenPrices as GatewayTokenPrices,
+)
+from exp.common.models.catalog_prices import (
+    NanoUsdRatePerMillionTokens as NanoUsdRatePerMillionTokens,
+)
+from exp.common.models.catalog_roles import ModelRoles
+from exp.common.models.discovery import DiscoveredModel
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.failover_tokens import FailoverToken
+from exp.common.models.gateway_chains import GatewayModelChain
+from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.model import (
     BillingSource,
     ModelCapabilities,
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.common.models.nano_usd_upgrade import (
+    upgrade_legacy_billing_source,
+    upgrade_model_catalog_document,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
 _AWS_REGION_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-_VERTEX_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com")
-_FIXED_ORIGIN_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "openrouter", "tinker"})
+_VERTEX_HOST = re.compile(
+    r"(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-)?aiplatform\.googleapis\.com"
+    r"|aiplatform\.(?:us|eu)\.rep\.googleapis\.com)"
+)
+_FIXED_ORIGIN_PROVIDERS = frozenset(
+    {"anthropic", "gemini", "openai", "openrouter", "tinker", "typesafe"}
+)
 _EXPLICIT_CAPABILITY_PROVIDERS = frozenset({"azure", "bedrock", "openai-compatible", "vertex"})
 
-AzureApiSurface = Literal["openai_deployments", "model_inference"]
-
-FailoverMode = Literal["maximize_availability", "maximize_cache"]
-"""How a pool's waterfall reacts to a failed attempt.
-
-``maximize_availability`` (the default, historical behavior) fails over to the
-next rung on any failover-eligible error. ``maximize_cache`` does NOT fail over on
-a throttle (429) -- it returns the throttle so the caller retries the warm rung
-after backoff, preserving its prompt cache rather than restarting cold on another
-provider -- while STILL failing over on operational deadness
-(auth/not-found/5xx/transport) and on a stalled lane (a first-byte or
-header-phase timeout that never answered), for which there is no warm cache to
-preserve. A genuinely retryable timeout (provider 408) redials the warm rung in
-both modes. Client errors reject without failover in both modes.
-"""
-"""Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
-
-_FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
-_AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
-_MODEL_INFERENCE_ROOT_SUFFIXES = ("/models", "/openai/v1")
 _MODEL_INFERENCE_IDENTITY_SUFFIX = "/models"
 
 
@@ -84,50 +102,6 @@ def _normalize_base_url(value: str) -> str:
     default_port = 443 if scheme == "https" else 80
     netloc = host if port in {None, default_port} else f"{host}:{port}"
     return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
-
-
-def infer_azure_api_surface(endpoint: str) -> AzureApiSurface | None:
-    """Infer the Azure wire surface one resource endpoint serves.
-
-    Azure AI Foundry resources (``*.services.ai.azure.com``) serve the model-inference surface,
-    which carries provider-specific sampling fields such as ``top_k``. Azure OpenAI resources
-    (``*.openai.azure.com``) serve only the deployment surface.
-
-    Args:
-        endpoint: Azure resource endpoint from a connection.
-
-    Returns:
-        The surface the host is known to serve, or ``None`` for an unrecognized host such as a
-        private endpoint or a local recording proxy.
-    """
-    host = urlsplit(endpoint).hostname
-    if host is None:
-        return None
-    host = host.lower()
-    if host.endswith(_AZURE_OPENAI_HOST_SUFFIX):
-        return "openai_deployments"
-    if any(host.endswith(suffix) for suffix in _FOUNDRY_HOST_SUFFIXES):
-        return "model_inference"
-    return None
-
-
-def strip_model_inference_root(value: str) -> str:
-    """Remove the route suffix one Azure model-inference endpoint spelling carries.
-
-    The model-inference surface serves ``/models`` directly off the resource, so the bare resource,
-    its terminal ``/models`` form, and the Azure OpenAI ``/openai/v1`` root all name one resource.
-
-    Args:
-        value: Endpoint or endpoint path, with or without a trailing slash.
-
-    Returns:
-        The value reduced to the resource itself.
-    """
-    trimmed = value.rstrip("/")
-    for suffix in _MODEL_INFERENCE_ROOT_SUFFIXES:
-        if trimmed.lower().endswith(suffix):
-            return trimmed[: -len(suffix)].rstrip("/")
-    return trimmed
 
 
 def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
@@ -151,6 +125,22 @@ class ModelCatalogError(ValueError):
     """A local model catalog was malformed or named a credential value."""
 
 
+SubscriptionKind = Literal["chatgpt", "anthropic"]
+"""Consumer plan a connection signs in with instead of an API key.
+
+``chatgpt`` is a ChatGPT plan reaching the Codex Responses backend; ``anthropic`` is a Claude
+plan reaching the Messages API through the OAuth application Anthropic issued to the operator.
+The connection stores no credential NAME: the sign-in lives under the connection ID and the
+gateway mints a fresh bearer per dispatch from it.
+"""
+
+SUBSCRIPTION_PROVIDERS: dict[SubscriptionKind, str] = {
+    "chatgpt": "openai",
+    "anthropic": "anthropic",
+}
+"""The one catalog provider each plan kind is a sign-in for."""
+
+
 class ConnectionConfig(ContractModel):
     """Local provider connection metadata, with an optional credential environment name only."""
 
@@ -158,10 +148,19 @@ class ConnectionConfig(ContractModel):
     base_url: str | None = Field(default=None, max_length=2_048)
     api_key_env: str | None = Field(default=None, max_length=256)
     api_version: str | None = Field(default=None, max_length=64)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=64)
+    inference_geo: Literal["us"] | None = None
+    """Operator-enforced Anthropic inference geography, independent of caller input."""
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None
+    # Opt-in: native provider via a trusted https base_url in its own dialect (default-off).
+    trusted_custom_origin: bool = False
+    tenant_origin: bool = False
+    """The base_url is a customer-addressed origin, so the data plane collapses every upstream
+    failure into one opaque error and holds its socket to the tenant destination policy."""
+    subscription: SubscriptionKind | None = None
+    """Consumer plan sign-in this connection dispatches on, instead of an API key."""
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -187,6 +186,10 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        if self.subscription is not None:
+            self._require_bare_subscription_connection()
+        if self.inference_geo is not None and self.provider != "anthropic":
+            raise ValueError("inference_geo is only accepted for provider='anthropic'")
         if self.provider != "azure" and self.azure_api_surface is not None:
             raise ValueError("azure_api_surface is only accepted for provider='azure'")
         if self.provider != "bedrock" and (
@@ -196,10 +199,21 @@ class ConnectionConfig(ContractModel):
                 "aws_access_key_id_env and bedrock_auth_mode are only accepted for "
                 "provider='bedrock'"
             )
-        if self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
+        if self.tenant_origin and (
+            self.base_url is None or urlsplit(self.base_url).scheme != "https"
+        ):
+            raise ValueError("tenant_origin requires an explicit https base_url")
+        if self.trusted_custom_origin:
+            if self.provider not in _FIXED_ORIGIN_PROVIDERS:
+                raise ValueError("trusted_custom_origin applies only to a native provider")
+            if self.base_url is None:
+                raise ValueError("trusted_custom_origin requires an explicit base_url")
+            if urlsplit(self.base_url).scheme != "https":
+                raise ValueError("trusted_custom_origin requires an https base_url")
+        elif self.provider in _FIXED_ORIGIN_PROVIDERS and self.base_url is not None:
             raise ValueError(
                 f"native provider {self.provider!r} uses its built-in official endpoint; "
-                "use provider='openai-compatible' for a trusted custom endpoint"
+                "set trusted_custom_origin=True or use provider='openai-compatible'"
             )
         if self.provider == "azure":
             if self.base_url is None:
@@ -224,26 +238,13 @@ class ConnectionConfig(ContractModel):
             if self.region is not None:
                 raise ValueError("region is only accepted for provider='bedrock'")
         elif self.provider == "bedrock":
-            if self.bedrock_auth_mode == "api_key":
-                if self.api_key_env is None or self.aws_access_key_id_env is not None:
-                    raise ValueError(
-                        "bedrock api_key auth requires api_key_env and forbids "
-                        "aws_access_key_id_env"
-                    )
-            elif self.bedrock_auth_mode == "access_key_pair":
-                if self.api_key_env is None or self.aws_access_key_id_env is None:
-                    raise ValueError(
-                        "bedrock access_key_pair auth requires both credential environment names"
-                    )
-            elif (self.api_key_env is None) != (self.aws_access_key_id_env is None):
-                raise ValueError(
-                    "bedrock explicit access-key auth requires both api_key_env naming the "
-                    "secret access key and aws_access_key_id_env naming the access key id"
-                )
-            if self.base_url is not None:
-                raise ValueError("bedrock does not accept base_url")
-            if self.api_version is not None:
-                raise ValueError("api_version is only accepted for provider='azure'")
+            require_bedrock_connection_shape(
+                bedrock_auth_mode=self.bedrock_auth_mode,
+                api_key_env=self.api_key_env,
+                aws_access_key_id_env=self.aws_access_key_id_env,
+                base_url=self.base_url,
+                api_version=self.api_version,
+            )
             if self.region is not None and not _AWS_REGION_NAME.fullmatch(self.region):
                 raise ValueError("bedrock region must be an AWS region name")
         elif self.provider == "vertex":
@@ -295,6 +296,40 @@ class ConnectionConfig(ContractModel):
             raise ValueError("connection metadata must not contain credential values") from exc
         return self
 
+    def _require_bare_subscription_connection(self) -> None:
+        """Reject credential names or endpoint overrides on a plan sign-in.
+
+        Raises:
+            ValueError: The plan names another provider, or the connection also carries an
+                API-key locator, an inference geography, or any endpoint override.
+        """
+        if self.subscription is None:
+            return
+        expected = SUBSCRIPTION_PROVIDERS[self.subscription]
+        if self.provider != expected:
+            raise ValueError(
+                f"subscription {self.subscription!r} is a sign-in for provider {expected!r}, "
+                f"not {self.provider!r}"
+            )
+        if self.api_key_env is not None or self.aws_access_key_id_env is not None:
+            raise ValueError(
+                "a subscription connection signs in through the browser and stores no "
+                "credential environment name; omit api_key_env"
+            )
+        if (
+            self.base_url is not None
+            or self.api_version is not None
+            or self.region is not None
+            or self.inference_geo is not None
+            or self.trusted_custom_origin
+        ):
+            # inference_geo is refused rather than ignored: the plan client never sends it,
+            # so accepting it would silently drop a data-residency constraint.
+            raise ValueError(
+                "a subscription connection reaches its plan's fixed backend; omit base_url, "
+                "inference_geo, and every endpoint override"
+            )
+
     def identity_sha256(self) -> Sha256:
         """Return a deterministic digest of the secret-free provider endpoint identity.
 
@@ -313,8 +348,16 @@ class ConnectionConfig(ContractModel):
             # contract that predates this discriminator. Only the genuinely
             # different Foundry surface needs a new credential binding.
             identity["azure_api_surface"] = "model_inference"
+        if self.inference_geo is not None:
+            identity["inference_geo"] = self.inference_geo
         if self.region is not None:
             identity["region"] = self.region
+        if self.trusted_custom_origin:  # endpoint identity; added only when set
+            identity["trusted_custom_origin"] = True
+        if self.tenant_origin:  # a different dispatch policy; added only when set
+            identity["tenant_origin"] = True
+        if self.subscription is not None:  # a different backend than the API-key origin
+            identity["subscription"] = self.subscription
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -345,10 +388,18 @@ class ConnectionConfig(ContractModel):
     ) -> dict[str, object]:
         """Preserve pre-Bedrock canonical bytes on every supported Pydantic version."""
         serialized: dict[str, object] = handler(self)
+        if self.inference_geo is None:
+            serialized.pop("inference_geo", None)
         if self.aws_access_key_id_env is None:
             serialized.pop("aws_access_key_id_env", None)
         if self.bedrock_auth_mode is None:
             serialized.pop("bedrock_auth_mode", None)
+        if not self.trusted_custom_origin:
+            serialized.pop("trusted_custom_origin", None)
+        if not self.tenant_origin:
+            serialized.pop("tenant_origin", None)
+        if self.subscription is None:
+            serialized.pop("subscription", None)
         return serialized
 
 
@@ -374,107 +425,209 @@ class GatewayDeploymentCapabilities(ContractModel):
     These fields are intentionally separate from ``ModelCapabilities``. The latter participates
     in frozen optimizer and runtime identities, while this declaration can evolve with the
     gateway protocol without invalidating existing router artifacts.
+
+    Attributes:
+        supports_decisions: Whether it serves native typed decisions instead of chat.
+        supports_speech: Whether this deployment serves ``/audio/speech`` (fail-closed).
+        supports_transcription: Whether it serves ``/audio/transcriptions`` (fail-closed).
+        supports_video_generation: Whether it serves ``/v1/videos`` jobs (fail-closed).
+        supports_developer_messages: Whether developer-role messages are supported.
+        supports_streaming: Whether streaming responses are supported.
+        supports_streaming_tool_arguments: Whether tool arguments can be streamed incrementally.
+        supports_responses_logprobs: Verified native Responses probability support, opt-in.
+        logprobs_reasoning_efforts: Verified Chat probability efforts; empty means unknown.
+        supports_strict_tools: Whether strict function-tool schemas are supported.
+        supports_parallel_tool_calls: Whether parallel tool calls are supported.
+        supports_custom_tools: Whether this deployment's relevant native wire can preserve
+            free-form custom tools.
+
+            False means the capability is not declared. Public Chat still refuses custom tools
+            even when a Responses-native deployment declares this, because Chat accepts function
+            tools only. Read the flag with the parity row's dialect and the caller's public API
+            surface.
+        supports_grammar_tools: Whether grammar-constrained custom tools can be preserved on
+            this deployment.
+
+            This requires ``supports_custom_tools``. False means the capability is not declared;
+            it does not describe Chat, which still refuses custom and grammar tools.
+        supports_tool_call_limit: Whether a caller's Responses ``max_tool_calls`` limit can be
+            preserved.
+
+            False means the capability is not declared. The public Responses surface currently
+            refuses the field, so no authored catalog should set this until a route honors the
+            cap.
+        supports_structured_text: Whether schema-constrained text output is supported.
+        supports_stop_sequences: Whether caller-specified stop sequences are supported.
+        supports_image_input: Whether the wire and model accept images; else images are refused.
+        supports_image_url_input: Whether the provider fetches remote images; undeclared URLs
+            are rejected.
+
+            Every image-capable wire accepts inline base64; URL support varies by route.
+        supports_video_input: Whether the wire and model accept video; undeclared video input is
+            rejected.
+
+            Video carriers exist on Gemini, Bedrock Converse, and compatible ``video_url``
+            wires.
+        supports_video_url_input: Whether the provider fetches video URLs (Gemini and
+            OpenAI-compatible wires).
+
+            Bedrock requires inline bytes or an S3 location that the gateway does not author.
+        supports_audio_input: Whether the wire and model accept audio; undeclared audio input is
+            rejected.
+
+            Supported models use compatible Chat ``input_audio`` or Gemini ``inline_data``. No
+            public audio surface accepts remote URLs.
+        supports_pdf_input: Whether the wire and model accept PDFs; undeclared document input is
+            rejected.
+        supports_pdf_url_input: Whether this route's provider fetches a caller PDF URL itself.
+
+            Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url`` source)
+            wires fetch a remote document; Chat Completions ``file`` parts, Gemini, and Bedrock
+            accept inline bytes only.
+        supports_prompt_cache_boundaries: Whether explicit caller-selected prompt-cache
+            boundaries can be preserved.
+
+            This covers Chat ``prompt_cache_options`` and ``prompt_cache_retention``. False
+            means those explicit boundaries are not declared as preserved; it does not mean
+            implicit prefix caching is absent.
+        supports_prompt_cache_ttl_12h: Whether this route forwards OpenAI's 12-hour
+            minimum cache lifetime (Responses ``prompt_cache_options.ttl: "12h"``).
+
+            OpenAI serves it on the Responses API for GPT-5.6 and later; Chat
+            Completions answers 400 for it. Admission sends ``"12h"`` only to rungs
+            declaring this and refuses the request when none does.
+        supports_media_handle_input: Whether this route forwards handles to media the caller
+            uploaded to its provider.
+
+            A handle (an OpenAI or Anthropic ``file_id``, a Gemini Files URI, a ``gs://`` object
+            on Vertex, an ``s3://`` object on Bedrock) is scoped to the provider that minted it
+            and never portable, so admission requires both this declaration and a handle
+            provider equal to the route's provider. Providers whose inference wire defines no
+            uploaded-media reference (Fireworks, OpenRouter) never declare it.
+        maximum_stop_sequences: Largest stop-sequence count this route accepts, when the
+            provider caps it.
+
+            ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
+            field). A concrete value lets admission reject an over-limit list locally with a
+            named parameter error instead of forwarding it and surfacing the provider's opaque
+            4xx (e.g. Gemini caps ``stopSequences`` at 5).
+        minimum_output_tokens: Provider output-token floor (sonar/fugu via OpenRouter, grok-4.6
+            on Bedrock: 16); a smaller caller ceiling is floored to it with disclosure on every
+            surface (see the profile).
+        supported_reasoning_efforts: Exact caller values this deployment can preserve without
+            normalization.
+
+            An empty tuple means the gateway should use its maintained provider-family contract.
+            OpenRouter and other catalog-driven providers declare the exact ordered set here
+            because their supported values vary by model.
+        reasoning_default_effort: The depth this deployment reasons at when the caller names
+            none.
+
+            Emitted on a wire that requires an explicit effort, and read by Messages admission
+            as the depth a budget-less ``thinking`` config (``adaptive``, or Claude Code's bare
+            ``{type: enabled}``) asks for on an effort rung, so a lane's think-mode depth is set
+            here, not in code.
+        reasoning_effort_required: Whether this deployment requires an explicit reasoning effort
+            on its wire.
+        reports_refusals: Whether provider refusals are reported explicitly.
+        reports_cached_input_tokens: Whether cached input-token usage is reported.
+        reports_cache_creation_input_tokens: Whether cache-write input-token usage is reported.
+        reports_reasoning_tokens: Whether reasoning-token usage is reported separately.
+        reports_model_status: Whether provider model-status metadata is preserved in the
+            normalized response.
+
+            False means the capability is not declared. Gemini ``modelStatus`` is currently
+            unpreserved, so no authored catalog should set this until the response contract
+            carries that field.
+        supports_async_tools: Whether a tool may be flagged ``async`` so the model keeps
+            generating while the caller runs it, with the result returned later on the tool
+            call's ORIGINAL ``call_id`` (GPT-6 Astra Responses). Declaration-driven and off
+            until the decoder + turn lifecycle honor it; a route that declares it must not drop
+            an async tool call. See the platform's astra_responses helpers.
+        supports_mid_turn_steering: Whether the caller may inject additional input over the
+            Responses WebSocket WHILE the model is working, folded into a continuation that
+            preserves completed work (GPT-6 Astra). Off until the WS transport accepts inbound
+            mid-turn frames.
+        supports_reasoning_effort_update: Whether a ``configuration_update`` input item may
+            change reasoning effort mid-conversation without invalidating the cached prompt
+            prefix -- the request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). Off
+            until the decoder recognizes the item (it must not hit the unknown-item reject path)
+            and applies the effort forward.
+        time_to_first_byte_base_seconds: Deployment override for the lane's flat
+            time-to-first-byte allowance.
+
+            ``None`` uses the serving configuration's default. The effective bound on the wait
+            for a provider's response headers is this base plus the input-scaled allowance
+            below, so very large prompts are not misread as a dead lane. The wait for the first
+            TOKEN has its own base (``time_to_first_token_base_seconds``) and shares the slope.
+        time_to_first_byte_seconds_per_million_input_tokens: Deployment override for the
+            input-scaled time-to-first-byte allowance.
+
+            Seconds added per million approximate input tokens (the request body's bytes divided
+            by four; an allowance heuristic, never a billing quantity). ``None`` uses the
+            serving configuration's default; ``0`` disables scaling for this deployment.
+        time_to_first_token_base_seconds: Deployment override for the lane's flat
+            time-to-first-TOKEN allowance.
+
+            ``None`` uses the serving configuration's default (two minutes). The effective bound
+            on the wait from the dial to the first semantic event (content, reasoning, a tool
+            call; keepalive comments and role-only frames do not count) is this base plus the
+            input-scaled allowance above. A stall past it fails over to the next rung. Author it
+            above the lane's observed first-token p99 on a thinking model, below the stall you
+            want caught.
+        failover_only_on: Failure tokens this rung serves as a failover for, or ``None`` for an
+            unrestricted rung.
+
+            A rung carrying a set is never dialed first and is dialed as a successor only when
+            the failure being failed over from spells one of its tokens (see
+            ``exp.common.models.failover_tokens``); a rule-carrying rung reached that way
+            records ``fallback_reason = failover_only_on:<token>``.
     """
+
+    supports_decisions: bool = False
+    supports_speech: bool = False
+    supports_transcription: bool = False
+    supports_video_generation: bool = False
 
     supports_developer_messages: bool = False
     supports_streaming: bool = False
     supports_streaming_tool_arguments: bool = False
+    supports_responses_logprobs: bool = False
     supports_strict_tools: bool = False
     supports_parallel_tool_calls: bool = False
+    supports_custom_tools: bool = False
+    supports_grammar_tools: bool = False
+    supports_tool_call_limit: bool = False
     supports_structured_text: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
-    """Whether this deployment's wire and model can carry caller image parts.
-
-    Image input is declaration-driven and never assumed: a route that does
-    not declare it rejects an image request at admission, so a picture is
-    never dropped and answered from the surrounding text alone.
-    """
     supports_image_url_input: bool = False
-    """Whether this route's provider fetches a caller image URL itself.
-
-    Inline base64 rides every image-capable wire, but only some wires accept a
-    remote URL. A route that does not declare this rejects a URL image at
-    admission, which lets a waterfall narrow to a rung that can carry it.
-    """
     supports_video_input: bool = False
-    """Whether this deployment's wire and model can carry caller video parts.
-
-    Video is narrower than images: only the Gemini, Bedrock Converse, and
-    OpenAI-compatible ``video_url`` wires define a video carrier, and only
-    some models on those wires accept one. Like images the declaration is
-    never assumed, so a route without it rejects a video at admission rather
-    than answering from the surrounding text.
-    """
     supports_video_url_input: bool = False
-    """Whether this route's provider fetches a caller video URL itself.
-
-    Bedrock accepts inline bytes (or an S3 location the gateway does not
-    author) only; Gemini and the OpenAI-compatible video wires fetch an
-    http(s) URL on the caller's behalf.
-    """
     supports_audio_input: bool = False
-    """Whether this deployment's wire and model can carry caller audio parts.
-
-    Audio is the narrowest attachment: only the OpenAI-compatible Chat
-    ``input_audio`` wire and the Gemini ``inline_data`` wire carry a clip a
-    model serves, and on those wires only specific models (the gpt-audio
-    family, audio-capable Gemini models) accept one. The declaration is never
-    assumed, so a route without it rejects audio at admission rather than
-    answering from the surrounding text. Audio has no remote URL carrier on
-    any public surface, so there is no separate URL declaration.
-    """
     supports_pdf_input: bool = False
-    """Whether this deployment's wire and model can carry caller PDF documents.
-
-    Like image input this is declaration-driven and never assumed: a route
-    that does not declare it rejects a document request at admission, so a
-    PDF is never dropped and answered from the surrounding text alone.
-    """
     supports_pdf_url_input: bool = False
-    """Whether this route's provider fetches a caller PDF URL itself.
-
-    Only the OpenAI Responses (``file_url``) and Anthropic Messages (``url``
-    source) wires fetch a remote document; Chat Completions ``file`` parts,
-    Gemini, and Bedrock accept inline bytes only.
-    """
+    supports_prompt_cache_boundaries: bool = False
+    supports_prompt_cache_ttl_12h: bool = False
+    supports_media_handle_input: bool = False
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
-    """Largest stop-sequence count this route accepts, when the provider caps it.
-
-    ``None`` leaves the count unbounded (only ``supports_stop_sequences`` gates the
-    field). A concrete value lets admission reject an over-limit list locally with a
-    named parameter error instead of forwarding it and surfacing the provider's
-    opaque 4xx (e.g. Gemini caps ``stopSequences`` at 5)."""
+    minimum_output_tokens: int | None = Field(default=None, ge=1)
+    logprobs_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
     supported_reasoning_efforts: tuple[ReasoningEffort, ...] = ()
-    """Exact caller values this deployment can preserve without normalization.
-
-    An empty tuple means the gateway should use its maintained provider-family
-    contract. OpenRouter and other catalog-driven providers declare the exact
-    ordered set here because their supported values vary by model.
-    """
     reasoning_default_effort: ReasoningEffort | None = None
-    """Explicit provider default used only when the wire requires this field."""
     reasoning_effort_required: bool = False
-    """Whether this deployment requires an explicit reasoning effort on its wire."""
     reports_refusals: bool = False
     reports_cached_input_tokens: bool = False
+    reports_cache_creation_input_tokens: bool = False
     reports_reasoning_tokens: bool = False
+    reports_model_status: bool = False
+    supports_async_tools: bool = False
+    supports_mid_turn_steering: bool = False
+    supports_reasoning_effort_update: bool = False
     time_to_first_byte_base_seconds: float | None = Field(default=None, gt=0)
-    """Deployment override for the lane's flat time-to-first-byte allowance.
-
-    ``None`` uses the serving configuration's default. The effective bound on
-    the wait for a provider's response headers is this base plus the
-    input-scaled allowance below, so very large prompts are not misread as a
-    dead lane.
-    """
     time_to_first_byte_seconds_per_million_input_tokens: float | None = Field(default=None, ge=0)
-    """Deployment override for the input-scaled time-to-first-byte allowance.
-
-    Seconds added per million approximate input tokens (the request body's
-    bytes divided by four; an allowance heuristic, never a billing quantity).
-    ``None`` uses the serving configuration's default; ``0`` disables scaling
-    for this deployment.
-    """
+    time_to_first_token_base_seconds: float | None = Field(default=None, gt=0)
+    failover_only_on: tuple[FailoverToken, ...] | None = None
 
     @property
     def declares_reasoning_contract(self) -> bool:
@@ -484,6 +637,21 @@ class GatewayDeploymentCapabilities(ContractModel):
             or self.reasoning_default_effort is not None
             or self.reasoning_effort_required
         )
+
+    @model_validator(mode="after")
+    def _require_custom_tools_for_grammar(self) -> GatewayDeploymentCapabilities:
+        """Reject grammar-tool support that is not backed by custom-tool support.
+
+        Returns:
+            The validated declaration.
+
+        Raises:
+            ValueError: ``supports_grammar_tools`` is true while
+                ``supports_custom_tools`` is false.
+        """
+        if self.supports_grammar_tools and not self.supports_custom_tools:
+            raise ValueError("supports_grammar_tools requires supports_custom_tools=true")
+        return self
 
     @model_validator(mode="after")
     def _require_valid_reasoning_contract(self) -> GatewayDeploymentCapabilities:
@@ -510,51 +678,13 @@ class GatewayDeploymentCapabilities(ContractModel):
         return self
 
 
-class GatewayLongContextTier(ContractModel):
-    """Premium rates a provider applies to whole long-context requests.
-
-    Both published tier schedules this models (Gemini's ``prompts > 200k``
-    rates and Anthropic's legacy 1M-beta premium) reprice the ENTIRE request
-    once provider-reported input tokens reach the threshold, never only the
-    tokens past it, so that is the one semantic implemented: when
-    ``usage.input_tokens >= input_threshold_tokens``, these rates replace
-    the base rates for every dimension of the request. ``None`` means the
-    tier rate is unknown exactly as on the base schedule; it never inherits
-    the base rate, so a deployment reporting a dimension without a tier
-    price stays honestly unpriced above the threshold.
-    """
-
-    input_threshold_tokens: int = Field(gt=0)
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-
-
-class GatewayTokenPrices(ContractModel):
-    """Integer gateway attribution rates for one provider deployment.
-
-    Values are micro-USD per million provider-reported tokens. ``None`` means the rate is unknown;
-    it must never be interpreted as zero. Existing optimizer float pricing remains unchanged.
-    """
-
-    input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    cached_input_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    output_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    reasoning_micro_usd_per_million_tokens: int | None = Field(default=None, ge=0)
-    long_context: GatewayLongContextTier | None = None
-    """Whole-request premium schedule for long-context input, when one exists.
-
-    Verified against the providers' published schedules (2026-08-30):
-    Gemini prices ``prompts > 200k tokens`` at a higher whole-request rate
-    for input, output, and cache reads; Anthropic's Claude 4.6+ models serve
-    the full 1M window at standard pricing (no tier), so current Anthropic
-    deployments leave this ``None``.
-    """
-
-
 class GatewayDeploymentMetadata(ContractModel):
-    """Optional gateway-only metadata authored beside one existing model record."""
+    """Optional gateway-only metadata authored beside one existing model record.
+
+    Attributes:
+        cache_retention_seconds: Declared positive cache lifetime, at most one hour;
+            None supplies no plausible warmth claim.
+    """
 
     exact_model_id: ArtifactId | None = None
     capabilities: GatewayDeploymentCapabilities = Field(
@@ -563,58 +693,19 @@ class GatewayDeploymentMetadata(ContractModel):
     prices: GatewayTokenPrices = Field(default_factory=GatewayTokenPrices)
     pricing_source: str | None = Field(default=None, min_length=1, max_length=512)
     pricing_effective_at: AwareDatetime | None = None
-
-
-class GatewayEquivalenceCertification(ContractModel):
-    """Operator-authored evidence that deployments serve one exact model revision."""
-
-    authority: Literal["operator"] = "operator"
-    certification_id: ArtifactId
-    provenance: str = Field(min_length=1, max_length=2_048)
-    evidence_sha256: Sha256
-    certified_at: AwareDatetime
-
-    @model_validator(mode="after")
-    def _require_safe_provenance(self) -> GatewayEquivalenceCertification:
-        """Reject credential-like or control-bearing equivalence provenance."""
-        try:
-            assert_secret_free(self.model_dump(mode="json"))
-        except SecretBoundaryError as exc:
-            raise ValueError("equivalence provenance must be secret-free") from exc
-        if any(ord(character) < 32 for character in self.provenance):
-            raise ValueError("equivalence provenance must be display-safe")
-        return self
-
-
-class GatewayPoolRecord(ContractModel):
-    """Authored ordered deployments explicitly certified as one exact model."""
-
-    exact_model_id: ArtifactId
-    deployment_aliases: tuple[ArtifactId, ...] = Field(min_length=2)
-    equivalence: GatewayEquivalenceCertification
-    # Per-model failover policy for this pool's waterfall. Defaults to the
-    # historical maximize_availability so an unset authored pool is unchanged.
-    failover_mode: FailoverMode = "maximize_availability"
-
-    @model_validator(mode="after")
-    def _require_unique_deployments(self) -> GatewayPoolRecord:
-        """Reject repeated deployment aliases inside one equivalence pool."""
-        if len(set(self.deployment_aliases)) != len(self.deployment_aliases):
-            raise ValueError("gateway pool deployment aliases must not repeat")
-        return self
+    dispatch: GatewayRungDispatchPolicy | None = None
+    cache_retention_seconds: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
 
 
 class ModelRecord(ContractModel):
-    """A stable local alias, exact capability snapshot, and provider-side model name.
+    """A stable alias, capability snapshot, and provider-side model identity.
 
-    An omitted capability declaration means the catalog cannot prove any optional protocol
-    feature or token limit. Unknown declarations stay permissive: capability preflight blocks
-    only an explicit declaration that rules a requirement out, so an undeclared model remains
-    usable and the provider reports any real protocol gap.
-
-    ``served_model_id`` accepts an alternate identifier the provider echoes in responses when it
-    differs from the requested ``model``, for example a vLLM endpoint that publishes an alias in
-    ``/models`` but reports its canonical served name in every completion.
+    Unknown capabilities stay permissive; only explicit declarations rule out protocol features
+    or token limits. ``served_model_id`` pins an alternate provider-echoed model name.
+    ``supported_reasoning_efforts`` preserves setup choices outside capability identity;
+    ``None`` means the listing did not declare them. ``discovery`` retains published tri-state
+    flags so explicit denials survive reload. Capability-only gateway metadata has no authored
+    tariff; an explicitly supplied empty price card retains unknown pricing authority.
     """
 
     connection: str = Field(min_length=1, max_length=128)
@@ -623,12 +714,42 @@ class ModelRecord(ContractModel):
     served_model_id: str | None = Field(default=None, min_length=1, max_length=2_048)
     billing_source: BillingSource
     capabilities: ModelCapabilities | None = None
+    supported_reasoning_efforts: tuple[ReasoningEffort, ...] | None = None
+    discovery: DiscoveredModel | None = None
     gateway: GatewayDeploymentMetadata | None = None
     sft_provenance: SFTModelProvenance | None = None
+
+    @property
+    def token_prices(self) -> GatewayTokenPrices | None:
+        """Return the complete authored schedule when this model carries one."""
+        if self.gateway is None or "prices" not in self.gateway.model_fields_set:
+            return None
+        return self.gateway.prices
+
+    @model_serializer(mode="wrap")
+    def _serialize_authored_gateway_prices(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Preserve tariff absence without changing normalized gateway metadata's wire shape."""
+        serialized: dict[str, object] = handler(self)
+        gateway = serialized.get("gateway")
+        if isinstance(gateway, dict) and self.token_prices is None:
+            gateway.pop("prices", None)
+        return serialized
+
+    def __eq__(self, other: object) -> bool:
+        """Include tariff presence when deciding whether an authored catalog changed."""
+        return (
+            isinstance(other, ModelRecord)
+            and super().__eq__(other)
+            and self.token_prices == other.token_prices
+        )
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:
         """Reject contradictory reasoning metadata and credential-bearing identity fields."""
+        if self.discovery is not None and self.discovery.model != self.model:
+            raise ValueError("discovery metadata must describe the same provider model")
         if (
             self.gateway is not None
             and self.gateway.capabilities.declares_reasoning_contract
@@ -659,6 +780,11 @@ class ModelRecord(ContractModel):
                     "gateway": (
                         self.gateway.model_dump(mode="json") if self.gateway is not None else None
                     ),
+                    "discovery": (
+                        self.discovery.model_dump(mode="json")
+                        if self.discovery is not None
+                        else None
+                    ),
                     "sft_provenance": (
                         self.sft_provenance.model_dump(mode="json")
                         if self.sft_provenance is not None
@@ -671,53 +797,8 @@ class ModelRecord(ContractModel):
         return self
 
 
-class ModelRoles(ContractModel):
-    """Project roles that select stable aliases without revealing credentials.
-
-    Each completion role may carry its own reasoning-effort choice, so one alias can use
-    different efforts as world model, judge, or router candidate. An absent role effort means
-    the alias's catalog capability pin applies unchanged.
-    """
-
-    candidates: tuple[str, ...] = ()
-    incumbent: str | None = None
-    world_model: str | None = None
-    judge: str | None = None
-    rubric_proposer: str | None = None
-    embedder: str | None = None
-    teacher: str | None = None
-    world_model_reasoning_effort: ReasoningEffort | None = None
-    judge_reasoning_effort: ReasoningEffort | None = None
-    candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)
-
-    @field_validator("candidates")
-    @classmethod
-    def _require_unique_candidates(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("candidate aliases must not repeat")
-        return value
-
-    @model_validator(mode="after")
-    def _require_role_bound_reasoning_efforts(self) -> ModelRoles:
-        """Require every role-specific effort to name a currently assigned role alias.
-
-        Returns:
-            The validated roles.
-
-        Raises:
-            ValueError: An effort is declared for an unassigned role or unknown candidate.
-        """
-        if self.world_model_reasoning_effort is not None and self.world_model is None:
-            raise ValueError("world_model_reasoning_effort requires an assigned world_model")
-        if self.judge_reasoning_effort is not None and self.judge is None:
-            raise ValueError("judge_reasoning_effort requires an assigned judge")
-        unknown = sorted(set(self.candidate_reasoning_efforts).difference(self.candidates))
-        if unknown:
-            raise ValueError(
-                "candidate_reasoning_efforts name unassigned candidates: " + ", ".join(unknown)
-            )
-        return self
-
+MODEL_CATALOG_SCHEMA_VERSION = 3
+"""Authored catalog revision this build writes (3 = integer nano-USD prices)."""
 
 SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION = 10_000
 """Upper bound on an authored catalog version this parser accepts as real.
@@ -729,10 +810,19 @@ and fails closed rather than being read as a future contract.
 
 
 class ModelCatalog(ContractModel):
-    """The local model aliases, connection metadata, and project role assignments."""
+    """The local model aliases, connection metadata, and project role assignments.
 
-    schema_version: int = Field(default=2, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION)
+    Attributes:
+        gateway_model_chains: Authored chains keyed by canonical model ID; empty by default.
+    """
+
+    schema_version: int = Field(
+        default=MODEL_CATALOG_SCHEMA_VERSION, ge=2, le=SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
+    )
     """Authored catalog contract revision. Deliberately NOT a ``Literal``.
+
+    Schema 3 prices in integer nano-USD; schema 2 (micro-USD) documents are
+    upgraded at every read boundary by ``upgrade_model_catalog_document``.
 
     Every cross-version hydration parses the authored document first, and a
     changed ``Literal`` value on a known field raises ``literal_error``, which
@@ -743,11 +833,12 @@ class ModelCatalog(ContractModel):
     safe by construction; a revision that REINTERPRETS existing fields must not
     reuse this channel — it needs a new field name or a fleet-first tolerance
     release. Version 1 stays rejected here: it is only readable through
-    ``_migrate_legacy_model_catalog`` on the TOML load path.
+    ``upgrade_legacy_billing_source`` on the TOML load path.
     """
     connections: dict[str, ConnectionConfig]
     models: dict[str, ModelRecord]
     gateway_pools: dict[str, GatewayPoolRecord] = Field(default_factory=dict)
+    gateway_model_chains: dict[str, GatewayModelChain] = Field(default_factory=dict)
     roles: ModelRoles = Field(default_factory=ModelRoles)
 
     @field_validator("schema_version", mode="before")
@@ -865,55 +956,11 @@ def load_model_catalog(path: Path) -> ModelCatalog:
     except tomllib.TOMLDecodeError as exc:
         raise ModelCatalogError(f"model catalog is invalid TOML: {path}") from exc
     try:
-        return ModelCatalog.model_validate(_migrate_legacy_model_catalog(raw_catalog))
+        return ModelCatalog.model_validate(
+            upgrade_model_catalog_document(upgrade_legacy_billing_source(raw_catalog))
+        )
     except ValueError as exc:
         raise ModelCatalogError(f"model catalog is invalid: {exc}") from exc
-
-
-def _migrate_legacy_model_catalog(raw_catalog: JsonObject) -> JsonObject:
-    """Upgrade only schema-v1 local catalogs with conservative customer-owned billing.
-
-    Args:
-        raw_catalog: Parsed secret-free TOML payload.
-
-    Returns:
-        A schema-v2 payload. Current schema records are returned unchanged so a missing
-        ``billing_source`` remains a validation error.
-    """
-    raw_version = raw_catalog.get("schema_version", 1)
-    if type(raw_version) is not int or raw_version != 1:
-        return raw_catalog
-    payload = cast(JsonObject, dict(raw_catalog))
-    models = raw_catalog.get("models")
-    if isinstance(models, dict):
-        migrated_models: JsonObject = {}
-        for alias, value in models.items():
-            if isinstance(value, dict):
-                record = cast(JsonObject, dict(value))
-                if "billing_source" in record:
-                    raise ValueError(
-                        "schema-v1 model record must not declare current billing_source"
-                    )
-                record["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                provenance = record.get("sft_provenance")
-                if isinstance(provenance, dict):
-                    migrated_provenance = cast(JsonObject, dict(provenance))
-                    base_model = provenance.get("base_model")
-                    if isinstance(base_model, dict):
-                        migrated_base = cast(JsonObject, dict(base_model))
-                        if "billing_source" in migrated_base:
-                            raise ValueError(
-                                "schema-v1 SFT base model must not declare current billing_source"
-                            )
-                        migrated_base["billing_source"] = BillingSource.CUSTOMER_MANAGED.value
-                        migrated_provenance["base_model"] = migrated_base
-                    record["sft_provenance"] = migrated_provenance
-                migrated_models[str(alias)] = record
-            else:
-                migrated_models[str(alias)] = value
-        payload["models"] = migrated_models
-    payload["schema_version"] = 2
-    return payload
 
 
 def write_model_catalog(path: Path, catalog: ModelCatalog) -> None:

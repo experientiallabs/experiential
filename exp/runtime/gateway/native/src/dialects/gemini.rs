@@ -1,26 +1,85 @@
 //! Gemini `streamGenerateContent` frame mapping plus its golden-fixture tests.
 
+#[path = "gemini_usage.rs"]
+mod usage;
+pub(super) use usage::StreamState;
+
 use serde_json::Value;
 
-use super::{malformed, parse_object, refusal_failure, Normalizer};
+use super::{malformed, parse_object, Normalizer};
 use crate::errors::{Failure, FailureClass};
-use crate::events::{gemini_usage, require_string, Event, ToolAccumulator};
+use crate::events::{require_string, Event, ToolAccumulator};
 
 impl Normalizer {
-    /// Normalize one Gemini `streamGenerateContent` SSE frame: reasoning parts
-    /// are skipped, whole function calls expand to start/arguments/completed,
-    /// and the terminal candidate flushes the latest usage before its finish
-    /// reason maps to the shared completion, incomplete, refusal, or
-    /// provider-internal outcome.
+    /// Normalize one Gemini `streamGenerateContent` SSE frame: thought parts
+    /// stay capture-only, whole function calls expand to start/arguments/completed,
+    /// and the terminal candidate freezes content while metadata trailers can
+    /// complete the meter. Its declared outcome is emitted once transport ends.
+    /// A prompt-level block (`promptFeedback.blockReason`, delivered with no
+    /// candidates at all) is the same
+    /// content-free refusal a candidate-level safety finish produces.
     pub(super) fn feed_gemini(
         &mut self,
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
+        if self.metadata_drain_started().is_some() {
+            if let Some(raw) = payload.get("usageMetadata").filter(|raw| !raw.is_null()) {
+                self.observe_gemini_usage(raw)?;
+            }
+            // The first finish is authoritative. Late content, tools, errors,
+            // refusals and further finish reasons cannot reopen the answer.
+            return Ok(Vec::new());
+        }
+        if let Some(error) = payload.get("error").filter(|value| !value.is_null()) {
+            // Google's error envelope ({"error":{"code":503,"status":"UNAVAILABLE"}})
+            // arrives as a candidate-less frame; without this branch it reads
+            // as a usage-only trailer and the stream ends malformed (or, after
+            // prior output, as a synthesized completion of a failed answer).
+            // It is the provider declaring failure, so it takes the shared
+            // retry-then-failover classification the other dialects give it,
+            // with its status and message riding as the bounded ledger detail.
+            let (code, message) = match error.as_object() {
+                Some(error) => (
+                    error.get("status").and_then(Value::as_str),
+                    error.get("message").and_then(Value::as_str),
+                ),
+                None => (None, None),
+            };
+            return Ok(vec![Event::Failed(self.provider_stream_failure(
+                "gemini_generate_content",
+                code,
+                message,
+                None,
+            ))]);
+        }
         if let Some(raw_usage) = payload.get("usageMetadata") {
             if !raw_usage.is_null() {
-                self.usage = Some(gemini_usage(raw_usage).map_err(|message| malformed(&message))?);
+                self.observe_gemini_usage(raw_usage)?;
             }
+        }
+        if gemini_prompt_blocked(&payload)? {
+            // A candidate-less frame naming `promptFeedback.blockReason` is the
+            // provider's verdict on the PROMPT, not a usage-only trailer: no
+            // candidate follows and no finishReason will name the outcome.
+            // It is the same content-free refusal a candidate-level SAFETY
+            // finish is, so it terminates the stream as one (no retry, no
+            // failover: every lane blocks the same prompt), after the usage
+            // Google reported for the prompt it counted.
+            let mut events = Vec::new();
+            if let Some(usage) = self.usage.take() {
+                events.push(Event::Usage(usage));
+            }
+            // The block reason names the category the same way a candidate
+            // finishReason does. Google's raw token also rides the ledger
+            // detail: `OTHER` (and any reason newer than the vocabulary)
+            // maps to the unnamed category, and without the token the
+            // ledger read a bare "provider refused the request" that no one
+            // could tell apart from any other refusal (2026-10-22,
+            // gemini-4-argon under Claude Code).
+            let reason = gemini_block_reason(&payload).unwrap_or_default();
+            events.push(Event::Failed(gemini_refusal("blockReason", &reason)));
+            return Ok(events);
         }
         let candidates = match payload.get("candidates") {
             // A usage-only trailer frame legitimately carries no candidates at
@@ -45,26 +104,94 @@ impl Normalizer {
         match candidate.get("content") {
             None | Some(Value::Null) => {}
             Some(content) => {
-                let parts = content
+                // A blocked image turn ends with `"content": {}` (no parts at
+                // all) beside its IMAGE_RECITATION finish: nothing to emit.
+                let parts = match content
                     .as_object()
                     .ok_or_else(|| malformed("Gemini candidate content must be an object"))?
                     .get("parts")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| malformed("Gemini candidate parts must be an array"))?;
+                {
+                    None | Some(Value::Null) => &Vec::new(),
+                    Some(Value::Array(parts)) => parts,
+                    Some(_) => return Err(malformed("Gemini candidate parts must be an array")),
+                };
                 for raw_part in parts {
                     let part = raw_part
                         .as_object()
                         .ok_or_else(|| malformed("Gemini candidate part must be an object"))?;
-                    // Reasoning parts (thought text and thought signatures)
-                    // are not gateway-visible output.
-                    if part.get("thought") == Some(&Value::Bool(true)) {
+                    // Google exposes thought summaries, not full CoT. Preserve the
+                    // whole signed part so a signature remains paired with its
+                    // text or functionCall; the part itself is capture and replay
+                    // evidence, never readable output. An unsigned thought
+                    // summary carries only display text, which streams below as
+                    // plaintext reasoning instead.
+                    let thought = part.get("thought") == Some(&Value::Bool(true));
+                    let thought_text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| thought && !text.is_empty());
+                    let retained_whole = part.contains_key("thoughtSignature")
+                        || (thought && thought_text.is_none());
+                    if retained_whole {
+                        // A signed generated image keeps its signature and media
+                        // type as evidence; its inline bytes are charged to the
+                        // image budget and delivered as the image below, so
+                        // retaining them here too would hold a multi-MiB image
+                        // against the 1 MiB evidence bound and fail the stream.
+                        // Its signature alone can pass 1 MB (an image model
+                        // signs each image), so it is charged to the stream's
+                        // whole retained-output budget, not a per-part bound.
+                        let retained = gemini_part_without_inline_data(raw_part);
+                        let bytes = crate::dialects::json_retained_bytes(&retained);
+                        self.reserve_summary_bytes(bytes.max(64))?;
+                        events.push(Event::GeminiThoughtPart(std::sync::Arc::new(retained)));
+                    }
+                    if thought {
+                        // The thought summary text is the model's displayable
+                        // reasoning: it renders as plaintext reasoning on rungs
+                        // whose reasoning display is on.
+                        if let Some(text) = thought_text {
+                            // A signed part was charged whole above.
+                            if !retained_whole {
+                                self.reserve_summary_bytes(text.len())?;
+                            }
+                            events.push(Event::ReasoningTextDelta(text.to_string()));
+                        }
                         continue;
                     }
                     if let Some(call) = part.get("functionCall") {
                         if !call.is_null() {
-                            events.extend(self.gemini_tool_events(call)?);
+                            let signature = match part.get("thoughtSignature") {
+                                None | Some(Value::Null) => None,
+                                Some(Value::String(signature)) if !signature.is_empty() => {
+                                    Some(signature.clone())
+                                }
+                                Some(_) => {
+                                    return Err(malformed(
+                                        "Gemini thoughtSignature must be nonempty text",
+                                    ))
+                                }
+                            };
+                            events.extend(self.gemini_tool_events(call, signature)?);
                             continue;
                         }
+                    }
+                    if let Some(image) = part.get("inlineData") {
+                        let media_type =
+                            image
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    malformed("Gemini image requires a media type")
+                                        .with_retry(false, false)
+                                })?;
+                        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
+                            malformed("Gemini image requires base64 data").with_retry(false, false)
+                        })?;
+                        let url = crate::image_output::inline_image(media_type, data)?;
+                        self.reserve_image_bytes(url.len())?;
+                        events.push(Event::Image(url));
+                        continue;
                     }
                     match part.get("text") {
                         Some(Value::String(text)) => {
@@ -86,31 +213,53 @@ impl Normalizer {
             Some(Value::String(reason)) => reason.clone(),
             Some(_) => return Err(malformed("Gemini finishReason must be text")),
         };
-        if let Some(usage) = self.usage.take() {
-            events.push(Event::Usage(usage));
-        }
-        match finish_reason.as_str() {
-            "STOP" | "FINISH_REASON_UNSPECIFIED" => events.push(Event::Completed),
-            "MAX_TOKENS" => events.push(Event::Incomplete),
-            // The python mapper's refusal signal table: safety, copyright,
-            // and sensitive-information stops are content-free refusals.
-            "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII" => {
-                events.push(Event::Failed(refusal_failure()));
-            }
-            _ => {
-                events.push(Event::Failed(Failure::new(
-                    FailureClass::ProviderInternal,
-                    "provider ended the stream unexpectedly",
-                )));
-            }
-        }
+        let terminal = match finish_reason.as_str() {
+            "STOP" | "FINISH_REASON_UNSPECIFIED" => Event::Completed,
+            "MAX_TOKENS" => Event::Incomplete,
+            // The refusal signal table: safety, copyright,
+            // and sensitive-information stops are content-free refusals. The
+            // finish token names the category (RECITATION, SPII, SAFETY), so
+            // the caller sees which policy declined without any provider prose.
+            "SAFETY"
+            | "PROHIBITED_CONTENT"
+            | "BLOCKLIST"
+            | "RECITATION"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION" => Event::Failed(gemini_refusal("finishReason", &finish_reason)),
+            // The model produced an unparsable call or answer. It is a
+            // sampling failure, not a verdict on the request: Gemini 3.1 Pro
+            // ends about half of fresh tool prompts this way when called
+            // directly (live 2026-10-18), and the same request succeeds on a
+            // fresh sample. So it re-dials the rung, then fails over.
+            "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE" => Event::Failed(
+                Failure::new(
+                    FailureClass::MalformedResponse,
+                    "provider ended the stream with a malformed answer",
+                )
+                .with_retry(true, true),
+            ),
+            _ => Event::Failed(Failure::new(
+                FailureClass::ProviderInternal,
+                "provider ended the stream unexpectedly",
+            )),
+        };
+        self.gemini.finish = Some(terminal);
+        self.gemini.finished_at = Some(std::time::Instant::now());
         Ok(events)
     }
 
     /// Expand one complete Gemini function call into the canonical tool-call
     /// lifecycle, assigning the deterministic local call-ID fallback and the
-    /// canonical compact JSON argument text the python mapper produces.
-    fn gemini_tool_events(&mut self, value: &Value) -> Result<Vec<Event>, Failure> {
+    /// canonical compact JSON argument text. The part's `thoughtSignature`
+    /// rides the call so the caller can echo it on the next turn; Gemini
+    /// signs only the first call of a parallel batch, so the rest carry none.
+    fn gemini_tool_events(
+        &mut self,
+        value: &Value,
+        thought_signature: Option<String>,
+    ) -> Result<Vec<Event>, Failure> {
         let call = value
             .as_object()
             .ok_or_else(|| malformed("Gemini functionCall must be an object"))?;
@@ -131,12 +280,17 @@ impl Normalizer {
         self.reserve_tool_bytes(raw_arguments.len())?;
         let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
         tool.raw_arguments = raw_arguments.clone();
+        tool.thought_signature = thought_signature.clone();
         let completed = tool.complete().map_err(|message| malformed(&message))?;
         Ok(vec![
             Event::ToolCallStarted {
+                custom: false,
                 index,
                 call_id,
                 name,
+                namespace: None,
+                caller: None,
+                thought_signature,
             },
             Event::ToolArgumentsDelta {
                 index,
@@ -150,381 +304,66 @@ impl Normalizer {
     }
 }
 
-#[cfg(test)]
-mod gemini_tests {
-    use super::super::{drain_stream_fixture, Dialect};
-    use super::*;
-    use serde_json::json;
-
-    fn run_stream(dialect: Dialect, chunks: &[&[u8]]) -> (Vec<Value>, Option<Failure>) {
-        let owned: Vec<Vec<u8>> = chunks.iter().map(|chunk| chunk.to_vec()).collect();
-        drain_stream_fixture(dialect, &owned)
-    }
-
-    fn sse(payload: &Value) -> Vec<u8> {
-        format!("data: {payload}\n\n").into_bytes()
-    }
-
-    #[test]
-    fn gemini_golden_stream_normalizes_text_tools_usage_and_completion() {
-        // Golden fixture: raw provider bytes in, exact canonical events out.
-        // `native_dialect_parity_test.py` holds the python-mapper comparison.
-        let chunks = [
-            sse(&json!({"candidates": [{"content": {"parts": [{"text": "Hel"}]}}]})),
-            sse(&json!({"candidates": [{"content": {"parts": [
-                {"thought": true, "text": "hidden reasoning"},
-                {"text": "lo"},
-            ]}}]})),
-            sse(&json!({"candidates": [{"content": {"parts": [{
-                "functionCall": {
-                    "id": "call-1",
-                    "name": "lookup",
-                    "args": {"city": "Zürich", "count": 2},
-                }
-            }]}}]})),
-            sse(&json!({
-                "candidates": [{"finishReason": "STOP"}],
-                "usageMetadata": {
-                    "promptTokenCount": 11,
-                    "candidatesTokenCount": 5,
-                    "cachedContentTokenCount": 2,
-                    "thoughtsTokenCount": 3,
-                },
-            })),
-        ];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        let raw_arguments = "{\"city\":\"Zürich\",\"count\":2}";
-        assert_eq!(
-            events,
-            vec![
-                json!({"kind": "text_delta", "text": "Hel"}),
-                json!({"kind": "text_delta", "text": "lo"}),
-                json!({"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"}),
-                json!({"kind": "tool_arguments_delta", "index": 0, "text": raw_arguments}),
-                json!({
-                    "kind": "tool_call_completed",
-                    "index": 0,
-                    "call_id": "call-1",
-                    "name": "lookup",
-                    "raw_arguments": raw_arguments,
-                }),
-                // thoughtsTokenCount is additive on the Gemini wire, so the
-                // output total carries the folded 5 + 3 and reasoning names
-                // the subset.
-                json!({
-                    "kind": "usage",
-                    "input_tokens": 11,
-                    "output_tokens": 8,
-                    "cached_input_tokens": 2,
-                    "reasoning_tokens": 3,
-                }),
-                json!({"kind": "completed"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn gemini_thinking_stream_folds_thoughts_into_the_terminal_usage() {
-        // Frame shapes from gemini-3.7-flash streamGenerateContent?alt=sse
-        // (2026-09-03): every chunk carries usageMetadata, the final chunk
-        // adds the thoughtSignature part and STOP. The terminal chunk's counts
-        // win over the earlier partial ones, and Google's totalTokenCount
-        // (11 + 7 + 654 = 672) shows thoughts are additive, so the normalized
-        // output total is 661 with 654 as the reasoning subset.
-        let chunks = [
-            sse(&json!({
-                "candidates": [{"content": {"parts": [{"text": "Sunlight scatters off air "}], "role": "model"}, "index": 0}],
-                "usageMetadata": {
-                    "promptTokenCount": 11,
-                    "candidatesTokenCount": 3,
-                    "totalTokenCount": 668,
-                    "thoughtsTokenCount": 654,
-                },
-                "modelVersion": "gemini-3.7-flash",
-                "responseId": "resp-1",
-            })),
-            sse(&json!({
-                "candidates": [{
-                    "content": {"parts": [{"text": "molecules.", "thoughtSignature": "CikB"}], "role": "model"},
-                    "finishReason": "STOP",
-                    "index": 0,
-                }],
-                "usageMetadata": {
-                    "promptTokenCount": 11,
-                    "candidatesTokenCount": 7,
-                    "totalTokenCount": 672,
-                    "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 11}],
-                    "thoughtsTokenCount": 654,
-                    "serviceTier": "standard",
-                },
-                "modelVersion": "gemini-3.7-flash",
-                "responseId": "resp-1",
-            })),
-        ];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(
-            events,
-            vec![
-                json!({"kind": "text_delta", "text": "Sunlight scatters off air "}),
-                json!({"kind": "text_delta", "text": "molecules."}),
-                json!({
-                    "kind": "usage",
-                    "input_tokens": 11,
-                    "output_tokens": 661,
-                    "cached_input_tokens": 0,
-                    "reasoning_tokens": 654,
-                }),
-                json!({"kind": "completed"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn gemini_missing_call_id_uses_the_deterministic_local_fallback() {
-        let chunks = [
-            sse(&json!({"candidates": [{"content": {"parts": [
-                {"functionCall": {"name": "first", "args": {}}},
-                {"functionCall": {"name": "second"}},
-            ]}}]})),
-            sse(&json!({
-                "candidates": [{"finishReason": "STOP"}],
-                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
-            })),
-        ];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(
-            events[0],
-            json!({"kind": "tool_call_started", "index": 0, "call_id": "gemini-call-0", "name": "first"})
-        );
-        assert_eq!(events[1]["text"], "{}");
-        assert_eq!(
-            events[3],
-            json!({"kind": "tool_call_started", "index": 1, "call_id": "gemini-call-1", "name": "second"})
-        );
-        // Absent usage counts are zero (require_integer parity), and an
-        // omitted thoughtsTokenCount stays unknown.
-        assert_eq!(
-            events[6],
-            json!({
-                "kind": "usage",
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "cached_input_tokens": 0,
-                "reasoning_tokens": null,
-            })
-        );
-        assert_eq!(events[7], json!({"kind": "completed"}));
-    }
-
-    #[test]
-    fn gemini_safety_finish_maps_to_a_content_free_refusal() {
-        for reason in [
-            "SAFETY",
-            "PROHIBITED_CONTENT",
-            "BLOCKLIST",
-            "RECITATION",
-            "SPII",
-        ] {
-            let chunks = [sse(&json!({"candidates": [{"finishReason": reason}]}))];
-            let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-            assert!(failure.is_none());
-            assert_eq!(
-                events,
-                vec![json!({
-                    "kind": "failed",
-                    "failure_class": "refusal",
-                    "safe_message": "provider refused the request",
-                })]
-            );
+/// The retained evidence copy of a signed part: the provider's part with
+/// `inlineData.data` (generated image bytes, delivered to the caller as an
+/// image event) replaced by its encoded length.
+fn gemini_part_without_inline_data(part: &Value) -> Value {
+    let mut retained = part.clone();
+    if let Some(inline) = retained
+        .get_mut("inlineData")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(Value::String(data)) = inline.remove("data") {
+            inline.insert("dataBytes".to_string(), Value::from(data.len()));
         }
     }
+    retained
+}
 
-    #[test]
-    fn gemini_max_tokens_is_incomplete_and_unknown_reasons_fail() {
-        let incomplete = [sse(
-            &json!({"candidates": [{"finishReason": "MAX_TOKENS"}]}),
-        )];
-        let refs: Vec<&[u8]> = incomplete.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(events, vec![json!({"kind": "incomplete"})]);
+/// The content-free refusal for one Gemini verdict token (a candidate
+/// `finishReason` or a `promptFeedback.blockReason`). The caller sees only the
+/// bounded category; the token itself, screened to an identifier, rides
+/// `provider_detail` into the ledger, which refusals never relay to callers.
+fn gemini_refusal(field: &str, token: &str) -> Failure {
+    Failure::refusal(crate::stream_errors::refusal_reason(Some(token), None)).with_provider_detail(
+        Some(format!("{field} {}", super::bounded_wire_token(token))),
+    )
+}
 
-        let unknown = [sse(
-            &json!({"candidates": [{"finishReason": "MALFUNCTION"}]}),
-        )];
-        let refs: Vec<&[u8]> = unknown.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(
-            events,
-            vec![json!({
-                "kind": "failed",
-                "failure_class": "provider_internal",
-                "safe_message": "provider ended the stream unexpectedly",
-            })]
-        );
-    }
-
-    #[test]
-    fn gemini_malformed_frame_before_content_is_a_retryable_abnormal_end() {
-        // A malformed frame arriving before any content is a Gemini abnormal
-        // end with nothing to salvage: there is no partial answer, so it is
-        // reclassified from a hard malformed reject to a retryable transport
-        // failure (retry the lane, then fail over) rather than being accepted.
-        // The frames are still rejected — none is silently taken as content.
-        let cases: [Value; 3] = [
-            // A non-text text part (python: parts.text must be a string).
-            json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
-            // Null function-call args (python: args must decode to a dict).
-            json!({"candidates": [{"content": {"parts": [
-                {"functionCall": {"name": "x", "args": null}}
-            ]}}]}),
-            // Two candidates in one frame.
-            json!({"candidates": [{}, {}]}),
-        ];
-        for payload in &cases {
-            let chunk = sse(payload);
-            let refs: Vec<&[u8]> = [chunk.as_slice()].to_vec();
-            let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-            assert!(events.is_empty(), "a rejected frame emits no content");
-            let failure = failure.expect("a malformed pre-content frame must not succeed");
-            assert_eq!(failure.failure_class, FailureClass::Transport);
-            assert!(failure.retryable_same_deployment);
-            assert!(failure.failover_eligible);
-        }
-    }
-
-    #[test]
-    fn gemini_usage_only_close_without_content_still_fails_malformed() {
-        // A stream that closes having emitted NO content at all (here only a
-        // usage-only trailer, then a clean EOF) still fails malformed: there is
-        // no real answer to complete, so the clean-end tolerance does not apply
-        // and the abnormal-end recovery never engages (nothing terminated it).
-        let empty = [sse(&json!({
-            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0},
-        }))];
-        let refs: Vec<&[u8]> = empty.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(events.is_empty());
-        assert_eq!(
-            failure.expect("must fail").failure_class,
-            FailureClass::MalformedResponse
-        );
-    }
-
-    #[test]
-    fn gemini_malformed_frame_after_content_recovers_as_incomplete() {
-        // Content emitted, then a structurally malformed frame: the real answer
-        // is preserved and the turn ends `incomplete` (an early-termination
-        // finish reason), never discarded as malformed. Last-seen usage is
-        // folded so delivered tokens still bill at settle.
-        let chunks = [
-            sse(&json!({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]})),
-            sse(&json!({"usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 3}})),
-            // A non-text text part after content: malformed mid-stream frame.
-            sse(&json!({"candidates": [{"content": {"parts": [{"text": 5}]}}]})),
-        ];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(
-            failure.is_none(),
-            "a partial answer is recovered, not failed"
-        );
-        assert_eq!(
-            events,
-            vec![
-                json!({"kind": "text_delta", "text": "partial"}),
-                json!({
-                    "kind": "usage",
-                    "input_tokens": 9,
-                    "output_tokens": 3,
-                    "cached_input_tokens": 0,
-                    "reasoning_tokens": null,
-                }),
-                json!({"kind": "incomplete"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn gemini_usage_only_trailer_frame_folds_usage_without_failing() {
-        // A trailer frame that carries only usageMetadata (no candidates array)
-        // must not fail: its usage is folded and the stream continues to its
-        // real terminal candidate, which flushes the last-seen usage.
-        let chunks = [
-            sse(&json!({"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})),
-            sse(&json!({"usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 2}})),
-            sse(&json!({"candidates": [{"finishReason": "STOP"}]})),
-        ];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(
-            events,
-            vec![
-                json!({"kind": "text_delta", "text": "hi"}),
-                json!({
-                    "kind": "usage",
-                    "input_tokens": 7,
-                    "output_tokens": 2,
-                    "cached_input_tokens": 0,
-                    "reasoning_tokens": null,
-                }),
-                json!({"kind": "completed"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn gemini_clean_end_after_content_completes_with_folded_usage() {
-        // Gemini sometimes ends the stream right after its last content frame
-        // with no finishReason frame; the relay/drain closes it as a normal
-        // completion (folding the last-seen usage) rather than throwing the
-        // real answer away as malformed.
-        let chunks = [
-            sse(&json!({"candidates": [{"content": {"parts": [{"text": "done"}]}}]})),
-            sse(&json!({"usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 1}})),
-        ];
-        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
-        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &refs);
-        assert!(failure.is_none());
-        assert_eq!(
-            events,
-            vec![
-                json!({"kind": "text_delta", "text": "done"}),
-                json!({
-                    "kind": "usage",
-                    "input_tokens": 4,
-                    "output_tokens": 1,
-                    "cached_input_tokens": 0,
-                    "reasoning_tokens": null,
-                }),
-                json!({"kind": "completed"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn gemini_frames_after_the_terminal_candidate_are_ignored() {
-        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
-        let terminal = crate::sse::SseEvent {
-            event: None,
-            data: json!({"candidates": [{"finishReason": "STOP"}]}).to_string(),
-        };
-        let trailing = crate::sse::SseEvent {
-            event: None,
-            data: json!({"candidates": [{"content": {"parts": [{"text": "late"}]}}]}).to_string(),
-        };
-        let events = normalizer.feed(&terminal).expect("terminal frame");
-        assert!(events.iter().any(Event::is_terminal));
-        assert!(normalizer.saw_terminal());
-        assert!(normalizer.feed(&trailing).expect("ignored").is_empty());
+/// Whether `promptFeedback` reports a prompt-level block: any `blockReason`
+/// other than the enum's unspecified default means Google refused the prompt
+/// before generating. An absent or null `promptFeedback`, or one that only
+/// carries `safetyRatings`, is not a block.
+fn gemini_prompt_blocked(payload: &serde_json::Map<String, Value>) -> Result<bool, Failure> {
+    let feedback = match payload.get("promptFeedback") {
+        None | Some(Value::Null) => return Ok(false),
+        Some(value) => value
+            .as_object()
+            .ok_or_else(|| malformed("Gemini promptFeedback must be an object"))?,
+    };
+    match feedback.get("blockReason") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(reason)) => Ok(reason != "BLOCK_REASON_UNSPECIFIED"),
+        Some(_) => Err(malformed("Gemini promptFeedback.blockReason must be text")),
     }
 }
+
+/// The `promptFeedback.blockReason` token, if the frame carries one. Only
+/// called after `gemini_prompt_blocked` confirmed a present, meaningful
+/// reason, so a malformed shape has already been rejected.
+fn gemini_block_reason(payload: &serde_json::Map<String, Value>) -> Option<String> {
+    payload
+        .get("promptFeedback")
+        .and_then(Value::as_object)
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+#[path = "gemini_usage_tests.rs"]
+mod usage_tests;
+
+#[cfg(test)]
+#[path = "gemini_tests.rs"]
+mod gemini_tests;

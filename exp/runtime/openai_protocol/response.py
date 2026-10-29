@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 from typing import cast
 
+from pydantic import JsonValue
+
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
-    GatewayMessage,
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.openai_protocol.cache_write_lifetimes import cache_write_lifetimes
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.reasoning_estimate import ReasoningEstimate
 from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
     stable_public_id,
@@ -48,7 +50,7 @@ def completed_body(
         encoder = ResponsesSseEncoder(
             request_id=request_id,
             model=model,
-            created_at=created_at,
+            created_at=int(created_at),
             request=request,
         )
         encoder.start()
@@ -82,7 +84,12 @@ def completed_body(
         "role": "assistant",
         "content": text or None,
         "refusal": refusal or None,
-        "tool_calls": [
+    }
+    if tool_calls:
+        # OpenAI documents ``tool_calls`` as an optional array and omits it
+        # from a message that made no calls; strict OpenAI-schema consumers
+        # reject ``null`` there while accepting an absent key.
+        message["tool_calls"] = [
             {
                 "id": tool.call_id,
                 "type": "function",
@@ -90,8 +97,7 @@ def completed_body(
             }
             for tool in tool_calls
         ]
-        or None,
-    }
+    probability_value = _chat_logprobs(events)
     usage = next(
         (
             event.usage
@@ -116,10 +122,12 @@ def completed_body(
                     if tool_calls
                     else "stop"
                 ),
-                "logprobs": None,
+                "logprobs": probability_value,
             }
         ],
-        "usage": chat_usage(usage),
+        "usage": ReasoningEstimate.from_events(events).annotate(
+            chat_usage(usage), usage, "completion_tokens_details"
+        ),
         **_ignored_parameters_extension(request),
     }
 
@@ -133,6 +141,12 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
     details: JsonObject = {}
     if usage.cached_input_tokens is not None:
         details["cached_tokens"] = usage.cached_input_tokens
+    if usage.cache_creation_input_tokens is not None:
+        details["cache_write_tokens"] = usage.cache_creation_input_tokens
+    if usage.cache_creation_1h_input_tokens is not None:
+        details["cache_write_1h_tokens"] = usage.cache_creation_1h_input_tokens
+    if (split := cache_write_lifetimes(usage)) is not None:
+        details["cache_write_tokens_details"] = split
     output_details: JsonObject = {}
     if usage.reasoning_tokens is not None:
         output_details["reasoning_tokens"] = usage.reasoning_tokens
@@ -145,30 +159,39 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
     }
 
 
+def _chat_logprobs(events: tuple[GatewayEvent, ...]) -> JsonObject | None:
+    """Aggregate ordered choice probability observations into Chat output."""
+    content: list[JsonValue] | None = None
+    refusal: list[JsonValue] | None = None
+    observed = False
+    for event in events:
+        if event.kind != GatewayEventKind.CHOICE_LOGPROBS_DELTA:
+            continue
+        update = event.choice_logprobs_delta
+        if update is None or update.choice_index != 0:
+            raise OpenAIProtocolError(
+                status_code=502,
+                code="invalid_provider_stream",
+                message="Chat probability events require a payload for choice index 0.",
+                error_type="api_error",
+            )
+        value = update.logprobs
+        if value is None:
+            continue
+        observed = True
+        if value.content is not None:
+            if content is None:
+                content = []
+            content.extend(record.model_dump(mode="json") for record in value.content)
+        if value.refusal is not None:
+            if refusal is None:
+                refusal = []
+            refusal.extend(record.model_dump(mode="json") for record in value.refusal)
+    return {"content": content, "refusal": refusal} if observed else None
+
+
 def _ignored_parameters_extension(request: GatewayRequest) -> JsonObject:
     """Expose accepted-but-ignored controls so compatibility behavior is never silent."""
     if not request.ignored_parameters:
         return {}
     return {"x-experiential-ignored-parameters": list(request.ignored_parameters)}
-
-
-def assistant_message(events: tuple[GatewayEvent, ...]) -> GatewayMessage | None:
-    """Build continuation history without converting typed refusals into assistant text."""
-    if any(event.kind == GatewayEventKind.REFUSAL_DELTA for event in events):
-        return None
-    text = "".join(
-        event.text_delta or "" for event in events if event.kind == GatewayEventKind.TEXT_DELTA
-    )
-    tool_calls = tuple(
-        event.tool_call
-        for event in events
-        if event.kind == GatewayEventKind.TOOL_CALL_COMPLETED and event.tool_call is not None
-    )
-    if not text and not tool_calls:
-        return None
-    action = AssistantAction(content=text or None, tool_calls=tool_calls)
-    return GatewayMessage(
-        role="assistant",
-        content=action.content,
-        tool_calls=action.tool_calls,
-    )

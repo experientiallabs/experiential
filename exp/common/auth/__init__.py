@@ -7,7 +7,8 @@ from exp.common.auth.store import (
     ProviderAuthStoreError,
     StoredCredentialBinding,
     StoredCredentialEndpointMismatch,
-    StoredCredentialStatus,
+    StoredCredentialKindMismatch,
+    StoredOAuthTokens,
 )
 
 __all__ = [
@@ -17,7 +18,8 @@ __all__ = [
     "ProviderAuthStoreError",
     "StoredCredentialBinding",
     "StoredCredentialEndpointMismatch",
-    "StoredCredentialStatus",
+    "StoredCredentialKindMismatch",
+    "StoredOAuthTokens",
     "default_auth_path",
     "derived_api_key_env",
     "provider_data_dir",

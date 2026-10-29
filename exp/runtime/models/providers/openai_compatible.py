@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import ClassVar, Literal, cast
 
 from pydantic import JsonValue
@@ -23,6 +24,11 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
+from exp.common.models.usage_observability import (
+    fold_openai_shaped_reasoning,
+    unreported_token_details,
+)
+from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -34,10 +40,16 @@ from exp.runtime.models.providers.base import (
     ProviderHttpClient,
     ReasoningWireFormat,
 )
+from exp.runtime.models.providers.deepseek import (
+    is_deepseek_base_url,
+    is_deepseek_model_id,
+)
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
     require_array,
     require_integer,
     require_object,
@@ -47,11 +59,23 @@ from exp.runtime.models.providers.fireworks import (
     is_fireworks_base_url,
     reasoning_content_route_sha256,
 )
+from exp.runtime.models.providers.hunyuan import is_hunyuan_base_url
+from exp.runtime.models.providers.instruction_turns import (
+    fold_instruction_turns_after_the_first,
+    fold_trailing_instruction_turns,
+)
+from exp.runtime.models.providers.json_prefix import incomplete_json_object_prefix
+from exp.runtime.models.providers.openrouter_routing import (
+    OPENROUTER_PROVIDER_ID,
+    openrouter_cache_writes_within_reads,
+)
+from exp.runtime.models.providers.prompt_cache_options import openai_prompt_cache_origin
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from exp.runtime.models.providers.xai import xai_videos_url
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
@@ -75,25 +99,28 @@ def openai_compatible_request(
     reasoning_effort: str | None = None,
     reasoning_wire_format: ReasoningWireFormat = "reasoning_effort",
     sampling_requires_reasoning_none: bool = False,
+    deepseek_reasoning_history: bool = False,
+    system_messages_leading_only: bool = False,
 ) -> JsonObject:
     """Convert a EXP request into one non-streaming Chat Completions payload.
 
     Args:
         model_id: Provider model identifier to place on the wire.
         request: Typed EXP request.
-        token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
-            reasoning deployments reject ``max_tokens`` and require
-            ``max_completion_tokens``.
+        token_limit_key: Output-token ceiling field; Azure reasoning deployments require
+            ``max_completion_tokens`` instead of ``max_tokens``.
         supports_temperature: Whether this exact model accepts explicit sampling controls.
         supports_top_p: Whether this exact model accepts nucleus sampling. ``None`` follows
             ``supports_temperature`` for older catalog records.
         supports_top_k: Whether this exact route accepts top-k sampling.
-        supports_logprobs: Reserved route capability retained for contract parity. Chat
-            logprob controls are currently ignored because the normalized gateway response
-            cannot return provider logprob details.
+        supports_logprobs: Reserved capability; ignored until normalized responses carry logprobs.
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
+        deepseek_reasoning_history: Backfill assistant messages with empty reasoning content
+            for DeepSeek thinking, matching ``openai_chat_message`` in the streaming builder.
+        system_messages_leading_only: Fold non-leading instruction turns into user text,
+            matching ``fold_instruction_turns_after_the_first`` in the streaming builder.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -101,9 +128,18 @@ def openai_compatible_request(
     Raises:
         ValueError: A request message cannot be represented without losing tool context.
     """
+    messages: Sequence[ModelMessage] = request.messages
+    if deepseek_reasoning_history or is_deepseek_model_id(model_id):
+        # Same DeepSeek trailing-instruction rule as the streaming builder.
+        messages = fold_trailing_instruction_turns(messages)
+    if system_messages_leading_only:
+        messages = fold_instruction_turns_after_the_first(messages)
     payload: JsonObject = {
         "model": model_id,
-        "messages": [_openai_message(message) for message in request.messages],
+        "messages": [
+            _openai_message(message, deepseek_reasoning_history=deepseek_reasoning_history)
+            for message in messages
+        ],
         "stream": False,
     }
     if request.tools:
@@ -147,6 +183,8 @@ def openai_compatible_request(
     del supports_logprobs
     if request.maximum_output_tokens is not None:
         payload[token_limit_key] = request.maximum_output_tokens
+    if request.json_object_output:
+        payload["response_format"] = {"type": "json_object"}
     if supports_reasoning and effective_reasoning_effort is not None:
         if reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
@@ -159,16 +197,17 @@ def openai_compatible_request(
 
 def openai_embedding_request(
     model_id: str,
-    texts: Sequence[str],
+    texts: Sequence[str] | Sequence[Sequence[int]],
     *,
     dimensions: int | None = None,
     encoding_format: Literal["float", "base64"] | None = None,
 ) -> JsonObject:
-    """Convert ordered text into one OpenAI-compatible embedding request.
+    """Convert ordered text or token inputs into an OpenAI-compatible embedding request.
 
     Args:
         model_id: Served embedding model id.
-        texts: Ordered visible text values to embed.
+        texts: Homogeneous ordered text values or token sequences to embed. Token IDs
+            are passed unchanged and must use the served model's tokenizer.
         dimensions: Optional output dimensionality the caller requested. Omitted
             from the wire when absent so the provider's native width applies.
         encoding_format: Optional caller vector encoding. Omitted when absent so
@@ -177,7 +216,10 @@ def openai_embedding_request(
     Returns:
         The OpenAI-compatible ``/embeddings`` request body.
     """
-    request: JsonObject = {"model": model_id, "input": list(texts)}
+    request: JsonObject = {
+        "model": model_id,
+        "input": [item if isinstance(item, str) else list(item) for item in texts],
+    }
     if dimensions is not None:
         request["dimensions"] = dimensions
     if encoding_format is not None:
@@ -185,7 +227,9 @@ def openai_embedding_request(
     return request
 
 
-def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
+def openai_images_request(
+    model_id: str, request: ImagesRequest, *, inline_images: bool = False
+) -> JsonObject:
     """Convert one canonical image-generation request into the OpenAI wire body.
 
     Every optional control is omitted when absent so the provider default
@@ -194,6 +238,10 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
     Args:
         model_id: Served image model id.
         request: Canonical image-generation request.
+        inline_images: Force ``response_format: "b64_json"`` whatever the caller
+            asked, for a provider that keeps hosted images (xAI refuses ``url``
+            output for Zero Data Retention teams). The caller then receives
+            ``b64_json`` items; the gateway hosts no images to link to.
 
     Returns:
         The OpenAI-compatible ``/images/generations`` request body.
@@ -212,7 +260,45 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
         value = getattr(request, field)
         if value is not None:
             body[field] = value
+    if inline_images:
+        body["response_format"] = "b64_json"
     return body
+
+
+def _message_text(content: JsonValue) -> str | None:
+    """Return a Chat message's answer text from string or typed-part content.
+
+    Mistral answers ``content`` as an array of typed parts whenever the model
+    reasons: ``thinking`` parts hold the reasoning and ``text`` parts the
+    answer. Only the text parts are the answer; this contract carries no
+    reasoning output, so thinking parts are not part of it.
+
+    Args:
+        content: The wire ``message.content`` value.
+
+    Returns:
+        The concatenated answer text, or ``None`` when the message has none.
+
+    Raises:
+        ProviderResponseError: A content part is not a JSON object, or a text
+            part's ``text`` is neither text nor null.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            raise ProviderResponseError("OpenAI-compatible content part must be an object")
+        if part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if text is not None and not isinstance(text, str):
+            raise ProviderResponseError("OpenAI-compatible text part must be text")
+        if text:
+            texts.append(text)
+    return "".join(texts) if texts else None
 
 
 def openai_compatible_response(
@@ -236,7 +322,7 @@ def openai_compatible_response(
     """
     choices = require_array(payload.get("choices"), "choices")
     if not choices:
-        raise OpenAICompatibleResponseError("OpenAI-compatible response has no choices")
+        raise ProviderRetryableResponseError("OpenAI-compatible response has no choices")
     choice = require_object(choices[0], "choices[0]")
     message = require_object(choice.get("message"), "choices[0].message")
     if choice.get("finish_reason") in {"content_filter", "safety"} or isinstance(
@@ -246,23 +332,31 @@ def openai_compatible_response(
             provider="openai-compatible",
             signal=ProviderRefusalSignal.CONTENT_POLICY,
         )
-    content_value = message.get("content")
-    content = content_value if isinstance(content_value, str) else None
+    content = _message_text(message.get("content"))
     tool_call_values = _array_or_empty(message)
     tool_calls = tuple(
-        parse_openai_wire_tool_call(value, index) for index, value in enumerate(tool_call_values)
+        parse_openai_wire_tool_call(
+            value, index, hit_length_limit=choice.get("finish_reason") == "length"
+        )
+        for index, value in enumerate(tool_call_values)
     )
     try:
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
-        raise OpenAICompatibleResponseError(
+        raise ProviderRetryableResponseError(
             "OpenAI-compatible response has neither text nor a complete tool call"
         ) from exc
     return ModelResponse.completed(
         output=output,
         configured_model=configured_model,
         served_model_id=payload.get("model"),
-        usage=_usage(payload),
+        usage=_usage(
+            payload,
+            cache_writes_within_reads=(
+                configured_model.provider == OPENROUTER_PROVIDER_ID
+                and openrouter_cache_writes_within_reads(configured_model.model_id)
+            ),
+        ),
         latency_seconds=latency_seconds,
         hit_length_limit=choice.get("finish_reason") == "length",
     )
@@ -358,6 +452,15 @@ def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
 
+    def _embedding_model_id(self) -> str:
+        """Return the model id placed on the embeddings wire.
+
+        The configured identity by default; a client whose provider spells the wire id
+        differently from the catalog record (Vertex MaaS collapses a resource path onto
+        ``<publisher>/<model>``) overrides this so both routes name the same model.
+        """
+        return self._model.model_id
+
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Embed ordered text through the configured model without making empty requests.
 
@@ -369,7 +472,9 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
         """
         if not texts:
             return ()
-        response = self._post("embeddings", openai_embedding_request(self._model.model_id, texts))
+        response = self._post(
+            "embeddings", openai_embedding_request(self._embedding_model_id(), texts)
+        )
         return openai_embedding_response(response, expected_count=len(texts))
 
     def embed_raw(
@@ -405,7 +510,7 @@ class OpenAIEmbeddingMixin(ProviderHttpClient):
         response = self._post(
             "embeddings",
             openai_embedding_request(
-                self._model.model_id,
+                self._embedding_model_id(),
                 texts,
                 dimensions=dimensions,
                 encoding_format=encoding_format,
@@ -439,8 +544,28 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         reasoning_effort: str | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
+        reasoning_output_exposed: bool = False,
+        reasoning_content_native: bool = False,
+        system_messages_leading_only: bool = False,
     ) -> None:
-        """Create one compatible client with explicit model wire capabilities."""
+        """Create one compatible client with explicit model wire capabilities.
+
+        ``reasoning_content_native`` declares that this origin returns the
+        model's chain-of-thought in the standard ``reasoning_content`` field and
+        accepts it back on assistant turns, so the rung is a preserved-thinking
+        carrier route whatever its hostname (a self-hosted vLLM origin with a
+        reasoning parser). Tencent's own origins carry that contract by
+        recognition and need no declaration. The declaration decides the
+        carrier route and exposure only; the ``prompt_cache_key`` node pin stays
+        keyed on Tencent's hosts.
+
+        ``system_messages_leading_only`` declares that this origin's chat
+        template accepts a system message only as the very first message (the
+        official Qwen3.6+ template raises ``System message must be at the
+        beginning.`` for any other position, a second leading system turn
+        included), so every other instruction turn is folded into user text
+        before dispatch instead of 400ing the whole request.
+        """
         super().__init__(
             model=model,
             api_key=api_key,
@@ -459,9 +584,28 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
+        self._reasoning_output_exposed = reasoning_output_exposed
         self._fireworks_reasoning_route_sha256 = (
             reasoning_content_route_sha256(model) if is_fireworks_base_url(self._base_url) else None
         )
+        # A native ``reasoning_content`` origin returns the model's plaintext
+        # reasoning and accepts it back; the gateway exposes it for display and
+        # round-trips it through a domain-separated opaque carrier, so this rung
+        # is both a carrier route and an exposed-plaintext route. Tencent's own
+        # origins are recognized by host; any other origin declares the contract
+        # per rung. Fireworks keeps its own carrier and wire flag, so the
+        # declaration never doubles a Fireworks rung's route.
+        self._reasoning_content_native = (
+            is_hunyuan_base_url(self._base_url) or reasoning_content_native
+        ) and self._fireworks_reasoning_route_sha256 is None
+        self._hunyuan_reasoning_route_sha256 = (
+            reasoning_content_route_sha256(model) if self._reasoning_content_native else None
+        )
+        # DeepSeek's own API enforces reasoning_content on every assistant
+        # message of the current turn in thinking mode (400 otherwise); both the
+        # streaming wire profile and the buffered request builder read this.
+        self._deepseek_reasoning_history = is_deepseek_base_url(self._base_url)
+        self._system_messages_leading_only = system_messages_leading_only
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
@@ -470,6 +614,9 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             url=f"{self._base_url}/{self._request_path(self._completion_path())}",
             embeddings_url=f"{self._base_url}/{self._request_path('embeddings')}",
             images_url=f"{self._base_url}/{self._request_path('images/generations')}",
+            speech_url=f"{self._base_url}/{self._request_path('audio/speech')}",
+            transcriptions_url=f"{self._base_url}/{self._request_path('audio/transcriptions')}",
+            videos_url=xai_videos_url(self._base_url),
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
@@ -485,7 +632,34 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             token_limit_key=self._token_limit_key,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
             fireworks_reasoning_route_sha256=self._fireworks_reasoning_route_sha256,
+            hunyuan_reasoning_route_sha256=self._hunyuan_reasoning_route_sha256,
+            # Expose plaintext reasoning only when the rung explicitly declares
+            # it AND resolves a reasoning-carrier route: an absent capability
+            # fails closed and stays stripped even on the Hunyuan endpoint, so
+            # exposure is per-rung, never per-endpoint.
+            reasoning_output_exposed=(
+                self._reasoning_output_exposed and self._hunyuan_reasoning_route_sha256 is not None
+            ),
+            # The DeepSeek rung replays caller plaintext and backfills the
+            # field WITHOUT the exposure stamp: a house lane that fails every
+            # agent loop by default is wrong, and the stamp only governs
+            # output exposure.
+            deepseek_reasoning_history=self._deepseek_reasoning_history,
+            system_messages_leading_only=self._system_messages_leading_only,
+            # Tencent's prefix cache is per node behind its load balancer;
+            # prompt_cache_key pins a session to one node (verified live
+            # 2026-09-05). The hint stays host-keyed: a rung declaring
+            # ``reasoning_content_native`` says only that its origin speaks the
+            # reasoning_content contract, and a strict compatible server that
+            # does may still reject an unknown top-level field, so the
+            # declaration never widens what is sent, BYOK or not.
+            forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
+            forwards_prompt_cache_options=self._carries_prompt_cache_options(),
         )
+
+    def _carries_prompt_cache_options(self) -> bool:
+        """Whether this origin carries OpenAI's ``prompt_cache_options`` and breakpoints."""
+        return openai_prompt_cache_origin(self._base_url)
 
     def _completion_path(self) -> str:
         """Return the shared Chat Completions route."""
@@ -505,6 +679,8 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+            deepseek_reasoning_history=self._deepseek_reasoning_history,
+            system_messages_leading_only=self._system_messages_leading_only,
         )
 
     def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
@@ -523,9 +699,36 @@ class OpenRouterClient(OpenAICompatibleClient):
     }
     reasoning_wire_format: ClassVar[ReasoningWireFormat] = "reasoning"
 
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the compatible profile with OpenRouter's sticky-routing hint on.
 
-def _openai_message(message: ModelMessage) -> JsonObject:
-    """Convert one EXP message while retaining assistant tool history."""
+        OpenRouter load-balances one model across upstream providers and pins a
+        conversation to the provider that served it only once a cache hit has
+        been observed, keyed by ``session_id`` else the OpenAI-style
+        ``prompt_cache_key`` (its documented fallback sticky key). Without the
+        hint two identical prefixes can land on different providers or nodes,
+        so the miss a caller sees is real and its metering is correct.
+        Forwarding the tenant-namespaced key makes placement deterministic per
+        conversation, and OpenRouter forwards provider-specific fields
+        upstream, so a per-node pin such as Tencent's rides along.
+        """
+        return replace(
+            super().gateway_wire_profile(),
+            forwards_prompt_cache_key=True,
+            forwards_cache_control=True,
+        )
+
+
+def _openai_message(
+    message: ModelMessage, *, deepseek_reasoning_history: bool = False
+) -> JsonObject:
+    """Convert one EXP message while retaining assistant tool history.
+
+    On DeepSeek's own origin every assistant message gains ``reasoning_content: ""``:
+    the provider 400s a tools request when any assistant message of the current
+    turn lacks the field and accepts an empty one everywhere (see
+    ``openai_chat_message`` for the streaming twin of this rule).
+    """
     if message.role == "tool":
         return {
             "role": "tool",
@@ -550,15 +753,20 @@ def _openai_message(message: ModelMessage) -> JsonObject:
             }
             for call in action.tool_calls
         ]
+    if deepseek_reasoning_history:
+        payload["reasoning_content"] = ""
     return payload
 
 
-def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
+def parse_openai_wire_tool_call(
+    value: object, index: int, *, hit_length_limit: bool = False
+) -> ToolCall:
     """Parse one OpenAI-wire tool call without accepting malformed JSON arguments.
 
     Args:
         value: One decoded ``tool_calls`` array element.
         index: Zero-based array position used in error messages.
+        hit_length_limit: Retained termination flag permits only EOF truncation classification.
 
     Returns:
         The typed tool call with its arguments decoded as a JSON object.
@@ -575,10 +783,19 @@ def parse_openai_wire_tool_call(value: object, index: int) -> ToolCall:
         function.get("arguments"), f"tool_calls[{index}].function.arguments"
     )
     try:
-        arguments = json.loads(raw_arguments)
+        arguments = json.loads(raw_arguments, object_pairs_hook=reject_duplicate_json_keys)
     except json.JSONDecodeError as exc:
+        if hit_length_limit and incomplete_json_object_prefix(raw_arguments):
+            raise ProviderTruncatedResponseError(
+                f"tool_calls[{index}].function.arguments ended inside JSON "
+                "at the response length boundary"
+            ) from exc
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments is not JSON"
+        ) from exc
+    except ValueError as exc:
+        raise OpenAICompatibleResponseError(
+            f"tool_calls[{index}].function.arguments contains duplicate JSON keys"
         ) from exc
     if not isinstance(arguments, dict):
         raise OpenAICompatibleResponseError(
@@ -600,25 +817,65 @@ def _array_or_empty(message: JsonObject) -> list[JsonValue]:
     return require_array(value, "choices[0].message.tool_calls")
 
 
-def _usage(payload: JsonObject) -> Usage | None:
+def _usage(payload: JsonObject, *, cache_writes_within_reads: bool) -> Usage | None:
     """Read optional OpenAI-compatible token usage without inventing absent measurements."""
     value = payload.get("usage")
     if value is None:
         return None
     usage = require_object(value, "usage")
+    try:
+        unknown = unreported_token_details(usage)
+    except ValueError as error:
+        raise OpenAICompatibleResponseError(str(error)) from error
     prompt_tokens = require_integer(usage.get("prompt_tokens"), "usage.prompt_tokens")
     completion_tokens = require_integer(usage.get("completion_tokens"), "usage.completion_tokens")
-    details_value = usage.get("prompt_tokens_details")
-    cached_input_tokens = None
-    if details_value is not None:
-        details = require_object(details_value, "usage.prompt_tokens_details")
-        cached_input_tokens = require_integer(
-            details.get("cached_tokens"), "usage.prompt_tokens_details.cached_tokens"
+
+    def detail(group: str, field: str) -> int | None:
+        """Preserve a reported token subset without treating omission as zero."""
+        if field in unknown:
+            return None
+        raw = usage.get(group)
+        if raw is None:
+            return None
+        value = require_object(raw, f"usage.{group}").get(field)
+        return None if value is None else require_integer(value, f"usage.{group}.{field}")
+
+    reasoning = detail("completion_tokens_details", "reasoning_tokens")
+    raw_top_level = usage.get("reasoning_tokens")
+    if raw_top_level is not None:
+        # Azure AI Foundry's DeepSeek models report the same subset as a top-level
+        # count, validated like the native mapper; the nested placement wins.
+        top_level = require_integer(raw_top_level, "usage.reasoning_tokens")
+        if reasoning is None and "reasoning_tokens" not in unknown:
+            reasoning = top_level
+    raw_total = usage.get("total_tokens")
+    total = None if raw_total is None else require_integer(raw_total, "usage.total_tokens")
+    try:
+        completion_tokens = fold_openai_shaped_reasoning(
+            prompt_tokens, completion_tokens, reasoning, total
         )
+    except ValueError as error:
+        raise OpenAICompatibleResponseError(str(error)) from error
+    tier = payload.get("service_tier")
+    cached = detail("prompt_tokens_details", "cached_tokens")
+    written = detail("prompt_tokens_details", "cache_write_tokens")
+    if (
+        cache_writes_within_reads
+        and cached is not None
+        and written is not None
+        and written <= cached
+    ):
+        # Match the native normalizer's disjoint contract. This provider's
+        # authored write rate includes the read charge on the written tokens.
+        cached -= written
     return Usage(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
-        cached_input_tokens=cached_input_tokens,
+        cached_input_tokens=cached,
+        cache_write_input_tokens=written,
+        cache_write_1h_input_tokens=detail("prompt_tokens_details", "cache_write_1h_tokens"),
+        reasoning_tokens=reasoning,
+        service_tier=None if tier is None else require_string(tier, "service_tier"),
     )
 
 

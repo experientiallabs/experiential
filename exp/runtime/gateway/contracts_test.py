@@ -7,7 +7,7 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.compatibility import (
     CompatibilityDisposition,
@@ -17,7 +17,6 @@ from exp.runtime.gateway.compatibility import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -27,7 +26,11 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
     ProjectTarget,
+    StructuredTextFormat,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
+from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 
 
 def test_gateway_request_preserves_developer_and_raw_tool_history() -> None:
@@ -118,6 +121,33 @@ def test_targets_and_compatibility_manifest_are_closed_and_deterministic() -> No
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             fields=(manifest.fields[0], manifest.fields[0]),
         )
+
+
+def test_authorization_snapshot_carries_the_trusted_client_ip() -> None:
+    """The optional trusted-hop client IP round-trips and defaults to None."""
+    without_ip = AuthorizationSnapshot(
+        request_id="request-1",
+        organization_id="organization-1",
+        identity_id="identity-1",
+        virtual_key_id="key-1",
+        alias="coding",
+        alias_revision_id="alias-revision-1",
+        target=ProjectTarget(
+            project_ref="support-agent",
+            activation_ref="activation-1",
+            catalog_sha256="a" * 64,
+        ),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=10.0,
+    )
+    assert without_ip.client_ip is None
+
+    with_ip = without_ip.model_copy(update={"client_ip": "198.51.100.9"})
+    assert with_ip.client_ip == "198.51.100.9"
+    restored = AuthorizationSnapshot.model_validate_json(with_ip.model_dump_json())
+    assert restored.client_ip == "198.51.100.9"
 
 
 def test_project_authorization_precedes_route_bound_execution() -> None:
@@ -556,6 +586,30 @@ def test_anthropic_tool_annotations_are_digest_free_but_bind_replay_identity() -
     assert canonical_request_sha256(hinted) == canonical_request_sha256(bare)
 
 
+def test_safeguards_are_a_messages_only_carrier_that_binds_replay() -> None:
+    """Auto-mode safeguards stay out of the serialized request but change the
+    provider's answer (it gains ``safeguard_results``), so they bind replay."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=messages)
+    guarded = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        safeguards=({"type": "dangerous_tool_use", "classifier_context": {"v": 1}},),
+    )
+    assert guarded.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(guarded) == sha256_json(bare)
+    assert canonical_request_sha256(guarded) != canonical_request_sha256(bare)
+    with pytest.raises(ValidationError, match="safeguards is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            safeguards=({"type": "dangerous_tool_use"},),
+        )
+
+
 def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
     """The top-level cache marker stays identity-inert; the region binds replay."""
     from exp.common.core.artifacts import sha256_json
@@ -674,6 +728,80 @@ def test_tool_choice_may_name_a_server_tool() -> None:
         )
 
 
+def test_named_tool_choice_may_name_the_synthesized_tool_search_tool() -> None:
+    """A named choice may target the gateway tool-search function before it exists.
+
+    ``plan_tool_search`` only synthesizes the function once admission
+    completes, but its name is deterministic from the declared tool names, so
+    a caller naming it up front (the common shape for a forced first search)
+    must not be rejected as incoherent.
+    """
+    search = GatewayToolSearch(declared_as="openrouter_tool", tool_type="openrouter:tool_search")
+    deferred_tool = GatewayToolDefinition(
+        name="get_weather",
+        description="Look up the weather.",
+        parameters={"type": "object"},
+        defer_loading=True,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(deferred_tool,),
+        tool_search=search,
+        tool_choice=GatewayNamedToolChoice(name="tool_search"),
+    )
+    assert request.tool_choice == GatewayNamedToolChoice(name="tool_search")
+
+    # A name that collides with a declared tool falls back to the gateway's
+    # collision-avoiding name; that fallback must be accepted too.
+    taken_tool = GatewayToolDefinition(
+        name="tool_search",
+        description="A caller tool that happens to share the gateway's default name.",
+        parameters={"type": "object"},
+        defer_loading=True,
+    )
+    collision_request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(taken_tool,),
+        tool_search=search,
+        tool_choice=GatewayNamedToolChoice(name="gateway_tool_search"),
+    )
+    assert collision_request.tool_choice == GatewayNamedToolChoice(name="gateway_tool_search")
+
+    # Without a tool-search carrier, the same name is still incoherent.
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(deferred_tool,),
+            tool_choice=GatewayNamedToolChoice(name="tool_search"),
+        )
+
+    # A tool-search carrier does not excuse an unrelated absent name.
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(deferred_tool,),
+            tool_search=search,
+            tool_choice=GatewayNamedToolChoice(name="absent"),
+        )
+
+    # No deferred tools means plan_tool_search never synthesizes the search
+    # function at all (it drops the carrier instead), so the exemption must
+    # not apply: the named choice is still incoherent.
+    loaded_only_tool = deferred_tool.model_copy(update={"defer_loading": None})
+    with pytest.raises(ValidationError, match="must name a request tool"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            tools=(loaded_only_tool,),
+            tool_search=search,
+            tool_choice=GatewayNamedToolChoice(name="tool_search"),
+        )
+
+
 def test_block_cache_markers_are_identity_inert_and_role_scoped() -> None:
     """Cache markers change cost, not semantics: no digest or replay effect."""
     from exp.common.core.artifacts import sha256_json
@@ -752,11 +880,35 @@ def test_native_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> 
     )
     assert canonical_request_sha256(moved) != canonical_request_sha256(carried)
 
-    with pytest.raises(ValidationError, match="valid only for Responses"):
+    # Chat carries them too now (OpenRouter's server tools ride the same array);
+    # the Messages surface has its own server-tool carrier and rejects these.
+    GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        provider_native_tools=(native_entry.model_copy(update={"index": 0}),),
+    )
+    with pytest.raises(ValidationError, match="valid only for Responses and Chat"):
         GatewayRequest(
-            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            surface=GatewayApiSurface.MESSAGES,
             messages=(GatewayMessage(role="user", content="hi"),),
             provider_native_tools=(native_entry,),
+        )
+
+
+def test_text_verbosity_is_carried_on_responses_and_chat_but_not_messages() -> None:
+    """The one verbosity carrier serves both OpenAI spellings and no other surface."""
+    for surface in (GatewayApiSurface.RESPONSES, GatewayApiSurface.CHAT_COMPLETIONS):
+        request = GatewayRequest(
+            surface=surface,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            text_verbosity="high",
+        )
+        assert request.text_verbosity == "high"
+    with pytest.raises(ValidationError, match="valid only for Responses and Chat"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            text_verbosity="high",
         )
 
 
@@ -835,6 +987,71 @@ def test_videos_join_semantic_identity_while_cache_markers_stay_out() -> None:
     assert first.videos == (first.messages[0].content_parts[0],)
 
 
+def test_media_handles_join_semantic_identity_and_never_mix_providers() -> None:
+    """A handle changes the canonical digest; two providers in one request refuse.
+
+    The digest must separate two handles to different uploads, separate a
+    handle from the same media inline, and ignore a cache marker placed on
+    a handle-carrying image. No route can serve handles from two providers,
+    so the request itself fails validation.
+    """
+    from exp.common.core.artifacts import sha256_json
+    from exp.common.models.content import ImageContentPart, MediaHandle, TextContentPart
+
+    def request(*parts: ImageContentPart) -> GatewayRequest:
+        """Build one Chat request carrying the given image parts before a text run."""
+        return GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content="what is this?",
+                    content_parts=(*parts, TextContentPart(text="what is this?")),
+                ),
+            ),
+        )
+
+    openai_a = MediaHandle(provider="openai", reference="file-a")
+    openai_b = MediaHandle(provider="openai", reference="file-b")
+    first = request(ImageContentPart(handle=openai_a))
+    second = request(ImageContentPart(handle=openai_b))
+    marked = request(ImageContentPart(handle=openai_a, cache_control={"type": "ephemeral"}))
+    owned = request(
+        ImageContentPart(
+            handle=MediaHandle(provider="bedrock", reference="s3://bkt/a.png"),
+            media_type="image/png",
+        )
+    )
+    unowned = request(
+        ImageContentPart(
+            handle=MediaHandle(
+                provider="bedrock", reference="s3://bkt/a.png", bucket_owner="123456789012"
+            ),
+            media_type="image/png",
+        )
+    )
+    dumped = first.model_dump(mode="json")
+    part = dumped["messages"][0]["content_parts"][0]
+    assert part["handle"] == {"provider": "openai", "reference": "file-a", "bucket_owner": None}
+    assert "cache_control" not in part
+    assert sha256_json(first) != sha256_json(second)
+    assert sha256_json(first) == sha256_json(marked)
+    assert sha256_json(owned) != sha256_json(unowned)
+    assert first.media_handles == (openai_a,)
+    assert request(
+        ImageContentPart(handle=openai_a), ImageContentPart(handle=openai_b)
+    ).media_handles == (
+        openai_a,
+        openai_b,
+    )
+
+    with pytest.raises(ValidationError, match="same provider"):
+        request(
+            ImageContentPart(handle=openai_a),
+            ImageContentPart(handle=MediaHandle(provider="anthropic", reference="file_a")),
+        )
+
+
 def test_audio_joins_semantic_identity_while_cache_markers_stay_out() -> None:
     """Audio parts change the canonical digest; cache-only markers never do."""
     from exp.common.core.artifacts import sha256_json
@@ -905,4 +1122,205 @@ def test_service_tier_is_serialization_inert_but_binds_replay_identity() -> None
             surface=GatewayApiSurface.MESSAGES,
             messages=messages,
             service_tier="flex",
+        )
+
+
+def test_json_object_output_is_serialization_inert_but_binds_replay_identity() -> None:
+    """Mode-free Chat digests are untouched; an enabled JSON mode is its own operation."""
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages)
+    json_mode = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=messages,
+        json_object_output=True,
+    )
+    assert "json_object_output" not in bare.model_dump(mode="json")
+    assert json_mode.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(json_mode) == sha256_json(bare)
+    assert canonical_request_sha256(bare) == sha256_json(bare)
+    assert canonical_request_sha256(json_mode) != canonical_request_sha256(bare)
+    with pytest.raises(ValidationError, match="mutually exclusive"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            json_object_output=True,
+            structured_text=StructuredTextFormat(name="out", json_schema={"type": "object"}),
+        )
+    with pytest.raises(ValidationError, match="valid only for Chat and Responses"):
+        GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=messages,
+            json_object_output=True,
+        )
+
+
+def test_tool_messages_carry_text_image_and_document_parts() -> None:
+    """A tool screenshot or tool-returned PDF rides the tool message; other
+    media kinds stay out, and an assistant turn stays text and image only."""
+    from exp.common.models.content import (
+        DocumentContentPart,
+        ImageContentPart,
+        TextContentPart,
+        VideoContentPart,
+    )
+
+    message = GatewayMessage(
+        role="tool",
+        tool_call_id="call-1",
+        content="tool said:",
+        content_parts=(
+            TextContentPart(text="tool said:"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+            DocumentContentPart(media_type="application/pdf", data="aGk=", name="report.pdf"),
+        ),
+    )
+    assert [part.kind for part in message.content_parts] == ["text", "image", "document"]
+    assert message.images
+    assert message.documents[0].name == "report.pdf"
+
+    with pytest.raises(ValidationError, match="carry only text, image, and document parts"):
+        GatewayMessage(
+            role="tool",
+            tool_call_id="call-1",
+            content="",
+            content_parts=(VideoContentPart(media_type="video/mp4", data="aGk="),),
+        )
+    with pytest.raises(ValidationError, match="assistant messages carry only text and image"):
+        GatewayMessage(
+            role="assistant",
+            content="",
+            content_parts=(DocumentContentPart(media_type="application/pdf", data="aGk="),),
+        )
+    assistant = GatewayMessage(
+        role="assistant",
+        content="hi",
+        content_parts=(
+            TextContentPart(text="hi"),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+    assert assistant.images
+
+
+def test_replay_identity_binds_the_function_call_namespace() -> None:
+    """A replayed item differing only by namespace is a different request.
+
+    Namespace-free requests keep their exact pre-existing digest because the
+    field joins the replay envelope only when present.
+    """
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, namespace: str | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="spawn_agent",
+                            provider_output_index=0,
+                            provider_namespace=namespace,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    namespaced = request(namespace="collaboration")
+    assert canonical_request_sha256(namespaced) == canonical_request_sha256(
+        request(namespace="collaboration")
+    )
+    assert canonical_request_sha256(namespaced) != canonical_request_sha256(
+        request(namespace="agents")
+    )
+    assert canonical_request_sha256(namespaced) != canonical_request_sha256(request(namespace=None))
+
+
+def test_replay_identity_binds_tool_output_attribution() -> None:
+    """A function_call_output name/namespace pair joins replay identity."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, namespace: str | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="tool",
+                    content="spawned",
+                    tool_call_id="call-1",
+                    provider_tool_name="spawn_agent" if namespace is not None else None,
+                    provider_tool_namespace=namespace,
+                ),
+            ),
+        )
+
+    plain = request(namespace=None)
+    assert canonical_request_sha256(plain) == sha256_json(plain)
+    assert canonical_request_sha256(request(namespace="collaboration")) != canonical_request_sha256(
+        plain
+    )
+
+
+def test_replay_identity_binds_the_function_call_caller() -> None:
+    """A retained SDK 3.0 caller joins replay identity only when present."""
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def request(*, caller: JsonObject | None) -> GatewayRequest:
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-1",
+                            name="lookup",
+                            provider_output_index=0,
+                            provider_caller=caller,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    program: JsonObject = {"type": "program", "caller_id": "call_prog"}
+    direct: JsonObject = {"type": "direct"}
+    attributed = request(caller=program)
+    assert canonical_request_sha256(attributed) == canonical_request_sha256(request(caller=program))
+    assert canonical_request_sha256(attributed) != canonical_request_sha256(request(caller=direct))
+    assert canonical_request_sha256(attributed) != canonical_request_sha256(request(caller=None))
+
+
+def test_a_tool_result_caller_is_valid_only_on_tool_messages() -> None:
+    """The output-side attribution carrier keeps the tool-role contract."""
+    import pytest as _pytest
+
+    message = GatewayMessage(
+        role="tool",
+        content="ok",
+        tool_call_id="call-1",
+        provider_tool_caller={"type": "direct"},
+    )
+    assert message.provider_tool_caller == {"type": "direct"}
+    with _pytest.raises(ValueError, match="attribution"):
+        GatewayMessage(
+            role="assistant",
+            content="ok",
+            provider_tool_caller={"type": "direct"},
+        )
+
+
+@pytest.mark.parametrize(
+    "surface", [GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.MESSAGES]
+)
+def test_responses_probability_selector_rejects_other_surfaces(surface: GatewayApiSurface) -> None:
+    """A canonical request cannot carry the Responses selector on a different API."""
+    with pytest.raises(ValueError, match="include_output_text_logprobs"):
+        GatewayRequest(
+            surface=surface,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            include_output_text_logprobs=True,
         )

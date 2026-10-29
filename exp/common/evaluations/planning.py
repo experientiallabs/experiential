@@ -64,6 +64,7 @@ def build_evaluation_plan(
     observed_cells: Sequence[ObservedProductionCell],
     additional_inputs: Sequence[ArtifactInput] = (),
     repeats: Sequence[int] = (0,),
+    task_ids: Sequence[ArtifactId] | None = None,
     created_at: datetime,
     code_revision: str,
 ) -> EvaluationPlan:
@@ -77,6 +78,7 @@ def build_evaluation_plan(
         observed_cells: Production rollout assignments that already fill matrix cells.
         additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
+        task_ids: Optional subset of the task set to plan, or None for every task.
         created_at: Time the plan is completed.
         code_revision: Exact EXP revision creating the plan.
 
@@ -93,6 +95,7 @@ def build_evaluation_plan(
         fidelity_overlap_count=None,
         additional_inputs=additional_inputs,
         repeats=repeats,
+        task_ids=task_ids,
         created_at=created_at,
         code_revision=code_revision,
     )
@@ -156,6 +159,7 @@ def _build_evaluation_plan(
     fidelity_overlap_count: int | None,
     additional_inputs: Sequence[ArtifactInput],
     repeats: Sequence[int],
+    task_ids: Sequence[ArtifactId] | None = None,
     created_at: datetime,
     code_revision: str,
 ) -> EvaluationPlan:
@@ -175,6 +179,7 @@ def _build_evaluation_plan(
         fidelity_overlap_count: Optional positive number of observed lineages to measure.
         additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
+        task_ids: Optional subset of the task set to plan, or None for every task.
         created_at: Time the plan is completed.
         code_revision: Exact EXP revision creating the plan.
 
@@ -224,6 +229,17 @@ def _build_evaluation_plan(
     _require_sealed_lineages(loaded_tasks.tasks)
     candidates_by_alias = {candidate.alias: candidate for candidate in candidates}
 
+    if task_ids is not None and (
+        not task_ids or len(set(task_ids)) != len(task_ids) or not set(task_ids) <= set(tasks_by_id)
+    ):
+        raise EvaluationEvidenceError(
+            "planned task subset must name distinct tasks from the task set"
+        )
+    planned = None if task_ids is None else frozenset(task_ids)
+    planned_tasks = tuple(
+        task for task in loaded_tasks.tasks if planned is None or task.task_id in planned
+    )
+
     observed_by_key: dict[tuple[str, str, int], RolloutArtifact] = {}
     observed_inputs = []
     for observed in observed_cells:
@@ -234,7 +250,12 @@ def _build_evaluation_plan(
             )
         task = tasks_by_id.get(observed.task_id)
         candidate = candidates_by_alias.get(observed.candidate_alias)
-        if task is None or candidate is None or observed.repeat not in repeat_ids:
+        if (
+            task is None
+            or (planned is not None and task.task_id not in planned)
+            or candidate is None
+            or observed.repeat not in repeat_ids
+        ):
             raise EvaluationEvidenceError(
                 "observed production evidence lies outside the requested task, candidate, or "
                 "repeat scope"
@@ -252,7 +273,7 @@ def _build_evaluation_plan(
             observed_by_key.get((task.task_id, candidate.alias, repeat)),
             task_set_input=task_input,
         )
-        for task in loaded_tasks.tasks
+        for task in planned_tasks
         for candidate in candidates
         for repeat in repeat_ids
     )
@@ -302,8 +323,7 @@ def _build_evaluation_plan(
         fidelity_protocol_sha256=fidelity_protocol_sha256,
         cells=cells,
     )
-    plan_destination = store.project_directory / "artifacts" / plan.plan_id
-    if plan_destination.exists():
+    if store.exists(plan.plan_id):
         existing, _input = read_evaluation_plan(store, plan.plan_id)
         replay = plan.model_copy(update={"created_at": existing.created_at})
         if existing != replay:
@@ -331,7 +351,12 @@ def _require_unique_candidates(candidates: tuple[RoutedCandidateSnapshot, ...]) 
 
 
 def _require_sealed_lineages(tasks: Sequence[TaskCase]) -> None:
-    """Reject a task lineage that straddles router fit and held-out partitions."""
+    """Reject a task lineage that straddles router fit and held-out partitions.
+
+    Authored tasks are not router evidence, so a person may copy a held-out request into one
+    without leaking a sealed lineage; only mined tasks are compared.
+    """
+    tasks = tuple(task for task in tasks if task.origin == "mined")
     fit_lineages = {task.lineage_group_id for task in tasks if task.partition == "fit"}
     held_out_lineages = {task.lineage_group_id for task in tasks if task.partition == "held_out"}
     leaked = sorted(fit_lineages.intersection(held_out_lineages))

@@ -37,9 +37,20 @@ MESSAGES_MANIFEST = CompatibilityManifest(
                 "stream",
             )
         ),
+        # The gateway's cross-surface ZDR demand (`provider: {"zdr": true}`,
+        # OpenRouter's routing-preference shape); Anthropic's own API has no
+        # such field, so SDK callers send it through extra_body.
+        _field("provider", CompatibilityDisposition.SUPPORTED),
+        _field("gateway", CompatibilityDisposition.SUPPORTED),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "extended_thinking"),
+        # OpenRouter's Anthropic-compatible Messages endpoint accepts its
+        # ``reasoning`` object (effort / max_tokens / enabled / exclude) on
+        # this surface, and agents built against it send the field verbatim.
+        # Not an official SDK field: an installed extension, decoded closed and
+        # mapped onto the canonical effort channel (see requests.py).
+        _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field(
             "context_management",
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
@@ -60,6 +71,16 @@ MESSAGES_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "fast_mode",
         ),
+        # Claude Code auto mode asks the provider to run its dangerous-tool-use
+        # classifier server-side. Forwarded verbatim on Anthropic rungs and
+        # silently dropped elsewhere (the caller then reviews tool calls
+        # itself), so the provider's ``safeguard_results`` reach the caller
+        # only from a rung that actually ran the review.
+        _field(
+            "safeguards",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "safeguards",
+        ),
         _field(
             "cache_control",
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
@@ -70,7 +91,13 @@ MESSAGES_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "inference_geo",
         ),
-        _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # ``metadata.user_id`` reaches Anthropic rungs as the provider's own
+        # end-user attribution; other rungs define no equivalent and omit it.
+        _field(
+            "metadata",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "end_user_attribution",
+        ),
         # Conscious rejections, each with a recorded reason:
         # - ``thread`` is Anthropic's server-held conversation state (it
         #   replaces ``messages`` upstream); the stateless gateway cannot
@@ -154,6 +181,13 @@ MESSAGES_SERVER_TOOL_TYPES_ACCEPTED = frozenset(
         "web_search_20250305",
         "web_search_20260209",
         "web_search_20260318",
+        # Tool search: forwarded verbatim on an all-Anthropic route; on every
+        # other route the GATEWAY runs the search over the deferred tools
+        # (see exp.runtime.gateway.tool_search) and renders the same blocks.
+        "tool_search_tool_bm25",
+        "tool_search_tool_bm25_20251119",
+        "tool_search_tool_regex",
+        "tool_search_tool_regex_20251119",
     }
 )
 """Anthropic-defined tool types the gateway forwards verbatim.
@@ -188,10 +222,6 @@ MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(
         "text_editor_20250124",
         "text_editor_20250429",
         "text_editor_20250728",
-        "tool_search_tool_bm25",
-        "tool_search_tool_bm25_20251119",
-        "tool_search_tool_regex",
-        "tool_search_tool_regex_20251119",
         "web_fetch_20250910",
         "web_fetch_20260209",
         "web_fetch_20260309",
@@ -204,7 +234,7 @@ Each is rejected because the gateway cannot yet serve it truthfully, not
 because the provider would refuse it (a live probe on a plain key,
 2026-08-31, accepted the current-generation types bare; beta headers only
 matter for the 2024-10-22 family): ``web_fetch_*``, ``code_execution_*``,
-and ``tool_search_*`` stream result blocks the data plane does not carry
+stream result blocks the data plane does not carry
 (silently dropping them would falsify the response); ``code_execution_*``,
 ``browser_toolset_*``, ``computer*``, and ``mcp_toolset`` additionally bind
 provider-hosted execution state. ``bash_20250124``,
@@ -220,10 +250,12 @@ block-vocabulary evidence, exactly as web_search was.
 MESSAGES_BETA_TOKENS_FORWARDED = frozenset(
     {
         "context-1m-2025-08-07",
+        "extended-cache-ttl-2025-04-11",
         "interleaved-thinking-2025-05-14",
         "context-management-2025-06-27",
         "cache-diagnosis-2026-04-07",
         "fast-mode-2026-02-01",
+        "thinking-display-updates-2026-08-18",
     }
 )
 """Caller ``anthropic-beta`` tokens forwarded verbatim on Anthropic rungs.
@@ -232,15 +264,35 @@ A caller beta header is operator-trust surface, so forwarding is an exact
 allowlist, never a pattern: each listed token's behavior is understood and
 safe to relay. ``context-1m-2025-08-07`` activates the 1M context window
 (Claude Code sends it with 1M-suffixed models; without forwarding, the
-provider serves 200K and long sessions fail). ``interleaved-thinking``
+provider serves 200K and long sessions fail). ``extended-cache-ttl``
+admits ``cache_control.ttl: "1h"`` markers, which the gateway already relays
+byte-for-byte and settles at the one-hour write rate. ``interleaved-thinking``
 gates thinking between tool calls, whose blocks this gateway already
-carries opaquely. The remaining three are the same tokens the gateway
+carries opaquely. The remaining four are the same tokens the gateway
 injects itself when the bound field (``context_management``,
-``diagnostics``, ``speed``) is present. Every other caller token is
+``diagnostics``, ``speed``, ``thinking.display: "updates"``) is present;
+Claude Code sends the display token beside ``display: "updates"``, and
+dropping it while the field still dispatched made Anthropic refuse the
+request (2026-10-05). Every other caller token is
 validated and dropped with an ``anthropic-beta.<token>`` disclosure, never
 rejected and never blind-forwarded; notable deliberate drops are
 ``server-side-fallback-*`` and ``fallback-credit-*`` (an upstream model
 swap would falsify this gateway's committed route identity and billing)
 and ``claude-code-20250219`` (an umbrella product token with an
 unenumerated behavior surface).
+"""
+
+
+MESSAGES_BETA_TOKENS_FIELD_BOUND = frozenset({"dangerous-tool-use-2026-09-03"})
+"""Caller ``anthropic-beta`` tokens accepted silently and never relayed as sent.
+
+Each token here only gates one request field, and the gateway injects it
+itself exactly when that field dispatches to an Anthropic rung (see
+``anthropic_request_headers``). Claude Code sends
+``dangerous-tool-use-2026-09-03`` beside its auto-mode ``safeguards`` field;
+the caller copy is neither forwarded (a bare token without its field, or on
+a non-Anthropic rung, would change nothing a caller can observe) nor
+disclosed as dropped, so a route that cannot run the server-side review
+answers exactly as if the caller had never asked, and the caller falls back
+to reviewing tool calls itself.
 """

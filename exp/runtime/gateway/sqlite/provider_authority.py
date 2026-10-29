@@ -7,6 +7,8 @@ from typing import Literal, cast
 
 from exp.common.core.artifacts import ContractModel, Sha256, stable_id
 from exp.common.models import ConnectionConfig
+from exp.common.models.azure_endpoints import AzureApiSurface
+from exp.common.models.catalog import SubscriptionKind
 
 
 class ProviderAuthorityError(ValueError):
@@ -128,8 +130,9 @@ def upsert_provider_connection(
         INSERT INTO provider_connection_revisions (
             revision_id, organization_id, connection_id, revision_number,
             provider, base_url, api_key_env, api_version, azure_api_surface, region,
-            aws_access_key_id_env, bedrock_auth_mode, connection_sha256, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            aws_access_key_id_env, bedrock_auth_mode, trusted_custom_origin,
+            subscription, connection_sha256, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             revision_id,
@@ -144,6 +147,8 @@ def upsert_provider_connection(
             config.region,
             config.aws_access_key_id_env,
             config.bedrock_auth_mode,
+            1 if config.trusted_custom_origin else 0,
+            config.subscription,
             digest,
             now,
         ),
@@ -198,8 +203,8 @@ def bound_provider_connections(
         SELECT c.connection_id, r.revision_id, r.revision_number,
                r.provider, r.base_url, r.api_key_env, r.api_version,
                r.azure_api_surface, r.region,
-               r.aws_access_key_id_env, r.bedrock_auth_mode,
-               r.connection_sha256, c.active
+               r.aws_access_key_id_env, r.bedrock_auth_mode, r.trusted_custom_origin,
+               r.subscription, r.connection_sha256, c.active
         FROM alias_revision_provider_connections AS b
         JOIN provider_connections AS c
           ON c.organization_id = b.organization_id
@@ -328,7 +333,7 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
         api_key_env=None if row["api_key_env"] is None else str(row["api_key_env"]),
         api_version=None if row["api_version"] is None else str(row["api_version"]),
         azure_api_surface=cast(
-            Literal["openai_deployments", "model_inference"] | None,
+            AzureApiSurface | None,
             None if row["azure_api_surface"] is None else str(row["azure_api_surface"]),
         ),
         region=None if row["region"] is None else str(row["region"]),
@@ -339,6 +344,11 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
             None
             if row["bedrock_auth_mode"] is None
             else cast('Literal["access_key_pair", "api_key"]', str(row["bedrock_auth_mode"]))
+        ),
+        trusted_custom_origin=bool(row["trusted_custom_origin"]),
+        subscription=cast(
+            "SubscriptionKind | None",
+            None if row["subscription"] is None else str(row["subscription"]),
         ),
     )
     digest = str(row["connection_sha256"])
@@ -358,8 +368,8 @@ _SELECT_AUTHORITY = """
 SELECT c.connection_id, r.revision_id, r.revision_number,
        r.provider, r.base_url, r.api_key_env, r.api_version,
        r.azure_api_surface, r.region,
-       r.aws_access_key_id_env, r.bedrock_auth_mode,
-       r.connection_sha256, c.active
+       r.aws_access_key_id_env, r.bedrock_auth_mode, r.trusted_custom_origin,
+       r.subscription, r.connection_sha256, c.active
 FROM provider_connections AS c
 JOIN provider_connection_revisions AS r
   ON r.organization_id = c.organization_id

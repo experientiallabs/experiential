@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from typing import Literal, overload
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.evaluations.evidence import read_rollout
@@ -12,14 +13,14 @@ from exp.common.rollouts import (
     RolloutArtifact,
     RolloutEventKind,
     SimulationArtifactSet,
+    unknown_dispatch_reservation_is_upper_bound,
     unknown_dispatch_reserved_cost_usd,
     unknown_spend_failure,
 )
 from exp.optimize.router.errors import RouterCompositionError
-from exp.simulation.engines.text.bindings import rollout_id_for_binding
 from exp.simulation.engines.text.errors import SimulationConfigurationError
 from exp.simulation.engines.text.grounding import load_completion_contract
-from exp.simulation.engines.text.rollout_support import rollout_spend
+from exp.simulation.engines.text.lineage_spend import lineage_spend
 
 
 def observed_rollout_spend(rollout: RolloutArtifact) -> float:
@@ -28,7 +29,7 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
     A rollout whose failure left one dispatch's spend unknown is charged its exact persisted
     worst-case reservation on top of every priced operation, so one ambiguous cell counts
     conservatively against the ceiling instead of aborting reconciliation for every other
-    valid rollout. Unknown-spend evidence with no persisted reservation stays fail-closed.
+    valid rollout. Unknown-spend evidence without a proven reservation bound stays fail-closed.
 
     Args:
         rollout: Completed simulation evidence whose provider economics are inspected.
@@ -39,6 +40,29 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
 
     Raises:
         RouterCompositionError: A dispatched operation is unknown, unpriced, or misclassified.
+    """
+    amount = _observed_rollout_spend(rollout)
+    if amount is None:
+        raise RouterCompositionError(
+            "simulation rollout has unknown dispatched spend and no persisted reservation "
+            "proven as an upper bound; reconcile pricing before finite-budget execution"
+        )
+    return amount
+
+
+def _observed_rollout_spend(rollout: RolloutArtifact) -> float | None:
+    """Validate every recorded economy before preserving any unresolved dispatch liability.
+
+    Args:
+        rollout: Immutable simulation evidence with observed costs and retained dispatch bounds.
+
+    Returns:
+        The sum of verified costs and bounded reservations, or None when a dispatched charge
+        remains unknown without a proven upper bound.
+
+    Raises:
+        RouterCompositionError: Evidence is not simulation output, lacks required bindings or
+            costs, or contains invalid cost values or provenance.
     """
     unknown_spend = unknown_spend_failure(rollout.failure)
     economics = []
@@ -88,40 +112,65 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
             raise RouterCompositionError("simulation rollout spend is not fully observed")
         costs.append(cost.value)
     if unknown_spend:
-        costs.append(_unknown_dispatch_charge(rollout))
+        charge = _unknown_dispatch_charge(rollout)
+        if charge is None:
+            return None
+        costs.append(charge)
     return math.fsum(costs)
 
 
-def _unknown_dispatch_charge(rollout: RolloutArtifact) -> float:
-    """Return the exact persisted worst-case charge for one unknown-spend failure.
+def _unknown_dispatch_charge(rollout: RolloutArtifact) -> float | None:
+    """Return a verified reservation bound for one unknown-spend failure, when available.
 
     Args:
         rollout: Failed evidence whose dispatched spend is permanently ambiguous.
 
     Returns:
         The reservation persisted with the failure, or the durable sandbox episode ceiling
-        for environment dispatches that predate per-failure reservation persistence.
-
-    Raises:
-        RouterCompositionError: No durable worst-case reservation was persisted.
+        for environment dispatches that predate per-failure reservation persistence, or None
+        when the retained estimate cannot bound the liability.
     """
+    if not unknown_dispatch_reservation_is_upper_bound(rollout.failure):
+        return None
     reserved = unknown_dispatch_reserved_cost_usd(rollout.failure)
     if reserved is None and rollout.evidence_source == "sandbox":
         binding = rollout.sandbox_binding
         if binding is not None:
             reserved = binding.environment_maximum_episode_cost_usd
-    if reserved is None:
-        raise RouterCompositionError(
-            "simulation rollout has unknown dispatched spend and no persisted reservation"
-        )
     return reserved
+
+
+@overload
+def verified_simulation_spend(
+    project: ProjectStore,
+    expected: SimulationArtifactSet,
+    completion_contract_input: ArtifactInput | None,
+    *,
+    allow_unknown_interrupted: Literal[False] = False,
+) -> float:
+    """Require a finite reconciled total for ordinary and finite-budget callers."""
+    ...
+
+
+@overload
+def verified_simulation_spend(
+    project: ProjectStore,
+    expected: SimulationArtifactSet,
+    completion_contract_input: ArtifactInput | None,
+    *,
+    allow_unknown_interrupted: Literal[True],
+) -> float | None:
+    """Preserve unresolved spend for shared-ledger execution or free replay."""
+    ...
 
 
 def verified_simulation_spend(
     project: ProjectStore,
     expected: SimulationArtifactSet,
     completion_contract_input: ArtifactInput | None,
-) -> float:
+    *,
+    allow_unknown_interrupted: bool = False,
+) -> float | None:
     """Recompute one phase's spend from verified immutable rollouts.
 
     Args:
@@ -129,9 +178,11 @@ def verified_simulation_spend(
         expected: Exact artifact set returned for the simulation phase.
         completion_contract_input: Reviewed completion reservation contract reference used to
             charge superseded retry attempts conservatively.
+        allow_unknown_interrupted: Shared-ledger callers may retain unknown dispatched spend
+            for uncapped execution or free replay, without fabricating whole-cell reservations.
 
     Returns:
-        Finite total of candidate, world-model, and retrieval dispatch spend.
+        Reconciled total, or None when permitted dispatched liability has no proven cost bound.
 
     Raises:
         RouterCompositionError: The set, index, rollout, or economics cannot be verified.
@@ -149,51 +200,15 @@ def verified_simulation_spend(
     )
     if hashlib.sha256(index_payload).hexdigest() != artifact_set.artifacts_sha256:
         raise RouterCompositionError("simulation spend index digest has drifted")
-    values: list[float] = []
-    for rollout_id in artifact_set.artifact_ids:
-        rollout = read_rollout(project.artifacts, rollout_id)[0]
-        values.append(observed_rollout_spend(rollout))
-        values.extend(superseded_attempt_spend(project, rollout, completion_contract_input))
-    return math.fsum(values)
-
-
-def superseded_attempt_spend(
-    project: ProjectStore,
-    rollout: RolloutArtifact,
-    completion_contract_input: ArtifactInput | None,
-) -> tuple[float, ...]:
-    """Return conservative charges for every superseded retry attempt behind one rollout.
-
-    Args:
-        project: Project store containing the immutable prior-attempt artifacts.
-        rollout: Final rollout selected for its cell, possibly after retries.
-        completion_contract_input: Reviewed completion reservation contract reference.
-
-    Returns:
-        One worst-case charge per superseded attempt, so retried dispatches with unknown
-        spend still count against the phase ceiling.
-
-    Raises:
-        RouterCompositionError: A superseded attempt cannot be reconciled conservatively.
-    """
-    if rollout.retry_attempt == 0:
-        return ()
-    binding = rollout.simulation_binding
-    if binding is None:
-        raise RouterCompositionError("retried simulation rollout lacks its cell binding")
     try:
         load_completion_contract(project.artifacts, completion_contract_input)
     except SimulationConfigurationError as exc:
         raise RouterCompositionError(str(exc)) from exc
-    charges = []
-    for attempt in range(rollout.retry_attempt):
-        prior, _input = read_rollout(
-            project.artifacts, rollout_id_for_binding(binding, attempt=attempt)
-        )
-        spend = rollout_spend(prior)
-        if spend is None:
-            raise RouterCompositionError(
-                "superseded simulation attempt spend cannot be reconciled conservatively"
-            )
-        charges.append(spend)
-    return tuple(charges)
+    rollouts = tuple(
+        read_rollout(project.artifacts, identity)[0] for identity in artifact_set.artifact_ids
+    )
+
+    total = lineage_spend(project.artifacts, rollouts, measure=_observed_rollout_spend)
+    if total is None and not allow_unknown_interrupted:
+        raise RouterCompositionError("simulation lineage spend is unknown")
+    return total

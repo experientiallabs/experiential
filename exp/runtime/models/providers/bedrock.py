@@ -14,14 +14,11 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
-    AssistantAction,
     Embedding,
-    ModelFinishReason,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
-    ToolCall,
-    Usage,
+    ReasoningEffort,
 )
 from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, GatewayWireProfile
 from exp.runtime.models.providers.bedrock_endpoints import (
@@ -30,17 +27,14 @@ from exp.runtime.models.providers.bedrock_endpoints import (
     built_in_botocore_loader,
 )
 from exp.runtime.models.providers.bedrock_requests import converse_request
+from exp.runtime.models.providers.bedrock_responses import converse_response
+from exp.runtime.models.providers.bedrock_stability import stability_model
 from exp.runtime.models.providers.errors import (
-    ProviderRefusalError,
-    ProviderRefusalSignal,
     ProviderResponseError,
-    require_array,
-    require_integer,
-    require_object,
-    require_string,
 )
 from exp.runtime.models.providers.openai_compatible import normalize_embedding_vector
 from exp.runtime.models.providers.protocol import BoundedSyncModelClientAdapter
+from exp.runtime.models.providers.reasoning_compat import bedrock_adaptive_thinking_model
 from exp.runtime.models.providers.transport import (
     ProviderTransportError,
     RetryPolicy,
@@ -389,6 +383,8 @@ class BedrockClient:
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_logprobs: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a lazy Bedrock client that does not import boto or open a session.
 
@@ -401,6 +397,10 @@ class BedrockClient:
             bearer_token: Optional bearer resolved from the credential seam.
             runtime_factory: Optional deterministic factory used by tests.
             retry_policy: Bounded same-region retry policy applied outside botocore.
+            supports_reasoning: Whether the catalog declares a reasoning control
+                for this deployment. Only Claude of the adaptive-thinking
+                generation carries one on the ConverseStream wire.
+            reasoning_effort: The deployment's configured default effort.
         """
         self._model = model
         self._configured_region = region
@@ -421,6 +421,10 @@ class BedrockClient:
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_logprobs = supports_logprobs
+        self._supports_reasoning = supports_reasoning and bedrock_adaptive_thinking_model(
+            model.model_id
+        )
+        self._reasoning_effort = reasoning_effort if self._supports_reasoning else None
         self._client: BedrockRuntime | None = None
         self._region: str | None = None
         self._signing_credentials: _ResolvableCredentials | None = None
@@ -588,6 +592,16 @@ class BedrockClient:
         """Return whether this Bedrock route accepts logprob controls."""
         return self._supports_logprobs
 
+    @property
+    def supports_reasoning(self) -> bool:
+        """Return whether this route carries a Claude adaptive-thinking control."""
+        return self._supports_reasoning
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffort | None:
+        """Return the deployment's configured default effort, if it reasons."""
+        return self._reasoning_effort
+
     def converse_stream_url(self) -> str:
         """Return the regional ConverseStream REST endpoint for this model.
 
@@ -606,6 +620,23 @@ class BedrockClient:
         origin = bedrock_runtime_origin(region)
         return f"{origin}/model/{encoded_model}/converse-stream"
 
+    def invoke_url(self) -> str:
+        """Return the regional ``InvokeModel`` REST endpoint for this model.
+
+        The image wire (Stability AI models) posts one JSON body here; the model
+        identifier is encoded exactly like :meth:`converse_stream_url`.
+
+        Returns:
+            The full ``invoke`` URL for the resolved region.
+
+        Raises:
+            BedrockRegionError: No region could be resolved.
+        """
+        region = self._region_name()
+        encoded_model = quote(self._model.model_id, safe="/~")
+        origin = bedrock_runtime_origin(region)
+        return f"{origin}/model/{encoded_model}/invoke"
+
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
         """Compute SigV4 headers for one frozen native-dispatch request body.
 
@@ -617,12 +648,14 @@ class BedrockClient:
         within milliseconds and any later retry signs again.
 
         Args:
-            url: Exact endpoint the data plane will POST to.
+            url: Exact endpoint the data plane will POST to: this model's
+                ConverseStream URL or, for an image rung, its InvokeModel URL.
             body: Exact pre-serialized JSON body the data plane will send.
 
         Returns:
             Headers to send verbatim: ``Authorization``, ``X-Amz-Date``, the
-            session token when present, and the content type that was signed.
+            session token when present, and the content type that was signed
+            (an event-stream ``accept`` for ConverseStream, JSON for InvokeModel).
 
         Raises:
             BedrockRegionError: No region could be resolved.
@@ -630,8 +663,11 @@ class BedrockClient:
             RuntimeError: ``boto3`` or ``botocore`` is not installed.
         """
         region = self._region_name()
-        expected_url = self.converse_stream_url()
-        if url != expected_url:
+        if url == self.converse_stream_url():
+            accept = "application/vnd.amazon.eventstream"
+        elif url == self.invoke_url():
+            accept = "application/json"
+        else:
             raise ProviderTransportError(
                 "Bedrock dispatch URL differs from the admitted regional model endpoint"
             )
@@ -639,7 +675,7 @@ class BedrockClient:
             return {
                 "authorization": f"Bearer {self._bearer_token}",
                 "content-type": "application/json",
-                "accept": "application/vnd.amazon.eventstream",
+                "accept": accept,
             }
         auth_factory, request_factory = _import_botocore_signing()
         frozen = self._resolved_signing_credentials().get_frozen_credentials()
@@ -647,10 +683,7 @@ class BedrockClient:
             method="POST",
             url=url,
             data=body.encode("utf-8"),
-            headers={
-                "content-type": "application/json",
-                "accept": "application/vnd.amazon.eventstream",
-            },
+            headers={"content-type": "application/json", "accept": accept},
         )
         auth_factory(frozen, "bedrock", bedrock_signing_region(region)).add_auth(request)
         return {str(name): str(value) for name, value in dict(request.headers).items()}
@@ -711,8 +744,15 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
         Bedrock authenticates with per-request SigV4 signatures over the exact
         body bytes, so the profile carries no static credential headers and
         instead marks the request body for dispatch-time signing through
-        :meth:`sign_gateway_dispatch`.
+        :meth:`sign_gateway_dispatch`. A Stability AI image model also carries
+        its InvokeModel URL as the images endpoint on the ``bedrock_stability``
+        image wire; every other Bedrock model speaks no images wire.
         """
+        stability_url = (
+            self._bedrock_client.invoke_url()
+            if stability_model(self._bedrock_client.model_id) is not None
+            else None
+        )
         return GatewayWireProfile(
             dialect="bedrock_converse_stream",
             url=self._bedrock_client.converse_stream_url(),
@@ -724,7 +764,14 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             supports_top_p=self._bedrock_client.supports_top_p,
             supports_top_k=self._bedrock_client.supports_top_k,
             supports_logprobs=self._bedrock_client.supports_logprobs,
+            supports_reasoning=self._bedrock_client.supports_reasoning,
+            reasoning_wire_format=(
+                "anthropic_adaptive" if self._bedrock_client.supports_reasoning else "none"
+            ),
+            reasoning_effort=self._bedrock_client.reasoning_effort,
             signs_request_body=True,
+            images_url=stability_url,
+            images_wire="bedrock_stability" if stability_url is not None else "openai",
         )
 
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
@@ -864,132 +911,3 @@ def _embedding_values(payload: JsonObject) -> list[JsonValue]:
     if not isinstance(values, list) or not values:
         raise ProviderResponseError("Bedrock embedding response needs a non-empty embedding array")
     return cast("list[JsonValue]", values)
-
-
-_COMPLETED_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "tool_use"})
-_LENGTH_STOP_REASONS = frozenset({"max_tokens"})
-
-
-def converse_response(
-    payload: Mapping[str, object],
-    *,
-    configured_model: ModelSnapshot,
-    latency_seconds: float,
-) -> ModelResponse:
-    """Translate one Converse response into EXP's shared completion contract.
-
-    Args:
-        payload: Decoded Converse response object.
-        configured_model: Resolved identity before the request was sent.
-        latency_seconds: Wall-clock duration for the successful request sequence.
-
-    Returns:
-        Typed output, configured model identity, and observed usage and latency.
-
-    Raises:
-        ProviderResponseError: The response is malformed or uses an unsupported block or stop.
-    """
-    output = require_object(cast("JsonValue | None", payload.get("output")), "Bedrock output")
-    message = require_object(output.get("message"), "Bedrock output.message")
-    blocks = require_array(message.get("content"), "Bedrock output.message.content")
-    text_parts: list[str] = []
-    tool_calls: list[ToolCall] = []
-    for index, raw_block in enumerate(blocks):
-        block = require_object(raw_block, f"Bedrock output.message.content[{index}]")
-        if "text" in block:
-            text = block.get("text")
-            if not isinstance(text, str):
-                raise ProviderResponseError(
-                    f"Bedrock output.message.content[{index}].text must be a string"
-                )
-            text_parts.append(text)
-            continue
-        if "toolUse" in block:
-            tool_calls.append(_tool_use(block["toolUse"], index))
-            continue
-        if "reasoningContent" in block:
-            # Converse leads a reasoning model's turn with its thinking blocks
-            # (captured live 2026-09-02 on us.anthropic.claude-opus-5). The
-            # non-streaming completion contract carries answer text and tool
-            # calls only, so the thinking is read and dropped rather than
-            # failing the response.
-            require_object(
-                block["reasoningContent"],
-                f"Bedrock output.message.content[{index}].reasoningContent",
-            )
-            continue
-        raise ProviderResponseError(
-            f"Bedrock output.message.content[{index}] has an unsupported block"
-        )
-    content = "".join(text_parts) or None
-    try:
-        action = AssistantAction(content=content, tool_calls=tuple(tool_calls))
-    except ValueError as exc:
-        raise ProviderResponseError(
-            "Bedrock Converse response has neither text nor a complete tool call"
-        ) from exc
-    finish_reason = _finish_reason(payload.get("stopReason"))
-    return ModelResponse.completed(
-        output=action,
-        configured_model=configured_model,
-        served_model_id=None,
-        usage=_usage(payload),
-        latency_seconds=latency_seconds,
-        hit_length_limit=finish_reason is ModelFinishReason.LENGTH,
-    )
-
-
-def _tool_use(value: JsonValue, index: int) -> ToolCall:
-    """Parse one Converse toolUse block while preserving the exact tool-use ID."""
-    item = require_object(value, f"Bedrock output.message.content[{index}].toolUse")
-    call_id = require_string(
-        item.get("toolUseId"), f"Bedrock output.message.content[{index}].toolUse.toolUseId"
-    )
-    name = require_string(item.get("name"), f"Bedrock output.message.content[{index}].toolUse.name")
-    arguments = item.get("input")
-    if arguments is None:
-        arguments = {}
-    if not isinstance(arguments, dict):
-        raise ProviderResponseError(
-            f"Bedrock output.message.content[{index}].toolUse.input must be an object"
-        )
-    return ToolCall(call_id=call_id, name=name, arguments=arguments)
-
-
-def _finish_reason(value: object) -> ModelFinishReason:
-    """Map a Converse stop reason onto the current finish-reason contract."""
-    if value is None:
-        return ModelFinishReason.COMPLETED
-    if not isinstance(value, str) or not value:
-        raise ProviderResponseError("Bedrock stopReason must be a non-empty string")
-    if value in _LENGTH_STOP_REASONS:
-        return ModelFinishReason.LENGTH
-    if value in {"content_filtered", "guardrail_intervened"}:
-        raise ProviderRefusalError(
-            provider="bedrock",
-            signal=ProviderRefusalSignal.GUARDRAIL,
-        )
-    if value in _COMPLETED_STOP_REASONS:
-        return ModelFinishReason.COMPLETED
-    raise ProviderResponseError(f"Bedrock stopReason {value!r} is not supported")
-
-
-def _usage(payload: Mapping[str, object]) -> Usage | None:
-    """Normalize Converse cache legs into total input plus explicit read and write subsets."""
-    raw = payload.get("usage")
-    if raw is None:
-        return None
-    usage = require_object(cast("JsonValue | None", raw), "Bedrock usage")
-    fresh = require_integer(usage.get("inputTokens"), "Bedrock usage.inputTokens")
-    cache_read = require_integer(
-        usage.get("cacheReadInputTokens"), "Bedrock usage.cacheReadInputTokens"
-    )
-    cache_write = require_integer(
-        usage.get("cacheWriteInputTokens"), "Bedrock usage.cacheWriteInputTokens"
-    )
-    return Usage(
-        input_tokens=fresh + cache_read + cache_write,
-        output_tokens=require_integer(usage.get("outputTokens"), "Bedrock usage.outputTokens"),
-        cached_input_tokens=cache_read,
-        cache_write_input_tokens=cache_write,
-    )

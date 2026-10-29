@@ -2,33 +2,47 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
 
-from exp.common.core.artifacts import ContractModel, canonical_json_bytes
+from exp.common.core.artifacts import ContractModel
+from exp.runtime.gateway.audio_contracts import SpeechRequest, TranscriptionRequest
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
+from exp.runtime.gateway.video.contracts import VideoRequest
+
+type EmbeddingTokenIds = Annotated[
+    tuple[Annotated[int, Field(strict=True, ge=0)], ...], Field(min_length=1)
+]
+"""One nonempty token sequence in the selected model's tokenizer vocabulary."""
+
+type EmbeddingInputs = tuple[str, ...] | tuple[EmbeddingTokenIds, ...]
+"""A homogeneous ordered batch of texts or pre-tokenized inputs, one vector per item."""
 
 
 class EmbeddingsRequest(ContractModel):
     """Canonical, provider-neutral embeddings request.
 
-    Deliberately parallel to :class:`~exp.runtime.gateway.contracts.GatewayRequest`
-    rather than a mode of it: the embeddings surface is message-less and
-    non-streaming, while ``GatewayRequest`` hard-requires ``messages`` and is
-    admitted stream-only. Reusing that contract would have forced either a
-    message-less exception or a stream-forced embeddings dispatch, so the two
-    surfaces stay separate. It lives in its own module so the already
-    line-budgeted ``contracts`` module carries only the shared enum member.
+    This message-less, non-streaming surface is separate from completion requests.
+    Each batch item produces one vector. Token sequences retain their provider-specific
+    IDs; the gateway never decodes or translates between tokenizer vocabularies.
+
+    Attributes:
+        surface: Fixed embeddings API surface.
+        inputs: Nonempty homogeneous batch of text strings or token sequences.
+        dimensions: Optional positive output dimensionality, enforced by the provider.
+        encoding_format: Optional float or base64 vector encoding.
+        user: Optional gateway-only end-user attribution, at most 1,024 characters.
     """
 
     surface: Literal[GatewayApiSurface.EMBEDDINGS] = GatewayApiSurface.EMBEDDINGS
-    inputs: tuple[str, ...] = Field(min_length=1)
+    inputs: EmbeddingInputs = Field(min_length=1)
     dimensions: int | None = Field(default=None, gt=0)
     encoding_format: Literal["float", "base64"] | None = None
     user: str | None = Field(default=None, max_length=1024)
-    """End-user attribution from the OpenAI ``user`` field: content-free and never a credential."""
 
     @property
     def attribution_label(self) -> str | None:
@@ -45,11 +59,11 @@ class EmbeddingsRequest(ContractModel):
 
     @field_validator("inputs")
     @classmethod
-    def _require_nonempty_inputs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        """Reject empty input strings, mirroring the provider's own rejection.
+    def _require_nonempty_inputs(cls, value: EmbeddingInputs) -> EmbeddingInputs:
+        """Reject empty input strings; token sequences are nonempty by type.
 
         Args:
-            value: Ordered visible text inputs to embed.
+            value: Ordered text or token inputs to embed.
 
         Returns:
             The unchanged validated inputs.
@@ -57,36 +71,45 @@ class EmbeddingsRequest(ContractModel):
         Raises:
             ValueError: An input string is empty.
         """
-        if any(not text for text in value):
+        if any(not item for item in value):
             raise ValueError("embedding inputs must not be empty strings")
         return value
 
 
-ServingRequest = GatewayRequest | EmbeddingsRequest | ImagesRequest
+ServingRequest = (
+    GatewayRequest
+    | EmbeddingsRequest
+    | ImagesRequest
+    | DecisionRequest
+    | SpeechRequest
+    | TranscriptionRequest
+    | VideoRequest
+)
 """One admitted serving request across every public surface.
 
 The money, auth, and accounting seams widen from ``GatewayRequest`` to this
 union so a chat-assuming reader cannot duck-type onto an embeddings request and
 touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
-that must now handle the embeddings and images arms, and each branches
+that must now handle the embeddings, images, and video arms, and each branches
 exhaustively.
 """
 
 
-def embeddings_input_ceiling_micro_usd(
-    request: EmbeddingsRequest,
+def embeddings_input_ceiling_nano_usd(
     *,
+    input_tokens: int,
     input_rate: int | None,
-    maximum: int,
 ) -> int | None:
     """Return the conservative input-only reservation ceiling for one embeddings call.
 
-    The canonical UTF-8 byte length upper-bounds the input tokens (there is no
+    ``input_tokens`` is the request's estimated input reservation (there is no
     output leg and no excluded provider carrier), so only the input rate
-    applies. A missing rate unprices the route (``None``), and a ceiling above
-    ``maximum`` is likewise unpriceable, matching the completion path.
+    applies. A missing rate unprices the route (``None``); a ceiling past the
+    int8 ledger column raises ``NanoUsdOverflowError`` like the completion path.
     """
     if input_rate is None:
         return None
-    ceiling = (len(canonical_json_bytes(request)) * input_rate + 999_999) // 1_000_000
-    return ceiling if ceiling <= maximum else None
+    return require_representable_nano_usd(
+        (input_tokens * input_rate + 999_999) // 1_000_000,
+        what="embeddings reservation ceiling",
+    )

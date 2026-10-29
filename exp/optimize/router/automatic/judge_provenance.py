@@ -136,12 +136,13 @@ def hosted_judge_inputs(
             raise ValueError("Project does not select this provisional judge evidence")
         record = catalog.models.get(judge_alias)
         capabilities = record.capabilities if record is not None else None
-        if capabilities is None:
+        if record is None or capabilities is None:
             raise ValueError("judge capability declaration is absent")
         verify_completion_reservation(
             evidence.request_reservation,
             model=persisted.judge_model,
             capabilities=capabilities,
+            token_prices=record.token_prices,
             maximum_attempts=options.completion_maximum_attempts,
         )
         return persisted, evidence.setup_input, calibration.calibration_id, calibration_input

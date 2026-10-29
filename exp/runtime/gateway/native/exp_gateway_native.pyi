@@ -1,9 +1,11 @@
 """Type stubs for the exp_gateway_native extension module."""
 
-from collections.abc import Callable
-from typing import Protocol
+from collections.abc import Callable, Mapping
+from typing import Literal, Protocol, overload
 
 __version__: str
+MODEL_STAGE_CONTRACT_VERSION: int
+AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION: int
 
 class _ControlPlane(Protocol):
     """The callback surface the data plane requires (see NativeControlPlane)."""
@@ -26,10 +28,95 @@ class _ControlPlane(Protocol):
     def readiness(self, argument: str) -> str: ...
     def close_thread_resources(self, argument: str) -> str: ...
 
+class _DeterministicDetector(Protocol):
+    """The compiled-rule surface the data plane accepts (see RegexDetector)."""
+
+    def redact(self, text: str) -> str | None: ...
+    def matches(self, text: str) -> bool: ...
+
+class RegexDetector:
+    """One compiled deterministic guardrail rule owned by the data plane."""
+
+    def __init__(self, spec_json: str) -> None: ...
+    def redact(self, text: str) -> str | None: ...
+    def matches(self, text: str) -> bool: ...
+
 class ShutdownHandle:
     """Embedder-owned stop signal for one `serve` call."""
 
     def request_shutdown(self) -> None: ...
+
+class CaptureResponse:
+    """Observed provider output and terminal evidence shared with gateway capture."""
+
+    def __init__(self, protocol: str, body: bytes, sse: bool) -> None: ...
+    @property
+    def body_json(self) -> str: ...
+    @property
+    def completed(self) -> bool: ...
+    @property
+    def events_json(self) -> str | None: ...
+
+# A record too large for memory: ("split", skeleton JSON, reference marker,
+# [(part kind, file path, byte length), ...]). See native_capture.CaptureSpillConfiguration.
+SplitRecord = tuple[Literal["split"], bytes, str, list[tuple[Literal["json", "frames"], str, int]]]
+
+class CaptureCollector:
+    """Bounded native content capture with an off-path persistence destination."""
+
+    def __init__(self, config_json: str, sink: Callable[[str], None]) -> None: ...
+    @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[str, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        bytes_output: Literal[False] = False,
+    ) -> CaptureCollector: ...
+    @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[bytes | SplitRecord, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        bytes_output: Literal[True],
+    ) -> CaptureCollector: ...
+    @staticmethod
+    def sqlite(config_json: str, local_json: str) -> CaptureCollector | None: ...
+    def begin(self, request_json: str) -> bool: ...
+    def begin_bytes(self, request_json: bytes) -> bool: ...
+    def select_model(self, request_id: str, model_id: str) -> None: ...
+    def claim_relay(self, request_id: str) -> bool: ...
+    def finish_relay(self, request_id: str, metadata_json: str, body: bytes) -> bool: ...
+    def settle(self, request_id: str, keep_prompt: bool, keep_response: bool) -> None: ...
+    def close(self, timeout_seconds: float = 10.0) -> bool: ...
+    def counts(self) -> tuple[int, int, int, int, int, int]: ...
+    def maintenance_failures(self) -> int: ...
+
+class ExecutionHandle:
+    """Callback target with explicit capacity, capture, detectors and private replay identity."""
+
+    def __init__(
+        self,
+        control_plane: _ControlPlane,
+        *,
+        max_active_requests: int,
+        callback_permits: int,
+        settlement_permits: int,
+        guardrail_detectors: Mapping[str, _DeterministicDetector],
+        capture: CaptureCollector | None,
+    ) -> None: ...
+    @property
+    def in_use(self) -> bool: ...
+
+class ExecutionBindings:
+    """Bounded one-use relay bindings; removal never revokes already claimed work."""
+
+    def __init__(self, capacity: int = 4096) -> None: ...
+    def register(self, token: str, handle: ExecutionHandle) -> None: ...
+    def remove(self, token: str) -> None: ...
 
 def shutdown_handle() -> ShutdownHandle: ...
 def serve(
@@ -37,6 +124,9 @@ def serve(
     config_json: str,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
+    guardrail_detectors: Mapping[str, _DeterministicDetector] | None = None,
+    capture: CaptureCollector | None = None,
+    execution_bindings: ExecutionBindings | None = None,
 ) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(
@@ -49,27 +139,16 @@ def encode_chat_fixture(
 def encode_responses_fixture(
     request_id: str,
     model: str,
-    created_at: float,
+    created_at: int,
     envelope_json: str,
     events_json: str,
 ) -> list[str]: ...
 def completed_responses_fixture(
     request_id: str,
     model: str,
-    created_at: float,
+    created_at: int,
     envelope_json: str,
     events_json: str,
 ) -> str: ...
-def encode_messages_fixture(
-    request_id: str,
-    model: str,
-    events_json: str,
-) -> list[str]: ...
-def completed_messages_fixture(
-    request_id: str,
-    model: str,
-    events_json: str,
-) -> str: ...
-def anthropic_error_fixture(public_error_json: str) -> str: ...
 def normalize_stream_fixture(dialect: str, chunks_json: str) -> str: ...
 def failure_public_error_fixture(failure_class: str, safe_message: str) -> str: ...

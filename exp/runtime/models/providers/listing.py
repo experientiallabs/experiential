@@ -10,12 +10,14 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
+from urllib.parse import urlencode
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ReasoningEffort
 from exp.common.models.discovery import DiscoveredModel
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, ANTHROPIC_VERSION
+from exp.runtime.models.providers.experiential_catalog import catalog_url, model_metadata
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL
 from exp.runtime.models.providers.openai import OPENAI_BASE_URL
 from exp.runtime.models.providers.openai_compatible import (
@@ -34,7 +36,11 @@ from exp.runtime.models.providers.transport import (
 
 LISTING_TIMEOUT_SECONDS = 20.0
 LISTING_RETRY_POLICY = RetryPolicy(maximum_attempts=2)
+_ANTHROPIC_PAGE_SIZE = 1_000
+_MAXIMUM_ANTHROPIC_PAGES = 10
 _MAXIMUM_GEMINI_PAGES = 10
+_CATALOG_PAGE_SIZE = 1_000
+_MAXIMUM_CATALOG_PAGES = 10
 _CREDENTIAL_STATUS_CODES = frozenset({401, 403})
 
 
@@ -44,11 +50,19 @@ class ProviderListingError(RuntimeError):
 
 @dataclass(frozen=True)
 class ProviderEndpoint:
-    """One authenticated provider endpoint whose available models can be listed."""
+    """One authenticated provider endpoint whose available models can be listed.
+
+    Attributes:
+        provider: Runtime provider family.
+        api_key: Resolved credential, never persisted with discovered metadata.
+        base_url: Explicit provider origin, or the family's standard origin.
+        catalog: Explicit hosted metadata contract; generic compatible endpoints leave it unset.
+    """
 
     provider: str
     api_key: str
     base_url: str | None = None
+    catalog: Literal["experiential"] | None = None
 
 
 class ProviderModelLister(Protocol):
@@ -146,13 +160,63 @@ class HttpProviderModelLister:
 
     def _openai_compatible_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
         """List OpenAI-compatible models, keeping only validated optional metadata."""
+        entries = _entries(endpoint.provider, self._openai_listing(endpoint))
+        metadata = (
+            self._experiential_catalog(endpoint) if endpoint.catalog == "experiential" else {}
+        )
         models = []
-        for entry in _entries(endpoint.provider, self._openai_listing(endpoint)):
+        for entry in entries:
             identity = _text(entry.get("id"))
             if identity is None:
                 continue
-            models.append(_openai_compatible_model(endpoint.provider, identity, entry))
+            models.append(
+                _openai_compatible_model(
+                    endpoint.provider, identity, {**entry, **metadata.get(identity, {})}
+                )
+            )
         return models
+
+    def _experiential_catalog(self, endpoint: ProviderEndpoint) -> dict[str, JsonObject]:
+        """Read bounded catalog pages from the selected Cloud gateway's own origin.
+
+        Args:
+            endpoint: Explicit Experiential Cloud listing connection.
+
+        Returns:
+            Default-route metadata indexed by exact public model slug.
+
+        Raises:
+            ProviderListingError: The catalog is unavailable or pagination is malformed.
+        """
+        try:
+            url = catalog_url(endpoint.base_url or "")
+        except ValueError as exc:
+            raise ProviderListingError(str(exc)) from exc
+        metadata: dict[str, JsonObject] = {}
+        offset = 0
+        for _ in range(_MAXIMUM_CATALOG_PAGES):
+            body = self._read(
+                endpoint,
+                f"{url}?{urlencode({'limit': _CATALOG_PAGE_SIZE, 'offset': offset})}",
+                {"Authorization": f"Bearer {endpoint.api_key}"},
+            )
+            entries = _entries(endpoint.provider, body.get("models"))
+            total = _generation_integer(body.get("total"))
+            if total is None or body.get("offset") != offset:
+                raise ProviderListingError("Experiential Cloud returned invalid catalog pagination")
+            for entry in entries:
+                projected = model_metadata(entry)
+                if projected is not None:
+                    slug, fields = projected
+                    metadata[slug] = fields
+            offset += len(entries)
+            if offset >= total:
+                return metadata
+            if not entries:
+                raise ProviderListingError(
+                    "Experiential Cloud returned an incomplete model catalog"
+                )
+        raise ProviderListingError("Experiential Cloud model catalog exceeded its page limit")
 
     def _openai_listing(self, endpoint: ProviderEndpoint) -> object:
         """Read one OpenAI-shaped ``/models`` array from the configured origin."""
@@ -165,17 +229,39 @@ class HttpProviderModelLister:
         return body.get("data")
 
     def _anthropic_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
-        """List Anthropic models, which publish only model identities."""
+        """List Anthropic model identities across bounded cursor pages."""
         base_url = _base_url(endpoint, default=ANTHROPIC_BASE_URL)
-        body = self._read(
-            endpoint,
-            f"{base_url}/models",
-            {"x-api-key": endpoint.api_key, "anthropic-version": ANTHROPIC_VERSION},
+        headers = {"x-api-key": endpoint.api_key, "anthropic-version": ANTHROPIC_VERSION}
+        models: list[DiscoveredModel] = []
+        after_id: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(_MAXIMUM_ANTHROPIC_PAGES):
+            query = [("limit", str(_ANTHROPIC_PAGE_SIZE))]
+            if after_id is not None:
+                query.append(("after_id", after_id))
+            body = self._read(endpoint, f"{base_url}/models?{urlencode(query)}", headers)
+            models.extend(
+                DiscoveredModel(provider=endpoint.provider, model=identity)
+                for identity in _identities(endpoint.provider, body.get("data"), "id")
+            )
+            has_more = body.get("has_more")
+            if not isinstance(has_more, bool):
+                raise ProviderListingError(
+                    "anthropic returned pagination without a boolean has_more"
+                )
+            if not has_more:
+                return models
+            after_id = _text(body.get("last_id"))
+            if after_id is None:
+                raise ProviderListingError(
+                    "anthropic returned more models without a non-empty last_id"
+                )
+            if after_id in seen_cursors:
+                raise ProviderListingError("anthropic returned a repeated last_id cursor")
+            seen_cursors.add(after_id)
+        raise ProviderListingError(
+            f"anthropic model listing exceeded {_MAXIMUM_ANTHROPIC_PAGES} pages"
         )
-        return [
-            DiscoveredModel(provider=endpoint.provider, model=identity)
-            for identity in _identities(endpoint.provider, body.get("data"), "id")
-        ]
 
     def _openrouter_models(self, endpoint: ProviderEndpoint) -> list[DiscoveredModel]:
         """List OpenRouter models, which publish capabilities, limits, and prices."""
@@ -204,9 +290,10 @@ class HttpProviderModelLister:
         models = []
         page_token: str | None = None
         for _ in range(_MAXIMUM_GEMINI_PAGES):
-            url = f"{base_url}/models?pageSize=200"
+            query_parameters = {"pageSize": "200"}
             if page_token is not None:
-                url = f"{url}&pageToken={page_token}"
+                query_parameters["pageToken"] = page_token
+            url = f"{base_url}/models?{urlencode(query_parameters)}"
             body = self._read(endpoint, url, headers)
             for entry in _entries(endpoint.provider, body.get("models")):
                 identity = _text(entry.get("name"))
@@ -249,6 +336,7 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         provider=provider,
         model=identity,
         supports_completions=_strict_bool(entry.get("supports_completions")),
+        supports_embeddings=_strict_bool(entry.get("supports_embeddings")),
         supports_tools=_strict_bool(entry.get("supports_tools")),
         supports_structured_output=_strict_bool(entry.get("supports_structured_output")),
         supports_temperature=_strict_bool(entry.get("supports_temperature")),
@@ -259,6 +347,9 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         supports_presence_penalty=_strict_bool(entry.get("supports_presence_penalty")),
         supports_reasoning=_strict_bool(entry.get("supports_reasoning")),
         reasoning_effort=_reasoning_effort(entry.get("reasoning_effort")),
+        supported_reasoning_efforts=_reasoning_effort_choices(
+            entry.get("supported_reasoning_efforts")
+        ),
         sampling_requires_reasoning_none=_strict_bool(
             entry.get("sampling_requires_reasoning_none")
         ),
@@ -271,14 +362,17 @@ def _openai_compatible_model(provider: str, identity: str, entry: JsonObject) ->
         maximum_top_k=_generation_integer(entry.get("maximum_top_k")),
         context_window_tokens=_strict_positive_int(entry.get("context_window_tokens")),
         maximum_output_tokens=_strict_positive_int(entry.get("maximum_output_tokens")),
-        input_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("input_micro_usd_per_million_tokens")
+        input_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("input_nano_usd_per_million_tokens")
         ),
-        output_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("output_micro_usd_per_million_tokens")
+        output_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("output_nano_usd_per_million_tokens")
         ),
-        cached_input_cost_per_million_tokens_usd=_micro_usd_price(
-            prices.get("cached_input_micro_usd_per_million_tokens")
+        cached_input_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("cached_input_nano_usd_per_million_tokens")
+        ),
+        cache_write_cost_per_million_tokens_usd=_nano_usd_price(
+            prices.get("cache_write_nano_usd_per_million_tokens")
         ),
     )
 
@@ -432,6 +526,16 @@ def _strict_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _reasoning_effort_choices(value: object) -> tuple[ReasoningEffort, ...] | None:
+    """Preserve an explicit effort list, rejecting malformed or unknown declarations."""
+    if not isinstance(value, list):
+        return None
+    efforts = tuple(_reasoning_effort(item) for item in value)
+    if any(effort is None for effort in efforts) or len(set(efforts)) != len(efforts):
+        return None
+    return tuple(effort for effort in efforts if effort is not None)
+
+
 def _reasoning_effort(value: object) -> ReasoningEffort | None:
     """Read one exact public reasoning-effort enum value."""
     if value == "none":
@@ -468,11 +572,11 @@ def _generation_integer(value: object) -> int | None:
     return value if value >= 0 else None
 
 
-def _micro_usd_price(value: object) -> float | None:
-    """Convert one configured micro-USD-per-million-token price to USD.
+def _nano_usd_price(value: object) -> float | None:
+    """Convert one configured nano-USD-per-million-token price to USD.
 
     Args:
-        value: Integer micro-USD per million tokens published by the endpoint.
+        value: Integer nano-USD per million tokens published by the endpoint.
 
     Returns:
         USD per million tokens, or ``None`` when the value is absent or unusable.
@@ -481,7 +585,7 @@ def _micro_usd_price(value: object) -> float | None:
         return None
     if value < 0:
         return None
-    return value / 1_000_000
+    return value / 1_000_000_000
 
 
 def _million_token_price(value: object) -> float | None:

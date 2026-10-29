@@ -4,9 +4,7 @@ from exp.common.models.catalog import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
-    GatewayEquivalenceCertification,
     GatewayLongContextTier,
-    GatewayPoolRecord,
     GatewayTokenPrices,
     ModelCatalog,
     ModelCatalogError,
@@ -16,10 +14,15 @@ from exp.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.catalog_prices import (
+    BilledUnitKind,
+    GatewayOffPeakPrices,
+    GatewayPriceWindow,
+    GatewayUnitPrices,
+)
 from exp.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
 from exp.common.models.connection_authoring import (
     ProviderConnectionAuthoringError,
-    configure_provider_connections,
     sync_provider_models,
 )
 from exp.common.models.discovery import (
@@ -33,10 +36,13 @@ from exp.common.models.discovery import (
     served_roles,
     serves_role,
 )
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import (
+    FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     GATEWAY_EXCLUDED_PROVIDERS,
     SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotDigestError,
+    CatalogSnapshotUnitError,
     DeploymentId,
     ExactModelDeployment,
     ExactModelId,
@@ -46,8 +52,11 @@ from exp.common.models.gateway_catalog import (
     is_foreign_snapshot,
     load_forward_compatible,
     normalize_gateway_catalog,
+    read_model_catalog_document,
+    read_normalized_snapshot_document,
     read_pinned_normalized_snapshot,
 )
+from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
 from exp.common.models.known_models import (
     KnownModel,
     canonical_model_id,
@@ -133,7 +142,12 @@ __all__ = [
     "GatewayEquivalenceCertification",
     "GatewayPoolRecord",
     "GatewayLongContextTier",
+    "GatewayOffPeakPrices",
+    "GatewayPriceWindow",
+    "GatewayRungDispatchPolicy",
     "GatewayTokenPrices",
+    "GatewayUnitPrices",
+    "BilledUnitKind",
     "IdempotentModelClient",
     "KnownModel",
     "ModelCatalog",
@@ -178,19 +192,22 @@ __all__ = [
     "completion_cost_reservation",
     "completion_request_cost_usd",
     "configure_provider_catalog",
-    "configure_provider_connections",
     "sync_provider_models",
     "configure_router_candidates",
     "derive_connection_name",
     "derive_model_alias",
     "known_model_metadata",
     "CatalogSnapshotDigestError",
+    "CatalogSnapshotUnitError",
     "load_forward_compatible",
     "load_model_catalog",
     "load_pricing_snapshot",
     "is_foreign_snapshot",
+    "read_model_catalog_document",
+    "read_normalized_snapshot_document",
     "normalize_gateway_catalog",
     "read_pinned_normalized_snapshot",
+    "FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION",
     "SNAPSHOT_SCHEMA_VERSION",
     "persist_pricing_snapshot",
     "reconcile_completion_economics",

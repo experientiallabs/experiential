@@ -22,9 +22,14 @@ from exp.common.models import (
     ModelResponse,
     ModelSnapshot,
     OperationEconomics,
+    Usage,
+    completion_cost_reservation,
 )
+from exp.common.models.token_cost_test import prices
 from exp.common.project import artifact_input
 from exp.common.rollouts import RolloutArtifact
+from exp.optimize.router.automatic.judge import ReservedJudgeClient
+from exp.optimize.router.errors import JudgePricingError, JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.artifacts import write_production_rollout
 from exp.optimize.router.judging.contracts import ManualJudgeError, judge_feedback_schema
 from exp.optimize.router.judging.protocol import (
@@ -42,7 +47,8 @@ from exp.optimize.router.judging.service import (
     prepare_manual_judge_setup,
 )
 from exp.optimize.router.judging.service_test import _TIME, _built_store, _catalog, _template
-from exp.simulation.engines.text.recording import Utf8UpperBoundTokenCounter
+from exp.runtime.models.providers.openai_compatible import openai_compatible_request
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 def _response(content: str) -> ModelResponse:
@@ -277,6 +283,113 @@ def test_null_rationale_probe_persists_and_replays(tmp_path: Path) -> None:
     assert replay.provider_calls_made == 0
 
 
+def test_paid_unpriceable_judge_probe_persists_and_replays_without_dispatch(tmp_path: Path) -> None:
+    """A real full-schedule client error retains its response before the protocol rejects it."""
+    store = _built_store(tmp_path)
+    setup = commit_manual_judge_setup(
+        store,
+        prepare_manual_judge_setup(
+            store,
+            _catalog(),
+            prompt_template=_template("scalar"),
+            created_at=_TIME,
+            code_revision="test-revision",
+        ),
+        confirmed=True,
+    )
+    plan = prepare_manual_judge_calibration(store, sample_size=1)
+    rollout_input = write_production_rollout(
+        store, setup, plan.tasks[0], plan.traces[0], _TIME, "test-revision"
+    )
+    rollout, _ = read_artifact_json(
+        store,
+        artifact_id=rollout_input.artifact_id,
+        expected_artifact_type="rollout",
+        relative_path="rollout.json",
+        model_type=RolloutArtifact,
+    )
+    rubric, _ = read_artifact_json(
+        store,
+        artifact_id=setup.rubric.artifact_id,
+        expected_artifact_type="rubric",
+        relative_path="rubric.json",
+        model_type=Rubric,
+    )
+
+    class Client(_NullRationaleClient):
+        """Return paid output whose cache meters were genuinely not observed."""
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            """Keep actual output and usage for the frozen card's strict valuation."""
+            return (
+                super()
+                .complete(request)
+                .model_copy(
+                    update={
+                        "economics": OperationEconomics(
+                            usage=Usage(input_tokens=100, output_tokens=20), provider_attempts=1
+                        )
+                    }
+                )
+            )
+
+    client = Client(setup.judge_model)
+    card = prices()
+    reservation = completion_cost_reservation(
+        model=setup.judge_model,
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=1,
+        maximum_input_tokens=100_000,
+        maximum_output_tokens=16_384,
+        token_prices=card,
+    )
+    reserved = ReservedJudgeClient(
+        client,
+        reservation=reservation,
+        model=setup.judge_model,
+        capabilities=ModelCapabilities(
+            supports_completions=True,
+            context_window_tokens=200_000,
+            maximum_output_tokens=16_384,
+            input_cost_per_million_tokens_usd=1,
+            output_cost_per_million_tokens_usd=4,
+            cached_input_cost_per_million_tokens_usd=0.1,
+            cache_write_cost_per_million_tokens_usd=2,
+        ),
+        maximum_attempts=1,
+        maximum_provider_calls=2,
+        token_prices=card,
+    )
+    retained = None
+    for _ in range(2):
+        adapter = TemplateJudgeClient(
+            reserved,
+            setup.prompt_template,
+            rollout,
+            rubric,
+            store=store,
+            setup_input=artifact_input(store.artifacts.read(setup.setup_id).manifest),
+            rollout_input=rollout_input,
+            reference_input=None,
+            created_at=_TIME,
+            code_revision="test-revision",
+            maximum_output_tokens=16_384,
+        )
+        with pytest.raises(JudgePricingError) as error:
+            adapter.complete(_scalar_request(setup.prompt_template.prompt.text))
+        assert error.value.response.economics.cost_usd is None
+        if retained is None:
+            retained = error.value.response
+        else:
+            assert error.value.response == retained
+    assert len(client.requests) == 1
+    assert reserved.calls == 1
+    assert len(reserved.economics) == 1
+
+
 def _oversized_rollout(rollout: RolloutArtifact) -> RolloutArtifact:
     """Return a copy of one rollout whose first span payload is far above 32k tokens.
 
@@ -292,10 +405,10 @@ def _oversized_rollout(rollout: RolloutArtifact) -> RolloutArtifact:
     return rollout.model_copy(update={"spans": (first, *rollout.spans[1:])})
 
 
-def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
+def test_long_transcript_keeps_full_evidence_within_model_capacity(
     tmp_path: Path,
 ) -> None:
-    """A transcript above the reserved input ceiling dispatches within the ceiling.
+    """Long transcripts retain tool evidence and work with reasoning-only sampling constraints.
 
     Args:
         tmp_path: Isolated project root.
@@ -352,31 +465,28 @@ def test_long_transcript_judge_request_is_elided_to_fit_the_reserved_ceiling(
         rubric,
         oversized,
         None,
-        maximum_input_tokens=32_768,
+        maximum_input_tokens=1_000_000,
         maximum_output_tokens=16_384,
     )
-    replayed = _bounded_judge_request(
-        setup.prompt_template,
-        rubric,
-        oversized,
-        None,
-        maximum_input_tokens=32_768,
-        maximum_output_tokens=16_384,
+    assert bounded == unbounded
+    assert "x" * 200_000 in (bounded.messages[1].content or "")
+    assert "payload_elided" not in (bounded.messages[1].content or "")
+    payload = openai_compatible_request(
+        "gpt-6-luna",
+        bounded,
+        supports_reasoning=True,
+        reasoning_effort="high",
+        sampling_requires_reasoning_none=True,
     )
-
-    assert counter.count(bounded) <= 32_768
-    assert bounded == replayed
-    body = bounded.messages[1].content or ""
-    assert '"payload_elided": true' in body or '"payload_elided":true' in body
-    assert '"payload_sha256"' in body
-    assert oversized.spans[0].span_id in body
-    with pytest.raises(ManualJudgeError, match="every span"):
+    assert "temperature" not in payload
+    assert payload["reasoning_effort"] == "high"
+    with pytest.raises(JudgeTranscriptAdmissionError, match="full.*evidence"):
         _bounded_judge_request(
             setup.prompt_template,
             rubric,
             oversized,
             None,
-            maximum_input_tokens=16,
+            maximum_input_tokens=32_768,
             maximum_output_tokens=16_384,
         )
 
@@ -437,9 +547,9 @@ def test_template_client_dispatch_respects_the_reserved_input_ceiling(
         reference_input=None,
         created_at=_TIME,
         code_revision="test-revision",
-        maximum_input_tokens=32_768,
+        maximum_input_tokens=1_000_000,
         maximum_output_tokens=16_384,
     ).complete(_scalar_request(setup.prompt_template.prompt.text))
 
     assert len(client.requests) == 1
-    assert Utf8UpperBoundTokenCounter().count(client.requests[0]) <= 32_768
+    assert Utf8UpperBoundTokenCounter().count(client.requests[0]) <= 1_000_000

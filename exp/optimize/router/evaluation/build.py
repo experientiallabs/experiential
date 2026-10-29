@@ -6,9 +6,10 @@ from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
+from exp.common.tasks import load_task_set
+from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.errors import RouterCompositionError
 from exp.simulation.build import BuildReviewReadiness, ProjectBuild, build_project
-from exp.simulation.ingest.otlp import TraceNormalizationResult
 
 
 def completed_project_build(project: ProjectStore) -> ProjectBuildArtifacts:
@@ -83,10 +84,16 @@ def reconstruct_completed_project_build(
             project.artifacts.read(completed.trace_dataset.artifact_id).manifest
         )
         task_input = artifact_input(project.artifacts.read(completed.task_set.artifact_id).manifest)
+        tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
     except (FileNotFoundError, ValueError) as exc:
         raise RouterCompositionError("completed project build artifacts are unavailable") from exc
     if trace_input != completed.trace_dataset or task_input != completed.task_set:
         raise RouterCompositionError("completed project build artifact manifest changed")
+    if any(task.origin == "authored" for task in tasks):
+        raise RouterCompositionError(
+            "router optimization replays mined scenarios only, and this build selects authored "
+            "scenarios; restore the mined set with select_authored_scenarios(project, ()) first"
+        )
     try:
         built = build_project(
             normalized,

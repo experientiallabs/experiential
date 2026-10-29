@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import socket
 import threading
 import time
@@ -36,6 +37,7 @@ RouterPolicyVerifier = ProjectActivationVerifier
 _LOOPBACK_HOST = "127.0.0.1"
 _STARTUP_TIMEOUT_SECONDS = 30.0
 _SHUTDOWN_JOIN_SECONDS = 15.0
+_logger = logging.getLogger(__name__)
 
 
 class _OwnedGateway:
@@ -72,11 +74,17 @@ class _OwnedGateway:
         self.error: BaseException | None = None
         native = importlib.import_module("exp_gateway_native")
         self.shutdown = native.shutdown_handle()
-        self.control_plane = NativeControlPlane(
-            components,
-            data_plane_metrics=native.metrics_snapshot_json,
-            guardrails=load_guardrail_engine(manager.root),
-        )
+        self.guardrails = load_guardrail_engine(manager.root)
+        try:
+            self.control_plane = NativeControlPlane(
+                components,
+                data_plane_metrics=native.metrics_snapshot_json,
+                guardrails=self.guardrails,
+            )
+        except BaseException:
+            if self.guardrails is not None:
+                self.guardrails.close(timeout_seconds=_SHUTDOWN_JOIN_SECONDS)
+            raise
 
     def start(self) -> None:
         """Serve the native plane on a background thread and await liveness.
@@ -104,7 +112,7 @@ class _OwnedGateway:
         while time.monotonic() < deadline:
             if self.error is not None or not self.thread.is_alive():
                 error = self.error
-                self.stop()
+                self._stop_before_return()
                 raise RouterApplicationError(f"the compatibility gateway failed to start: {error}")
             try:
                 live = httpx.get(
@@ -117,23 +125,45 @@ class _OwnedGateway:
             if live.status_code == 200:
                 return
             time.sleep(0.05)
-        self.stop()
+        self._stop_before_return()
         raise RouterApplicationError(
             "the compatibility gateway did not become live within the startup bound"
         )
 
     def stop(self) -> None:
-        """Stop the plane, drain the writer, and revoke the ephemeral key."""
+        """Drain serving and accounting before releasing the owned stack.
+
+        Raises:
+            RouterApplicationError: The join budget expired. Resources remain
+                owned and callers must retry close after recovery progresses.
+        """
+        deadline = time.monotonic() + _SHUTDOWN_JOIN_SECONDS
+        self.shutdown.request_shutdown()
+        if self.thread is not None:
+            self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if self.thread.is_alive():
+                raise RouterApplicationError("gateway serving is still draining; retry close")
+        if not self.control_plane.close(max(0.0, deadline - time.monotonic())):
+            raise RouterApplicationError("gateway accounting is still recovering; retry close")
         try:
-            self.shutdown.request_shutdown()
-            if self.thread is not None:
-                self.thread.join(timeout=_SHUTDOWN_JOIN_SECONDS)
+            if self.guardrails is not None:
+                self.guardrails.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         finally:
             try:
                 self.components.selection_workers.shutdown()
                 self.components.write_ledger.close()
             finally:
                 self.manager.revoke_key(key_id=self.key_id)
+
+    def _stop_before_return(self) -> None:
+        """Retain startup ownership until cleanup succeeds; no client exists to retry it."""
+        while True:
+            try:
+                self.stop()
+                return
+            except RouterApplicationError:
+                _logger.warning("Waiting for gateway recovery before returning startup failure")
+                time.sleep(0.1)
 
 
 class _RevokingGatewayClient(httpx2.Client):

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeGuard
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.common.models.content import MessageContentPart
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
+    ExposedReasoningContentBlock,
     GatewayMessage,
     SealedReasoningContentBlock,
 )
@@ -17,10 +19,19 @@ from exp.runtime.openai_protocol.errors import invalid_field
 
 @dataclass(frozen=True)
 class ReplayedReasoning:
-    """One validated provider reasoning item and its public input index."""
+    """One validated provider reasoning item and its public input index.
+
+    Attributes:
+        index: The item's position in the caller's ``input`` array.
+        block: The provider-opaque encrypted reasoning or the gateway-sealed carrier.
+        visible: The caller-visible summary parts replayed beside a gateway
+            carrier, one block per part. Trace capture keeps them; provider
+            replay never sees them, since the carrier holds the authenticated text.
+    """
 
     index: int
     block: EncryptedReasoningBlock | SealedReasoningContentBlock
+    visible: tuple[ExposedReasoningContentBlock, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,11 +62,24 @@ class ReplayedNativeItem:
 
 @dataclass(frozen=True)
 class ReplayedFunctionOutput:
-    """One validated function result."""
+    """One validated function result.
+
+    ``name`` and ``namespace`` are the optional tool attribution Codex
+    serializes on outputs of namespaced calls, re-emitted verbatim; ``caller``
+    is SDK 3.0's opaque programmatic tool-calling attribution, re-emitted the
+    same way.
+    """
 
     index: int
     call_id: str
     output: str
+    name: str | None = None
+    namespace: str | None = None
+    caller: JsonObject | None = None
+    content_parts: tuple[MessageContentPart, ...] = ()
+    """Ordered canonical parts when the SDK list form carried an image
+    beside text; empty for the plain-text form, whose message shape is
+    unchanged."""
 
 
 ReplayedInput = (
@@ -90,7 +114,8 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
             if len(assistant_items) > 1:
                 raise invalid_field(
                     f"input.{assistant_items[1].index}",
-                    "A Fireworks continuation may contain only one assistant message item.",
+                    "A gateway reasoning-carrier continuation may contain only one "
+                    "assistant message item.",
                 )
             content = assistant_items[0].message.content if assistant_items else None
             calls = tuple(item.call for item in segment if isinstance(item, ReplayedFunctionCall))
@@ -100,6 +125,12 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
                     content=content,
                     tool_calls=calls,
                     provider_reasoning=tuple(reasoning),
+                    capture_only_reasoning=tuple(
+                        visible
+                        for item in segment
+                        if isinstance(item, ReplayedReasoning)
+                        for visible in item.visible
+                    ),
                 )
             )
             segment.clear()
@@ -139,21 +170,85 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
             messages.append(GatewayMessage(role="assistant", provider_reasoning=tuple(pending)))
         segment.clear()
 
+    # Assistant output items of the current run, with any developer or system
+    # instructions a client recorded between them (see ``flush_run``).
+    run: list[ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall] = []
+
+    def flush_run() -> None:
+        """Emit one assistant output run, keeping a carrier with its own tool turn.
+
+        Codex records items as they stream and can append a developer reminder
+        after a function call it is already executing but before that turn's
+        reasoning item lands, so a gateway carrier arrives separated from its
+        calls by an instruction. A response that issued a function call cannot be
+        followed by another response before the call's output, so in a run that
+        holds a carrier, an instruction recorded after a function call or a
+        carrier belongs inside that tool turn: the turn is rebuilt whole and the
+        instruction follows it, ahead of the tool outputs. An instruction before
+        either still delimits two responses, and a run without a carrier keeps
+        every item in its original position.
+        """
+        carried = any(
+            isinstance(item, ReplayedReasoning) and item.block.kind == "sealed_reasoning_content"
+            for item in run
+        )
+        trailing: list[GatewayMessage] = []
+        # Tracked, not rescanned, so a long run stays linear. A carrier is only
+        # ever sealed on a tool turn, so one seen before an instruction marks an
+        # unfinished tool turn exactly as a call does.
+        in_tool_turn = False
+        for item in run:
+            if not _is_instruction(item):
+                segment.append(item)
+                in_tool_turn = (
+                    in_tool_turn
+                    or isinstance(item, ReplayedFunctionCall)
+                    or (
+                        isinstance(item, ReplayedReasoning)
+                        and item.block.kind == "sealed_reasoning_content"
+                    )
+                )
+            elif carried and in_tool_turn:
+                trailing.append(item.message)
+            else:
+                flush_segment()
+                messages.append(item.message)
+        flush_segment()
+        messages.extend(trailing)
+        run.clear()
+
     for item in value:
         if isinstance(item, ReplayedNativeItem):
             # Native items break the assistant segment and keep their exact
             # position; the payload builder re-emits them verbatim.
-            flush_segment()
+            flush_run()
             messages.append(GatewayMessage(role=item.role, provider_native_item=item.item))
+        elif isinstance(item, ReplayedMessage) and _is_instruction(item) and run:
+            run.append(item)
         elif isinstance(item, ReplayedMessage) and item.message.role != "assistant":
-            flush_segment()
+            flush_run()
             messages.append(item.message)
         elif isinstance(item, ReplayedFunctionOutput):
-            flush_segment()
+            flush_run()
             messages.append(
-                GatewayMessage(role="tool", content=item.output, tool_call_id=item.call_id)
+                GatewayMessage(
+                    role="tool",
+                    content=item.output,
+                    content_parts=item.content_parts,
+                    tool_call_id=item.call_id,
+                    provider_tool_name=item.name,
+                    provider_tool_namespace=item.namespace,
+                    provider_tool_caller=item.caller,
+                )
             )
         else:
-            segment.append(item)
-    flush_segment()
+            run.append(item)
+    flush_run()
     return tuple(messages)
+
+
+def _is_instruction(
+    item: ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall,
+) -> TypeGuard[ReplayedMessage]:
+    """Return whether a replayed item is a developer or system instruction message."""
+    return isinstance(item, ReplayedMessage) and item.message.role in {"developer", "system"}

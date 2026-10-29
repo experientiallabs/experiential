@@ -10,6 +10,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
+    ChoiceLogprobs,
+    ChoiceLogprobsDelta,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -18,14 +20,14 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
     GatewayUsage,
+    TokenLogprob,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.streaming import (
     ChatSseEncoder,
     ResponsesSseEncoder,
-    encode_chat_events,
-    encode_responses_events,
 )
+from exp.runtime.openai_protocol.streaming_support import encode_events
 
 _RAW_ARGUMENTS = '{ "city" : "Zürich" }'
 
@@ -95,7 +97,7 @@ def test_chat_sse_preserves_raw_arguments_stable_ids_usage_and_one_terminal() ->
         created_at=123,
         include_usage=True,
     )
-    frames = encode_chat_events(encoder, _tool_events())
+    frames = encode_events(encoder, _tool_events())
     payloads = tuple(_chat_payload(frame) for frame in frames if frame != "data: [DONE]\n\n")
     argument_parts: list[str] = []
     finish_reasons: list[str] = []
@@ -148,10 +150,10 @@ def test_responses_sse_emits_full_lifecycle_monotonic_sequence_and_exact_argumen
     encoder = ResponsesSseEncoder(
         request_id="request-one",
         model="coding",
-        created_at=123.0,
+        created_at=123,
         request=request,
     )
-    frames = encode_responses_events(encoder, _tool_events())
+    frames = encode_events(encoder, _tool_events())
     payloads = tuple(_responses_payload(frame) for frame in frames)
     event_types = tuple(str(payload["type"]) for payload in payloads)
     deltas = tuple(
@@ -187,7 +189,7 @@ def test_responses_sse_exposes_ignored_compatibility_parameters() -> None:
     encoder = ResponsesSseEncoder(
         request_id="request-ignored",
         model="coding",
-        created_at=123.0,
+        created_at=123,
         request=request,
     )
 
@@ -207,11 +209,11 @@ def test_responses_sse_preserves_reasoning_summary_items() -> None:
         reasoning_summary="concise",
         reasoning_summary_parameters=("reasoning.summary",),
     )
-    frames = encode_responses_events(
+    frames = encode_events(
         ResponsesSseEncoder(
             request_id="request-reasoning",
             model="coding",
-            created_at=123.0,
+            created_at=123,
             request=request,
         ),
         (
@@ -264,11 +266,11 @@ def test_responses_sse_exposes_provider_encrypted_reasoning_only_when_requested(
         stream=True,
         include_encrypted_reasoning=include_encrypted_reasoning,
     )
-    frames = encode_responses_events(
+    frames = encode_events(
         ResponsesSseEncoder(
             request_id="request-provider-encrypted",
             model="coding",
-            created_at=123.0,
+            created_at=123,
             request=request,
         ),
         (
@@ -305,11 +307,11 @@ def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal
         failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
         safe_message="Provider stream failed.",
     )
-    frames = encode_responses_events(
+    frames = encode_events(
         ResponsesSseEncoder(
             request_id="request-two",
             model="coding",
-            created_at=123.0,
+            created_at=123,
             request=request,
         ),
         (
@@ -337,3 +339,21 @@ def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal
     error = cast(JsonObject, response["error"])
     assert error["message"] == "Provider stream failed."
     assert "response.output_item.done" in {payload["type"] for payload in payloads}
+
+
+def test_chat_stream_projects_choice_logprobs_metadata_events() -> None:
+    """Emit typed probability observations as ordinary Chat choice fields."""
+    record = TokenLogprob(token="é", logprob=-0.25, bytes=(195, 169), top_logprobs=())
+    event = GatewayEvent(
+        kind=GatewayEventKind.CHOICE_LOGPROBS_DELTA,
+        sequence_number=0,
+        choice_logprobs_delta=ChoiceLogprobsDelta(
+            choice_index=0, logprobs=ChoiceLogprobs(content=(record,))
+        ),
+    )
+    encoder = ChatSseEncoder(
+        request_id="probabilities", model="coding", created_at=1, include_usage=False
+    )
+    encoder.start()
+    frame = json.loads(encoder.feed(event)[0].partition("data: ")[2])
+    assert frame["choices"][0]["logprobs"]["content"][0]["token"] == "é"

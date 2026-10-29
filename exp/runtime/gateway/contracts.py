@@ -2,28 +2,98 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, Sha256
 from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
     ImageContentPart,
+    MediaHandle,
     MessageContentPart,
     VideoContentPart,
     require_attachment_ceilings,
 )
 from exp.common.models.gateway_catalog import (
-    DeploymentId,
     ExactModelId,
     ExactModelPoolId,
-    FailoverMode,
 )
-from exp.common.models.model import ReasoningEffort, ToolCall
+from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
 from exp.common.routing.policy import SwitchOutcome
+from exp.runtime.gateway.client_apps import ClientAttribution
+from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
+from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock as EncryptedReasoningBlock
+from exp.runtime.gateway.reasoning_blocks import (
+    ExposedReasoningContentBlock as ExposedReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    OpaqueReasoningContentBlock as OpaqueReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import (
+    ProviderReasoningBlock as ProviderReasoningBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import RedactedThinkingBlock as RedactedThinkingBlock
+from exp.runtime.gateway.reasoning_blocks import (
+    SealedReasoningContentBlock as SealedReasoningContentBlock,
+)
+from exp.runtime.gateway.reasoning_blocks import ThinkingBlock as ThinkingBlock
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy, RequestedRouteId
+from exp.runtime.gateway.request_surface_fields import require_no_responses_only_fields
+from exp.runtime.gateway.sampling_extras import SamplingExtras
+from exp.runtime.gateway.service_tiers import (
+    GatewayServiceTierAdmission as GatewayServiceTierAdmission,
+)
+from exp.runtime.gateway.service_tiers import (
+    GatewayServiceTierSettlement as GatewayServiceTierSettlement,
+)
+from exp.runtime.gateway.stream_contracts import (
+    ChoiceLogprobs as ChoiceLogprobs,
+)
+from exp.runtime.gateway.stream_contracts import (
+    ChoiceLogprobsDelta as ChoiceLogprobsDelta,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayEvent as GatewayEvent,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayEventKind as GatewayEventKind,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayFailure as GatewayFailure,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayFailureClass as GatewayFailureClass,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayHeaderTimeout as GatewayHeaderTimeout,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayRefusalReason as GatewayRefusalReason,
+)
+from exp.runtime.gateway.stream_contracts import (
+    GatewayUsage as GatewayUsage,
+)
+from exp.runtime.gateway.stream_contracts import (
+    LogprobCandidate as LogprobCandidate,
+)
+from exp.runtime.gateway.stream_contracts import (
+    TokenLogprob as TokenLogprob,
+)
+from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
+from exp.runtime.gateway.tool_contracts import (
+    GatewayNamedToolChoice as GatewayNamedToolChoice,
+)
+from exp.runtime.gateway.tool_contracts import (
+    GatewayProviderNativeTool as GatewayProviderNativeTool,
+)
+from exp.runtime.gateway.tool_contracts import GatewayToolChoice, tool_choice_names
+from exp.runtime.gateway.tool_contracts import (
+    GatewayToolDefinition as GatewayToolDefinition,
+)
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch, gateway_tool_search_name
+from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
 
 GatewayAliasName = ArtifactId
 OrganizationId = ArtifactId
@@ -55,201 +125,60 @@ class ProjectTarget(ContractModel):
 GatewayTarget = Annotated[DirectTarget | ProjectTarget, Field(discriminator="kind")]
 
 
-class GatewayApiSurface(StrEnum):
-    """Public endpoint family used by one canonical request."""
-
-    CHAT_COMPLETIONS = "chat_completions"
-    RESPONSES = "responses"
-    MESSAGES = "messages"
-    EMBEDDINGS = "embeddings"
-    IMAGES = "images"
-
-
-class GatewayToolDefinition(ContractModel):
-    """One caller-defined function tool with its exact JSON Schema declaration.
-
-    The description bound is deliberately generous: both providers accept
-    40k-character tool descriptions live (verified 2026-08-30), and real
-    Claude Code toolsets exceeded the earlier 8k bound. The request-body
-    size cap remains the effective total limit.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=65_536)
-    parameters: JsonObject
-    strict: bool = False
-    cache_control: JsonObject | None = Field(default=None, exclude=True)
-    """Validated caller prompt-caching hint attached to this tool definition,
-    forwarded onto the native Anthropic tool block and dropped with
-    disclosure on other wires. Like ``ToolCall.cache_control``, a cache hint
-    changes cost, not semantics: it joins neither serialization nor replay
-    identity."""
-    eager_input_streaming: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic fine-grained tool-input streaming selector, sent
-    conditionally by Claude Code and accepted bare by the provider (verified
-    live 2026-08-30, no beta header). Excluded from serialization (tool
-    digests predate it); a present value joins replay identity through
-    :func:`canonical_request_sha256`, like every carrier below."""
-    defer_loading: bool | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic tool-search deferred-loading selector; the provider
-    owns the cross-tool validity rules (verified live 2026-08-30: ``false``
-    is a no-op and an all-deferred toolset is the provider's own 400)."""
-    allowed_callers: tuple[str, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic programmatic-tool-calling caller allowlist,
-    accepted bare by the provider even without a companion server tool
-    (verified live 2026-08-30), which stays the combination authority."""
-    input_examples: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
-    """Verbatim Anthropic example tool inputs.
-
-    Accepted bare by the provider (verified live 2026-08-30). Examples add
-    provider-visible prompt content, so a present value is excluded from
-    serialization and joins replay identity through
-    :func:`canonical_request_sha256`; reservation counts its bytes with the
-    rest of the replay envelope.
-    """
-
-    def has_anthropic_tool_carriers(self) -> bool:
-        """Whether any Anthropic-native tool carrier is present on this tool."""
-        return (
-            self.eager_input_streaming is not None
-            or self.defer_loading is not None
-            or self.allowed_callers is not None
-            or self.input_examples is not None
-        )
-
-
 class StructuredTextFormat(ContractModel):
     """A strict structured-text output schema requested by the caller."""
 
     name: str = Field(min_length=1, max_length=256)
-    description: str | None = Field(default=None, max_length=8_192)
+    description: str | None = Field(default=None, max_length=65_536)
     json_schema: JsonObject
     strict: bool = True
 
 
-class GatewayProviderNativeTool(ContractModel):
-    """One verbatim non-function OpenAI Responses tool declaration.
-
-    Codex ships ``custom`` (freeform grammar), ``namespace`` (nested tool tree),
-    ``web_search``, and ``tool_search`` declarations whose shapes exist on no
-    other wire; each is validated shallowly at decode and re-emitted byte-for-byte
-    on native Responses rungs only, with the provider owning the declaration's
-    internal shape (each type captured live from Codex 0.151.0 and accepted with
-    a plain API key, 2026-09-01). ``index`` is the declaration's position in the
-    caller's ``tools`` array so re-emission preserves the caller's interleaving.
-    """
-
-    index: int = Field(ge=0)
-    tool: JsonObject
-
-
-class GatewayNamedToolChoice(ContractModel):
-    """A request to require one named caller-defined function."""
-
-    name: str = Field(min_length=1, max_length=256)
-
-
-class ThinkingBlock(ContractModel):
-    """One verbatim Anthropic extended-thinking block from assistant history.
-
-    ``signature`` is an opaque cryptographic value the provider issued with
-    the block; it must round-trip byte-exact or the provider rejects the
-    replayed turn, so it is never normalized or re-encoded.
-    """
-
-    kind: Literal["thinking"] = "thinking"
-    text: str = ""
-    signature: str | None = None
-
-
-class RedactedThinkingBlock(ContractModel):
-    """One opaque Anthropic redacted-thinking block from assistant history."""
-
-    kind: Literal["redacted_thinking"] = "redacted_thinking"
-    data: str
-
-
-class EncryptedReasoningBlock(ContractModel):
-    """One opaque OpenAI Responses reasoning item replayed with the input.
-
-    ``encrypted_content`` is the provider-issued opaque payload a stateless
-    caller (``store: false``) replays so the model can resume its own prior
-    reasoning; it must reach the provider byte-exact.
-    """
-
-    kind: Literal["encrypted_reasoning"] = "encrypted_reasoning"
-    id: str = Field(min_length=1, max_length=256)
-    encrypted_content: str = Field(min_length=1)
-    output_index: int | None = Field(default=None, ge=0, exclude=True)
-    status: Literal["in_progress", "completed", "incomplete"] | None = Field(
-        default=None,
-        exclude=True,
-    )
-
-
-class OpaqueReasoningContentBlock(ContractModel):
-    """Authenticated Fireworks reasoning retained only inside the gateway.
-
-    The provider-issued text is never accepted directly from a caller. Public
-    decoding creates a sealed block, and admission replaces it with this
-    plaintext form only after authenticating the carrier against the exact
-    current deployment and credential authority.
-    """
-
-    kind: Literal["reasoning_content"] = "reasoning_content"
-    route_sha256: Sha256
-    content: str = Field(min_length=1, max_length=8 * 1024 * 1024)
-    carrier_size_bytes: int = Field(default=0, ge=0, exclude=True)
-
-
-class SealedReasoningContentBlock(ContractModel):
-    """One bounded, still-encrypted Fireworks continuation carrier."""
-
-    kind: Literal["sealed_reasoning_content"] = "sealed_reasoning_content"
-    carrier: str = Field(min_length=1)
-    deployment_hint: str = Field(min_length=1, max_length=256)
-
-
-ProviderReasoningBlock = Annotated[
-    ThinkingBlock
-    | RedactedThinkingBlock
-    | EncryptedReasoningBlock
-    | OpaqueReasoningContentBlock
-    | SealedReasoningContentBlock,
-    Field(discriminator="kind"),
-]
-
-
 class GatewayMessage(ContractModel):
-    """One canonical gateway message preserving developer and tool-call identity."""
+    """One canonical gateway message preserving developer and tool-call identity.
+
+    Attributes:
+        capture_only_reasoning: Caller-visible copies accompanying sealed replay.
+            Empty by default; excluded from serialization, provider dispatch and
+            replay authority. Only content capture consumes this evidence.
+        tool_references: Deferred tools this tool result loads, in caller order
+            (Anthropic ``tool_reference`` sub-blocks a client-side tool search
+            returns). Valid only on tool messages. Native Anthropic Messages
+            re-emits them as reference blocks after the result's own content;
+            every other wire states each one as text and keeps the tool's full
+            definition in the dispatched tools (``tool_references.py`` in the
+            provider package). Excluded from serialization so reference-free
+            digests are unperturbed; a present reference changes what the model
+            can call, so it joins replay identity through
+            :func:`canonical_request_sha256`.
+    """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | None = None
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
+    tool_call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     tool_calls: tuple[ToolCall, ...] = ()
+    capture_only_reasoning: tuple[ExposedReasoningContentBlock, ...] = Field(
+        default=(), exclude=True
+    )
     tool_is_error: bool = Field(default=False, exclude=True)
-    """Whether this tool result reports a failed tool invocation.
-
-    Only the Anthropic Messages surface can express it (``tool_result.is_error``),
-    and only the Anthropic upstream dialect can emit it back, so route
-    admission requires every waterfall rung to use that dialect. OpenAI-family
-    wires cannot represent the flag and are rejected instead of dropping it. Like
-    ``ToolCall.raw_arguments``, the field is deliberately excluded from model
-    serialization so request digests, replay identity, and immutable
-    artifacts are unaffected by it.
-    """
+    """Whether this tool result reports a failed invocation; retained outside serialization."""
+    tool_references: tuple[Annotated[str, Field(min_length=1, max_length=256)], ...] = Field(
+        default=(), exclude=True
+    )
+    provider_specific_fields: JsonObject | None = Field(default=None, exclude=True)
+    """LiteLLM's echoed per-message ``provider_specific_fields``: accepted so verbatim
+    replays keep working, dropped on every wire with a disclosure, excluded from
+    serialization like the other carried-but-never-forwarded message fields."""
     provider_reasoning: tuple[ProviderReasoningBlock, ...] = Field(default=(), exclude=True)
     """Ordered opaque provider-reasoning blocks carried on assistant turns.
 
-    Thinking and redacted-thinking blocks exist only on the Anthropic wire;
-    encrypted reasoning items exist only on the OpenAI Responses wire. Route
-    admission therefore requires every waterfall rung to speak the one
-    dialect that can replay them, mirroring ``tool_is_error``. Like that
-    flag, the carrier is excluded from model serialization so immutable
-    artifacts and carrier-free request digests are unperturbed; requests that
-    do carry it join replay identity through
-    :func:`canonical_request_sha256`, so a caller operation key reused with
-    different reasoning is a rejected conflict, never a silent replay.
+    Thinking blocks exist only on the Anthropic wire and encrypted reasoning
+    items only on OpenAI Responses, so route admission requires every rung to
+    speak the one dialect that can replay them (mirroring ``tool_is_error``).
+    Excluded from serialization; a present carrier joins replay identity, so a
+    reused operation key with different reasoning is a conflict, never a replay.
     """
     provider_item_id: str | None = Field(default=None, min_length=1, max_length=256, exclude=True)
     provider_output_index: int | None = Field(default=None, ge=0, exclude=True)
@@ -262,17 +191,72 @@ class GatewayMessage(ContractModel):
         exclude=True,
     )
     """OpenAI Responses assistant-message phase retained for exact replay."""
+    provider_tool_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude=True,
+    )
+    provider_tool_namespace: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        exclude=True,
+    )
+    """Tool-result attribution replayed on a Responses ``function_call_output``.
+
+    Codex serializes an optional ``name`` and ``namespace`` on the outputs of
+    namespaced tool calls; both re-emit verbatim on the rebuilt item
+    (mirroring ``ToolCall.provider_namespace`` on the call side) and are
+    excluded from serialization like the other replay carriers, joining
+    replay identity explicitly through :func:`canonical_request_sha256`.
+    ``provider_tool_name`` also carries the Chat surface's legacy
+    ``role: "tool"`` ``name`` (the old ``role: "function"`` attribution many
+    agent frameworks still send; the provider serves it, probed live
+    2026-09-05), re-emitted on both OpenAI wires and dropped with disclosure
+    elsewhere.
+    """
+    provider_tool_caller: JsonObject | None = Field(default=None, exclude=True)
+    """Opaque SDK 3.0 ``caller`` attribution on a ``function_call_output``.
+
+    Programmatic tool calling attributes the result to the program that
+    invoked the call; the object's internal shape is an evolving provider
+    surface, so it is validated only as an object and re-emitted verbatim on
+    the rebuilt item (mirroring ``ToolCall.provider_caller`` on the call
+    side). Excluded from serialization like the other replay carriers,
+    joining replay identity explicitly through
+    :func:`canonical_request_sha256`.
+    """
     provider_native_item: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim OpenAI Responses input item the gateway carries opaquely.
 
     Codex ships tool definitions and freeform tool history as native input
     items (``additional_tools``, ``custom_tool_call``,
-    ``custom_tool_call_output``) whose shapes cannot be expressed on any
-    other wire; the item is validated shallowly at decode and re-emitted
-    byte-for-byte at its position on native Responses rungs only. A message
-    carrying it carries nothing else. Excluded from serialization like the
-    other carriers so item-free digests are unperturbed; a present item
-    joins replay identity through :func:`canonical_request_sha256`.
+    ``custom_tool_call_output``), and hosted-tool turns echo their
+    provider-executed items (``web_search_call``, ``mcp_call``,
+    ``code_interpreter_call``, their outputs, ...); every such shape exists
+    on no other wire, so the item is validated shallowly at decode and
+    re-emitted byte-for-byte at its position on native Responses rungs only.
+    A message carrying it carries nothing else. Excluded from serialization
+    like the other carriers so item-free digests are unperturbed; a present
+    item joins replay identity through :func:`canonical_request_sha256`.
+    """
+    provider_anthropic_blocks: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
+    """The caller's assistant content blocks in their ORIGINAL order, when a
+    thinking block is among them.
+
+    The flattened fields (``content``, ``tool_calls``, ``provider_reasoning``)
+    lose the order of blocks within one assistant turn; the Anthropic wire
+    re-emits them as thinking, then text, then tool_use. With interleaved
+    thinking a turn is [thinking, tool_use, thinking, text, tool_use ...], and
+    Anthropic verifies the LATEST assistant message byte-for-byte against the
+    signatures it issued: a reordered turn is refused as "thinking or
+    redacted_thinking blocks in the latest assistant message cannot be
+    modified" (134 requests / 48h on one Messages-surface client,
+    2026-09-07). The Anthropic wire replays these verbatim when they are
+    present and the flattened reasoning was not narrowed; every other wire
+    keeps reading the flattened fields. Excluded from serialization like the
+    other carriers.
     """
     provider_anthropic_block: JsonObject | None = Field(default=None, exclude=True)
     """One verbatim Anthropic content block the gateway carries opaquely.
@@ -299,8 +283,7 @@ class GatewayMessage(ContractModel):
     the blocks' concatenated text equals ``content`` exactly and Anthropic
     rungs re-emit them verbatim; other wires keep the flattened string and
     disclose the dropped markers. A cache hint changes cost, not semantics,
-    so like the other cache carriers this joins neither serialization nor
-    replay identity.
+    so like the other cache carriers this joins neither serialization nor replay identity.
     """
     content_parts: tuple[MessageContentPart, ...] = ()
     """Ordered caller content parts for a message that carries attachments.
@@ -362,7 +345,7 @@ class GatewayMessage(ContractModel):
             raise ValueError("gateway messages need content, tool calls, or reasoning blocks")
         if self.role != "assistant" and self.tool_calls:
             raise ValueError("tool_calls are valid only for assistant messages")
-        if self.role != "assistant" and self.provider_reasoning:
+        if self.role != "assistant" and (self.provider_reasoning or self.capture_only_reasoning):
             raise ValueError("provider reasoning blocks are valid only for assistant messages")
         if self.role != "assistant" and (
             self.provider_item_id is not None
@@ -384,8 +367,16 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool messages require tool_call_id")
         if self.role != "tool" and self.tool_call_id is not None:
             raise ValueError("tool_call_id is valid only for tool messages")
+        if self.role != "tool" and (
+            self.provider_tool_name is not None
+            or self.provider_tool_namespace is not None
+            or self.provider_tool_caller is not None
+        ):
+            raise ValueError("tool-result attribution is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:
             raise ValueError("tool_is_error is valid only for tool messages")
+        if self.role != "tool" and self.tool_references:
+            raise ValueError("tool_references are valid only for tool messages")
         if self.cache_control is not None and self.role != "tool":
             raise ValueError("message cache_control is valid only for tool messages")
         if self.provider_text_blocks:
@@ -398,10 +389,21 @@ class GatewayMessage(ContractModel):
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
         if self.content_parts:
-            if self.role != "user":
-                raise ValueError("content parts are valid only for user messages")
+            # Retain tool screenshots and generated assistant images as caller-owned history.
+            if self.role not in ("user", "tool", "assistant"):
+                raise ValueError(
+                    "content parts are valid only for user, tool, and assistant messages"
+                )
             if all(part.kind == "text" for part in self.content_parts):
                 raise ValueError("content parts are retained only for multimodal messages")
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image", "document") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text, image, and document parts")
+            if self.role == "assistant" and any(
+                part.kind not in ("text", "image") for part in self.content_parts
+            ):
+                raise ValueError("assistant messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -422,16 +424,50 @@ class GatewayMessage(ContractModel):
         """Return this message's retained document parts in caller order."""
         return tuple(part for part in self.content_parts if part.kind == "document")
 
+    def folded_tool_error_content(self) -> str:
+        """Return this tool result's text with ``tool_is_error`` folded in.
+
+        Only the Anthropic wire has a native ``tool_result.is_error`` field;
+        every other wire re-states the flag in the one channel it has (the
+        result text, prefixed with :data:`TOOL_ERROR_TEXT_PREFIX`) so the
+        model still learns the invocation failed. The fold derives from the
+        canonical flag on each request, never from previously folded text, so
+        a replayed history can never accumulate prefixes.
+        """
+        content = self.content or ""
+        if self.tool_is_error:
+            return f"{TOOL_ERROR_TEXT_PREFIX}{content}"
+        return content
+
+
+TOOL_ERROR_TEXT_PREFIX = "[tool error] "
+"""Prefix folding Anthropic's ``tool_result.is_error`` into plain result text
+on wires without a native error flag (see
+:meth:`GatewayMessage.folded_tool_error_content`)."""
+
 
 class GatewayRequest(ContractModel):
-    """Lossless canonical request shared by protocol and provider implementations."""
+    """Lossless canonical request shared by protocol and provider implementations.
+
+    Attributes:
+        include_output_text_logprobs: Responses probability selector (default false).
+        include_web_search_sources: Responses web search sources selector (default false).
+        top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
+        thinking_budget: Optional strict numeric Chat control, at least -1; provider validation
+            defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
+        reasoning_effort_parameter: Optional exact caller spelling of the effort control;
+            omission uses the surface default when reporting unsupported parameters.
+        gateway: Optional request routing/retry policy; excluded from provider serialization.
+    """
 
     surface: GatewayApiSurface
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
     tools: tuple[GatewayToolDefinition, ...] = ()
-    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
+    tool_choice: GatewayToolChoice = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
+    json_object_output: bool = Field(default=False, exclude=True)
+    # Native JSON mode or disclosed instruction; enabled mode joins replay identity.
     maximum_output_tokens: int | None = Field(default=None, gt=0)
     maximum_output_tokens_parameter: (
         Literal["max_tokens", "max_completion_tokens", "max_output_tokens"] | None
@@ -443,23 +479,33 @@ class GatewayRequest(ContractModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
-    logprobs: bool | None = None
-    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+    sampling_extras: SamplingExtras | None = Field(default=None, exclude=True)
+    """OpenRouter's ``repetition_penalty`` / ``min_p`` / ``top_a``, forwarded per rung.
+
+    Excluded from serialization so extra-free digests are unchanged; a present
+    value joins replay identity through ``canonical_request_sha256``."""
+    logprobs: StrictBool | None = None
+    top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
+    include_output_text_logprobs: bool = Field(default=False, exclude=True)
+    include_web_search_sources: bool = Field(default=False, exclude=True)
     reasoning_effort: ReasoningEffort | None = None
+    reasoning_effort_parameter: (
+        Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
+    ) = Field(default=None, exclude=True)
+    # Level-less enable-thinking; the route seam resolves the concrete effort.
+    thinking_budget: int | None = Field(default=None, ge=-1, strict=True, exclude=True)
+    thinking_default_enable: bool = False
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[
         Literal["reasoning.generate_summary", "reasoning.summary"], ...
     ] = Field(default=(), exclude=True)
     """Exact caller selector paths normalized into ``reasoning_summary``."""
     provider_thinking_config: JsonObject | None = Field(default=None, exclude=True)
-    """Verbatim caller ``thinking`` configuration from the Messages surface.
+    """Verbatim caller ``thinking`` configuration from Messages or budgeted Chat.
 
-    The object is opaque to the gateway: it is validated against the closed
-    wire profile at decode time and then forwarded byte-for-byte to the
-    Anthropic upstream, overriding the catalog's adaptive default. Excluded
-    from serialization like the other Anthropic-only carriers so
-    config-free digests are unperturbed; a present config joins replay
-    identity through :func:`canonical_request_sha256`.
+    Validated at decode and route admission. Numeric values survive translation
+    to qualified native wires; other config fields require verbatim support.
+    Excluded from serialization; joins :func:`canonical_request_sha256`.
     """
     context_management: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``context_management`` from the Messages surface.
@@ -476,24 +522,21 @@ class GatewayRequest(ContractModel):
     diagnostics: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``diagnostics`` from the Messages surface.
 
-    Anthropic's diagnostics-correlation object (Claude Code sends
-    ``{"previous_message_id": ...}`` conditionally). Validated only as an
-    object and forwarded byte-for-byte with the required beta header on
-    Anthropic rungs, dropped with disclosure elsewhere; the shape is an
-    evolving provider beta, so validation stays shallow. Excluded from
-    serialization; a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Anthropic's diagnostics-correlation object (Claude Code sends ``{"previous_message_id":
+    ...}`` conditionally), validated only as an object (an evolving provider beta) and
+    forwarded byte-for-byte with its beta header on Anthropic rungs, dropped with disclosure
+    elsewhere. Excluded from serialization; a present value joins replay identity.
     """
+    safeguards: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
+    """Verbatim Claude Code auto-mode ``safeguards`` (Messages only): sent on
+    Anthropic rungs, silently omitted elsewhere; joins replay identity."""
     speed: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``speed`` selector from the Messages surface.
 
-    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted
-    live behind its beta header, 2026-08-30). Bounded but deliberately not
-    enumerated: the value set is an evolving provider surface. Forwarded
-    with the required beta header on Anthropic rungs and dropped with
-    disclosure elsewhere. Fast-mode output is provider-priced at a premium,
-    so a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted live behind its
+    beta header, 2026-08-30), bounded but not enumerated (an evolving provider surface).
+    Forwarded with its beta header on Anthropic rungs, dropped with disclosure elsewhere.
+    Fast-mode output is priced at a premium, so a present value joins replay identity.
     """
     provider_cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller top-level ``cache_control`` from the Messages surface.
@@ -508,12 +551,10 @@ class GatewayRequest(ContractModel):
     inference_geo: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``inference_geo`` selector from the Messages surface.
 
-    Anthropic's inference-region selector (accepted bare, verified live
-    2026-08-30). Bounded but deliberately not enumerated: the region set is
-    an evolving provider surface. Forwarded verbatim on Anthropic rungs and
-    dropped with disclosure elsewhere. Where inference runs is a
-    caller-visible processing commitment, so a present value joins replay
-    identity through :func:`canonical_request_sha256`.
+    Anthropic's inference-region selector (accepted bare, verified live 2026-08-30), bounded
+    but not enumerated (an evolving provider surface). Forwarded verbatim on Anthropic rungs,
+    dropped with disclosure elsewhere. Where inference runs is a caller-visible processing
+    commitment, so a present value joins replay identity (:func:`canonical_request_sha256`).
     """
     provider_beta_tokens: tuple[str, ...] = Field(default=(), exclude=True)
     """Allowlisted caller ``anthropic-beta`` tokens from the Messages surface.
@@ -547,7 +588,11 @@ class GatewayRequest(ContractModel):
     :func:`canonical_request_sha256`.
     """
     text_verbosity: Literal["low", "medium", "high"] | None = None
-    """Caller ``text.verbosity`` selector from the Responses surface."""
+    """Caller output-length hint: Responses ``text.verbosity`` or Chat ``verbosity``.
+
+    One canonical carrier for both spellings; the surface decides which public
+    path a drop disclosure names.
+    """
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.
 
@@ -560,49 +605,93 @@ class GatewayRequest(ContractModel):
     provider_output_config: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``output_config`` from the Messages surface.
 
-    Anthropic's native output configuration (Claude Code sends
-    ``{"effort": ...}`` by default). A canonical ``effort`` value also maps
-    into ``reasoning_effort`` so the shared effort machinery applies; the
-    raw object forwards byte-for-byte on Anthropic rungs with caller keys
-    winning over engine-derived ones. Excluded from serialization like the
-    other Anthropic-only carriers; a present value joins replay identity
-    through :func:`canonical_request_sha256`.
+    Anthropic's native output configuration (Claude Code sends ``{"effort":
+    ...}``); a canonical ``effort`` also maps into ``reasoning_effort``. The
+    raw object forwards byte-for-byte on Anthropic rungs, caller keys winning.
+    Excluded from serialization like the other Anthropic-only carriers; a
+    present value joins replay identity through :func:`canonical_request_sha256`.
     """
     provider_native_tools: tuple[GatewayProviderNativeTool, ...] = Field(default=(), exclude=True)
-    """Verbatim non-function OpenAI Responses tool declarations.
-
-    See :class:`GatewayProviderNativeTool`. Rungs that are not native
-    Responses cannot serve these, so route admission rejects by name instead
-    of silently dropping a capability the caller asked for. Excluded from
-    serialization like the other carriers so declaration-free digests are
-    unperturbed; present entries join replay identity through
-    :func:`canonical_request_sha256`.
-    """
+    """Verbatim non-function OpenAI Responses tool declarations (see
+    :class:`GatewayProviderNativeTool`); excluded, join replay identity when present."""
+    native_tool_translation: dict[str, tuple[str, str | None, bool]] | None = Field(
+        default=None, exclude=True
+    )
+    """Provider-only reverse map for translated Codex native tools; not in replay identity."""
     provider_server_tools: tuple[JsonObject, ...] = Field(default=(), exclude=True)
     """Verbatim Anthropic server-tool entries from the Messages ``tools`` array.
 
-    Server tools (``web_search_20250305``-style typed entries with no
-    ``input_schema``) execute at the provider; their per-type configuration
-    is an evolving provider surface, so each entry is validated shallowly at
-    decode and re-emitted byte-for-byte AFTER the converted custom tools on
-    native Anthropic rungs only (an accepted ordering deviation from the
-    caller's interleaving). Other rungs cannot execute them, so route
-    admission rejects by name instead of silently dropping a capability the
-    caller asked for. Excluded from serialization like the other carriers so
-    server-tool-free digests are unperturbed; present entries join replay
-    identity through :func:`canonical_request_sha256`.
+    Typed entries with no ``input_schema`` execute at the provider; validated
+    shallowly at decode, re-emitted byte-for-byte AFTER the converted custom tools
+    on native Anthropic rungs only (other rungs reject by name). Excluded from
+    serialization; present entries join replay identity (``canonical_request_sha256``).
     """
+    web_search: GatewayWebSearch | None = Field(default=None, exclude=True)
+    """The caller's normalized pre-answer web-search request (any spelling); excluded
+    from serialization, joins replay identity when present. See ``web_search.plan``."""
+    tool_search: GatewayToolSearch | None = Field(default=None, exclude=True)
+    """The caller's normalized tool-search declaration (any spelling); excluded from
+    serialization, joins replay identity when present. See ``tool_search.plan``."""
+    # `provider: {"zdr": true}`: the caller demanded ZDR routing. Tightening
+    # only: the host applies its require_zdr posture filter to this request and
+    # refuses with the same 403 when no rung qualifies. Part of identity.
+    zdr_requested: bool = False
+    # Verbatim caller `provider` object: forwarded to OpenRouter rungs (tightened
+    # when the rung is constrained), dropped on every other wire.
+    provider_preferences: JsonObject | None = Field(default=None, exclude=True)
+    gateway: GatewayRequestPolicy | None = Field(default=None, exclude=True)
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
     # End-user attribution / cache hints from the OpenAI request. Captured for
-    # gateway-side attribution and never forwarded to the model. `safety_identifier`
+    # gateway-side attribution and never forwarded verbatim. `safety_identifier`
     # is the current stable end-user identifier; `user` its deprecated predecessor;
-    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity).
+    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity) that
+    # reaches the provider only as the namespaced `provider_prompt_cache_key`.
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    provider_prompt_cache_key: str | None = Field(default=None, max_length=128, exclude=True)
+    """Tenant-namespaced cache-affinity key dispatched to rungs that route by it.
+
+    Derived at admission (``prompt_cache_affinity.provider_prompt_cache_key``)
+    from the caller's ``prompt_cache_key`` or, absent one, from the
+    conversation stem (the leading system/developer messages, else the first
+    user turn), so every request sharing a cacheable prefix lands on the
+    provider cache node that holds it while the caller's raw key never leaves
+    the gateway. Excluded from serialization: it is routing state, never request identity.
+    """
+    provider_session_id: str | None = Field(default=None, max_length=128, exclude=True)
+    """Tenant-namespaced per-conversation id for providers that pin by session.
+
+    Derived at admission (``prompt_cache_affinity.provider_session_id``) from
+    the caller's ``prompt_cache_key`` or the conversation's opening, and sent
+    only as Novita's ``x-session-id``. Routing state, never request identity.
+    """
+    prompt_cache_ttl: Literal["12h"] | None = Field(default=None, exclude=True)
+    """OpenAI's 12-hour minimum prompt-cache lifetime (Responses ``prompt_cache_options.ttl``).
+
+    Routed only to rungs declaring ``supports_prompt_cache_ttl_12h`` and refused when none
+    does. Like ``provider_cache_control`` it changes cache-write cost, never semantics, so
+    it joins neither serialization nor replay identity."""
+    prompt_cache_mode: Literal["explicit"] | None = Field(default=None, exclude=True)
+    """OpenAI's ``prompt_cache_options.mode: "explicit"`` (both OpenAI surfaces).
+
+    Turns the provider's implicit breakpoint off so only content blocks marked with
+    ``prompt_cache_breakpoint`` are cached (none marked: nothing is written). Sent only on
+    rungs whose wire carries OpenAI's prompt-cache options; the Anthropic and Bedrock wires
+    already cache only at markers, every other wire drops it with disclosure. ``"implicit"``
+    is the provider default and is never carried. Cost, not semantics: it joins neither
+    serialization nor replay identity."""
+    prompt_cache_breakpoints: bool = Field(default=False, exclude=True)
+    """Whether the caller marked content blocks with OpenAI's ``prompt_cache_breakpoint``.
+
+    Each marker rides the canonical cache carriers as an ephemeral ``cache_control``,
+    so Anthropic and Bedrock rungs cache at the same boundary (their default lifetime).
+    This flag tells OpenAI-wire rungs that carry the field to re-emit those boundaries
+    as ``prompt_cache_breakpoint`` (``{"mode": "explicit"}``, inheriting the request
+    lifetime) and keeps every disclosure in the caller's spelling. Never identity."""
     service_tier: str | None = Field(default=None, max_length=64, exclude=True)
     """Caller provider processing tier, forwarded only on BYOK OpenAI-family
     rungs (routing and billing rules live at streaming_requests and
@@ -611,6 +700,10 @@ class GatewayRequest(ContractModel):
     :func:`canonical_request_sha256`: the same body at a different tier is a
     different provider price and schedule."""
     ignored_parameters: tuple[str, ...] = Field(default=(), exclude=True)
+    """The caller sent ``parallel_tool_calls: false`` and at least one admitted
+    rung has no such wire control: the data plane serializes those rungs' tool
+    calls to one per turn instead. Disclosed through ``ignored_parameters``."""
+    serialize_tool_calls: bool = Field(default=False, exclude=True)
     """Disclosed compatibility decisions applied to this request.
 
     A plain field path names a control accepted but intentionally omitted
@@ -657,6 +750,17 @@ class GatewayRequest(ContractModel):
         """Return every document this request carries, in message and part order."""
         return tuple(part for message in self.messages for part in message.documents)
 
+    @property
+    def media_handles(self) -> tuple[MediaHandle, ...]:
+        """Return every provider media handle this request carries, in caller order."""
+        return tuple(
+            part.handle
+            for message in self.messages
+            for part in message.content_parts
+            if isinstance(part, (ImageContentPart, VideoContentPart, DocumentContentPart))
+            and part.handle is not None
+        )
+
     @field_validator("stop")
     @classmethod
     def _require_unique_stop_sequences(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -677,6 +781,28 @@ class GatewayRequest(ContractModel):
             raise ValueError("stop sequences must not repeat")
         return value
 
+    @property
+    def caller_effort_parameter(
+        self,
+    ) -> Literal["reasoning_effort", "reasoning.effort", "output_config.effort"]:
+        """The public field an unservable effort is rejected under.
+
+        The recorded caller field when the decoder knows it; otherwise the
+        surface's one effort field. The name matters: Claude Code carries its
+        effort as Messages ``output_config.effort`` and auto-recovers (drops
+        the field and retries) only when the 400 names that channel, so naming
+        a translated internal field wedges every turn instead.
+        """
+        if self.reasoning_effort_parameter is not None:
+            return self.reasoning_effort_parameter
+        match self.surface:
+            case GatewayApiSurface.RESPONSES:
+                return "reasoning.effort"
+            case GatewayApiSurface.MESSAGES:
+                return "output_config.effort"
+            case _:
+                return "reasoning_effort"
+
     @model_validator(mode="after")
     def _require_coherent_tools(self) -> GatewayRequest:
         """Require named and required tool choices to reference available tools.
@@ -695,33 +821,43 @@ class GatewayRequest(ContractModel):
         server_names = tuple(
             str(entry["name"]) for entry in self.provider_server_tools if "name" in entry
         )
-        if (
-            isinstance(self.tool_choice, GatewayNamedToolChoice)
-            and self.tool_choice.name not in names
-            and self.tool_choice.name not in server_names
-        ):
+        if self.tool_search is not None and any(tool.defer_loading for tool in self.tools):
+            server_names = (*server_names, gateway_tool_search_name(names))
+        choice_names = tool_choice_names(self.tool_choice)
+        if any(name not in names and name not in server_names for name in choice_names):
             raise ValueError("named gateway tool choice must name a request tool")
+        if len(set(choice_names)) != len(choice_names):
+            raise ValueError("allowed gateway tool names must not repeat")
         has_tools = bool(self.tools or self.provider_server_tools or self.provider_native_tools)
         if self.tool_choice == "required" and not has_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
         if self.include_usage and not self.stream:
             raise ValueError("include_usage is valid only for streaming requests")
+        if self.json_object_output and self.structured_text is not None:
+            raise ValueError("json_object_output and structured_text are mutually exclusive")
+        if self.json_object_output and self.surface not in ("chat_completions", "responses"):
+            raise ValueError("json_object_output is valid only for Chat and Responses requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
-        if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("reasoning_summary is valid only for Responses requests")
-        if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("response_store is valid only for Responses requests")
-        if self.include_encrypted_reasoning and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
-        if self.reasoning_context is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("reasoning_context is valid only for Responses requests")
-        if self.provider_thinking_config is not None and self.surface != GatewayApiSurface.MESSAGES:
-            raise ValueError("provider_thinking_config is valid only for Messages requests")
+        if len({handle.provider for handle in self.media_handles}) > 1:
+            raise ValueError(
+                "media handles in one request must all name the same provider; "
+                "no single route can resolve handles from two providers"
+            )
+        if self.surface != GatewayApiSurface.RESPONSES:
+            require_no_responses_only_fields(self)
+        if self.provider_thinking_config is not None and self.surface not in {
+            GatewayApiSurface.MESSAGES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("provider_thinking_config is valid only for Messages or Chat requests")
         if self.provider_output_config is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_output_config is valid only for Messages requests")
-        if self.text_verbosity is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("text_verbosity is valid only for Responses requests")
+        if self.text_verbosity is not None and self.surface not in {
+            GatewayApiSurface.RESPONSES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("text_verbosity is valid only for Responses and Chat requests")
         if self.client_metadata is not None and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("client_metadata is valid only for Responses requests")
         if self.context_management is not None and self.surface != GatewayApiSurface.MESSAGES:
@@ -730,12 +866,21 @@ class GatewayRequest(ContractModel):
             raise ValueError("diagnostics is valid only for Messages requests")
         if self.speed is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("speed is valid only for Messages requests")
+        if self.safeguards is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("safeguards is valid only for Messages requests")
         if self.provider_cache_control is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_cache_control is valid only for Messages requests")
         if self.inference_geo is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("inference_geo is valid only for Messages requests")
         if (
-            any(tool.has_anthropic_tool_carriers() for tool in self.tools)
+            # defer_loading is also OpenAI's and OpenRouter's marker, so it is
+            # valid on every surface; the other carriers stay Anthropic-only.
+            any(
+                tool.eager_input_streaming is not None
+                or tool.allowed_callers is not None
+                or tool.input_examples is not None
+                for tool in self.tools
+            )
             and self.surface != GatewayApiSurface.MESSAGES
         ):
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
@@ -745,8 +890,11 @@ class GatewayRequest(ContractModel):
             raise ValueError("service_tier is not valid for Messages requests")
         if self.provider_server_tools and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_server_tools are valid only for Messages requests")
-        if self.provider_native_tools and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("provider_native_tools are valid only for Responses requests")
+        if self.provider_native_tools and self.surface not in {
+            GatewayApiSurface.RESPONSES,
+            GatewayApiSurface.CHAT_COMPLETIONS,
+        }:
+            raise ValueError("provider_native_tools are valid only for Responses and Chat requests")
         if self.provider_native_tools:
             # Positions must tile one tools array with the converted function
             # tools exactly, so native re-emission is total by construction.
@@ -768,189 +916,6 @@ class GatewayRequest(ContractModel):
         return self
 
 
-class GatewayUsage(ContractModel):
-    """Normalized token counts and invoked tool names from one provider attempt.
-
-    Cached-input and reasoning counts are subsets of the total input and output counts when
-    present. They identify differently priced portions of those totals and must not be added a
-    second time by callers.
-
-    A terminal event may carry only ``tool_names`` when the provider omits token usage. In that
-    case both token totals remain unknown instead of being represented as zero.
-    """
-
-    input_tokens: int | None = Field(default=None, ge=0)
-    output_tokens: int | None = Field(default=None, ge=0)
-    cached_input_tokens: int | None = Field(default=None, ge=0)
-    cache_creation_input_tokens: int | None = Field(default=None, ge=0)
-    """Cache-write tokens inside the input total (Anthropic-only today),
-    present only when the provider reported a nonzero count; billing keeps
-    using the folded input total."""
-    reasoning_tokens: int | None = Field(default=None, ge=0)
-    tool_names: tuple[str, ...] = ()
-    """Invoked tool names in first-use order, names only and never arguments."""
-
-    @model_validator(mode="after")
-    def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
-        """Require complete token totals unless this is tool-only terminal metadata."""
-        totals = (self.input_tokens, self.output_tokens)
-        if (totals[0] is None) != (totals[1] is None):
-            raise ValueError("input and output token counts must be reported together")
-        if totals[0] is None:
-            if (
-                self.cached_input_tokens is not None
-                or self.cache_creation_input_tokens is not None
-                or self.reasoning_tokens is not None
-            ):
-                raise ValueError("token detail counts require input and output totals")
-            if not self.tool_names:
-                raise ValueError("usage requires token totals or invoked tool names")
-        return self
-
-    @property
-    def has_token_counts(self) -> bool:
-        """Return whether both provider token totals are known."""
-        return self.input_tokens is not None and self.output_tokens is not None
-
-
-class GatewayEventKind(StrEnum):
-    """Provider-neutral semantic and terminal stream event categories."""
-
-    TEXT_DELTA = "text_delta"
-    REFUSAL_DELTA = "refusal_delta"
-    REASONING_SUMMARY_DELTA = "reasoning_summary_delta"
-    THINKING_DELTA = "thinking_delta"
-    THINKING_SIGNATURE = "thinking_signature"
-    REDACTED_THINKING = "redacted_thinking"
-    ENCRYPTED_REASONING = "encrypted_reasoning"
-    TOOL_CALL_STARTED = "tool_call_started"
-    TOOL_ARGUMENTS_DELTA = "tool_arguments_delta"
-    TOOL_CALL_COMPLETED = "tool_call_completed"
-    USAGE = "usage"
-    COMPLETED = "completed"
-    INCOMPLETE = "incomplete"
-    FAILED = "failed"
-
-
-class GatewayEvent(ContractModel):
-    """One ordered provider-neutral stream event, including raw tool fragments."""
-
-    kind: GatewayEventKind
-    sequence_number: int = Field(ge=0)
-    text_delta: str | None = None
-    reasoning_summary_output_index: int | None = Field(default=None, ge=0)
-    reasoning_summary_index: int | None = Field(default=None, ge=0)
-    reasoning_item_id: str | None = Field(default=None, min_length=1, max_length=256)
-    reasoning_block_index: int | None = Field(default=None, ge=0)
-    """Provider content-block (or output-item) index grouping reasoning events."""
-    thinking_signature: str | None = None
-    redacted_thinking_data: str | None = None
-    encrypted_content: str | None = None
-    tool_call_index: int | None = Field(default=None, ge=0)
-    tool_call_id: str | None = Field(default=None, min_length=1, max_length=256)
-    tool_name: str | None = Field(default=None, min_length=1, max_length=256)
-    raw_arguments_delta: str | None = None
-    tool_call: ToolCall | None = None
-    usage: GatewayUsage | None = None
-    failure: GatewayFailure | None = None
-
-    @model_validator(mode="after")
-    def _require_event_payload(self) -> GatewayEvent:
-        """Require each event kind to carry its one relevant payload.
-
-        Returns:
-            The validated stream event.
-
-        Raises:
-            ValueError: The selected event kind lacks its required payload.
-        """
-        if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
-            if self.text_delta is None:
-                raise ValueError("text and refusal deltas require text_delta")
-        elif self.kind == GatewayEventKind.REASONING_SUMMARY_DELTA:
-            if (
-                self.text_delta is None
-                or self.reasoning_summary_output_index is None
-                or self.reasoning_summary_index is None
-                or self.reasoning_item_id is None
-            ):
-                raise ValueError("reasoning summary deltas require item, output, summary, and text")
-        elif self.kind == GatewayEventKind.THINKING_DELTA:
-            if self.text_delta is None or self.reasoning_block_index is None:
-                raise ValueError("thinking deltas require block index and text")
-        elif self.kind == GatewayEventKind.THINKING_SIGNATURE:
-            if self.thinking_signature is None or self.reasoning_block_index is None:
-                raise ValueError("thinking signatures require block index and signature")
-        elif self.kind == GatewayEventKind.REDACTED_THINKING:
-            if self.redacted_thinking_data is None or self.reasoning_block_index is None:
-                raise ValueError("redacted thinking requires block index and data")
-        elif self.kind == GatewayEventKind.ENCRYPTED_REASONING:
-            if (
-                self.encrypted_content is None
-                or self.reasoning_block_index is None
-                or self.reasoning_item_id is None
-            ):
-                raise ValueError("encrypted reasoning requires item, block index, and content")
-        elif self.kind == GatewayEventKind.TOOL_CALL_STARTED:
-            if self.tool_call_index is None or self.tool_call_id is None or self.tool_name is None:
-                raise ValueError("tool-call start requires index, ID, and name")
-        elif self.kind == GatewayEventKind.TOOL_ARGUMENTS_DELTA:
-            if self.tool_call_index is None or self.raw_arguments_delta is None:
-                raise ValueError("tool argument delta requires index and raw fragment")
-        elif self.kind == GatewayEventKind.TOOL_CALL_COMPLETED and self.tool_call is None:
-            raise ValueError("tool-call completion requires the complete tool call")
-        elif self.kind == GatewayEventKind.USAGE:
-            if self.usage is None or not self.usage.has_token_counts:
-                raise ValueError("usage event requires complete normalized token usage")
-        elif self.kind == GatewayEventKind.FAILED and self.failure is None:
-            raise ValueError("failed event requires a normalized failure")
-        return self
-
-
-class GatewayFailureClass(StrEnum):
-    """Stable failure classes shared by provider execution and the public protocol."""
-
-    INVALID_REQUEST = "invalid_request"
-    UNSUPPORTED_CAPABILITY = "unsupported_capability"
-    AUTHENTICATION = "authentication"
-    AUTHORIZATION = "authorization"
-    QUOTA_EXCEEDED = "quota_exceeded"
-    THROTTLED = "throttled"
-    TRANSPORT = "transport"
-    TIMEOUT = "timeout"
-    PROVIDER_AUTHENTICATION = "provider_authentication"
-    PROVIDER_NOT_FOUND = "provider_not_found"
-    # The provider ACCOUNT cannot pay for the request (trial quota exhausted,
-    # billing not enabled): operator-actionable deadness that fails over in
-    # every mode. Distinct from QUOTA_EXCEEDED, the CALLER's gateway credit.
-    PROVIDER_QUOTA = "provider_quota"
-    REFUSAL = "refusal"
-    MALFORMED_RESPONSE = "malformed_response"
-    PROVIDER_INTERNAL = "provider_internal"
-    CANCELLED = "cancelled"
-    GUARDRAIL = "guardrail"
-    INTERNAL = "internal"
-    # A transient control-plane condition (a rolling deploy building the
-    # authorized catalog revision) that the caller should simply retry. Unlike
-    # INTERNAL it is not a bug signal and does not page; unlike a provider class
-    # it never opens a deployment circuit.
-    UNAVAILABLE = "unavailable"
-
-
-class GatewayFailure(ContractModel):
-    """Sanitized failure with retry and failover eligibility already classified."""
-
-    failure_class: GatewayFailureClass
-    safe_message: str = Field(min_length=1, max_length=2_048)
-    retryable_same_deployment: bool = False
-    failover_eligible: bool = False
-    safe_details: JsonObject = Field(default_factory=dict)
-    rejected_parameter: str | None = Field(default=None, min_length=1, max_length=128)
-    """Validated provider-named parameter path; never provider prose."""
-    provider_detail: str | None = Field(default=None, min_length=1, max_length=240)
-    """Provider explanation of a client error, relayed only for that class."""
-
-
 class ProjectSelection(ContractModel):
     """One frozen learned-router selection resolved before provider execution."""
 
@@ -961,8 +926,24 @@ class ProjectSelection(ContractModel):
     switch_outcome: SwitchOutcome | None = None
 
 
-class AuthorizationSnapshot(ContractModel):
-    """Immutable authority and alias target frozen before learned model selection."""
+class AuthorizationSnapshot(ClientAttribution):
+    """Immutable authority and alias target frozen before learned model selection.
+
+    Attributes:
+        model_chain_authority: Optional backend binding, revalidated at acceptance and reservation.
+        fair_share_weight: Organization weight in [1, 1,000,000], default 1.
+        priority_admission: Host-vouched 0 free, 1 paying, 2 Pro (lane_saturation caps).
+        priority_class: Host-vouched request class 0..8, higher first (class_throttles.py).
+        output_tokens_per_second: Class stream pace on self-hosted rungs; None never paces.
+        output_pace_saturation: Pace only at or above this rung load fraction; None = always.
+        self_hosted_class_concurrency: Per-worker in-flight cap for the class on a self-hosted rung.
+        fast: The ``:fast`` spelling: priority tier, above every class (class_throttles.py).
+        descendant_start_authorized: False unless the host proves root funding
+            and policy gates before allowing a request to start at a child.
+        zdr_requested: Caller demand for stricter ZDR filtering, default False.
+        prompt_caching_disabled: The org turned prompt caching off (prompt_caching.py).
+        requested_route_id: Optional public selector, excluded from durable serialization.
+    """
 
     request_id: RequestId
     organization_id: OrganizationId
@@ -975,6 +956,8 @@ class AuthorizationSnapshot(ContractModel):
     catalog_sha256: Sha256
     canonical_request_sha256: Sha256
     caller_operation_sha256: Sha256 | None = None
+    model_chain_authority: ModelChainAuthority | None = None
+    requested_route_id: RequestedRouteId | None = Field(default=None, exclude=True)
     refusal_failover: bool = False
     deadline_monotonic: float = Field(gt=0)
     app_referer: str | None = Field(default=None, max_length=2_048)
@@ -984,16 +967,19 @@ class AuthorizationSnapshot(ContractModel):
     attribution_label: str | None = Field(default=None, max_length=1024)
     """End-user attribution from the OpenAI ``safety_identifier`` (or deprecated
     ``user``) request field: content-free and never a credential."""
-
-
-class ExecutionSnapshot(ContractModel):
-    """Route-bound request plan created only after exact-model selection."""
-
-    authorization: AuthorizationSnapshot
-    exact_model_id: ExactModelId
-    pool_id: ExactModelPoolId
-    deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
-    # The pool's per-model failover policy, carried onto the route so the
-    # per-attempt retry/failover decision can honor it. Defaults to the
-    # historical maximize_availability.
-    failover_mode: FailoverMode = "maximize_availability"
+    client_ip: str | None = Field(default=None, max_length=45)
+    """Caller IP from the TRUSTED proxy hop (``X-Real-IP``, else the RIGHTMOST
+    ``X-Forwarded-For`` entry; never the leftmost, which is client-forgeable),
+    for per-key IP allow/deny enforcement by the hosted authority. Content-free
+    and never a credential; ``None`` when no trusted hop yields an address (an
+    allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
+    fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
+    priority_admission: int = Field(default=0, ge=0, le=2)
+    priority_class: int | None = Field(default=None, ge=0, le=8)
+    output_tokens_per_second: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    output_pace_saturation: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    self_hosted_class_concurrency: int | None = Field(default=None, ge=1)
+    fast: bool = False
+    descendant_start_authorized: bool = False
+    zdr_requested: bool = False
+    prompt_caching_disabled: bool = False

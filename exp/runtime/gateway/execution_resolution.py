@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.catalog_prices import BilledUnitKind
+from exp.common.models.gateway_catalog import ExactModelDeployment, NormalizedGatewayCatalog
 from exp.common.models.model import BillingSource
-from exp.runtime.models import ResolvedModel
+from exp.runtime.gateway.audio_billing import AudioSurface, billing_mode
+from exp.runtime.gateway.video.providers import video_dialect
+from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_AUDIO_DIALECT
+from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 
@@ -54,8 +59,22 @@ def _resolved_wire_profile(
         )
         return replace(
             profile,
+            credential_receipt=runtime_model.credential_receipt
+            if not profile.signs_request_body
+            else None,
             model_id=profile.model_id or runtime_model.snapshot.model_id,
+            supports_responses_logprobs=(
+                gateway_capabilities.supports_responses_logprobs
+                and profile.dialect == "openai_responses"
+            ),
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
+            tenant_origin=runtime_model.tenant_origin,
+            service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,
+            service_tier_cards=frozenset(
+                tier
+                for tier in ("flex", "priority")
+                if deployment.gateway.prices.service_tier(tier) is not None
+            ),
             minimum_temperature=(
                 max(profile.minimum_temperature, capabilities.minimum_temperature)
                 if capabilities.minimum_temperature is not None
@@ -89,6 +108,7 @@ def _resolved_wire_profile(
                 else profile.maximum_top_k
             ),
             sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+            logprobs_reasoning_efforts=gateway_capabilities.logprobs_reasoning_efforts,
             supported_reasoning_efforts=(
                 gateway_capabilities.supported_reasoning_efforts
                 or profile.supported_reasoning_efforts
@@ -101,6 +121,11 @@ def _resolved_wire_profile(
             ),
             token_limit_key=capabilities.chat_max_tokens_field or profile.token_limit_key,
             maximum_output_tokens=min(output_limits) if output_limits else None,
+            # The provider's output-token floor is a catalog lane fact the
+            # client profile cannot know (a relay serves floored and unfloored
+            # models on one wire); the deployment declaration is the only
+            # source, so it is carried, never intersected.
+            minimum_output_tokens=gateway_capabilities.minimum_output_tokens,
         )
     raise TypeError(
         f"provider {deployment.provider!r} resolved to a client without a native wire profile"
@@ -124,3 +149,121 @@ def _require_deployment_identity(
         )
     ):
         raise ValueError("resolved runtime client differs from the frozen gateway deployment")
+
+
+def alias_native_blockers(
+    alias: str,
+    normalized: NormalizedGatewayCatalog,
+    runtime_catalog: RuntimeModelCatalog,
+) -> tuple[str, ...]:
+    """Name why the native engine cannot serve one alias, or ``()`` if it can.
+
+    Every deployment reachable from the alias's catalog snapshot (direct pools
+    and project candidates alike) must resolve to a provider client with a
+    native wire dialect and a valid wire contract, since no other engine exists
+    to serve the request. This is the per-alias servability check the catalog
+    build runs so a structurally unservable alias is excluded (marked
+    UNAVAILABLE) rather than aborting the whole build; the same check names the
+    fleet-level startup blockers.
+
+    Args:
+        alias: Public alias name, used only for the returned reason text.
+        normalized: The alias's normalized catalog snapshot.
+        runtime_catalog: The frozen runtime catalog for the alias's revision.
+
+    Returns:
+        Display-safe reasons the alias cannot be served natively, deduplicated,
+        or an empty tuple when every deployment resolves to a native wire.
+    """
+    reasons: list[str] = []
+    for deployment in normalized.deployments:
+        try:
+            resolved = runtime_catalog.resolve(deployment.source_alias)
+        except Exception:  # noqa: BLE001 - name the deployment, not the internals.
+            reasons.append(f"deployment {deployment.deployment_id!r} does not resolve")
+            continue
+        client = resolved.client
+        if not isinstance(client, NativeWireClient):
+            reasons.append(f"provider {deployment.provider!r} has no native wire profile")
+            continue
+        try:
+            profile = _resolved_wire_profile(deployment, resolved)
+        except ProviderCapabilityError as exc:
+            if exc.capability != "native_data_plane":
+                raise
+            reasons.append(f"provider {deployment.provider!r} has no native dialect implementation")
+        except GatewayWireContractError:
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} has an invalid reasoning wire contract"
+            )
+        else:
+            reasons.extend(_audio_claim_blockers(deployment, profile))
+            reasons.extend(_video_claim_blockers(deployment, profile))
+    return tuple(dict.fromkeys(reasons))
+
+
+def _audio_claim_blockers(
+    deployment: ExactModelDeployment, profile: GatewayWireProfile
+) -> tuple[str, ...]:
+    """Name each audio surface a deployment claims but cannot serve or bill.
+
+    A claimed surface without its endpoint, or whose price card names no
+    single valid meter (``audio_billing.billing_mode``), could only fail after
+    a request was durably accepted, so the alias is excluded at startup
+    instead. An ElevenLabs rung must bill a unit card (characters or audio
+    seconds): its wire reports no token usage.
+    """
+    capabilities = deployment.gateway.capabilities
+    claims: tuple[tuple[AudioSurface, bool, str | None], ...] = (
+        ("speech", capabilities.supports_speech, profile.speech_url),
+        ("transcription", capabilities.supports_transcription, profile.transcriptions_url),
+    )
+    reasons: list[str] = []
+    for surface, claimed, url in claims:
+        if not claimed:
+            continue
+        if url is None:
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} without a "
+                f"{surface} endpoint"
+            )
+        elif billing_mode(deployment, surface) is None:
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} without a "
+                "single billable meter"
+            )
+        elif (
+            profile.dialect == ELEVENLABS_AUDIO_DIALECT
+            and billing_mode(deployment, surface) != "units"
+        ):
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} on ElevenLabs "
+                "without a unit card"
+            )
+    return tuple(reasons)
+
+
+def _video_claim_blockers(
+    deployment: ExactModelDeployment, profile: GatewayWireProfile
+) -> tuple[str, ...]:
+    """Name why a deployment that claims video generation cannot serve or bill it.
+
+    A claimed video surface needs a provider video job dialect (a Veo-capable
+    Gemini connection or xAI's origin) and a ``video_second`` unit card: a job
+    priced any other way could only fail after the request was accepted, so
+    the alias is excluded at startup instead.
+    """
+    if not deployment.gateway.capabilities.supports_video_generation:
+        return ()
+    if video_dialect(profile) is None:
+        return (
+            f"deployment {deployment.deployment_id!r} claims video generation without a "
+            "video job endpoint",
+        )
+    units = deployment.gateway.prices.units
+    if units is None or units.kind != BilledUnitKind.VIDEO_SECOND:
+        return (
+            f"deployment {deployment.deployment_id!r} claims video generation without a "
+            "video_second unit card",
+        )
+    return ()

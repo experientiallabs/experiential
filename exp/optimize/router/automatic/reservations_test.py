@@ -24,6 +24,8 @@ from exp.common.models import (
     RouterCandidateSelection,
     completion_cost_reservation,
 )
+from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.optimize.router.automatic.reservations import (
@@ -31,6 +33,7 @@ from exp.optimize.router.automatic.reservations import (
     completion_reservation_from_catalog,
     median_trace_token_estimate,
     plan_automatic_router_cost,
+    retrieval_query_input_limit,
     simulation_input_token_estimate,
 )
 from exp.optimize.router.automatic.service_test import _catalog as _service_catalog
@@ -73,6 +76,48 @@ def test_cost_plan_reserves_exact_small_schedule_without_io() -> None:
         (plan.router_embedding_cost_usd, plan.judgment_cost_usd, plan.simulation_cost_usd)
     )
     assert catalog.model_dump(mode="json") == original
+
+
+@pytest.mark.parametrize("alias", ["candidate-a", "world", "judge"])
+@pytest.mark.parametrize("missing", ["reasoning", "cache_creation_1h_input"])
+def test_finite_router_plan_rejects_incomplete_role_tariffs(alias: str, missing: str) -> None:
+    """No finite router allowance can be authorized from only the known tariff legs."""
+    catalog = _service_catalog()
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=2_000_000_000,
+    ).model_copy(update={f"{missing}_nano_usd_per_million_tokens": None})
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                alias: catalog.models[alias].model_copy(
+                    update={"gateway": GatewayDeploymentMetadata(prices=card)}
+                ),
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="incomplete.*tariff"):
+        plan_automatic_router_cost(
+            _tasks(1),
+            catalog,
+            RouterCandidateSelection(
+                candidates=("candidate-a", "candidate-b"), incumbent="candidate-a"
+            ),
+            world_model_alias="world",
+            judge_alias="judge",
+            embedder_alias="embedder",
+            judge_response_shape="scalar",
+            judge_audit=None,
+            provisional_judge=True,
+            observed_candidate_aliases=(),
+            estimated_input_tokens=32_768,
+            options=AutomaticRouterOptions(),
+        )
 
 
 def test_cost_plan_reserves_full_default_corpus_and_pairwise_calls() -> None:
@@ -292,6 +337,7 @@ def test_simulation_input_estimate_sums_explicit_deterministic_components() -> N
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
+    assert _QUERY_TOKENS > median
     assert estimate == 6 * median + _QUERY_TOKENS + _OUTPUT_TOKENS + 4_096
     assert (
         simulation_input_token_estimate(
@@ -346,8 +392,41 @@ def test_completion_reservation_prices_from_trace_estimate_and_admits_to_context
     )
 
 
-def test_completion_reservation_rejects_estimates_above_the_context_window() -> None:
-    """An input estimate that cannot fit the model context fails closed with a problem."""
+@pytest.mark.parametrize("configured_limit", [None, 32_768, 900_000])
+@pytest.mark.parametrize("published_output", [None, 393_216])
+def test_query_capacity_derivation_preserves_explicit_limits(
+    configured_limit: int | None, published_output: int | None
+) -> None:
+    """Aggregate query admission follows world capacity only when the user omits a ceiling."""
+    catalog = _catalog()
+    record = catalog.models["world"]
+    assert record.capabilities is not None
+    catalog.models["world"] = record.model_copy(
+        update={
+            "capabilities": record.capabilities.model_copy(
+                update={
+                    "context_window_tokens": 1_048_576,
+                    "maximum_output_tokens": published_output,
+                }
+            )
+        }
+    )
+    problems: list[str] = []
+    derived = retrieval_query_input_limit(
+        problems,
+        catalog=catalog,
+        world_alias="world",
+        maximum_output_tokens=1_000_000,
+        configured_limit=configured_limit,
+    )
+    assert derived == (
+        configured_limit if configured_limit is not None else 1_048_576 - (published_output or 0)
+    )
+    assert not problems
+
+
+def test_completion_reservation_bounds_episode_estimates_to_request_capacity() -> None:
+    """A large historical episode cannot reject a model before seeing its actual requests."""
     problems: list[str] = []
 
     reservation = completion_reservation_from_catalog(
@@ -357,14 +436,66 @@ def test_completion_reservation_rejects_estimates_above_the_context_window() -> 
         model=_snapshot("world"),
         label="world model",
         maximum_attempts=3,
-        estimated_input_tokens=_LARGE_CONTEXT_TOKENS,
+        estimated_input_tokens=_LARGE_CONTEXT_TOKENS * 100,
         maximum_output_tokens=_OUTPUT_TOKENS,
     )
 
+    assert problems == []
+    assert reservation is not None
+    assert reservation.maximum_input_tokens == _LARGE_CONTEXT_TOKENS - _OUTPUT_TOKENS
+    assert reservation.estimated_input_tokens == reservation.maximum_input_tokens
+    assert reservation.maximum_output_tokens == _OUTPUT_TOKENS
+    assert (
+        reservation.estimated_maximum_call_cost_usd == reservation.absolute_maximum_call_cost_usd()
+    )
+
+
+def test_completion_reservation_identifies_missing_prices() -> None:
+    """A partial catalog reports the missing rate and recovery command instead of a blank error."""
+    catalog = _catalog()
+    capabilities = catalog.models["world"].capabilities
+    assert capabilities is not None
+    catalog.models["world"] = catalog.models["world"].model_copy(
+        update={
+            "capabilities": capabilities.model_copy(
+                update={"cache_write_cost_per_million_tokens_usd": None}
+            )
+        }
+    )
+    problems: list[str] = []
+    reservation = completion_reservation_from_catalog(
+        problems,
+        catalog=catalog,
+        alias="world",
+        model=_snapshot("world"),
+        label="world model",
+        maximum_attempts=3,
+        estimated_input_tokens=1000,
+        maximum_output_tokens=_OUTPUT_TOKENS,
+    )
+    assert reservation is None
+    assert len(problems) == 1
+    assert "world model alias 'world' is missing cache write prices" in problems[0]
+    assert "exp login" in problems[0]
+
+
+@pytest.mark.parametrize("estimate", [0, -1])
+def test_completion_reservation_rejects_nonpositive_estimates(estimate: int) -> None:
+    """Bounding positive planning inputs must not hide malformed estimates."""
+    problems: list[str] = []
+    reservation = completion_reservation_from_catalog(
+        problems,
+        catalog=_catalog(),
+        alias="world",
+        model=_snapshot("world"),
+        label="world model",
+        maximum_attempts=3,
+        estimated_input_tokens=estimate,
+        maximum_output_tokens=_OUTPUT_TOKENS,
+    )
     assert reservation is None
     assert problems == [
-        f"world model alias 'world' cannot fit the estimated {_LARGE_CONTEXT_TOKENS} input plus "
-        f"{_OUTPUT_TOKENS} output tokens inside its {_LARGE_CONTEXT_TOKENS}-token context window"
+        f"world model alias 'world' requires a positive input estimate; got {estimate}"
     ]
 
 

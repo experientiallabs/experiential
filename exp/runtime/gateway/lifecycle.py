@@ -18,25 +18,40 @@ from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
     SNAPSHOT_SCHEMA_VERSION,
+    CatalogSnapshotUnitError,
     ModelCatalog,
     NormalizedGatewayCatalog,
     is_foreign_snapshot,
-    load_forward_compatible,
     normalize_gateway_catalog,
+    read_model_catalog_document,
+    read_normalized_snapshot_document,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayTarget,
     ProjectTarget,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+from exp.runtime.gateway.lifecycle_fields import (
+    GatewayLifecycleError as GatewayLifecycleError,
+)
+from exp.runtime.gateway.lifecycle_fields import (
+    required as _required,
+)
+from exp.runtime.gateway.lifecycle_fields import (
+    required_revision as _required_revision,
+)
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
+from exp.runtime.gateway.model_chain_authority import (
+    ModelChainAuthorityError,
+    refuse_unenforced_model_chains,
+)
 from exp.runtime.gateway.project_activation import (
     ProjectActivationError,
     ProjectActivationRepository,
@@ -49,18 +64,14 @@ from exp.runtime.gateway.routing import (
     SelectionWorkerPool,
 )
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.video.store import SQLiteVideoJobStore, VideoJobStore
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
 
-_DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 _RETIRED_REVISION_RETENTION_SECONDS = 600.0
 
 _logger = logging.getLogger(__name__)
-
-
-class GatewayLifecycleError(ValueError):
-    """Local gateway configuration cannot form one ready execution snapshot."""
 
 
 @dataclass(frozen=True)
@@ -89,10 +100,9 @@ class _AliasAuthorityState:
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
     unavailable_aliases: tuple[tuple[str, str], ...] = ()
-    # (alias, dead active revision_id) -> the last-good prior revision serving
-    # it. Keyed by alias too (not the revision id alone) so a shared revision id
-    # can never route one alias's request to another alias's fallback target.
-    # Empty unless an alias's active pinned snapshot was unservable at load.
+    # (alias, dead active revision_id) -> the last-good prior revision serving it. Keyed by
+    # alias too, so a shared revision id never routes one alias's request to another alias's
+    # fallback target. Empty unless an alias's active pinned snapshot was unservable at load.
     fallback_revisions: Mapping[tuple[str, str], _ServedFallback] = field(default_factory=dict)
 
 
@@ -354,12 +364,11 @@ class _ReadyControlStore:
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authorize only an alias revision this process can serve, reloading once on drift.
 
-        A revision retired by a concurrent activation stays authorized while its retained
-        catalogs can still serve it, so a request whose SQLite authority was minted an instant
-        before the swap is pinned to its revision instead of being rejected at the swap boundary.
+        An authority minted just before an activation swap is pinned to its revision, not rejected.
         """
         authorization = self.store.authorize_request(
             raw_key=raw_key,
@@ -368,13 +377,13 @@ class _ReadyControlStore:
             deadline_monotonic=deadline_monotonic,
             app_referer=app_referer,
             app_title=app_title,
+            client_ip=client_ip,
         )
         served = _serve_or_fallback(self.reloader.state, authorization)
         if served is not None:
             return served
-        # The SQLite authority names a revision this generation has not loaded
-        # (a concurrent activation, or an active revision whose snapshot was
-        # unservable at load); reload once and re-resolve, including last-good.
+        # The SQLite authority names a revision this generation has not loaded (a concurrent
+        # activation or an unservable active snapshot); reload once, re-resolve with last-good.
         authority = (
             authorization.alias,
             authorization.alias_revision_id,
@@ -434,9 +443,9 @@ class LocalGatewayComponents:
     selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
-    # The local launch serves no asynchronous batch lane; hosted compositions
-    # supply a BatchControlPlane here to enable /v1/batches.
+    # Hosted compositions supply a BatchControlPlane (/v1/batches); the local launch has none.
     batches: object | None = None
+    video_jobs: VideoJobStore | None = None  # /v1/videos jobs, in the gateway database
 
     @property
     def runtime_catalogs(self) -> Mapping[tuple[str, str], RuntimeModelCatalog]:
@@ -494,7 +503,11 @@ def load_gateway_components(
     manager = GatewayManagement(root)
     store = manager.require_initialized()
     manager.migrate_legacy_provider_connections()
-    ledger = SQLiteAttemptLedger(manager.database_path)
+    ledger = SQLiteAttemptLedger(
+        manager.database_path,
+        serving_snapshot_max_bytes=manager.serving_snapshot_max_bytes,
+        classification_memo=manager.classification_memo,
+    )
     write_ledger = GroupCommitAttemptLedger(ledger)
     expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
 
@@ -533,6 +546,7 @@ def load_gateway_components(
         selection_workers=selection_workers,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
+        video_jobs=SQLiteVideoJobStore(manager.database_path),
     )
 
 
@@ -599,7 +613,15 @@ def _load_alias_state(
         try:
             try:
                 revision_id, catalog_sha256 = _required_revision(alias)
+                if alias.snapshot_ref is not None:
+                    manager.check_serving_snapshot(alias.snapshot_ref)
                 catalog, normalized = _load_snapshot(manager, alias)
+                refuse_unenforced_model_chains(normalized)
+                refuse_unenforced_model_chains(catalog)
+            except ModelChainAuthorityError as exc:
+                # Feature policy cannot fall back to a prior, weaker alias revision.
+                unavailable_aliases.append((alias.alias_name, str(exc)))
+                continue
             except GatewayLifecycleError as exc:
                 # The alias's active revision pins an unservable snapshot (parse
                 # failure or a same-version self-inconsistent digest). Serve the
@@ -790,26 +812,19 @@ def _load_snapshot(
         raise GatewayLifecycleError("catalog snapshot reference escapes gateway state")
     authored = snapshot.with_suffix(".models.json")
     try:
-        # Read forward-compatibly: a snapshot authored by a NEWER engine build
-        # during a rolling deploy may carry fields this build does not know, and
-        # rejecting it would hard-fail every request until the roll finished.
-        # Unknown fields are dropped; every other validation stays strict.
-        normalized, normalized_dropped = load_forward_compatible(
-            NormalizedGatewayCatalog, snapshot.read_bytes()
-        )
-        authored_catalog, authored_dropped = load_forward_compatible(
-            ModelCatalog, authored.read_bytes()
-        )
+        # Tolerant readers drop forward fields and explicitly convert supported
+        # micro-USD schemas; unsupported money units fail by name.
+        normalized, normalized_dropped = read_normalized_snapshot_document(snapshot.read_bytes())
+        authored_catalog, authored_dropped = read_model_catalog_document(authored.read_bytes())
+    except CatalogSnapshotUnitError as exc:
+        raise GatewayLifecycleError(f"alias {alias.alias_name!r}: {exc}") from exc
     except (OSError, ValueError) as exc:
         raise GatewayLifecycleError(
             f"alias {alias.alias_name!r} has an unreadable catalog snapshot"
         ) from exc
     catalog_sha256 = _required(alias.catalog_sha256, "catalog digest", alias)
-    # A cross-version skew (this build's schema differs from the snapshot's) is
-    # served through this build's own tolerant view, keyed by the pinned digest,
-    # instead of the byte-exact digest checks below: the local normalizer is not
-    # expected to reproduce another build's bytes. When the versions agree the
-    # checks stay strict, so same-version corruption is still caught.
+    # A cross-version skew is served through this build's tolerant view keyed by
+    # the pinned digest; same-version reads keep the strict digest check below.
     foreign = is_foreign_snapshot(normalized)
     if normalized_dropped or authored_dropped or foreign:
         _logger.warning(
@@ -982,18 +997,3 @@ def _readiness_authorization(
         refusal_failover=alias.refusal_failover,
         deadline_monotonic=time.monotonic() + 30,
     )
-
-
-def _required_revision(alias: GatewayAliasView) -> tuple[str, str]:
-    """Return required alias revision and catalog digest values."""
-    return (
-        _required(alias.revision_id, "revision ID", alias),
-        _required(alias.catalog_sha256, "catalog digest", alias),
-    )
-
-
-def _required(value: str | None, name: str, alias: GatewayAliasView) -> str:
-    """Return one required active-alias field or fail with safe context."""
-    if value is None:
-        raise GatewayLifecycleError(f"alias {alias.alias_name!r} is missing {name}")
-    return value

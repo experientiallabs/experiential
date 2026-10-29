@@ -36,6 +36,10 @@ from exp.runtime.router import (
 from exp.simulation.retrieval.build import PersistedRAGIndex, persist_trace_rag
 from exp.simulation.retrieval.contracts import RAGLineageBinding
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
+from exp.simulation.retrieval.embedding_inputs import (
+    embedding_chunk_bytes,
+    plan_rag_embedding_inputs,
+)
 from exp.simulation.retrieval.refresh_dataset import (
     PersistedRuntimeRAGDataset,
     persist_runtime_rag_dataset,
@@ -285,8 +289,7 @@ def refresh_runtime_trace_rag(
     )
     lock_target = store.project_directory / "runtime" / f"{refresh_id}.receipt"
     with file_write_lock(lock_target, what="the runtime RAG refresh"):
-        destination = store.project_directory / "artifacts" / refresh_id
-        if destination.exists():
+        if store.exists(refresh_id):
             return _load_exact_refresh(
                 store,
                 refresh_id,
@@ -448,9 +451,10 @@ def load_runtime_rag_refresh(
         raise RuntimeRAGRefreshError(
             "runtime RAG transitions differ from the receipt's exact lineage assignments"
         )
-    required_input_tokens = sum(
-        len(item.key_text.encode("utf-8")) for item in loaded_rag.transitions
-    )
+    required_input_tokens = plan_rag_embedding_inputs(
+        tuple(item.key_text for item in loaded_rag.transitions),
+        maximum_chunk_bytes=loaded_rag.index.embedding_chunk_bytes,
+    ).maximum_input_tokens
     if required_input_tokens > refresh.embedding_reservation.maximum_input_tokens:
         raise RuntimeRAGRefreshError(
             "runtime RAG transition keys exceed the persisted embedding reservation"
@@ -567,7 +571,9 @@ def _reserved_embedding_cost(
         raise RuntimeRAGRefreshError("embedding reservation retry bound differs from embedder")
     if reservation.input_usd_per_million_tokens != embedder.input_usd_per_million_tokens:
         raise RuntimeRAGRefreshError("embedding reservation price differs from configured embedder")
-    required_input_tokens = sum(len(text.encode("utf-8")) for text in texts)
+    required_input_tokens = plan_rag_embedding_inputs(
+        texts, maximum_chunk_bytes=embedding_chunk_bytes(embedder.maximum_input_tokens)
+    ).maximum_input_tokens
     if required_input_tokens > reservation.maximum_input_tokens:
         raise RuntimeRAGRefreshError(
             "embedding input exceeds the explicit provider-independent token reservation"

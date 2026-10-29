@@ -3,28 +3,26 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from exp.common.core.artifacts import ArtifactInput, stable_id
 from exp.common.evaluations import EvaluationCell, EvaluationPlan
 from exp.common.rollouts import SimulationMode
+from exp.optimize.evaluation.contracts import EvaluationSetup
 from exp.simulation.specs import SimulationSpec
-
-if TYPE_CHECKING:
-    from exp.optimize.router.composition import RouterEvaluationSetup
 
 
 def build_router_simulation_spec(
     plan: EvaluationPlan,
     plan_input: ArtifactInput,
     task_input: ArtifactInput,
-    setup: RouterEvaluationSetup,
+    setup: EvaluationSetup,
     maximum_cost_usd: float,
     created_at: datetime,
     code_revision: str,
     cells: tuple[EvaluationCell, ...],
     *,
-    phase: Literal["fit", "heldout"],
+    phase: Literal["fit", "heldout", "evaluation"],
     stop_on_overspend: bool,
 ) -> SimulationSpec:
     """Create one phase-scoped simulation spec over the exact fit-only RAG.
@@ -56,7 +54,11 @@ def build_router_simulation_spec(
         "settings": setup.world_model_settings.model_dump(mode="json"),
         "agent_id": setup.agent_id,
         "seed": setup.seed,
+        "continuation_of": setup.continuation_of.model_dump(mode="json")
+        if setup.continuation_of
+        else None,
         "maximum_steps": setup.maximum_steps,
+        "maximum_rollout_output_tokens": setup.maximum_rollout_output_tokens,
         "maximum_concurrency": setup.maximum_concurrency,
         "maximum_cost_usd": maximum_cost_usd,
         "stop_on_overspend": stop_on_overspend,
@@ -70,6 +72,8 @@ def build_router_simulation_spec(
         setup.fit_rag_input,
         setup.world_model_settings.grounded_world_model_input,
     ]
+    if setup.continuation_of is not None:
+        spec_inputs.append(setup.continuation_of)
     if setup.simulation_completion_input is not None:
         spec_inputs.append(setup.simulation_completion_input)
     return SimulationSpec(
@@ -84,7 +88,9 @@ def build_router_simulation_spec(
         mode=SimulationMode.WORLD_MODEL,
         world_model=setup.world_model_settings,
         seed=setup.seed,
+        continuation_of=setup.continuation_of,
         maximum_steps=setup.maximum_steps,
+        maximum_rollout_output_tokens=setup.maximum_rollout_output_tokens,
         maximum_concurrency=setup.maximum_concurrency,
         maximum_cost_usd=maximum_cost_usd,
         stop_on_overspend=stop_on_overspend,

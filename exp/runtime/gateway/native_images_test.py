@@ -117,6 +117,33 @@ def test_admit_rejects_a_chat_alias_on_the_model_field(tmp_path: Path) -> None:
     assert json.loads(control.usage_json("{}"))["totals"]["requests"] == 1
 
 
+def test_admit_rejects_an_image_emitting_chat_lane_without_the_images_claim(
+    tmp_path: Path,
+) -> None:
+    """`emits_images` never admits /v1/images: the Images-API claim is the only key.
+
+    2026-09-15: projecting `supports_image_generation` onto the text+image
+    chat lanes admitted `/v1/images/generations` on OpenRouter, whose
+    OpenAI-compatible profile carries an `images_url` unconditionally, and
+    dispatched to a URL that does not exist. The chat-side fact lives under
+    its own key and this route ignores it.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path, capabilities=ModelCapabilities(emits_images=True)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, {"model": "coding", "prompt": "a cat"})
+    error = _public_error(raised.value)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert "does not generate images" in str(error["message"])
+
+
 def test_admit_rejects_protocol_failures_before_any_ledger_write(tmp_path: Path) -> None:
     """A missing prompt, a streaming request, and an unknown key never accept a request."""
     control, raw_key = _control_plane(tmp_path, images=True)
@@ -130,3 +157,18 @@ def test_admit_rejects_protocol_failures_before_any_ledger_write(tmp_path: Path)
         _admit(control, "not-a-key", {"model": "coding", "prompt": "a cat"})
     assert _public_error(unknown.value)["status_code"] == 401
     assert json.loads(control.usage_json("{}"))["totals"]["requests"] == 0
+
+
+def test_admit_attributes_the_calling_app(tmp_path: Path) -> None:
+    """The forwarded User-Agent classifies a images caller onto its durable request."""
+    control, raw_key = _control_plane(tmp_path, images=True)
+    argument = {
+        "raw_key": raw_key,
+        "body": json.dumps({"model": "coding", "prompt": "a cat"}),
+        "user_agent": "claude-cli/2.1.278 (external, cli)",
+    }
+    control.admit_images(json.dumps(argument))
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = connection.execute("select client_app, user_agent from gateway_requests").fetchall()
+    assert rows == [("claude_code", "claude-cli/2.1.278 (external, cli)")]

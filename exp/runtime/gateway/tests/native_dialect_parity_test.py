@@ -2,127 +2,24 @@
 
 The golden fixtures are the contract: raw provider stream bytes in, the exact
 canonical event sequence out. The native (Rust) normalizer is checked against
-the goldens through ``normalize_stream_fixture``.
+the goldens through ``normalize_stream_fixture``. Only the Anthropic and Responses
+lanes live here; the Rust dialect tests pin Gemini and Bedrock.
 """
 
 from __future__ import annotations
 
 import json
-import zlib
 from collections.abc import Sequence
 from typing import cast
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import (
-    GatewayEvent,
-    GatewayEventKind,
-)
 
 
 def _sse(payload: JsonObject) -> bytes:
     """Encode one JSON object as a complete SSE data event."""
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
-
-
-GEMINI_GOLDEN_CHUNKS: tuple[bytes, ...] = (
-    _sse({"candidates": [{"content": {"parts": [{"text": "Hel"}]}}]}),
-    _sse(
-        {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {"thought": True, "text": "hidden reasoning"},
-                            {"text": "lo"},
-                        ]
-                    }
-                }
-            ]
-        }
-    ),
-    _sse(
-        {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "functionCall": {
-                                    "id": "call-1",
-                                    "name": "lookup",
-                                    "args": {"city": "Zürich", "count": 2},
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        }
-    ),
-    _sse(
-        {
-            "candidates": [{"finishReason": "STOP"}],
-            "usageMetadata": {
-                "promptTokenCount": 11,
-                "candidatesTokenCount": 5,
-                "cachedContentTokenCount": 2,
-                "thoughtsTokenCount": 3,
-            },
-        }
-    ),
-)
-
-_GEMINI_RAW_ARGUMENTS = '{"city":"Zürich","count":2}'
-
-GEMINI_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
-    {"kind": "text_delta", "text": "Hel"},
-    {"kind": "text_delta", "text": "lo"},
-    {"kind": "tool_call_started", "index": 0, "call_id": "call-1", "name": "lookup"},
-    {"kind": "tool_arguments_delta", "index": 0, "text": _GEMINI_RAW_ARGUMENTS},
-    {
-        "kind": "tool_call_completed",
-        "index": 0,
-        "call_id": "call-1",
-        "name": "lookup",
-        "raw_arguments": _GEMINI_RAW_ARGUMENTS,
-    },
-    {
-        # Gemini thoughts are additive on the wire, so the engine folds the 3
-        # thought tokens into the output total and reports them as its subset.
-        "kind": "usage",
-        "input_tokens": 11,
-        "output_tokens": 8,
-        "cached_input_tokens": 2,
-        "reasoning_tokens": 3,
-    },
-    {"kind": "completed"},
-)
-
-GEMINI_REFUSAL_CHUNKS: tuple[bytes, ...] = (_sse({"candidates": [{"finishReason": "SAFETY"}]}),)
-
-GEMINI_INCOMPLETE_CHUNKS: tuple[bytes, ...] = (
-    _sse({"candidates": [{"content": {"parts": [{"text": "cut"}]}}]}),
-    _sse(
-        {
-            "candidates": [{"finishReason": "MAX_TOKENS"}],
-            "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 9},
-        }
-    ),
-)
-
-GEMINI_INCOMPLETE_EVENTS: tuple[JsonObject, ...] = (
-    {"kind": "text_delta", "text": "cut"},
-    {
-        "kind": "usage",
-        "input_tokens": 4,
-        "output_tokens": 9,
-        "cached_input_tokens": 0,
-        "reasoning_tokens": None,
-    },
-    {"kind": "incomplete"},
-)
 
 
 def _native_normalized(dialect: str, chunks: Sequence[bytes]) -> JsonObject:
@@ -138,299 +35,6 @@ def _native_normalized(dialect: str, chunks: Sequence[bytes]) -> JsonObject:
     native = pytest.importorskip("exp_gateway_native")
     argument = json.dumps([chunk.decode("latin-1") for chunk in chunks])
     return json.loads(native.normalize_stream_fixture(dialect, argument))
-
-
-def _simplified(event: GatewayEvent) -> JsonObject:
-    """Project one python gateway event onto the golden fixture vocabulary.
-
-    Args:
-        event: Normalized event from a python provider mapper.
-
-    Returns:
-        The content-bearing fields in the shared fixture shape.
-    """
-    if event.kind is GatewayEventKind.TEXT_DELTA:
-        return {"kind": "text_delta", "text": event.text_delta}
-    if event.kind is GatewayEventKind.REFUSAL_DELTA:
-        return {"kind": "refusal_delta", "text": event.text_delta}
-    if event.kind is GatewayEventKind.REASONING_SUMMARY_DELTA:
-        return {
-            "kind": "reasoning_summary_delta",
-            "output_index": event.reasoning_summary_output_index,
-            "summary_index": event.reasoning_summary_index,
-            "text": event.text_delta,
-        }
-    if event.kind is GatewayEventKind.TOOL_CALL_STARTED:
-        return {
-            "kind": "tool_call_started",
-            "index": event.tool_call_index,
-            "call_id": event.tool_call_id,
-            "name": event.tool_name,
-        }
-    if event.kind is GatewayEventKind.TOOL_ARGUMENTS_DELTA:
-        return {
-            "kind": "tool_arguments_delta",
-            "index": event.tool_call_index,
-            "text": event.raw_arguments_delta,
-        }
-    if event.kind is GatewayEventKind.TOOL_CALL_COMPLETED:
-        call = event.tool_call
-        assert call is not None
-        return {
-            "kind": "tool_call_completed",
-            "index": event.tool_call_index,
-            "call_id": call.call_id,
-            "name": call.name,
-            "raw_arguments": call.raw_arguments,
-        }
-    if event.kind is GatewayEventKind.USAGE:
-        usage = event.usage
-        assert usage is not None
-        return {
-            "kind": "usage",
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        }
-    if event.kind is GatewayEventKind.COMPLETED:
-        return {"kind": "completed"}
-    if event.kind is GatewayEventKind.INCOMPLETE:
-        return {"kind": "incomplete"}
-    assert event.failure is not None
-    return {
-        "kind": "failed",
-        "failure_class": event.failure.failure_class.value,
-        "safe_message": event.failure.safe_message,
-    }
-
-
-def test_native_gemini_normalizer_matches_the_golden_fixture() -> None:
-    """The Rust normalizer reproduces the committed canonical event sequence."""
-    result = _native_normalized("gemini_generate_content", GEMINI_GOLDEN_CHUNKS)
-    assert result["failure"] is None
-    assert result["events"] == list(GEMINI_GOLDEN_EVENTS)
-
-    incomplete = _native_normalized("gemini_generate_content", GEMINI_INCOMPLETE_CHUNKS)
-    assert incomplete["failure"] is None
-    assert incomplete["events"] == list(GEMINI_INCOMPLETE_EVENTS)
-
-    refusal = _native_normalized("gemini_generate_content", GEMINI_REFUSAL_CHUNKS)
-    assert refusal["failure"] is None
-    assert refusal["events"] == [
-        {
-            "kind": "failed",
-            "failure_class": "refusal",
-            "safe_message": "provider refused the request",
-        }
-    ]
-
-
-def test_native_gemini_normalizer_completes_a_clean_end_after_content() -> None:
-    """A stream that closes after content, with no finishReason frame, is a
-    normal completion: Gemini legitimately ends some streams that way, and the
-    real answer must not be thrown away as malformed."""
-    result = _native_normalized("gemini_generate_content", GEMINI_GOLDEN_CHUNKS[:1])
-    assert result["failure"] is None
-    assert result["events"] == [
-        {"kind": "text_delta", "text": "Hel"},
-        {"kind": "completed"},
-    ]
-
-
-def test_native_gemini_normalizer_fails_streams_that_produced_no_content() -> None:
-    """A stream that closes having emitted NO content at all stays malformed:
-    a usage-only trailer with no candidates has no answer to complete."""
-    trailer = _sse({"usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0}})
-    result = _native_normalized("gemini_generate_content", (trailer,))
-    assert result["events"] == []
-    failure = result["failure"]
-    assert isinstance(failure, dict)
-    assert failure["failure_class"] == "malformed_response"
-
-
-def test_native_gemini_normalizer_recovers_a_partial_before_an_abnormal_frame() -> None:
-    """Content, then a structurally malformed frame: the partial answer is kept
-    and the turn ends `incomplete` (an early-termination finish reason) with the
-    last-seen usage folded, never discarded as malformed. Gemini uniquely ends
-    legitimate turns abnormally, so a break after content is a truncated answer,
-    not corruption."""
-    chunks = (
-        _sse({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}),
-        _sse({"usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 3}}),
-        # A non-string text part after content: malformed mid-stream frame.
-        _sse({"candidates": [{"content": {"parts": [{"text": 5}]}}]}),
-    )
-    result = _native_normalized("gemini_generate_content", chunks)
-    assert result["failure"] is None
-    assert result["events"] == [
-        {"kind": "text_delta", "text": "partial"},
-        {
-            "kind": "usage",
-            "input_tokens": 9,
-            "output_tokens": 3,
-            "cached_input_tokens": 0,
-            "reasoning_tokens": None,
-        },
-        {"kind": "incomplete"},
-    ]
-
-
-def test_native_gemini_normalizer_reclassifies_a_pre_content_abnormal_frame() -> None:
-    """A malformed frame before any content is a Gemini abnormal end with
-    nothing to salvage: it is reclassified from a hard malformed reject to a
-    retryable transport failure (retry the lane, then fail over), and no content
-    is emitted."""
-    chunk = _sse({"candidates": [{"content": {"parts": [{"text": 5}]}}]})
-    result = _native_normalized("gemini_generate_content", (chunk,))
-    assert result["events"] == []
-    failure = result["failure"]
-    assert isinstance(failure, dict)
-    assert failure["failure_class"] == "transport"
-
-
-def _eventstream_message(name: str, payload: JsonObject, *, exception: bool = False) -> bytes:
-    """Encode one AWS event-stream message the way Bedrock frames its stream.
-
-    Args:
-        name: Event-type (or exception-type) header value.
-        payload: JSON payload object.
-        exception: Whether to frame the message as a service exception.
-
-    Returns:
-        One complete binary event-stream message with valid checksums.
-    """
-    headers = [
-        (":message-type", "exception" if exception else "event"),
-        (":exception-type" if exception else ":event-type", name),
-    ]
-    block = b""
-    for header_name, value in headers:
-        block += bytes([len(header_name)]) + header_name.encode()
-        block += bytes([7]) + len(value).to_bytes(2, "big") + value.encode()
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-    total = 12 + len(block) + len(body) + 4
-    prelude = total.to_bytes(4, "big") + len(block).to_bytes(4, "big")
-    message = prelude + zlib.crc32(prelude).to_bytes(4, "big") + block + body
-    return message + zlib.crc32(message).to_bytes(4, "big")
-
-
-BEDROCK_GOLDEN_ENVELOPES: tuple[tuple[str, JsonObject], ...] = (
-    ("messageStart", {"role": "assistant"}),
-    ("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "Hel"}}),
-    ("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "lo"}}),
-    ("contentBlockStop", {"contentBlockIndex": 0}),
-    (
-        "contentBlockStart",
-        {
-            "contentBlockIndex": 1,
-            "start": {"toolUse": {"toolUseId": "call-1", "name": "lookup"}},
-        },
-    ),
-    ("contentBlockDelta", {"contentBlockIndex": 1, "delta": {"toolUse": {"input": '{"city":'}}}),
-    (
-        "contentBlockDelta",
-        {"contentBlockIndex": 1, "delta": {"toolUse": {"input": '"Zürich"}'}}},
-    ),
-    ("contentBlockStop", {"contentBlockIndex": 1}),
-    ("messageStop", {"stopReason": "tool_use"}),
-    (
-        "metadata",
-        {
-            "usage": {
-                "inputTokens": 9,
-                "outputTokens": 4,
-                "cacheReadInputTokens": 2,
-                "cacheWriteInputTokens": 1,
-            },
-            "metrics": {"latencyMs": 12},
-        },
-    ),
-)
-
-BEDROCK_GOLDEN_EVENTS: tuple[JsonObject, ...] = (
-    {"kind": "text_delta", "text": "Hel"},
-    {"kind": "text_delta", "text": "lo"},
-    {"kind": "tool_call_started", "index": 1, "call_id": "call-1", "name": "lookup"},
-    {"kind": "tool_arguments_delta", "index": 1, "text": '{"city":'},
-    {"kind": "tool_arguments_delta", "index": 1, "text": '"Zürich"}'},
-    {
-        "kind": "tool_call_completed",
-        "index": 1,
-        "call_id": "call-1",
-        "name": "lookup",
-        "raw_arguments": '{"city":"Zürich"}',
-    },
-    {
-        "kind": "usage",
-        "input_tokens": 12,
-        "output_tokens": 4,
-        "cached_input_tokens": 2,
-        "reasoning_tokens": None,
-    },
-    {"kind": "completed"},
-)
-
-BEDROCK_REFUSAL_ENVELOPES: tuple[tuple[str, JsonObject], ...] = (
-    ("messageStop", {"stopReason": "guardrail_intervened"}),
-    ("metadata", {"usage": {"inputTokens": 3, "outputTokens": 0}}),
-)
-
-
-def test_native_bedrock_normalizer_matches_the_golden_fixture() -> None:
-    """The Rust event-stream decoder and normalizer reproduce the goldens."""
-    chunks = [_eventstream_message(name, payload) for name, payload in BEDROCK_GOLDEN_ENVELOPES]
-    result = _native_normalized("bedrock_converse_stream", chunks)
-    assert result["failure"] is None
-    assert result["events"] == list(BEDROCK_GOLDEN_EVENTS)
-
-    refusal_chunks = [
-        _eventstream_message(name, payload) for name, payload in BEDROCK_REFUSAL_ENVELOPES
-    ]
-    refusal = _native_normalized("bedrock_converse_stream", refusal_chunks)
-    assert refusal["failure"] is None
-    assert refusal["events"] == [
-        {
-            "kind": "usage",
-            "input_tokens": 3,
-            "output_tokens": 0,
-            "cached_input_tokens": 0,
-            "reasoning_tokens": None,
-        },
-        {
-            "kind": "failed",
-            "failure_class": "refusal",
-            "safe_message": "provider refused the request",
-        },
-    ]
-
-    throttled = _native_normalized(
-        "bedrock_converse_stream",
-        [_eventstream_message("throttlingException", {"message": "x"}, exception=True)],
-    )
-    assert throttled["failure"] is None
-    assert throttled["events"] == [
-        {
-            "kind": "failed",
-            "failure_class": "throttled",
-            "safe_message": "provider throttled the request",
-        }
-    ]
-
-
-def test_native_bedrock_normalizer_fails_corrupt_and_truncated_frames() -> None:
-    """Checksum corruption and mid-message truncation fail as malformed."""
-    good = _eventstream_message("messageStart", {"role": "assistant"})
-    corrupt = good[:-1] + bytes([good[-1] ^ 0xFF])
-    result = _native_normalized("bedrock_converse_stream", [corrupt])
-    failure = result["failure"]
-    assert isinstance(failure, dict)
-    assert failure["failure_class"] == "malformed_response"
-
-    truncated = _native_normalized("bedrock_converse_stream", [good[: len(good) - 3]])
-    failure = truncated["failure"]
-    assert isinstance(failure, dict)
-    assert failure["failure_class"] == "malformed_response"
 
 
 ANTHROPIC_THINKING_CHUNKS: tuple[bytes, ...] = (
@@ -509,6 +113,7 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 8,
         "output_tokens": 9,
         "cached_input_tokens": 2,
+        "cache_creation_input_tokens": 0,
         # Anthropic reports thinking inside output_tokens with no separate
         # count, so the reasoning subset stays unknown.
         "reasoning_tokens": None,
@@ -517,11 +122,31 @@ ANTHROPIC_THINKING_EVENTS: tuple[JsonObject, ...] = (
 )
 
 
+def _anthropic_start_usage(
+    input_tokens: int, output_tokens: int | None, cached: int
+) -> dict[str, object]:
+    """The usage event an Anthropic ``message_start`` now surfaces before content.
+
+    The start-frame meters reach the Messages encoder's own ``message_start``
+    (Claude Code reads input there) and stand in for settlement until the
+    terminal report supersedes them at ``message_stop``.
+    """
+    return {
+        "kind": "usage",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": cached,
+        "cache_creation_input_tokens": 0,
+        "reasoning_tokens": None,
+    }
+
+
 def test_native_anthropic_normalizer_emits_thinking_events() -> None:
     """Extended-thinking frames normalize to dedicated events, never silence."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_THINKING_CHUNKS)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_THINKING_EVENTS)
+    # message_start omits output_tokens; only message_delta reports its total.
+    assert result["events"] == [_anthropic_start_usage(8, None, 2), *ANTHROPIC_THINKING_EVENTS]
 
 
 # Captured from a live api.anthropic.com tool_use stream (2026-08-28,
@@ -570,6 +195,7 @@ ANTHROPIC_LIVE_TOOL_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 663,
         "output_tokens": 33,
         "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},
@@ -580,7 +206,7 @@ def test_native_anthropic_normalizer_decodes_the_live_tool_use_wire() -> None:
     """The real captured tool_use wire decodes to the canonical event stream."""
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_TOOL_FRAMES)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_LIVE_TOOL_EVENTS)
+    assert result["events"] == [_anthropic_start_usage(663, 12, 0), *ANTHROPIC_LIVE_TOOL_EVENTS]
 
 
 # Captured live (2026-08-28, claude-haiku-4-5, ids neutralized): a
@@ -616,6 +242,7 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_ZERO_ARG_FRAMES)
     assert result["failure"] is None
     assert result["events"] == [
+        _anthropic_start_usage(550, 21, 0),
         {"kind": "tool_call_started", "index": 0, "call_id": "toolu_fixture", "name": "get_time"},
         {"kind": "tool_arguments_delta", "index": 0, "text": ""},
         # The completion-time seed streams before the completed call so every
@@ -633,6 +260,7 @@ def test_native_anthropic_normalizer_completes_a_zero_argument_tool_call() -> No
             "input_tokens": 550,
             "output_tokens": 37,
             "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
             "reasoning_tokens": None,
         },
         {"kind": "completed"},
@@ -738,6 +366,7 @@ ANTHROPIC_LIVE_WEB_SEARCH_EVENTS: tuple[JsonObject, ...] = (
         "input_tokens": 12284,
         "output_tokens": 103,
         "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
         "reasoning_tokens": None,
     },
     {"kind": "completed"},
@@ -753,7 +382,10 @@ def test_native_anthropic_normalizer_decodes_the_live_web_search_wire() -> None:
     """
     result = _native_normalized("anthropic_messages", ANTHROPIC_LIVE_WEB_SEARCH_FRAMES)
     assert result["failure"] is None
-    assert result["events"] == list(ANTHROPIC_LIVE_WEB_SEARCH_EVENTS)
+    assert result["events"] == [
+        _anthropic_start_usage(2230, 25, 0),
+        *ANTHROPIC_LIVE_WEB_SEARCH_EVENTS,
+    ]
 
 
 def test_native_responses_preserves_multi_message_status_phase_and_idless_call() -> None:
@@ -927,7 +559,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
         native.completed_responses_fixture(
             "request-official",
             "gpt-5.6-sol",
-            1_700_000_000.0,
+            1_700_000_000,
             "{}",
             events_json,
         )
@@ -952,7 +584,7 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     frames = native.encode_responses_fixture(
         "request-official",
         "gpt-5.6-sol",
-        1_700_000_000.0,
+        1_700_000_000,
         "{}",
         events_json,
     )
@@ -965,3 +597,284 @@ def test_native_responses_preserves_multi_message_status_phase_and_idless_call()
     assert not any(
         payload["type"].startswith("response.function_call_arguments") for payload in payloads
     )
+
+
+def test_native_responses_serves_hosted_tool_items_end_to_end() -> None:
+    """Hosted-tool output items (web_search_call, mcp_call) pass through the
+    normalizer, the aggregated body, and the public stream verbatim, with
+    URL-citation annotations attached to the answer's text part.
+
+    Production incident (2026-09-04): the `response.output_item.added` frame
+    for a web_search_call killed the whole stream as malformed_response
+    post-dispatch across three orgs.
+    """
+    from openai.types.responses.response import Response
+    from openai.types.responses.response_output_item_done_event import (
+        ResponseOutputItemDoneEvent,
+    )
+
+    web_search_done = {
+        "id": "ws_1",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "current stable Python"},
+    }
+    mcp_done = {
+        "id": "mcp_1",
+        "type": "mcp_call",
+        "server_label": "deepwiki",
+        "name": "ask_question",
+        "arguments": '{"q": "pi"}',
+        "output": "3.14159",
+        "status": "completed",
+    }
+    chunks = (
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"},
+            }
+        ),
+        _sse(
+            {
+                "type": "response.web_search_call.searching",
+                "item_id": "ws_1",
+                "output_index": 0,
+                "sequence_number": 4,
+            }
+        ),
+        _sse({"type": "response.output_item.done", "output_index": 0, "item": web_search_done}),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "mcp_1",
+                    "type": "mcp_call",
+                    "server_label": "deepwiki",
+                    "name": "ask_question",
+                    "arguments": "",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.mcp_call_arguments.delta",
+                "item_id": "mcp_1",
+                "output_index": 1,
+                "delta": '{"q": "pi"}',
+                "sequence_number": 8,
+            }
+        ),
+        _sse({"type": "response.output_item.done", "output_index": 1, "item": mcp_done}),
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_text.delta",
+                "output_index": 2,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "Python 3.14.7.",
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_text.annotation.added",
+                "output_index": 2,
+                "item_id": "msg_1",
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": {
+                    "type": "url_citation",
+                    "url": "https://www.python.org/doc/versions/",
+                    "title": "Python versions",
+                    "start_index": 0,
+                    "end_index": 14,
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {"input_tokens": 320, "output_tokens": 41, "total_tokens": 361},
+                },
+            }
+        ),
+    )
+    normalized = _native_normalized("openai_responses", chunks)
+    assert normalized["failure"] is None
+    events = cast(list[JsonObject], normalized["events"])
+    kinds = [event["kind"] for event in events]
+    assert kinds == [
+        "hosted_tool_item_started",
+        "hosted_tool_item_progress",
+        "hosted_tool_item_completed",
+        "hosted_tool_item_started",
+        "hosted_tool_item_progress",
+        "hosted_tool_item_completed",
+        "provider_output_item_started",
+        "provider_text_delta",
+        "provider_text_annotation",
+        "provider_output_item_completed",
+        "usage",
+        "completed",
+    ]
+
+    native = pytest.importorskip("exp_gateway_native")
+    events_json = json.dumps(events)
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-hosted",
+            "gpt-5.6-sol",
+            1_700_000_000,
+            "{}",
+            events_json,
+        )
+    )
+    parsed = Response.model_validate(body)
+    assert [item.type for item in parsed.output] == ["web_search_call", "mcp_call", "message"]
+    assert body["output"][0] == web_search_done
+    assert body["output"][1] == mcp_done
+    message = body["output"][2]
+    assert message["content"][0]["text"] == "Python 3.14.7."
+    assert message["content"][0]["annotations"][0]["type"] == "url_citation"
+    assert parsed.usage is not None and parsed.usage.input_tokens == 320
+
+    frames = native.encode_responses_fixture(
+        "request-hosted",
+        "gpt-5.6-sol",
+        1_700_000_000,
+        "{}",
+        events_json,
+    )
+    payloads = [json.loads(frame.split("data: ", 1)[1]) for frame in frames if "data: " in frame]
+    searching = next(
+        payload for payload in payloads if payload["type"] == "response.web_search_call.searching"
+    )
+    # The public frame is re-stamped by the gateway: its own monotonic
+    # sequence, its own output index; the provider's payload fields survive.
+    assert searching["output_index"] == 0
+    assert searching["item_id"] == "ws_1"
+    sequence_numbers = [payload["sequence_number"] for payload in payloads]
+    assert sequence_numbers == sorted(set(sequence_numbers))
+    for payload in payloads:
+        if payload["type"] == "response.output_item.done":
+            ResponseOutputItemDoneEvent.model_validate(payload)
+    annotation_added = next(
+        payload
+        for payload in payloads
+        if payload["type"] == "response.output_text.annotation.added"
+    )
+    assert annotation_added["annotation"]["url"] == "https://www.python.org/doc/versions/"
+
+
+def test_native_responses_serves_a_budget_truncated_function_call_as_incomplete() -> None:
+    """A function call the provider itself cut at max_output_tokens serves as
+    an incomplete response with the truncated item intact, never a 502.
+
+    Frame shapes captured live from api.openai.com (gpt-6-astra, 2026-09-05):
+    `function_call_arguments.done` carries the PARTIAL bytes, the item's own
+    status is `incomplete`, and the terminal is `response.incomplete`.
+    Production incident (2026-09-05, ~5/min): the partial arguments failed the
+    strict JSON completion contract and killed the stream post-dispatch.
+    """
+    from openai.types.responses.response import Response
+
+    truncated_args = '{"city":"Paris","country":"France","units":"metric'
+    chunks = (
+        _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_astra",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "arguments": "",
+                    "call_id": "call_astra",
+                    "name": "get_weather",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_astra",
+                "output_index": 0,
+                "delta": truncated_args,
+            }
+        ),
+        _sse(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_astra",
+                "output_index": 0,
+                "arguments": truncated_args,
+            }
+        ),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "fc_astra",
+                    "type": "function_call",
+                    "status": "incomplete",
+                    "arguments": truncated_args,
+                    "call_id": "call_astra",
+                    "name": "get_weather",
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 62, "output_tokens": 24, "total_tokens": 86},
+                },
+            }
+        ),
+    )
+    normalized = _native_normalized("openai_responses", chunks)
+    assert normalized["failure"] is None
+    events = cast(list[JsonObject], normalized["events"])
+    kinds = [event["kind"] for event in events]
+    assert "tool_call_completed" not in kinds, kinds
+    assert kinds[-1] == "incomplete"
+
+    native = pytest.importorskip("exp_gateway_native")
+    events_json = json.dumps(events)
+    body = json.loads(
+        native.completed_responses_fixture(
+            "request-astra",
+            "gpt-6-astra",
+            1_700_000_000,
+            "{}",
+            events_json,
+        )
+    )
+    parsed = Response.model_validate(body)
+    assert parsed.status == "incomplete"
+    item = body["output"][0]
+    # The caller sees the provider's honest truncation: the item at its own
+    # incomplete status with the partial argument bytes, like OpenAI's wire.
+    assert item["type"] == "function_call"
+    assert item["status"] == "incomplete"
+    assert item["arguments"] == truncated_args

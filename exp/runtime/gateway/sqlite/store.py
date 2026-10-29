@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import sqlite3
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import assert_never
 
 from exp.common.core.artifacts import Sha256, sha256_json
+from exp.common.sqlite.connection import persistent_connection
 from exp.runtime.gateway.auth import (
     FingerprintPepperFile,
     GatewayAuthError,
@@ -30,16 +29,23 @@ from exp.runtime.gateway.contracts import (
     GatewayTarget,
     ProjectTarget,
 )
-from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
-from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.model_chain_authority import (
+    LocalSnapshotMemoOwner,
+    SnapshotClassificationMemo,
+    prepare_sqlite_chain_authority,
+    refuse_sqlite_chain_snapshot,
+    serving_snapshot_limit,
+)
+from exp.runtime.gateway.replay_identity import caller_operation_sha256 as _caller_operation_sha256
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.sqlite import key_delivery
 from exp.runtime.gateway.sqlite.alias_activation import (
     activate_alias_revision_in_transaction,
     alias_activation_transaction,
 )
-from exp.runtime.gateway.sqlite.migrations import initialize_database, persistent_connection
+from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionBinding,
     ProviderConnectionMutation,
@@ -47,7 +53,6 @@ from exp.runtime.gateway.sqlite.provider_authority import (
 from exp.runtime.gateway.sqlite.provider_store import ProviderConnectionStoreMixin
 from exp.runtime.gateway.sqlite.setup_authority import (
     configure_direct_alias_with_identity,
-    upsert_provider_connections_and_activate_direct_alias,
 )
 
 _LAST_USED_REFRESH_SECONDS = 60.0
@@ -59,6 +64,10 @@ class GatewayStoreError(ValueError):
 
 class InvalidVirtualKeyError(GatewayStoreError):
     """A virtual key is unknown, expired, revoked, or attached to disabled authority."""
+
+
+class ZdrRoutingUnavailableError(GatewayStoreError):
+    """A request demanded zero-data-retention routing this gateway cannot judge."""
 
 
 class AliasNotGrantedError(GatewayStoreError):
@@ -105,7 +114,7 @@ class SystemGatewayClock:
         return time.monotonic()
 
 
-class SQLiteGatewayStore(ProviderConnectionStoreMixin):
+class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
     """SQLite implementation of gateway authority and management operations."""
 
     _store_error = GatewayStoreError
@@ -117,6 +126,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         pepper_path: Path | None = None,
         clock: GatewayClock | None = None,
         busy_timeout_ms: int = 5_000,
+        serving_snapshot_max_bytes: int | None = None,
+        classification_memo: SnapshotClassificationMemo | None = None,
     ) -> None:
         """Initialize private database and fingerprint-pepper state.
 
@@ -125,7 +136,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             pepper_path: Optional HMAC pepper path outside SQLite.
             clock: Injectable time source.
             busy_timeout_ms: Maximum SQLite lock wait.
+            serving_snapshot_max_bytes: Per-file serving bound, default 64 MiB; no settings lookup.
+            classification_memo: Borrowed composition memo; omitted creates a private close owner.
         """
+        self._bind_classification_memo(classification_memo)
+        self._serving_snapshot_max_bytes = serving_snapshot_limit(serving_snapshot_max_bytes)
         self.database_path = database_path
         self._busy_timeout_ms = busy_timeout_ms
         self._clock = SystemGatewayClock() if clock is None else clock
@@ -442,6 +457,9 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             catalog_sha256: Normalized secret-free catalog digest.
         """
         with self._transaction() as connection:
+            refuse_sqlite_chain_snapshot(
+                connection, snapshot_ref, maximum_bytes=self._serving_snapshot_max_bytes
+            )
             connection.execute(
                 """
                 INSERT INTO catalog_snapshot_refs (
@@ -504,37 +522,8 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 refusal_failover=refusal_failover,
                 now=now,
                 store_error=GatewayStoreError,
+                maximum_bytes=self._serving_snapshot_max_bytes,
             )
-
-    def upsert_provider_connections_and_activate_direct_alias(
-        self,
-        *,
-        organization_id: str,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: Sha256,
-        provider_connections: tuple[ProviderConnectionMutation, ...],
-        replace: bool,
-        refusal_failover: bool = False,
-    ) -> None:
-        """Atomically revise providers, register a snapshot, and activate one direct alias."""
-        upsert_provider_connections_and_activate_direct_alias(
-            self,
-            organization_id=organization_id,
-            alias_id=alias_id,
-            alias_name=alias_name,
-            revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            provider_connections=provider_connections,
-            replace=replace,
-            refusal_failover=refusal_failover,
-            activate_alias_revision=activate_alias_revision_in_transaction,
-        )
 
     def configure_direct_alias_with_identity(
         self,
@@ -650,6 +639,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
         deadline_monotonic: float,
         app_referer: str | None = None,
         app_title: str | None = None,
+        client_ip: str | None = None,
     ) -> AuthorizationSnapshot:
         """Authenticate and authorize before any model or provider work.
 
@@ -659,6 +649,9 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             request: Canonical content-bearing request used only for its digest.
             deadline_monotonic: Absolute request-wide monotonic deadline.
             app_referer: Caller ``HTTP-Referer`` and ``app_title`` its ``X-Title`` app identity.
+            client_ip: Caller IP from the trusted proxy hop, frozen onto the snapshot
+                for the hosted authority's per-key IP enforcement; local SQLite serving
+                has no proxy, so it is simply carried through (usually ``None``).
 
         Returns:
             Immutable content-free authority snapshot.
@@ -694,6 +687,28 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             ).fetchone()
         if row is None:
             raise AliasNotGrantedError("requested model alias is not granted")
+        request_id = f"request-{uuid.uuid4().hex}"
+        with (
+            self._connect() as reader,
+            prepare_sqlite_chain_authority(
+                reader,
+                organization_id,
+                str(row["active_revision_id"]),
+                request_id=request_id,
+                operation="authorize",
+                maximum_bytes=self._serving_snapshot_max_bytes,
+                remaining_seconds=deadline_monotonic - self._clock.monotonic(),
+                classification_memo=self.classification_memo,
+            ) as proof,
+            self._transaction(connection=reader) as connection,
+        ):
+            proof.validate(
+                connection,
+                request_id=request_id,
+                organization_id=organization_id,
+                alias_revision_id=str(row["active_revision_id"]),
+                operation="authorize",
+            )
         target: GatewayTarget
         if str(row["target_kind"]) == "direct":
             target = DirectTarget(pool_id=str(row["pool_id"]))
@@ -703,18 +718,22 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 activation_ref=str(row["activation_ref"]),
                 catalog_sha256=str(row["catalog_sha256"]),
             )
-        match request:
-            case EmbeddingsRequest() | ImagesRequest():
-                # Keyed replay is deferred for the embeddings and images
-                # surfaces: they carry no idempotency key and never claim a
-                # caller-operation scope.
-                caller_operation = None
-            case GatewayRequest():
-                caller_operation = _caller_operation_sha256(request)
-            case _:  # pragma: no cover - exhaustive over the ServingRequest union.
-                assert_never(request)
+        # Only the chat-family surfaces carry an idempotency key; every other
+        # native surface (embeddings, images, decisions, speech, transcription)
+        # never claims a caller-operation scope.
+        caller_operation = None
+        if isinstance(request, GatewayRequest):
+            caller_operation = _caller_operation_sha256(request)
+            if request.zdr_requested:
+                # This gateway publishes no provider data-retention postures, so a
+                # zero-data-retention demand cannot be judged; refusing is the
+                # only honest answer.
+                raise ZdrRoutingUnavailableError(
+                    "provider.zdr demands zero-data-retention routing, which this "
+                    "gateway cannot judge: it publishes no provider data-retention postures"
+                )
         return AuthorizationSnapshot(
-            request_id=f"request-{uuid.uuid4().hex}",
+            request_id=request_id,
             organization_id=organization_id,
             identity_id=identity_id,
             virtual_key_id=key_id,
@@ -722,6 +741,13 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             alias_revision_id=str(row["active_revision_id"]),
             target=target,
             catalog_sha256=str(row["catalog_sha256"]),
+            requested_route_id=(
+                request.gateway.routing.route_id
+                if isinstance(request, GatewayRequest)
+                and request.gateway is not None
+                and request.gateway.routing is not None
+                else None
+            ),
             canonical_request_sha256=canonical_request_sha256(request),
             deadline_monotonic=deadline_monotonic,
             surface=request.surface,
@@ -729,6 +755,7 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             refusal_failover=bool(row["refusal_failover"]),
             app_referer=app_referer,
             app_title=app_title,
+            client_ip=client_ip,
         )
 
     def authenticate_key(self, *, raw_key: str) -> None:
@@ -889,9 +916,11 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
             yield connection
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        """Run one explicit immediate transaction with rollback on failure."""
-        with self._connect() as connection:
+    def _transaction(
+        self, *, connection: sqlite3.Connection | None = None
+    ) -> Iterator[sqlite3.Connection]:
+        """Run an immediate transaction, optionally borrowing the preflight connection."""
+        with self._connect() if connection is None else nullcontext(connection) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 yield connection
@@ -962,24 +991,3 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin):
                 created_at,
             ),
         )
-
-
-def _caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:
-    """Hash an opted-in caller operation without retaining the raw identifier.
-
-    Only the standard ``Idempotency-Key`` names a retriable operation.
-    ``client_request_id`` is a caller correlation identity that real
-    sessions reuse across distinct sequential requests, so it never keys
-    duplicate detection.
-
-    Args:
-        request: Canonical gateway request.
-
-    Returns:
-        Namespaced caller-operation digest, or ``None`` for ordinary requests.
-    """
-    if request.idempotency_key is None:
-        return None
-    return hashlib.sha256(
-        f"gateway-caller-operation-v1\0{request.idempotency_key}".encode()
-    ).hexdigest()

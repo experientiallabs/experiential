@@ -48,8 +48,8 @@ fn custom_tool_call_stream_normalizes_like_a_freeform_tool_call() {
                 kind: ProviderOutputItemKind::CustomToolCall,
                 ..
             },
-            Event::ToolCallStarted { call_id, name, .. },
-        ] if call_id == "call_live" && name == "exec"
+            Event::ToolCallStarted { call_id, name, custom, .. },
+        ] if call_id == "call_live" && name == "exec" && *custom
     ));
     let delta = SseEvent {
         event: None,
@@ -142,11 +142,11 @@ fn compatible_reasoning_content_requires_fireworks_route_authority() {
         }] if route == &route_sha256 && delta == "provider private"
     ));
 
-    let mut generic = Normalizer::new(Dialect::OpenAiCompatible);
-    assert!(generic
+    // Without a route the plaintext is display copy, never route reasoning.
+    let events = Normalizer::new(Dialect::OpenAiCompatible)
         .feed(&frame)
-        .expect("generic compatible extension is ignored")
-        .is_empty());
+        .unwrap();
+    assert!(matches!(events.as_slice(), [Event::ReasoningTextDelta(d)] if d == "provider private"));
 }
 
 #[test]
@@ -598,25 +598,401 @@ fn a_complete_tool_call_still_completes_when_the_budget_ends_the_stream() {
 }
 
 #[test]
-fn unparsable_tool_arguments_stay_malformed_on_a_normal_finish() {
-    // The strict contract holds whenever the provider claims it finished the
-    // call: a `tool_calls`/`stop` terminal with a dangling fragment is still a
-    // malformed stream, never silently dropped.
+fn namespaced_function_call_round_trips_namespace_through_the_stream() {
+    // Codex agent tools (e.g. spawn_agent) arrive as namespaced function
+    // calls; the provider rejects a replay of the item without its
+    // namespace, so the field must survive normalization verbatim.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "in_progress",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "collaboration", "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&added)
+        .expect("namespaced start must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ProviderOutputItemStarted { .. },
+            Event::ToolCallStarted { name, namespace: Some(namespace), .. },
+        ] if name == "spawn_agent" && namespace == "collaboration"
+    ));
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "completed",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "collaboration", "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&item_done)
+        .expect("namespaced completion must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ToolArgumentsDelta { .. },
+            Event::ProviderOutputItemCompleted { .. },
+            Event::ToolCallCompleted { call, .. },
+        ] if call.namespace.as_deref() == Some("collaboration") && !call.custom
+    ));
+}
+
+#[test]
+fn a_function_call_namespace_changed_at_completion_is_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "collaboration", "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    normalizer.feed(&added).expect("start must normalize");
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "spawn_agent",
+                "namespace": "other", "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let failure = normalizer
+        .feed(&item_done)
+        .expect_err("a changed namespace must fail closed");
+    assert!(failure
+        .safe_message
+        .contains("changed identity at completion"));
+}
+
+#[test]
+fn a_caller_attributed_function_call_round_trips_caller_through_the_stream() {
+    // SDK 3.0 programmatic tool calling attributes a function call to the
+    // program that invoked it via an opaque `caller` object; the item must
+    // replay exactly as emitted, so the object survives normalization
+    // verbatim.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let caller = serde_json::json!({"type": "program", "id": "prog_1"});
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "in_progress",
+                "call_id": "call_live", "name": "lookup",
+                "caller": caller, "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&added)
+        .expect("caller-attributed start must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ProviderOutputItemStarted { .. },
+            Event::ToolCallStarted { name, caller: Some(value), .. },
+        ] if name == "lookup" && *value == caller
+    ));
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "completed",
+                "call_id": "call_live", "name": "lookup",
+                "caller": caller, "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let events = normalizer
+        .feed(&item_done)
+        .expect("caller-attributed completion must normalize");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::ToolArgumentsDelta { .. },
+            Event::ProviderOutputItemCompleted { .. },
+            Event::ToolCallCompleted { call, .. },
+        ] if call.caller.as_ref() == Some(&caller)
+    ));
+}
+
+#[test]
+fn a_function_call_caller_changed_at_completion_is_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "lookup",
+                "caller": {"type": "program", "id": "prog_1"}, "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    normalizer.feed(&added).expect("start must normalize");
+    let item_done = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "status": "completed",
+                "call_id": "call_live", "name": "lookup",
+                "caller": {"type": "program", "id": "prog_2"}, "arguments": "{}",
+            },
+        })
+        .to_string(),
+    };
+    let failure = normalizer
+        .feed(&item_done)
+        .expect_err("a caller changed at completion is malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}
+
+#[test]
+fn a_non_object_function_call_caller_is_malformed() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let added = SseEvent {
+        event: None,
+        data: serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_live", "type": "function_call",
+                "call_id": "call_live", "name": "lookup",
+                "caller": "program", "arguments": "",
+            },
+        })
+        .to_string(),
+    };
+    let failure = normalizer
+        .feed(&added)
+        .expect_err("a non-object caller is malformed");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}
+
+#[test]
+fn responses_error_frames_classify_by_content_and_read_nested_envelopes() {
+    // Top-level documented shape: a rate limit is a throttle, not a 502.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let events = normalizer
+        .feed(&crate::sse::SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "error",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached.",
+                "param": null,
+                "sequence_number": 1,
+            })
+            .to_string(),
+        })
+        .expect("error frame normalizes");
+    assert!(matches!(
+        events.as_slice(),
+        [Event::Failed(failure)] if failure.failure_class == FailureClass::Throttled
+    ));
+
+    // Nested envelope (undocumented but observed): still classified, never opaque.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.set_request_words(["gpt-6-astra"]);
+    let events = normalizer
+        .feed(&crate::sse::SseEvent {
+            event: None,
+            data: serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of gpt-6-astra.",
+                },
+            })
+            .to_string(),
+        })
+        .expect("nested error frame normalizes");
+    match events.as_slice() {
+        [Event::Failed(failure)] => {
+            assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+            assert!(!failure.failover_eligible);
+            // The request's own model id is caller-known, so the sentence is kept.
+            assert_eq!(
+                failure.provider_detail.as_deref(),
+                Some("context_length_exceeded: Your input exceeds the context window of gpt-6-astra.")
+            );
+            assert_eq!(
+                failure.public_error().message,
+                "provider rejected the request: context_length_exceeded: Your input exceeds the context window of gpt-6-astra."
+            );
+        }
+        other => panic!("expected one failed event, got {other:?}"),
+    }
+}
+
+#[test]
+fn responses_error_frames_keep_numeric_codes() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    let events = normalizer
+        .feed(&crate::sse::SseEvent {
+            event: None,
+            data: serde_json::json!({"type": "error", "code": 429, "message": "Slow down."})
+                .to_string(),
+        })
+        .expect("numeric code frame normalizes");
+    assert!(matches!(
+        events.as_slice(),
+        [Event::Failed(failure)] if failure.failure_class == FailureClass::Throttled
+            && failure.provider_detail.as_deref() == Some("429: Slow down.")
+    ));
+}
+
+#[test]
+fn foundry_deepseek_zero_argument_call_streams_a_stray_empty_string_delta() {
+    // Azure Foundry serving DeepSeek-V4-Flash, captured live 2026-09-10 (ids
+    // redacted): a zero-argument call opens with `arguments: ""`, streams
+    // `{}`, then one more delta whose text is `""` (two quote characters),
+    // then finishes `tool_calls`. Verbatim assembly gave `{}""` and failed
+    // every such call as malformed_response ("trailing characters at line 1
+    // column 3 (4 bytes)"; 222 production attempts on 2026-09-10 alone). The
+    // stray delta is withheld from the caller and the call completes as `{}`.
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
-    normalizer
-        .feed(&compatible_chunk(
-            serde_json::json!({"tool_calls": [{
-                "index": 0, "id": "call_1", "type": "function",
-                "function": {"name": "get_weather", "arguments": "{\"city"},
-            }]}),
-            Some("tool_calls"),
-        ))
-        .expect("tool chunk must normalize");
+    let frames = [
+        serde_json::json!({"reasoning_content": null, "role": "assistant", "content": ""}),
+        serde_json::json!({"role": null, "content": "\n\n", "reasoning_content": null, "tool_calls": null}),
+        serde_json::json!({"role": null, "content": null, "reasoning_content": null, "tool_calls": [{
+            "id": "call_1ec818a39da5408bb7b383a9", "index": 0, "type": "function",
+            "function": {"name": "view_agent_graph", "arguments": ""},
+        }]}),
+        serde_json::json!({"role": null, "content": null, "reasoning_content": null, "tool_calls": [{
+            "id": null, "index": 0, "type": "function",
+            "function": {"name": null, "arguments": "{}"},
+        }]}),
+        serde_json::json!({"role": null, "content": null, "reasoning_content": null, "tool_calls": [{
+            "id": null, "index": 0, "type": "function",
+            "function": {"name": null, "arguments": "\"\""},
+        }]}),
+    ];
+    let mut events = Vec::new();
+    for frame in &frames {
+        events.extend(
+            normalizer
+                .feed(&compatible_chunk(frame.clone(), None))
+                .expect("every Foundry frame must normalize"),
+        );
+    }
+    events.extend(
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"reasoning_content": null}),
+                Some("tool_calls"),
+            ))
+            .expect("finish chunk must normalize"),
+    );
+    events.extend(
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "[DONE]".to_string(),
+            })
+            .expect("the stream must complete"),
+    );
+    let shown: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolArgumentsDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, "{}", "the stray delta never reaches the caller");
+    assert!(matches!(
+        events.as_slice(),
+        [
+            Event::TextDelta(text),
+            Event::ToolCallStarted { call_id, name, .. },
+            Event::ToolArgumentsDelta { delta: opening, .. },
+            Event::ToolArgumentsDelta { delta, .. },
+            Event::ToolCallCompleted { call, .. },
+            Event::Completed,
+        ] if text == "\n\n"
+            && call_id == "call_1ec818a39da5408bb7b383a9"
+            && name == "view_agent_graph"
+            && opening.is_empty()
+            && delta == "{}"
+            && call.raw_arguments == "{}"
+    ));
+}
+
+#[test]
+fn compatible_stream_still_rejects_argument_content_after_the_object_closed() {
+    // The hold-back drops NOISE only: a second object after a complete one
+    // is two candidate parses, and the stream stays malformed, reporting
+    // the position in the bytes the provider actually sent.
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    for arguments in ["{\"a\":1}", "{\"b\":2}"] {
+        normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "lookup", "arguments": arguments},
+                }]}),
+                None,
+            ))
+            .expect("fragments normalize until completion");
+    }
     let failure = normalizer
         .feed(&SseEvent {
             event: None,
             data: "[DONE]".to_string(),
         })
-        .expect_err("a dangling fragment on a normal finish is malformed");
+        .expect_err("content after a closed object stays malformed");
     assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    assert!(
+        failure
+            .safe_message
+            .ends_with("trailing characters at line 1 column 8 (14 bytes)"),
+        "{}",
+        failure.safe_message
+    );
+    assert!(
+        failure.failover_eligible,
+        "a provider fault may fail over to a later rung"
+    );
 }

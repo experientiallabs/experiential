@@ -15,6 +15,8 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.cli.judge import app as judge_app_module
+from exp.cli.shared import consent as consent_module
+from exp.common.config.settings import set_maximum_command_cost_usd
 from exp.common.models import (
     BillingSource,
     ModelCapabilities,
@@ -311,7 +313,7 @@ def test_calibrate_fails_closed_when_catalog_pricing_is_missing(tmp_path: Path) 
 
 
 def test_calibrate_uses_shared_command_budget_when_flag_is_omitted(tmp_path: Path) -> None:
-    """The shared command-budget setting becomes the calibration ceiling."""
+    """A shared budget overrun offers a route to consent before labels or credentials."""
     store = _built_store(tmp_path)
     _setup(store)
     root = store.paths.root
@@ -338,10 +340,65 @@ def test_calibrate_uses_shared_command_budget_when_flag_is_omitted(tmp_path: Pat
 
     output = " ".join(unstyle(result.output).replace("│", " ").split())
     assert result.exit_code == 2
-    assert "exceeds the configured per-command" in output
-    assert "exp config budget 0.59" in output
-    assert "--yes cannot override" in output
+    assert "command estimate $0.59 exceeds the $0.01 budget" in output
+    assert "interactive terminal to proceed, or use --yes" in output
     assert "missing labels" not in output
+
+
+@pytest.mark.parametrize("answer", ["y", "n"])
+def test_calibration_budget_override_reaches_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """Both calibration budgets warn once, and an accepted estimate covers the actual ledger."""
+    store = _built_store(tmp_path)
+    _setup(store)
+    _write_catalog(store.paths.root, _priced_catalog())
+    set_maximum_command_cost_usd(0.01, store.paths.root)
+    plan = prepare_manual_judge_calibration(store, sample_size=3)
+    client = _JudgeClient(plan.setup.judge_model)
+    runtime = _RuntimeCatalog(
+        ResolvedModel(
+            alias="judge-main",
+            snapshot=plan.setup.judge_model,
+            capabilities=ModelCapabilities(),
+            client=client,
+            embedding_client=None,
+        )
+    )
+    monkeypatch.setattr(judge_app_module, "RuntimeModelCatalog", lambda _catalog: runtime)
+    monkeypatch.setattr(consent_module, "can_prompt", lambda _console: True)
+    labels = [
+        argument
+        for trace in plan.traces
+        for argument in ("--label", f"{trace.trace_id}:task-success=1")
+    ]
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "judge",
+            "calibrate",
+            "support",
+            "--root",
+            str(store.paths.root),
+            "--sample-size",
+            "3",
+            "--maximum-cost-usd",
+            "0.001",
+            "--approve",
+            "--accept-insufficient-labels",
+            *labels,
+        ],
+        input=f"{answer}\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(unstyle(result.output).split())
+    assert "warning command estimate" in output
+    assert "warning judge calibration estimate" in output
+    assert output.count("Proceed anyway") == 1
+    assert len(client.requests) == (3 if answer == "y" else 0)
 
 
 def test_setup_output_is_plain_language_and_hides_execution_internals(

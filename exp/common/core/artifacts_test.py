@@ -16,6 +16,8 @@ from exp.common.core.artifacts import (
     SecretBoundaryError,
     SourceIdentity,
     StructuredFailure,
+    assert_key_secret_free,
+    assert_prose_secret_free,
     assert_secret_free,
     assert_text_secret_free,
     canonical_json_bytes,
@@ -140,7 +142,7 @@ def test_envelope_matches_manifest_covers_every_base_envelope_field() -> None:
 
 
 def test_source_identity_and_secret_boundary_round_trip() -> None:
-    """Source provenance serializes, while credential values and references do not."""
+    """Source provenance serializes, while credential values and reference fields do not."""
     envelope = ArtifactEnvelope(
         schema_version=1,
         created_at=datetime(2026, 8, 11, tzinfo=UTC),
@@ -155,8 +157,82 @@ def test_source_identity_and_secret_boundary_round_trip() -> None:
         assert_secret_free({"api_key_env": "OPENAI_API_KEY"})
     with pytest.raises(SecretBoundaryError, match="secret-like"):
         assert_secret_free({"note": "sk-abcdefghijklmnopqrstuvwxyz123456"})
-    with pytest.raises(SecretBoundaryError, match="environment name"):
-        assert_secret_free({"connection_hint": "OPENAI_API_KEY"})
+    with pytest.raises(SecretBoundaryError, match="credential_ref"):
+        assert_secret_free({"credential_ref": "OPENAI_API_KEY"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "OPENAI_API_KEY",
+        "client = Boltz(api_key=os.environ['BOLTZ_API_KEY'])",
+        "Set BRAINTRUST_API_KEY to authenticate requests.",
+    ],
+)
+def test_structured_evidence_preserves_public_credential_variable_names(content: str) -> None:
+    """Documentation names are safe text, while actual token values remain rejected."""
+    assert_secret_free({"messages": [{"role": "tool", "content": content}]})
+    with pytest.raises(SecretBoundaryError, match="secret-like"):
+        assert_secret_free({"content": content + " = sk-abcdefghijklmnopqrstuvwxyz123456"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The company sells password management and authorization software.",
+        "Set OPENAI_API_KEY in the environment. Do not share the secret.",
+        "Password management: resets and vaults.",
+    ],
+)
+def test_prose_allows_credential_mentions(content: str) -> None:
+    """Credential vocabulary is ordinary prose when it does not assign a value."""
+    assert_prose_secret_free(content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "export OPENAI_API_KEY=arbitrary-value",
+        '"CUSTOM_AUTH_TOKEN": "arbitrary-value"',
+        "password = arbitrary-value",
+        "api key: arbitrary-value",
+        "The password is arbitrary-value",
+        "The API key was arbitrary-value",
+        "Use sk-abcdefghijklmnopqrstuvwxyz123456 to connect.",
+    ],
+)
+def test_prose_rejects_credential_assignments_and_values(content: str) -> None:
+    """Unrecognized credential values and known token prefixes remain prohibited."""
+    with pytest.raises(SecretBoundaryError):
+        assert_prose_secret_free(content)
+
+
+@pytest.mark.parametrize(
+    "key", ["password-policy", "authorization status", "security.password-policy"]
+)
+def test_descriptive_keys_are_not_credential_fields(key: str) -> None:
+    """A schema can describe credentials without storing a credential field."""
+    assert_key_secret_free(key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api_key",
+        " api_key ",
+        "credential-ref",
+        "OPENAI_API_KEY",
+        "OPENAI_API_KEY=arbitrary-value",
+        "openai_api_key",
+        "provider.auth_token",
+        "provider/password",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+    ],
+)
+def test_exact_credential_keys_and_secret_values_are_rejected(key: str) -> None:
+    """Precise field validation still rejects decoded credential and environment names."""
+    with pytest.raises(SecretBoundaryError):
+        assert_key_secret_free(key)
 
 
 def test_artifact_file_paths_reject_nonportable_components() -> None:
@@ -196,6 +272,28 @@ def test_redaction_placeholder_passes_every_secret_boundary() -> None:
     assert_secret_free({"content": SECRET_REDACTION_PLACEHOLDER})
     assert_text_secret_free(SECRET_REDACTION_PLACEHOLDER)
     assert redact_secret_text(SECRET_REDACTION_PLACEHOLDER) == (SECRET_REDACTION_PLACEHOLDER, 0)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "AKIAABCDEFGHIJKLMNOP",
+        "xoxb-abcdefghijklmnop",
+        "bEaReR\t\nabcdefghijklmnop",
+    ],
+)
+def test_large_captured_documents_still_reject_secrets(secret: str) -> None:
+    """Literal prefilters preserve every detector after long Unicode source text."""
+    prose = "Research evidence café 東京. " * 10_000
+    assert_secret_free({"content": prose + "sk-short AKIAshort xoxb-short Bearer short"})
+    for check in (assert_secret_free, assert_text_secret_free):
+        with pytest.raises(SecretBoundaryError, match="secret-like"):
+            check(prose + secret)
+    redacted, count = redact_secret_text(prose + secret)
+    assert count == 1
+    assert redacted == prose + SECRET_REDACTION_PLACEHOLDER
+    assert_secret_free({"content": redacted})
 
 
 def test_redact_secret_json_counts_nested_replacements() -> None:

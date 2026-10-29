@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from typing import Literal
 
 from exp.common.core.artifacts import (
     ArtifactInput,
@@ -14,51 +14,116 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import (
     AssistantAction,
+    Embedding,
+    ModelCapabilities,
     ModelClient,
     ModelMessage,
     ModelRequest,
     ModelResponse,
 )
 from exp.common.project import ArtifactStore, artifact_input
-from exp.common.tasks import TaskCase
+from exp.common.tasks import TaskCase, ToolSchema
+from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import (
+    RECONSTRUCTED_TEXT_PROMPT_VERSION,
+    MemoryContext,
     TextWorldModelTransition,
     build_world_model_request,
+    candidate_rag_actions,
     parse_world_model_transition,
+    validate_transition_action,
+)
+from exp.simulation.engines.text.tokens import (
+    TokenCounter,
+    Utf8UpperBoundTokenCounter,
+    WorldModelCapacityError,
+    bound_unpublished_output,
 )
 from exp.simulation.retrieval import (
-    RAGAction,
+    RAGIndex,
     RAGMatch,
     RAGQuery,
     TraceRAGRetriever,
     load_rag_index,
 )
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
+from exp.simulation.retrieval.jev import JEVSelector
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
-    GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
     WORLD_MODEL_ARTIFACT_PATH,
     GroundedWorldModelArtifact,
     grounded_world_model_content,
     grounded_world_model_prompt_sha256,
+    persist_grounded_world_model,
 )
 
 
 @dataclass(frozen=True)
 class PreparedGroundedWorldModelCall:
-    """One retrieved and framed grounded request before provider dispatch."""
+    """One retrieved and framed grounded request before provider dispatch.
+
+    Attributes:
+        request: Fully framed world-model request ready for dispatch.
+        matches: Ordered grounding examples selected for the action.
+        action: Exact candidate action whose call IDs constrain generated results.
+    """
 
     request: ModelRequest
     matches: tuple[RAGMatch, ...]
+    action: AssistantAction
+
+    def fit_context(
+        self,
+        capabilities: ModelCapabilities,
+        token_counter: TokenCounter,
+        maximum_input_tokens: int | None = None,
+    ) -> PreparedGroundedWorldModelCall:
+        """Pack optional examples and bind provenance to the unchanged request allowance.
+
+        Args:
+            capabilities: Frozen world-model context and output capacity.
+            token_counter: Full-request input counter used by dispatch admission.
+            maximum_input_tokens: Optional stricter frozen input reservation.
+
+        Returns:
+            Request with only whole included examples in its matching provenance.
+        """
+        context = capabilities.context_window_tokens
+        output = self.request.maximum_output_tokens
+        if context is None or output is None:
+            return self
+        ceiling = context - output
+        if maximum_input_tokens is not None:
+            ceiling = min(ceiling, maximum_input_tokens)
+        request, identifiers = pack_world_model_request(
+            self.request, maximum_input_tokens=ceiling, token_counter=token_counter
+        )
+        # Optional evidence yields to the requested output first. An unpublished output limit
+        # can then use remaining context around the required prompt, never around dropped examples.
+        request = bound_unpublished_output(request, capabilities, token_counter)
+        matches = tuple(
+            match for match in self.matches if match.transition.transition_id in identifiers
+        )
+        if tuple(match.transition.transition_id for match in matches) != identifiers:
+            raise ValueError("packed world-model examples differ from retrieved provenance")
+        return replace(self, request=request, matches=matches)
 
 
 @dataclass(frozen=True)
 class DispatchedGroundedWorldModelCall:
-    """One artifact-bound response paired with its exact request and retrieval evidence."""
+    """One artifact-bound response paired with its exact request and retrieval evidence.
+
+    Attributes:
+        request: Exact dispatched world-model request.
+        response: Provider response awaiting protocol validation.
+        matches: Grounding evidence included in the request.
+        action: Exact candidate action used when validating generated result identities.
+    """
 
     request: ModelRequest
     response: ModelResponse
     matches: tuple[RAGMatch, ...]
+    action: AssistantAction
 
 
 @dataclass(frozen=True)
@@ -73,12 +138,40 @@ class GroundedWorldModelCall:
 
 @dataclass(frozen=True)
 class GroundedWorldModel:
-    """Call one configured model with nearest observed transitions as immutable evidence."""
+    """Call one configured model with nearest observed transitions as immutable evidence.
+
+    Attributes:
+        artifact_input: Exact verified grounded-model manifest reference.
+        artifact: Frozen model identity and grounding protocol.
+        retriever: Fit or serving retriever bound to the artifact's immutable corpus.
+        client: Explicit completion provider for world predictions.
+        capabilities: Required resolved metadata matching the artifact's frozen identity.
+            Unknown capacity fields remain explicit rather than disabling identity verification.
+        token_counter: Complete-request counter used for capacity admission.
+        evidence_selector: Optional artifact-bound JEV policy over eligible candidates.
+    """
 
     artifact_input: ArtifactInput
     artifact: GroundedWorldModelArtifact
     retriever: TraceRAGRetriever
     client: ModelClient
+    capabilities: ModelCapabilities
+    token_counter: TokenCounter = field(default_factory=Utf8UpperBoundTokenCounter)
+    evidence_selector: JEVSelector | None = None
+
+    def __post_init__(self) -> None:
+        """Require the current prompt and the immutable build's exact capacity binding."""
+        _require_current_prompt(self.artifact)
+        selector_id = (
+            None if self.evidence_selector is None else self.evidence_selector.policy.identity
+        )
+        if selector_id != self.artifact.selection_policy_sha256:
+            raise ValueError("evidence selection policy differs from the simulator artifact")
+        if self.capabilities.identity_sha256() != self.artifact.model.capabilities_sha256:
+            raise ValueError(
+                "world-model capabilities differ from the frozen build artifact; "
+                "use the artifact's resolved model or rebuild with the intended model"
+            )
 
     def prepare_turn(
         self,
@@ -88,6 +181,10 @@ class GroundedWorldModel:
         candidate_response: AssistantAction,
         excluded_lineage_ids: tuple[str, ...],
         maximum_output_tokens: int,
+        state: JsonObject | None = None,
+        json_object_output: bool = False,
+        memory: MemoryContext | None = None,
+        output_protocol: Literal["text", "json-tool"] = "text",
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -97,28 +194,162 @@ class GroundedWorldModel:
             candidate_response: Latest visible candidate action.
             excluded_lineage_ids: Source lineages forbidden from retrieval.
             maximum_output_tokens: Explicit provider output ceiling.
+            state: Private environment state retained between simulated turns.
+            json_object_output: Provider JSON control included in required framing.
+            memory: Typed cross-trajectory memory rendered into its authority channels.
+            output_protocol: Text transition or typed-proposal system instructions.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
         """
-        if candidate_response.content is None:
-            raise ValueError("grounded text simulation requires a visible candidate message")
-        query = RAGQuery(
-            task=task.instruction,
-            initial_context=task.initial_context,
-            action=RAGAction(kind="message", content=candidate_response.content),
-            excluded_lineage_ids=excluded_lineage_ids,
-            top_k=self.artifact.top_k,
+        self.preflight_turn(
+            task=task,
+            visible_messages=visible_messages,
+            candidate_response=candidate_response,
+            maximum_output_tokens=maximum_output_tokens,
+            state=state,
+            json_object_output=json_object_output,
+            memory=memory,
+            output_protocol=output_protocol,
         )
-        matches = self.retriever.retrieve(query)
+        if self.artifact.original_evidence == "none":
+            # Memory-first profile: no recorded transition is retrieved for any prediction.
+            request = build_world_model_request(
+                task,
+                visible_messages=visible_messages,
+                candidate_response=candidate_response,
+                grounded_examples=(),
+                knowledge=self.artifact.knowledge,
+                maximum_output_tokens=maximum_output_tokens,
+                state=state,
+                memory=memory,
+                output_protocol=output_protocol,
+            )
+            request = request.model_copy(update={"json_object_output": json_object_output})
+            return PreparedGroundedWorldModelCall(
+                request=request, matches=(), action=candidate_response
+            )
+        queries = tuple(
+            RAGQuery(
+                task=task.instruction,
+                initial_context=task.initial_context,
+                action=action,
+                excluded_lineage_ids=excluded_lineage_ids,
+                top_k=(
+                    self.evidence_selector.policy.candidate_limit
+                    if self.evidence_selector
+                    else self.artifact.top_k
+                ),
+            )
+            for action in candidate_rag_actions(candidate_response)
+        )
+        batches = tuple(self.retriever.retrieve(query) for query in queries)
+        if self.evidence_selector is not None:
+            batches = tuple(
+                self.evidence_selector.select(
+                    query,
+                    candidates,
+                    state=state or {},
+                    history=visible_messages,
+                    top_k=self.artifact.top_k,
+                )
+                for query, candidates in zip(queries, batches, strict=True)
+            )
+        # Round-robin over each call's nearest examples, retaining the pinned total context bound.
+        selected: dict[str, RAGMatch] = {}
+        for rank in range(self.artifact.top_k):
+            for batch in batches:
+                if rank < len(batch) and len(selected) < self.artifact.top_k:
+                    match = batch[rank]
+                    selected.setdefault(match.transition.transition_id, match)
+        matches = tuple(selected.values())
         request = build_world_model_request(
             task,
             visible_messages=visible_messages,
             candidate_response=candidate_response,
             grounded_examples=matches,
+            knowledge=self.artifact.knowledge,
             maximum_output_tokens=maximum_output_tokens,
+            state=state,
+            memory=memory,
+            output_protocol=output_protocol,
         )
-        return PreparedGroundedWorldModelCall(request=request, matches=matches)
+        request = request.model_copy(update={"json_object_output": json_object_output})
+        return PreparedGroundedWorldModelCall(
+            request=request, matches=matches, action=candidate_response
+        )
+
+    def preflight_turn(
+        self,
+        *,
+        task: TaskCase,
+        visible_messages: Sequence[ModelMessage],
+        candidate_response: AssistantAction,
+        maximum_output_tokens: int,
+        state: JsonObject | None = None,
+        json_object_output: bool = False,
+        maximum_input_tokens: int | None = None,
+        memory: MemoryContext | None = None,
+        output_protocol: Literal["text", "json-tool"] = "text",
+    ) -> None:
+        """Admit required framing before retrieval or its paid-work accounting window.
+
+        Args:
+            task: Complete canonical task, including tool schemas and initial context.
+            visible_messages: Candidate-visible transcript retained in the world prompt.
+            candidate_response: Exact assistant action and original tool-call identities.
+            maximum_output_tokens: Original requested output allowance.
+            state: Complete private environment state retained between simulated turns.
+            json_object_output: Provider JSON control included in token accounting.
+            maximum_input_tokens: Optional stricter frozen request reservation.
+            memory: Typed cross-trajectory memory counted as required content.
+            output_protocol: Text transition or typed-proposal system instructions.
+
+        Raises:
+            ValueError: The output allowance is not positive.
+            WorldModelCapacityError: Required framing cannot fit the declared capacities.
+        """
+        request = build_world_model_request(
+            task,
+            visible_messages=visible_messages,
+            candidate_response=candidate_response,
+            grounded_examples=(),
+            knowledge=self.artifact.knowledge,
+            maximum_output_tokens=maximum_output_tokens,
+            state=state,
+            memory=memory,
+            output_protocol=output_protocol,
+        ).model_copy(update={"json_object_output": json_object_output})
+        # Admission may bind unpublished output around required content. Retrieval still uses
+        # the original allowance so optional examples yield before actual output is bound.
+        request = bound_unpublished_output(request, self.capabilities, self.token_counter)
+        self._require_capacity(request, maximum_input_tokens=maximum_input_tokens)
+
+    def _require_capacity(
+        self, request: ModelRequest, *, maximum_input_tokens: int | None = None
+    ) -> None:
+        """Validate one fully rendered request without retrieval, dispatch, or accounting."""
+        output = request.maximum_output_tokens
+        if output is None or output <= 0:
+            raise WorldModelCapacityError("world-model maximum_output_tokens must be positive")
+        published_output = self.capabilities.maximum_output_tokens
+        if published_output is not None and output > published_output:
+            raise WorldModelCapacityError(
+                "world-model output exceeds the published model capacity; lower "
+                "maximum_output_tokens or choose a model with a larger output capacity"
+            )
+        required = self.token_counter.count(request)
+        context = self.capabilities.context_window_tokens
+        if required < 0 or (context is not None and required + output > context):
+            raise WorldModelCapacityError(
+                "required world-model input and output exceed the context capacity; "
+                "choose a larger-context world model"
+            )
+        if maximum_input_tokens is not None and required > maximum_input_tokens:
+            raise WorldModelCapacityError(
+                "required world-model input exceeds the frozen input reservation; "
+                "prepare a larger input reservation before retrying"
+            )
 
     def complete_turn(
         self,
@@ -131,12 +362,18 @@ class GroundedWorldModel:
 
         Returns:
             Exact request, response, and retrieved evidence.
+
+        Raises:
+            ValueError: Required evidence or output cannot fit the bound model capacity.
         """
+        prepared = prepared.fit_context(self.capabilities, self.token_counter)
+        self._require_capacity(prepared.request)
         response = self.client.complete(prepared.request)
         return DispatchedGroundedWorldModelCall(
             request=prepared.request,
             response=response,
             matches=prepared.matches,
+            action=prepared.action,
         )
 
     def parse_turn(
@@ -151,18 +388,21 @@ class GroundedWorldModel:
         Returns:
             Completed grounded call with its parsed visible transition.
         """
+        transition = parse_world_model_transition(dispatched.response.output)
+        validate_transition_action(transition, dispatched.action)
         return GroundedWorldModelCall(
             request=dispatched.request,
             response=dispatched.response,
             matches=dispatched.matches,
-            transition=parse_world_model_transition(dispatched.response.output),
+            transition=transition,
         )
 
     def step(
         self,
         *,
         task: str,
-        action: RAGAction,
+        action: AssistantAction,
+        tools: tuple[ToolSchema, ...] = (),
         initial_context: JsonObject | None = None,
         excluded_lineage_ids: tuple[str, ...] = (),
         maximum_output_tokens: int = 1_024,
@@ -171,59 +411,49 @@ class GroundedWorldModel:
 
         Args:
             task: Current request-visible task.
-            action: Latest assistant message or tool call.
+            action: Latest assistant text or tool calls retaining their original call IDs.
+            tools: Declared schemas for every tool the assistant may invoke.
             initial_context: Safe request-visible starting context.
             excluded_lineage_ids: Source lineages forbidden for this query.
             maximum_output_tokens: Explicit provider output ceiling.
 
         Returns:
             Parsed next visible message and terminal state from the text world-model protocol.
+
+        Raises:
+            TypeError: The action is not a canonical assistant action.
+            ValueError: Tool names, call IDs, response identity, or generated results are invalid.
         """
+        if not isinstance(action, AssistantAction):
+            raise TypeError("world-model actions must use AssistantAction with original tool IDs")
+        names = {tool.name for tool in tools}
+        if any(call.name not in names for call in action.tool_calls):
+            raise ValueError("declare every assistant tool in the tools argument")
+        if len({call.call_id for call in action.tool_calls}) != len(action.tool_calls):
+            raise ValueError("assistant tool calls must have unique call IDs")
         context = {} if initial_context is None else initial_context
-        query = RAGQuery(
-            task=task,
+        task_id = stable_id("world-model-step-task", {"task": task, "initial_context": context})
+        task_case = TaskCase(
+            task_id=task_id,
+            lineage_group_id=task_id,
+            partition="held_out",
+            instruction=task,
             initial_context=context,
-            action=action,
-            excluded_lineage_ids=excluded_lineage_ids,
-            top_k=self.artifact.top_k,
+            tools=tools,
+            workload_weight=1.0,
+            source_trace_ids=(task_id,),
         )
-        matches = self.retriever.retrieve(query)
-        evidence = [
-            {
-                "task": match.transition.task,
-                "action": match.transition.action.model_dump(mode="json", exclude_none=True),
-                "observation": match.transition.observation.model_dump(mode="json"),
-            }
-            for match in matches
-        ]
-        request = ModelRequest(
-            messages=(
-                ModelMessage(
-                    role="system",
-                    content=GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
-                ),
-                ModelMessage(
-                    role="user",
-                    content=json.dumps(
-                        {
-                            "task": task,
-                            "initial_context": context,
-                            "action": action.model_dump(mode="json", exclude_none=True),
-                            "grounded_examples": evidence,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                ),
-            ),
-            tool_choice="none",
+        prepared = self.prepare_turn(
+            task=task_case,
+            visible_messages=(),
+            candidate_response=action,
+            excluded_lineage_ids=excluded_lineage_ids,
             maximum_output_tokens=maximum_output_tokens,
         )
-        response = self.client.complete(request)
-        if response.model != self.artifact.model:
+        dispatched = self.complete_turn(prepared)
+        if dispatched.response.model != self.artifact.model:
             raise ValueError("world-model response identity differs from its build artifact")
-        return parse_world_model_transition(response.output)
+        return self.parse_turn(dispatched).transition
 
 
 def load_grounded_world_model(
@@ -231,7 +461,10 @@ def load_grounded_world_model(
     artifact_id: str,
     *,
     client: ModelClient,
+    capabilities: ModelCapabilities,
     embedder: RAGEmbedderBinding | None = None,
+    token_counter: TokenCounter | None = None,
+    evidence_selector: JEVSelector | None = None,
 ) -> GroundedWorldModel:
     """Load and verify one executable grounded world-model artifact.
 
@@ -241,19 +474,35 @@ def load_grounded_world_model(
         client: Runtime client. Every returned response must match the artifact's exact model
             identity before its output is accepted.
         embedder: Exact explicit semantic embedding binding used to build the serving RAG.
+        capabilities: Required resolved metadata for pre-dispatch packing. Its identity must
+            match the artifact's frozen model snapshot, including unknown capacity fields.
+        token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
+        evidence_selector: Reranker whose identity must match the persisted policy.
 
     Returns:
         Executable grounded world model.
+
+    Raises:
+        ValueError: Supplied capabilities differ from the artifact's frozen model identity.
     """
     stored = store.read(artifact_id)
     world_model_input = artifact_input(stored.manifest)
     artifact = _load_verified_artifact(store, world_model_input)
     loaded_rag = load_rag_index(store, artifact.serving_rag.artifact_id)
+    if artifact.original_evidence == "none":
+        if embedder is not None:
+            raise ValueError("a memory-first simulator embeds no retrieval queries")
+        embedder = RAGEmbedderBinding(
+            client=_NoRetrievalQueries(), snapshot=loaded_rag.index.embedder
+        )
     return GroundedWorldModel(
         artifact_input=world_model_input,
         artifact=artifact,
         retriever=TraceRAGRetriever(loaded_rag, embedder=embedder),
         client=client,
+        capabilities=capabilities,
+        token_counter=token_counter or Utf8UpperBoundTokenCounter(),
+        evidence_selector=evidence_selector,
     )
 
 
@@ -295,12 +544,58 @@ def verify_grounded_world_model_artifact(
     return load_grounded_world_model_artifact(store, world_model_input)
 
 
+class _NoRetrievalQueries:
+    """Embedding seam of a memory-first simulator, which never retrieves recorded evidence."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+        """Refuse every query; a memory-first prediction never reaches retrieval.
+
+        Raises:
+            ValueError: Always.
+        """
+        raise ValueError("a memory-first simulator never embeds retrieval queries")
+
+
+def persist_memory_first_world_model(
+    store: ArtifactStore, world_model_input: ArtifactInput
+) -> ArtifactInput:
+    """Persist the same world model in the memory-first profile, as its own simulator.
+
+    The result keeps the built model, prompt, knowledge and serving-index identity (the stored
+    evidence corpus) but retrieves no recorded transition: predictions read only the task,
+    the visible history and learned memory. No embedder is needed to serve it. Its identity is
+    content-derived, so repeated calls return the same artifact.
+
+    Args:
+        store: Project-local immutable artifact store.
+        world_model_input: Exact completed grounded world-model manifest pointer.
+
+    Returns:
+        Manifest pointer of the memory-first grounded world model.
+    """
+    artifact = _load_verified_artifact(store, world_model_input)
+    persisted = persist_grounded_world_model(
+        store,
+        artifact.serving_rag,
+        model_alias=artifact.model_alias,
+        model=artifact.model,
+        created_at=artifact.created_at,
+        code_revision=artifact.code_revision,
+        top_k=artifact.top_k,
+        knowledge=artifact.knowledge,
+        original_evidence="none",
+    )
+    return artifact_input(persisted.manifest)
+
+
 def bind_fit_grounded_world_model(
     store: ArtifactStore,
     world_model_input: ArtifactInput,
     *,
     client: ModelClient,
     fit_retriever: TraceRAGRetriever,
+    capabilities: ModelCapabilities,
+    token_counter: TokenCounter | None = None,
 ) -> GroundedWorldModel:
     """Bind a persisted world-model protocol to the exact fit-only simulation index.
 
@@ -309,16 +604,85 @@ def bind_fit_grounded_world_model(
         world_model_input: Exact completed grounded world-model manifest pointer.
         client: Resolved world-model provider client.
         fit_retriever: Exact fit-only retriever used by optimization simulation.
+        capabilities: Required resolved metadata matching the artifact's frozen identity.
+        token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
 
     Returns:
         Artifact-bound executor that can retrieve only fit evidence.
 
     Raises:
-        ValueError: Artifact, source, schema, embedder, lineage, or top-k identity differs.
+        ValueError: Artifact, capability, source, schema, embedder, lineage, or top-k
+            identity differs.
     """
     artifact = _load_verified_artifact(store, world_model_input)
+    _require_fit_subset(store, artifact, fit_retriever.index)
+    return GroundedWorldModel(
+        artifact_input=world_model_input,
+        artifact=artifact,
+        retriever=fit_retriever,
+        client=client,
+        capabilities=capabilities,
+        token_counter=token_counter or Utf8UpperBoundTokenCounter(),
+    )
+
+
+def persist_fit_only_world_model(
+    store: ArtifactStore,
+    world_model_input: ArtifactInput,
+    fit_rag_input: ArtifactInput,
+) -> ArtifactInput:
+    """Persist the same world model over the build's fit-only index, as its own simulator.
+
+    The build's serving index also holds held-out traces, so a simulator measured or used on
+    held-out tasks must retrieve from the fit-only index instead. The result keeps the exact
+    model, prompt, knowledge, reranker and top-k of the built world model; only its index
+    changes. Its identity is content-derived, so repeated calls return the same artifact.
+
+    Args:
+        store: Project-local immutable artifact store.
+        world_model_input: Exact completed grounded world-model manifest pointer.
+        fit_rag_input: The same build's fit-only RAG index.
+
+    Returns:
+        Manifest pointer of the fit-only grounded world model.
+
+    Raises:
+        ValueError: The index is not the fit-only subset of this world model's serving index.
+    """
+    artifact = _load_verified_artifact(store, world_model_input)
+    fit = load_rag_index(store, fit_rag_input.artifact_id)
+    if artifact_input(fit.manifest) != fit_rag_input:
+        raise ValueError("fit RAG manifest differs from its selected input")
+    _require_fit_subset(store, artifact, fit.index)
+    persisted = persist_grounded_world_model(
+        store,
+        fit_rag_input,
+        model_alias=artifact.model_alias,
+        model=artifact.model,
+        created_at=artifact.created_at,
+        code_revision=artifact.code_revision,
+        top_k=artifact.top_k,
+        knowledge=artifact.knowledge,
+        selection_policy_sha256=artifact.selection_policy_sha256,
+    )
+    return artifact_input(persisted.manifest)
+
+
+def _require_fit_subset(
+    store: ArtifactStore, artifact: GroundedWorldModelArtifact, fit: RAGIndex
+) -> None:
+    """Require a fit-only index built from the same graph as the artifact's serving index.
+
+    Args:
+        store: Project-local immutable artifact store.
+        artifact: Verified grounded world model whose serving index covers fit and held out.
+        fit: Candidate fit-only index envelope.
+
+    Raises:
+        ValueError: Partition scope, source, schema, embedder, lineage, top-k, or transition
+            identity differs.
+    """
     serving = load_rag_index(store, artifact.serving_rag.artifact_id)
-    fit = fit_retriever.index
     if artifact_input(serving.manifest) != artifact.serving_rag:
         raise ValueError("grounded world-model serving RAG manifest digest changed")
     if serving.index.included_partitions != ("fit", "held_out"):
@@ -330,6 +694,7 @@ def bind_fit_grounded_world_model(
         or serving.index.key_schema_version != fit.key_schema_version
         or serving.index.embedder != fit.embedder
         or serving.index.embedding_dimension != fit.embedding_dimension
+        or serving.index.embedding_chunk_bytes != fit.embedding_chunk_bytes
         or serving.index.fit_lineage_ids != fit.fit_lineage_ids
         or serving.index.default_top_k != fit.default_top_k
         or artifact.top_k != fit.default_top_k
@@ -345,12 +710,6 @@ def bind_fit_grounded_world_model(
     )
     if fit.transition_ids != serving_fit_ids:
         raise ValueError("fit RAG transitions differ from the serving index fit subset")
-    return GroundedWorldModel(
-        artifact_input=world_model_input,
-        artifact=artifact,
-        retriever=fit_retriever,
-        client=client,
-    )
 
 
 def _load_verified_artifact(
@@ -390,11 +749,29 @@ def _load_verified_artifact(
         prompt_sha256=artifact.prompt_sha256,
         top_k=artifact.top_k,
         code_revision=artifact.code_revision,
+        knowledge=artifact.knowledge,
+        selection_policy_sha256=artifact.selection_policy_sha256,
+        original_evidence=artifact.original_evidence,
     )
     if stable_id("grounded-world-model", content) != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its complete content")
-    if artifact.prompt_version != GROUNDED_WORLD_MODEL_PROMPT_VERSION:
-        raise ValueError("grounded world-model prompt version is not supported by this runtime")
-    if artifact.prompt_sha256 != grounded_world_model_prompt_sha256():
-        raise ValueError("grounded world-model prompt digest differs from this runtime")
+    _require_current_prompt(artifact)
     return artifact
+
+
+def _require_current_prompt(artifact: GroundedWorldModelArtifact) -> None:
+    """Require the frozen prompt identity before loading or directly constructing a runtime."""
+    reconstructed = artifact.knowledge is not None
+    version = (
+        RECONSTRUCTED_TEXT_PROMPT_VERSION if reconstructed else GROUNDED_WORLD_MODEL_PROMPT_VERSION
+    )
+    if artifact.prompt_version != version:
+        raise ValueError(
+            "grounded world-model prompt version is not supported by this runtime; "
+            "persist a new world model over the unchanged RAG index and prepare a new evaluation"
+        )
+    if artifact.prompt_sha256 != grounded_world_model_prompt_sha256(reconstructed=reconstructed):
+        raise ValueError(
+            "grounded world-model prompt digest differs from this runtime; "
+            "persist a new world model over the unchanged RAG index and prepare a new evaluation"
+        )

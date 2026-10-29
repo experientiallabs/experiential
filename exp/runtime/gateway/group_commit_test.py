@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -13,23 +15,32 @@ import pytest
 
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
+    GatewayFailure,
+    GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import (
     GroupCommitAttemptLedger,
     SyncGroupCommitLedger,
     abandoned_write_outcome,
 )
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
+from exp.runtime.gateway.model_chain_authority import (
+    ChainOperation,
+    ModelChainAuthorityError,
+    SQLiteChainPreflight,
+)
+from exp.runtime.gateway.snapshot_file import PreparedSnapshotFile
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 
 _CATALOG_DIGEST = "a" * 64
@@ -75,10 +86,10 @@ def _deployment() -> ExactModelDeployment:
         capabilities_sha256="c" * 64,
         gateway=GatewayDeploymentMetadata(
             prices=GatewayTokenPrices(
-                input_micro_usd_per_million_tokens=2_000_000,
-                cached_input_micro_usd_per_million_tokens=1_000_000,
-                output_micro_usd_per_million_tokens=4_000_000,
-                reasoning_micro_usd_per_million_tokens=5_000_000,
+                input_nano_usd_per_million_tokens=2_000_000,
+                cached_input_nano_usd_per_million_tokens=1_000_000,
+                output_nano_usd_per_million_tokens=4_000_000,
+                reasoning_nano_usd_per_million_tokens=5_000_000,
             ),
             pricing_source="operator-authored",
             pricing_effective_at=datetime(2026, 8, 18, tzinfo=UTC),
@@ -150,6 +161,166 @@ def _execution(authorization: AuthorizationSnapshot) -> ExecutionSnapshot:
         pool_id="pool-one",
         deployment_ids=("deployment-one",),
     )
+
+
+@pytest.mark.parametrize("outcome", ["success", "refusal", "batch_failure", "cancelled"])
+def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outcome: str) -> None:
+    """The writer owns all retained proof handles through cancellation, refusal and rollback."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    (tmp_path / "snapshot-one").write_text("{}")
+    authorization = _authorize(store, clock, raw_key, "proof-lifetime")
+    original = core.prepare_chain_authority
+    proofs: list[SQLiteChainPreflight] = []
+    entered, release = threading.Event(), threading.Event()
+
+    @contextmanager
+    def tracked(
+        auth: AuthorizationSnapshot,
+        operation: ChainOperation,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> Iterator[SQLiteChainPreflight | None]:
+        """Pause only outside the transaction and retain each real production proof."""
+        with original(auth, operation, connection=connection) as proof:
+            assert proof is not None
+            proofs.append(proof)
+            entered.set()
+            if outcome == "cancelled":
+                assert release.wait(5)
+            yield proof
+
+    def fail_fence(prepared: PreparedSnapshotFile) -> None:
+        """Refuse an actual apply fence after the real out-of-lock preparation completed."""
+        if entered.is_set():
+            raise ValueError("controlled generation change")
+
+    def fail_batch(connection: sqlite3.Connection, batch: list[object]) -> None:
+        """Simulate a writer failure after preflight but before a transaction starts."""
+        raise sqlite3.OperationalError("controlled writer failure")
+
+    grouped = GroupCommitAttemptLedger(core)
+    try:
+        with mock.patch.object(core, "prepare_chain_authority", tracked):
+            if outcome == "batch_failure":
+                with (
+                    mock.patch.object(grouped, "_commit_batch", fail_batch),
+                    pytest.raises(sqlite3.OperationalError),
+                ):
+                    SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+            elif outcome == "refusal":
+                with (
+                    mock.patch.object(PreparedSnapshotFile, "validate_current", fail_fence),
+                    pytest.raises(ModelChainAuthorityError),
+                ):
+                    SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+            elif outcome == "cancelled":
+
+                async def cancel_waiter() -> None:
+                    """Cancel only the waiter, then let its queued operation finish durably."""
+                    task = asyncio.create_task(grouped.accept_request(authorization=authorization))
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    release.set()
+                    await grouped.flush()
+
+                asyncio.run(cancel_waiter())
+            else:
+                SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+    finally:
+        release.set()
+        grouped.close()
+    assert proofs and all(proof._closed for proof in proofs)
+    assert all(
+        file._closed and (file._stream is None or file._stream.closed)
+        for proof in proofs
+        for file in proof.files
+    )
+    with sqlite3.connect(core.database_path) as connection:
+        count = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0]
+    assert count == (1 if outcome in ("success", "cancelled") else 0)
+    with pytest.raises(RuntimeError, match="closed"):
+        SyncGroupCommitLedger(grouped).accept_request(authorization=authorization)
+    assert len(proofs) == 1
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+def test_group_preflight_reuses_the_writer_database_connection(
+    tmp_path: Path,
+    batch_size: int,
+) -> None:
+    """Prepared batch size never allocates cached or concurrently held reader connections."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    authorizations = [
+        _authorize(store, clock, raw_key, f"request-{index}") for index in range(batch_size)
+    ]
+    entered, release = threading.Event(), threading.Event()
+    grouped = GroupCommitAttemptLedger(core, max_batch_size=batch_size)
+
+    def pause(connection: sqlite3.Connection) -> None:
+        """Hold a preceding writer operation while the next exact batch is queued."""
+        entered.set()
+        assert release.wait(5)
+
+    blocker = grouped._enqueue(pause)
+    assert entered.wait(5)
+    try:
+        with mock.patch.object(core, "_connect", wraps=core._connect) as reader_checkouts:
+            writes = [
+                grouped._enqueue_chain(
+                    auth,
+                    "accept",
+                    lambda connection, proof, auth=auth: core.apply_accept_request(
+                        connection, authorization=auth, chain_preflight=proof
+                    ),
+                )
+                for auth in authorizations
+            ]
+            release.set()
+            blocker.result(timeout=5)
+            for write in writes:
+                write.result(timeout=5)
+            assert reader_checkouts.call_count == 0
+    finally:
+        release.set()
+        grouped.close()
+
+
+def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
+    """Every JSON classification can obtain another write lock because BEGIN has not started."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    (tmp_path / "snapshot-one").write_text("{}")
+    authorization = _authorize(store, clock, raw_key, "before-begin")
+    original = authority.json.loads
+    reads = 0
+
+    def classify(content: bytes) -> dict[str, object]:
+        """Probe actual writer-lock availability around each real catalog parse."""
+        nonlocal reads
+        with sqlite3.connect(core.database_path, timeout=0) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+        reads += 1
+        return original(content)
+
+    grouped = GroupCommitAttemptLedger(core)
+    try:
+        with mock.patch.object(authority.json, "loads", classify):
+            sync = SyncGroupCommitLedger(grouped)
+            sync.accept_request(authorization=authorization)
+            sync.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+            )
+    finally:
+        grouped.close()
+    assert reads == 1  # Reservation reuses only the already classified, still-current plain pair.
 
 
 def test_full_request_lifecycle_commits_durably_through_group_writer(tmp_path: Path) -> None:
@@ -416,6 +587,130 @@ def test_closed_writer_rejects_sync_operations(tmp_path: Path) -> None:
         facade.flush()
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_zero_attempt_certificate_waits_for_committed_terminal_state(
+    tmp_path: Path, asynchronous: bool
+) -> None:
+    """Both facades expose the certificate only after the writer commits it."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "capacity-refusal")
+    facade.accept_request(authorization=authorization)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="local capacity exhausted"
+    )
+    applied = threading.Event()
+    release = threading.Event()
+    results: list[bool] = []
+    original = core.apply_finish_request
+
+    def apply(connection: sqlite3.Connection, **kwargs: object) -> bool:
+        """Hold the already-written transaction before its COMMIT."""
+        assert kwargs == {
+            "authorization": authorization,
+            "failure": failure,
+            "certify_no_effects": True,
+            "web_search_requests": 0,
+        }
+        result = original(
+            connection, authorization=authorization, failure=failure, certify_no_effects=True
+        )
+        applied.set()
+        assert release.wait(10)
+        return result
+
+    def finish() -> None:
+        """Collect the result through the selected public facade."""
+        if asynchronous:
+            result = asyncio.run(
+                grouped.finish_request(
+                    authorization=authorization, failure=failure, certify_no_effects=True
+                )
+            )
+        else:
+            result = facade.finish_request(
+                authorization=authorization, failure=failure, certify_no_effects=True
+            )
+        results.append(result)
+
+    worker = threading.Thread(target=finish)
+    try:
+        with mock.patch.object(core, "apply_finish_request", side_effect=apply):
+            worker.start()
+            assert applied.wait(10)
+            assert results == []
+            with sqlite3.connect(tmp_path / "gateway.db") as reader:
+                assert reader.execute(
+                    "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+                    (authorization.request_id,),
+                ).fetchone() == (None,)
+            release.set()
+            worker.join(10)
+            assert not worker.is_alive()
+        assert results == [True]
+        with sqlite3.connect(tmp_path / "gateway.db") as reader:
+            assert reader.execute(
+                "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+                (authorization.request_id,),
+            ).fetchone() == ("failed",)
+    finally:
+        release.set()
+        worker.join(10)
+        grouped.close()
+
+
+def test_rolled_back_terminal_write_never_returns_zero_attempt_certificate(tmp_path: Path) -> None:
+    """A failure after the SQL update rolls it back and fails the waiting caller."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "rolled-back-refusal")
+    facade.accept_request(authorization=authorization)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED, safe_message="local capacity exhausted"
+    )
+    original = core.apply_finish_request
+
+    def fail_after_write(connection: sqlite3.Connection, **kwargs: object) -> bool:
+        """Inject storage failure after the proof was computed, before commit."""
+        assert kwargs == {
+            "authorization": authorization,
+            "failure": failure,
+            "certify_no_effects": True,
+            "web_search_requests": 0,
+        }
+        assert (
+            original(
+                connection, authorization=authorization, failure=failure, certify_no_effects=True
+            )
+            is True
+        )
+        raise sqlite3.OperationalError("terminal write lost before commit")
+
+    try:
+        with mock.patch.object(core, "apply_finish_request", side_effect=fail_after_write):
+            with pytest.raises(sqlite3.OperationalError, match="before commit"):
+                facade.finish_request(
+                    authorization=authorization, failure=failure, certify_no_effects=True
+                )
+        with sqlite3.connect(tmp_path / "gateway.db") as reader:
+            assert reader.execute(
+                "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+                (authorization.request_id,),
+            ).fetchone() == (None,)
+        assert (
+            facade.finish_request(
+                authorization=authorization, failure=failure, certify_no_effects=True
+            )
+            is True
+        )
+    finally:
+        grouped.close()
+
+
 def test_batch_machinery_failure_fails_blocked_callers_and_writer_recovers(
     tmp_path: Path,
 ) -> None:
@@ -565,3 +860,594 @@ def test_cancelled_write_task_yields_none() -> None:
         assert await abandoned_write_outcome(write) is None
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("writes", [None, 0, 3])
+def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
+    tmp_path: Path,
+    writes: int | None,
+) -> None:
+    """The hosted-ledger seam probes the host's apply hook, not the engine facade.
+
+    A host whose ``apply_finish_attempt`` predates ``upstream_provider`` (the
+    platform hook at the 0.7.88 repin) must settle cleanly with the keyword
+    withheld; the engine's own core still persists the named upstream.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    recorded: list[dict[str, object]] = []
+    original = core.apply_finish_attempt
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+    usage = GatewayUsage(input_tokens=10, output_tokens=4, cache_creation_input_tokens=writes)
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+    ) -> None:
+        """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        assert terminal_event is not None and terminal_event.usage == usage
+        assert first_token_at == observed
+        recorded.append({"attempt_id": attempt_id, "finalize": finalize_request})
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+        )
+
+    with mock.patch.object(core, "apply_finish_attempt", legacy_apply):
+        grouped = GroupCommitAttemptLedger(core)
+        facade = SyncGroupCommitLedger(grouped)
+        authorization = _authorize(store, clock, raw_key, "legacy-host-hook")
+        facade.accept_request(authorization=authorization)
+        attempt_id = facade.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        facade.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=usage,
+            ),
+            failure=None,
+            first_token_at=observed,
+            upstream_provider="Azure",
+        )
+        facade.flush()
+        grouped.close()
+    assert recorded == [{"attempt_id": attempt_id, "finalize": True}]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", None)
+    finally:
+        connection.close()
+
+    # The engine's own core accepts the keyword, so the label lands.
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    authorization = _authorize(store, clock, raw_key, "current-host-hook")
+    facade.accept_request(authorization=authorization)
+    attempt_id = facade.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+        route_reason="direct_alias",
+        fallback_reason=None,
+    )
+    facade.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=usage,
+        ),
+        failure=None,
+        first_token_at=observed,
+        upstream_provider="Azure",
+    )
+    facade.flush()
+    grouped.close()
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT upstream_provider FROM gateway_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone() == ("Azure",)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("writes", [None, 0, 3])
+def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(
+    tmp_path: Path, writes: int | None
+) -> None:
+    """``GroupCommitAttemptLedger.finish_attempt`` probes the host hook the same way.
+
+    The async facade captures the hook, probes it and queues its own lambda
+    independently of the blocking facade, so it gets its own legacy-hook case:
+    an old-signature ``apply_finish_attempt`` settles a full async lifecycle
+    with ``upstream_provider`` withheld, the row completed and the column NULL.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    recorded: list[str] = []
+    original = core.apply_finish_attempt
+    usage = GatewayUsage(input_tokens=10, output_tokens=4, cache_creation_input_tokens=writes)
+    observed = datetime(2026, 9, 18, 1, 2, 3, tzinfo=UTC)
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+    ) -> None:
+        """The pre-keyword host hook shape: any extra keyword would TypeError here."""
+        assert terminal_event is not None and terminal_event.usage == usage
+        assert first_token_at == observed
+        recorded.append(attempt_id)
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+        )
+
+    with mock.patch.object(core, "apply_finish_attempt", legacy_apply):
+        grouped = GroupCommitAttemptLedger(core)
+
+        async def lifecycle() -> str:
+            """Accept, dispatch and settle one request through the async facade."""
+            authorization = _authorize(store, clock, raw_key, "async-legacy-host-hook")
+            await grouped.accept_request(authorization=authorization)
+            attempt_id = await grouped.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+                route_reason="direct_alias",
+                fallback_reason=None,
+            )
+            await grouped.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=GatewayEvent(
+                    kind=GatewayEventKind.COMPLETED,
+                    sequence_number=1,
+                    usage=usage,
+                ),
+                failure=None,
+                first_token_at=observed,
+                upstream_provider="Azure",
+            )
+            await grouped.flush()
+            return attempt_id
+
+        attempt_id = asyncio.run(lifecycle())
+        grouped.close()
+    assert recorded == [attempt_id]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", None)
+    finally:
+        connection.close()
+
+
+def _pre_search_meter_hook(
+    original: Callable[..., None], recorded: list[dict[str, object]]
+) -> Callable[..., None]:
+    """The host hook shape that learned ``upstream_provider`` but not ``web_search_requests``.
+
+    Any further keyword would TypeError here, which is the drift under test.
+    """
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+    ) -> None:
+        """Record the settle and forward it to the engine's own core."""
+        recorded.append({"attempt_id": attempt_id, "upstream_provider": upstream_provider})
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+            upstream_provider=upstream_provider,
+        )
+
+    return legacy_apply
+
+
+def _search_meter_hook(
+    original: Callable[..., None], recorded: list[dict[str, object]]
+) -> Callable[..., None]:
+    """A host hook that accepts every settle keyword and records which ones arrived."""
+
+    def current_apply(connection: sqlite3.Connection, **kwargs: object) -> None:
+        """Record the keywords handed over, then forward them all."""
+        recorded.append(dict(kwargs))
+        original(connection, **kwargs)
+
+    return current_apply
+
+
+def _searching_terminal() -> GatewayEvent:
+    """One completed terminal whose usage bills two gateway-executed searches."""
+    return GatewayEvent(
+        kind=GatewayEventKind.COMPLETED,
+        sequence_number=1,
+        usage=GatewayUsage(input_tokens=10, output_tokens=4, web_search_requests=2),
+    )
+
+
+def _pre_tool_search_meter_hook(
+    original: Callable[..., None], recorded: list[dict[str, object]]
+) -> Callable[..., None]:
+    """The host hook shape that learned ``web_search_requests`` but not ``tool_search_requests``.
+
+    Any further keyword would TypeError here, which is the drift under test.
+    """
+
+    def legacy_apply(
+        connection: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+    ) -> None:
+        """Record the settle and forward it to the engine's own core."""
+        recorded.append(
+            {
+                "attempt_id": attempt_id,
+                "upstream_provider": upstream_provider,
+                "web_search_requests": web_search_requests,
+            }
+        )
+        original(
+            connection,
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+            first_token_at=first_token_at,
+            retry_after_seconds=retry_after_seconds,
+            ratelimit_limit_requests=ratelimit_limit_requests,
+            ratelimit_remaining_requests=ratelimit_remaining_requests,
+            ratelimit_limit_tokens=ratelimit_limit_tokens,
+            ratelimit_remaining_tokens=ratelimit_remaining_tokens,
+            upstream_provider=upstream_provider,
+            web_search_requests=web_search_requests,
+        )
+
+    return legacy_apply
+
+
+def _tool_searching_terminal() -> GatewayEvent:
+    """One completed terminal whose usage bills one web search and two tool-search rounds."""
+    return GatewayEvent(
+        kind=GatewayEventKind.COMPLETED,
+        sequence_number=1,
+        usage=GatewayUsage(
+            input_tokens=10, output_tokens=4, web_search_requests=1, tool_search_requests=2
+        ),
+    )
+
+
+def test_sync_facade_forwards_web_search_requests_only_to_a_host_hook_that_accepts_it(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the ``upstream_provider`` seam for the search meter, on the blocking facade.
+
+    A host hook predating ``web_search_requests`` settles cleanly with it
+    withheld while still receiving the upstream label; a current hook gets the
+    settled count; a zero count is withheld from the current hook too.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    original = core.apply_finish_attempt
+    recorded: list[dict[str, object]] = []
+
+    def lifecycle(label: str, terminal: GatewayEvent) -> str:
+        """Accept, dispatch and settle one request through the blocking facade."""
+        grouped = GroupCommitAttemptLedger(core)
+        facade = SyncGroupCommitLedger(grouped)
+        authorization = _authorize(store, clock, raw_key, label)
+        facade.accept_request(authorization=authorization)
+        attempt_id = facade.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        facade.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=terminal,
+            failure=None,
+            upstream_provider="Azure",
+            web_search_requests=terminal.usage.web_search_requests if terminal.usage else 0,
+        )
+        facade.flush()
+        grouped.close()
+        return attempt_id
+
+    with mock.patch.object(
+        core, "apply_finish_attempt", _pre_search_meter_hook(original, recorded)
+    ):
+        legacy_attempt = lifecycle("pre-search-meter-hook", _searching_terminal())
+    assert recorded == [{"attempt_id": legacy_attempt, "upstream_provider": "Azure"}]
+
+    recorded.clear()
+    with mock.patch.object(core, "apply_finish_attempt", _search_meter_hook(original, recorded)):
+        billed_attempt = lifecycle("search-meter-hook", _searching_terminal())
+        unbilled_attempt = lifecycle(
+            "no-search-hook",
+            GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=GatewayUsage(input_tokens=10, output_tokens=4),
+            ),
+        )
+    assert [entry["attempt_id"] for entry in recorded] == [billed_attempt, unbilled_attempt]
+    assert recorded[0]["web_search_requests"] == 2
+    assert "web_search_requests" not in recorded[1]
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        rows = connection.execute(
+            "SELECT attempt_id, state, upstream_provider FROM gateway_attempts ORDER BY attempt_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert sorted(rows) == sorted(
+        [
+            (attempt, "completed", "Azure")
+            for attempt in (legacy_attempt, billed_attempt, unbilled_attempt)
+        ]
+    )
+
+
+def test_async_facade_withholds_web_search_requests_from_a_pre_meter_host_hook(
+    tmp_path: Path,
+) -> None:
+    """``GroupCommitAttemptLedger.finish_attempt`` probes the hook for the meter the same way."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    original = core.apply_finish_attempt
+    recorded: list[dict[str, object]] = []
+
+    with mock.patch.object(
+        core, "apply_finish_attempt", _pre_search_meter_hook(original, recorded)
+    ):
+        grouped = GroupCommitAttemptLedger(core)
+
+        async def lifecycle() -> str:
+            """Accept, dispatch and settle one searching request through the async facade."""
+            authorization = _authorize(store, clock, raw_key, "async-pre-search-meter-hook")
+            await grouped.accept_request(authorization=authorization)
+            attempt_id = await grouped.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+                route_reason="direct_alias",
+                fallback_reason=None,
+            )
+            await grouped.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=_searching_terminal(),
+                failure=None,
+                upstream_provider="Azure",
+                web_search_requests=2,
+            )
+            await grouped.flush()
+            return attempt_id
+
+        attempt_id = asyncio.run(lifecycle())
+        grouped.close()
+    assert recorded == [{"attempt_id": attempt_id, "upstream_provider": "Azure"}]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", "Azure")
+    finally:
+        connection.close()
+
+
+def test_sync_facade_forwards_tool_search_requests_only_to_a_host_hook_that_accepts_it(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the ``web_search_requests`` seam for the tool-search meter, on the blocking facade.
+
+    A host hook predating ``tool_search_requests`` settles cleanly with it
+    withheld while still receiving the upstream label and the web-search count;
+    a current hook gets the settled count; a zero count is withheld from the
+    current hook too.
+    """
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    original = core.apply_finish_attempt
+    recorded: list[dict[str, object]] = []
+
+    def lifecycle(label: str, terminal: GatewayEvent) -> str:
+        """Accept, dispatch and settle one request through the blocking facade."""
+        grouped = GroupCommitAttemptLedger(core)
+        facade = SyncGroupCommitLedger(grouped)
+        authorization = _authorize(store, clock, raw_key, label)
+        facade.accept_request(authorization=authorization)
+        attempt_id = facade.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+            route_reason="direct_alias",
+            fallback_reason=None,
+        )
+        usage = terminal.usage
+        facade.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=terminal,
+            failure=None,
+            upstream_provider="Azure",
+            web_search_requests=usage.web_search_requests if usage else 0,
+            tool_search_requests=usage.tool_search_requests if usage else 0,
+        )
+        facade.flush()
+        grouped.close()
+        return attempt_id
+
+    with mock.patch.object(
+        core, "apply_finish_attempt", _pre_tool_search_meter_hook(original, recorded)
+    ):
+        legacy_attempt = lifecycle("pre-tool-search-meter-hook", _tool_searching_terminal())
+    assert recorded == [
+        {"attempt_id": legacy_attempt, "upstream_provider": "Azure", "web_search_requests": 1}
+    ]
+
+    recorded.clear()
+    with mock.patch.object(core, "apply_finish_attempt", _search_meter_hook(original, recorded)):
+        billed_attempt = lifecycle("tool-search-meter-hook", _tool_searching_terminal())
+        unbilled_attempt = lifecycle("no-tool-search-hook", _searching_terminal())
+    assert [entry["attempt_id"] for entry in recorded] == [billed_attempt, unbilled_attempt]
+    assert recorded[0]["tool_search_requests"] == 2
+    assert recorded[0]["web_search_requests"] == 1
+    assert "tool_search_requests" not in recorded[1]
+    assert recorded[1]["web_search_requests"] == 2
+
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        rows = connection.execute(
+            "SELECT attempt_id, state, upstream_provider FROM gateway_attempts ORDER BY attempt_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert sorted(rows) == sorted(
+        [
+            (attempt, "completed", "Azure")
+            for attempt in (legacy_attempt, billed_attempt, unbilled_attempt)
+        ]
+    )
+
+
+def test_async_facade_withholds_tool_search_requests_from_a_pre_meter_host_hook(
+    tmp_path: Path,
+) -> None:
+    """``GroupCommitAttemptLedger.finish_attempt`` probes the hook for the tool-search meter too."""
+    clock = FakeLedgerClock()
+    store, core, raw_key = _authority_fixture(tmp_path, clock)
+    original = core.apply_finish_attempt
+    recorded: list[dict[str, object]] = []
+
+    with mock.patch.object(
+        core, "apply_finish_attempt", _pre_tool_search_meter_hook(original, recorded)
+    ):
+        grouped = GroupCommitAttemptLedger(core)
+
+        async def lifecycle() -> str:
+            """Accept, dispatch and settle one tool-searching request through the async facade."""
+            authorization = _authorize(store, clock, raw_key, "async-pre-tool-search-meter-hook")
+            await grouped.accept_request(authorization=authorization)
+            attempt_id = await grouped.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+                route_reason="direct_alias",
+                fallback_reason=None,
+            )
+            await grouped.finish_attempt(
+                attempt_id=attempt_id,
+                terminal_event=_tool_searching_terminal(),
+                failure=None,
+                upstream_provider="Azure",
+                web_search_requests=1,
+                tool_search_requests=2,
+            )
+            await grouped.flush()
+            return attempt_id
+
+        attempt_id = asyncio.run(lifecycle())
+        grouped.close()
+    assert recorded == [
+        {"attempt_id": attempt_id, "upstream_provider": "Azure", "web_search_requests": 1}
+    ]
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        assert connection.execute(
+            "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() == ("completed", "Azure")
+    finally:
+        connection.close()

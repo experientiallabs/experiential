@@ -1,57 +1,78 @@
 [project]
 name = "experiential"
-version = "0.7.28"
+version = "0.7.223"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
 dependencies = [
+    # Every requirement here and in the extras is an exact pin, except `openai`: callers'
+    # own code imports that SDK next to this package, so it stays a certified range. A
+    # version moves only by a reviewed edit, and [tool.uv] keeps it 7 days old.
+    "exp-gateway-native==0.3.173",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
-    "exp-gateway-native>=0.3.28,<0.4",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
-    "filelock>=3.12",
-    "typer>=0.16",
-    "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
-    "pydantic>=2.6",
-    "numpy>=1.26",
-    "httpx>=0.27",
-    "rich>=14.1",
-    "tomli-w>=1.0",  # writing project and telemetry TOML; every `exp build` needs it
-    "posthog>=7.0",
+    "filelock==4.2.1",
+    "jsonschema==4.26.0",  # Validate induced local-only tool and state contracts.
+    "ijson==3.5.1",  # incremental parsing of local trace archives
+    "typer==0.26.8",
+    "click==8.4.2",  # no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
+    "pydantic==2.13.4",
+    "numpy==2.5.1",
+    "httpx==0.28.1",
+    "httpx2==2.13.1",  # at or above 2.12, the OpenAI SDK's response-decompression security floor
+    # The capture engine needs Python 3.13+ because mitmproxy on 3.12 conflicts with
+    # Pydantic's typing-extensions floor. Other commands remain available on 3.12.
+    "exp-mitmproxy==12.2.3.post2; python_version >= '3.13'",
+    "exp-mitmproxy-rs==0.12.11.post1; python_version >= '3.13'",
+    "cryptography==50.0.1; python_version >= '3.13'",
+    "brotli==1.2.0; python_version >= '3.13'",
+    "zstandard==0.25.0; python_version >= '3.13'",
+    "truststore==0.10.4",  # verified provider TLS through native system certificate stores
+    # At or above HTTPX's async-transport security floor, 4.14.2 (CVE-2026-63374).
+    "anyio==4.14.2",
+    "rich==15.0.0",
+    "tomli-w==1.2.0",  # writing project and telemetry TOML; every `exp build` needs it
+    "posthog==7.21.3",
     # Public router request and response types follow the official OpenAI-generated schemas.
     "openai>=3.0,<4",
     # Bedrock uses the official AWS runtime client. Imports stay lazy inside the Bedrock adapter.
-    "boto3>=1.35,<2",
-    "botocore>=1.35,<2",
+    "boto3==1.43.72",
+    "botocore==1.43.72",
     # Vertex mints OAuth tokens from service-account JSON through Google's official credential
     # library. Imports stay lazy inside the Vertex adapter, mirroring the Bedrock boundary.
-    "google-auth>=2.35,<3",
+    "google-auth==2.57.0",
+    # Realistic input-token estimates for per-attempt reservations (free-tier windows and the
+    # paid worst-case ceiling) count the prompt with the o200k BPE instead of a byte bound.
+    "tiktoken==0.14.0",
+    "google-re2==1.1.20251105",
 ]
 
 [project.optional-dependencies]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
-sft = ["tinker>=0.23,<0.24", "tinker-cookbook>=0.4.3,<0.5"]
+sft = ["tinker==0.23.4", "tinker-cookbook==0.4.3"]
 dev = [
-    "pytest>=8.0",
-    "pytest-xdist>=3.8",
+    "pytest==9.1.1",
+    "pytest-xdist==3.8.0",
     # Powers the Anthropic SDK-surface drift gate in the Messages manifest tests,
     # mirroring the runtime `openai` dependency's drift gate: an SDK bump turns new
     # request surface into a loud classification decision instead of a silent 400.
-    "anthropic>=1.2,<2",
-    "ruff>=0.5",
-    "ty>=0.0.1a1",
+    "anthropic==1.2.0",
+    "ruff==0.15.20",
+    "packaging==26.2",  # Compare Cargo SemVer and Python prerelease versions in release guards.
+    "ty==0.0.56",
     "experiential[sft]",
     # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
-    "maturin>=1.7,<2",
+    "maturin==1.14.1",
     # WebSocket client for the Responses-over-WebSocket gateway e2e tests.
-    "websockets>=14,<16",
+    "websockets==15.0.1",
 ]
 
 [project.scripts]
 exp = "exp.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -67,6 +88,8 @@ include = [
     "/exp",
     "/assets",
     "/docs/reference/gateway-architecture.md",
+    "/docs/reference/gateway-egress.md",
+    "/docs/reference/gateway-request-policy.md",
     "/docs/release-scope.md",
     "/docs/usage.md",
     "/README.md",
@@ -101,7 +124,26 @@ convention = "google"
 [tool.ty.environment]
 python-version = "3.12"
 
+[tool.uv]
+# Supply-chain cooldown: resolution only picks distributions uploaded at least
+# 7 days before the lock is written, so a compromised release is usually
+# yanked before it can enter uv.lock. Packages this project publishes itself
+# are exempt. Exempt any other package only for an urgent security fix, with a
+# cutoff date that admits exactly the fixed release and a removal date.
+# certifi: 2026.10.19 (uploaded 2026-10-20) drops emSign roots whose intermediate
+# CA keys were compromised (GHSA-6q48-6c7w-9gw2). Remove this entry after
+# 2026-10-27, when the 7-day window covers that release; until then no later
+# certifi release is eligible.
+# filelock: 4.2.1 (uploaded 2026-10-17) fixes ReadWriteLock reopening its database
+# by name (GHSA-v4x8-3wr5-3wq8, high). Remove this entry after 2026-10-24.
+exclude-newer = "7 days"
+exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z" }
+
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the
 # extension from source; published metadata keeps the normal PyPI requirement (--no-sources).
 exp-gateway-native = { path = "exp/runtime/gateway/native" }
+
+# Immutable development pins for Capture's reviewed forks; release metadata uses PyPI names.
+exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy.git", rev = "95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" }
+exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs.git", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }

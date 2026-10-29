@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from exp.common.models import ConnectionConfig, ModelCatalog
+from exp.common.models import ConnectionConfig, read_model_catalog_document
 from exp.runtime.gateway.catalog_authority import authored_snapshot_path
 from exp.runtime.gateway.management import GatewayManagement
 
@@ -41,7 +41,7 @@ def retained_streaming_tool_arguments(
     if bound is None or bound.config.identity_sha256() != connection.identity_sha256():
         return None
     normalized_snapshot = manager.root / "gateway" / active.snapshot_ref
-    snapshot = ModelCatalog.model_validate_json(
+    snapshot, _dropped = read_model_catalog_document(
         authored_snapshot_path(normalized_snapshot).read_bytes()
     )
     record = snapshot.models.get(alias_id)

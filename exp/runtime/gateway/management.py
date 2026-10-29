@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from exp.common.config.settings import load_settings
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import (
     GATEWAY_EXCLUDED_PROVIDERS,
@@ -15,10 +16,15 @@ from exp.common.models import (
     ModelCatalog,
     load_model_catalog,
 )
+from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.auth import IssuedVirtualKey
 from exp.runtime.gateway.contracts import DirectTarget, ProjectTarget
+from exp.runtime.gateway.model_chain_authority import (
+    LocalSnapshotMemoOwner,
+    refuse_local_chain_snapshot,
+    serving_snapshot_limit,
+)
 from exp.runtime.gateway.sqlite import key_delivery
-from exp.runtime.gateway.sqlite.migrations import connect_database
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderConnectionAuthority,
     ProviderConnectionBinding,
@@ -106,16 +112,29 @@ class GatewayStatus(ContractModel):
     grants: int = Field(default=0, ge=0)
 
 
-class GatewayManagement:
+class GatewayManagement(LocalSnapshotMemoOwner):
     """Own additive management operations around one SQLite gateway store."""
 
-    def __init__(self, root: Path, *, organization_id: str = "local") -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        organization_id: str = "local",
+        serving_snapshot_max_bytes: int | None = None,
+    ) -> None:
         """Bind one explicit local organization under a EXP root.
 
         Args:
             root: EXP root containing private gateway state.
             organization_id: Stable local organization identifier.
+            serving_snapshot_max_bytes: Explicit bound or the setting frozen from this root.
         """
+        self._bind_classification_memo(None)
+        self.serving_snapshot_max_bytes = serving_snapshot_limit(
+            load_settings(root).gateway.serving_snapshot_max_bytes
+            if serving_snapshot_max_bytes is None
+            else serving_snapshot_max_bytes
+        )
         self.root = root
         self.organization_id = organization_id
         self.state_dir = root / "gateway"
@@ -157,7 +176,17 @@ class GatewayManagement:
 
     def store(self) -> SQLiteGatewayStore:
         """Open the authoritative SQLite store and private pepper state."""
-        return SQLiteGatewayStore(self.database_path)
+        return SQLiteGatewayStore(
+            self.database_path,
+            serving_snapshot_max_bytes=self.serving_snapshot_max_bytes,
+            classification_memo=self.classification_memo,
+        )
+
+    def check_serving_snapshot(self, snapshot_ref: str) -> None:
+        """Classify both local serving files using this manager's frozen resource policy."""
+        refuse_local_chain_snapshot(
+            self.state_dir, snapshot_ref, maximum_bytes=self.serving_snapshot_max_bytes
+        )
 
     def require_initialized(self) -> SQLiteGatewayStore:
         """Return the store or fail with an actionable initialization command."""
@@ -193,53 +222,6 @@ class GatewayManagement:
             connection_id=connection_id,
             revision_id=revision_id,
             config=canonical,
-            replace=replace,
-        )
-
-    def configure_direct_alias(
-        self,
-        *,
-        alias_id: str,
-        alias_name: str,
-        revision_id: str,
-        pool_id: str,
-        snapshot_ref: str,
-        catalog_sha256: str,
-        provider_connections: dict[str, ConnectionConfig],
-        replace: bool,
-    ) -> None:
-        """Atomically revise serving connections and activate one direct alias revision.
-
-        Args:
-            alias_id: Stable public alias identifier.
-            alias_name: Public model string.
-            revision_id: Immutable alias revision identifier.
-            pool_id: Direct target pool identifier.
-            snapshot_ref: Content-addressed catalog snapshot reference.
-            catalog_sha256: Exact normalized catalog digest.
-            provider_connections: Desired secret-free SQLite-authoritative connection metadata.
-            replace: Whether differing active connection metadata may be revised.
-
-        Raises:
-            GatewayStoreError: The requested authority violates an existing invariant.
-        """
-        mutations = tuple(
-            ProviderConnectionMutation(
-                connection_id=connection_id,
-                revision_id=provider_connection_revision_id(connection_id, config),
-                config=config.canonicalized(),
-            )
-            for connection_id, config in sorted(provider_connections.items())
-        )
-        self.require_initialized().upsert_provider_connections_and_activate_direct_alias(
-            organization_id=self.organization_id,
-            alias_id=alias_id,
-            alias_name=alias_name,
-            revision_id=revision_id,
-            pool_id=pool_id,
-            snapshot_ref=snapshot_ref,
-            catalog_sha256=catalog_sha256,
-            provider_connections=mutations,
             replace=replace,
         )
 
@@ -886,6 +868,7 @@ class GatewayManagement:
         refusal_failover: bool,
     ) -> tuple[bool, bool]:
         """Return activation and snapshot change status after read-only validation."""
+        self.check_serving_snapshot(snapshot_ref)
         self.require_initialized()
         connection = connect_database(self.database_path)
         try:

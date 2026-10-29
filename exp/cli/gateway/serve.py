@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from rich.text import Text
 
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
+from exp.runtime.gateway.local_capture import local_capture_configuration, open_local_capture
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -19,7 +21,12 @@ _LOOPBACK_HOST = LOOPBACK_HOST
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_ACTIVE_REQUESTS = 1024
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+# One hour: long enough for the longest single provider answer, short enough
+# that a stuck request still ends on its own.
+MAXIMUM_REQUEST_TIMEOUT_SECONDS = 3600.0
 _console = Console(theme=EXP_THEME)
+_logger = logging.getLogger(__name__)
 _EXP_WORDMARK = "\n".join(
     (
         "███████╗██╗  ██╗██████╗ ",
@@ -47,10 +54,7 @@ def run(
     ghost: bool = typer.Option(
         False,
         "--ghost",
-        help=(
-            "Compatibility flag: project journals stay disabled while gateway accounting "
-            "remains on."
-        ),
+        help="Disable traffic content capture. Content-free gateway accounting remains on.",
     ),
     non_interactive: bool = typer.Option(
         False,
@@ -75,6 +79,16 @@ def run(
         min=1,
         help="Maximum concurrently admitted requests.",
     ),
+    request_timeout: float = typer.Option(
+        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        "--request-timeout",
+        min=1.0,
+        max=MAXIMUM_REQUEST_TIMEOUT_SECONDS,
+        help=(
+            "Total seconds one request may take, failover included. Raise it for long "
+            "streamed answers; a stream cut at this limit ends with a time-limit error."
+        ),
+    ),
 ) -> None:
     """Start the local gateway directly, optionally with one project-backed alias.
 
@@ -83,12 +97,13 @@ def run(
         root: Local artifact and model-catalog root.
         policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
-        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        ghost: Disable content capture while preserving content-free accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
         max_active_requests: Concurrent-admission bound for the data plane.
+        request_timeout: Total per-request budget in seconds, failover included.
 
     Raises:
         typer.BadParameter: The selected project form or activation is invalid.
@@ -104,6 +119,7 @@ def run(
         check=check,
         graceful_timeout=graceful_timeout,
         max_active_requests=max_active_requests,
+        request_timeout=request_timeout,
     )
 
 
@@ -119,6 +135,7 @@ def start_gateway(
     check: bool = False,
     graceful_timeout: float = DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> None:
     """Start the local gateway, optionally materializing one project-backed alias.
 
@@ -127,19 +144,20 @@ def start_gateway(
         root: Local artifact and model-catalog root.
         policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
-        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        ghost: Disable content capture while preserving content-free accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
         max_active_requests: Concurrent-admission bound for the data plane.
+        request_timeout: Total per-request budget in seconds, failover included.
 
     Raises:
         typer.BadParameter: The selected project form or activation is invalid,
             or the native gateway extension is not installed.
     """
-    if (policy is not None or ghost) and project is None:
-        raise typer.BadParameter("--policy and --ghost require --project")
+    if policy is not None and project is None:
+        raise typer.BadParameter("--policy requires --project")
     blocker = _native_engine_blocker()
     if blocker is not None:
         raise typer.BadParameter(blocker)
@@ -154,6 +172,7 @@ def start_gateway(
         check=check,
         graceful_timeout=graceful_timeout,
         max_active_requests=max_active_requests,
+        request_timeout=request_timeout,
     )
 
 
@@ -187,6 +206,7 @@ def _run_gateway(
     check: bool,
     graceful_timeout: float,
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> None:
     """Validate, optionally set up, and serve the native gateway.
 
@@ -201,12 +221,13 @@ def _run_gateway(
         root: Local artifact and model-catalog root.
         policy: Exact policy for an ambiguous project.
         port: Local loopback TCP port.
-        ghost: Compatibility marker for project traffic, which always uses gateway accounting.
+        ghost: Disable content capture while preserving content-free accounting.
         non_interactive: Whether first-run gateway prompts are forbidden.
         json_output: Whether startup output is one versioned JSON receipt.
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
         max_active_requests: Concurrent-admission bound for the data plane.
+        request_timeout: Total per-request budget in seconds, failover included.
 
     Raises:
         typer.BadParameter: Setup, alias loading, native servability, or the
@@ -252,6 +273,7 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_credentials(port=port, setup=setup)
 
+    guardrails = None
     try:
         with usage_error(ValueError):
             with gateway_instance_lock(root, port=port):
@@ -277,10 +299,14 @@ def _run_gateway(
                 # host ever starts.
                 exp_gateway_native = importlib.import_module("exp_gateway_native")
                 guardrails = load_guardrail_engine(root)
+                capture = local_capture_configuration(root, ghost=ghost)
+                capture_controller = None if check else open_local_capture(capture)
                 control_plane = NativeControlPlane(
                     components,
                     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                     guardrails=guardrails,
+                    capture=capture_controller,
+                    request_timeout_seconds=request_timeout,
                 )
                 receipt = {
                     "schema_version": 1,
@@ -291,6 +317,8 @@ def _run_gateway(
                     "reconciled_expired_requests": control_plane.reconciled_expired_requests,
                     "reconciled_unknown_attempts": control_plane.reconciled_unknown_attempts,
                     "launch_mode": "gateway" if compatibility is None else "project_alias",
+                    "traffic_capture": "enabled" if capture is not None else "disabled",
+                    "traffic_database": None if capture is None else str(capture.database_path),
                     "unavailable_aliases": _unavailable_alias_entries(
                         components.unavailable_aliases
                     ),
@@ -315,18 +343,17 @@ def _run_gateway(
                         _emit_gateway_ready(
                             port=port,
                             compatibility=compatibility,
-                            ghost=ghost,
+                            capture_enabled=capture is not None,
                         )
                         _emit_unavailable_aliases(components.unavailable_aliases)
-
-                if check:
-                    announce_ready()
-                    return
 
                 # Readiness is announced by the native server itself, from
                 # its bound-listener callback, so a launch that cannot own
                 # the port fails without ever printing a ready receipt.
                 try:
+                    if check:
+                        announce_ready()
+                        return
                     serve_native_gateway(
                         control_plane,
                         host=_LOOPBACK_HOST,
@@ -334,13 +361,24 @@ def _run_gateway(
                         max_active_requests=max_active_requests,
                         graceful_timeout_seconds=graceful_timeout,
                         on_listening=announce_ready,
+                        capture=None if capture_controller is None else capture_controller.native,
                     )
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc
+                finally:
+                    while not control_plane.close(
+                        timeout_seconds=min(300.0, max(0.1, graceful_timeout))
+                    ):
+                        _logger.warning("Waiting for retained gateway accounting before shutdown")
+                    if capture_controller is not None:
+                        capture_controller.native.close(0)
     except typer.BadParameter:
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
+    finally:
+        if guardrails is not None:
+            guardrails.close(timeout_seconds=graceful_timeout)
 
 
 def _unavailable_alias_entries(
@@ -535,12 +573,18 @@ def _emit_gateway_ready(
     *,
     port: int,
     compatibility: object | None,
-    ghost: bool,
+    capture_enabled: bool,
 ) -> None:
     """Print the green startup result and project compatibility credentials."""
     _console.print(
         f"[green]✓ Gateway ready[/green] http://{_LOOPBACK_HOST}:{port}/v1",
         markup=True,
+    )
+    _console.print(
+        "Traffic content capture disabled."
+        if not capture_enabled
+        else "Local traffic content capture enabled. Use --ghost to disable.",
+        markup=False,
     )
     if compatibility is not None:
         from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
