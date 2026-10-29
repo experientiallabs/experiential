@@ -4,12 +4,12 @@ Copy-paste prompts for getting started with the hosted Experiential Labs gateway
 (dashboard https://platform.experientiallabs.ai, API https://api.experientiallabs.ai/v1, OpenAI and Anthropic compatible). Paste the
 prompt you want into your coding agent (Claude Code, Cursor, Codex, Aider, or
 Conductor) and it runs the setup for you. Your account is created instantly from
-the email you give the agent; verifying that email unlocks platform credits, and everything else
-works right away. This file mirrors the machine-readable contract at
+the email you give the agent. Email confirmation and card/payment verification
+are separate steps; email alone does not unlock Free core model access.
+For the current machine-readable contract, see
 https://platform.experientiallabs.ai/llms.txt.
 
-Each block below is one self-contained prompt. The prompt text is the product's
-own shipped copy, reproduced verbatim.
+Each block below is one self-contained prompt. Each prompt includes the verification and Free core usage rules relevant to setup.
 
 ## 1. Upload your LLM traces as telemetry
 
@@ -18,8 +18,8 @@ me and then pull my existing LLM traces onto the platform as telemetry. This is
 my consent to create the account under my identity (using the email I give you
 when you ask), to read my own trace files, and to use the observability
 credential I give you. No browser step is needed to start — my account is
-created instantly from my email; I only verify that email later to unlock my
-credits, and I don't need to for my traces to land.
+created instantly from my email; trace uploads do not require card verification.
+Free core model access separately requires card or payment verification.
 
 This uploads my existing traces so I can see them as telemetry on the platform.
 
@@ -55,9 +55,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion yet: first complete the verification shown on
+   the Credits page. Email confirmation alone does not unlock Free core access;
+   that allowance requires card or payment verification. Landing my traces as telemetry works regardless.
 
 Now bring my traces in as telemetry. Use EXPLABS_API_KEY (the xpl_ key from
 step 2) as the bearer token on every call below. org_id is from step 2.
@@ -142,10 +142,19 @@ and the machine-readable contract is https://platform.experientiallabs.ai/llms.t
 
 One last thing to tell me, then you're done: check my email inbox for a message
 from Experiential Labs and click the verification link (or enter the code at
-https://platform.experientiallabs.ai/signin) to confirm my email. That's the ONLY thing left for me to do, and
-it just unlocks my credits for paid model calls — my traces are already live and
-don't need it. Until I verify, credit-drawing model calls are refused with
-"insufficient_quota"; using my own provider keys (BYOK) is unaffected.
+https://platform.experientiallabs.ai/signin) to confirm my email. My traces are already live
+and do not need that step.
+
+Free core access requires card or payment verification; email verification alone
+is not enough. Eligible Free accounts get GPT-6 Luna, DeepSeek V4.1 Flash and
+Clef at 10 requests/minute and 250,000 tokens/minute per model, with 1 million
+input and output tokens shared per day, resetting at 00:00 UTC. Accounts created
+before this offer launched also include Jev. At https://platform.experientiallabs.ai/credits,
+"Keep going on credits" lets requests past a Free limit use the credit balance
+at list price; otherwise they pause until free capacity is available. New Free
+accounts must opt in; existing paying Free accounts retain continuation unless
+they turn it off. Respect a saved choice and never enable paid continuation
+without asking me. Paid usage does not consume the Free core allowance.
 
 ## 2. Connect your inference provider keys (BYOK)
 
@@ -155,8 +164,8 @@ the gateway with my own keys (BYOK). This is my consent to create the account
 under my identity (using the email I give you when you ask), to search for MY
 own provider keys locally, and to connect the ones I approve to MY gateway
 account. No browser step is needed to start — my account is created instantly
-from my email; I only verify that email later to unlock platform credits, and I
-don't need to for BYOK pass-through calls (those run on my own keys).
+from my email. Free core model access separately requires card or payment
+verification; BYOK pass-through calls run on my own connected keys.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -190,9 +199,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion yet: first complete the verification shown on
+   the Credits page. Email confirmation alone does not unlock Free core access;
+   that allowance requires card or payment verification. Landing my traces as telemetry works regardless.
 
 Now connect my own provider keys. Use EXPLABS_API_KEY (the xpl_ key from step 2)
 as the bearer token on every call below.
@@ -251,9 +260,20 @@ connections anytime at https://platform.experientiallabs.ai/settings/integration
 One last thing to tell me, then you're done: to also use Experiential's
 platform-funded credits (calling models WITHOUT your own keys), check my email
 inbox for a message from Experiential Labs and click the verification link (or
-enter the code at https://platform.experientiallabs.ai/signin) to confirm my email. That unlocks my credits;
-until then, credit-drawing model calls are refused with "insufficient_quota",
-but BYOK pass-through on my connected keys is unaffected.
+enter the code at https://platform.experientiallabs.ai/signin) to confirm my email. Follow any
+additional verification steps shown on the Credits page. BYOK pass-through on
+my connected keys is unaffected.
+
+Free core access requires card or payment verification; email verification alone
+is not enough. Eligible Free accounts get GPT-6 Luna, DeepSeek V4.1 Flash and
+Clef at 10 requests/minute and 250,000 tokens/minute per model, with 1 million
+input and output tokens shared per day, resetting at 00:00 UTC. Accounts created
+before this offer launched also include Jev. At https://platform.experientiallabs.ai/credits,
+"Keep going on credits" lets requests past a Free limit use the credit balance
+at list price; otherwise they pause until free capacity is available. New Free
+accounts must opt in; existing paying Free accounts retain continuation unless
+they turn it off. Respect a saved choice and never enable paid continuation
+without asking me. Paid usage does not consume the Free core allowance.
 
 ## 3. Start calling models on the gateway
 
@@ -268,6 +288,17 @@ EXPLABS_API_KEY=<paste my xpl_ key from https://platform.experientiallabs.ai/set
 The gateway is OpenAI-compatible and also speaks the Anthropic Messages API.
 Everything is served under https://api.experientiallabs.ai/v1 with one header: Authorization: Bearer
 <my xpl_ key>. Nothing else changes about how I use the OpenAI or Anthropic SDK.
+
+Free core access requires card or payment verification; email verification alone
+is not enough. Eligible Free accounts get GPT-6 Luna, DeepSeek V4.1 Flash and
+Clef at 10 requests/minute and 250,000 tokens/minute per model, with 1 million
+input and output tokens shared per day, resetting at 00:00 UTC. Accounts created
+before this offer launched also include Jev. At https://platform.experientiallabs.ai/credits,
+"Keep going on credits" lets requests past a Free limit use the credit balance
+at list price; otherwise they pause until free capacity is available. New Free
+accounts must opt in; existing paying Free accounts retain continuation unless
+they turn it off. Respect a saved choice and never enable paid continuation
+without asking me. Paid usage does not consume the Free core allowance.
 
 Do it in this order. Print what you're doing at each step. If you get stuck,
 stop and tell me exactly what to do manually. Never invent a key — if you don't
@@ -332,8 +363,8 @@ my coding agents at the gateway. This is my consent to create the account under
 my identity (using the email I give you when you ask), to search for MY own
 provider keys and coding-agent logs locally, and to connect the ones I approve to
 MY gateway account. No browser step is needed to start — my account is created
-instantly from my email; I only verify that email later to unlock platform
-credits.
+instantly from my email. Free core model access separately requires card or
+payment verification; email verification alone is not enough.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -367,9 +398,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion yet: first complete the verification shown on
+   the Credits page. Email confirmation alone does not unlock Free core access;
+   that allowance requires card or payment verification. Landing my traces as telemetry works regardless.
 
 Now onboard my account with my own tools. Use EXPLABS_API_KEY (the xpl_ key from
 step 2) as the bearer token on every call below.
@@ -465,8 +496,8 @@ step 2) as the bearer token on every call below.
    After each repoint, make one tiny test call (model + messages only) through
    that agent's client to confirm it routes. Use a model served by one of the
    provider keys I connected in step 6 so it runs as free BYOK pass-through:
-   until I verify my email my platform credits stay locked and a credit-drawing
-   call is refused with "insufficient_quota".
+   platform-funded calls require the verification shown on the Credits page;
+   email confirmation alone does not unlock Free core access.
 
 When you're done, report back to me: my org_id, my starting credit balance
 (credits_granted), how many models GET /v1/models returned, which providers you
@@ -478,6 +509,17 @@ contract is https://platform.experientiallabs.ai/llms.txt.
 One last thing to tell me, then you're done: to use Experiential's
 platform-funded credits (calling models WITHOUT my own keys), check my email
 inbox for a message from Experiential Labs and click the verification link (or
-enter the code at https://platform.experientiallabs.ai/signin) to confirm my email. That unlocks my credits;
-until then, credit-drawing model calls are refused with "insufficient_quota",
-but BYOK pass-through on my connected keys is unaffected.
+enter the code at https://platform.experientiallabs.ai/signin) to confirm my email. Follow any
+additional verification steps shown on the Credits page. BYOK pass-through on
+my connected keys is unaffected.
+
+Free core access requires card or payment verification; email verification alone
+is not enough. Eligible Free accounts get GPT-6 Luna, DeepSeek V4.1 Flash and
+Clef at 10 requests/minute and 250,000 tokens/minute per model, with 1 million
+input and output tokens shared per day, resetting at 00:00 UTC. Accounts created
+before this offer launched also include Jev. At https://platform.experientiallabs.ai/credits,
+"Keep going on credits" lets requests past a Free limit use the credit balance
+at list price; otherwise they pause until free capacity is available. New Free
+accounts must opt in; existing paying Free accounts retain continuation unless
+they turn it off. Respect a saved choice and never enable paid continuation
+without asking me. Paid usage does not consume the Free core allowance.
