@@ -314,7 +314,7 @@ have mine, ask me.
      from anthropic import Anthropic
      client = Anthropic(base_url="https://api.experientiallabs.ai/v1", api_key=EXPLABS_API_KEY)
      m = client.messages.create(
-         model="<a model id from step 1>", max_tokens=16,
+         model="<the eligible chat model id selected in step 2>", max_tokens=16,
          messages=[{"role": "user", "content": "reply with the single word: ok"}])
      print(m.content[0].text)
    If a model rejects a param, retry with the minimal body (model + messages +
