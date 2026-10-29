@@ -55,9 +55,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion yet: first complete the verification shown on
+   the Credits page. Email confirmation alone does not unlock Free core access;
+   that allowance requires card or payment verification. Landing my traces as telemetry works regardless.
 
 Now bring my traces in as telemetry. Use EXPLABS_API_KEY (the xpl_ key from
 step 2) as the bearer token on every call below. org_id is from step 2.
@@ -199,9 +199,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion yet: first complete the verification shown on
+   the Credits page. Email confirmation alone does not unlock Free core access;
+   that allowance requires card or payment verification. Landing my traces as telemetry works regardless.
 
 Now connect my own provider keys. Use EXPLABS_API_KEY (the xpl_ key from step 2)
 as the bearer token on every call below.
@@ -398,9 +398,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion yet: first complete the verification shown on
+   the Credits page. Email confirmation alone does not unlock Free core access;
+   that allowance requires card or payment verification. Landing my traces as telemetry works regardless.
 
 Now onboard my account with my own tools. Use EXPLABS_API_KEY (the xpl_ key from
 step 2) as the bearer token on every call below.
