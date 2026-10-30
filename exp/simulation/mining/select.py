@@ -234,7 +234,11 @@ def _nearest_center(
     """Return the best center index, breaking vector ties by center identity."""
     ranked = sorted(
         (
-            (-_cosine(candidate.vector, by_id[center_id].vector), center_id, index)
+            (
+                -_cosine(candidate.selection_vector, by_id[center_id].selection_vector),
+                center_id,
+                index,
+            )
             for index, center_id in enumerate(centers)
         )
     )
@@ -269,7 +273,7 @@ def _medoid(member_ids: Sequence[str], by_id: dict[str, DeduplicatedTrace]) -> s
         member_ids,
         key=lambda candidate_id: (
             -sum(
-                _cosine(by_id[candidate_id].vector, by_id[other_id].vector)
+                _cosine(by_id[candidate_id].selection_vector, by_id[other_id].selection_vector)
                 * by_id[other_id].workload_mass
                 for other_id in member_ids
             ),
@@ -405,7 +409,10 @@ def _boundary_gap(
         for cluster_id in set(clusters.values())
     }
     similarities = sorted(
-        (_cosine(candidate.vector, by_id[medoid_id].vector) for medoid_id in medoids.values()),
+        (
+            _cosine(candidate.selection_vector, by_id[medoid_id].selection_vector)
+            for medoid_id in medoids.values()
+        ),
         reverse=True,
     )
     return similarities[0] - similarities[1]
@@ -429,7 +436,8 @@ def _farthest_first_candidate(
         remaining,
         key=lambda candidate: (
             max(
-                _cosine(candidate.vector, by_id[selected_id].vector) for selected_id in selected_ids
+                _cosine(candidate.selection_vector, by_id[selected_id].selection_vector)
+                for selected_id in selected_ids
             ),
             candidate.representative_trace_id,
         ),
@@ -491,7 +499,7 @@ def nearest_representative(
         selected_ids,
         key=lambda selected: (
             selected != candidate.representative_trace_id,
-            -_cosine(candidate.vector, by_id[selected].vector),
+            -_cosine(candidate.selection_vector, by_id[selected].selection_vector),
             selected,
         ),
     )

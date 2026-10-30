@@ -70,7 +70,12 @@ class DeduplicatedTrace:
         coverage_descriptor: Mining-only coverage facts aggregated across represented traces.
         source_coverage_descriptors: Mining-only facts retained per source trace for exact coverage
             mass accounting after duplicate collapse.
-        vector: Unit routing-descriptor embedding used for duplicate and core-set geometry.
+        vector: Unit routing-descriptor embedding used for duplicate and leakage geometry.
+        selection_vector: Unit embedding used for core-set geometry only: clustering, medoids,
+            farthest-first coverage, and nearest-representative assignment. An empty value
+            defaults to ``vector``, so provider-free mining keeps one geometry. A selection
+            strategy that embeds more than request-visible content replaces this vector alone
+            and never changes duplicate, lineage, or partition evidence.
     """
 
     representative_trace_id: str
@@ -81,6 +86,12 @@ class DeduplicatedTrace:
     coverage_descriptor: CoverageDescriptor
     source_coverage_descriptors: tuple[CoverageDescriptor, ...]
     vector: tuple[float, ...]
+    selection_vector: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Default core-set geometry to the request-visible descriptor vector."""
+        if not self.selection_vector:
+            object.__setattr__(self, "selection_vector", self.vector)
 
 
 @dataclass(frozen=True)
