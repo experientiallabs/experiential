@@ -132,3 +132,11 @@ def test_fast_reserve_fraction_is_a_proper_fraction_of_an_authored_bound() -> No
     for fraction in (0.0, 1.0, -0.1, float("nan")):
         with pytest.raises(ValidationError):
             GatewayRungDispatchPolicy(concurrency_bound=4, fast_reserve_fraction=fraction)
+
+
+def test_priority_tier_attested_is_off_by_default_and_independent_of_upstream_priority() -> None:
+    """The attestation sends nothing upstream, so it needs no self-hosted flag or bound."""
+    assert GatewayRungDispatchPolicy().priority_tier_attested is False
+    policy = GatewayRungDispatchPolicy(priority_tier_attested=True)
+    assert policy.priority_tier_attested is True
+    assert policy.upstream_priority is False
