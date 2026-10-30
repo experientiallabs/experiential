@@ -9,7 +9,12 @@ from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_inp
 from exp.common.tasks import load_task_set
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.errors import RouterCompositionError
-from exp.simulation.build import BuildReviewReadiness, ProjectBuild, build_project
+from exp.simulation.build import (
+    ProjectBuild,
+    SupersededBuildReviewError,
+    build_project,
+    parse_build_review,
+)
 
 
 def completed_project_build(project: ProjectStore) -> ProjectBuildArtifacts:
@@ -74,7 +79,9 @@ def reconstruct_completed_project_build(
     if not isinstance(review_state, dict) or "build_review" not in review_state:
         raise RouterCompositionError("completed project build has no build review contract")
     try:
-        review = BuildReviewReadiness.model_validate(review_state["build_review"])
+        review = parse_build_review(review_state["build_review"])
+    except SupersededBuildReviewError as exc:
+        raise RouterCompositionError(str(exc)) from exc
     except ValueError as exc:
         raise RouterCompositionError("completed project build review is invalid") from exc
     if review.trace_dataset != completed.trace_dataset or review.task_set != completed.task_set:

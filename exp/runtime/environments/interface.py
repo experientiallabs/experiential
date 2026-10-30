@@ -9,6 +9,7 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models import ToolCall
+from exp.common.rollouts.containment import ContainmentReport
 from exp.common.tasks import TaskCase
 
 
@@ -52,3 +53,13 @@ class EnvironmentRuntime(Protocol):
         Returns:
             A context manager that releases the session when it exits.
         """
+
+
+@runtime_checkable
+class ContainedEnvironmentRuntime(EnvironmentRuntime, Protocol):
+    """An environment runtime that reports the host containment every session enforces."""
+
+    @property
+    def containment(self) -> ContainmentReport:
+        """Return the startup containment report; sessions enforce its level or refuse."""
+        ...

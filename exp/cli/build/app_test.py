@@ -55,6 +55,13 @@ _RUNNER = CliRunner()
 _RESOLVE_CALLS: list[str] = []
 
 
+def test_evidence_reading_cannot_be_silently_ignored_by_router_wizard(tmp_path: Path) -> None:
+    result = _RUNNER.invoke(app, ["build", "reader", "--root", str(tmp_path), "--evidence-reading"])
+    assert result.exit_code == 2
+    assert "requires --traces PATH or --import-id ID" in result.output
+    assert not list(tmp_path.iterdir())
+
+
 def test_malformed_release_revision_fails_before_build_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -229,6 +236,10 @@ class _RuntimeCatalog:
         self._catalog = catalog
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
+
+    def with_transport_wrapper(self, _wrapper: object) -> _RuntimeCatalog:
+        """No HTTP exists in these injected clients; retain their deterministic semantics."""
+        return self
 
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Return the fixture alias identity without constructing a provider client.
@@ -1794,3 +1805,38 @@ def test_replacement_import_is_selected_with_its_completed_build(tmp_path: Path)
     assert store.load_project().trace_import_id == second.import_id
     assert store.load_project().build != original.build
     assert frozen.load_project() == original
+
+
+def test_replacement_import_of_another_format_is_selected_with_its_build(
+    tmp_path: Path,
+) -> None:
+    """An import's declared format is a build pointer, selected with the import it describes.
+
+    Trajectories exported from a project's own continuation studies arrive as an import of
+    another format; rebuilding the project from it must not be refused as a changed
+    configuration.
+    """
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    _, first = ingest_traces(
+        "support", root=root, source_format="otlp", path=_otlp_export(tmp_path)
+    )
+    _, second = ingest_traces(
+        "support", root=root, source_format="chat-json", path=_chat_json_export(tmp_path)
+    )
+    assert first is not None and second is not None
+    command = ["build", "support", "--root", str(root), "--import-id"]
+    result = _RUNNER.invoke(app, [*command, first.import_id])
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    original = store.load_project()
+    assert original.trace_source == "otlp"
+    preflight = _RUNNER.invoke(app, [*command, second.import_id, "--dry-run"])
+    assert preflight.exit_code == 0, preflight.output
+    assert store.load_project() == original, "a dry run selects nothing"
+    replaced = _RUNNER.invoke(app, [*command, second.import_id])
+    assert replaced.exit_code == 0, replaced.output
+    rebuilt = store.load_project()
+    assert (rebuilt.trace_import_id, rebuilt.trace_source) == (second.import_id, "chat-json")
+    assert rebuilt.build != original.build

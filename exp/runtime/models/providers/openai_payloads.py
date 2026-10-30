@@ -36,6 +36,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
 )
+from exp.runtime.models.providers.tool_turn_order import fold_assistant_text_into_tool_turns
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
     fold_tool_result_attachments,
@@ -408,6 +409,9 @@ def openai_compatible_stream_payload(
         request.messages,
         route_sha256=reasoning_route_sha256,
     )
+    # Chat requires a tool turn's results right after the message that called
+    # them; Responses history can carry progress text in between.
+    messages = fold_assistant_text_into_tool_turns(messages)
     if deepseek_reasoning_history or is_deepseek_model_id(model_id):
         # DeepSeek ends a tools+reasoning turn empty when the conversation
         # ends on an instruction; see fold_trailing_instruction_turns.

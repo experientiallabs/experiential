@@ -13,6 +13,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ContractModel,
     JsonObject,
+    Sha256,
     sha256_json,
     stable_id,
 )
@@ -28,10 +29,16 @@ from exp.common.models import (
     ToolChoice,
 )
 from exp.common.models.client import RequestCapacityExceeded
-from exp.common.project import ArtifactStore
+from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.models.budget import RequestBudget
+from exp.runtime.models.call_evidence import (
+    call_consumer,
+    canonical_call,
+    current_call_intent,
+    current_consumer,
+)
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
 
@@ -100,8 +107,20 @@ class StructuredCompletion:
         budget: RequestBudget,
         artifacts: ArtifactStore,
         clock: Callable[[], datetime] | None = None,
+        window: datetime | None = None,
     ) -> None:
-        """Bind already configured provider, budget, physical counter and artifacts."""
+        """Bind already configured provider, budget, physical counter and artifacts.
+
+        Args:
+            client: Configured provider client.
+            plan: Frozen limits; its deadline is part of every request fingerprint.
+            budget: Shared request ledger with exact response replay.
+            artifacts: Immutable call-intent owner.
+            clock: Aware dispatch and admission clock.
+            window: Deadline of an explicitly resumed execution window. It extends, never
+                shortens, admission past the plan's deadline; the plan, and so every saved
+                request's replay identity, keeps the registered deadline.
+        """
         if plan.capabilities.identity_sha256() != plan.model.capabilities_sha256:
             raise ValueError("completion capabilities differ from the model snapshot")
         if plan.json_object_output and not plan.capabilities.supports_structured_output:
@@ -113,6 +132,28 @@ class StructuredCompletion:
         self.plan = plan
         self._client, self._budget = client, budget
         self._artifacts, self._clock = artifacts, clock or _utc_now
+        self._deadline = plan.deadline if window is None else max(plan.deadline, window)
+
+    @property
+    def model_identity(self) -> str:
+        """Return the configured model whose returned snapshot is verified at admission."""
+        return self.plan.model.model_id
+
+    @property
+    def completion_profile_sha256(self) -> Sha256:
+        """Bind inference-affecting settings independently of scheduling and cost authority."""
+        return sha256_json(
+            self.plan.model_dump(
+                mode="json",
+                include={
+                    "model",
+                    "capabilities",
+                    "output_tokens",
+                    "output_protocol",
+                    "json_object_output",
+                },
+            )
+        )
 
     def __call__(self, body: JsonObject, logical_id: str) -> JsonObject:
         """Dispatch one structured request or return its exact saved proposal.
@@ -229,7 +270,7 @@ class StructuredCompletion:
             )
         if caps.maximum_output_tokens is not None and requested_output > caps.maximum_output_tokens:
             raise RequestCapacityExceeded("output reservation exceeds the declared route capacity")
-        if self._clock() >= self.plan.deadline:
+        if self._clock() >= self._deadline:
             raise CompletionNotDispatched("completion deadline reached before dispatch")
 
     def complete_request(self, request: ModelRequest, logical_id: str) -> ModelResponse:
@@ -241,34 +282,44 @@ class StructuredCompletion:
         requested_output = request.maximum_output_tokens or self.plan.output_tokens
         request = request.model_copy(update={"maximum_output_tokens": requested_output})
         self._check_capacity(request)
-        fingerprint = sha256_json(
-            {"request": request.model_dump(mode="json"), "plan": self.plan.model_dump(mode="json")}
-        )
+        caller = current_call_intent()
+        identity_body: JsonObject = {
+            "request": request.model_dump(mode="json"),
+            "plan": self.plan.model_dump(mode="json"),
+        }
+        if caller is not None:
+            if artifact_input(self._artifacts.read(caller.artifact_id).manifest) != caller:
+                raise ValueError("structured caller intent differs from its exact artifact")
+            identity_body["caller_intent"] = caller.model_dump(mode="json")
+        fingerprint = sha256_json(identity_body)
 
         def operation() -> ModelResponse:
             """Claim physical capacity and retain intent before using the injected client."""
-            if self._clock() >= self.plan.deadline:
+            if self._clock() >= self._deadline:
                 raise TimeoutError("completion deadline reached during admission")
             identity = stable_id(
                 "structured-intent", {"logical_id": logical_id, "fingerprint": fingerprint}
             )
-            self._artifacts.write_json(
+            manifest = self._artifacts.write_json(
                 artifact_id=identity,
                 artifact_type="structured-call-intent",
                 envelope=ArtifactEnvelope(
                     schema_version=1,
                     created_at=self._clock(),
-                    inputs=(),
+                    inputs=() if caller is None else (caller,),
                     code_revision=self.plan.code_revision,
                 ),
                 files={
                     "request.json": {
+                        "logical_id": logical_id,
+                        "consumer": current_consumer(),
                         "request": request.model_dump(mode="json"),
                         "plan": self.plan.model_dump(mode="json"),
                     }
                 },
             )
-            return self._client.complete(request)
+            with canonical_call(artifact_input(manifest)):
+                return self._client.complete(request)
 
         with self._budget.scope(logical_id):
             response = self._budget.call(
@@ -283,7 +334,7 @@ class StructuredCompletion:
             )
         if response.model != self.plan.model and response.model != self._served_model():
             raise ValueError("model identity differs; raw response retained")
-        if self._clock() >= self.plan.deadline:
+        if self._clock() >= self._deadline:
             raise TimeoutError("late model response retained without admission")
         return response
 
@@ -333,7 +384,8 @@ class _EpisodeClient:
         """Consume one exact turn coordinate before calling the existing budget owner."""
         turn = self._turn
         self._turn += 1
-        return self._owner.complete_request(request, f"{self._episode_id}/actor-{turn}")
+        with call_consumer("actor"):
+            return self._owner.complete_request(request, f"{self._episode_id}/actor-{turn}")
 
 
 def _utc_now() -> datetime:

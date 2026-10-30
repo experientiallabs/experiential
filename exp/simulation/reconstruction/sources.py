@@ -16,6 +16,9 @@ def from_canonical_traces(
 ) -> RawInputs:
     """Retain original span ordering, provenance and call/result identities.
 
+    A trace's shared message history, which its model spans reference by prefix length, is
+    retained once in the episode's first record.
+
     Args:
         traces: Caller-admitted canonical traces from an existing source loader.
         description: Optional environment description, independent of observed outcomes.
@@ -36,6 +39,11 @@ def from_canonical_traces(
                         "initial_context": trace.initial_context,
                         "source": trace.source.model_dump(mode="json"),
                         "conversation_id": trace.conversation_id,
+                        **(
+                            {"message_history": list(trace.message_history)}
+                            if trace.message_history
+                            else {}
+                        ),
                     },
                     *(span.model_dump(mode="json") for span in trace.spans),
                 ),

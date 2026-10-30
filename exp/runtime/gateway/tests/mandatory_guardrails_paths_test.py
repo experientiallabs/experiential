@@ -84,6 +84,7 @@ def _serving(control: NativeControlPlane) -> Iterator[str]:
         stop.request_shutdown()
         worker.join(5)
         assert not worker.is_alive()
+        control.close()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
@@ -224,6 +225,8 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
                 "select web_search_requests from gateway_requests"
             ).fetchall() == [(1 if blocked_input else 0,)]
     finally:
+        policy.close()
+        components.close()
         provider.shutdown()
         provider.server_close()
         worker.join(5)
@@ -357,6 +360,8 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
         assert attempts[0][2:] == (50, 8)
         assert len(attempts) == len(provider_requests)
     finally:
+        policy.close()
+        components.close()
         provider.shutdown()
         provider.server_close()
         worker.join(5)

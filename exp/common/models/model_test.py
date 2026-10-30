@@ -553,3 +553,13 @@ def test_emits_images_stays_out_of_the_capability_identity() -> None:
     emitting = ModelCapabilities(supports_tools=True, emits_images=True)
     assert plain.identity_sha256() == emitting.identity_sha256()
     assert emitting.emits_images is True and plain.emits_images is False
+
+
+def test_forced_tool_choice_declaration_keeps_digests_until_it_is_declared() -> None:
+    """Unknown support adds nothing to the dump; a declaration never moves the identity."""
+    unknown = ModelCapabilities(supports_tools=True)
+    refusing = ModelCapabilities(supports_tools=True, supports_forced_tool_choice=False)
+
+    assert "supports_forced_tool_choice" not in unknown.model_dump(mode="json")
+    assert refusing.model_dump(mode="json")["supports_forced_tool_choice"] is False
+    assert refusing.identity_sha256() == unknown.identity_sha256()

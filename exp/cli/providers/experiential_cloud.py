@@ -14,7 +14,7 @@ from __future__ import annotations
 import html
 import os
 import secrets
-import select
+import selectors
 import sys
 import termios
 import threading
@@ -349,29 +349,30 @@ def read_masked_key_with_callback(
     prompted = False
     try:
         # Keep the final read non-blocking even if terminal readiness changes between
-        # select() and os.read(). This lets callback completion restore echo before
+        # the readiness check and os.read(). This lets callback completion restore echo before
         # returning, with no daemon reader left owning the terminal.
         os.set_blocking(fd, False)
         termios.tcsetattr(fd, termios.TCSADRAIN, hidden_attributes)
         console.print(prompt, end="")
         prompted = True
-        while True:
-            token = wait_for_callback(0.05)
-            if token is not None:
-                # Do not leave partially entered secret bytes for the next shell or
-                # CLI prompt after callback-driven login takes ownership of the result.
-                termios.tcflush(fd, termios.TCIFLUSH)
-                return token
-            readable, _, _ = select.select([fd], [], [], 0.05)
-            if not readable:
-                continue
-            try:
-                data = os.read(fd, 4096)
-            except BlockingIOError:
-                continue
-            if not data:
-                raise EOFError
-            return data.decode("utf-8", errors="replace").strip() or None
+        with selectors.DefaultSelector() as reader:
+            reader.register(fd, selectors.EVENT_READ)
+            while True:
+                token = wait_for_callback(0.05)
+                if token is not None:
+                    # Do not leave partially entered secret bytes for the next shell or
+                    # CLI prompt after callback-driven login takes ownership of the result.
+                    termios.tcflush(fd, termios.TCIFLUSH)
+                    return token
+                if not reader.select(0.05):
+                    continue
+                try:
+                    data = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    raise EOFError
+                return data.decode("utf-8", errors="replace").strip() or None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attributes)
         os.set_blocking(fd, was_blocking)

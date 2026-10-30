@@ -20,7 +20,7 @@ from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServic
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.judging_resume import revised_judge_setup
 from exp.optimize.evaluation.judging_spend import judge_request_coordinates
-from exp.optimize.evaluation.learned_memory import bind_evaluation_memory
+from exp.optimize.evaluation.learning.profile import bind_evaluation_memory
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models

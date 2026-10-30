@@ -57,6 +57,7 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
+from exp.runtime.gateway.native_lifecycle import NativeAccountingLifecycle
 from exp.runtime.gateway.native_recovery import (
     observe_reserved_attempt,
     record_departure,
@@ -96,7 +97,6 @@ from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_GRACE_SECONDS = 5.0
-_SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
 
 # The request deadline ran out between attempts, before any provider answered.
@@ -113,7 +113,7 @@ TOOL_SEARCH_ROUND: Final = "tool_search_round"
 """Dispatch reason of a same-rung re-dial after a gateway tool-search round."""
 
 
-class NativeAttemptAccounting:
+class NativeAttemptAccounting(NativeAccountingLifecycle):
     """Registry of admitted requests and their durable attempt settlements.
 
     A lock protects Rust callbacks; timed and opportunistic sweeps bound abandoned
@@ -182,7 +182,7 @@ class NativeAttemptAccounting:
         self._throttles_failed_over = 0
         self._throttle_backoff_redials = 0
         self._throttle_backoff_forced = 0
-        # Reconcile retained writes and abandoned requests even without new traffic.
+        self._sweep_stop = threading.Event()
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
             name="exp-native-settlement-sweep",
@@ -874,12 +874,6 @@ class NativeAttemptAccounting:
             lock=self._lock,
             sample_gate=self._cache_sample_gate,
         )
-
-    def _sweep_loop(self) -> None:
-        """Periodically reconcile retained or expired attempts for the process lifetime."""
-        while True:
-            time.sleep(_SWEEP_INTERVAL_SECONDS)
-            self.sweep_expired()
 
     def sweep_expired(self) -> None:
         """Recover retained settlements and close abandoned requests.

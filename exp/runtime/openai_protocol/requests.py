@@ -90,6 +90,7 @@ from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache
 from exp.runtime.openai_protocol.reasoning_replay import (
     ReplayedReasoningTooLong,
     fold_replayed_reasoning,
+    replayed_reasoning_disclosures,
 )
 from exp.runtime.openai_protocol.responses_input import (
     ReplayedFunctionCall,
@@ -366,7 +367,7 @@ def decode_chat(
                     and request.chat_template_kwargs.preserve_thinking is not None
                     else ()
                 ),
-                *_replayed_reasoning_disclosures(request.messages),
+                *replayed_reasoning_disclosures(request.messages),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
@@ -551,7 +552,7 @@ def decode_responses(
                 *alias_disclosures,
                 *breakpoints.disclosures,
                 *cache_disclosures,
-                *_replayed_reasoning_disclosures(
+                *replayed_reasoning_disclosures(
                     ()
                     if isinstance(request.input, str)
                     else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
@@ -758,26 +759,6 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 converted[-1], f"{prefix}.{message_index}.content"
             )
     return tuple(converted)
-
-
-def _replayed_reasoning_disclosures(messages: Sequence[_Message]) -> tuple[str, ...]:
-    """Collect the OpenRouter replay disclosures owed across a transcript, once each."""
-    disclosures: list[str] = []
-    for message in messages:
-        try:
-            folded = fold_replayed_reasoning(
-                reasoning_content=message.reasoning_content,
-                reasoning=message.reasoning,
-                reasoning_details=message.reasoning_details,
-            )
-        except ReplayedReasoningTooLong:
-            # ``_messages`` names the field in its own 400 before this runs
-            # on the Chat path; the Responses path folds the same message.
-            continue
-        for disclosure in folded.disclosures:
-            if disclosure not in disclosures:
-                disclosures.append(disclosure)
-    return tuple(disclosures)
 
 
 def _tool_call(call: _AssistantToolCall) -> ToolCall:

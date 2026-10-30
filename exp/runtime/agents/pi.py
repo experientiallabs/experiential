@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import subprocess
 import threading
 from contextlib import AbstractContextManager
@@ -33,8 +34,10 @@ from exp.common.models import (
     ModelResponse,
     ToolCall,
 )
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from exp.common.tasks import TaskCase, ToolSchema
+from exp.runtime.agents.chat import task_messages
 from exp.runtime.agents.interface import AgentEpisode
 from exp.runtime.environments import EnvironmentSession, Observation
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -96,11 +99,14 @@ class PiAgentRuntime:
     the model EXP supplied for this episode. Its explicit extension forwards task-visible tool
     calls to the supplied execute-only environment. This configuration prevents ambient Pi model
     selection. Its private working directory isolates evaluator inputs from caller project Pi
-    settings and prompts. It is not a security sandbox for the installed Pi process.
+    settings and prompts. The child gets a minimal environment and private HOME/TMPDIR; provider
+    credentials stay with the injected coordinator. This is not filesystem or network confinement.
 
     Args:
         executable: Name or path of the externally installed Pi executable.
         timeout_seconds: Positive upper bound for the installed Pi subprocess.
+        maximum_model_calls: Per-episode logical model attempts, including failed completions.
+        maximum_output_tokens: Per-call ceiling advertised to Pi and enforced before injection.
     """
 
     def __init__(
@@ -108,13 +114,21 @@ class PiAgentRuntime:
         *,
         executable: str = "pi",
         timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        maximum_model_calls: int = 100,
+        maximum_output_tokens: int = 16384,
     ) -> None:
         if not executable:
             raise ValueError("Pi executable must be a non-empty command or path")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("Pi timeout_seconds must be a finite positive value")
+        if type(maximum_model_calls) is not int or maximum_model_calls < 1:
+            raise ValueError("Pi maximum_model_calls must be a positive integer")
+        if type(maximum_output_tokens) is not int or maximum_output_tokens < 1:
+            raise ValueError("Pi maximum_output_tokens must be a positive integer")
         self._executable = executable
         self._timeout_seconds = timeout_seconds
+        self._maximum_model_calls = maximum_model_calls
+        self._maximum_output_tokens = maximum_output_tokens
 
     def preflight(self) -> None:
         """Confirm that EXP can call the configured installed Pi executable.
@@ -147,13 +161,26 @@ class PiAgentRuntime:
             PiTranscriptError: Pi emitted an invalid or incomplete JSON event transcript.
         """
         executable = self._resolve_executable()
-        with _PiBridge(task, model, environment) as bridge:
-            output = _invoke_installed_pi(
-                executable,
-                bridge.invocation(executable, task.instruction),
-                self._timeout_seconds,
+        with _PiBridge(
+            task, model, environment, self._maximum_model_calls, self._maximum_output_tokens
+        ) as bridge:
+            try:
+                output = _invoke_installed_pi(
+                    executable,
+                    bridge.invocation(executable, task_messages(task)[-1].content or ""),
+                    self._timeout_seconds,
+                )
+            finally:
+                # Pi can catch an HTTP tool failure and emit a successful transcript. The
+                # coordinator must retain the original dependency error, including when
+                # Pi instead exits unsuccessfully or exhausts its model allowance.
+                bridge.raise_if_failed()
+        episode = _episode_from_pi_events(output)
+        if bridge.limit_reached and episode.failure is None:
+            return episode.model_copy(
+                update={"stop_reason": StopReason.MAXIMUM_STEPS, "failure": None}
             )
-        return _episode_from_pi_events(output)
+        return episode
 
     def _resolve_executable(self) -> str:
         """Resolve the configured Pi command and raise an actionable local-install error."""
@@ -174,9 +201,18 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         task: TaskCase,
         model: ModelClient,
         environment: EnvironmentSession,
+        maximum_model_calls: int = 100,
+        maximum_output_tokens: int = 16384,
     ) -> None:
         self._task = task
+        self._bridge_token = secrets.token_urlsafe(32)
         self._model = model
+        self._maximum_model_calls = maximum_model_calls
+        self._maximum_output_tokens = maximum_output_tokens
+        self._model_calls = 0
+        self.limit_reached = False
+        self._failure: Exception | RequestAdmissionRefused | None = None
+        self._failure_lock = threading.Lock()
         self._environment = environment
         self._tools_by_name = {tool.name: tool for tool in task.tools}
         if len(self._tools_by_name) != len(task.tools):
@@ -203,7 +239,11 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         thread.start()
         bridge_url = f"http://127.0.0.1:{server.server_port}"
         (config_directory / "models.json").write_text(
-            json.dumps(_pi_models_config(bridge_url), separators=(",", ":")), encoding="utf-8"
+            json.dumps(
+                _pi_models_config(bridge_url, self._bridge_token, self._maximum_output_tokens),
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
         )
         (root / "tools.json").write_text(
             json.dumps(_pi_tools_config(self._task.tools), separators=(",", ":")), encoding="utf-8"
@@ -240,7 +280,23 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         if temporary_directory is None or server is None:
             raise RuntimeError("Pi bridge invocation requested outside its active context")
         root = Path(temporary_directory.name)
-        process_environment = os.environ.copy()
+        private_directories = {
+            key: root / name
+            for key, name in (
+                ("HOME", "home"),
+                ("TMPDIR", "tmp"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_CACHE_HOME", "cache"),
+            )
+        }
+        for directory in private_directories.values():
+            directory.mkdir(exist_ok=True)
+        process_environment = {
+            "PATH": str(Path(executable).parent) + os.pathsep + os.defpath,
+            "LANG": "C.UTF-8",
+            "TZ": "UTC",
+            **{key: str(path) for key, path in private_directories.items()},
+        }
         process_environment.update(
             {
                 "PI_CODING_AGENT_DIR": str(root / "agent"),
@@ -248,6 +304,7 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
                 "PI_TELEMETRY": "0",
                 "PI_SKIP_VERSION_CHECK": "1",
                 "EXP_PI_BRIDGE_URL": f"http://127.0.0.1:{server.server_port}",
+                "EXP_PI_BRIDGE_TOKEN": self._bridge_token,
                 "EXP_PI_TOOLS_PATH": str(root / "tools.json"),
             }
         )
@@ -276,15 +333,40 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
             cwd=root,
         )
 
+    def authorized(self, header: str | None) -> bool:
+        """Accept only this episode's capability, never an ambient provider credential."""
+        return header is not None and secrets.compare_digest(
+            header.encode(), ("Bearer " + self._bridge_token).encode()
+        )
+
     def complete_model(self, payload: JsonObject) -> tuple[GatewayRequest, ModelResponse]:
         """Convert one Pi OpenAI-compatible request and call the EXP-injected model client."""
         try:
             serving_request = decode_chat(_normalize_pi_chat_payload(payload)).request
         except OpenAIProtocolError as exc:
             raise _PiBridgeError(f"Pi model bridge request is invalid: {exc.detail.code}") from exc
-        request = model_request(serving_request).model_copy(update={"tools": self._task.tools})
+        request = model_request(serving_request)
+        request = request.model_copy(
+            update={
+                "tools": self._task.tools,
+                "messages": (*task_messages(self._task)[:-1], *request.messages),
+                "maximum_output_tokens": min(
+                    request.maximum_output_tokens or self._maximum_output_tokens,
+                    self._maximum_output_tokens,
+                ),
+            }
+        )
         with self._model_lock:
-            response = self._model_context.run(self._model.complete, request)
+            self.raise_if_failed()
+            if self._model_calls >= self._maximum_model_calls:
+                self.limit_reached = True
+                raise _PiBridgeError("Pi actor model-call allowance exhausted; no call dispatched")
+            self._model_calls += 1
+            try:
+                response = self._model_context.run(self._model.complete, request)
+            except (Exception, RequestAdmissionRefused) as error:
+                self._record_failure(error)
+                raise
         return serving_request, response
 
     def execute_tool(self, tool_name: str, payload: JsonObject) -> Observation:
@@ -301,10 +383,28 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         except ValidationError as exc:
             raise _PiBridgeError("Pi tool bridge request has non-object arguments") from exc
         with self._tool_lock:
-            return self._environment_context.run(
-                self._environment.execute,
-                ToolCall(call_id=call_id, name=tool_name, arguments=arguments),
-            )
+            self.raise_if_failed()
+            try:
+                return self._environment_context.run(
+                    self._environment.execute,
+                    ToolCall(call_id=call_id, name=tool_name, arguments=arguments),
+                )
+            except (Exception, RequestAdmissionRefused) as error:
+                self._record_failure(error)
+                raise
+
+    def _record_failure(self, error: Exception | RequestAdmissionRefused) -> None:
+        """Retain the first dependency failure across HTTP worker threads."""
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = error
+
+    def raise_if_failed(self) -> None:
+        """Refuse further dispatch and propagate the original error to the episode owner."""
+        with self._failure_lock:
+            failure = self._failure
+        if failure is not None:
+            raise failure
 
 
 class _PiBridgeHttpServer(ThreadingHTTPServer):
@@ -324,6 +424,10 @@ class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler hook name
         """Route one local Pi model or tool request without logging its contents."""
+        if not self._bridge.authorized(self.headers.get("Authorization")):
+            self.close_connection = True
+            self._write_json(HTTPStatus.UNAUTHORIZED, {"error": "Pi bridge capability required"})
+            return
         try:
             payload = self._read_payload()
             parsed_path = urlparse(self.path)
@@ -337,7 +441,7 @@ class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "unknown Pi bridge endpoint"})
         except _PiBridgeError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except Exception:  # noqa: BLE001 - bridge failures must not expose episode payloads
+        except (Exception, RequestAdmissionRefused):  # noqa: BLE001 - redact dependency details.
             self._write_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Pi bridge execution failed"}
             )
@@ -419,6 +523,8 @@ class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -427,14 +533,16 @@ class _PiBridgeError(ValueError):
     """A local conversion or execution request cannot cross the Pi bridge."""
 
 
-def _pi_models_config(bridge_url: str) -> JsonObject:
+def _pi_models_config(
+    bridge_url: str, bridge_token: str, maximum_output_tokens: int = 16384
+) -> JsonObject:
     """Return Pi's ephemeral custom-provider configuration for one injected EXP model."""
     return {
         "providers": {
             _EXP_PI_PROVIDER: {
                 "baseUrl": f"{bridge_url}/v1",
                 "api": "openai-completions",
-                "apiKey": "exp-local-bridge",
+                "apiKey": bridge_token,
                 "compat": {
                     "maxTokensField": "max_tokens",
                     "supportsDeveloperRole": False,
@@ -448,7 +556,7 @@ def _pi_models_config(bridge_url: str) -> JsonObject:
                         "reasoning": False,
                         "input": ["text"],
                         "contextWindow": 128000,
-                        "maxTokens": 16384,
+                        "maxTokens": maximum_output_tokens,
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                     }
                 ],
@@ -801,13 +909,14 @@ _PI_EXTENSION_SOURCE = r"""import { readFile } from "node:fs/promises";
 import { Type } from "typebox";
 
 const bridgeUrl = process.env.EXP_PI_BRIDGE_URL;
+const bridgeToken = process.env.EXP_PI_BRIDGE_TOKEN;
 const toolsPath = process.env.EXP_PI_TOOLS_PATH;
 
 async function request(path, body) {
-  if (!bridgeUrl) throw new Error("EXP_PI_BRIDGE_URL is required");
+  if (!bridgeUrl || !bridgeToken) throw new Error("EXP Pi bridge configuration is required");
   const response = await fetch(`${bridgeUrl}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "Authorization": `Bearer ${bridgeToken}` },
     body: JSON.stringify(body),
   });
   const payload = await response.json();

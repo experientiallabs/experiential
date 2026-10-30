@@ -22,7 +22,7 @@ field.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Literal
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -155,3 +155,49 @@ def fold_replayed_reasoning(
         disclosures.append(REASONING_DETAILS_DROPPED)
     plaintext = "".join(texts) if texts else None
     return FoldedReasoning(plaintext, "reasoning_details", tuple(disclosures))
+
+
+class ReplayedReasoningMessage(Protocol):
+    """The reasoning fields one replayed assistant message carries."""
+
+    @property
+    def reasoning_content(self) -> str | None:
+        """The gateway's own replay field."""
+        ...
+
+    @property
+    def reasoning(self) -> str | None:
+        """OpenRouter's plaintext field."""
+        ...
+
+    @property
+    def reasoning_details(self) -> Iterable[ReasoningDetail] | None:
+        """OpenRouter's typed blocks."""
+        ...
+
+
+def replayed_reasoning_disclosures(messages: Iterable[ReplayedReasoningMessage]) -> tuple[str, ...]:
+    """Collect the OpenRouter replay disclosures owed across a transcript, once each.
+
+    Args:
+        messages: The transcript's messages, in order.
+
+    Returns:
+        Each distinct disclosure, in first-seen order.
+    """
+    disclosures: list[str] = []
+    for message in messages:
+        try:
+            folded = fold_replayed_reasoning(
+                reasoning_content=message.reasoning_content,
+                reasoning=message.reasoning,
+                reasoning_details=message.reasoning_details,
+            )
+        except ReplayedReasoningTooLong:
+            # The Chat decoder names the field in its own 400 before this runs;
+            # the Responses path folds the same message.
+            continue
+        for disclosure in folded.disclosures:
+            if disclosure not in disclosures:
+                disclosures.append(disclosure)
+    return tuple(disclosures)

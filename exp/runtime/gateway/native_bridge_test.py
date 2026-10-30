@@ -2492,11 +2492,13 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
     control = NativeControlPlane(components, request_timeout_seconds=0.01)
     native_time = mock.Mock(wraps=time)
     native_time.monotonic.side_effect = clock.monotonic
-    # Only these module references are replaced. SQLite auth and settlement use
-    # their constructor clock; shared timer, health and group-commit time stays real.
+    # Admission and snapshot preflight share the deterministic monotonic clock; SQLite auth
+    # and settlement use their constructor clock. Shared timer, health and group-commit time
+    # stays real, while local I/O does not consume the test's logical request allowance.
     with (
         mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
+        mock.patch("exp.runtime.gateway.model_chain_authority.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
     ):
         clock.elapsed += setup_elapsed
@@ -4351,12 +4353,11 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
 
 def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> None:
     """An abandoned admission closed by the sweep moves the cancellation counter."""
-    # The deadline must outlast admission itself (a 10 ms budget raced local
-    # snapshot preparation on a loaded CI runner) and then lapse before the sweep.
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=30)
     _admit(control, raw_key, _chat_body())
-    time.sleep(0.6)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    with mock.patch(
+        "exp.runtime.gateway.native_accounting.time.monotonic", return_value=time.monotonic() + 60
+    ):
         control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
     snapshot = control.metrics_snapshot()

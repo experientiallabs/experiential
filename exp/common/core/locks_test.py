@@ -13,10 +13,12 @@ import time
 from pathlib import Path
 
 import pytest
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
+from exp.common.core import host_scope
 from exp.common.core.files import write_text_atomic
-from exp.common.core.locks import FileLockTimeout, file_write_lock
+from exp.common.core.host_scope import MARKER_NAME, HostScopeError
+from exp.common.core.locks import CoordinationLock, FileLockTimeout, file_write_lock
 
 
 def test_file_write_lock_reports_a_stuck_holder_instead_of_hanging(tmp_path: Path) -> None:
@@ -128,3 +130,40 @@ def test_two_symlinks_to_one_target_contend_on_a_single_lock(tmp_path: Path) -> 
 
     assert [item.name for item in shared.glob("*.lock")] == ["pool.toml.lock"]
     assert list(tmp_path.glob("*.lock")) == [], "a lock was keyed off the symlink, not the target"
+
+
+def _foreign_marker(directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind ``directory`` to another machine and forget this process's verified directories."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / MARKER_NAME).write_text(
+        '{"protocol": "exp-host-scope-v1", "machine": "elsewhere", "hostname": "other-box"}'
+    )
+    monkeypatch.setattr(host_scope, "_verified", set())
+
+
+def test_coordination_lock_binds_its_directory_and_behaves_like_a_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the owning machine a coordination lock excludes and releases like any file lock."""
+    monkeypatch.setattr(host_scope, "_verified", set())
+    directory = tmp_path / "fresh" / "runs"
+    first = CoordinationLock(directory / "run.lock", timeout=0)
+    with first:
+        assert (directory / MARKER_NAME).is_file()
+        with pytest.raises(Timeout):
+            CoordinationLock(directory / "run.lock", timeout=0).acquire()
+    with CoordinationLock(directory / "run.lock", timeout=0):
+        pass
+
+
+def test_locks_in_a_directory_owned_by_another_machine_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second host never "acquires" a lock that only excludes processes of the first host."""
+    _foreign_marker(tmp_path, monkeypatch)
+    with pytest.raises(HostScopeError, match=r"another machine \(other-box\)"):
+        CoordinationLock(tmp_path / "run.lock", timeout=0).acquire()
+    with pytest.raises(HostScopeError, match="another machine"):
+        with file_write_lock(tmp_path / "roster.toml", what="the roster"):
+            pass  # pragma: no cover - refused before the lock is taken
+    assert not (tmp_path / "roster.toml").exists()

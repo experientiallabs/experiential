@@ -685,6 +685,7 @@ def test_build_replacement_crash_blocks_stale_judge_commit_and_recovers(
         "rubric_review",
         "human_score_history",
         "human_score_submissions",
+        "human_review_submissions",
     ):
         assert stale_key not in recovered_review
     for artifact_id, manifest in old_manifests.items():

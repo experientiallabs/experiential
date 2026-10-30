@@ -10,21 +10,22 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.runtime.sessions.store import (
+from exp.runtime.sessions.edits import SetValue, StateEdit
+from exp.runtime.sessions.errors import (
     ClaimLostError,
-    RequestPreflightReceipt,
-    SessionBinding,
     SessionDrainingError,
     SessionExistsError,
     SessionNotFoundError,
-    SessionStore,
     SessionStoreError,
     StepAmbiguousError,
     StepConflictError,
+    StepDeadlineExceededError,
     StepInFlightError,
     StepRejectedError,
     VersionConflictError,
 )
+from exp.runtime.sessions.records import RequestPreflightReceipt, SessionBinding, StepStatus
+from exp.runtime.sessions.store import SessionStore
 
 BINDING = SessionBinding(
     deadline=datetime(2099, 1, 1, tzinfo=UTC),
@@ -49,6 +50,18 @@ def _store(tmp_path: Path) -> SessionStore:
     store = SessionStore(tmp_path / "sessions.sqlite")
     store.create_session("s1", BINDING, {"orders": {"o1": {"status": "open"}}})
     return store
+
+
+def _replace(state: JsonObject) -> tuple[StateEdit, ...]:
+    """Return the edit that replaces a whole test state.
+
+    Args:
+        state: Complete next state.
+
+    Returns:
+        One root ``set`` edit.
+    """
+    return (SetValue(path=(), value=state),)
 
 
 def _digest(label: str) -> str:
@@ -131,13 +144,15 @@ def test_complete_step_commits_state_response_and_version_together(tmp_path: Pat
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
 
-    record = store.complete_step(
+    head = store.complete_step(
         claim,
-        next_state={"orders": {"o1": {"status": "cancelled"}}},
+        _replace({"orders": {"o1": {"status": "cancelled"}}}),
         response={"status": "supported", "reply_raw": '{"ok": true}  \u00e9'},
     )
 
-    assert record.version == 1
+    record = store.read_session("s1")
+    assert head.version == record.version == 1
+    assert head.state == store.ref_at("s1", 1)
     assert record.state == {"orders": {"o1": {"status": "cancelled"}}}
     replay = store.begin_step("s1", "step-1", _digest("a"), expected_version=0, binding=BINDING)
     assert replay.kind == "completed"
@@ -159,7 +174,7 @@ def test_replay_after_lost_response_never_reaches_provider_twice(tmp_path: Path)
         claim,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    store.complete_step(claim, {"orders": {}}, {"reply_raw": "x"})
+    store.complete_step(claim, _replace({"orders": {}}), {"reply_raw": "x"})
 
     second = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING)
 
@@ -212,7 +227,7 @@ def test_stale_expected_version_is_refused_without_claim(tmp_path: Path) -> None
         claim,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    store.complete_step(claim, {"orders": {}}, {"reply_raw": "x"})
+    store.complete_step(claim, _replace({"orders": {}}), {"reply_raw": "x"})
 
     with pytest.raises(VersionConflictError):
         store.begin_step("s1", "step-2", _digest("b"), expected_version=0, binding=BINDING)
@@ -264,7 +279,7 @@ def test_step_id_reuse_with_different_request_is_refused(tmp_path: Path) -> None
         claim,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    store.complete_step(claim, {"orders": {}}, {"reply_raw": "x"})
+    store.complete_step(claim, _replace({"orders": {}}), {"reply_raw": "x"})
 
     with pytest.raises(StepConflictError):
         store.begin_step("s1", "step-1", _digest("different"), 0, binding=BINDING)
@@ -278,7 +293,7 @@ def test_claim_token_must_match_open_claim(tmp_path: Path) -> None:
     forged = claim.model_copy(update={"claim_token": "forged"})
 
     with pytest.raises(ClaimLostError):
-        store.complete_step(forged, {"orders": {}}, {"reply_raw": "x"})
+        store.complete_step(forged, _replace({"orders": {}}), {"reply_raw": "x"})
     with pytest.raises(ClaimLostError):
         store.release_step(forged)
     store.release_step(claim)
@@ -306,7 +321,7 @@ def test_draining_refuses_new_steps_but_not_existing_completion(tmp_path: Path) 
         claim,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    store.complete_step(claim, {"orders": {}}, {"reply_raw": "x"})
+    store.complete_step(claim, _replace({"orders": {}}), {"reply_raw": "x"})
 
     store.set_draining("s1", True)
 
@@ -358,7 +373,7 @@ def test_replay_matches_original_request_after_version_advances(tmp_path: Path) 
         claim,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    store.complete_step(claim, {"orders": {}}, {"reply_raw": "first"})
+    store.complete_step(claim, _replace({"orders": {}}), {"reply_raw": "first"})
     second = store.begin_step("s1", "step-2", _digest("b"), 1, binding=BINDING).claim
     assert second is not None
     store.mark_provider_started(second, 100)
@@ -366,7 +381,7 @@ def test_replay_matches_original_request_after_version_advances(tmp_path: Path) 
         second,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    store.complete_step(second, {"orders": {"o2": {}}}, {"reply_raw": "second"})
+    store.complete_step(second, _replace({"orders": {"o2": {}}}), {"reply_raw": "second"})
 
     replay = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING)
 
@@ -437,9 +452,11 @@ def test_nested_state_keeps_declared_key_order_across_reload(tmp_path: Path) -> 
         claim,
         {"status": "supported", "reply": {"reply_raw": "x"}, "state_delta": [], "reason": None},
     )
-    record = store.complete_step(
-        claim, {"product": {"options": ORDERED_OPTIONS}}, {"reply_raw": "x"}
+    head = store.complete_step(
+        claim, _replace({"product": {"options": ORDERED_OPTIONS}}), {"reply_raw": "x"}
     )
+    record = store.read_session("s1")
+    assert head.version == record.version == 1
 
     reloaded = SessionStore(tmp_path / "sessions.sqlite").read_session("s1")
 
@@ -463,7 +480,7 @@ def test_proposal_and_response_keep_declared_key_order(tmp_path: Path) -> None:
         "alpha": 2,
     }
     store.record_proposal(claim, proposal)
-    store.complete_step(claim, {}, {"zeta": 1, "alpha": 2, "reply_raw": "x"})
+    store.complete_step(claim, _replace({}), {"zeta": 1, "alpha": 2, "reply_raw": "x"})
 
     stored_proposal = store.proposal("s1", "step-1")
     stored_response = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING).completed
@@ -498,7 +515,7 @@ def test_schema_one_database_is_refused_without_migration(tmp_path: Path) -> Non
     connection.commit()
     connection.close()
 
-    with pytest.raises(SessionStoreError, match="schema 1 is not 3"):
+    with pytest.raises(SessionStoreError, match="uses schema 1"):
         SessionStore(path)
 
     raw = sqlite3.connect(path)
@@ -513,8 +530,6 @@ def test_schema_one_database_is_refused_without_migration(tmp_path: Path) -> Non
 
 def test_late_result_is_retained_and_terminal_without_mutation(tmp_path: Path) -> None:
     """Commit authorization is sampled under the transaction after proposal validation."""
-    from exp.runtime.sessions.store import StepDeadlineExceededError
-
     before = datetime(2030, 1, 1, tzinfo=UTC)
     deadline = datetime(2030, 1, 2, tzinfo=UTC)
     clock = [before]
@@ -528,10 +543,66 @@ def test_late_result_is_retained_and_terminal_without_mutation(tmp_path: Path) -
     store.record_proposal(claim, proposal)
     clock[0] = deadline
     with pytest.raises(StepDeadlineExceededError):
-        store.complete_step(claim, {"items": ["new"]}, {"reply": "ok"})
+        store.complete_step(claim, _replace({"items": ["new"]}), {"reply": "ok"})
     reopened = SessionStore(tmp_path / "late.sqlite")
     assert reopened.read_session("s1").version == 0
     assert reopened.read_session("s1").state == {"items": []}
     assert reopened.proposal("s1", "op") == proposal
     with pytest.raises(StepRejectedError):
         reopened.begin_step("s1", "op", _digest("late"), 0, binding)
+
+
+def test_an_explicit_resumption_reclaims_an_interrupted_step(tmp_path: Path) -> None:
+    """A never-started claim reopens as claimed; a started one stays counted and dispatched."""
+    store = _store(tmp_path)
+    claim = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING).claim
+    assert claim is not None
+    restarted = SessionStore(tmp_path / "sessions.sqlite")
+    reclaimed, left = restarted.reclaim_step("s1", "step-1", _digest("a"), BINDING)
+    assert left is StepStatus.CLAIMED and reclaimed.claim_token != claim.claim_token
+    with pytest.raises(ClaimLostError):
+        store.mark_provider_started(claim, 100)  # the stopped process's claim is gone
+    restarted.mark_provider_started(reclaimed, 1)
+    restarted.recover()
+    again, left = restarted.reclaim_step("s1", "step-1", _digest("a"), BINDING)
+    assert left is StepStatus.AMBIGUOUS
+    # The dispatch already counted: no second provider start, so a budget of one suffices.
+    restarted.record_proposal(again, {"reply": "ok"})
+    restarted.complete_step(again, _replace({"orders": {}}), {"reply": "ok"})
+    assert restarted.read_session("s1").version == 1
+
+
+def test_a_reclaim_refuses_finished_or_different_steps(tmp_path: Path) -> None:
+    """Only the same request, still open, can be taken over."""
+    store = _store(tmp_path)
+    claim = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING).claim
+    assert claim is not None
+    with pytest.raises(StepConflictError, match="different request"):
+        store.reclaim_step("s1", "step-1", _digest("b"), BINDING)
+    store.mark_provider_started(claim, 1)
+    store.record_proposal(claim, {"reply": "ok"})
+    store.complete_step(claim, _replace({"orders": {}}), {"reply": "ok"})
+    with pytest.raises(StepConflictError, match="not an interrupted open step"):
+        store.reclaim_step("s1", "step-1", _digest("a"), BINDING)
+    with pytest.raises(StepConflictError):
+        store.reclaim_step("s1", "never", _digest("a"), BINDING)
+
+
+def test_a_resumption_window_extends_the_commit_deadline(tmp_path: Path) -> None:
+    """The binding keeps its deadline; an explicit later window admits the commit."""
+    deadline = datetime(2030, 1, 2, tzinfo=UTC)
+    clock = [deadline]
+    binding = BINDING.model_copy(update={"deadline": deadline})
+    store = SessionStore(tmp_path / "window.sqlite", clock=lambda: clock[0])
+    store.create_session("s1", binding, {"items": []})
+    claim = store.begin_step("s1", "op", _digest("resumed"), 0, binding).claim
+    assert claim is not None
+    store.mark_provider_started(claim, 1)
+    store.record_proposal(claim, {"items": ["new"]})
+    committed = store.complete_step(
+        claim,
+        _replace({"items": ["new"]}),
+        {"reply": "ok"},
+        window=datetime(2030, 1, 3, tzinfo=UTC),
+    )
+    assert committed.version == 1 and committed.binding.deadline == deadline

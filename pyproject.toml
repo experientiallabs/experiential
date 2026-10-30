@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.220"
+version = "0.7.221"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -9,7 +9,7 @@ dependencies = [
     # Every requirement here and in the extras is an exact pin, except `openai`: callers'
     # own code imports that SDK next to this package, so it stays a certified range. A
     # version moves only by a reviewed edit, and [tool.uv] keeps it 7 days old.
-    "exp-gateway-native==0.3.170",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native==0.3.171",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "filelock==4.2.1",
@@ -51,6 +51,8 @@ dependencies = [
 [project.optional-dependencies]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker==0.23.4", "tinker-cookbook==0.4.3"]
+# Native artifact materialization: typed workbook edits on immutable input bytes.
+artifact-edits = ["openpyxl==3.1.5", "et-xmlfile==2.0.0"]
 dev = [
     "pytest==9.1.1",
     "pytest-xdist==3.8.0",
@@ -62,6 +64,7 @@ dev = [
     "packaging==26.2",  # Compare Cargo SemVer and Python prerelease versions in release guards.
     "ty==0.0.56",
     "experiential[sft]",
+    "experiential[artifact-edits]",
     # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
     "maturin==1.14.1",
     # WebSocket client for the Responses-over-WebSocket gateway e2e tests.

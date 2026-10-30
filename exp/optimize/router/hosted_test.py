@@ -96,6 +96,7 @@ from exp.optimize.router.spend import (
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import build_project
+from exp.simulation.mining.descriptors import DESCRIPTOR_EMBEDDING
 from exp.simulation.mining.service import MiningSpec
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
@@ -2056,6 +2057,7 @@ def _restored_prepared_project(
             task_set=artifact_input(
                 store.artifacts.read(built.artifacts.task_set.task_set_id).manifest
             ),
+            descriptor_embedder=DESCRIPTOR_EMBEDDING,
         )
     )
     exported = export_project_bundle(

@@ -205,6 +205,7 @@ def _verify_stitched_runtime_traces(
             or stitched.source != source.source
             or stitched.spans[: len(source.spans)] != source.spans
             or stitched_context != source.initial_context
+            or stitched.message_history != source.message_history
         ):
             raise RuntimeRAGDatasetError(
                 f"stitched runtime trace {source.trace_id!r} changed canonical source evidence"

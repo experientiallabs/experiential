@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from importlib import metadata
+from pathlib import Path
 
 _DISTRIBUTION = "experiential"
 _REVISION_ENV = "EXP_RELEASE_REVISION"
@@ -46,3 +48,65 @@ def installed_release_revision() -> str:
     if _SAFE_VERSION.fullmatch(version) is None:
         raise ReleaseRevisionError("installed experiential version metadata is invalid")
     return f"{_DISTRIBUTION}=={version}"
+
+
+def installed_execution_revision() -> str:
+    """Bind the producer release to the installed EXP source and runtime resource bytes.
+
+    Editable installs can change without changing their distribution version or Git commit.
+    Executable studies therefore bind the package's actual Python and resource files, using
+    relative names so an identical installation may move. Tests and build caches are excluded.
+    Third-party libraries, the interpreter, and explicitly selected external factories remain
+    separately owned dependencies; this is not an environment image or a sandbox certificate.
+    """
+    digest = _package_source_digest(Path(__file__).resolve().parents[1])
+    return f"{installed_release_revision()};source-sha256={digest}"
+
+
+def _package_source_digest(package: Path) -> str:
+    """Hash production source/resources without Git, credentials, timestamps or bytecode."""
+    ignored = {"__pycache__", "tests", "target", "node_modules"}
+    rows = []
+    for directory, directories, files in package.walk():
+        directories[:] = [
+            name for name in directories if name not in ignored and not name.startswith(".")
+        ]
+        for name in directories:
+            if (directory / name).is_symlink():
+                raise ReleaseRevisionError(
+                    "execution source must not contain symlinked directories"
+                )
+        for name in files:
+            path = directory / name
+            if name.startswith(".") or name.endswith("_test.py") or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise ReleaseRevisionError(
+                    "execution source must contain only regular package files"
+                )
+            before = path.stat()
+            payload = path.read_bytes()
+            after = path.stat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ):
+                raise ReleaseRevisionError(
+                    "execution source changed while its identity was computed"
+                )
+            rows.append((path.relative_to(package).as_posix(), hashlib.sha256(payload).hexdigest()))
+    if not rows or not any(name.endswith(".py") for name, _ in rows):
+        raise ReleaseRevisionError("execution identity requires readable installed Python source")
+    digest = hashlib.sha256()
+    for name, content in sorted(rows):
+        digest.update(name.encode() + b"\0" + content.encode() + b"\n")
+    return digest.hexdigest()

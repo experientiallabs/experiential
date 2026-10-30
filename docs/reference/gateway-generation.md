@@ -108,6 +108,17 @@ another gateway's `item_` prefix, a non-`fc_` function-call ID) are never sent t
 an OpenAI Responses rung, which refuses them. The item replays without its ID at
 its original position; `store=false` means the provider resolves nothing by ID.
 
+Codex records output items in the order they complete, so a replayed turn can
+carry an assistant message between its `function_call` items and their
+`function_call_output` items. Chat Completions requires the tool results to follow
+the message that called them (DeepSeek answers otherwise with HTTP 400), so a Chat
+rung folds that text into the tool-call message's content, or moves it ahead of the
+calls when it cannot merge losslessly, and the route discloses
+`messages.assistant.content->tool_call_turn`. The Responses wire keeps the items
+verbatim. The gateway's own Responses stream completes items (`output_item.done`)
+in the order `response.completed.output` lists them, so a recorded history matches
+the order the model produced.
+
 ## Tolerated client fields
 
 - Responses `stream_options` is accepted. The gateway never emits obfuscation

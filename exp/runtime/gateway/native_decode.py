@@ -13,6 +13,7 @@ from exp.runtime.openai_protocol.audio_requests import (
     decode_transcription,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.image_edits_requests import decode_image_edits
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
     DecodedEmbeddingsRequest,
@@ -171,6 +172,28 @@ def decode_native_images_body(body: str) -> DecodedImagesRequest:
     payload = _load_object_body(body)
     try:
         return decode_images(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_image_edits_upload(upload: str) -> DecodedImagesRequest:
+    """Decode the data plane's parsed ``/images/edits`` multipart upload.
+
+    The data plane parses the multipart body itself; ``upload`` is its JSON
+    object of the text ``fields`` plus the base64 image ``files``.
+
+    Args:
+        upload: JSON text of the parsed upload.
+
+    Returns:
+        The public alias and canonical image-edit request.
+
+    Raises:
+        NativeDecodeError: The upload fails shared protocol validation.
+    """
+    payload = _load_object_body(upload)
+    try:
+        return decode_image_edits(payload)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
 
