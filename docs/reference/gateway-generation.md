@@ -166,6 +166,21 @@ the order the model produced.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.
+- A lone UTF-16 surrogate escape (`\ud83d` without its pair, what JavaScript's well-formed
+  `JSON.stringify` writes for a string cut inside an emoji) is valid JSON with no UTF-8 form.
+  On Chat, Responses and Messages (and a Messages count) every such escape in content
+  (message text and parts, tool results, tool-call `arguments`, system prompts and
+  instructions, tool descriptions and schemas, metadata) becomes U+FFFD before any decoder
+  reads the body, disclosed once per field path as `<path>->replaced(lone_surrogate)` with
+  list positions omitted (`messages.content`, `messages.tool_calls.function.arguments`,
+  `system.text`). A path stops at a caller-keyed object (`parameters`, `input_schema`,
+  `schema`, `metadata`, `properties`, a tool call's `input`), so no caller key is echoed.
+  A field that names something is a 400 `invalid_parameter` naming that field instead:
+  `model`, tool and function `name`s, `id`, `call_id`, `tool_call_id`, `tool_use_id`,
+  `previous_response_id`, `type`, `role`, and opaque provider tokens (`signature`,
+  `thought_signature`, `encrypted_content`, `data`), as is an object key holding one.
+  Embeddings, images and audio have no disclosure channel, so a lone surrogate there is the
+  same field-named 400. A body whose bytes are not UTF-8 stays `invalid_json`.
 - A Chat system, developer, user or tool message whose `content` is null or omitted (Go clients
   drop an empty tool result under `omitempty`) is refused with `400 invalid_parameter` naming
   `messages.<n>.content`; an empty string is content and is accepted.

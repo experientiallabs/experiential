@@ -39,6 +39,7 @@ use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartRes
 use body_budget::reserve_body;
 use openai::{openai_decision_usage, public_openai_decisions};
 use residual::residual_envelope;
+use served::{disclose, served_headers};
 
 const PROBABILITY_TOLERANCE: f64 = 1e-6;
 
@@ -61,6 +62,9 @@ struct DecisionsAdmission {
     openai_questions: Vec<Value>,
     maximum_total_attempts: u32,
     maximum_same_deployment_attempts: u32,
+    /// Decoder rewrites the answer discloses (`x-experiential-ignored-parameters`).
+    #[serde(default)]
+    ignored_parameters: Vec<String>,
 }
 
 /// The upstream decisions wire an admission dispatches.
@@ -181,7 +185,7 @@ async fn serve(
             }
             json_response(
                 StatusCode::OK,
-                &served.body,
+                &disclose(served.body, &admission.ignored_parameters),
                 &served_headers(&admission, served.depth, client_request_id),
             )
         }
@@ -946,40 +950,6 @@ fn token_count(value: &Value) -> Result<u64, Failure> {
         .ok_or_else(|| malformed("decision usage requires nonnegative integer input_tokens and output_tokens within i64"))
 }
 
-fn served_headers(
-    admission: &DecisionsAdmission,
-    depth: usize,
-    client_request_id: Option<String>,
-) -> Vec<(String, String)> {
-    let wire = &admission.route[depth];
-    let mut headers = vec![
-        ("x-request-id".to_string(), admission.request_id.clone()),
-        ("x-gateway-alias".to_string(), admission.alias.clone()),
-        (
-            "x-gateway-alias-revision".to_string(),
-            admission.alias_revision_id.clone(),
-        ),
-        (
-            "x-gateway-canonical-model".to_string(),
-            admission.exact_model_id.clone(),
-        ),
-        ("x-gateway-provider".to_string(), wire.provider.clone()),
-        (
-            "x-gateway-deployment".to_string(),
-            wire.deployment_id.clone(),
-        ),
-        ("x-gateway-route-depth".to_string(), depth.to_string()),
-        (
-            "x-gateway-route-reason".to_string(),
-            admission.route_reason.clone(),
-        ),
-    ];
-    if let Some(value) = client_request_id {
-        headers.push(("x-client-request-id".to_string(), value));
-    }
-    headers
-}
-
 #[cfg(test)]
 #[path = "route_decisions/admission_tests.rs"]
 mod admission_tests;
@@ -995,5 +965,7 @@ mod residual;
 #[cfg(test)]
 #[path = "route_decisions/score_tests.rs"]
 mod score_tests;
+#[path = "route_decisions/served.rs"]
+mod served;
 #[cfg(test)]
 mod tests;
