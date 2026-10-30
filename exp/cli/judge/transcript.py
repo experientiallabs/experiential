@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
-
-from pydantic import JsonValue
 from rich.console import Console
 
 from exp.common.models import ModelSnapshot
 from exp.common.traces import Trace, TraceSpan
+from exp.common.traces.attributes import assistant_completion, jsonish_text, user_input
 
 
 def model_display_name(model: ModelSnapshot) -> str:
@@ -132,117 +130,6 @@ def _render_span(
             f"{span.failure.code.value}: {span.failure.message}",
             character_limit=character_limit,
         )
-
-
-def assistant_completion(attributes: dict[str, JsonValue]) -> str | None:
-    """Extract readable assistant content from supported normalized attributes.
-
-    Args:
-        attributes: Canonical normalized span attributes.
-
-    Returns:
-        Assistant content when captured, otherwise ``None``.
-    """
-    for key in ("gen_ai.completion", "gen_ai.response.text"):
-        value = attributes.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return _last_role_message(
-        _decoded_json_value(attributes.get("gen_ai.output.messages")),
-        frozenset({"assistant", "model"}),
-    )
-
-
-def user_input(attributes: dict[str, JsonValue]) -> str | None:
-    """Extract the latest readable user message from one normalized span.
-
-    Args:
-        attributes: Canonical normalized span attributes.
-
-    Returns:
-        Latest user content when captured, otherwise ``None``.
-    """
-    return _last_role_message(
-        _decoded_json_value(attributes.get("gen_ai.input.messages")),
-        frozenset({"user", "human"}),
-    )
-
-
-def _last_role_message(value: JsonValue, roles: frozenset[str]) -> str | None:
-    """Return the latest visible message for one set of transcript roles.
-
-    Args:
-        value: Decoded normalized message collection.
-        roles: Accepted lowercase role names.
-
-    Returns:
-        Latest nonempty message content, or ``None`` when absent.
-    """
-    if not isinstance(value, list):
-        return None
-    for item in reversed(value):
-        if not isinstance(item, dict) or item.get("role") not in roles:
-            continue
-        text = _message_text(item.get("content"))
-        if text is not None:
-            return text
-    return None
-
-
-def _decoded_json_value(value: JsonValue | None) -> JsonValue:
-    """Decode JSON-encoded semantic attributes without guessing malformed text.
-
-    Args:
-        value: Native or JSON-encoded normalized attribute value.
-
-    Returns:
-        Decoded JSON value, or the original value when it is not encoded JSON.
-    """
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
-
-
-def _message_text(value: JsonValue | None) -> str | None:
-    """Read plain text from one normalized message content value.
-
-    Args:
-        value: String or structured content parts.
-
-    Returns:
-        Joined text content, or ``None`` when no text was captured.
-    """
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if not isinstance(value, list):
-        return None
-    texts = tuple(
-        item["text"].strip()
-        for item in value
-        if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip()
-    )
-    return "\n".join(texts) if texts else None
-
-
-def jsonish_text(value: JsonValue) -> str:
-    """Format native or JSON-encoded transcript evidence for a human.
-
-    Args:
-        value: Captured transcript value.
-
-    Returns:
-        Stable indented JSON when possible, otherwise its original text.
-    """
-    decoded = value
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return json.dumps(decoded, indent=2, sort_keys=True, ensure_ascii=False)
 
 
 def span_evidence_text(span: TraceSpan) -> str:
