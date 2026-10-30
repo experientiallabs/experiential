@@ -4,9 +4,12 @@ import pytest
 
 from exp.common.models import Usage
 from exp.common.tasks import TaskCase
+from exp.common.traces import Trace
+from exp.common.traces.ingest.chat_json_test import _inline_history, _two_request_trace
 from exp.optimize.evaluation.usage_estimate import (
     AUTHORED_ANSWER_TOKENS,
     AUTHORED_TOOL_TURN_TOKENS,
+    ExpectedUsage,
     model_turns,
     task_usage,
     token_estimate,
@@ -275,3 +278,25 @@ def test_authored_scenarios_are_sized_from_declared_inputs() -> None:
         maximum_query_tokens=32_768,
     )
     assert len(one_step.assistant_requests) == 1
+
+
+def test_shared_history_is_sized_like_inline_history() -> None:
+    """A model call's referenced history counts toward its input exactly as an inline copy."""
+    trace = _two_request_trace()
+    task = TaskCase(
+        task_id="case",
+        lineage_group_id="lineage",
+        partition="fit",
+        instruction=trace.task,
+        source_trace_ids=(trace.trace_id,),
+        workload_weight=1,
+    )
+
+    def usage(source: Trace) -> ExpectedUsage:
+        """Estimate one task's workload from one form of the trace."""
+        return task_usage(
+            task, (source,), (), top_k=2, maximum_steps=100, maximum_query_tokens=32_768
+        )
+
+    assert usage(trace) == usage(_inline_history(trace))
+    assert usage(trace).assistant_input > token_estimate(list(trace.message_history))

@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 
 from exp.common.models.catalog_prices import BilledUnitKind
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -160,6 +161,9 @@ class VideoEngine:
         self._clock = clock
         self._poll_interval = timedelta(seconds=max(0.0, poll_interval_seconds))
         self._outputs = outputs
+        self._poller_stop = threading.Event()
+        self._poller_lock = threading.Lock()
+        self._poller: threading.Thread | None = None
 
     # -- create -----------------------------------------------------------------
 
@@ -754,27 +758,42 @@ class VideoEngine:
     # -- background poller ------------------------------------------------------
 
     def start_poller(self, *, interval_seconds: float = POLL_INTERVAL_SECONDS) -> threading.Thread:
-        """Start the daemon thread that drives every open job to settlement.
-
-        Args:
-            interval_seconds: Sleep between passes.
-
-        Returns:
-            The started thread.
-        """
+        """Start at most one owned poller; shutdown interrupts its idle wait immediately."""
+        if interval_seconds <= 0:
+            raise ValueError("video poller interval must be positive")
 
         def loop() -> None:
-            """Poll open jobs for the life of the process."""
-            while True:
-                time.sleep(interval_seconds)
-                try:
-                    self.poll_open()
-                except Exception:  # noqa: BLE001 - the poller must outlive store hiccups.
-                    _LOGGER.exception("video poller pass failed")
+            """Poll until shutdown, releasing this worker's cached database handles on exit."""
+            try:
+                while not self._poller_stop.wait(interval_seconds):
+                    try:
+                        self.poll_open()
+                    except Exception:  # noqa: BLE001 - survive a store hiccup until shutdown.
+                        _LOGGER.exception("video poller pass failed")
+            finally:
+                close_idle_connections()
 
-        thread = threading.Thread(target=loop, name="gateway-video-poller", daemon=True)
-        thread.start()
-        return thread
+        with self._poller_lock:
+            if self._poller_stop.is_set():
+                raise RuntimeError("video poller is closed")
+            if self._poller is None:
+                self._poller = threading.Thread(
+                    target=loop, name="gateway-video-poller", daemon=True
+                )
+                self._poller.start()
+            return self._poller
+
+    def stop_poller(self, *, timeout_seconds: float = 30.0) -> bool:
+        """Stop admission of new polling passes and report whether the actual worker exited."""
+        if timeout_seconds < 0:
+            raise ValueError("video poller shutdown timeout cannot be negative")
+        with self._poller_lock:
+            self._poller_stop.set()
+            thread = self._poller
+        if thread is None:
+            return True
+        thread.join(timeout_seconds)
+        return not thread.is_alive()
 
 
 def _unsupported_failure() -> GatewayFailure:

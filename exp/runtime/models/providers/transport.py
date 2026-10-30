@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
 import ssl
 import sys
 import time
@@ -47,6 +48,9 @@ class JsonHttpResponse:
         )
 
 
+_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
 class ProviderTransportError(RuntimeError):
     """A sanitized transport failure with safe retry metadata.
 
@@ -55,6 +59,10 @@ class ProviderTransportError(RuntimeError):
         retry_after_seconds: Sanitized minimum server wait.
         known_unbilled: Trusted proof this attempt was rejected before billable dispatch.
             It says nothing about earlier attempts in the same logical request.
+        error_code: The response's OpenAI-style ``error.code`` when it is a short lowercase
+            identifier (such as ``invalid_provider_stream``), else None. Never free text.
+        request_sha256: Digest of the exact request body that failed, when the raising client
+            knows it, so a caller can tell a resend of the identical request from new work.
     """
 
     def __init__(
@@ -64,12 +72,34 @@ class ProviderTransportError(RuntimeError):
         status_code: int | None = None,
         retry_after_seconds: float | None = None,
         known_unbilled: bool = False,
+        error_code: str | None = None,
+        request_sha256: str | None = None,
     ) -> None:
         """Retain only explicit safe metadata, never raw headers or provider error bodies."""
         super().__init__(message)
         self.status_code = status_code
         self.retry_after_seconds = _safe_retry_delay(retry_after_seconds)
         self.known_unbilled = known_unbilled is True and status_code == 429
+        self.error_code = (
+            error_code
+            if isinstance(error_code, str) and _ERROR_CODE.fullmatch(error_code)
+            else None
+        )
+        self.request_sha256 = request_sha256
+
+
+def public_error_code(body: JsonObject) -> str | None:
+    """The sanitized ``error.code`` identifier of an OpenAI-style error body, if any.
+
+    Args:
+        body: Decoded non-success response body.
+
+    Returns:
+        The code when it is a short lowercase identifier; None otherwise.
+    """
+    error = body.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else None
 
 
 @dataclass(frozen=True)
@@ -518,7 +548,8 @@ class RetryPolicy:
         maximum_attempts: Maximum potentially billable attempts. The async loop may separately
             wait for certified non-dispatch responses until its fixed request deadline.
         initial_delay_seconds: Initial backoff for ordinary transport failures.
-        maximum_delay_seconds: Exponential backoff and jitter ceiling. Async server-directed
+        maximum_delay_seconds: Registered cap of the exponential backoff window and its
+            jitter. Ordinary retries wait a full-jitter sample of the window. Async server-directed
             minimum waits may exceed it within the existing absolute request deadline. The
             sync helper has no request deadline, so this remains its total per-retry wait bound.
     """
@@ -549,6 +580,8 @@ def classify_retry(exception: Exception) -> RetryClassification:
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderTransportError):
+        if exception.error_code == "idempotency_replay_unavailable":
+            return RetryClassification(retryable=False, reason="outcome_unknown")
         if exception.status_code is None:
             return RetryClassification(retryable=True, reason="transport")
         if exception.status_code in _RETRYABLE_STATUS_CODES:
@@ -559,6 +592,25 @@ def classify_retry(exception: Exception) -> RetryClassification:
     if isinstance(exception, OSError):
         return RetryClassification(retryable=True, reason="os_error")
     return RetryClassification(retryable=False, reason="non_transport_error")
+
+
+def classify_unrepeatable_retry(exception: Exception) -> RetryClassification:
+    """Classify one error for a wire that cannot deduplicate a resend of the same request.
+
+    A timeout, transport failure or retryable HTTP answer does not prove that a request
+    was never executed. Without deduplication, only a trusted certified non-dispatch refusal
+    may retry. A lost completed keyed result remains unknown under either wire policy.
+
+    Args:
+        exception: Error raised by one request attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    classification = classify_retry(exception)
+    if classification.retryable and not is_unbilled_attempt(exception):
+        return RetryClassification(retryable=False, reason="outcome_unknown")
+    return classification
 
 
 def run_with_retry[ResultT](
@@ -629,7 +681,12 @@ def retry_delay_seconds(
     random_sample: Callable[[], float],
     server_wait_ceiling_seconds: float | None = None,
 ) -> float | None:
-    """Respect a server minimum and add bounded jitter only to directed throttling.
+    """Respect a server minimum, otherwise wait a full-jitter share of the exponential backoff.
+
+    Ordinary failures wait a uniform sample of ``[0, delay]`` (full jitter), so processes that
+    failed together under load do not retry together. A server Retry-After (honoured on 429,
+    503 and every other retryable status) or a certified non-dispatch refusal is a minimum:
+    the wait never starts before it, and bounded jitter is added above it.
 
     Args:
         error: The preceding attempt's safe failure metadata.
@@ -651,11 +708,11 @@ def retry_delay_seconds(
     floor = max(delay, hint or 0.0)
     if floor > ceiling:
         return None
-    if hint is None and not is_unbilled_attempt(error):
-        return floor
     sample = random_sample()
     if not math.isfinite(sample) or not 0 <= sample <= 1:
         raise ValueError("retry random sample must be finite and between zero and one")
+    if hint is None and not is_unbilled_attempt(error):
+        return floor * sample
     headroom = min(ceiling - floor, floor, policy.maximum_delay_seconds)
     return floor + headroom * sample
 
@@ -702,4 +759,5 @@ def _successful_body(response: JsonHttpResponse) -> JsonObject:
         status_code=response.status_code,
         retry_after_seconds=response.retry_after_seconds,
         known_unbilled=response.known_unbilled,
+        error_code=public_error_code(response.body),
     )

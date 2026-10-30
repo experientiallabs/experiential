@@ -12,6 +12,7 @@ from rich.console import Console
 
 from exp.cli.shared.consent import require_spend_consent
 from exp.common.models import ModelCatalog
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.engines.text.errors import SimulationContentionError
 
@@ -52,10 +53,10 @@ def require_learning_consent(
 
 @contextmanager
 def paid_work_stops(console: Console) -> Iterator[None]:
-    """Stop a failed provider request or contended paid work readably, with exit 1."""
+    """Stop a failed or timed-out provider request or contended paid work readably, with exit 1."""
     try:
         yield
-    except ProviderTransportError as exc:
+    except (ProviderTransportError, ProviderDeadlineExceeded) as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(
             "Completed embedding batches and finished steps are saved. Run the same exp build "

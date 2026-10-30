@@ -16,8 +16,8 @@ from exp.common.evaluations.reconstruction import (
     saved_turn_outcomes,
 )
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import PreparedFidelity
-from exp.optimize.evaluation.fidelity_memory import fidelity_decision_trace
+from exp.optimize.evaluation.fidelity.memory import fidelity_decision_trace
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 
 REPLY_CHARS = 480
 SHOWN_DIFFERENCES = 6

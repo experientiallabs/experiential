@@ -22,6 +22,7 @@ from exp.common.core.artifacts import (
     validate_artifact_file_path,
 )
 from exp.common.core.locks import file_write_lock
+from exp.common.core.verified_cache import VerifiedCache
 from exp.common.project.artifact_sqlite import (
     StoredArtifact,
     artifact_exists,
@@ -122,10 +123,11 @@ class ArtifactStore:
                 raise ArtifactStoreError(
                     f"artifact data files repeat normalized path {validated_path}"
                 )
-            _assert_payload_secret_free(validated_path, payload)
+            entry = file_digest(validated_path, payload)
+            _assert_payload_secret_free(validated_path, payload, entry.sha256)
             seen_paths.add(validated_path)
             normalized_files.append((validated_path, payload))
-            manifest_files.append(file_digest(validated_path, payload))
+            manifest_files.append(entry)
         manifest = ArtifactManifest(
             artifact_id=validated_artifact_id,
             artifact_type=validated_artifact_type,
@@ -397,8 +399,9 @@ class ArtifactStore:
         validate_local_id(artifact_id, label="artifact ID")
         stored = read_artifact(self._paths, artifact_id)
         assert_secret_free(stored.manifest)
+        digests = {entry.path: entry.sha256 for entry in stored.manifest.files}
         for path, payload in stored.payloads.items():
-            _assert_payload_secret_free(path, payload)
+            _assert_payload_secret_free(path, payload, digests[path])
         return stored
 
     def read_bytes(self, artifact_id: str, relative_path: str) -> bytes:
@@ -564,13 +567,19 @@ class ProjectStore(HostedProjectStoreMixin):
             raise ValueError("provider-free trace and task manifest revisions differ")
 
     def bind_completed_build(
-        self, build: ProjectBuildArtifacts, *, trace_import_id: ArtifactId | None = None
+        self,
+        build: ProjectBuildArtifacts,
+        *,
+        trace_import_id: ArtifactId | None = None,
+        trace_source: str | None = None,
     ) -> ProjectConfig:
         """Atomically select a fully verified immutable build for future project workflows.
 
         Args:
             build: Exact trace, task, RAG, and world-model artifact manifest references.
             trace_import_id: Optional exact stored corpus backing the selected graph.
+            trace_source: Declared format of that corpus, selected with it; None keeps the
+                recorded format.
 
         Returns:
             Updated project configuration naming the completed build.
@@ -613,11 +622,42 @@ class ProjectStore(HostedProjectStoreMixin):
                         )
                 existing = load_project_config(self.paths)
                 updated = existing.model_copy(
-                    update={"build": build, "trace_import_id": trace_import_id}
+                    update={
+                        "build": build,
+                        "trace_import_id": trace_import_id,
+                        "trace_source": trace_source or existing.trace_source,
+                    }
                 )
                 write_project_config(self.paths, updated)
             except (ArtifactCorruptionError, ValueError) as exc:
                 raise ProjectStoreError(f"cannot bind completed build: {exc}") from exc
+            return updated
+
+    def select_evaluation_task(self, reference: ArtifactInput) -> ProjectConfig:
+        """Select a verified evaluation artifact for the normal Project bundle closure.
+
+        Args:
+            reference: Exact immutable task artifact manifest.
+
+        Returns:
+            Updated project configuration; selecting the same artifact is idempotent.
+        """
+        self._require_mutable_config()
+        with project_connection(self.paths.root, write=True):
+            manifest = self.artifacts.read(reference.artifact_id).manifest
+            if artifact_input(manifest) != reference:
+                raise ProjectStoreError("evaluation task manifest digest differs")
+            current = load_project_config(self.paths)
+            existing = {item.artifact_id: item for item in current.evaluation_tasks}
+            if reference.artifact_id in existing and existing[reference.artifact_id] != reference:
+                raise ProjectStoreError(
+                    "evaluation task identity conflicts with its selected digest"
+                )
+            existing[reference.artifact_id] = reference
+            updated = current.model_copy(
+                update={"evaluation_tasks": tuple(existing[key] for key in sorted(existing))}
+            )
+            write_project_config(self.paths, updated)
             return updated
 
     def bind_model_optimization_config(
@@ -824,8 +864,32 @@ def _require_selected_task_set(
         )
 
 
-def _assert_payload_secret_free(relative_path: str, payload: bytes) -> None:
-    """Apply secret checks to structured JSON and UTF-8 text artifact data."""
+# Payload digests this process has already proven secret-free, per scan kind. The boundary is a
+# pure function of the bytes and the scan kind (JSON, JSONL or text, chosen by suffix); ``read``
+# recomputes every payload's SHA-256 against its manifest before consulting it.
+SECRET_FREE_PAYLOADS: VerifiedCache[tuple[str, str], bool] = VerifiedCache(65_536)
+
+
+def _scan_kind(relative_path: str) -> str:
+    """The secret scan a data file receives: by its suffix."""
+    suffix = Path(relative_path).suffix
+    return suffix if suffix in (".json", ".jsonl") else "text"
+
+
+def _assert_payload_secret_free(
+    relative_path: str, payload: bytes, sha256: str | None = None
+) -> None:
+    """Apply secret checks to structured JSON and UTF-8 text artifact data.
+
+    Args:
+        relative_path: Artifact-relative path; its suffix selects the scan.
+        payload: Exact bytes.
+        sha256: Digest of ``payload`` the caller has just verified, which lets a payload this
+            process already proved secret-free skip its rescan. None always scans.
+    """
+    key = (_scan_kind(relative_path), sha256) if sha256 is not None else None
+    if key is not None and SECRET_FREE_PAYLOADS.get(key):
+        return
     suffix = Path(relative_path).suffix
     try:
         text = payload.decode("utf-8")
@@ -848,3 +912,5 @@ def _assert_payload_secret_free(relative_path: str, payload: bytes) -> None:
         raise ArtifactStoreError(
             f"artifact data file {relative_path} violates the secret boundary"
         ) from exc
+    if key is not None:
+        SECRET_FREE_PAYLOADS.put(key, True)

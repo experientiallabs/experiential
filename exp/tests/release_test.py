@@ -2675,6 +2675,7 @@ def _installed_release_driver() -> None:
         answers: list[tuple[str, str]],
         *,
         completion_marker: str | None = None,
+        timeout: float = 30,
     ) -> str:
         """Drive one installed interactive CLI process through ordered prompt matches.
 
@@ -2682,6 +2683,7 @@ def _installed_release_driver() -> None:
             arguments: CLI arguments after the installed executable.
             answers: Ordered prompt substring and terminal answer pairs.
             completion_marker: Optional output that must appear before terminal input closes.
+            timeout: Seconds the whole interactive exchange may take.
 
         Returns:
             Combined terminal transcript.
@@ -2692,6 +2694,7 @@ def _installed_release_driver() -> None:
             environment=child_environment,
             answers=answers,
             completion_marker=completion_marker,
+            timeout=timeout,
         )
 
     down = "\x1b[B"
@@ -2924,9 +2927,12 @@ def _installed_release_driver() -> None:
             ),
             "--yes",
         ]
+        # Router optimization runs every fit and held-out cell before its prompt; allow it
+        # the time that takes on a loaded machine instead of the short default.
         optimization_output = run_tty(
             optimize_arguments,
             [("Save these router candidates?", "y")],
+            timeout=180,
         )
         assert "candidates: candidate-b, core-model" in optimization_output
         assert "incumbent: core-model" in optimization_output

@@ -7,6 +7,7 @@ base owns: constructor validation, the authenticated header set including the pe
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from typing import ClassVar
 
@@ -20,8 +21,14 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_deadline_seconds,
+    request_timeout_seconds,
 )
 from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
     MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
     GatewayWireProfile,
@@ -32,6 +39,7 @@ from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
+    RetryPolicy,
     ScriptedJsonTransport,
 )
 
@@ -79,6 +87,8 @@ def _ok_transport() -> ScriptedJsonTransport:
 class _EchoClient(ProviderHttpClient):
     """Minimal concrete client that exposes exactly what the base template supplies."""
 
+    # This timing/economics fixture models a protocol with a defined deduplication header.
+    supports_idempotency_key: ClassVar[bool] = True
     default_headers: ClassVar[Mapping[str, str]] = {"X-Fixture": "echo"}
 
     def _completion_path(self) -> str:
@@ -113,7 +123,10 @@ def _snapshot() -> ModelSnapshot:
 
 
 def _client(
-    transport: JsonHttpTransport, *, base_url: str = "https://echo.test/v1/"
+    transport: JsonHttpTransport,
+    *,
+    base_url: str = "https://echo.test/v1/",
+    reasoning_effort: ReasoningEffort | None = None,
 ) -> _EchoClient:
     """Build the client under test against a deterministic transport."""
     return _EchoClient(
@@ -121,6 +134,7 @@ def _client(
         api_key="secret-key",
         base_url=base_url,
         transport=transport,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -316,8 +330,8 @@ def test_completion_timeout_keeps_the_configured_floor_for_small_or_absent_budge
 
 
 def test_completion_timeout_scales_with_the_requested_output_budget() -> None:
-    """A 16000-token request gets a proportionally longer bounded attempt timeout."""
-    assert completion_timeout_seconds(DEFAULT_TIMEOUT_SECONDS, 16_000) == pytest.approx(480.0)
+    """An 8000-token request gets a proportionally longer bounded attempt timeout."""
+    assert completion_timeout_seconds(DEFAULT_TIMEOUT_SECONDS, 8_000) == pytest.approx(400.0)
 
 
 def test_completion_timeout_caps_the_scaled_value_at_the_module_ceiling() -> None:
@@ -333,7 +347,7 @@ def test_completion_timeout_never_reduces_an_explicitly_configured_timeout() -> 
 
 
 def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
-    """The completion template posts each attempt under the token-scaled timeout."""
+    """The completion template posts each attempt under the request-derived timeout."""
     transport = _TimeoutRecordingTransport(
         [
             JsonHttpResponse(status_code=200, body={"answer": "ok"}),
@@ -343,18 +357,107 @@ def test_complete_passes_the_derived_timeout_to_the_transport() -> None:
     client = _client(transport)
     message = ModelMessage(role="user", content="hi")
 
-    client.complete(ModelRequest(messages=(message,), maximum_output_tokens=16_000))
+    client.complete(ModelRequest(messages=(message,), maximum_output_tokens=8_000))
     client.complete(ModelRequest(messages=(message,)))
 
-    # Each attempt is bounded by the derived timeout minus the wall time
-    # already spent under the request deadline, so scheduling jitter legally
-    # lands the observed value slightly below the exact derivation. The
-    # contract under test is WHICH timeout reached the transport (the
-    # token-scaled one, then the configured default), so a whole second of
-    # slack still distinguishes 480.0 from 60.0 unambiguously.
+    # The tiny request adds well under a second of input allowance to the output-scaled 400 s,
+    # and scheduling jitter may land the observed value slightly below the derivation. The
+    # contract under test is WHICH timeout reached the transport, so a second of slack on each
+    # side still distinguishes 400 s from the configured 60 s unambiguously.
     assert len(transport.timeouts) == 2
-    for observed, derived in zip(transport.timeouts, (480.0, DEFAULT_TIMEOUT_SECONDS), strict=True):
-        assert derived - 1.0 < observed <= derived
+    for observed, derived in zip(transport.timeouts, (400.0, DEFAULT_TIMEOUT_SECONDS), strict=True):
+        assert derived - 1.0 < observed <= derived + 1.0
+
+
+def test_complete_scales_the_attempt_timeout_with_the_request_size() -> None:
+    """A large prompt lengthens the attempt even when its output budget alone would not."""
+    transport = _TimeoutRecordingTransport(
+        [JsonHttpResponse(status_code=200, body={"answer": "ok"})]
+    )
+    client = _client(transport)
+    prompt = "x" * 300_000
+
+    client.complete(
+        ModelRequest(
+            messages=(ModelMessage(role="user", content=prompt),), maximum_output_tokens=2_048
+        )
+    )
+
+    # 2,048 output tokens alone allow 102.4 s; 300 KB of input adds about 100 s more.
+    assert len(transport.timeouts) == 1
+    assert 200.0 < transport.timeouts[0] <= 205.0
+
+
+def test_a_catalog_pinned_reasoning_effort_lengthens_the_attempt() -> None:
+    """A client that pins an effort on the wire gets that effort's allowance on every attempt."""
+    transport = _TimeoutRecordingTransport(
+        [JsonHttpResponse(status_code=200, body={"answer": "ok"})]
+    )
+    client = _client(transport, reasoning_effort="high")
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),), maximum_output_tokens=2_048
+    )
+
+    client.complete(request)
+
+    # 102.4 s for 2,048 output tokens plus the registered 120 s for high effort.
+    assert len(transport.timeouts) == 1
+    assert 221.0 < transport.timeouts[0] <= 223.0
+    # The request deadline gives each allowed attempt that same whole allowance.
+    attempt = request_timeout_seconds(
+        DEFAULT_TIMEOUT_SECONDS, request, default_reasoning_effort="high"
+    )
+    assert client._completion_deadline_seconds(request) == completion_deadline_seconds(
+        attempt, DEFAULT_RETRY_POLICY
+    )
+
+
+def test_a_retry_after_a_slow_failed_attempt_gets_its_whole_attempt_timeout() -> None:
+    """A retry is never starved by the time its predecessor spent under one shared allowance.
+
+    The SpreadsheetBench wide pilot lost most actor retries this way: the request deadline equaled
+    one attempt's timeout, so a retry after a slow empty or throttled first attempt received only
+    the remainder and timed out as an unknown outcome.
+    """
+
+    class SlowFirstAttempt(_TimeoutRecordingTransport):
+        """Spend most of the first attempt's allowance before answering HTTP 503."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Delay only the first attempt, then answer from the script."""
+            if not self.timeouts:
+                time.sleep(0.4)
+            return super().post(
+                url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+            )
+
+    transport = SlowFirstAttempt(
+        [
+            JsonHttpResponse(status_code=503, body={}),
+            JsonHttpResponse(status_code=200, body={"answer": "ok"}),
+        ]
+    )
+    client = _EchoClient(
+        model=_snapshot(),
+        api_key="secret-key",
+        base_url="https://echo.test",
+        transport=transport,
+        retry_policy=RetryPolicy(initial_delay_seconds=0.0, maximum_delay_seconds=0.0),
+        timeout_seconds=0.5,
+    )
+
+    response = client.complete(ModelRequest(messages=(ModelMessage(role="user", content="hi"),)))
+
+    assert response.economics.provider_attempts == 2
+    # Under a single shared 0.5 s allowance the retry would have had about 0.1 s left.
+    assert transport.timeouts[1] > 0.45
 
 
 def test_forwards_tier_requires_a_card_and_a_tier_capable_dialect() -> None:

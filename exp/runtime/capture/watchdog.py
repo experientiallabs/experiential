@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import select
+import selectors
 import signal
 import socket
 import struct
@@ -34,17 +35,19 @@ def _write_control(descriptor: int, actions: tuple[str, ...]) -> None:
     """Write one complete configuration without changing the shared socket's blocking mode."""
     remaining = memoryview(_frame(actions))
     deadline = time.monotonic() + 2.0
-    while remaining:
-        wait = deadline - time.monotonic()
-        if wait <= 0 or not select.select([], [descriptor], [], wait)[1]:
-            raise TimeoutError("Capture could not disable interception.")
-        try:
-            sent = os.write(descriptor, remaining)
-        except BlockingIOError:
-            continue
-        if sent == 0:
-            raise OSError("Capture control socket closed.")
-        remaining = remaining[sent:]
+    with selectors.DefaultSelector() as writable:
+        writable.register(descriptor, selectors.EVENT_WRITE)
+        while remaining:
+            wait = deadline - time.monotonic()
+            if wait <= 0 or not writable.select(wait):
+                raise TimeoutError("Capture could not disable interception.")
+            try:
+                sent = os.write(descriptor, remaining)
+            except BlockingIOError:
+                continue
+            if sent == 0:
+                raise OSError("Capture control socket closed.")
+            remaining = remaining[sent:]
 
 
 def _supervise(descriptor: int, owner: int, timeout: float) -> None:

@@ -542,7 +542,7 @@ def load_or_create_manifest(
     manifest = TinkerSFTRunManifest(
         schema_version=1,
         created_at=created_at,
-        inputs=(dataset_input,),
+        inputs=(dataset_input,) + ((spec.tail_sft.reference,) if spec.tail_sft else ()),
         code_revision=code_revision,
         run_id=run_id,
         dataset_id=dataset.dataset.dataset_id,
@@ -578,7 +578,8 @@ def validate_manifest(
     """
     if manifest.dataset_id != dataset.dataset.dataset_id:
         raise TinkerSFTResumeError("existing Tinker SFT run belongs to a different W12 dataset")
-    if manifest.inputs != (dataset_input,):
+    expected_inputs = (dataset_input,) + ((spec.tail_sft.reference,) if spec.tail_sft else ())
+    if manifest.inputs != expected_inputs:
         raise TinkerSFTResumeError(
             "existing Tinker SFT run does not name the canonical W12 artifact manifest"
         )

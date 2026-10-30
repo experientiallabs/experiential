@@ -280,8 +280,8 @@ def test_concurrent_client_construction_does_not_deadlock() -> None:
     assert len(runtime.converse_calls) == 4
 
 
-def test_retries_stay_on_the_same_region_and_model() -> None:
-    """Transient Bedrock failures retry the same client without changing region or model."""
+def test_unproven_throttle_does_not_redraw_on_the_same_region_and_model() -> None:
+    """A Bedrock throttle without non-dispatch proof remains unknown on its original model."""
 
     class _FlakyRuntime(_FakeBedrockRuntime):
         """Fail once with a retryable transport error, then succeed."""
@@ -289,10 +289,12 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.attempts = 0
+            self.seen_model: object = None
 
         def converse(self, **request: object) -> Mapping[str, object]:
             """Raise one retryable throttle error, then delegate to the recording fake."""
             self.attempts += 1
+            self.seen_model = request.get("modelId")
             if self.attempts == 1:
                 raise ProviderTransportError(
                     "Bedrock returned ThrottlingException", status_code=429
@@ -307,11 +309,41 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
         runtime_factory=lambda *, region_name: runtime,
     )
 
-    response = client.complete(_request())
+    with pytest.raises(ProviderTransportError) as failure:
+        client.complete(_request())
+    assert failure.value.status_code == 429
+    assert runtime.attempts == 1
+    assert runtime.seen_model == "exact-model"
+    assert not runtime.converse_calls
 
-    assert response.output.content == "ok"
-    assert runtime.attempts == 2
-    assert runtime.converse_calls[0]["modelId"] == "exact-model"
+
+def test_a_timed_out_converse_call_is_never_redrawn() -> None:
+    """Converse has no idempotency key, so a call whose outcome is unknown is not resent."""
+
+    class _LostRuntime(_FakeBedrockRuntime):
+        """Time out once after the request may have executed, then answer."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def converse(self, **request: object) -> Mapping[str, object]:
+            """Raise one read timeout, then delegate to the recording fake."""
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ProviderTransportError("Bedrock request timed out")
+            return super().converse(**request)
+
+    runtime = _LostRuntime()
+    client = BedrockClient(
+        model=_snapshot("exact-model"),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+    )
+    with pytest.raises(ProviderTransportError, match="timed out"):
+        client.complete(_request())
+    assert runtime.attempts == 1
 
 
 def test_catalog_requires_a_complete_bedrock_access_key_pair_and_resolves_ambient() -> None:
@@ -1327,3 +1359,67 @@ def test_bounded_profile_keeps_reasoning_off_outside_adaptive_claude(
     assert profile.supports_reasoning is False
     assert profile.reasoning_wire_format == "none"
     assert profile.reasoning_effort is None
+
+
+def test_invoke_url_encodes_the_model_like_converse_stream() -> None:
+    """The InvokeModel route shares the ConverseStream model encoding."""
+    client = BedrockClient(
+        model=_snapshot("stability.sd3-5-large-v1:0"),
+        region="us-west-2",
+        environment={},
+        runtime_factory=None,
+    )
+    assert client.invoke_url() == (
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/stability.sd3-5-large-v1%3A0/invoke"
+    )
+
+
+def test_invoke_dispatch_signs_with_a_json_accept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An image rung's InvokeModel POST signs a JSON accept, not an event stream."""
+    client = _signing_client(monkeypatch)
+    headers = client.sign_gateway_dispatch(url=client.invoke_url(), body='{"prompt":"x"}')
+    assert headers["accept"] == "application/json"
+    assert "accept;content-type;host;x-amz-date" in headers["Authorization"]
+    stream = client.sign_gateway_dispatch(url=client.converse_stream_url(), body='{"messages":[]}')
+    assert stream["accept"] == "application/vnd.amazon.eventstream"
+
+
+def test_invoke_dispatch_with_a_bearer_accepts_json() -> None:
+    """Bedrock API-key auth on an InvokeModel POST answers JSON."""
+    client = BedrockClient(
+        model=_snapshot("stability.stable-image-core-v1:1"),
+        region="us-west-2",
+        environment={},
+        bearer_token="explicit-bedrock-bearer",
+        runtime_factory=None,
+    )
+    headers = client.sign_gateway_dispatch(url=client.invoke_url(), body="{}")
+    assert headers == {
+        "authorization": "Bearer explicit-bedrock-bearer",
+        "content-type": "application/json",
+        "accept": "application/json",
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_id", "wire"),
+    [
+        ("stability.stable-image-ultra-v1:1", "bedrock_stability"),
+        ("us.stability.stable-image-inpaint-v1:0", "bedrock_stability"),
+        ("us.anthropic.claude-sonnet-4-5", None),
+    ],
+)
+def test_only_a_stability_model_carries_the_images_wire(model_id: str, wire: str | None) -> None:
+    """A Stability model's profile names its InvokeModel URL; other models speak no images wire."""
+    client = BedrockClient(
+        model=_snapshot(model_id), region="us-east-1", environment={}, runtime_factory=None
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    if wire is None:
+        assert profile.images_url is None
+        assert profile.images_wire == "openai"
+    else:
+        assert profile.images_url == client.invoke_url()
+        assert profile.images_wire == wire
+    assert profile.url == client.converse_stream_url()
+    assert profile.signs_request_body

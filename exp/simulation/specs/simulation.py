@@ -23,6 +23,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import EmbeddingCostReservation
 from exp.common.rollouts import SimulationMode
+from exp.common.rollouts.containment import ContainmentGuarantee, canonical_guarantees
 
 
 class WorldModelSettings(ContractModel):
@@ -48,11 +49,20 @@ class WorldModelSettings(ContractModel):
 
 
 class SandboxSettings(ContractModel):
-    """Versioned executable-environment identity and per-episode wall-clock limit."""
+    """Versioned executable-environment identity and per-episode wall-clock limit.
+
+    Attributes:
+        environment_id: Stable environment identity the configured runtime must match.
+        environment_sha256: Exact environment plan or image digest.
+        maximum_time_seconds: Finite wall-clock limit for one executable episode.
+        required_containment: Host containment guarantees the environment runtime must enforce
+            before any cell dispatches; canonically sorted, omitted from identity when empty.
+    """
 
     environment_id: ArtifactId
     environment_sha256: Sha256
     maximum_time_seconds: float = Field(default=300.0, gt=0)
+    required_containment: tuple[ContainmentGuarantee, ...] = Field(default=(), exclude_if=not_)
 
     @field_validator("maximum_time_seconds")
     @classmethod
@@ -60,6 +70,17 @@ class SandboxSettings(ContractModel):
         """Reject a wall-clock limit that cannot stop an executable episode."""
         if not math.isfinite(value):
             raise ValueError("sandbox maximum_time_seconds must be finite")
+        return value
+
+    @field_validator("required_containment")
+    @classmethod
+    def _require_canonical_containment(
+        cls,
+        value: tuple[ContainmentGuarantee, ...],
+    ) -> tuple[ContainmentGuarantee, ...]:
+        """Reject an unsorted or repeated requirement so equal specs digest equally."""
+        if value != canonical_guarantees(value):
+            raise ValueError("sandbox required_containment must be sorted and unique")
         return value
 
 

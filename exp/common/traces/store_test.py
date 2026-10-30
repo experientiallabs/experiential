@@ -14,6 +14,7 @@ from exp.common.models import BillingSource, ModelSnapshot
 from exp.common.project import ArtifactCorruptionError, ArtifactStore, ProjectPaths
 from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
+from exp.common.traces import store as trace_store
 from exp.common.traces.ingest.dataset import persist_trace_dataset
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.store import load_trace_dataset
@@ -177,3 +178,34 @@ def test_trace_dataset_rejects_noninteger_schema_one_lookalikes(
 
     with pytest.raises(ValueError, match="schema_version must be an integer"):
         TraceDataset.model_validate(payload)
+
+
+def test_a_verified_dataset_is_decoded_once_and_a_changed_one_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Records decode once per verified dataset; changed bytes still fail every later load."""
+    store = _store(tmp_path)
+    persisted = persist_trace_dataset(
+        TraceNormalizationResult(traces=(_trace("trace-1"), _trace("trace-2")), issues=()),
+        store,
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+        code_revision="test",
+    )
+    decoded: list[str] = []
+    decode = trace_store._decode_trace_record  # noqa: SLF001
+
+    def counted(payload: str, *, legacy: bool) -> Trace:
+        """Count one record decode."""
+        decoded.append(payload)
+        return decode(payload, legacy=legacy)
+
+    monkeypatch.setattr(trace_store, "_decode_trace_record", counted)
+    dataset_id = persisted.dataset.dataset_id
+    first = load_trace_dataset(store, dataset_id)
+    assert load_trace_dataset(store, dataset_id) == first and first.traces == persisted.traces
+    assert len(decoded) == 2, "both records decode once; the second load reuses them"
+    path = RawArtifact(store._paths, dataset_id) / persisted.dataset.traces_path
+    path.write_text('{"trace_id":"forged"}\n', encoding="utf-8")
+    for _ in range(2):
+        with pytest.raises(ArtifactCorruptionError, match="data file digest mismatch"):
+            load_trace_dataset(store, dataset_id)

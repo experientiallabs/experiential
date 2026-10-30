@@ -9,7 +9,8 @@ output items with a lifecycle ``status`` or ``phase`` but without the item
 ``internal_chat_message_metadata_passthrough``, the OpenAI SDK sends
 Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
 Chat, agents attach determinism and cache-retention hints (``seed``,
-``prompt_cache_retention``) no route forwards, and image clients send
+``prompt_cache_retention``) no route forwards, n8n sends Responses
+``background: false``, and image clients send
 OpenRouter's Chat ``modalities`` of text and image, which the route's own
 declared output modalities already decide. OpenRouter's deprecated
 ``include_reasoning`` boolean is rewritten to the ``reasoning.exclude`` it
@@ -26,7 +27,7 @@ import json
 from typing import Literal
 
 from exp.common.core.artifacts import JsonObject, JsonValue
-from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.legacy_functions import translate_legacy_functions
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
 from exp.runtime.openai_protocol.responses_probe import drop_gateway_web_search_items
@@ -222,6 +223,11 @@ def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[
     such an item, and its summary and content are display-only parts that never
     reach provider history, so the whole item goes.
 
+    An item that is only an ``id`` (with ``type`` absent or null) is the SDK's
+    ``ItemReference`` spelling without its optional tag; it is given the
+    ``item_reference`` tag the strict wire union keys on, which changes
+    nothing a provider reads, so no disclosure is recorded for it.
+
     Args:
         payload: Parsed Responses body.
 
@@ -234,11 +240,15 @@ def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[
         return payload, ()
     dropped_metadata = False
     dropped_reasoning = False
+    tagged_reference = False
     items: list[JsonValue] = []
     for item in raw_input:
         if not isinstance(item, dict):
             items.append(item)
             continue
+        if set(item) <= {"id", "type"} and item.get("type") is None and "id" in item:
+            tagged_reference = True
+            item = {"type": "item_reference", "id": item["id"]}
         if (
             item.get("type") == "reasoning"
             and item.get("id") is None
@@ -254,7 +264,7 @@ def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[
                 if key != "internal_chat_message_metadata_passthrough"
             }
         items.append(item)
-    if not dropped_metadata and not dropped_reasoning:
+    if not dropped_metadata and not dropped_reasoning and not tagged_reference:
         return payload, ()
     disclosures = (
         *((INPUT_METADATA_PASSTHROUGH_DROPPED,) if dropped_metadata else ()),
@@ -366,6 +376,42 @@ def accept_responses_stream_options(payload: JsonObject) -> tuple[JsonObject, tu
         ),
     )
     return remaining, disclosures
+
+
+def accept_foreground_responses(payload: JsonObject) -> JsonObject:
+    """Consume a Responses ``background`` flag that asks for the foreground.
+
+    n8n's OpenAI node sends ``background: false`` on every Responses call
+    unless its Background Mode option is switched on. Every response this
+    gateway serves already runs in the foreground, so ``false`` (or ``null``)
+    is satisfied exactly and removed without disclosure; ``true`` asks for a
+    stored, pollable background job the gateway does not run and keeps the
+    exact-parameter refusal. Nothing is forwarded to a provider either way.
+
+    Args:
+        payload: Parsed Responses body.
+
+    Returns:
+        The payload without ``background``.
+
+    Raises:
+        OpenAIProtocolError: ``background`` is true or not a boolean.
+    """
+    if "background" not in payload:
+        return payload
+    background = payload["background"]
+    if background is True:
+        raise unsupported_field(
+            "background",
+            message=(
+                "The parameter 'background' is supported only at false: this gateway "
+                "serves every response in the foreground. Remove the field or send "
+                "false and resend the request."
+            ),
+        )
+    if background is not None and background is not False:
+        raise invalid_field("background", "'background' must be a boolean.")
+    return {key: value for key, value in payload.items() if key != "background"}
 
 
 def drop_unforwarded_hints(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
@@ -663,5 +709,5 @@ def repair_responses(
     payload, arguments = normalize_responses_call_arguments(payload)
     payload, unknown = drop_unknown_responses_message_fields(payload)
     payload, hints = drop_unforwarded_hints(payload)
-    payload, stream = accept_responses_stream_options(payload)
+    payload, stream = accept_responses_stream_options(accept_foreground_responses(payload))
     return payload, (*disclosures, *items, *markers, *arguments, *unknown, *hints, *stream)

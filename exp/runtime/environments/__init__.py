@@ -1,5 +1,10 @@
 """Customer executable-environment contracts."""
 
+from exp.runtime.environments.containment.contract import (
+    LocalProcessCleanupError,
+    LocalProcessCrashError,
+    ResourceLimits,
+)
 from exp.runtime.environments.harbor import (
     BOUNDED_CLEANUP_CONTRACT,
     HarborCleanupResult,
@@ -13,28 +18,64 @@ from exp.runtime.environments.harbor import (
     HarborTranscriptEntry,
 )
 from exp.runtime.environments.interface import (
+    ContainedEnvironmentRuntime,
     EnvironmentResetError,
     EnvironmentRuntime,
     EnvironmentSession,
     Observation,
 )
 from exp.runtime.environments.local import (
-    LocalProcessCleanupError,
-    LocalProcessCrashError,
     LocalProcessEnvironmentRuntime,
     LocalProcessLimits,
     LocalProcessProtocolError,
 )
+from exp.runtime.environments.mixed import (
+    MixedCheckpoint,
+    MixedRealityEnvironmentRuntime,
+    MixedRealityPolicy,
+    StepIntent,
+    StepPrediction,
+    StepResult,
+    ToolRoute,
+)
+from exp.runtime.environments.world_contracts import (
+    AuthorityError,
+    ExecutableCheckpoint,
+    NativeImage,
+    RestoreError,
+    StateDomain,
+    ToolEffectPolicy,
+    UndeclaredEffectError,
+    WorldAccess,
+    WorldEvent,
+    WorldManifest,
+    WorldPolicyError,
+)
+from exp.runtime.environments.worlds import (
+    CheckpointableSession,
+    ExecutableWorld,
+    ExecutableWorldRuntime,
+    RestorableEnvironmentRuntime,
+    WorldBackend,
+    WorldBackendFactory,
+    WorldContext,
+)
 
 __all__ = [
+    "AuthorityError",
     "BOUNDED_CLEANUP_CONTRACT",
+    "CheckpointableSession",
+    "ContainedEnvironmentRuntime",
     "EnvironmentResetError",
     "EnvironmentRuntime",
     "EnvironmentSession",
-    "HarborCommandResult",
+    "ExecutableCheckpoint",
+    "ExecutableWorld",
+    "ExecutableWorldRuntime",
     "HarborCleanupResult",
     "HarborCleanupTimeoutError",
     "HarborCleanupUnprovenError",
+    "HarborCommandResult",
     "HarborEnvironmentRuntime",
     "HarborExecutableSession",
     "HarborRetryableCommandError",
@@ -45,5 +86,26 @@ __all__ = [
     "LocalProcessEnvironmentRuntime",
     "LocalProcessLimits",
     "LocalProcessProtocolError",
+    "MixedCheckpoint",
+    "MixedRealityEnvironmentRuntime",
+    "MixedRealityPolicy",
+    "NativeImage",
     "Observation",
+    "ResourceLimits",
+    "RestorableEnvironmentRuntime",
+    "RestoreError",
+    "StateDomain",
+    "StepIntent",
+    "StepPrediction",
+    "StepResult",
+    "ToolEffectPolicy",
+    "ToolRoute",
+    "UndeclaredEffectError",
+    "WorldAccess",
+    "WorldBackend",
+    "WorldBackendFactory",
+    "WorldContext",
+    "WorldEvent",
+    "WorldManifest",
+    "WorldPolicyError",
 ]

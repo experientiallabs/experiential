@@ -28,6 +28,7 @@ from exp.runtime.models.providers.bedrock_endpoints import (
 )
 from exp.runtime.models.providers.bedrock_requests import converse_request
 from exp.runtime.models.providers.bedrock_responses import converse_response
+from exp.runtime.models.providers.bedrock_stability import stability_model
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
@@ -37,6 +38,7 @@ from exp.runtime.models.providers.reasoning_compat import bedrock_adaptive_think
 from exp.runtime.models.providers.transport import (
     ProviderTransportError,
     RetryPolicy,
+    classify_unrepeatable_retry,
     run_with_retry,
 )
 
@@ -619,6 +621,23 @@ class BedrockClient:
         origin = bedrock_runtime_origin(region)
         return f"{origin}/model/{encoded_model}/converse-stream"
 
+    def invoke_url(self) -> str:
+        """Return the regional ``InvokeModel`` REST endpoint for this model.
+
+        The image wire (Stability AI models) posts one JSON body here; the model
+        identifier is encoded exactly like :meth:`converse_stream_url`.
+
+        Returns:
+            The full ``invoke`` URL for the resolved region.
+
+        Raises:
+            BedrockRegionError: No region could be resolved.
+        """
+        region = self._region_name()
+        encoded_model = quote(self._model.model_id, safe="/~")
+        origin = bedrock_runtime_origin(region)
+        return f"{origin}/model/{encoded_model}/invoke"
+
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
         """Compute SigV4 headers for one frozen native-dispatch request body.
 
@@ -630,12 +649,14 @@ class BedrockClient:
         within milliseconds and any later retry signs again.
 
         Args:
-            url: Exact endpoint the data plane will POST to.
+            url: Exact endpoint the data plane will POST to: this model's
+                ConverseStream URL or, for an image rung, its InvokeModel URL.
             body: Exact pre-serialized JSON body the data plane will send.
 
         Returns:
             Headers to send verbatim: ``Authorization``, ``X-Amz-Date``, the
-            session token when present, and the content type that was signed.
+            session token when present, and the content type that was signed
+            (an event-stream ``accept`` for ConverseStream, JSON for InvokeModel).
 
         Raises:
             BedrockRegionError: No region could be resolved.
@@ -643,8 +664,11 @@ class BedrockClient:
             RuntimeError: ``boto3`` or ``botocore`` is not installed.
         """
         region = self._region_name()
-        expected_url = self.converse_stream_url()
-        if url != expected_url:
+        if url == self.converse_stream_url():
+            accept = "application/vnd.amazon.eventstream"
+        elif url == self.invoke_url():
+            accept = "application/json"
+        else:
             raise ProviderTransportError(
                 "Bedrock dispatch URL differs from the admitted regional model endpoint"
             )
@@ -652,7 +676,7 @@ class BedrockClient:
             return {
                 "authorization": f"Bearer {self._bearer_token}",
                 "content-type": "application/json",
-                "accept": "application/vnd.amazon.eventstream",
+                "accept": accept,
             }
         auth_factory, request_factory = _import_botocore_signing()
         frozen = self._resolved_signing_credentials().get_frozen_credentials()
@@ -660,10 +684,7 @@ class BedrockClient:
             method="POST",
             url=url,
             data=body.encode("utf-8"),
-            headers={
-                "content-type": "application/json",
-                "accept": "application/vnd.amazon.eventstream",
-            },
+            headers={"content-type": "application/json", "accept": accept},
         )
         auth_factory(frozen, "bedrock", bedrock_signing_region(region)).add_auth(request)
         return {str(name): str(value) for name, value in dict(request.headers).items()}
@@ -674,7 +695,7 @@ class BedrockClient:
         *,
         retry_policy: RetryPolicy | None = None,
     ) -> Mapping[str, object]:
-        """Retry one Bedrock call on the same region and model without botocore multiplication."""
+        """Retry one Bedrock call in its region and model; an unknown outcome is never resent."""
 
         def send() -> Mapping[str, object]:
             """Run one attempt and translate provider failures into transport errors."""
@@ -689,7 +710,9 @@ class BedrockClient:
             except Exception as exc:
                 raise _as_transport_error(exc) from exc
 
-        return run_with_retry(send, policy=retry_policy or self._retry_policy)
+        return run_with_retry(
+            send, policy=retry_policy or self._retry_policy, classify=classify_unrepeatable_retry
+        )
 
 
 class BoundedBedrockClient(BoundedSyncModelClientAdapter):
@@ -724,8 +747,15 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
         Bedrock authenticates with per-request SigV4 signatures over the exact
         body bytes, so the profile carries no static credential headers and
         instead marks the request body for dispatch-time signing through
-        :meth:`sign_gateway_dispatch`.
+        :meth:`sign_gateway_dispatch`. A Stability AI image model also carries
+        its InvokeModel URL as the images endpoint on the ``bedrock_stability``
+        image wire; every other Bedrock model speaks no images wire.
         """
+        stability_url = (
+            self._bedrock_client.invoke_url()
+            if stability_model(self._bedrock_client.model_id) is not None
+            else None
+        )
         return GatewayWireProfile(
             dialect="bedrock_converse_stream",
             url=self._bedrock_client.converse_stream_url(),
@@ -743,6 +773,8 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             ),
             reasoning_effort=self._bedrock_client.reasoning_effort,
             signs_request_body=True,
+            images_url=stability_url,
+            images_wire="bedrock_stability" if stability_url is not None else "openai",
         )
 
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:

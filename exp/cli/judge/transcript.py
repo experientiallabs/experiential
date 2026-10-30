@@ -47,6 +47,7 @@ def render_trace(console: Console, trace: Trace, *, character_limit: int | None)
     for index, span in enumerate(trace.spans):
         _render_span(
             console,
+            trace,
             span,
             final_response=index == final_completion,
             character_limit=character_limit,
@@ -71,6 +72,7 @@ def render_trace(console: Console, trace: Trace, *, character_limit: int | None)
 
 def _render_span(
     console: Console,
+    trace: Trace,
     span: TraceSpan,
     *,
     final_response: bool,
@@ -80,6 +82,7 @@ def _render_span(
 
     Args:
         console: Destination for the rendered fields.
+        trace: Trace holding the span and any shared message history it references.
         span: One normalized chronological trace span.
         final_response: Whether this span holds the last captured assistant response.
         character_limit: Maximum characters per field, or ``None`` for the full value.
@@ -92,7 +95,7 @@ def _render_span(
     if result is None:
         result = attributes.get("gen_ai.tool.output")
     completion = assistant_completion(attributes)
-    user_message = user_input(attributes)
+    user_message = user_input(trace, span)
     console.print(f"\nEvidence span {span.span_id} ({span.name})", style="dim", markup=False)
     if user_message is not None:
         render_field(console, "User message", user_message, character_limit=character_limit)
@@ -153,17 +156,18 @@ def assistant_completion(attributes: dict[str, JsonValue]) -> str | None:
     )
 
 
-def user_input(attributes: dict[str, JsonValue]) -> str | None:
+def user_input(trace: Trace, span: TraceSpan) -> str | None:
     """Extract the latest readable user message from one normalized span.
 
     Args:
-        attributes: Canonical normalized span attributes.
+        trace: Trace holding the span and any shared message history it references.
+        span: One normalized trace span.
 
     Returns:
         Latest user content when captured, otherwise ``None``.
     """
     return _last_role_message(
-        _decoded_json_value(attributes.get("gen_ai.input.messages")),
+        _decoded_json_value(trace.input_messages(span)),
         frozenset({"user", "human"}),
     )
 
@@ -245,10 +249,11 @@ def jsonish_text(value: JsonValue) -> str:
     return json.dumps(decoded, indent=2, sort_keys=True, ensure_ascii=False)
 
 
-def span_evidence_text(span: TraceSpan) -> str:
+def span_evidence_text(trace: Trace, span: TraceSpan) -> str:
     """Return role- and tool-labeled visible content from one cited span.
 
     Args:
+        trace: Trace holding the span and any shared message history it references.
         span: Judge-cited normalized trace span.
 
     Returns:
@@ -256,7 +261,7 @@ def span_evidence_text(span: TraceSpan) -> str:
     """
     attributes = span.attributes
     pieces: list[str] = []
-    user_message = user_input(attributes)
+    user_message = user_input(trace, span)
     completion = assistant_completion(attributes)
     if user_message is not None:
         pieces.append("User message: " + user_message)

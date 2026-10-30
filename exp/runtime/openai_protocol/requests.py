@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from typing import Literal, cast
 
-from openai.types import EmbeddingCreateParams
-from openai.types.chat.completion_create_params import CompletionCreateParams
-from openai.types.responses.response_create_params import ResponseCreateParams
-from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError, field_validator
+from pydantic import Field, JsonValue, ValidationError, field_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.model import ToolCall
@@ -44,8 +41,6 @@ from exp.runtime.openai_protocol.client_field_repairs import (
 )
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
-    CustomToolCallItem,
-    CustomToolCallOutputItem,
 )
 from exp.runtime.openai_protocol.custom_tools import (
     chat_custom_call_messages,
@@ -71,6 +66,19 @@ from exp.runtime.openai_protocol.manifest import (
     validate_manifest,
 )
 from exp.runtime.openai_protocol.media_parts import message_content
+from exp.runtime.openai_protocol.nullable_params import (
+    CHAT_NULLABLE_PARAMS,
+    RESPONSES_NULLABLE_PARAMS,
+    drop_null_defaults,
+)
+from exp.runtime.openai_protocol.official_schema import (
+    CHAT_OFFICIAL,
+    EMBEDDINGS_OFFICIAL,
+    RESPONSES_OFFICIAL,
+    streaming_branch,
+    validate_official,
+    validate_wire,
+)
 from exp.runtime.openai_protocol.prompt_cache_controls import (
     extract_prompt_cache_breakpoints,
     prompt_cache_fields,
@@ -80,14 +88,17 @@ from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache
 from exp.runtime.openai_protocol.reasoning_replay import (
     ReplayedReasoningTooLong,
     fold_replayed_reasoning,
+    replayed_reasoning_disclosures,
 )
 from exp.runtime.openai_protocol.responses_input import (
+    NATIVE_INPUT_ITEMS,
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
     ReplayedInput,
     ReplayedMessage,
     ReplayedNativeItem,
     ReplayedReasoning,
+    native_input_role,
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
@@ -112,13 +123,10 @@ from exp.runtime.openai_protocol.web_search import (
     split_online_suffix,
 )
 from exp.runtime.openai_protocol.wire_models import (
-    HOSTED_TOOL_ITEM_TYPES_TOOL,
-    _AdditionalToolsItem,
     _AssistantToolCall,
     _ChatRequest,
     _ChatTool,
     _FunctionCall,
-    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -183,10 +191,6 @@ class _EmbeddingsRequest(_WireModel):
         return cast(EmbeddingInputs, self.input)
 
 
-_CHAT_OFFICIAL = TypeAdapter(CompletionCreateParams)
-_RESPONSES_OFFICIAL = TypeAdapter(ResponseCreateParams)
-# object-parametrized: EmbeddingCreateParams is one TypedDict, unlike the chat/responses unions.
-_EMBEDDINGS_OFFICIAL: TypeAdapter[object] = TypeAdapter[object](EmbeddingCreateParams)
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 
 
@@ -280,15 +284,17 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
+    payload, alias_disclosures = repair_chat(
+        *fold_prompt_cache_key_alias(drop_null_defaults(payload, CHAT_NULLABLE_PARAMS))
+    )
     breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
     payload = cache_payload = breakpoints.marked  # Breakpoints ride the cache_control path.
     payload = drop_opencode_cache_control(payload)
     validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
-    _validate_official(
-        _CHAT_OFFICIAL,
+    validate_official(
+        streaming_branch(CHAT_OFFICIAL, payload),
         _without_chat_message_extensions(payload),
         extension_fields={
             "top_k",
@@ -302,7 +308,7 @@ def decode_chat(
             "plugins",
         },
     )
-    request = _validate_wire(_ChatRequest, payload)
+    request = validate_wire(_ChatRequest, payload)
     cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
     alias, online_suffix = split_online_suffix(request.model)
     idempotency_key, client_request_id = validated_operation_headers(
@@ -358,7 +364,7 @@ def decode_chat(
                     and request.chat_template_kwargs.preserve_thinking is not None
                     else ()
                 ),
-                *_replayed_reasoning_disclosures(request.messages),
+                *replayed_reasoning_disclosures(request.messages),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
@@ -422,8 +428,8 @@ def decode_embeddings(payload: JsonObject) -> DecodedEmbeddingsRequest:
     validate_manifest(payload, EMBEDDINGS_MANIFEST)
     if payload.get("stream") is True:
         raise unsupported_field("stream")
-    _validate_official(_EMBEDDINGS_OFFICIAL, payload, extension_fields={"stream"})
-    request = _validate_wire(_EmbeddingsRequest, payload)
+    validate_official(EMBEDDINGS_OFFICIAL, payload, extension_fields={"stream"})
+    request = validate_wire(_EmbeddingsRequest, payload)
     try:
         canonical = EmbeddingsRequest(
             inputs=request.batch_inputs(),
@@ -455,13 +461,15 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
+    payload, alias_disclosures = repair_responses(
+        *fold_prompt_cache_key_alias(drop_null_defaults(payload, RESPONSES_NULLABLE_PARAMS))
+    )
     breakpoints = extract_prompt_cache_breakpoints(payload, container="input")
     payload = breakpoints.payload
     validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
-    request = _validate_wire(_ResponsesRequest, payload)
+    request = validate_wire(_ResponsesRequest, payload)
     cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
     alias, online_suffix = split_online_suffix(request.model)
     require_responses_input(request)
@@ -470,8 +478,8 @@ def decode_responses(
             if isinstance(item, _ResponseMessage):
                 require_responses_text_spelling(item_index, item)
     official_probe = official_responses_probe(payload)
-    _validate_official(
-        _RESPONSES_OFFICIAL,
+    validate_official(
+        streaming_branch(RESPONSES_OFFICIAL, official_probe),
         official_probe,
         extension_fields={"top_k", "reasoning", "client_metadata", "provider", "gateway"},
     )
@@ -541,7 +549,7 @@ def decode_responses(
                 *alias_disclosures,
                 *breakpoints.disclosures,
                 *cache_disclosures,
-                *_replayed_reasoning_disclosures(
+                *replayed_reasoning_disclosures(
                     ()
                     if isinstance(request.input, str)
                     else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
@@ -641,30 +649,6 @@ def _provider_preferences(
         return None
     raw = payload.get("provider")
     return dict(raw) if isinstance(raw, dict) else None
-
-
-def _validate_official(
-    adapter: TypeAdapter[object],
-    payload: JsonObject,
-    *,
-    extension_fields: Collection[str] = frozenset(),
-) -> None:
-    """Run the installed official SDK request schema before gateway narrowing."""
-    try:
-        official_payload = {
-            key: value for key, value in payload.items() if key not in extension_fields
-        }
-        adapter.validate_python(official_payload)
-    except ValidationError as exc:
-        raise validation_protocol_error(exc) from exc
-
-
-def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) -> ModelT:
-    """Validate one strict private wire model with a field-specific public error."""
-    try:
-        return model.model_validate(payload)
-    except ValidationError as exc:
-        raise validation_protocol_error(exc) from exc
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:
@@ -774,26 +758,6 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
     return tuple(converted)
 
 
-def _replayed_reasoning_disclosures(messages: Sequence[_Message]) -> tuple[str, ...]:
-    """Collect the OpenRouter replay disclosures owed across a transcript, once each."""
-    disclosures: list[str] = []
-    for message in messages:
-        try:
-            folded = fold_replayed_reasoning(
-                reasoning_content=message.reasoning_content,
-                reasoning=message.reasoning,
-                reasoning_details=message.reasoning_details,
-            )
-        except ReplayedReasoningTooLong:
-            # ``_messages`` names the field in its own 400 before this runs
-            # on the Chat path; the Responses path folds the same message.
-            continue
-        for disclosure in folded.disclosures:
-            if disclosure not in disclosures:
-                disclosures.append(disclosure)
-    return tuple(disclosures)
-
-
 def _tool_call(call: _AssistantToolCall) -> ToolCall:
     """Parse one replayed call, keeping its exact text; text naming no object gets a stand-in.
 
@@ -857,27 +821,11 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(
-            item,
-            (
-                _AdditionalToolsItem,
-                CustomToolCallItem,
-                CustomToolCallOutputItem,
-                _HostedToolItemEcho,
-            ),
-        ):
+        if isinstance(item, NATIVE_INPUT_ITEMS):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _HostedToolItemEcho):
-                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
-            elif isinstance(item, CustomToolCallItem):
-                native_role = "assistant"
-            elif isinstance(item, CustomToolCallOutputItem):
-                native_role = "tool"
-            else:
-                native_role = "developer"
             replayed.append(
-                ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
+                ReplayedNativeItem(index=index, role=native_input_role(item), item=raw_items[index])
             )
         elif isinstance(item, _ResponseReasoningItem):
             if item.encrypted_content is None:
@@ -971,6 +919,12 @@ def _response_input_messages(
                     ),
                 )
             )
+        elif item.call_id is None:
+            # A named output that answers no call (SDK 3.37 makes call_id
+            # optional; Codex 0.162+ delivers thread messages and
+            # notifications this way) has no canonical tool message, so it
+            # is carried verbatim like the other provider-owned items.
+            replayed.append(ReplayedNativeItem(index=index, role="user", item=raw_items[index]))
         else:
             if isinstance(item.output, str):
                 output_text, output_parts = item.output, ()

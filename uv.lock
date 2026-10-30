@@ -882,6 +882,15 @@ wheels = [
 ]
 
 [[package]]
+name = "et-xmlfile"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54", size = 17234, upload-time = "2024-10-25T17:25:40.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa", size = 18059, upload-time = "2024-10-25T17:25:39.051Z" },
+]
+
+[[package]]
 name = "execnet"
 version = "2.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -892,7 +901,7 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.170"
+version = "0.3.171"
 source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]
@@ -944,7 +953,7 @@ dependencies = [
 
 [[package]]
 name = "experiential"
-version = "0.7.220"
+version = "0.7.221"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -976,9 +985,15 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+artifact-edits = [
+    { name = "et-xmlfile" },
+    { name = "openpyxl" },
+]
 dev = [
     { name = "anthropic" },
+    { name = "et-xmlfile" },
     { name = "maturin" },
+    { name = "openpyxl" },
     { name = "packaging" },
     { name = "pytest" },
     { name = "pytest-xdist" },
@@ -1002,9 +1017,11 @@ requires-dist = [
     { name = "brotli", marker = "python_full_version >= '3.13'", specifier = "==1.2.0" },
     { name = "click", specifier = "==8.4.2" },
     { name = "cryptography", marker = "python_full_version >= '3.13'", specifier = "==50.0.1" },
+    { name = "et-xmlfile", marker = "extra == 'artifact-edits'", specifier = "==2.0.0" },
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
     { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://gitlab.com/experiential-labs-group/mitmproxy.git?rev=95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" },
     { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://gitlab.com/experiential-labs-group/mitmproxy_rs.git?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d" },
+    { name = "experiential", extras = ["artifact-edits"], marker = "extra == 'dev'" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
     { name = "filelock", specifier = "==4.2.1" },
     { name = "google-auth", specifier = "==2.57.0" },
@@ -1016,6 +1033,7 @@ requires-dist = [
     { name = "maturin", marker = "extra == 'dev'", specifier = "==1.14.1" },
     { name = "numpy", specifier = "==2.5.1" },
     { name = "openai", specifier = ">=3.0,<4" },
+    { name = "openpyxl", marker = "extra == 'artifact-edits'", specifier = "==3.1.5" },
     { name = "packaging", marker = "extra == 'dev'", specifier = "==26.2" },
     { name = "posthog", specifier = "==7.21.3" },
     { name = "pydantic", specifier = "==2.13.4" },
@@ -1033,7 +1051,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'dev'", specifier = "==15.0.1" },
     { name = "zstandard", marker = "python_full_version >= '3.13'", specifier = "==0.25.0" },
 ]
-provides-extras = ["sft", "dev"]
+provides-extras = ["sft", "artifact-edits", "dev"]
 
 [[package]]
 name = "filelock"
@@ -2283,6 +2301,18 @@ wheels = [
 ]
 
 [[package]]
+name = "openpyxl"
+version = "3.1.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "et-xmlfile" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/f9/88d94a75de065ea32619465d2f77b29a0469500e99012523b91cc4141cd1/openpyxl-3.1.5.tar.gz", hash = "sha256:cf0e3cf56142039133628b5acffe8ef0c12bc902d2aadd3e0fe5878dc08d1050", size = 186464, upload-time = "2024-06-28T14:03:44.161Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl", hash = "sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2", size = 250910, upload-time = "2024-06-28T14:03:41.161Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.45.1"
 source = { registry = "https://pypi.org/simple" }
@@ -3335,11 +3365,11 @@ wheels = [
 
 [[package]]
 name = "setuptools"
-version = "83.0.0"
+version = "84.2.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/34/26/f5d29e25ffdb535afef2d35cdb55b325298f96debd670da4c325e08d70f4/setuptools-83.0.0.tar.gz", hash = "sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef", size = 1154254, upload-time = "2026-07-04T15:31:22.699Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/63/40/e2c41d00a4bfea5548c31420a74c6cf149cc0e7c36b45c4c82202ce867aa/setuptools-84.2.0.tar.gz", hash = "sha256:6f445ca2ce864605f81e223f262b4c94ffcb9a4a63473bae0ed7be5aab0291da", size = 1227656, upload-time = "2026-10-19T20:38:03.407Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl", hash = "sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3", size = 1008090, upload-time = "2026-07-04T15:31:20.885Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/a2/2e1af99d56c8145aa69496026c7e5fd7b6ec759b500c3ad697e2062832dc/setuptools-84.2.0-py3-none-any.whl", hash = "sha256:8cc107ac7a403105dc8d6477664171f36135fab26adf8b5e0edaebc313f39b21", size = 875816, upload-time = "2026-10-19T20:38:01.629Z" },
 ]
 
 [[package]]
