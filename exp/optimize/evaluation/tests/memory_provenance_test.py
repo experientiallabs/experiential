@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel_test import (
     SimulatedProvider,
     _arr,
     _at,
@@ -18,8 +18,8 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.trace_learning import learning_plan
-from exp.optimize.evaluation.trace_learning_test import memory_delivered
+from exp.optimize.evaluation.learning.traces import learning_plan
+from exp.optimize.evaluation.learning.traces_test import memory_delivered
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 from exp.simulation.world_model.experience_memory import memory_head
 

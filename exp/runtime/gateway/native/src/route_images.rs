@@ -1,17 +1,24 @@
-//! The native image-generation surface: the `POST /v1/images/generations`
-//! handler.
+//! The native image surface: the `POST /v1/images/generations` handler and
+//! the shared ladder `POST /v1/images/edits` reuses.
 //!
-//! Prompt in, images out, never streamed: admission returns one fully built
-//! OpenAI-wire `/images/generations` payload per certified deployment and the
-//! ladder below reserves each attempt through `start_attempt`, POSTs the
-//! payload, buffers the JSON answer under the retained-output cap, validates
-//! it against the request (one image per requested `n`, a reported token
-//! usage), and settles the winning attempt with the provider's prompt and
-//! image token counts. A rung whose lane prices images per image (dall-e,
-//! xAI Grok Imagine) settles billed `image` units instead: one per image
-//! returned, at the variant admission named, and never its token counts. A
-//! token-billed answer without usage is refused as unbillable, so no image is
-//! ever handed out unaccounted.
+//! Prompt in (plus input images for an edit), images out, never streamed:
+//! admission returns one fully built provider payload per certified
+//! deployment and the ladder below reserves each attempt through
+//! `start_attempt`, POSTs the payload, buffers the JSON answer under the
+//! retained-output cap, validates it against the request, and settles the
+//! winning attempt. Two answer shapes exist, named per rung by admission:
+//!
+//! - the OpenAI Images API: one image per requested `n` and a reported token
+//!   usage, settled on the provider's prompt and image token counts; a rung
+//!   whose lane prices images per image (dall-e, xAI Grok Imagine) settles
+//!   billed `image` units instead, one per image returned, never its tokens;
+//! - Stability AI's Bedrock InvokeModel answer (`images`, `seeds`,
+//!   `finish_reasons`): one base64 image, always billed per image. Its body
+//!   is frozen at admission and signed (SigV4) immediately before each
+//!   physical POST; a content-filter finish reason is a refusal billed $0.
+//!
+//! A token-billed answer without usage is refused as unbillable, so no image
+//! is ever handed out unaccounted.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -23,6 +30,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use crate::admission::{acquire_permit, new_guard, wire_drift_response};
+use crate::bridge::Bridge;
 use crate::dialects::{Dialect, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE};
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -36,7 +44,10 @@ use crate::respond::{
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::upstream::open_stream;
-use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
+use crate::waterfall::{
+    customer_owned, dispatch_headers, successor_possible, DeploymentWire, RoutePolicy,
+    StartResponse,
+};
 
 /// The wire configuration returned by one successful images admission.
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +64,9 @@ struct ImagesAdmission {
     /// that variant, `None` (or an absent list) bills the provider's tokens.
     #[serde(default)]
     unit_billing: Vec<Option<ImageUnitBilling>>,
+    /// Per-rung answer shapes aligned with `route` (absent means OpenAI).
+    #[serde(default)]
+    wire_shapes: Vec<WireShape>,
     maximum_total_attempts: u32,
     maximum_same_deployment_attempts: u32,
 }
@@ -75,6 +89,22 @@ impl ImagesAdmission {
 struct ImageUnitBilling {
     #[serde(default)]
     variant: String,
+}
+
+/// The answer shape one rung's provider returns.
+#[derive(Debug, Clone, Deserialize)]
+struct WireShape {
+    /// `openai` (the Images API) or `stability` (Bedrock InvokeModel).
+    shape: String,
+    /// The encoded format a Stability rung returns (`png`, `jpeg`, `webp`).
+    #[serde(default)]
+    output_format: Option<String>,
+}
+
+impl WireShape {
+    fn stability(&self) -> bool {
+        self.shape == "stability"
+    }
 }
 
 struct Served {
@@ -108,12 +138,34 @@ pub(crate) async fn images(
         Ok(text) => text,
         Err(_) => return error_response(&PublicError::invalid_json()),
     };
-    let client_request_id = latin1_header(&headers, "x-client-request-id");
+    let admit_value = json!({"raw_key": raw_key, "body": body_text});
+    serve_images(
+        &state,
+        &headers,
+        started,
+        deadline,
+        &raw_key,
+        "admit_images",
+        admit_value,
+    )
+    .await
+}
 
-    let mut admit_value = json!({"raw_key": raw_key, "body": body_text});
-    with_app_identity(&mut admit_value, &headers);
+/// Admit one parsed image request through `admit_method`, then walk its
+/// ladder and answer: shared by the generations and edits routes.
+pub(crate) async fn serve_images(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    started: Instant,
+    deadline: Instant,
+    raw_key: &str,
+    admit_method: &'static str,
+    mut admit_value: Value,
+) -> Response {
+    let client_request_id = latin1_header(headers, "x-client-request-id");
+    with_app_identity(&mut admit_value, headers);
     let admit_argument = compact_json(&admit_value);
-    let admission_text = match state.bridge.call("admit_images", admit_argument).await {
+    let admission_text = match state.bridge.call(admit_method, admit_argument).await {
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
@@ -127,16 +179,16 @@ pub(crate) async fn images(
     }
     let admission: ImagesAdmission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
-        Err(_) => return wire_drift_response(&state, &admission_value, started).await,
+        Err(_) => return wire_drift_response(state, &admission_value, started).await,
     };
-    let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
+    let mut guard = new_guard(state, admission.request_id.clone(), started);
+    let permit = match acquire_permit(state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
     let _permit = permit;
 
-    match run_ladder(&state, &admission, &raw_key, &mut guard, deadline).await {
+    match run_ladder(state, &admission, raw_key, &mut guard, deadline).await {
         Err(error) => error_response(&error),
         Ok(served) => {
             if !guard
@@ -239,8 +291,15 @@ async fn run_ladder(
         total_attempts += 1;
         counts[depth] += 1;
         let units = admission.unit_billing.get(depth).cloned().flatten();
+        let shape = admission.wire_shapes.get(depth);
         let http = state.http.for_origin(wire.tenant_origin);
-        match dispatch(http, wire, deadline, admission, units.as_ref()).await {
+        let target = DispatchTarget {
+            bridge: &state.bridge,
+            request_id: &admission.request_id,
+            wire,
+            shape,
+        };
+        match dispatch(http, &target, deadline, admission, units.as_ref()).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err((failure, opened)) => {
                 let failure = failure.with_tenant_origin(wire.tenant_origin);
@@ -276,29 +335,59 @@ async fn run_ladder(
     }
 }
 
+/// One attempt's dispatch target: the rung's wire and answer shape, plus the
+/// bridge a body-signing rung signs through.
+struct DispatchTarget<'a> {
+    bridge: &'a Bridge,
+    request_id: &'a str,
+    wire: &'a DeploymentWire,
+    shape: Option<&'a WireShape>,
+}
+
 /// POST one admitted payload and validate the buffered answer; the error
-/// carries whether the provider dispatch opened.
+/// carries whether the provider dispatch opened. A body-signing rung
+/// (Bedrock) is signed here, immediately before the POST, and its frozen
+/// body is sent verbatim; a customer-managed rung's credential failure is
+/// the customer's to fix, never operator deadness.
 async fn dispatch(
     http: &crate::upstream::UpstreamClient,
-    wire: &DeploymentWire,
+    target: &DispatchTarget<'_>,
     deadline: Instant,
     admission: &ImagesAdmission,
     units: Option<&ImageUnitBilling>,
 ) -> Result<(Value, Usage), (Failure, bool)> {
+    let wire = target.wire;
+    let stability = target.shape.is_some_and(WireShape::stability);
+    let headers = dispatch_headers(target.bridge, target.request_id, wire)
+        .await
+        .map_err(|_| {
+            (
+                Failure::new(
+                    FailureClass::ProviderAuthentication,
+                    "provider dispatch signing failed",
+                ),
+                false,
+            )
+        })?;
+    let dialect = if stability {
+        Dialect::BedrockConverseStream
+    } else {
+        Dialect::OpenAiCompatible
+    };
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let bound = remaining(deadline).min(phase_timeout);
     let response = open_stream(
         http,
         &wire.url,
-        &wire.headers,
+        &headers,
         &wire.idempotency_key,
         &wire.upstream_payload,
-        None,
+        wire.upstream_body.as_deref(),
         bound,
-        Dialect::OpenAiCompatible,
+        dialect,
     )
     .await
-    .map_err(|failure| (failure, false))?;
+    .map_err(|failure| (customer_owned(failure, wire), false))?;
     if response
         .content_length()
         .is_some_and(|length| length > MAXIMUM_RETAINED_OUTPUT_BYTES as u64)
@@ -315,7 +404,11 @@ async fn dispatch(
         Ok(payload) => payload,
         Err(_) => return Err((malformed("images response is not JSON"), true)),
     };
-    public_images(payload, admission, units).map_err(|failure| (failure, true))
+    let answer = match target.shape.filter(|shape| shape.stability()) {
+        Some(shape) => public_stability_images(payload, admission, units, shape),
+        None => public_images(payload, admission, units),
+    };
+    answer.map_err(|failure| (failure, true))
 }
 
 /// Read one provider body chunk by chunk under the retained-output cap (a
@@ -462,6 +555,91 @@ fn public_images(
     Ok((Value::Object(public), usage))
 }
 
+/// Validate one Stability (Bedrock InvokeModel) answer and rebuild it as the
+/// public Images answer: `n` base64 images (Stability returns one per call)
+/// in `data[].b64_json`, the requested `output_format`, and one billed
+/// `image` unit per image. A content-filter finish reason is a refusal (the
+/// model's answer to the request, never rung deadness); an inference error
+/// is a retryable provider failure.
+fn public_stability_images(
+    payload: Value,
+    admission: &ImagesAdmission,
+    units: Option<&ImageUnitBilling>,
+    shape: &WireShape,
+) -> Result<(Value, Usage), Failure> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| malformed("images response is not an object"))?;
+    if let Some(reasons) = object.get("finish_reasons").and_then(Value::as_array) {
+        if let Some(reason) = reasons.iter().find_map(Value::as_str) {
+            return Err(match reason.strip_prefix("Filter reason:") {
+                Some(what) => Failure::new(
+                    FailureClass::Refusal,
+                    &format!(
+                        "the image model's content filter refused the request ({})",
+                        filter_subject(what)
+                    ),
+                ),
+                None => Failure::new(
+                    FailureClass::ProviderInternal,
+                    "the image model reported an inference error",
+                )
+                .with_retry(true, true),
+            });
+        }
+    }
+    let encoded = object
+        .get("images")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("images response omitted the images array"))?;
+    if encoded.len() != admission.image_count {
+        return Err(malformed(
+            "images response count does not match the requested n",
+        ));
+    }
+    let mut images: Vec<Value> = Vec::with_capacity(encoded.len());
+    for item in encoded {
+        let data = item
+            .as_str()
+            .filter(|data| !data.is_empty())
+            .ok_or_else(|| malformed("images response item is not a base64 string"))?;
+        images.push(json!({"b64_json": data}));
+    }
+    // Admission routes a Stability rung only with a per-image price card.
+    let units = units.ok_or_else(|| malformed("a Stability image rung has no per-image price"))?;
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let count = images.len() as u64;
+    let mut public = Map::new();
+    public.insert("created".to_string(), Value::from(created));
+    public.insert("data".to_string(), Value::Array(images));
+    if let Some(format) = &shape.output_format {
+        public.insert("output_format".to_string(), Value::from(format.clone()));
+    }
+    let usage = Usage {
+        billed_units: Some(BilledUnits {
+            kind: "image".to_string(),
+            variant: units.variant.clone(),
+            quantity_milli: count.saturating_mul(1000),
+        }),
+        ..Usage::default()
+    };
+    Ok((Value::Object(public), usage))
+}
+
+/// Name what Stability's content filter screened (`prompt`, `output image`,
+/// `input image`) from its finish reason, as a bounded vocabulary only.
+fn filter_subject(reason: &str) -> &'static str {
+    match reason.trim() {
+        "prompt" => "prompt",
+        "output image" => "output image",
+        "input image" => "input image",
+        _ => "content",
+    }
+}
+
 fn served_headers(
     admission: &ImagesAdmission,
     depth: usize,
@@ -511,6 +689,7 @@ mod tests {
             route: Vec::new(),
             image_count,
             unit_billing: Vec::new(),
+            wire_shapes: Vec::new(),
             maximum_total_attempts: 8,
             maximum_same_deployment_attempts: 2,
         }
@@ -585,5 +764,135 @@ mod tests {
             public_images(usageless, &admission(1), Some(&units)).expect("usageless answer");
         assert!(body.get("usage").is_none());
         assert_eq!(usage.billed_units.expect("units").quantity_milli, 1_000);
+    }
+
+    fn stability_shape() -> WireShape {
+        WireShape {
+            shape: "stability".to_string(),
+            output_format: Some("jpeg".to_string()),
+        }
+    }
+
+    fn flat_units() -> ImageUnitBilling {
+        ImageUnitBilling {
+            variant: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_stability_answer_becomes_one_billed_b64_image() {
+        let payload = json!({
+            "seeds": [2_130_420_379_u64],
+            "finish_reasons": [null],
+            "images": ["aW1hZ2U="],
+        });
+        let (body, usage) = public_stability_images(
+            payload,
+            &admission(1),
+            Some(&flat_units()),
+            &stability_shape(),
+        )
+        .expect("valid answer");
+        assert_eq!(body["data"], json!([{"b64_json": "aW1hZ2U="}]));
+        assert_eq!(body["output_format"], "jpeg");
+        assert!(body["created"].as_u64().is_some_and(|created| created > 0));
+        assert!(
+            body.get("seeds").is_none(),
+            "provider-only fields stay private"
+        );
+        let billed = usage.billed_units.expect("image units");
+        assert_eq!(billed.kind, "image");
+        assert_eq!(billed.variant, "");
+        assert_eq!(billed.quantity_milli, 1_000);
+        assert_eq!(usage.input_tokens, None);
+    }
+
+    #[test]
+    fn a_stability_content_filter_is_a_refusal_naming_only_its_subject() {
+        for (reason, subject) in [
+            ("Filter reason: prompt", "prompt"),
+            ("Filter reason: output image", "output image"),
+            ("Filter reason: input image", "input image"),
+            ("Filter reason: something new", "content"),
+        ] {
+            let payload = json!({"finish_reasons": [reason]});
+            let failure = public_stability_images(
+                payload,
+                &admission(1),
+                Some(&flat_units()),
+                &stability_shape(),
+            )
+            .expect_err("filtered");
+            assert_eq!(failure.failure_class, FailureClass::Refusal);
+            assert!(failure.safe_message.ends_with(&format!("({subject})")));
+            assert!(!failure.retryable_same_deployment);
+            assert!(!failure.failover_eligible);
+        }
+    }
+
+    #[test]
+    fn a_stability_inference_error_is_a_retryable_provider_failure() {
+        let payload = json!({"finish_reasons": ["Inference error"], "images": []});
+        let failure = public_stability_images(
+            payload,
+            &admission(1),
+            Some(&flat_units()),
+            &stability_shape(),
+        )
+        .expect_err("inference error");
+        assert_eq!(failure.failure_class, FailureClass::ProviderInternal);
+        assert!(failure.retryable_same_deployment);
+        assert!(failure.failover_eligible);
+    }
+
+    #[test]
+    fn a_stability_answer_without_its_image_or_price_is_malformed() {
+        for payload in [
+            json!({"finish_reasons": [null]}),
+            json!({"finish_reasons": [null], "images": []}),
+            json!({"finish_reasons": [null], "images": [""]}),
+            json!({"finish_reasons": [null], "images": [7]}),
+            json!(["not", "an", "object"]),
+        ] {
+            let failure = public_stability_images(
+                payload,
+                &admission(1),
+                Some(&flat_units()),
+                &stability_shape(),
+            )
+            .expect_err("malformed");
+            assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        }
+        let unpriced = public_stability_images(
+            json!({"finish_reasons": [null], "images": ["aW1hZ2U="]}),
+            &admission(1),
+            None,
+            &stability_shape(),
+        )
+        .expect_err("no per-image price");
+        assert_eq!(unpriced.failure_class, FailureClass::MalformedResponse);
+    }
+
+    #[test]
+    fn admission_wire_shapes_default_to_the_openai_answer() {
+        let without: ImagesAdmission = serde_json::from_value(json!({
+            "request_id": "r", "alias": "a", "alias_revision_id": "v",
+            "exact_model_id": "m", "route_reason": "direct", "route": [],
+            "image_count": 1, "maximum_total_attempts": 1,
+            "maximum_same_deployment_attempts": 1,
+        }))
+        .expect("older admission shape");
+        assert!(without.wire_shapes.is_empty());
+        let with: ImagesAdmission = serde_json::from_value(json!({
+            "request_id": "r", "alias": "a", "alias_revision_id": "v",
+            "exact_model_id": "m", "route_reason": "direct", "route": [],
+            "image_count": 1, "maximum_total_attempts": 1,
+            "maximum_same_deployment_attempts": 1,
+            "wire_shapes": [{"shape": "stability", "output_format": "png"}, {"shape": "openai"}],
+        }))
+        .expect("shaped admission");
+        assert!(with.wire_shapes[0].stability());
+        assert!(!with.wire_shapes[1].stability());
+        assert_eq!(with.wire_shapes[1].output_format, None);
     }
 }

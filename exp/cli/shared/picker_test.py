@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
+import os
+import pty
 import re
+import resource
 from collections.abc import Callable
 
 import pytest
@@ -14,6 +18,7 @@ from exp.cli.shared.picker import (
     PickerEvent,
     PickerKey,
     PickerOption,
+    _read_terminal_key_from_fd,
     interpret_key_bytes,
     select_many,
     select_many_list,
@@ -26,6 +31,22 @@ _DOWN = "\x1b[B"
 _UP = "\x1b[A"
 _ENTER = "\r"
 _SPACE = " "
+
+
+@pytest.mark.parametrize("key", [b"\x1b[B", "界".encode()])
+def test_keyboard_sequences_accept_high_numbered_descriptors(key: bytes) -> None:
+    """Arrow and multibyte input survive a terminal opened above select's descriptor limit."""
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 2048:
+        pytest.skip("process descriptor ceiling cannot exercise high terminal descriptors")
+    reader, writer = os.pipe()
+    descriptor = fcntl.fcntl(reader, fcntl.F_DUPFD_CLOEXEC, 2048)
+    os.close(reader)
+    try:
+        os.write(writer, key)
+        assert _read_terminal_key_from_fd(descriptor) == interpret_key_bytes(key)
+    finally:
+        os.close(descriptor)
+        os.close(writer)
 
 
 class ScriptedConsole(Console):
@@ -314,6 +335,8 @@ def _picker_script(body: str) -> str:
         Source for a child interpreter attached to a pseudo-terminal.
     """
     return (
+        "import os\n"
+        'os.environ["TERM"] = "xterm-256color"\n'
         "from rich.console import Console\n"
         "from exp.cli.shared.picker import PickerOption, choose_many, choose_one\n"
         "console = Console()\n"
@@ -430,14 +453,34 @@ def test_provider_multi_select_redraws_one_region_for_repeated_and_batched_keys(
     assert [line for line in run.screen if line.strip() == "\u276f Complete"]
 
 
+@pytest.mark.parametrize("descriptor_floor", [0, 2048])
 def test_model_single_select_confirms_the_focused_row_with_enter(
     python_terminal_child: Callable[..., TerminalRun],
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor_floor: int,
 ) -> None:
     """Enter immediately confirms the focused model and keeps its metadata visible.
 
     Args:
         python_terminal_child: Runner for one inline script under a pseudo-terminal.
+        monkeypatch: Restore the fixture's pseudo-terminal constructor after this case.
+        descriptor_floor: Exercise the parent terminal driver with a high descriptor too.
     """
+    if descriptor_floor:
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= descriptor_floor:
+            pytest.skip("process descriptor ceiling cannot exercise a high terminal master")
+        openpty = pty.openpty
+
+        def high_terminal() -> tuple[int, int]:
+            """Keep a real pseudo-terminal while assigning its master a high descriptor."""
+            master, slave = openpty()
+            try:
+                duplicated = fcntl.fcntl(master, fcntl.F_DUPFD_CLOEXEC, descriptor_floor)
+            finally:
+                os.close(master)
+            return duplicated, slave
+
+        monkeypatch.setattr(pty, "openpty", high_terminal)
     script = _picker_script(
         "result = choose_one(\n"
         "    console,\n"
@@ -674,7 +717,8 @@ def test_an_exception_during_a_screen_restores_the_terminal(
         python_terminal_child: Runner for one inline script under a pseudo-terminal.
     """
     script = (
-        "import signal, sys, termios\n"
+        "import os, signal, sys, termios\n"
+        'os.environ["TERM"] = "xterm-256color"\n'
         "from rich.console import Console\n"
         "from exp.cli.shared.picker import PickerOption, choose_many\n"
         "def fail(signum, frame):\n"

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
+import resource
 import signal
 import socket
 import struct
@@ -13,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.runtime.capture.watchdog import CaptureWatchdog, _frame
+from exp.runtime.capture.watchdog import CaptureWatchdog, _frame, _write_control
 
 _OWNER = """
 import asyncio, os, socket, sys, time
@@ -53,10 +55,36 @@ def _receive(control: socket.socket) -> bytes:
     return bytes(header + body)
 
 
-@pytest.mark.parametrize("failure", ["crash", "hang", "clean", "watchdog"])
-def test_watchdog_disables_after_owner_or_watchdog_failure(failure: str) -> None:
-    """Owner death, a blocked loop, and watchdog death all disable the same owned connection."""
+def test_control_write_accepts_high_numbered_descriptors() -> None:
+    """Cleanup must work when a long-lived owner has more descriptors than select supports."""
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 2048:
+        pytest.skip("process descriptor ceiling cannot exercise a descriptor above FD_SETSIZE")
     extension, control = socket.socketpair()
+    extension.settimeout(2)
+    control.setblocking(False)
+    descriptor = fcntl.fcntl(control.fileno(), fcntl.F_DUPFD_CLOEXEC, 2048)
+    try:
+        _write_control(descriptor, ("0", "!0"))
+        assert _receive(extension) == _frame(("0", "!0"))
+    finally:
+        os.close(descriptor)
+        control.close()
+        extension.close()
+
+
+@pytest.mark.parametrize("failure", ["crash", "hang", "clean", "watchdog"])
+@pytest.mark.parametrize("descriptor_floor", [0, 2048])
+def test_watchdog_disables_after_owner_or_watchdog_failure(
+    failure: str, descriptor_floor: int
+) -> None:
+    """Owner death, a blocked loop, and watchdog death all disable the same owned connection."""
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= descriptor_floor:
+        pytest.skip("process descriptor ceiling cannot exercise the requested control descriptor")
+    extension, control = socket.socketpair()
+    if descriptor_floor:
+        descriptor = fcntl.fcntl(control.fileno(), fcntl.F_DUPFD_CLOEXEC, descriptor_floor)
+        control.close()
+        control = socket.socket(fileno=descriptor)
     extension.settimeout(7)
     owner = subprocess.Popen(
         [sys.executable, "-c", _OWNER, str(control.fileno()), failure],

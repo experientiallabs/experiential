@@ -70,6 +70,7 @@ from exp.simulation.world_model.runtime import (
     GroundedWorldModel,
     load_grounded_world_model_artifact,
     persist_fit_only_world_model,
+    persist_memory_first_world_model,
 )
 
 
@@ -140,7 +141,10 @@ def test_build_and_simulation_share_one_grounded_prompt_identity() -> None:
     assert grounded_world_model_prompt_sha256() == text_prompt_sha256()
 
 
-def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: Path) -> None:
+@pytest.mark.parametrize("top_k", [5, 7])
+def test_loaded_world_model_retrieves_real_evidence_before_prediction(
+    tmp_path: Path, top_k: int
+) -> None:
     """A completed build artifact executes with immutable observed-transition grounding.
 
     Args:
@@ -212,9 +216,9 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
         model=world_snapshot,
         created_at=created_at,
         code_revision="fixture-revision",
-        top_k=5,
+        top_k=top_k,
     )
-    assert artifact.artifact.top_k == 5
+    assert artifact.artifact.top_k == top_k
     client = _WorldClient(world_snapshot)
 
     for context in (16_384, 65_536):
@@ -288,8 +292,17 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     )
     fit_only_artifact = load_grounded_world_model_artifact(store.artifacts, fit_only)
     assert fit_only_artifact.serving_rag == artifact_input(fit_rag.manifest)
-    assert (fit_only_artifact.model, fit_only_artifact.top_k) == (world_snapshot, 5)
+    assert (fit_only_artifact.model, fit_only_artifact.top_k) == (world_snapshot, top_k)
     assert fit_only_artifact.prompt_sha256 == artifact.artifact.prompt_sha256
+    memory_first = persist_memory_first_world_model(
+        store.artifacts, artifact_input(artifact.manifest)
+    )
+    memory_fit = persist_fit_only_world_model(
+        store.artifacts, memory_first, artifact_input(fit_rag.manifest)
+    )
+    assert (
+        load_grounded_world_model_artifact(store.artifacts, memory_fit).original_evidence == "none"
+    )
     with pytest.raises(ValueError, match="fit-only"):
         persist_fit_only_world_model(
             store.artifacts, artifact_input(artifact.manifest), artifact_input(rag.manifest)

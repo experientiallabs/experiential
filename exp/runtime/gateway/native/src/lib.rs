@@ -48,6 +48,7 @@ mod route_batches;
 mod route_chat;
 mod route_decisions;
 mod route_embeddings;
+mod route_image_edits;
 mod route_images;
 mod route_messages;
 mod route_responses;

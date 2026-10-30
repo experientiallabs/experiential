@@ -397,7 +397,10 @@ def preflight_gateway_request(
         requirements += ((True, capabilities.supports_streaming, "streaming"),)
     for requested, supported, capability in requirements:
         if requested and not supported and capability not in emulated_capabilities:
-            raise ProviderCapabilityError(capability=capability)
+            raise ProviderCapabilityError(
+                capability=capability,
+                detail=(_image_location_detail(request) if capability == "image_input" else None),
+            )
     preflight_media_handles(
         request.media_handles,
         supports_media_handle_input=capabilities.supports_media_handle_input,
@@ -413,6 +416,36 @@ def preflight_gateway_request(
             param=("stop_sequences" if request.surface == GatewayApiSurface.MESSAGES else "stop"),
             code="invalid_parameter",
         )
+
+
+def _image_location_detail(request: GatewayRequest) -> str | None:
+    """Say which message carries the image a text-only route refused.
+
+    A caller who believes the conversation is text sees only "cannot accept
+    image input" and cannot find the cause: the image is usually a pasted
+    screenshot or a tool result many turns back, or a clipboard paste that
+    carried an image beside its text. Naming the message (position and role)
+    lets the caller remove it. Content is never quoted.
+
+    Args:
+        request: Canonical request whose images the route cannot accept.
+
+    Returns:
+        The complete caller-safe sentence, or ``None`` when no message
+        carries an image part.
+    """
+    total = len(request.messages)
+    for index, message in enumerate(request.messages):
+        if message.images:
+            return (
+                f"Message {index + 1} of {total} in this request (role {message.role}) "
+                "carries an image, and the selected model route accepts text only. "
+                "Images often come from a pasted screenshot, a clipboard paste that "
+                "included an image, or a tool result earlier in the conversation. "
+                "Remove the image from the conversation (or start a new session), "
+                "or choose an image-capable model alias."
+            )
+    return None
 
 
 def require_gateway_provider(provider: str) -> None:

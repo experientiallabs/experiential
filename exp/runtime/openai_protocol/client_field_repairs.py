@@ -223,6 +223,11 @@ def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[
     such an item, and its summary and content are display-only parts that never
     reach provider history, so the whole item goes.
 
+    An item that is only an ``id`` (with ``type`` absent or null) is the SDK's
+    ``ItemReference`` spelling without its optional tag; it is given the
+    ``item_reference`` tag the strict wire union keys on, which changes
+    nothing a provider reads, so no disclosure is recorded for it.
+
     Args:
         payload: Parsed Responses body.
 
@@ -235,11 +240,15 @@ def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[
         return payload, ()
     dropped_metadata = False
     dropped_reasoning = False
+    tagged_reference = False
     items: list[JsonValue] = []
     for item in raw_input:
         if not isinstance(item, dict):
             items.append(item)
             continue
+        if set(item) <= {"id", "type"} and item.get("type") is None and "id" in item:
+            tagged_reference = True
+            item = {"type": "item_reference", "id": item["id"]}
         if (
             item.get("type") == "reasoning"
             and item.get("id") is None
@@ -255,7 +264,7 @@ def drop_responses_client_items(payload: JsonObject) -> tuple[JsonObject, tuple[
                 if key != "internal_chat_message_metadata_passthrough"
             }
         items.append(item)
-    if not dropped_metadata and not dropped_reasoning:
+    if not dropped_metadata and not dropped_reasoning and not tagged_reference:
         return payload, ()
     disclosures = (
         *((INPUT_METADATA_PASSTHROUGH_DROPPED,) if dropped_metadata else ()),

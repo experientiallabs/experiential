@@ -27,9 +27,14 @@ RAG_INDEX_PATH = "rag-index.json"
 
 
 class RealTraceSourceIdentity(SourceIdentity):
-    """Typed external provenance accepted as observed retrieval evidence."""
+    """Typed observed provenance accepted as retrieval evidence.
 
-    kind: Literal["file", "otlp", "production"]
+    Attributes:
+        kind: Recorded files, OTLP exports, production traffic, or replies executed by a
+            native-owned executable world. Simulated, generated and manual evidence is refused.
+    """
+
+    kind: Literal["file", "otlp", "production", "native-world"]
 
 
 class RAGSourceRef(ContractModel):

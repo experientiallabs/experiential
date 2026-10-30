@@ -16,11 +16,8 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_learning, trace_replay
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
-from exp.optimize.evaluation.fidelity_memory import DUPLICATE, saved_memory_receipt
-from exp.optimize.evaluation.held_out_fidelity import register_held_out_fidelity
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel import register_held_out_fidelity
+from exp.optimize.evaluation.audit.panel_test import (
     REVISION,
     USERS,
     SimulatedProvider,
@@ -31,15 +28,19 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.miss_retest import register_miss_retest
-from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity import replay as trace_replay
+from exp.optimize.evaluation.fidelity.memory import DUPLICATE, saved_memory_receipt
+from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
+from exp.optimize.evaluation.learning import traces as trace_learning
+from exp.optimize.evaluation.learning.retest import register_miss_retest
+from exp.optimize.evaluation.learning.traces import (
     fit_calls,
     learn_from_traces,
     learning_curve,
     learning_plan,
     learning_progress,
 )
+from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model.observed_tools import observed_calls
@@ -123,7 +124,7 @@ def test_a_learning_pass_continues_after_a_catalog_edit(
 def test_an_interrupted_run_that_bought_calls_is_not_bought_again_silently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without --retry-incomplete the run stays and stops visibly; with it, a fresh attempt."""
+    """Without --retry-incomplete the run stays and stops visibly; with it, the run resumes."""
     provider = Interrupting([episode(i) for i in range(USERS)])
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
     panel = register_held_out_fidelity(
@@ -140,16 +141,10 @@ def test_an_interrupted_run_that_bought_calls_is_not_bought_again_silently(
     with pytest.raises(ValueError, match="--retry-incomplete"):
         execute_fidelity_evaluation(store, kept.prepared[0])
     assert len(provider.requests) == sent
-    retried = register_held_out_fidelity(
-        store,
-        1,
-        profile="source-rag",
-        code_revision=REVISION,
-        clock=now,
-        retry_incomplete=True,
+    resumed = execute_fidelity_evaluation(
+        store, kept.prepared[0], resume_until=now() + trace_replay.DEADLINE
     )
-    assert retried.retired == (panel.prepared[0].spec.run_id,)
-    assert execute_fidelity_evaluation(store, retried.prepared[0]).planned_steps > 0
+    assert resumed.planned_steps > 0
 
 
 class FlakyInvestigator(SimulatedProvider):
@@ -221,13 +216,14 @@ def test_scores_keep_first_report_and_retests_require_learning(
         with pytest.raises(ValueError, match="nothing has been learned"):
             register_miss_retest(store, 99, code_revision=REVISION, clock=now)
         return
-    assert curve.incomplete == 0
-    case, first_attempt, _, _ = scored[0]
-    attempts = trace_learning._saved_attempts(store, plan, case)
-    assert len(attempts) > 1 and attempts[0][0].id == first_attempt.id, "first attempt stays scored"
+    assert curve.incomplete == 1
+    failed = [(case, prepared) for case, prepared, _, learned in scored if not learned]
+    assert len(failed) == 1
+    case, first_attempt = failed[0]
+    assert len(trace_learning._saved_attempts(store, plan, case)) == 1
     panel = register_miss_retest(store, 99, code_revision=REVISION, clock=now)
-    assert panel.learned == USERS
-    assert panel.before[0].run_id == first_attempt.spec.run_id
+    assert panel.learned == USERS - 1
+    assert first_attempt.spec.run_id not in {row.run_id for row in panel.before}
 
 
 class RedrawnPrediction(FlakyInvestigator):
@@ -266,17 +262,23 @@ def test_investigation_failure_cannot_select_a_better_prediction_score(
     outcome = learn_from_traces(
         store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
     )
-    assert outcome.learned == 4 and outcome.incomplete == 0
+    assert outcome.learned == 4 - investigation_failures
+    assert outcome.incomplete == investigation_failures
+    assert provider.draws == 1
     curve = learning_curve(store)
     assert curve is not None
     assert sum(point.exact for point in curve.points) == 11
     assert sum(point.steps for point in curve.points) == 12
     case = trace_learning.learning_cases(store, "all")[0]
     attempts = trace_learning._saved_attempts(store, learning_plan(store), case)
-    assert len(attempts) == 1 + investigation_failures
+    assert len(attempts) == 1
     assert curve.points[0].run_id == attempts[0][0].spec.run_id
-    panel = register_miss_retest(store, 4, code_revision=REVISION, clock=now)
-    assert panel.before[0].run_id == attempts[0][0].spec.run_id
+    if investigation_failures:
+        with pytest.raises(ValueError, match="no miss to retest"):
+            register_miss_retest(store, 4, code_revision=REVISION, clock=now)
+    else:
+        panel = register_miss_retest(store, 4, code_revision=REVISION, clock=now)
+        assert panel.before[0].run_id == attempts[0][0].spec.run_id
 
 
 def test_a_world_model_without_tools_is_refused_before_any_call(
@@ -305,16 +307,15 @@ def test_a_world_model_without_tools_is_refused_before_any_call(
     assert len(provider.requests) == sent
 
 
+@pytest.mark.parametrize("prompt", ["MEMORY_CONTEXT_GUIDANCE", "INVESTIGATION_PROMPT"])
 def test_editing_a_sent_prompt_addresses_a_new_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt: str
 ) -> None:
     """Saved results never replay under a system prompt they were not produced with."""
     _, base = memory_project(tmp_path)
-    before = trace_replay.content_run_id(base, "held-out", "trace")
-    monkeypatch.setattr(
-        trace_replay, "MEMORY_CONTEXT_GUIDANCE", trace_replay.MEMORY_CONTEXT_GUIDANCE + " Edited."
-    )
-    assert trace_replay.content_run_id(base, "held-out", "trace") != before
+    before = trace_replay.content_run_id(base, "held-out", "trace", code_revision=REVISION)
+    monkeypatch.setattr(trace_replay, prompt, getattr(trace_replay, prompt) + " Edited.")
+    assert trace_replay.content_run_id(base, "held-out", "trace", code_revision=REVISION) != before
 
 
 def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
@@ -329,3 +330,29 @@ def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
     assert {name for name, _ in fit_calls(store)} == {
         name for name, _ in observed_calls(fit.transitions)
     }
+
+
+def test_saved_predictions_are_not_redrawn_after_failed_investigation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed learning stage must not purchase new draws of committed predictions."""
+    episodes = [episode(i) for i in range(4)]
+    provider = RedrawnPrediction(episodes)
+    provider.failures = 1
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    outcome = learn_from_traces(
+        store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
+    )
+    assert provider.draws == 1, "saved prediction was purchased again after research failed"
+    assert outcome.incomplete == 1 and outcome.learned == 3
+    before = len(provider.requests)
+    replay = learn_from_traces(
+        store,
+        recall_alias="jev",
+        maximum_attempts=10_000,
+        code_revision=REVISION,
+        clock=now,
+        retry_incomplete=True,
+    )
+    assert replay.learned == outcome.learned and replay.incomplete == outcome.incomplete
+    assert len(provider.requests) == before

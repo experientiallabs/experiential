@@ -193,8 +193,7 @@ def task_usage(
         world_requests = []
         for group in groups:
             first = group[0]
-            attrs = first.attributes
-            messages = _decoded(attrs.get("gen_ai.input.messages"))
+            messages = _decoded(trace.input_messages(first))
             input_tokens = token_estimate(messages) if messages else task_size + transcript
             input_tokens += token_estimate([tool.model_dump(mode="json") for tool in task.tools])
             output_tokens = _output_tokens(group)

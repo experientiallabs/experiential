@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     FidelityRetrieval,
     FidelitySpec,
     execute_fidelity_evaluation,

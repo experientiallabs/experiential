@@ -551,8 +551,8 @@ def _reasoning_only_response() -> JsonHttpResponse:
     )
 
 
-def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() -> None:
-    """A response with only reasoning output re-dispatches within the bounded retry policy."""
+def test_openai_reasoning_only_allowance_stop_is_not_redrawn() -> None:
+    """A known allowance stop cannot select a later successful model draw."""
     transport = ScriptedJsonTransport(
         [
             _reasoning_only_response(),
@@ -588,18 +588,15 @@ def test_openai_reasoning_only_output_is_retried_and_a_later_answer_completes() 
         retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
     )
 
-    response = client.complete(_request())
-
-    assert response.output.content == "ok"
-    assert len(transport.requests) == 2
-    assert (
-        transport.requests[0].headers["Idempotency-Key"]
-        != transport.requests[1].headers["Idempotency-Key"]
-    )
+    with pytest.raises(ProviderRetryableResponseError, match="no text or tool call") as raised:
+        client.complete(_request())
+    assert raised.value.hit_length_limit is True
+    assert raised.value.response_body == _reasoning_only_response().body
+    assert len(transport.requests) == 1
 
 
-def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustion() -> None:
-    """Exhausted empty-output retries raise the typed retryable response error."""
+def test_openai_reasoning_only_output_retains_its_length_signal_and_body() -> None:
+    """An empty allowance stop retains its wire evidence without retrying or faking output."""
     transport = ScriptedJsonTransport([_reasoning_only_response(), _reasoning_only_response()])
     client = OpenAIClient(
         model=_snapshot("openai", "gpt-5.6-luna"),
@@ -609,10 +606,12 @@ def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustio
         retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
     )
 
-    with pytest.raises(ProviderRetryableResponseError, match="no text or tool call"):
+    with pytest.raises(ProviderRetryableResponseError, match="no text or tool call") as raised:
         client.complete(_request())
 
-    assert len(transport.requests) == 2
+    assert raised.value.hit_length_limit is True
+    assert raised.value.response_body == _reasoning_only_response().body
+    assert len(transport.requests) == 1
 
 
 def test_native_provider_refusals_are_typed_without_exposing_refusal_text() -> None:

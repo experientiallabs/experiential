@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from collections.abc import Callable
 
@@ -30,6 +31,7 @@ def _terminal(*, width: int = 100, height: int = 24) -> Console:
         width=width,
         height=height,
         legacy_windows=False,
+        _environ={**os.environ, "TERM": "xterm-256color"},
     )
 
 

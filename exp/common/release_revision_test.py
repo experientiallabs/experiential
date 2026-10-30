@@ -67,3 +67,55 @@ def test_missing_or_malformed_installed_metadata_fails_closed(
     monkeypatch.setattr(release_revision.metadata, "version", lambda _name: "bad version")
     with pytest.raises(ReleaseRevisionError, match="version metadata is invalid"):
         installed_release_revision()
+
+
+def test_execution_source_identity_tracks_actual_bytes_without_git_or_test_noise(
+    tmp_path: Path,
+) -> None:
+    """Moving a package preserves identity; same-length edits with restored mtime do not."""
+    import os
+    import shutil
+
+    package = tmp_path / "package"
+    package.mkdir()
+    source = package / "implementation.py"
+    source.write_text("value = 1\n")
+    prompt = package / "prompt.txt"
+    prompt.write_text("Original instructions")
+    baseline = release_revision._package_source_digest(package)
+    (package / "implementation_test.py").write_text("irrelevant test changes")
+    assert release_revision._package_source_digest(package) == baseline
+    moved = tmp_path / "moved"
+    shutil.copytree(package, moved)
+    assert release_revision._package_source_digest(moved) == baseline
+    stamp = source.stat()
+    source.write_text("value = 2\n")
+    os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert release_revision._package_source_digest(package) != baseline
+    source.write_text("value = 1\n")
+    prompt.write_text("Different instructions")
+    assert release_revision._package_source_digest(package) != baseline
+
+
+def test_execution_revision_includes_source_when_release_pin_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release label cannot erase an editable package's behavior identity."""
+    monkeypatch.setenv("EXP_RELEASE_REVISION", "a" * 40)
+    monkeypatch.setattr(release_revision, "_package_source_digest", lambda package: "b" * 64)
+    first = release_revision.installed_execution_revision()
+    monkeypatch.setattr(release_revision, "_package_source_digest", lambda package: "c" * 64)
+    assert release_revision.installed_execution_revision() != first
+    assert first == "a" * 40 + ";source-sha256=" + "b" * 64
+
+
+def test_execution_identity_ignores_read_access_timestamp_changes(tmp_path: Path) -> None:
+    """Reading a fresh copied package can update atime without any source modification."""
+    import os
+
+    path = tmp_path / "implementation.py"
+    path.write_text("value = 1\n")
+    stamp = path.stat()
+    os.utime(path, ns=(0, stamp.st_mtime_ns))
+    first = release_revision._package_source_digest(tmp_path)
+    assert release_revision._package_source_digest(tmp_path) == first

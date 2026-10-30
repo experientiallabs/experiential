@@ -32,7 +32,13 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.text import normalize_durable_text
 from exp.common.models import BillingSource, ModelSnapshot, Usage
-from exp.common.traces import Trace, TraceSource, TraceSpan
+from exp.common.traces import (
+    INPUT_HISTORY_PREFIX_KEY,
+    INPUT_MESSAGES_KEY,
+    Trace,
+    TraceSource,
+    TraceSpan,
+)
 from exp.common.traces.ingest.model_identity import (
     CAPABILITIES_DIGEST_ATTRIBUTE,
     CONNECTION_DIGEST_ATTRIBUTE,
@@ -288,7 +294,31 @@ def _build_trace(
             identity=source,
             semantic_convention_version=semantic_convention_version,
         ),
+        message_history=_message_history(ordered),
     )
+
+
+def _message_history(observations: Sequence[VendorObservation]) -> tuple[JsonObject, ...]:
+    """Return a trace's shared message history, cut to its longest referenced prefix.
+
+    Args:
+        observations: Observations belonging to one trace.
+
+    Returns:
+        The referenced history prefix, or an empty tuple when no observation references one.
+        A reference longer than the declared history is left for trace validation to reject.
+
+    Raises:
+        VendorTraceFormatError: More than one observation of the trace declares a history.
+    """
+    declared = [item.message_history for item in observations if item.message_history]
+    if len(declared) > 1:
+        raise VendorTraceFormatError("one trace declares its message history more than once")
+    longest = max(
+        (item.input_history_prefix or 0 for item in observations),
+        default=0,
+    )
+    return declared[0][:longest] if declared else ()
 
 
 def _model_spans(
@@ -314,8 +344,10 @@ def _model_spans(
     base = _base_attributes(observation, vendor=vendor)
     base["gen_ai.operation.name"] = "chat"
     base["gen_ai.prompt"] = task
-    if observation.input_messages is not None:
-        base["gen_ai.input.messages"] = observation.input_messages
+    if observation.input_history_prefix is not None:
+        base[INPUT_HISTORY_PREFIX_KEY] = observation.input_history_prefix
+    elif observation.input_messages is not None:
+        base[INPUT_MESSAGES_KEY] = observation.input_messages
     model = _model_snapshot(observation)
     usage = _usage(observation)
     if not observation.tool_calls:

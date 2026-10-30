@@ -7,18 +7,28 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
 import exp.common.project.database as database_module
 from exp.common.core.artifacts import ArtifactEnvelope, sha256_json
 from exp.common.project import ProjectConfig, ProjectStore, ProjectStoreError, write_project_config
-from exp.common.project.database import content_database_path, project_connection
-from exp.common.project.records import ProjectRecordError
+from exp.common.project.database import (
+    ProjectDatabaseBusyError,
+    content_database_path,
+    project_connection,
+)
+from exp.common.project.records import ProjectRecordError, ProjectRecords
 from exp.common.project.sqlite_schema import initialize_project_schema
+from exp.common.sqlite import connection as sqlite_connection
 from exp.common.sqlite.schema import ContentSchemaError
+
+if TYPE_CHECKING:
+    from sqlite3 import _Parameters
 
 
 def test_read_only_discovery_creates_no_database_or_project_directory(tmp_path: Path) -> None:
@@ -188,3 +198,229 @@ def test_wal_initialization_and_begin_share_one_admission_deadline(
     with project_connection(tmp_path, write=True, timeout_s=0.5) as connection:
         remaining_ms = connection.execute("PRAGMA busy_timeout").fetchone()[0]
         assert 0 < remaining_ms <= 100
+
+
+def _busy() -> sqlite3.OperationalError:
+    """Build the error SQLite raises when another writer holds the lock."""
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    error.sqlite_errorname = "SQLITE_BUSY"
+    return error
+
+
+def _refusing(statement: str, refusals: int) -> type[sqlite3.Connection]:
+    """Return a project connection class whose first ``statement`` runs report busy."""
+
+    class Refusing(database_module._ProjectConnection):
+        """Project connection that refuses a statement as if another writer held the lock."""
+
+        remaining = refusals
+
+        def execute(self, sql: str, parameters: _Parameters = (), /) -> sqlite3.Cursor:
+            """Refuse ``statement`` before SQLite runs it while refusals remain."""
+            if sql == statement and type(self).remaining > 0:
+                type(self).remaining -= 1
+                raise _busy()
+            return super().execute(sql, parameters)
+
+    return Refusing
+
+
+@pytest.fixture
+def pauses(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record backoff pauses instead of sleeping."""
+    recorded: list[float] = []
+    monkeypatch.setattr(database_module.time, "sleep", recorded.append)
+    return recorded
+
+
+def test_operations_reuse_one_connection_validated_once_per_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated reads and writes open one connection and validate only after schema changes."""
+    opened: list[Path] = []
+    validated: list[int] = []
+    connect, validate = sqlite_connection.connect_database, database_module.validate_content_tables
+
+    def counting_connect(
+        path: Path,
+        *,
+        busy_timeout_ms: int,
+        enable_wal: bool,
+        create: bool,
+        factory: type[sqlite3.Connection],
+    ) -> sqlite3.Connection:
+        """Count database opens."""
+        opened.append(path)
+        return connect(
+            path,
+            busy_timeout_ms=busy_timeout_ms,
+            enable_wal=enable_wal,
+            create=create,
+            factory=factory,
+        )
+
+    def counting_validate(connection: sqlite3.Connection) -> frozenset[str]:
+        """Count content-table validations."""
+        validated.append(1)
+        return validate(connection)
+
+    monkeypatch.setattr(sqlite_connection, "connect_database", counting_connect)
+    monkeypatch.setattr(database_module, "validate_content_tables", counting_validate)
+    records = ProjectRecords(tmp_path, "project-a", "project")
+    records.write("first", b"1")
+    setup = len(validated)
+    for index in range(50):
+        records.write(f"record-{index}", b"x")
+        assert records.read(f"record-{index}") == b"x"
+    assert len(opened) == 1
+    assert len(validated) == setup + 1, "only the schema created by the first write revalidates"
+    with sqlite3.connect(content_database_path(tmp_path)) as other:
+        other.execute("CREATE TABLE unrelated (value TEXT)")
+    with pytest.raises(ContentSchemaError, match="Unrecognized"):
+        records.read("first")
+
+
+def test_a_replaced_database_file_is_reopened_not_written_through_a_stale_handle(
+    tmp_path: Path,
+) -> None:
+    """A database deleted and recreated at the same path receives the next write."""
+    records = ProjectRecords(tmp_path, "project-a", "project")
+    records.write("before", b"old")
+    database = content_database_path(tmp_path)
+    for suffix in ("", "-wal", "-shm"):
+        database.with_name(database.name + suffix).unlink(missing_ok=True)
+    records.write("after", b"new")
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute("SELECT record_id FROM project_state_records").fetchall()
+    assert rows == [("after",)]
+
+
+def test_a_read_snapshot_on_a_reused_connection_refuses_writes(tmp_path: Path) -> None:
+    """Reads stay read-only although the connection is shared with write transactions."""
+    records = ProjectRecords(tmp_path, "project-a", "project")
+    records.write("kept", b"1")
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        with project_connection(tmp_path) as connection:
+            connection.execute("DELETE FROM project_state_records")
+    records.write("next", b"2")
+    assert records.list_ids() == ("kept", "next")
+
+
+def test_an_attached_database_does_not_outlive_its_transaction(tmp_path: Path) -> None:
+    """A reused connection starts every transaction with only its own databases."""
+    other = tmp_path / "other.db"
+    sqlite3.connect(other).close()
+    ProjectRecords(tmp_path, "project-a", "project").write("seed", b"1")
+    for _ in range(2):
+        with project_connection(tmp_path, write=True) as connection:
+            connection.execute("ATTACH DATABASE ? AS restored", (str(other),))
+    with project_connection(tmp_path) as connection:
+        names = [row[1] for row in connection.execute("PRAGMA database_list")]
+    assert names == ["main"]
+
+
+def test_busy_admission_retries_without_rerunning_the_transaction_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pauses: list[float]
+) -> None:
+    """A lock refusal before the body is retried; the body and its write happen once."""
+    ProjectRecords(tmp_path, "project-a", "project").write("seed", b"1")
+    monkeypatch.setattr(database_module, "_ProjectConnection", _refusing("BEGIN IMMEDIATE", 2))
+    bodies: list[int] = []
+    log = ProjectRecords(tmp_path, "project-a", "log")
+    with project_connection(tmp_path, write=True):
+        bodies.append(1)
+        log.append("event", b"once")
+    assert bodies == [1]
+    assert len(pauses) == 2
+    assert 0 <= pauses[0] <= database_module.PROJECT_LOCK_BACKOFF_S
+    assert log.events() == (b"once",)
+
+
+def test_a_busy_commit_is_retried_only_while_uncommitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pauses: list[float]
+) -> None:
+    """A COMMIT refused for a lock is retried; the committed change appears exactly once."""
+    ProjectRecords(tmp_path, "project-a", "project").write("seed", b"1")
+    monkeypatch.setattr(database_module, "_ProjectConnection", _refusing("COMMIT", 1))
+    bodies: list[int] = []
+    log = ProjectRecords(tmp_path, "project-a", "log")
+    with project_connection(tmp_path, write=True):
+        bodies.append(1)
+        log.append("event", b"once")
+    assert bodies == [1]
+    assert len(pauses) == 1
+    assert log.events() == (b"once",)
+
+
+def test_exhausted_lock_attempts_report_a_clear_busy_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pauses: list[float]
+) -> None:
+    """After the bound the caller gets a busy error naming what to do, and nothing commits."""
+    records = ProjectRecords(tmp_path, "project-a", "project")
+    records.write("seed", b"1")
+    monkeypatch.setattr(database_module, "_ProjectConnection", _refusing("BEGIN IMMEDIATE", 99))
+    with pytest.raises(ProjectDatabaseBusyError, match="stayed locked.*Retry") as raised:
+        with project_connection(tmp_path, write=True):
+            pytest.fail("the transaction body must not run without the write lock")
+    assert raised.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+    assert len(pauses) == database_module.PROJECT_LOCK_ATTEMPTS - 1
+    monkeypatch.undo()
+    assert records.list_ids() == ("seed",)
+
+
+def test_a_writer_outlasting_the_lock_wait_retries_instead_of_crashing(tmp_path: Path) -> None:
+    """A real lock held past one attempt's wait is survived by the bounded retry."""
+    records = ProjectRecords(tmp_path, "project-a", "project")
+    records.write("seed", b"1")
+    holder = sqlite3.connect(
+        content_database_path(tmp_path), isolation_level=None, check_same_thread=False
+    )
+    holder.execute("BEGIN IMMEDIATE")
+    release = threading.Timer(0.2, holder.rollback)
+    release.start()
+    try:
+        with project_connection(tmp_path, write=True, timeout_s=0.1):
+            records.write("after", b"2")
+    finally:
+        release.join()
+        holder.close()
+    assert records.list_ids() == ("after", "seed")
+
+
+def test_concurrent_processes_write_every_record_exactly_once(tmp_path: Path) -> None:
+    """Writers in several processes on one store commit every write once, never crashing."""
+    script = """
+import sys, time
+from pathlib import Path
+from exp.common.project.records import ProjectRecords
+root, worker = Path(sys.argv[1]), sys.argv[2]
+events = ProjectRecords(root, "project-a", "events")
+state = ProjectRecords(root, "project-a", "state")
+for index in range(25):
+    with state.transaction():
+        events.append(f"{worker}-{index}", f"{worker}-{index}".encode())
+        state.write("counter", str(int(state.read("counter") or b"0") + 1).encode())
+        time.sleep(0.005)
+    assert events.events()
+"""
+    workers = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(tmp_path), str(worker)], stderr=subprocess.PIPE
+        )
+        for worker in range(8)
+    ]
+    try:
+        for worker in workers:
+            _, error = worker.communicate(timeout=120)
+            assert worker.returncode == 0, error.decode()
+            assert b"database is locked" not in error
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait()
+    events = ProjectRecords(tmp_path, "project-a", "events").events()
+    expected = {f"{worker}-{index}".encode() for worker in range(8) for index in range(25)}
+    assert len(events) == len(expected) and set(events) == expected
+    assert ProjectRecords(tmp_path, "project-a", "state").read("counter") == b"200"

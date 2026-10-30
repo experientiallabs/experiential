@@ -5,14 +5,93 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import partial
 from importlib import import_module
-from typing import cast
+from pathlib import Path
+from typing import Literal, Self, cast
 
-from exp.common.core.artifacts import Sha256, sha256_json
+from pydantic import Field, model_validator
+
+from exp.common.core.artifacts import ContractModel, Sha256, sha256_bytes, sha256_json
 from exp.common.project import AgentConfiguration
 from exp.runtime.agents.chat import ChatAgentRuntime, normalize_chat_system_prompt
 from exp.runtime.agents.interface import AgentRuntime, preflight_agent_runtime
+from exp.runtime.agents.pi import PiAgentRuntime
 
 AgentFactory = Callable[[], AgentRuntime]
+
+
+class ActorHarness(ContractModel):
+    """Select a maintained actor adapter without changing the injected model or tool owner.
+
+    Attributes:
+        kind: Chat or installed Pi; neither grants new environment capabilities.
+        executable: Absolute Pi entrypoint, checked before any new execution.
+        executable_sha256: Digest of the resolved entrypoint bytes, not a containment claim.
+        version: Operator-declared Pi release label, recorded separately from content identity.
+        dependencies: Additional exact installed files, such as the interpreter and lockfile.
+            The inventory is declared, not proof that every transitive dependency is listed.
+        timeout_seconds: Positive per-process bound; provider deadlines remain authoritative.
+    """
+
+    kind: Literal["chat", "pi"] = "chat"
+    executable: Path | None = None
+    executable_sha256: Sha256 | None = None
+    version: str | None = Field(default=None, min_length=1)
+    dependencies: dict[Path, Sha256] = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=300, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def coherent(self) -> Self:
+        """Require concrete Pi identity and reject silently ignored chat configuration."""
+        if self.kind == "pi":
+            if self.executable is None or self.executable_sha256 is None or self.version is None:
+                raise ValueError("Pi requires executable, executable_sha256 and version")
+            if not self.executable.is_absolute() or any(
+                not path.is_absolute() for path in self.dependencies
+            ):
+                raise ValueError("Pi executable and dependency pins must use absolute paths")
+            if self.executable in self.dependencies:
+                raise ValueError("Pi executable has one digest; omit it from dependencies")
+        elif (
+            self.executable is not None
+            or self.executable_sha256 is not None
+            or self.version is not None
+            or self.dependencies
+            or self.timeout_seconds != 300
+        ):
+            raise ValueError("chat harness cannot accept ignored Pi settings")
+        return self
+
+    def preflight(self) -> None:
+        """Verify the declared installed files without subprocesses or provider credentials."""
+        if self.kind == "chat":
+            return
+        assert self.executable is not None and self.executable_sha256 is not None
+        for path, expected in {
+            self.executable: self.executable_sha256,
+            **self.dependencies,
+        }.items():
+            if not path.is_file() or sha256_bytes(path.read_bytes()) != expected:
+                raise ValueError(
+                    f"Pi runtime file changed or unavailable: {path}; restore its pinned bytes "
+                    "or register a fresh evaluation with the new installation"
+                )
+        PiAgentRuntime(executable=str(self.executable)).preflight()
+
+
+def create_actor_runtime(
+    profile: ActorHarness, *, maximum_model_calls: int, maximum_output_tokens: int = 16384
+) -> AgentRuntime:
+    """Create a fresh bounded maintained actor; models and tools are still injected per cell."""
+    profile.preflight()
+    if profile.kind == "chat":
+        return ChatAgentRuntime(maximum_model_calls=maximum_model_calls)
+    assert profile.executable is not None
+    return PiAgentRuntime(
+        executable=str(profile.executable),
+        timeout_seconds=profile.timeout_seconds,
+        maximum_model_calls=maximum_model_calls,
+        maximum_output_tokens=maximum_output_tokens,
+    )
 
 
 class AgentFactoryError(ValueError):

@@ -1,11 +1,18 @@
-"""Append-only human score and correction-history contracts for calibration."""
+"""Append-only human score, independent review and correction-history contracts.
+
+Calibration fits against one active score per rollout and rubric axis. Several reviewers can
+judge the same target independently: each initial judgment is its own immutable source record,
+and the score calibration uses is a separate, later adjudication that names every independent
+review it resolved. One reviewer never corrects another; a correction revises the active score.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from operator import not_
 
-from pydantic import AwareDatetime, JsonValue, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -23,6 +30,11 @@ from exp.common.project import (
     coordinate_completed_build_selection,
 )
 
+_UNNAMED_REVIEW = (
+    "adjudications must name every independent review recorded before them, "
+    "including disagreeing ones"
+)
+
 
 class HumanScore(ContractModel):
     """One immutable human rating, optionally correcting an earlier rating.
@@ -34,8 +46,12 @@ class HumanScore(ContractModel):
         lineage_id: Source lineage used to separate fit and held-out evidence.
         dimension_id: Scored rubric axis.
         score: Signed integer checked against the axis before persistence.
-        created_at: Timezone-aware time the reviewer authored this score.
+        created_at: Timezone-aware time the reviewer authored this score; informational, never
+            used to order labels and reviews.
         supersedes_label_id: Earlier active label being corrected, or None for a new label.
+        adjudicates_review_ids: Independent reviews this score resolves; empty for a score
+            recorded directly. Omitted from persistence when empty, so direct labels keep their
+            identity.
     """
 
     label_id: ArtifactId
@@ -46,12 +62,117 @@ class HumanScore(ContractModel):
     score: int
     created_at: AwareDatetime
     supersedes_label_id: ArtifactId | None = None
+    adjudicates_review_ids: tuple[ArtifactId, ...] = Field(default=(), exclude_if=not_)
+
+
+class ReviewerJudgment(ContractModel):
+    """One reviewer's independent initial judgment of one rollout on one rubric axis.
+
+    It is source evidence, not a calibration label: several reviewers can judge the same target,
+    none of them supersedes another, and only an adjudicated or directly recorded
+    :class:`HumanScore` becomes the active score.
+
+    Attributes:
+        review_id: Unique identity of this judgment.
+        reviewer_id: Stable identity of the independent reviewer.
+        rubric_id: Immutable rubric defining the score range.
+        rollout_id: Rollout assessed by the reviewer.
+        lineage_id: Source lineage used to separate fit and held-out evidence.
+        dimension_id: Scored rubric axis.
+        score: Signed integer checked against the axis before persistence.
+        created_at: Timezone-aware time the reviewer authored this judgment; informational,
+            never used to order labels and reviews.
+        critique: Optional evidence-grounded justification citing observable fields or events.
+    """
+
+    review_id: ArtifactId
+    reviewer_id: ArtifactId
+    rubric_id: ArtifactId
+    rollout_id: ArtifactId
+    lineage_id: ArtifactId
+    dimension_id: ArtifactId
+    score: int
+    created_at: AwareDatetime
+    critique: str = Field(default="", max_length=4000, exclude_if=not_)
+
+
+class ReviewedTarget(ContractModel):
+    """Independent reviews of one rollout axis and the score currently resolving them.
+
+    Attributes:
+        rubric_id: Immutable rubric defining the score range.
+        rollout_id: Reviewed rollout.
+        lineage_id: Source lineage of the rollout.
+        dimension_id: Reviewed rubric axis.
+        reviews: Every independent judgment of this target, in recorded order.
+        active_label_id: Active score for this target, adjudicated or direct, if any.
+        adjudicated: Whether the active score names every review recorded before it.
+    """
+
+    rubric_id: ArtifactId
+    rollout_id: ArtifactId
+    lineage_id: ArtifactId
+    dimension_id: ArtifactId
+    reviews: tuple[ReviewerJudgment, ...]
+    active_label_id: ArtifactId | None
+    adjudicated: bool
+
+    @property
+    def agreement(self) -> bool:
+        """Whether every independent reviewer gave the same score."""
+        return len({review.score for review in self.reviews}) <= 1
 
 
 class HumanScoreHistory(ContractModel):
-    """An append-only label history whose active scores retain every correction."""
+    """An append-only label history whose active scores retain every correction.
+
+    Attributes:
+        scores: Direct, adjudicated and correcting labels, in recorded order.
+        reviews: Independent reviewer judgments, in recorded order. Omitted from persistence
+            when empty, so histories without independent reviews keep their identity.
+    """
 
     scores: tuple[HumanScore, ...] = ()
+    reviews: tuple[ReviewerJudgment, ...] = Field(default=(), exclude_if=not_)
+
+    @model_validator(mode="after")
+    def _require_independent_reviews(self) -> HumanScoreHistory:
+        """Keep one initial judgment per reviewer and target, separate from active labels."""
+        reviews: dict[str, ReviewerJudgment] = {}
+        reviewers: set[tuple[str, str, str, str, str]] = set()
+        label_ids = {score.label_id for score in self.scores}
+        for review in self.reviews:
+            if review.review_id in reviews or review.review_id in label_ids:
+                raise ValueError("human review IDs must not repeat or reuse a label ID")
+            key = (*_target_key(review), review.reviewer_id)
+            if key in reviewers:
+                raise ValueError(
+                    "each reviewer records one independent initial judgment per rollout and "
+                    "scale; resolve later changes with an adjudication"
+                )
+            reviewers.add(key)
+            reviews[review.review_id] = review
+        for score in self.scores:
+            if not score.adjudicates_review_ids:
+                continue
+            cited = score.adjudicates_review_ids
+            if len(set(cited)) != len(cited) or any(item not in reviews for item in cited):
+                raise ValueError("adjudications must name distinct recorded human reviews")
+            if any(_target_key(reviews[item]) != _target_key(score) for item in cited):
+                raise ValueError("adjudications must resolve reviews of the same rollout and scale")
+            # Recorded order, never reviewer clocks: appended, it named every review then present.
+            recorded = [r.review_id for r in self.reviews if _target_key(r) == _target_key(score)]
+            if set(cited) != set(recorded[: len(cited)]):
+                raise ValueError(_UNNAMED_REVIEW)
+        return self
+
+    def _require_every_recorded_review(self, score: HumanScore) -> None:
+        """Refuse an adjudication omitting a review of its target already in this history."""
+        recorded = {r.review_id for r in self.reviews if _target_key(r) == _target_key(score)}
+        cited = set(score.adjudicates_review_ids)
+        # Unknown or cross-target citations are refused by the history validator's own message.
+        if cited and cited <= recorded and cited != recorded:
+            raise ValueError(_UNNAMED_REVIEW)
 
     @model_validator(mode="after")
     def _require_linear_correction_history(self) -> HumanScoreHistory:
@@ -104,11 +225,12 @@ class HumanScoreHistory(ContractModel):
             A validated append-only history with the supplied score at its end.
 
         Raises:
-            ValueError: The supplied score is expressed as a correction.
+            ValueError: A correction, or an adjudication omitting an already recorded review.
         """
         if score.supersedes_label_id is not None:
             raise ValueError("append accepts original labels; use correct for a correction")
-        return HumanScoreHistory(scores=(*self.scores, score))
+        self._require_every_recorded_review(score)
+        return HumanScoreHistory(scores=(*self.scores, score), reviews=self.reviews)
 
     def correct(self, score: HumanScore) -> HumanScoreHistory:
         """Return a new history with one correction appended.
@@ -120,11 +242,52 @@ class HumanScoreHistory(ContractModel):
             A validated append-only history retaining both the old and new labels.
 
         Raises:
-            ValueError: The supplied score does not declare a predecessor.
+            ValueError: No predecessor, or an adjudication omitting an already recorded review.
         """
         if score.supersedes_label_id is None:
             raise ValueError("correct requires supersedes_label_id")
-        return HumanScoreHistory(scores=(*self.scores, score))
+        self._require_every_recorded_review(score)
+        return HumanScoreHistory(scores=(*self.scores, score), reviews=self.reviews)
+
+    def review(self, review: ReviewerJudgment) -> HumanScoreHistory:
+        """Return a new history with one independent reviewer judgment appended.
+
+        Args:
+            review: Initial judgment by one reviewer; it never changes an active score.
+
+        Returns:
+            A validated history retaining every earlier label and review.
+        """
+        return HumanScoreHistory(scores=self.scores, reviews=(*self.reviews, review))
+
+    def reviewed_targets(self) -> tuple[ReviewedTarget, ...]:
+        """Return every independently reviewed target with its reviews and resolving score.
+
+        Returns:
+            One entry per reviewed rollout axis, in first-review order. Disagreement stays
+            visible after adjudication; ``adjudicated`` is false while the active score was
+            recorded directly or predates a later review.
+        """
+        active = {_target_key(score): score for score in self.active_scores()}
+        grouped: dict[tuple[str, str, str, str], list[ReviewerJudgment]] = {}
+        for review in self.reviews:
+            grouped.setdefault(_target_key(review), []).append(review)
+        targets = []
+        for target, reviews in grouped.items():
+            label = active.get(target)
+            targets.append(
+                ReviewedTarget(
+                    rubric_id=target[0],
+                    rollout_id=target[1],
+                    lineage_id=target[2],
+                    dimension_id=target[3],
+                    reviews=tuple(reviews),
+                    active_label_id=None if label is None else label.label_id,
+                    adjudicated=label is not None
+                    and set(label.adjudicates_review_ids) == {r.review_id for r in reviews},
+                )
+            )
+        return tuple(targets)
 
     def for_rubric(self, rubric_id: ArtifactId) -> HumanScoreHistory:
         """Return this complete correction history restricted to one rubric version.
@@ -136,12 +299,13 @@ class HumanScoreHistory(ContractModel):
             An append-only history containing only labels for the requested rubric.
         """
         return HumanScoreHistory(
-            scores=tuple(score for score in self.scores if score.rubric_id == rubric_id)
+            scores=tuple(score for score in self.scores if score.rubric_id == rubric_id),
+            reviews=tuple(review for review in self.reviews if review.rubric_id == rubric_id),
         )
 
 
-def _target_key(score: HumanScore) -> tuple[str, str, str, str]:
-    """Return the stable target of a human rubric label."""
+def _target_key(score: HumanScore | ReviewerJudgment) -> tuple[str, str, str, str]:
+    """Return the stable target of a human rubric label or independent review."""
     return (score.rubric_id, score.rollout_id, score.lineage_id, score.dimension_id)
 
 
@@ -157,7 +321,9 @@ class HumanLabelSet(ArtifactEnvelope):
     def _require_consistent_history(self) -> HumanLabelSet:
         if tuple(item.artifact_id for item in self.inputs) != (self.rubric_id,):
             raise ValueError("human label sets must hash exactly their finalized rubric")
-        if any(score.rubric_id != self.rubric_id for score in self.history.scores):
+        if any(score.rubric_id != self.rubric_id for score in self.history.scores) or any(
+            review.rubric_id != self.rubric_id for review in self.history.reviews
+        ):
             raise ValueError("human label sets must contain labels for one rubric")
         expected_active_ids = tuple(score.label_id for score in self.history.active_scores())
         if self.active_label_ids != expected_active_ids:
@@ -339,6 +505,210 @@ class HumanScoreReview:
             self._store.update_review(update)
         self._root_review, self._history = selected[0]
         return result[0]
+
+    def record_review(
+        self,
+        *,
+        rubric_id: ArtifactId,
+        rollout_id: ArtifactId,
+        lineage_id: ArtifactId,
+        dimension_id: ArtifactId,
+        reviewer_id: ArtifactId,
+        score: int,
+        submission_id: str,
+        created_at: datetime,
+        critique: str = "",
+    ) -> ReviewerJudgment:
+        """Persist one reviewer's independent initial judgment without touching active scores.
+
+        Args:
+            rubric_id: Immutable finalized rubric that owns the score.
+            rollout_id: Persisted rollout being reviewed.
+            lineage_id: Frozen task lineage retained for calibration.
+            dimension_id: Rubric axis being reviewed.
+            reviewer_id: Stable identity of the independent reviewer.
+            score: Reviewer's score on the finalized axis range.
+            submission_id: Stable identifier for this one submission and all of its retries.
+            created_at: Time at which the reviewer's judgment is recorded.
+            critique: Optional evidence-grounded justification.
+
+        Returns:
+            The stored judgment, or the identical judgment saved by an earlier retry.
+
+        Raises:
+            ValueError: The submission is empty, untimed, reused for another judgment, or this
+                reviewer already judged the target.
+        """
+        _require_submission(submission_id, created_at)
+        result: list[ReviewerJudgment] = []
+
+        def transition(root: JsonObject, history: HumanScoreHistory) -> HumanScoreHistory:
+            """Append or replay one independent judgment in the review namespace."""
+            submissions = _submissions_from_root(root, "human_review_submissions")
+            target = (rubric_id, rollout_id, lineage_id, dimension_id)
+            saved_id = submissions.get(submission_id)
+            if saved_id is not None:
+                saved = next((item for item in history.reviews if item.review_id == saved_id), None)
+                if saved is None:
+                    raise ValueError("human review submission refers to a missing review")
+                if (
+                    _target_key(saved) != target
+                    or saved.reviewer_id != reviewer_id
+                    or saved.score != score
+                ):
+                    raise ValueError(
+                        "human review submission IDs cannot be reused for a different judgment"
+                    )
+                result.append(saved)
+                return history
+            review = ReviewerJudgment(
+                review_id=stable_id(
+                    "human-review",
+                    {
+                        "target": list(target),
+                        "reviewer_id": reviewer_id,
+                        "score": score,
+                        "sequence": len(history.reviews),
+                    },
+                ),
+                reviewer_id=reviewer_id,
+                rubric_id=rubric_id,
+                rollout_id=rollout_id,
+                lineage_id=lineage_id,
+                dimension_id=dimension_id,
+                score=score,
+                created_at=created_at,
+                critique=critique,
+            )
+            submissions[submission_id] = review.review_id
+            root["human_review_submissions"] = submissions
+            result.append(review)
+            return history.review(review)
+
+        self._locked(transition, rubric_id=rubric_id, dimension_id=dimension_id, score=score)
+        return result[0]
+
+    def adjudicate(
+        self,
+        *,
+        rubric_id: ArtifactId,
+        rollout_id: ArtifactId,
+        lineage_id: ArtifactId,
+        dimension_id: ArtifactId,
+        score: int,
+        review_ids: tuple[ArtifactId, ...],
+        submission_id: str,
+        created_at: datetime,
+    ) -> HumanScore:
+        """Record the score that resolves independent reviews as a separate, later label.
+
+        The adjudication becomes the active calibration score, appended as a new label or as a
+        correction of the earlier active score, and every reviewed judgment stays unchanged.
+
+        Args:
+            rubric_id: Immutable finalized rubric that owns the score.
+            rollout_id: Persisted rollout receiving the score.
+            lineage_id: Frozen task lineage retained for calibration.
+            dimension_id: Rubric axis receiving the score.
+            score: Adjudicated score on the finalized axis range.
+            review_ids: Every independent review of this target recorded before the decision.
+            submission_id: Stable identifier for this one decision and all of its retries.
+            created_at: Time at which the adjudication is recorded.
+
+        Returns:
+            The stored adjudication, or the identical one saved by an earlier retry.
+
+        Raises:
+            ValueError: The submission is empty, untimed or reused, or the adjudication omits,
+                misplaces or predates an independent review.
+        """
+        _require_submission(submission_id, created_at)
+        result: list[HumanScore] = []
+
+        def transition(root: JsonObject, history: HumanScoreHistory) -> HumanScoreHistory:
+            """Append or replay one adjudication in the review namespace."""
+            submissions = _score_submissions_from_root(root)
+            target = (rubric_id, rollout_id, lineage_id, dimension_id)
+            saved_id = submissions.get(submission_id)
+            if saved_id is not None:
+                saved = next((item for item in history.scores if item.label_id == saved_id), None)
+                if saved is None:
+                    raise ValueError("human score submission refers to a missing label")
+                if (
+                    _target_key(saved) != target
+                    or saved.score != score
+                    or saved.adjudicates_review_ids != review_ids
+                ):
+                    raise ValueError(
+                        "human score submission IDs cannot be reused for a different decision"
+                    )
+                result.append(saved)
+                return history
+            existing = next(
+                (item for item in history.active_scores() if _target_key(item) == target), None
+            )
+            label = HumanScore(
+                label_id=stable_id(
+                    "human-score",
+                    {
+                        "target": list(target),
+                        "score": score,
+                        "adjudicates_review_ids": list(review_ids),
+                        "sequence": len(history.scores),
+                    },
+                ),
+                rubric_id=rubric_id,
+                rollout_id=rollout_id,
+                lineage_id=lineage_id,
+                dimension_id=dimension_id,
+                score=score,
+                created_at=created_at,
+                supersedes_label_id=None if existing is None else existing.label_id,
+                adjudicates_review_ids=review_ids,
+            )
+            submissions[submission_id] = label.label_id
+            root["human_score_submissions"] = submissions
+            result.append(label)
+            return history.append(label) if existing is None else history.correct(label)
+
+        if not review_ids:
+            raise ValueError("adjudications must name the independent reviews they resolve")
+        self._locked(transition, rubric_id=rubric_id, dimension_id=dimension_id, score=score)
+        return result[0]
+
+    def _locked(
+        self,
+        transition: Callable[[JsonObject, HumanScoreHistory], HumanScoreHistory],
+        *,
+        rubric_id: ArtifactId,
+        dimension_id: ArtifactId,
+        score: int,
+    ) -> None:
+        """Apply one review-namespace transition under the build-selection and review locks.
+
+        Args:
+            transition: Updates the locked root's submission maps and returns the new history.
+            rubric_id: Immutable rubric whose source task set must remain selected.
+            dimension_id: Axis receiving the score.
+            score: Proposed score, checked against the axis before mutation.
+        """
+        selected: list[tuple[JsonObject, HumanScoreHistory]] = []
+
+        def update(current: JsonValue | None) -> JsonObject:
+            """Apply the transition to the latest persisted namespace."""
+            root = root_review_object(current)
+            history = transition(root, _history_from_root(root))
+            root["human_score_history"] = history.model_dump(mode="json")
+            selected.append((root, history))
+            return root
+
+        with coordinate_completed_build_selection(self._store):
+            _require_rubric_matches_selected_build(self._store, rubric_id)
+            _require_score_on_rubric_axis(
+                self._store, rubric_id=rubric_id, dimension_id=dimension_id, score=score
+            )
+            self._store.update_review(update)
+        self._root_review, self._history = selected[0]
 
     def finalize(
         self,
@@ -592,9 +962,30 @@ def _history_from_root(root: JsonObject) -> HumanScoreHistory:
         raise ValueError("review.json contains an invalid human score history") from exc
 
 
+def _require_submission(submission_id: str, created_at: datetime) -> None:
+    """Reject an untimed or anonymous human submission before taking any lock.
+
+    Args:
+        submission_id: Stable identifier for one submission and its retries.
+        created_at: Time the human decision is recorded.
+
+    Raises:
+        ValueError: The time has no timezone or the submission ID is empty.
+    """
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("human score timestamps must include a timezone")
+    if not submission_id.strip():
+        raise ValueError("human score submission IDs must be nonempty")
+
+
 def _score_submissions_from_root(root: JsonObject) -> dict[str, str]:
-    """Validate the local retry map from a locked review root."""
-    saved = root.get("human_score_submissions")
+    """Validate the local score retry map from a locked review root."""
+    return _submissions_from_root(root, "human_score_submissions")
+
+
+def _submissions_from_root(root: JsonObject, key: str) -> dict[str, str]:
+    """Validate one local retry map, keyed by submission ID, from a locked review root."""
+    saved = root.get(key)
     if saved is None:
         return {}
     if not isinstance(saved, dict) or any(

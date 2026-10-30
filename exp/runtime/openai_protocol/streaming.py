@@ -259,6 +259,7 @@ class _ResponseToolState:
         self.name = name
         self.arguments = ""
         self.done = False
+        self.close_deferred = False
 
     def item(self, *, completed: bool) -> JsonObject:
         """Return the current official Responses function-call item."""
@@ -582,6 +583,16 @@ class ResponsesSseEncoder:
             or state.arguments.encode() != expected.encode()
         ):
             raise self._state_error("Responses tool completion changed streamed identity or bytes.")
+        slot = self._output_order.index(("tool", _required_index(event)))
+        if any(
+            kind != "tool" or not self._tools[index].done
+            for kind, index in self._output_order[:slot]
+        ):
+            # Item completion follows output order (the order the completed
+            # response lists): messages and reasoning close at the terminal,
+            # so a call after one completes there too (see the native encoder).
+            state.close_deferred = True
+            return ()
         state.done = True
         return self._close_tool(state)
 
@@ -826,7 +837,7 @@ class ResponsesSseEncoder:
         state = self._tools.get(index)
         if state is None:
             raise self._state_error("Responses tool event arrived before tool-call start.")
-        if state.done:
+        if state.done or state.close_deferred:
             raise self._state_error("Responses tool event arrived after item completion.")
         return state
 

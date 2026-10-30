@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from exp.common.traces.ingest.vendor_observations import (
     VendorModelIdentity,
+    VendorObservation,
     VendorTokenUsage,
     VendorToolCall,
     declared_completion_text,
@@ -83,3 +86,18 @@ def test_declared_error_message_reads_text_and_structured_errors() -> None:
     )
     assert declared_error_message({"error": {}}, keys=("error",), label="span") is None
     assert declared_error_message({}, keys=("error",), label="span") is None
+
+
+def test_observation_input_is_inline_or_a_history_prefix() -> None:
+    """An observation cannot declare its input both inline and by history reference."""
+    with pytest.raises(VendorTraceFormatError, match="not both"):
+        VendorObservation(
+            source_trace_id="trace-1",
+            source_span_id="span-1",
+            ordinal=0,
+            started_at=datetime(2024, 5, 1, tzinfo=UTC),
+            ended_at=datetime(2024, 5, 1, tzinfo=UTC),
+            kind="model",
+            input_messages=[],
+            input_history_prefix=0,
+        )

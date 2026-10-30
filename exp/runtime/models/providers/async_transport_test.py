@@ -499,6 +499,7 @@ def test_backoff_cannot_run_past_the_request_deadline() -> None:
                 operation,
                 policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=1),
                 deadline=RequestDeadline.after(0.05),
+                random_sample=lambda: 1.0,
             )
         )
 
