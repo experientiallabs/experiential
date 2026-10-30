@@ -23,6 +23,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
+from exp.common.tasks.facts import ConditioningFacts
 from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import (
     RECONSTRUCTED_TEXT_PROMPT_VERSION,
@@ -185,6 +186,7 @@ class GroundedWorldModel:
         json_object_output: bool = False,
         memory: MemoryContext | None = None,
         output_protocol: Literal["text", "json-tool"] = "text",
+        facts: ConditioningFacts | None = None,
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -198,6 +200,7 @@ class GroundedWorldModel:
             json_object_output: Provider JSON control included in required framing.
             memory: Typed cross-trajectory memory rendered into its authority channels.
             output_protocol: Text transition or typed-proposal system instructions.
+            facts: Instance facts admissible for this prediction, in their own channel.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
@@ -211,6 +214,7 @@ class GroundedWorldModel:
             json_object_output=json_object_output,
             memory=memory,
             output_protocol=output_protocol,
+            facts=facts,
         )
         if self.artifact.original_evidence == "none":
             # Memory-first profile: no recorded transition is retrieved for any prediction.
@@ -224,6 +228,7 @@ class GroundedWorldModel:
                 state=state,
                 memory=memory,
                 output_protocol=output_protocol,
+                facts=facts,
             )
             request = request.model_copy(update={"json_object_output": json_object_output})
             return PreparedGroundedWorldModelCall(
@@ -273,6 +278,7 @@ class GroundedWorldModel:
             state=state,
             memory=memory,
             output_protocol=output_protocol,
+            facts=facts,
         )
         request = request.model_copy(update={"json_object_output": json_object_output})
         return PreparedGroundedWorldModelCall(
@@ -291,6 +297,7 @@ class GroundedWorldModel:
         maximum_input_tokens: int | None = None,
         memory: MemoryContext | None = None,
         output_protocol: Literal["text", "json-tool"] = "text",
+        facts: ConditioningFacts | None = None,
     ) -> None:
         """Admit required framing before retrieval or its paid-work accounting window.
 
@@ -304,6 +311,7 @@ class GroundedWorldModel:
             maximum_input_tokens: Optional stricter frozen request reservation.
             memory: Typed cross-trajectory memory counted as required content.
             output_protocol: Text transition or typed-proposal system instructions.
+            facts: Instance facts counted as required content.
 
         Raises:
             ValueError: The output allowance is not positive.
@@ -319,6 +327,7 @@ class GroundedWorldModel:
             state=state,
             memory=memory,
             output_protocol=output_protocol,
+            facts=facts,
         ).model_copy(update={"json_object_output": json_object_output})
         # Admission may bind unpublished output around required content. Retrieval still uses
         # the original allowance so optional examples yield before actual output is bound.
@@ -664,6 +673,7 @@ def persist_fit_only_world_model(
         top_k=artifact.top_k,
         knowledge=artifact.knowledge,
         selection_policy_sha256=artifact.selection_policy_sha256,
+        original_evidence=artifact.original_evidence,
     )
     return artifact_input(persisted.manifest)
 
@@ -697,7 +707,6 @@ def _require_fit_subset(
         or serving.index.embedding_chunk_bytes != fit.embedding_chunk_bytes
         or serving.index.fit_lineage_ids != fit.fit_lineage_ids
         or serving.index.default_top_k != fit.default_top_k
-        or artifact.top_k != fit.default_top_k
     ):
         raise ValueError("fit RAG identity differs from the grounded world-model build graph")
     fit_lineages = set(fit.fit_lineage_ids)

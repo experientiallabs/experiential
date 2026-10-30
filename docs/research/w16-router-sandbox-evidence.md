@@ -30,7 +30,7 @@ the raw episode ID.
 ## Text and local process comparison
 
 `exp/simulation/tests/comparison_evidence_test.py` runs both the real text simulator and the bounded
-Darwin `LocalProcessEnvironmentRuntime` through `SandboxSimulator`. Two exact post-lock pairs are
+`LocalProcessEnvironmentRuntime` through `SandboxSimulator`. Two exact post-lock pairs are
 retained: both are paired, one is usable, and one records an explicit malformed sandbox response.
 The report therefore keeps one sandbox failure in the denominator instead of silently dropping it.
 Replay performs zero additional model, world-model, or local-process dispatches and leaves no
@@ -43,6 +43,6 @@ uv run pytest -q exp/optimize/router/tests/composition_evidence_test.py \
   exp/simulation/tests/comparison_evidence_test.py
 ```
 
-The local process case is intentionally skipped outside Darwin because that runtime's containment
-contract is Darwin-only. Release tests separately require every public W16 owner in the wheel and
+The local process case is skipped, with the detected reason, on hosts that refuse local process
+containment (see `docs/reference/local-process-containment.md`). Release tests separately require every public W16 owner in the wheel and
 resolve the public APIs without importing test modules.

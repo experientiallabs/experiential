@@ -79,6 +79,13 @@ def test_noninteractive_missing_or_conflicting_inputs_fail_clearly(args: list[st
     assert "PROJECT" in result.output or "frozen settings" in result.output
 
 
+def test_include_inspected_applies_only_to_the_audit() -> None:
+    """Re-running exposed held-out cases is a held-out audit option, refused elsewhere."""
+    result = CliRunner().invoke(app, ["eval", "support", "--include-inspected"])
+    assert result.exit_code == 2
+    assert "--include-inspected applies only with --audit" in " ".join(result.output.split())
+
+
 def test_interactive_cancel_before_launch_never_constructs_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

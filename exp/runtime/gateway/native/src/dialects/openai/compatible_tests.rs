@@ -983,3 +983,6 @@ fn writes_within_reads_accepts_a_cache_covering_the_whole_prompt() {
 // file crosses the repository line limit.
 #[path = "compatible_length_tests.rs"]
 mod length;
+
+#[path = "compatible_unseen_tests.rs"]
+mod unseen;

@@ -99,6 +99,7 @@ from exp.runtime.gateway.native_explicit_cache import (
     validate_cache_hosts,
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
+from exp.runtime.gateway.native_lifecycle import NativeControlLifecycle
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_openai_decisions import NativeDecisionSurfacesMixin
 from exp.runtime.gateway.native_reasoning import (
@@ -160,6 +161,7 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
+    NativeControlLifecycle,
     NativeAuthenticationMixin,
     NativeGuardrailsMixin,
     NativeDecodeMixin,
@@ -258,7 +260,8 @@ class NativeControlPlane(
         self._guardrail_detectors = deterministic.compile_native_detectors(
             {} if guardrails is None else guardrails.deterministic_specifications
         )
-        # Shared accounting owns reservations, health, recovery and deadline cleanup.
+        # Initialize the tokenizer before opening any owned worker threads.
+        reservation_encoder()
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
             budget_error_factory=budget_error_factory,
@@ -266,11 +269,7 @@ class NativeControlPlane(
             recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
         )
-        self._bind_videos()  # the optional /v1/videos engine and its settlement poller
-        # Every reservation tokenizes its prompt; build the packaged BPE now so
-        # a fresh process pays that once at bind time, never on its first
-        # request, and a corrupt table fails startup with its own message.
-        reservation_encoder()
+        self._start_after_accounting(self._bind_videos)
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:

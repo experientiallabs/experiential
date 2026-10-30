@@ -245,3 +245,35 @@ def test_approved_extensions_copies_only_approved_keys() -> None:
         "exp.outcome.escalated": True,
         "exp.trace.metadata": {"team": "support"},
     }
+
+
+def test_shared_history_is_kept_once_up_to_its_longest_reference() -> None:
+    """One observation declares the history; spans keep only their prefix length."""
+    history = (
+        {"role": "user", "content": "What is the weather in Paris?"},
+        {"role": "assistant", "content": "Checking."},
+        {"role": "user", "content": "Unreferenced follow-up."},
+    )
+    model = replace(_MODEL_OBSERVATION, input_history_prefix=2, message_history=history)
+
+    result = build_vendor_traces([model, _TOOL_OBSERVATION], vendor="langfuse", source=_SOURCE)
+
+    (trace,) = result.traces
+    assert trace.message_history == history[:2]
+    assert trace.input_messages(trace.spans[0]) == list(history[:2])
+    assert "gen_ai.input.messages" not in trace.spans[0].attributes
+
+
+def test_a_history_declared_twice_or_too_short_is_excluded() -> None:
+    """A trace never silently picks one of two histories or resolves past its end."""
+    history = ({"role": "user", "content": "What is the weather in Paris?"},)
+    model = replace(_MODEL_OBSERVATION, input_history_prefix=1, message_history=history)
+    twice = replace(_TOOL_OBSERVATION, message_history=history)
+    short = replace(model, input_history_prefix=2)
+
+    doubled = build_vendor_traces([model, twice], vendor="langfuse", source=_SOURCE)
+    dangling = build_vendor_traces([short, _TOOL_OBSERVATION], vendor="langfuse", source=_SOURCE)
+
+    assert doubled.traces == dangling.traces == ()
+    assert "more than once" in doubled.issues[0].message
+    assert "references 2 history messages" in dangling.issues[0].message

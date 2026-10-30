@@ -24,6 +24,10 @@ pub(super) struct ToolState {
     pub(super) arguments: String,
     pub(super) status: Option<ProviderOutputItemStatus>,
     pub(super) done: bool,
+    /// Completed by the provider while an earlier output item was still open:
+    /// its `output_item.done` waits for `finish`, which closes items in
+    /// output order (see `ResponsesSseEncoder::tool_completed`).
+    pub(super) close_deferred: bool,
     /// Freeform custom tool call: renders the `custom_tool_call` item type
     /// with opaque `input` text and the custom input event names.
     pub(super) custom: bool,

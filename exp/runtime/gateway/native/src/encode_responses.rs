@@ -703,6 +703,7 @@ impl ResponsesSseEncoder {
             arguments: String::new(),
             status,
             done: false,
+            close_deferred: false,
             custom,
         };
         let frame = self.event(
@@ -774,7 +775,21 @@ impl ResponsesSseEncoder {
             }
             state.status = Some(status);
         }
-        state.done = true;
+        if matches!(
+            state.status,
+            None | Some(ProviderOutputItemStatus::InProgress)
+        ) {
+            state.status = Some(ProviderOutputItemStatus::Completed);
+        }
+        if self.earlier_item_open(OutputSlot::Tool(index)) {
+            // Items complete in output order; see `earlier_item_open`.
+            self.tools
+                .get_mut(&index)
+                .expect("tool just resolved")
+                .close_deferred = true;
+            return Ok(Vec::new());
+        }
+        self.tools.get_mut(&index).expect("tool just resolved").done = true;
         Ok(self.close_tool(index, ProviderOutputItemStatus::Completed))
     }
 
@@ -783,7 +798,7 @@ impl ResponsesSseEncoder {
         let state = self.tools.get_mut(&index).ok_or_else(|| {
             invalid_provider_stream("Responses tool event arrived before tool-call start.")
         })?;
-        if state.done {
+        if state.done || state.close_deferred {
             return Err(invalid_provider_stream(
                 "Responses tool event arrived after item completion.",
             ));

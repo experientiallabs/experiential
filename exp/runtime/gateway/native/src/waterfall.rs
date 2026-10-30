@@ -699,7 +699,7 @@ pub(crate) use empty::{
 };
 
 mod dispatch;
-use dispatch::{customer_owned, dispatch_headers};
+pub(crate) use dispatch::{customer_owned, dispatch_headers};
 
 mod successor;
 pub(crate) use successor::successor_possible;

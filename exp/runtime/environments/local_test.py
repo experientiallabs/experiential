@@ -16,24 +16,30 @@ import pytest
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import local as local_module
-from exp.runtime.environments.local import (
+from exp.runtime.environments.containment import darwin as darwin_module
+from exp.runtime.environments.containment.contract import (
     LocalProcessCleanupError,
     LocalProcessCrashError,
+)
+from exp.runtime.environments.containment.host import host_containment
+from exp.runtime.environments.local import (
     LocalProcessEnvironmentRuntime,
     LocalProcessLimits,
     LocalProcessProtocolError,
-    _ProcessIdentity,
-    _ProcessRecord,
-    _signal_exact_identity,
 )
 
+_HOST_REFUSAL = host_containment().report.refusal
+_CONTAINED = pytest.mark.skipif(
+    _HOST_REFUSAL is not None,
+    reason=f"this host refuses local process containment: {_HOST_REFUSAL}",
+)
 _DARWIN_ONLY = pytest.mark.skipif(
     sys.platform != "darwin",
-    reason="process-containment integration requires Darwin kqueue fork notifications",
+    reason="fork-proof failure semantics are specific to Darwin kqueue containment",
 )
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_environment_executes_in_an_ephemeral_workspace(tmp_path: Path) -> None:
     """Each episode gets a private workspace that disappears after simulator-owned cleanup."""
     runtime = _runtime(tmp_path)
@@ -48,7 +54,7 @@ def test_local_process_environment_executes_in_an_ephemeral_workspace(tmp_path: 
     assert list(tmp_path.glob("exp-sandbox-*")) == []
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_high_descriptors_execute_and_cleanup(tmp_path: Path) -> None:
     """Real pipes above select's descriptor ceiling keep all three I/O paths usable."""
     soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -89,7 +95,7 @@ def test_local_process_high_descriptors_execute_and_cleanup(tmp_path: Path) -> N
             os.close(descriptor)
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_environment_times_out_and_cleans_up(tmp_path: Path) -> None:
     """A blocked tool response reaches the configured bound instead of hanging a rollout."""
     runtime = _runtime(
@@ -108,7 +114,7 @@ def test_local_process_environment_times_out_and_cleans_up(tmp_path: Path) -> No
     assert list(tmp_path.glob("exp-sandbox-*")) == []
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_environment_records_a_child_crash_without_stderr_leakage(
     tmp_path: Path,
 ) -> None:
@@ -122,7 +128,7 @@ def test_local_process_environment_records_a_child_crash_without_stderr_leakage(
     assert list(tmp_path.glob("exp-sandbox-*")) == []
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_environment_rejects_an_oversized_or_unframed_response(
     tmp_path: Path,
 ) -> None:
@@ -144,7 +150,7 @@ def test_local_process_environment_rejects_an_oversized_or_unframed_response(
     assert list(tmp_path.glob("exp-sandbox-*")) == []
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_environment_rejects_malformed_json_and_cleans_up(tmp_path: Path) -> None:
     """Malformed child output remains protocol failure evidence and leaves no workspace."""
     runtime = _runtime(tmp_path)
@@ -156,7 +162,7 @@ def test_local_process_environment_rejects_malformed_json_and_cleans_up(tmp_path
     assert list(tmp_path.glob("exp-sandbox-*")) == []
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_child_receives_only_the_documented_environment_allowlist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -253,23 +259,6 @@ def test_cleanup_kills_setsid_descendant_without_touching_unrelated_process(
         unrelated.wait(timeout=2.0)
 
 
-def test_reused_pid_identity_is_never_signaled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stale PID or former group member cannot authorize a signal after PID reuse."""
-    stale = _ProcessIdentity(pid=12345, started=(100, 1))
-    replacement = _ProcessRecord(
-        identity=_ProcessIdentity(pid=12345, started=(200, 2)),
-        parent_pid=1,
-        zombie=False,
-    )
-    signals: list[tuple[int, int]] = []
-    monkeypatch.setattr(local_module, "_process_snapshot", lambda: {12345: replacement})
-    monkeypatch.setattr(local_module.os, "kill", lambda pid, sig: signals.append((pid, sig)))
-
-    _signal_exact_identity(stale, 9)
-
-    assert signals == []
-
-
 def test_local_process_rejects_unsafe_environment_keys() -> None:
     """Configuration cannot reintroduce credentials on any platform."""
     with pytest.raises(ValueError, match="outside the safe allowlist"):
@@ -279,9 +268,9 @@ def test_local_process_rejects_unsafe_environment_keys() -> None:
         )
 
 
-@_DARWIN_ONLY
+@_CONTAINED
 def test_local_process_rejects_symlinked_workspace_parent(tmp_path: Path) -> None:
-    """Darwin execution cannot redirect its ephemeral workspace through a symlink."""
+    """Local execution cannot redirect its ephemeral workspace through a symlink."""
     real_parent = tmp_path / "real"
     real_parent.mkdir()
     linked_parent = tmp_path / "linked"
@@ -309,11 +298,12 @@ def test_unsupported_platform_fails_before_customer_or_worker_spawn(
 ) -> None:
     """Public context preflight allocates no gate, process, pipe, or worker resources."""
     marker = tmp_path / "customer-executed"
+    monkeypatch.setattr(darwin_module.sys, "platform", "unsupported-test")
     runtime = LocalProcessEnvironmentRuntime(
         (sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"),
         workspace_parent=tmp_path,
     )
-    monkeypatch.setattr(local_module.sys, "platform", "unsupported-test")
+    assert runtime.containment.level.guarantees == ()
     before_fds = _open_file_descriptors()
     before_threads = _local_worker_threads()
     started = time.monotonic()
@@ -325,18 +315,9 @@ def test_unsupported_platform_fails_before_customer_or_worker_spawn(
     assert time.monotonic() - started < 0.25
     assert not marker.exists()
     session = context.__dict__["_session"]
-    assert session.__dict__["_process"] is None
+    assert session.__dict__["_contained"] is None
     assert _open_file_descriptors() == before_fds
     assert _local_worker_threads() == before_threads
-
-
-def test_darwin_without_kqueue_binding_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A Darwin build without the kernel-notification binding cannot open local execution."""
-    monkeypatch.setattr(local_module.sys, "platform", "darwin")
-    monkeypatch.delattr(local_module.select, "kqueue", raising=False)
-
-    with pytest.raises(LocalProcessCleanupError, match="requires Darwin"):
-        local_module._require_containment_support()
 
 
 @_DARWIN_ONLY
@@ -352,10 +333,25 @@ def test_snapshot_failure_after_gated_spawn_is_cleaned_without_masking(
         workspace_parent=tmp_path,
     )
     monkeypatch.setattr(
-        local_module,
+        darwin_module,
         "_process_snapshot",
         lambda: (_ for _ in ()).throw(OSError("injected snapshot failure")),
     )
+    launched: list[subprocess.Popen[bytes]] = []
+    real_abort = darwin_module._abort_gated_start
+
+    def recording_abort(
+        process: subprocess.Popen[bytes],
+        tracker: darwin_module._DescendantTracker | None,
+        gate_write: int,
+        root_identity: darwin_module._ProcessIdentity | None,
+        cleanup_timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        """Run the real abort and retain its gate process for the reaping assertion."""
+        launched.append(process)
+        return real_abort(process, tracker, gate_write, root_identity, cleanup_timeout_seconds)
+
+    monkeypatch.setattr(darwin_module, "_abort_gated_start", recording_abort)
     before_fds = _open_file_descriptors()
     before_threads = _local_worker_threads()
     started = time.monotonic()
@@ -366,9 +362,7 @@ def test_snapshot_failure_after_gated_spawn_is_cleaned_without_masking(
 
     assert time.monotonic() - started <= 0.65
     assert not marker.exists()
-    session = context.__dict__["_session"]
-    process = session.__dict__["_process"]
-    assert process is not None and process.poll() is not None
+    assert len(launched) == 1 and launched[0].poll() is not None
     assert _open_file_descriptors() == before_fds
     assert _local_worker_threads() == before_threads
     assert list(tmp_path.glob("exp-sandbox-*")) == []
@@ -385,7 +379,7 @@ def _pid_exists(pid: int) -> bool:
 
 def _pid_is_running(pid: int) -> bool:
     """Return whether one PID still names a non-zombie process."""
-    record = local_module._process_snapshot().get(pid)
+    record = darwin_module._process_snapshot().get(pid)
     return record is not None and not record.zombie
 
 

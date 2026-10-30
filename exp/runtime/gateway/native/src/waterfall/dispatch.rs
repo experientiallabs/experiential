@@ -15,7 +15,7 @@ use crate::errors::{Failure, PublicError};
 /// POST, so neither queue time nor a spent earlier attempt can age the
 /// signature toward AWS's short clock window. Other dialects use the route
 /// entry's headers unchanged.
-pub(super) async fn dispatch_headers(
+pub(crate) async fn dispatch_headers(
     bridge: &Bridge,
     request_id: &str,
     wire: &DeploymentWire,
@@ -45,7 +45,7 @@ pub(super) async fn dispatch_headers(
 /// account at stream OPEN is the customer's to fix (see
 /// `stream_errors::customer_credential_failure`); failures declared on the
 /// open stream take the same path inside the relay. House rungs are unchanged.
-pub(super) fn customer_owned(failure: Failure, wire: &DeploymentWire) -> Failure {
+pub(crate) fn customer_owned(failure: Failure, wire: &DeploymentWire) -> Failure {
     if wire.billing_customer_managed {
         crate::stream_errors::customer_credential_failure(failure, &wire.provider)
     } else {

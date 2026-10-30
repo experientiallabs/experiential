@@ -7,13 +7,13 @@ import pytest
 
 from exp.common.evaluations.reconstruction import ReferenceStep
 from exp.common.models import ToolCall
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.memory import saved_memory_receipt
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_memory import saved_memory_receipt
 from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     investigation,

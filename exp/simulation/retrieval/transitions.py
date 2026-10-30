@@ -123,7 +123,7 @@ def _trace_transitions(trace: Trace, lineage_id: str) -> list[RAGTransition]:
                 spans[index:],
             )
         else:
-            observation_pair = _message_observation(span, spans[index + 1 :])
+            observation_pair = _message_observation(trace, span, spans[index + 1 :])
         if observation_pair is None:
             continue
         observation_span, observation = observation_pair
@@ -228,15 +228,16 @@ def _tool_observation(
 
 
 def _message_observation(
+    trace: Trace,
     action_span: TraceSpan,
     later_spans: Sequence[TraceSpan],
 ) -> tuple[TraceSpan, RAGObservation] | None:
     """Find a genuinely new user-visible message after one assistant response."""
-    previous_user_text = _user_text(action_span.attributes)
+    previous_user_text = _user_text(trace, action_span)
     for span in later_spans:
         if span.started_at < action_span.ended_at:
             continue
-        content = _user_text(span.attributes)
+        content = _user_text(trace, span)
         if content is None or content == previous_user_text:
             continue
         return span, RAGObservation(kind="message", content=content)
@@ -259,13 +260,13 @@ def _assistant_text(attributes: Mapping[str, JsonValue]) -> str | None:
     return _visible_text(attributes.get("gen_ai.completion"))
 
 
-def _user_text(attributes: Mapping[str, JsonValue]) -> str | None:
+def _user_text(trace: Trace, span: TraceSpan) -> str | None:
     """Read the latest visible user input from one model-call span."""
-    messages = _json_value(attributes.get("gen_ai.input.messages"))
+    messages = _json_value(trace.input_messages(span))
     text = _last_role_message(messages, frozenset({"user", "human"}))
     if text is not None:
         return text
-    return _visible_text(attributes.get("gen_ai.prompt"))
+    return _visible_text(span.attributes.get("gen_ai.prompt"))
 
 
 def _last_role_message(value: JsonValue, roles: frozenset[str]) -> str | None:

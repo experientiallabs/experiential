@@ -24,12 +24,12 @@ def validate_content_tables(connection: sqlite3.Connection) -> frozenset[str]:
     Returns:
         Complete recognized table names.
     """
-    tables = frozenset(
-        row[0]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    definitions_by_name = dict(
+        connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
     )
+    tables = frozenset(definitions_by_name)
     if tables - CONTENT_TABLES:
         raise ContentSchemaError(
             "Unrecognized traffic database; preserve it and select another --root."
@@ -43,9 +43,7 @@ def validate_content_tables(connection: sqlite3.Connection) -> frozenset[str]:
                 f"Incomplete {domain} database schema; preserve it and select another --root."
             )
         for table in present:
-            saved_sql = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone()[0]
+            saved_sql = definitions_by_name[table]
             if (
                 " ".join(saved_sql.split()).casefold()
                 != " ".join(definitions[table].split()).casefold()

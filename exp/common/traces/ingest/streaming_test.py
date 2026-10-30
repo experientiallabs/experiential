@@ -1,12 +1,15 @@
 """Streaming normalization matches canonical source evidence across archive shapes."""
 
 import json
+import sqlite3
 import tracemalloc
 from pathlib import Path
 
 import pytest
 
 from exp.common.traces.ingest.braintrust_test import _rows
+from exp.common.traces.ingest.chat_json_test import _conversation as _chat
+from exp.common.traces.ingest.chat_json_test import _long_conversation
 from exp.common.traces.ingest.langfuse_test import _trace as _langfuse
 from exp.common.traces.ingest.langsmith_test import _runs
 from exp.common.traces.ingest.mastra_test import _spans as _mastra
@@ -33,6 +36,7 @@ from exp.common.traces.ingest.sources import load_trace_source
         ("otel-genai", _otel()),
         ("otlp", [_payload()]),
         ("posthog", _posthog_events()),
+        ("chat-json", [_chat(), _long_conversation(3)]),
         (
             "chat-json",
             [
@@ -117,6 +121,31 @@ def test_payload_memory_does_not_grow_with_archive_size(tmp_path: Path) -> None:
             tracemalloc.stop()
         assert receipt is not None and summary.trace_count == count
     assert peaks[1] < peaks[0] * 3, peaks
+
+
+def test_long_transcript_import_grows_linearly(tmp_path: Path) -> None:
+    """Stored bytes and the staging working set grow linearly with one transcript's length."""
+    stored: list[int] = []
+    peaks: list[int] = []
+    for turns in (100, 400):
+        path = tmp_path / f"long-{turns}.json"
+        path.write_text(json.dumps(_long_conversation(turns)))
+        root = tmp_path / f"state-{turns}"
+        tracemalloc.start()
+        try:
+            summary, receipt = ingest_traces(
+                "powerset", root=root, source_format="chat-json", path=path
+            )
+            peaks.append(tracemalloc.get_traced_memory()[1])
+        finally:
+            tracemalloc.stop()
+        assert receipt is not None and summary.trace_count == 1
+        with sqlite3.connect(root / "gateway" / "traffic.db") as database:
+            (size,) = database.execute("SELECT sum(length(payload)) FROM trace_records").fetchone()
+        stored.append(size)
+    # Quadrupling the transcript quadruples linear storage; a per-step copy would be ~16x.
+    assert stored[1] < 5 * stored[0], stored
+    assert peaks[1] < 6 * peaks[0], peaks
 
 
 def test_interleaved_otlp_records_are_grouped_before_normalization(tmp_path: Path) -> None:

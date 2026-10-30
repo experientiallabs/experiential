@@ -98,3 +98,33 @@ def test_declared_conversation_still_groups_synthetic_traces() -> None:
     assert len({item.lineage_group_id for item in assignments}) == 1
     assert all(item.conversation_id == "declared-thread" for item in assignments)
     assert all(item.time_bucket is None for item in assignments)
+
+
+def test_declared_tasks_preserve_conversation_connections_transitively() -> None:
+    """A declared replay joins its entire original conversation, including other task IDs."""
+    normalized = CHAT_JSON_SOURCE.normalize(
+        (
+            {**_record("first"), "exp.conversation.id": "thread-a"},
+            {**_record("bridge"), "exp.conversation.id": "thread-a"},
+            {**_record("fork"), "exp.conversation.id": "thread-b"},
+        ),
+        source=SourceIdentity(kind="file", source_id="chat-export"),
+    )
+    declarations = {"first": "task-a", "bridge": "task-b", "fork": "task-b"}
+    traces = []
+    for trace in normalized.traces:
+        source_trace_id = trace.spans[0].attributes["exp.source.trace.id"]
+        assert isinstance(source_trace_id, str)
+        traces.append(
+            trace.model_copy(
+                update={"initial_context": {"task_lineage": declarations[source_trace_id]}}
+            )
+        )
+
+    assignments = assign_source_lineages(traces)
+    reversed_assignments = assign_source_lineages(tuple(reversed(traces)))
+
+    assert len({assignment.lineage_group_id for assignment in assignments}) == 1
+    assert {item.trace_id: item.lineage_group_id for item in assignments} == {
+        item.trace_id: item.lineage_group_id for item in reversed_assignments
+    }

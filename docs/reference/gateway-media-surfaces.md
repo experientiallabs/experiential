@@ -20,10 +20,10 @@ or send the literal `false`; `true` and unknown parameters are rejected, and `st
 forwarded. Reservations count token IDs directly and retain normal headroom; settlement uses the
 provider-reported input usage. There is no response cache.
 
-## Images: `POST /v1/images/generations`
+## Images: `POST /v1/images/generations` and `POST /v1/images/edits`
 
-Generations only: prompt in, images out. Served by aliases that declare
-`supports_image_generation`. Each rung bills one of two ways, chosen from its price card:
+Prompt in (plus input images for an edit), images out, never streamed. Served by aliases that
+declare `supports_image_generation`. Each rung bills one of two ways, chosen from its price card:
 
 - A lane with an `image` unit card (dall-e, xAI Grok Imagine) bills per image. The variant is the
   request's `quality/size` with omitted parts dropped (`hd/1024x1792`, `1024x1024`, or the empty
@@ -44,6 +44,95 @@ even when it asked for `url` (the gateway hosts no images to link to). Other pro
 caller's `response_format` unchanged. Per-image billing is the same either way. Published xAI
 prices (2026-10-18): Grok Imagine Image $0.02, Imagine Image Quality $0.05, Imagine Image 2.0
 $0.04 per image.
+
+An Azure connection (`provider="azure"`, an Azure OpenAI or Foundry resource, `api-key` auth)
+serves image models on three wires chosen by the model family, matched on the lane's exact model
+id or its deployment name (verified against Microsoft Learn 2026-10-23):
+
+- **OpenAI Image API**: `gpt-image-*`, `FLUX-1.1-pro`, `FLUX.1-Kontext-pro`. The deployments path
+  `{resource}/openai/deployments/{deployment}/images/generations?api-version=...` (or the
+  `/openai/v1` root) with the OpenAI body unchanged. A connection on the Foundry model-inference
+  surface (`{resource}/models`), which has no images route, is sent to the deployments path at
+  `api-version=2025-04-01-preview`. Billing follows the lane's card (tokens or per image).
+- **MAI image API**: `MAI-Image-2.5`, `-2.5-Flash`, `-2.5-Pro`, `-2.6`, `-2.6-Flash`.
+  `{resource}/mai/v1/images/generations` with `{model: deployment, prompt, width, height}`; `size`
+  becomes `width`/`height` (each side at least 768 px, at most 1,048,576 pixels on the 2.5 models
+  and 2,359,296 on the 2.6 models) and `auto` or no size leaves the provider default.
+- **BFL provider API**: `FLUX.2-pro`, `FLUX.2-flex`.
+  `{resource}/providers/blackforestlabs/v1/{flux-2-pro|flux-2-flex}?api-version=preview` with
+  `Authorization: Bearer <api key>` and `{model: deployment, prompt, n: 1, width, height,
+  output_format}` (`png` or `jpeg`).
+
+The MAI and BFL wires return one image as `data[0].b64_json` with no token usage, so their rungs
+are admitted only with an `image` unit card (a rung without one is excluded and, alone, answers a
+400 naming the missing per-image price), and the caller always receives `b64_json`. A request
+these wires cannot honour faithfully excludes the rung with a 400 on the field rather than being
+changed: `n` above 1, a `size` outside the model's limits, `output_format: webp`, MAI's
+non-PNG formats, and OpenAI-only `quality`, `style`, `background`, `moderation`, or
+`output_compression`. Retired on Azure and not served: DALL·E 2 and 3 (DALL·E 3 retired
+2026-03-04), Stability AI's Stable Diffusion 3.5 Large, Stable Image Core and Ultra (retired
+2026-07-31), MAI-Image-2 and 2e (retired 2026-08-15), and Sora (`sora-2` 2025-12-08 retired
+2026-10-15, so Azure has no video model).
+
+### Stability AI on Amazon Bedrock
+
+A Bedrock connection (customer AWS credentials or a Bedrock API key) serves Stability AI's
+models through `InvokeModel`. The rung's body is frozen at admission and signed (SigV4)
+immediately before each POST, like every Bedrock body; Stability returns one base64 image per
+call, so the caller receives `data[].b64_json` (whatever `response_format` asked) and every
+Stability lane bills per image: a lane needs an `image` unit card, or it is excluded. A
+content-filter finish reason (`"Filter reason: prompt"`, `output image`, `input image`) answers
+a 400 `refusal` billed $0; an `"Inference error"` is a retryable provider failure.
+
+Model ids (`provider_model_id`) and Bedrock list prices per image (Oregon, N. Virginia, Ohio;
+read 2026-10-23 from the AWS Bedrock pricing page and the AWS Price List API):
+
+| Model | Bedrock model id | Surface | $/image |
+| --- | --- | --- | --- |
+| Stable Image Core | `stability.stable-image-core-v1:1` | generations | 0.04 |
+| Stable Diffusion 3.5 Large | `stability.sd3-5-large-v1:0` | generations, edits (image-to-image) | 0.08 |
+| Stable Image Ultra | `stability.stable-image-ultra-v1:1` | generations, edits (image-to-image) | 0.14 |
+| Fast Upscale | `us.stability.stable-fast-upscale-v1:0` | edits | 0.03 |
+| Conservative Upscale | `us.stability.stable-conservative-upscale-v1:0` | edits | 0.40 |
+| Creative Upscale | `us.stability.stable-creative-upscale-v1:0` | edits | 0.60 |
+| Inpaint | `us.stability.stable-image-inpaint-v1:0` | edits | 0.07 |
+| Outpaint | `us.stability.stable-outpaint-v1:0` | edits | 0.06 |
+| Erase Object | `us.stability.stable-image-erase-object-v1:0` | edits | 0.07 |
+| Remove Background | `us.stability.stable-image-remove-background-v1:0` | edits | 0.07 |
+| Search and Recolor | `us.stability.stable-image-search-recolor-v1:0` | edits | 0.07 |
+| Search and Replace | `us.stability.stable-image-search-replace-v1:0` | edits | 0.07 |
+| Control Sketch | `us.stability.stable-image-control-sketch-v1:0` | edits | 0.07 |
+| Control Structure | `us.stability.stable-image-control-structure-v1:0` | edits | 0.07 |
+| Style Guide | `us.stability.stable-image-style-guide-v1:0` | edits | 0.07 |
+| Style Transfer | `us.stability.stable-style-transfer-v1:0` | edits | 0.08 |
+
+The three generation models are on-demand in `us-west-2`; the Image Services tools are served
+through the cross-region `us.` inference profiles (`us-east-1`, `us-east-2`, `us-west-2`).
+
+Generations: `size` becomes the nearest Stability `aspect_ratio` (`1792x1024` is `16:9`,
+`1536x1024` is `3:2`, square sizes `1:1`; omitted or `auto` keeps the 1:1 default), and
+`output_format` is forwarded. `n` above 1, `quality`, `style`, `background`, `moderation` and
+`output_compression` have no Stability field and are refused with a 400 naming the parameter
+before any provider call. An edit-only tool on this surface answers a 400 pointing to
+`/v1/images/edits`.
+
+Edits take the official SDKs' `multipart/form-data`: the `image` part (or a one-entry `image[]`),
+an optional `mask` (inpaint and erase object), and `style_image` (style transfer, where `image`
+travels as Stability's `init_image`); each part at most 20 MB. Text fields: `model`, `prompt`
+(required by every tool except outpaint, erase object, remove background, fast upscale and
+style transfer), `output_format`, `user`, and these Stability controls, each forwarded only to a
+tool that accepts it and otherwise refused by name: `negative_prompt`, `seed` (0 to
+4294967294), `style_preset`, `aspect_ratio` (style guide), `grow_mask` (0 to 20),
+`select_prompt` (search and recolor, required), `search_prompt` (search and replace,
+required), `left`, `right`, `up`, `down` (outpaint margins, 0 to 2000, at least one above 0),
+`creativity`, `control_strength`, `fidelity`, `composition_fidelity`, `style_strength`,
+`change_strength`, and `strength` (SD 3.5 Large and Ultra image-to-image, default 0.7). `size`
+is refused (an edit keeps the input size), as are `stream`, `partial_images` and
+`input_fidelity`. Edits are served by Stability rungs only: an OpenAI-wire alias answers a 400 on
+`model`.
+
+Fireworks retired serverless image generation (FLUX) on 2026-06-10, so no Fireworks image lane
+exists.
 
 ## Speech: `POST /v1/audio/speech`
 

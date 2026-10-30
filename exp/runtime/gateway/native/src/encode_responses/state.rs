@@ -144,6 +144,20 @@ pub(crate) enum OutputSlot {
     FireworksReasoning,
 }
 
+impl OutputSlot {
+    /// Whether two slots address the same output item.
+    pub(crate) fn same_item(self, other: OutputSlot) -> bool {
+        match (self, other) {
+            (OutputSlot::Message(a), OutputSlot::Message(b)) => a == b,
+            (OutputSlot::Tool(a), OutputSlot::Tool(b))
+            | (OutputSlot::Reasoning(a), OutputSlot::Reasoning(b))
+            | (OutputSlot::HostedTool(a), OutputSlot::HostedTool(b)) => a == b,
+            (OutputSlot::FireworksReasoning, OutputSlot::FireworksReasoning) => true,
+            _ => false,
+        }
+    }
+}
+
 /// One provider-hosted tool output item carried verbatim: the provider owns
 /// its shape, so the gateway re-serves the last-seen item JSON untouched.
 pub(crate) struct HostedToolState {

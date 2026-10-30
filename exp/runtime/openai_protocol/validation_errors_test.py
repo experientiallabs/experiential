@@ -3,13 +3,25 @@ messages are exercised in requests_test.py."""
 
 from __future__ import annotations
 
-from exp.runtime.openai_protocol.validation_errors import cleaned_location
+import pytest
+from openai.types.chat.completion_create_params import CompletionCreateParamsNonStreaming
+from pydantic import TypeAdapter, ValidationError
+
+from exp.runtime.openai_protocol.validation_errors import (
+    cleaned_location,
+    validation_protocol_error,
+)
 
 
 def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field() -> None:
     """A union-branch label is never the last segment; a caller field may be."""
     assert cleaned_location(("input", 1, "reasoning", "id")) == ("input", "1", "id")
     assert cleaned_location(("messages", 0, "reasoning")) == ("messages", "0", "reasoning")
+    # Only the label right after the item index is a branch: the next segment
+    # is the item's own field, even one that spells like a variant.
+    assert cleaned_location(
+        ("input", 4, "tagged-union[...]", "configuration_update", "reasoning", "effort")
+    ) == ("input", "4", "reasoning", "effort")
     assert cleaned_location(("body", "input", "tuple[...]", 0, "_ResponseMessage", "role")) == (
         "input",
         "0",
@@ -22,4 +34,16 @@ def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field
         "1",
         "image_url",
         "url",
+    )
+
+
+def test_an_open_string_vocabulary_names_the_string_not_its_members() -> None:
+    """``str | Literal[...]`` (the SDK's ``model``) admits any string: no member list is shown."""
+    adapter = TypeAdapter[object](CompletionCreateParamsNonStreaming)
+    with pytest.raises(ValidationError) as raised:
+        adapter.validate_python({"model": {"value": "coding"}, "messages": []})
+    error = validation_protocol_error(raised.value)
+    assert error.detail.param == "model"
+    assert error.detail.message == (
+        "Invalid value for 'model': expected a string, but got an object instead."
     )
