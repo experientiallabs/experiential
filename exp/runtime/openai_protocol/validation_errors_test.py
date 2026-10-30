@@ -3,7 +3,14 @@ messages are exercised in requests_test.py."""
 
 from __future__ import annotations
 
-from exp.runtime.openai_protocol.validation_errors import cleaned_location
+import pytest
+from openai.types.chat.completion_create_params import CompletionCreateParamsNonStreaming
+from pydantic import TypeAdapter, ValidationError
+
+from exp.runtime.openai_protocol.validation_errors import (
+    cleaned_location,
+    validation_protocol_error,
+)
 
 
 def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field() -> None:
@@ -22,4 +29,16 @@ def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field
         "1",
         "image_url",
         "url",
+    )
+
+
+def test_an_open_string_vocabulary_names_the_string_not_its_members() -> None:
+    """``str | Literal[...]`` (the SDK's ``model``) admits any string: no member list is shown."""
+    adapter = TypeAdapter[object](CompletionCreateParamsNonStreaming)
+    with pytest.raises(ValidationError) as raised:
+        adapter.validate_python({"model": {"value": "coding"}, "messages": []})
+    error = validation_protocol_error(raised.value)
+    assert error.detail.param == "model"
+    assert error.detail.message == (
+        "Invalid value for 'model': expected a string, but got an object instead."
     )
