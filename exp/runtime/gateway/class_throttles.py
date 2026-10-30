@@ -196,6 +196,24 @@ def fast_on_rung(authorization: AuthorizationSnapshot, deployment: ExactModelDep
     )
 
 
+def priority_tier_attested(deployment: ExactModelDeployment) -> bool:
+    """Whether the host attests this carded, platform-funded rung serves the priority tier.
+
+    The third-party counterpart of a self-hosted carded rung: the provider
+    reports no tier, and the host sells the rung only as ``:fast``
+    (``GatewayRungDispatchPolicy.priority_tier_attested``). A customer's own
+    key or endpoint never attests, and a rung without a priority card has no
+    tier to attest.
+    """
+    policy = deployment.gateway.dispatch
+    return (
+        deployment.billing_source is BillingSource.HOST_MANAGED
+        and policy is not None
+        and policy.priority_tier_attested
+        and deployment.gateway.prices.priority is not None
+    )
+
+
 def fast_reserve_slots(deployment: ExactModelDeployment) -> int | None:
     """In-flight slots per worker kept for ``:fast`` on this rung, or ``None``.
 
@@ -256,14 +274,20 @@ def tier_settlement(entry: InflightRequest, attempt_id: str) -> TierSettlementIn
 
     A self-hosted rung is our own server: it reports no processing tier, and the
     tier it ran at is ours to state, so its settlement is confirmed at the
-    admitted card (``native_service_tiers.settlement_kwarg``).
+    admitted card (``native_service_tiers.settlement_kwarg``). A rung whose host
+    attests it is the priority tier (``priority_tier_attested``) is confirmed
+    the same way: the provider reports no tier, and the lane is the tier.
     """
     admission: GatewayServiceTierAdmission | None = entry.attempt_service_tiers.get(attempt_id)
     depth = entry.attempt_depths.get(attempt_id)
+    rung = entry.route.deployments[depth] if depth is not None else None
     self_served = (
         admission is not None
         and admission.requested == "priority"
-        and depth is not None
-        and fast_on_rung(entry.authorization, entry.route.deployments[depth])
+        and rung is not None
+        and (
+            fast_on_rung(entry.authorization, rung)
+            or (entry.authorization.fast and priority_tier_attested(rung))
+        )
     )
     return {"service_tier": admission, "self_served": self_served}
