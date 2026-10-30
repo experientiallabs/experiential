@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.catalog_prices import BilledUnitKind, GatewayTokenPrices
@@ -29,17 +29,65 @@ ImageQuality = Literal["standard", "hd", "low", "medium", "high", "auto"]
 MAXIMUM_IMAGE_OUTPUT_TOKENS = 6_240
 
 
+# The largest decoded input image an edit carries (base64 travels 4/3 larger).
+# Stability's edit tools accept at most 9.4 megapixels; a lossless PNG of that
+# size stays under this bound.
+MAXIMUM_EDIT_IMAGE_BYTES = 20 * 1024 * 1024
+_MAXIMUM_EDIT_IMAGE_BASE64 = (MAXIMUM_EDIT_IMAGE_BYTES + 2) // 3 * 4
+
+EditOptionValue = str | int | float
+
+
+class ImageEditInput(ContractModel):
+    """The input images of one ``/v1/images/edits`` request, base64 encoded.
+
+    Attributes:
+        image: The image to edit (the multipart ``image`` part).
+        mask: The optional mask (the multipart ``mask`` part); white marks the
+            region to change.
+        style_image: The optional style reference (the multipart
+            ``style_image`` part), used by style transfer.
+    """
+
+    image: str = Field(min_length=1, max_length=_MAXIMUM_EDIT_IMAGE_BASE64)
+    mask: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_EDIT_IMAGE_BASE64)
+    style_image: str | None = Field(
+        default=None, min_length=1, max_length=_MAXIMUM_EDIT_IMAGE_BASE64
+    )
+
+
 class ImagesRequest(ContractModel):
-    """Canonical, provider-neutral image-generation request.
+    """Canonical, provider-neutral image-generation or image-edit request.
 
     Parallel to :class:`~exp.runtime.gateway.contracts.GatewayRequest` like the
-    embeddings contract: prompt-in, images-out, never streamed. Only the
-    OpenAI Images API's generation parameters are carried; ``user`` is the
-    end-user attribution label and never a credential.
+    embeddings contract: prompt-in (plus input images for an edit), images-out,
+    never streamed. The OpenAI Images API's generation parameters are carried;
+    ``user`` is the end-user attribution label and never a credential.
+
+    Attributes:
+        surface: Always the images surface (generations and edits share it).
+        prompt: The text prompt; required for a generation, optional for an
+            edit whose model needs none (background removal, fast upscale).
+        n: Images requested.
+        size: OpenAI output size.
+        quality: OpenAI output quality.
+        background: OpenAI background control.
+        output_format: Encoded image format.
+        output_compression: Lossy compression level.
+        moderation: OpenAI moderation level.
+        response_format: ``url`` or ``b64_json``.
+        style: DALL-E 3 style.
+        user: End-user attribution label.
+        edit: The input images when the request edits an image
+            (``/v1/images/edits``); None for a generation.
+        edit_options: Provider image-tool controls an edit carries beyond the
+            OpenAI fields (``seed``, ``negative_prompt``, ``creativity``...),
+            validated by the decoder and forwarded only to a rung that
+            accepts each one.
     """
 
     surface: Literal[GatewayApiSurface.IMAGES] = GatewayApiSurface.IMAGES
-    prompt: str = Field(min_length=1, max_length=32_000)
+    prompt: str = Field(default="", max_length=32_000)
     n: int = Field(default=1, ge=1, le=10)
     size: ImageSize | None = None
     quality: ImageQuality | None = None
@@ -50,6 +98,25 @@ class ImagesRequest(ContractModel):
     response_format: Literal["url", "b64_json"] | None = None
     style: Literal["vivid", "natural"] | None = None
     user: str | None = Field(default=None, max_length=1024)
+    edit: ImageEditInput | None = None
+    edit_options: dict[str, EditOptionValue] | None = None
+
+    @model_validator(mode="after")
+    def _prompt_or_edit(self) -> ImagesRequest:
+        """Require a prompt on a generation and keep edit controls on edits.
+
+        Returns:
+            The validated request.
+
+        Raises:
+            ValueError: A generation without a prompt, or edit options
+                without an edit.
+        """
+        if self.edit is None and not self.prompt:
+            raise ValueError("an image generation requires a prompt")
+        if self.edit is None and self.edit_options:
+            raise ValueError("edit options require an image edit")
+        return self
 
     @property
     def attribution_label(self) -> str | None:

@@ -30,6 +30,7 @@ from exp.runtime.gateway.latency_measure import (
     ALIAS_ID,
     CHAT_PATH,
     MOCK_MODEL,
+    GatewayProcess,
     MockOpenAIServer,
     RequestSample,
     chat_payload,
@@ -467,7 +468,7 @@ def run_latency_report(
     """
     mock = MockOpenAIServer()
     mock.start()
-    process: subprocess.Popen[str] | None = None
+    process: GatewayProcess | None = None
     try:
         raw_key = configure_gateway(work_root, provider_base_url=mock.base_url)
         port = unused_loopback_port()
@@ -516,9 +517,11 @@ def run_latency_report(
             runs=runs,
         )
     finally:
-        if process is not None:
-            stop_gateway_process(process)
-        mock.stop()
+        try:
+            if process is not None:
+                stop_gateway_process(process)
+        finally:
+            mock.stop()
 
 
 def _assert_functional_success(runs: tuple[LatencyMeasuredRun, ...]) -> None:

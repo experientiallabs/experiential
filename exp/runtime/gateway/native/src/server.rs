@@ -35,6 +35,7 @@ use crate::route_batches::{
 use crate::route_chat::chat;
 use crate::route_decisions::{decisions, openai_decisions};
 use crate::route_embeddings::embeddings;
+use crate::route_image_edits::{image_edits, image_edits_body_limit};
 use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
@@ -271,6 +272,10 @@ pub async fn run(
         .route("/v1/systemone", post(decisions))
         .route("/v1/decisions", post(openai_decisions))
         .route("/v1/images/generations", post(images))
+        .route(
+            "/v1/images/edits",
+            post(image_edits).layer(image_edits_body_limit()),
+        )
         .route("/v1/audio/speech", post(speech))
         .route(
             "/v1/audio/transcriptions",

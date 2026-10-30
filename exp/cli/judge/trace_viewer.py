@@ -142,7 +142,7 @@ def _trace_blocks(trace: Trace, *, candidate: str | None) -> tuple[ViewerBlock, 
     final_completion = completion_positions[-1] if completion_positions else None
     step = 0
     for index, span in enumerate(trace.spans):
-        span_blocks = _span_blocks(span, final_response=index == final_completion)
+        span_blocks = _span_blocks(trace, span, final_response=index == final_completion)
         for block in span_blocks:
             if block.anchor is not None:
                 step += 1
@@ -153,10 +153,11 @@ def _trace_blocks(trace: Trace, *, candidate: str | None) -> tuple[ViewerBlock, 
     return tuple(blocks)
 
 
-def _span_blocks(span: TraceSpan, *, final_response: bool) -> tuple[ViewerBlock, ...]:
+def _span_blocks(trace: Trace, span: TraceSpan, *, final_response: bool) -> tuple[ViewerBlock, ...]:
     """Build styled blocks for one normalized chronological span.
 
     Args:
+        trace: Trace holding the span and any shared message history it references.
         span: One normalized trace span.
         final_response: Whether this span holds the last captured assistant response.
 
@@ -171,7 +172,7 @@ def _span_blocks(span: TraceSpan, *, final_response: bool) -> tuple[ViewerBlock,
     if result is None:
         result = attributes.get("gen_ai.tool.output")
     completion = assistant_completion(attributes)
-    user_message = user_input(attributes)
+    user_message = user_input(trace, span)
     subtitle = f"[dim]{span.span_id} · {span.name}[/dim]"
     blocks: list[ViewerBlock] = []
     if user_message is not None:

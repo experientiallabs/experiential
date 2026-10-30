@@ -5,6 +5,7 @@ from pathlib import Path
 
 from exp.common.core.artifacts import JsonObject, JsonValue, sha256_json
 from exp.common.project import ProjectConfig, ProjectStore
+from exp.runtime.sessions.edits import SetValue
 from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.retrieval.selection import AllOriginals
 from exp.simulation.world_model.memory_tree_test import source
@@ -90,7 +91,7 @@ def test_revealed_overview_sources_are_inherited_from_committed_evidence(tmp_pat
         assert claim is not None
         sessions.mark_provider_started(claim, 10)
         sessions.record_proposal(claim, {})
-        sessions.complete_step(claim, {"transitions": transitions}, {})
+        sessions.complete_step(claim, (SetValue(path=(), value={"transitions": transitions}),), {})
         records.append(restarted().observe(f"op-{step}", "right", "feedback"))
     first, second = (_dependency_ids(record) for record in records)
     assert ref_a.artifact_id not in first

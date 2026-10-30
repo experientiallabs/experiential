@@ -146,6 +146,7 @@ def _multi_turn_rollout() -> RolloutArtifact:
                     "attributes": {
                         "gen_ai.prompt": "Refund order 42.",
                         "gen_ai.input.messages": [{"role": "user", "content": "Refund order 42."}],
+                        "exp.input.history_prefix": 1,
                         "gen_ai.completion": "The refund is complete.",
                     },
                 },
@@ -166,6 +167,7 @@ def test_visible_evidence_excludes_requests_and_reasoning() -> None:
     )
     assert '"request"' not in rendered
     assert '"gen_ai.input.messages"' not in rendered
+    assert '"exp.input.history_prefix"' not in rendered
     assert '"reasoning"' not in rendered
     assert "secret chain of thought" not in rendered
     assert "Looking up order 42." in rendered

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from exp.common.models.known_models import (
@@ -415,3 +417,35 @@ def test_every_served_anthropic_listing_id_resolves_a_generation_contract() -> N
     for wire_id in ("claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-sonnet-5"):
         known = known_model_metadata("anthropic", wire_id)
         assert known is not None and known.supports_reasoning_effort is True, wire_id
+
+
+@pytest.mark.parametrize(
+    ("model_id", "forced"),
+    [
+        ("claude-fable-5-1", False),
+        ("claude-mythos-5-1", False),
+        ("claude-opus-5-5", False),
+        ("claude-sonnet-5-5", False),
+        ("claude-sonnet-5-5-20260928", False),
+        ("claude-opus-5", None),
+        ("claude-sonnet-5", None),
+        ("claude-haiku-4-5", None),
+    ],
+)
+def test_releases_that_reject_forced_tool_choice_declare_it(
+    model_id: str, forced: bool | None
+) -> None:
+    """Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 answer any/tool with a 400.
+
+    Provider contract: https://platform.claude.com/docs/en/models/opus-5-5/migration-guide
+    """
+    known = known_model_metadata("anthropic", model_id)
+    assert known is not None and known.supports_forced_tool_choice is forced
+
+
+def test_opus_5_5_keeps_its_generation_contract_and_no_prices() -> None:
+    """Recording Opus 5.5 changes only its forced-tool fact, never what it inherited."""
+    recorded = known_model_metadata("anthropic", "claude-opus-5-5")
+    inherited = known_model_metadata("anthropic", "claude-opus-5-9")
+    assert recorded is not None and inherited is not None
+    assert replace(recorded, supports_forced_tool_choice=None) == inherited

@@ -45,6 +45,10 @@ from exp.runtime.models.providers.streaming_requests import (
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
+from exp.runtime.openai_protocol.nullable_params import (
+    CHAT_NULLABLE_PARAMS,
+    RESPONSES_NULLABLE_PARAMS,
+)
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
@@ -5681,18 +5685,83 @@ def test_replayed_web_search_items_decode_whatever_their_action(action: JsonObje
     assert decoded.request.surface == GatewayApiSurface.RESPONSES
 
 
-def test_malformed_replayed_web_search_items_are_still_refused() -> None:
-    """Relaxing the action enum keeps the item's structural checks."""
-    with pytest.raises(OpenAIProtocolError):
+@pytest.mark.parametrize(
+    ("item", "param"),
+    [
+        ({"type": "web_search_call", "id": "ws_1", "action": "search"}, "input.1.action"),
+        (
+            {"type": "web_search_call", "action": {"type": "search", "query": 5}},
+            "input.1.action.query",
+        ),
+        (
+            {"type": "web_search_call", "action": {"type": "find_in_page", "url": 5}},
+            "input.1.action.url",
+        ),
+        ({"type": "web_search_call", "status": 5}, "input.1.status"),
+    ],
+)
+def test_malformed_replayed_web_search_items_are_still_refused(
+    item: JsonObject, param: str
+) -> None:
+    """Completing the fields Codex leaves out keeps the checks on every field sent.
+
+    A missing ``status`` used to be the refused case here; Codex serializes it
+    (and ``id``, ``action``, and a find action's ``url``/``pattern``) as
+    optional, so a missing field is now completed for the probe only, and a
+    field of the wrong shape is refused at that field, never at the
+    computer-use or local-shell action vocabulary.
+
+    Args:
+        item: One malformed web search item.
+        param: The field the refusal must name.
+    """
+    with pytest.raises(OpenAIProtocolError) as refused:
         decode_responses(
             {
                 "model": "coding",
-                "input": [
-                    {"type": "message", "role": "user", "content": "look it up"},
-                    {"type": "web_search_call", "id": "ws_1", "action": {"type": "other"}},
-                ],
+                "input": [{"type": "message", "role": "user", "content": "look it up"}, item],
             }
         )
+
+    assert refused.value.detail.param == param
+    assert "'click'" not in refused.value.detail.message
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "web_search_call", "action": {"type": "search", "query": "weather"}},
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "open_page"}},
+        {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "find_in_page", "url": "https://example.com"},
+        },
+        {"type": "web_search_call", "id": "ws_1", "status": "incomplete"},
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "other"}},
+    ],
+)
+def test_codex_web_search_echoes_with_omitted_fields_forward_verbatim(item: JsonObject) -> None:
+    """Codex 0.118 to 0.145 echoes ``web_search_call`` items without ``id``,
+    ``status``, ``action``, or a find action's ``pattern`` (all optional in
+    ``ResponseItem::WebSearchCall``), and openai-python 3.37 adds the
+    ``incomplete`` status; each used to refuse as "Invalid value for
+    'input.N.action.type': expected one of 'click', ... or 'exec'." The item
+    decodes and the native OpenAI wire receives it unchanged.
+
+    Args:
+        item: One web search echo as Codex sends it.
+    """
+    decoded = decode_responses(
+        {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "look it up"}, item]}
+    )
+
+    assert decoded.request.messages[-1].provider_native_item == item
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    assert cast("list[JsonObject]", payload["input"])[-1] == item
 
 
 def test_gateway_issued_web_search_items_are_dropped_on_replay() -> None:
@@ -6054,4 +6123,260 @@ def test_a_malformed_thought_signature_is_refused_naming_its_field() -> None:
         decode_chat(_signed_chat_history("not base64!"))
     assert rejected.value.detail.param == (
         "messages.1.tool_calls.0.extra_content.google.thought_signature"
+    )
+
+
+_CODEX_AGENT_MESSAGE: JsonObject = {
+    "type": "agent_message",
+    "author": "/root/worker",
+    "recipient": "/root",
+    "content": [{"type": "input_text", "text": "Worker finished: 12 tests found."}],
+}
+"""A child's result for its parent, as Codex 0.162/0.163 records it (``agent_message``)."""
+
+
+def _codex_history(*tail: JsonObject) -> list[JsonValue]:
+    """Return a Codex-shaped history: instructions, a user turn, one tool round, then ``tail``."""
+    return [
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "Be brief."}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Count tests."}],
+        },
+        {"type": "function_call", "call_id": "call_1", "name": "spawn_agent", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "spawned /root/worker"},
+        *tail,
+    ]
+
+
+def test_codex_agent_and_compaction_items_decode_as_verbatim_native_items() -> None:
+    """Codex 0.162/0.163 replays ``agent_message`` items and ends a remote
+    compaction with ``compaction_trigger``; both used to fall into the message
+    branch and refuse the turn with "Invalid value for 'input.N.role':
+    expected a value." (2026-10-19 to 10-24, Codex Desktop and codex-cli).
+    Each now decodes as a native item carried byte-for-byte at its position on
+    the user role, and the native OpenAI wire receives the history unchanged."""
+    trigger: JsonObject = {"type": "compaction_trigger"}
+    decoded = decode_responses(
+        {"model": "gpt-5.6-sol", "input": _codex_history(_CODEX_AGENT_MESSAGE, trigger)}
+    )
+
+    messages = decoded.request.messages
+    assert [message.role for message in messages][-2:] == ["user", "user"]
+    assert [message.provider_native_item for message in messages[-2:]] == [
+        _CODEX_AGENT_MESSAGE,
+        trigger,
+    ]
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    items = cast("list[JsonObject]", payload["input"])
+    assert items[-2:] == [_CODEX_AGENT_MESSAGE, trigger]
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "configuration_update", "reasoning": {"effort": "xhigh"}},
+        {"type": "context_compaction", "id": "cc_1", "encrypted_content": "gAAAAB-opaque"},
+        {"type": "item_reference", "id": "rs_1"},
+        {
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [
+                {"type": "input_text", "text": "Message Type: MESSAGE\nPayload:\n"},
+                {"type": "encrypted_content", "encrypted_content": "gAAAAB-opaque"},
+            ],
+            "agent": {"agent_name": "worker"},
+        },
+    ],
+)
+def test_other_valid_openai_input_items_decode_as_native_items(item: JsonObject) -> None:
+    """Positional configuration, compacted history, stored references and an
+    encrypted agent message are valid OpenAI input the SDK schema (beta or
+    Codex-only) does not fully enumerate; the strict wire model owns them.
+
+    Args:
+        item: One valid input item.
+    """
+    decoded = decode_responses({"model": "gpt-5.6-sol", "input": _codex_history(item)})
+
+    assert decoded.request.messages[-1].provider_native_item == item
+
+
+def test_an_id_only_item_is_an_item_reference() -> None:
+    """The SDK's ``ItemReference`` makes ``type`` optional (the AI SDK sends
+    stored reasoning as ``{"id": ...}``); it used to read as a message
+    without a role. It decodes as a tagged reference, with nothing disclosed."""
+    decoded = decode_responses(
+        {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "hi"}, {"id": "rs_9"}]}
+    )
+
+    assert decoded.request.messages[-1].provider_native_item == {
+        "type": "item_reference",
+        "id": "rs_9",
+    }
+    assert decoded.request.ignored_parameters == ()
+
+
+def test_an_unknown_input_item_type_names_the_type_not_the_message_role() -> None:
+    """An item whose ``type`` no branch accepts is reported at its ``type`` with
+    the whole accepted vocabulary, instead of the message branch's complaint
+    about a ``role`` the caller never meant to send."""
+    with pytest.raises(OpenAIProtocolError) as refused:
+        decode_responses(
+            {"model": "gpt-5.6-sol", "input": _codex_history({"type": "future_item", "x": 1})}
+        )
+
+    assert refused.value.detail.param == "input.4.type"
+    message = refused.value.detail.message
+    assert message.startswith("Invalid value for 'input.4.type': expected one of 'message', ")
+    assert "'agent_message'" in message and "'compaction_trigger'" in message
+    assert message.endswith("but got 'future_item' instead.")
+
+
+def test_a_typeless_item_without_a_role_still_names_the_role() -> None:
+    """With no ``type``, an item reads as the defaulted message: its missing role is the fault."""
+    with pytest.raises(OpenAIProtocolError) as refused:
+        decode_responses({"model": "gpt-5.6-sol", "input": [{"content": "hi"}]})
+
+    assert refused.value.detail.param == "input.0.role"
+
+
+@pytest.mark.parametrize(
+    ("item", "param"),
+    [
+        (
+            {**_CODEX_AGENT_MESSAGE, "content": [{"type": "output_text", "text": "x"}]},
+            "input.4.content.0.type",
+        ),
+        ({"type": "agent_message", "author": "/root", "content": []}, "input.4.recipient"),
+        ({"type": "configuration_update", "reasoning": {}}, "input.4.reasoning.effort"),
+        ({"type": "compaction_trigger", "now": True}, "input.4.now"),
+        ({"type": "item_reference"}, "input.4.id"),
+    ],
+)
+def test_a_malformed_known_item_names_its_own_field(item: JsonObject, param: str) -> None:
+    """A recognized item that is genuinely invalid is refused at the field that is wrong.
+
+    Args:
+        item: One malformed item of a known type.
+        param: The field the refusal must name.
+    """
+    with pytest.raises(OpenAIProtocolError) as refused:
+        decode_responses({"model": "gpt-5.6-sol", "input": _codex_history(item)})
+
+    assert refused.value.detail.param == param
+
+
+_CODEX_UNPAIRED_OUTPUT: JsonObject = {
+    "type": "function_call_output",
+    "id": "fco_1",
+    "name": "send_message_to_thread",
+    "namespace": "codex_app",
+    "output": "<codex_delegation>Review the patch.</codex_delegation>",
+}
+"""A named output that answers no call, as Codex 0.162 to 0.164 sends it (thread delivery)."""
+
+
+def test_an_unpaired_function_output_decodes_as_a_verbatim_native_item() -> None:
+    """Codex 0.162+ starts or steers a turn with a ``function_call_output`` that
+    carries ``name``/``namespace`` but no ``call_id`` (openai-python 3.37 makes
+    the field optional). It used to refuse the turn as "Invalid value for
+    'input.3.call_id': expected a value." (codex-tui 0.164, Codex Desktop
+    0.162 to 0.164); it now decodes as a native item on the user role and the
+    native OpenAI wire receives it unchanged."""
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "developer", "content": "Be brief."},
+                {"role": "user", "content": "<environment_context />"},
+                {"role": "user", "content": "<permissions />"},
+                _CODEX_UNPAIRED_OUTPUT,
+            ],
+        }
+    )
+
+    last = decoded.request.messages[-1]
+    assert last.role == "user"
+    assert last.provider_native_item == _CODEX_UNPAIRED_OUTPUT
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    assert cast("list[JsonObject]", payload["input"])[-1] == _CODEX_UNPAIRED_OUTPUT
+
+
+def test_a_paired_function_output_still_decodes_as_a_tool_result() -> None:
+    """An output that carries its call_id keeps the canonical tool-message shape."""
+    decoded = decode_responses({"model": "gpt-5.6-sol", "input": _codex_history()})
+
+    last = decoded.request.messages[-1]
+    assert last.role == "tool"
+    assert last.tool_call_id == "call_1"
+    assert last.provider_native_item is None
+
+
+_CHAT_BODY: JsonObject = {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+_RESPONSES_BODY: JsonObject = {"model": "coding", "input": "hi"}
+
+
+def test_chat_stream_null_decodes_as_non_streaming() -> None:
+    """``"stream": null`` was a 400 ("expected a boolean, but got null"); OpenAI serves it."""
+    decoded = decode_chat({**_CHAT_BODY, "stream": None, "stream_options": None})
+    assert decoded.request.stream is False
+    assert decoded == decode_chat(_CHAT_BODY)
+
+
+@pytest.mark.parametrize("field", sorted(CHAT_NULLABLE_PARAMS))
+def test_every_chat_nullable_null_decodes_as_absent(field: str) -> None:
+    """A null on any OpenAI-nullable Chat field is the default, with no disclosure."""
+    assert decode_chat({**_CHAT_BODY, field: None}) == decode_chat(_CHAT_BODY)
+
+
+@pytest.mark.parametrize("field", sorted(RESPONSES_NULLABLE_PARAMS))
+def test_every_responses_nullable_null_decodes_as_absent(field: str) -> None:
+    """A null on any OpenAI-nullable Responses field is the default, with no disclosure."""
+    assert decode_responses({**_RESPONSES_BODY, field: None}) == decode_responses(_RESPONSES_BODY)
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        (_CHAT_BODY, "model"),
+        (_CHAT_BODY, "messages"),
+        (_CHAT_BODY, "tool_choice"),
+        (_CHAT_BODY, "response_format"),
+        (_RESPONSES_BODY, "model"),
+        (_RESPONSES_BODY, "input"),
+        (_RESPONSES_BODY, "tool_choice"),
+    ],
+)
+def test_a_null_openai_refuses_is_still_refused_by_name(body: JsonObject, field: str) -> None:
+    """Fields OpenAI does not let be null keep a 400 that names them, never ``stream``."""
+    decode = decode_chat if "messages" in body else decode_responses
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode({**body, field: None})
+    assert raised.value.status_code == 400
+    assert raised.value.detail.param == field
+
+
+def test_a_non_string_chat_model_is_named_not_reported_as_a_missing_stream() -> None:
+    """The production shape behind "Invalid value for 'stream': expected a value.".
+
+    A body whose ``model`` is not a string (PowerShell 5.1's ``ConvertTo-Json`` of a
+    ``Get-Content`` string emits an object) failed both official union branches, and
+    union error selection named the streaming branch's missing ``stream``.
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat({**_CHAT_BODY, "model": {"value": "coding", "PSPath": "C:\\model.txt"}})
+    assert raised.value.detail.param == "model"
+    assert str(raised.value) == (
+        "Invalid value for 'model': expected a string, but got an object instead."
     )

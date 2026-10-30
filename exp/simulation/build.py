@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,7 +34,7 @@ from exp.common.project.database import project_connection
 from exp.common.project.project import require_durable_source_id
 from exp.common.release_revision import installed_release_revision
 from exp.common.tasks import TaskSet
-from exp.common.traces import load_trace_dataset
+from exp.common.traces import Trace, load_trace_dataset
 from exp.common.traces.ingest.dataset import (
     PersistedTraceDataset,
     persist_trace_dataset,
@@ -45,7 +45,20 @@ from exp.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,
 )
-from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
+from exp.simulation.mining.descriptors import (
+    DESCRIPTOR_EMBEDDING,
+    DescriptorEmbedder,
+    DescriptorEmbedding,
+    HashingDescriptorEmbedder,
+)
+from exp.simulation.mining.exposure_ledger import (
+    ExposureLedger,
+    SourceRecord,
+    declared_vertex,
+    node_vertex,
+    record_sha256,
+)
+from exp.simulation.mining.lineage import assign_source_lineages
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
 _BUILD_SCOPED_REVIEW_KEYS = (
@@ -53,6 +66,7 @@ _BUILD_SCOPED_REVIEW_KEYS = (
     "rubric_review",
     "human_score_history",
     "human_score_submissions",
+    "human_review_submissions",
 )
 _MINIMUM_PROVIDER_FREE_TRACE_COUNT = 100
 _MAXIMUM_PROVIDER_FREE_TRACE_COUNT = 1000
@@ -84,7 +98,7 @@ class BuildReviewReadiness(ContractModel):
     project_config: ProjectConfig
     source: SourceIdentity
     mining_spec: MiningSpec
-    descriptor_embedder: Literal["hashing-descriptor-v1"] = "hashing-descriptor-v1"
+    descriptor_embedder: DescriptorEmbedding = DESCRIPTOR_EMBEDDING
     descriptor_dimensions: int = Field(ge=8)
     code_revision: str = Field(min_length=1, max_length=256)
     paid_calls_made: Literal[0] = 0
@@ -96,6 +110,44 @@ class BuildReviewReadiness(ContractModel):
         if self.readiness_id != expected:
             raise ValueError("build review readiness ID differs from its complete binding")
         return self
+
+
+class SupersededBuildReviewError(ValueError):
+    """A build review cannot establish grouping under the current descriptor version."""
+
+
+def parse_build_review(value: JsonValue) -> BuildReviewReadiness:
+    """Validate a stored build review, refusing one grouped under another descriptor version.
+
+    A build's leakage lineages and fit/held-out split come from its descriptor grouping. A
+    review recorded under another version names tasks this code would group differently, so it
+    is refused with the remedy instead of being reused or silently regrouped.
+
+    Args:
+        value: Stored ``build_review`` JSON.
+
+    Returns:
+        The validated review.
+
+    Raises:
+        SupersededBuildReviewError: The review records another descriptor grouping version.
+        ValueError: The review is otherwise malformed.
+    """
+    recorded = value.get("descriptor_embedder") if isinstance(value, dict) else None
+    if not isinstance(recorded, str):
+        raise SupersededBuildReviewError(
+            "this project's build has no valid descriptor grouping version, so its lineages "
+            "and fit/held-out split cannot be reused; run exp build for this project again "
+            "(pass --import-id to reuse its stored traces) to rebuild its tasks"
+        )
+    if recorded != DESCRIPTOR_EMBEDDING:
+        raise SupersededBuildReviewError(
+            f"this project's build grouped traces into lineages under {recorded}, and this "
+            f"version of exp groups them under {DESCRIPTOR_EMBEDDING}, so it will not reuse "
+            "that build or its fit/held-out split; run exp build for this project again (pass "
+            "--import-id to reuse its stored traces) to rebuild its tasks"
+        )
+    return BuildReviewReadiness.model_validate(value)
 
 
 @dataclass(frozen=True)
@@ -173,6 +225,7 @@ def prepare_project_traces(
     stage = ProjectProviderFreeStage(
         trace_dataset=trace_dataset,
         task_set=task_set,
+        descriptor_embedder=DESCRIPTOR_EMBEDDING,
     )
     store.bind_provider_free_stage(stage)
     return stage
@@ -215,6 +268,8 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
         Manifest-bound readiness record accepted by completed-build selection.
 
     Raises:
+        SupersededBuildReviewError: The stage was mined under another descriptor grouping
+            version, or before its version was recorded.
         ValueError: Preparation settings, source evidence, or selected pointers are inconsistent.
     """
     config = store.load_project()
@@ -222,6 +277,13 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
     settings = config.trace_preparation
     if stage is None or settings is None:
         raise ValueError("hosted build requires selected provider-free trace evidence")
+    if stage.descriptor_embedder != DESCRIPTOR_EMBEDDING:
+        raise SupersededBuildReviewError(
+            f"this project's provider-free tasks were grouped into lineages under "
+            f"{stage.descriptor_embedder or 'an unrecorded descriptor version'}, and this version "
+            f"of exp groups them under {DESCRIPTOR_EMBEDDING}, so it will not relabel that "
+            "fit/held-out split; prepare the traces again in a new project"
+        )
     trace_stored = store.artifacts.read(stage.trace_dataset.artifact_id)
     task_stored = store.artifacts.read(stage.task_set.artifact_id)
     if artifact_input(trace_stored.manifest) != stage.trace_dataset:
@@ -245,7 +307,7 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
         "project_config": provider_free_config.model_dump(mode="json"),
         "source": source.model_dump(mode="json"),
         "mining_spec": mining_spec.model_dump(mode="json"),
-        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_embedder": DESCRIPTOR_EMBEDDING,
         "descriptor_dimensions": settings.descriptor_dimensions,
         "code_revision": task_stored.manifest.code_revision,
         "paid_calls_made": 0,
@@ -329,21 +391,39 @@ def build_task_set(
 
     Returns:
         Immutable trace-dataset and task-set artifacts plus the mining evidence between them.
+
+    Raises:
+        ValueError: A trace carries simulation provenance. The simulator never learns from
+            replies a simulated owner produced.
     """
+    simulated = sorted(
+        {
+            trace.source.identity.source_id
+            for trace in normalized.traces
+            if trace.source.identity.kind == "simulation"
+        }
+    )
+    if simulated:
+        raise ValueError(
+            f"traces from {', '.join(simulated)} carry simulation provenance: a simulated world "
+            "owner produced their replies, and the simulator never learns from its own output. "
+            "Build from a generated-native trajectory import or recorded traces instead."
+        )
     trace_dataset = persist_trace_dataset(
         normalized,
         store,
         created_at=created_at,
         code_revision=code_revision,
     )
+    dataset_input = artifact_input(trace_dataset.manifest)
     mining = mine_tasks(
         trace_dataset.traces,
         mining_spec,
         embedder=embedder or HashingDescriptorEmbedder(),
         input_trace_count=len(trace_dataset.traces) + trace_dataset.dataset.invalid_trace_count,
         invalid_trace_count=trace_dataset.dataset.invalid_trace_count,
+        sealed_trace_ids=_sealed_traces(store, dataset_input, trace_dataset.traces),
     )
-    dataset_input = artifact_input(trace_dataset.manifest)
     task_set = persist_task_set(
         mining,
         store,
@@ -353,6 +433,40 @@ def build_task_set(
         inputs=(dataset_input,),
     )
     return TaskSetBuild(trace_dataset=trace_dataset, mining=mining, task_set=task_set)
+
+
+def _sealed_traces(
+    store: ArtifactStore, dataset: ArtifactInput, traces: Sequence[Trace]
+) -> frozenset[str]:
+    """Traces linked in the root ledger to content a held-out audit exposed or reserved.
+
+    The partition is a rank among the lineages one build sees, so a rebuild could otherwise move
+    such content from held out to fit, where every fitting path would learn or retrieve it. A
+    trace is linked through its own content or through the task identity it declares within
+    its source and customer, which earlier builds joined to their own declaring traces.
+    """
+    ledger = ExposureLedger(store.paths.root)
+    snapshot = ledger.snapshot()
+    sealed: set[str] = set()
+    for trace, assignment in zip(traces, assign_source_lineages(traces), strict=True):
+        source = SourceRecord(
+            project=store.paths.project_id,
+            dataset=dataset,
+            trace_id=trace.trace_id,
+            record_sha256=record_sha256(trace),
+        )
+        vertices = [node_vertex(*item, source) for item in ledger.vertices(trace).items()]
+        if assignment.task_lineage is not None:
+            vertices.append(
+                declared_vertex(
+                    trace.source.identity.source_id,
+                    assignment.customer_id,
+                    assignment.task_lineage,
+                )
+            )
+        if snapshot.exposure(vertices) is not None or snapshot.taken(vertices, None) is not None:
+            sealed.add(trace.trace_id)
+    return frozenset(sealed)
 
 
 def build_project(
@@ -396,6 +510,16 @@ def build_project(
         embedder=resolved_embedder,
     )
     trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
+    # Every build records its content and grouping at the root, exposed or not, so exposure
+    # found later in any project propagates through it.
+    ExposureLedger(store.paths.root).record_build(
+        project=store.paths.project_id,
+        build=artifacts.task_set.task_set_id,
+        dataset=artifact_input(trace_stored.manifest),
+        traces=artifacts.trace_dataset.traces,
+        lineages=artifacts.mining.lineage_assignments,
+        near_duplicates=artifacts.mining.analysis.edges,
+    )
     task_stored = store.artifacts.read(artifacts.task_set.task_set_id)
     if trace_stored.manifest != artifacts.trace_dataset.manifest:
         raise ValueError("loaded trace dataset manifest differs from the completed build")
@@ -416,7 +540,7 @@ def build_project(
         "project_config": project_config.model_dump(mode="json"),
         "source": source.model_dump(mode="json"),
         "mining_spec": resolved_spec.model_dump(mode="json"),
-        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_embedder": DESCRIPTOR_EMBEDDING,
         "descriptor_dimensions": descriptor_dimensions,
         "code_revision": code_revision,
         "paid_calls_made": 0,
@@ -428,7 +552,7 @@ def build_project(
         project_config=project_config,
         source=source,
         mining_spec=resolved_spec,
-        descriptor_embedder="hashing-descriptor-v1",
+        descriptor_embedder=DESCRIPTOR_EMBEDDING,
         descriptor_dimensions=descriptor_dimensions,
         code_revision=code_revision,
     )
@@ -461,6 +585,7 @@ def select_completed_build(
     review: BuildReviewReadiness,
     *,
     trace_import_id: ArtifactId | None = None,
+    trace_source: str | None = None,
 ) -> None:
     """Select a completed graph before advancing its recoverable review handoff.
 
@@ -472,6 +597,10 @@ def select_completed_build(
         build: Verified immutable trace, task, RAG, and world-model graph.
         review: Exact readiness record derived from the graph's trace and task artifacts.
         trace_import_id: Stored corpus to pin with this build, or None for direct normalized input.
+        trace_source: Declared format of that corpus, or None to keep the recorded format.
+
+    A review recorded under an earlier descriptor grouping version is replaced, like any other
+    previous build: ``review`` comes from mining under the current version.
 
     Raises:
         ValueError: The proposed graph and review name different trace or task artifacts.
@@ -480,8 +609,10 @@ def select_completed_build(
         raise ValueError("completed build does not match proposed build review")
     with _build_review_coordination(store):
         with project_connection(store.paths.root, write=True):
-            store.bind_completed_build(build, trace_import_id=trace_import_id)
-            select_build_review(store, review)
+            store.bind_completed_build(
+                build, trace_import_id=trace_import_id, trace_source=trace_source
+            )
+            select_build_review(store, review, replace_superseded=True)
 
 
 def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
@@ -506,7 +637,7 @@ def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
         current = store.read_review()
         if build is None or not isinstance(current, dict) or "build_review" not in current:
             raise ValueError("project has no completed build review; run exp build first")
-        review = BuildReviewReadiness.model_validate(current["build_review"])
+        review = parse_build_review(current["build_review"])
         if review.trace_dataset != build.trace_dataset or review.task_set != build.task_set:
             raise ValueError("project build review differs from its selected build; rebuild it")
         if task_set == build.task_set:
@@ -562,7 +693,9 @@ def coordinate_selected_build_review(
         if not isinstance(current, dict) or "build_review" not in current:
             raise ValueError("project has no completed build review")
         try:
-            review = BuildReviewReadiness.model_validate(current["build_review"])
+            review = parse_build_review(current["build_review"])
+        except SupersededBuildReviewError:
+            raise
         except ValueError as exc:
             raise ValueError("project build review is invalid") from exc
         if review.trace_dataset != trace_dataset or review.task_set != task_set:
@@ -586,7 +719,12 @@ def _build_review_coordination(store: ProjectStore) -> Iterator[None]:
         yield
 
 
-def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> None:
+def select_build_review(
+    store: ProjectStore,
+    review: BuildReviewReadiness,
+    *,
+    replace_superseded: bool = False,
+) -> None:
     """Advance review readiness after the exact completed build has been selected.
 
     The completed-build selection is written first. If execution stops before this function
@@ -595,8 +733,14 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
     Args:
         store: Project store owning the selected build and mutable review handoff.
         review: Exact readiness record derived from the selected trace and task artifacts.
+        replace_superseded: Whether ``review`` comes from mining just completed under the current
+            descriptor grouping, so a prior review recorded under an earlier version is replaced
+            as a previous build. Otherwise such a prior review is refused, since relabeling it
+            would claim a grouping its tasks were never mined under.
 
     Raises:
+        SupersededBuildReviewError: The prior review records another descriptor grouping version
+            and ``replace_superseded`` is false.
         ValueError: The selected completed build does not match the proposed review.
     """
     if not _completed_build_matches_review(store, review):
@@ -614,11 +758,11 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
         root_review = _review_object(current)
         prior_value = root_review.get("build_review")
         try:
-            prior = (
-                BuildReviewReadiness.model_validate(prior_value)
-                if prior_value is not None
-                else None
-            )
+            prior = parse_build_review(prior_value) if prior_value is not None else None
+        except SupersededBuildReviewError:
+            if not replace_superseded:
+                raise
+            prior = None
         except ValueError as exc:
             raise ValueError("review.json contains invalid build readiness") from exc
         return _advance_build_review(root_review, prior=prior, review=review)

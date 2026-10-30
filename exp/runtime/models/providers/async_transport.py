@@ -28,6 +28,7 @@ from exp.runtime.models.providers.transport import (
     is_unbilled_attempt,
     parse_retry_after,
     provider_ssl_context,
+    public_error_code,
     retain_request_attempt_evidence,
     retry_delay_seconds,
     transport_error_message,
@@ -584,6 +585,7 @@ async def post_json_async(
     retry_policy: RetryPolicy,
     idempotency_key: str | None = None,
     attempt_timeout_seconds: float | None = None,
+    classify: Callable[[Exception], RetryClassification] = classify_retry,
 ) -> JsonObject:
     """Send one JSON request with stable identity across safe endpoint retries.
 
@@ -596,6 +598,7 @@ async def post_json_async(
         retry_policy: Total same-endpoint attempt and delay bounds.
         idempotency_key: Optional stable caller or gateway attempt identity.
         attempt_timeout_seconds: Optional smaller per-attempt bound.
+        classify: Wire owner's retry policy; non-idempotent owners must refuse unknown resends.
 
     Returns:
         The first successful response body.
@@ -620,6 +623,7 @@ async def post_json_async(
         policy=retry_policy,
         deadline=deadline,
         attempt_timeout_seconds=attempt_timeout_seconds,
+        classify=classify,
     )
 
 
@@ -680,4 +684,5 @@ def _successful_body(response: JsonHttpResponse) -> JsonObject:
         status_code=response.status_code,
         retry_after_seconds=response.retry_after_seconds,
         known_unbilled=response.known_unbilled,
+        error_code=public_error_code(response.body),
     )

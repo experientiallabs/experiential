@@ -135,13 +135,39 @@ def test_comparison_rejects_leakage_and_every_hash_or_identity_drift(
         tmp_path,
         task_partition="fit" if case == "fit-task" else "held_out",
         pair_lineage="wrong-lineage" if case == "lineage-drift" else None,
-        evidence_at=_BEFORE_LOCK if case == "pre-lock" else _EVIDENCE_AT,
+        cites_lock=case != "pre-lock",
         sandbox_as_world=case == "wrong-mode",
         drift_reference="sandbox-spec" if case == "manifest-drift" else None,
         drift_rollout_hash=case == "rollout-drift",
     )
 
     with pytest.raises(SimulationComparisonError, match=message):
+        compare_text_and_sandbox(
+            fixture.spec,
+            store=fixture.store,
+            created_at=_REPORT_AT,
+            code_revision="report-revision",
+        )
+
+
+def test_post_lock_order_is_the_citation_whatever_the_clocks_claim(tmp_path: Path) -> None:
+    """Evidence citing the lock is post-lock although every clock claims it ran before the lock,
+    and a report whose clock claims a time before its protocol still resolves it."""
+    fixture = _protocol(tmp_path, evidence_at=_BEFORE_LOCK)
+    report = compare_text_and_sandbox(
+        fixture.spec,
+        store=fixture.store,
+        created_at=_BEFORE_LOCK,
+        code_revision="report-revision",
+    )
+    assert report.expected_pairs == 2
+    assert fixture.comparison_spec_input in report.inputs
+
+
+def test_evidence_not_citing_the_lock_is_refused_even_with_a_later_clock(tmp_path: Path) -> None:
+    """A simulation planned without the lock cannot be post-lock evidence, whatever its time."""
+    fixture = _protocol(tmp_path, evidence_at=_REPORT_AT, cites_lock=False)
+    with pytest.raises(SimulationComparisonError, match="predates the policy lock"):
         compare_text_and_sandbox(
             fixture.spec,
             store=fixture.store,
@@ -192,6 +218,7 @@ def _protocol(
     task_partition: Literal["fit", "held_out"] = "held_out",
     pair_lineage: str | None = None,
     evidence_at: datetime = _EVIDENCE_AT,
+    cites_lock: bool = True,
     sandbox_as_world: bool = False,
     drift_reference: Literal["sandbox-spec"] | None = None,
     drift_rollout_hash: bool = False,
@@ -211,6 +238,7 @@ def _protocol(
         task_input,
         SimulationMode.WORLD_MODEL,
         evidence_at,
+        lock_input=lock_input if cites_lock else None,
     )
     sandbox_spec, sandbox_spec_input = _persist_spec(
         store,
@@ -220,6 +248,7 @@ def _protocol(
         SimulationMode.WORLD_MODEL if sandbox_as_world else SimulationMode.SANDBOX,
         evidence_at,
         artifact_id="simulation-sandbox",
+        lock_input=lock_input if cites_lock else None,
     )
     text_simulator = _text_simulator()
     sandbox_simulator = _sandbox_simulator()
@@ -438,6 +467,7 @@ def _persist_spec(
     created_at: datetime,
     *,
     artifact_id: str | None = None,
+    lock_input: ArtifactInput | None = None,
 ) -> tuple[SimulationSpec, ArtifactInput]:
     """Persist one exact shared simulation specification for a selected mode.
 
@@ -449,6 +479,7 @@ def _persist_spec(
         mode: Simulator mode represented by the specification.
         created_at: Deterministic artifact creation time.
         artifact_id: Optional explicit simulation identity.
+        lock_input: Policy lock the specification cites, proving it was planned after it.
 
     Returns:
         Persisted specification and its exact manifest pointer.
@@ -467,6 +498,7 @@ def _persist_spec(
                 if mode is SimulationMode.WORLD_MODEL
                 else ()
             ),
+            *(() if lock_input is None else (lock_input,)),
         ),
         code_revision="fixture-revision",
         simulation_id=simulation_id,

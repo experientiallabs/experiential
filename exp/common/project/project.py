@@ -190,11 +190,16 @@ class ProjectTracePreparationSettings(ContractModel):
 
 
 class ProjectProviderFreeStage(ContractModel):
-    """Exact immutable trace and task pointers selected before provider-backed work."""
+    """Exact immutable trace and task pointers selected before provider-backed work.
+
+    ``descriptor_embedder`` is the descriptor grouping version the task set's lineages and
+    fit/held-out split were mined under; a stage selected before it was recorded has none.
+    """
 
     schema_version: int = 1
     trace_dataset: ArtifactInput
     task_set: ArtifactInput
+    descriptor_embedder: str | None = None
 
     @model_validator(mode="after")
     def _require_distinct_artifacts(self) -> ProjectProviderFreeStage:
@@ -284,7 +289,11 @@ class ProjectRouterReportArtifacts(ContractModel):
 
 
 class ProjectConfig(ContractModel):
-    """Project-local configuration that names no provider credentials or secret references."""
+    """Project-local configuration that names no provider credentials or secret references.
+
+    Attributes:
+        evaluation_tasks: Explicit immutable evaluation roots retained by normal Project export.
+    """
 
     schema_version: int = Field(default=4, ge=1)
     project_id: ArtifactId
@@ -306,6 +315,7 @@ class ProjectConfig(ContractModel):
     router_report: ProjectRouterReportArtifacts | None = None
     agent: AgentConfiguration | None = None
     model_optimization_config: ArtifactInput | None = None
+    evaluation_tasks: tuple[ArtifactInput, ...] = ()
     redacted_field_names: tuple[str, ...] = ()
 
     @model_validator(mode="before")

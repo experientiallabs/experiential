@@ -227,3 +227,27 @@ def test_invocation_slots_cannot_be_edited_to_restore_authority(
     assert ledger.used() == 1
     with pytest.raises(DispatchCapExhaustedError):
         ledger.claim(NOW)
+
+
+def test_attempt_snapshot_is_ordered_detached_and_durable_without_claims(tmp_path: Path) -> None:
+    """Reading attempt identities never creates authority or mutates an earlier snapshot."""
+    path = tmp_path / "ledger.sqlite"
+    ledger = DispatchLedger(path, cap=2, phase_config_sha256=PHASE)
+    empty = ledger.attempt_ids()
+    assert empty == ()
+    assert ledger.used() == 0
+
+    _, first = ledger.claim("2026-10-11T12:00:00+00:00")
+    one = ledger.attempt_ids()
+    _, second = ledger.claim("2026-10-10T12:00:00+00:00")
+
+    assert empty == ()
+    assert one == (first,)
+    assert ledger.attempt_ids() == (first, second)
+    assert ledger.attempt_ids() == (first, second)
+    assert ledger.used() == 2
+    reopened = DispatchLedger(path, cap=2, phase_config_sha256=PHASE)
+    assert reopened.attempt_ids() == (first, second)
+    assert reopened.used() == 2
+    with pytest.raises(DispatchCapExhaustedError):
+        reopened.claim(NOW)

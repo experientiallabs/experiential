@@ -348,6 +348,47 @@ def test_preflight_rejects_an_image_on_a_route_that_does_not_declare_it() -> Non
         preflight_gateway_request(_image_request(), GatewayDeploymentCapabilities())
 
 
+def test_an_image_refusal_names_the_message_that_carries_it() -> None:
+    """A caller who believes the session is text can find the image to remove.
+
+    The 2026-10-26 reports ("our input is just text") came from coding agents
+    whose history carried an image many turns back; the refusal named only
+    "image input".
+    """
+    image = _image_request()
+    history = image.model_copy(
+        update={
+            "messages": (
+                GatewayMessage(role="system", content="be brief"),
+                *image.messages,
+                GatewayMessage(role="assistant", content="a cat"),
+                GatewayMessage(role="user", content="thanks, now plain text only"),
+            )
+        }
+    )
+    with pytest.raises(ProviderCapabilityError, match="image_input") as raised:
+        preflight_gateway_request(history, GatewayDeploymentCapabilities())
+    detail = raised.value.detail
+    assert detail is not None
+    assert detail.startswith("Message 2 of 4 in this request (role user) carries an image")
+    assert "what is this" not in detail
+    assert "\u2014" not in detail and "\u2013" not in detail
+
+
+def test_a_non_image_refusal_carries_no_image_detail() -> None:
+    """Only the image refusal gains a location; other labels keep their wording."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stop=("END",),
+    )
+    with pytest.raises(ProviderCapabilityError, match="stop_sequences") as raised:
+        preflight_gateway_request(
+            request, GatewayDeploymentCapabilities(supports_stop_sequences=False)
+        )
+    assert raised.value.detail is None
+
+
 def test_preflight_admits_an_inline_image_on_an_image_route() -> None:
     """A declared image route serves inline bytes without declaring URL support."""
     preflight_gateway_request(

@@ -9,6 +9,7 @@ from typing import Literal
 from exp.common.core.artifacts import ArtifactId, stable_id
 from exp.common.models import NumericMeasurement
 from exp.optimize.model.sft.contracts import SFTExample
+from exp.optimize.model.sft.tail_sft import InitialLosses, select_tail
 from exp.optimize.model.sft.training_contracts import (
     TinkerSFTBudgetExceeded,
     TinkerSFTCheckpoint,
@@ -95,7 +96,11 @@ def _expected_schedule(
 
 
 def _validate_event_schedule(
-    events: Sequence[TinkerSFTEvent], expected_schedule: Sequence[_ExpectedBatch]
+    events: Sequence[TinkerSFTEvent],
+    expected_schedule: Sequence[_ExpectedBatch],
+    *,
+    spec: TinkerSFTSpec,
+    initial: InitialLosses | None,
 ) -> None:
     for event in events:
         if isinstance(event, TinkerSFTMetric):
@@ -111,6 +116,33 @@ def _validate_event_schedule(
                 raise TinkerSFTResumeError(
                     "Tinker SFT metric does not match its frozen scheduled batch"
                 )
+            if (spec.tail_sft is None) != (event.tail_selection is None):
+                raise TinkerSFTResumeError(
+                    "TailSFT metric selection differs from the frozen policy"
+                )
+            if event.tail_selection is not None:
+                selected = event.tail_selection
+                if tuple(row.example_id for row in selected.current) != event.example_ids:
+                    raise TinkerSFTResumeError("TailSFT selection differs from the scheduled batch")
+                if not set(selected.retained) <= set(event.example_ids) or not selected.retained:
+                    raise TinkerSFTResumeError("TailSFT selection lost its retained targets")
+                assert spec.tail_sft is not None and initial is not None
+                if (
+                    select_tail(initial.losses, selected.current, spec.tail_sft.drop_fraction)
+                    != selected
+                ):
+                    raise TinkerSFTResumeError(
+                        "TailSFT selection does not reproduce its loss ranking"
+                    )
+                if (
+                    sum(
+                        row.target_tokens
+                        for row in selected.current
+                        if row.example_id in selected.retained
+                    )
+                    != event.supervised_token_count
+                ):
+                    raise TinkerSFTResumeError("TailSFT target token count differs from selection")
         elif isinstance(event, TinkerSFTCheckpoint):
             expected_checkpoint_id = stable_id(
                 "tinker-sft-checkpoint",

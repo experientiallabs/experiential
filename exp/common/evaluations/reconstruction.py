@@ -6,9 +6,8 @@ from collections.abc import Callable
 from datetime import datetime
 from operator import not_
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -18,10 +17,12 @@ from exp.common.core.artifacts import (
     JsonValue,
     Sha256,
     sha256_json,
+    strict_equal,
     validate_artifact_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.judging.definition import JudgeDefinition
-from exp.common.models.client import RequestCapacityExceeded
+from exp.common.models.client import RequestAdmissionRefused, RequestCapacityExceeded
 from exp.common.project import ArtifactStore, artifact_input
 
 
@@ -57,6 +58,7 @@ class WorkflowEvidence(ContractModel):
         initial_state: Candidate initializer state.
         steps: Every planned slot in order.
         sources: Admitted reference evidence available to the judge.
+        audit_metadata: Private execution receipts, retained for audits and excluded from judging.
         contract: Declared external tool/state interface.
         final_answer: Actor answer, if the workload includes one.
         stop_reason: Actual workflow termination reason."""
@@ -68,6 +70,7 @@ class WorkflowEvidence(ContractModel):
     initial_state: JsonObject
     steps: tuple[WorkflowStep, ...]
     sources: JsonObject = Field(default_factory=dict)
+    audit_metadata: JsonObject = Field(default_factory=dict, exclude_if=not_)
     contract: JsonObject = Field(default_factory=dict)
     final_answer: JsonValue = None
     stop_reason: str = "unknown"
@@ -278,6 +281,25 @@ class TurnOutcome(ContractModel):
         return 1 - self.fields_matched / self.fields_total
 
 
+@runtime_checkable
+class ProfiledCompletion(Protocol):
+    """Structured evaluation completion with its inference configuration identity."""
+
+    @property
+    def model_identity(self) -> str:
+        """Return the actual configured completion model."""
+        ...
+
+    @property
+    def completion_profile_sha256(self) -> Sha256:
+        """Return the model, capability, output-framing and allowance identity."""
+        ...
+
+    def __call__(self, body: JsonObject, logical_id: str) -> JsonObject:
+        """Complete the exact framed request through the configured owner."""
+        ...
+
+
 class DualReport(ContractModel):
     """Independent mechanical truth and a mandatory, explicit judge outcome.
 
@@ -287,6 +309,7 @@ class DualReport(ContractModel):
         evidence_sha256: Actual chronology content identity.
         reference_sha256: Independent reference content identity.
         judge_config_sha256: Exact model, prompt and rubric identity.
+        judge_completion_sha256: Actual completion settings; absent results are unqualified.
         planned_steps: Complete planned denominator, including blocked suffixes.
         judge_status: Completed, failed, or not dispatched.
         judge_failure: Explicit unavailable/failure explanation.
@@ -299,6 +322,7 @@ class DualReport(ContractModel):
     evidence_sha256: str
     reference_sha256: str
     judge_config_sha256: str
+    judge_completion_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     planned_steps: int
     judge_status: Literal["completed", "failed", "unknown", "not_run"]
     judge_failure: str | None = None
@@ -745,6 +769,7 @@ def _evaluate_locked(
     artifact_id: str,
     clock: Callable[[], datetime],
     code_revision: str,
+    resume: bool = False,
 ) -> DualReport:
     """Retain a mechanical result and mandatory judge outcome with immutable evidence.
 
@@ -791,10 +816,20 @@ def _evaluate_locked(
         "judge.json": judge.model_dump(mode="json"),
         "request.json": body,
     }
+    completion_profile = (
+        complete.completion_profile_sha256 if isinstance(complete, ProfiledCompletion) else None
+    )
+    if isinstance(complete, ProfiledCompletion) and complete.model_identity != judge.model_identity:
+        raise ValueError("judge model differs from completion; register the matching configuration")
+    if completion_profile is not None:
+        intent_files["completion.json"] = {"profile_sha256": completion_profile}
     intent_exists = artifacts.exists(artifact_id + "-intent")
     if intent_exists:
         intent = artifacts.read(artifact_id + "-intent")
-        if intent.manifest.code_revision != code_revision or any(
+        if (
+            {file.path for file in intent.manifest.files} != set(intent_files)
+            or intent.manifest.code_revision != code_revision
+        ) or any(
             sha256_json(json.loads(artifacts.read_bytes(artifact_id + "-intent", name)))
             != sha256_json(value)
             for name, value in intent_files.items()
@@ -816,7 +851,7 @@ def _evaluate_locked(
         if artifacts.exists(artifact_id + "-response"):
             raw = json.loads(artifacts.read_bytes(artifact_id + "-response", "response.json"))
         else:
-            if intent_exists:
+            if intent_exists and not resume:
                 raise JudgeDispatchUnknown(
                     "prior judge dispatch has no saved response; billing unknown"
                 )
@@ -861,7 +896,7 @@ def _evaluate_locked(
             AxisOutcome(dimension_id=a.dimension_id, status="judge_unknown", rationale=failure)
             for a in judge.definition.dimensions
         )
-    except (JudgeNotRun, RequestCapacityExceeded) as error:
+    except (JudgeNotRun, RequestAdmissionRefused, RequestCapacityExceeded) as error:
         judged = None
         status, failure = "not_run", str(error)
         axes = tuple(
@@ -881,6 +916,7 @@ def _evaluate_locked(
         evidence_sha256=sha256_json(evidence.model_dump(mode="json")),
         reference_sha256=sha256_json(references.model_dump(mode="json")),
         judge_config_sha256=sha256_json(judge.model_dump(mode="json")),
+        judge_completion_sha256=completion_profile,
         planned_steps=len(evidence.steps),
         judge_status=status,
         judge_failure=failure,
@@ -923,17 +959,20 @@ def evaluate(
     artifact_id: str,
     clock: Callable[[], datetime],
     code_revision: str,
+    resume: bool = False,
 ) -> DualReport:
     """Evaluate or replay identical saved inputs without purchasing a judge twice.
 
     A live caller owns a nonblocking project lease. Completed reports and saved responses
     replay exactly. An interrupted intent without a response remains explicitly undispatched
-    or ambiguous, never permission to repeat an externally billed request.
+    or ambiguous, never permission to repeat an externally billed request. Only ``resume``,
+    an explicit continuation of the interrupted run, hands such an intent back to
+    ``complete``, which replays a saved response or owns any re-dispatch and its disclosure.
     """
     validate_artifact_id(artifact_id)
     lock = artifacts.project_directory.resolve() / ("evaluation-" + artifact_id + ".lock")
     lock.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(lock, timeout=0):
+    with CoordinationLock(lock, timeout=0):
         return _evaluate_locked(
             evidence,
             references,
@@ -943,19 +982,5 @@ def evaluate(
             artifact_id=artifact_id,
             clock=clock,
             code_revision=code_revision,
+            resume=resume,
         )
-
-
-def strict_equal(actual: JsonValue, expected: JsonValue) -> bool:
-    """Compare exact JSON types, preserving booleans and numeric representations."""
-    if type(actual) is not type(expected):
-        return False
-    if isinstance(actual, dict) and isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(
-            strict_equal(actual[k], expected[k]) for k in actual
-        )
-    if isinstance(actual, list) and isinstance(expected, list):
-        return len(actual) == len(expected) and all(
-            strict_equal(a, b) for a, b in zip(actual, expected, strict=True)
-        )
-    return actual == expected

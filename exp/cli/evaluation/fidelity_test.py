@@ -8,13 +8,13 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.memory import saved_memory_receipt
+from exp.optimize.evaluation.fidelity.runner import (
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_memory import saved_memory_receipt
 from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     judged,

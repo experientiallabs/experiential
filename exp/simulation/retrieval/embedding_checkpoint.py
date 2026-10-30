@@ -14,9 +14,10 @@ import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 
 from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import Embedding, ModelSnapshot
 from exp.common.project.database import content_database_path
 from exp.common.project.paths import ProjectPaths
@@ -202,7 +203,7 @@ class RAGEmbeddingCheckpoint:
     def _locked(self) -> Iterator[None]:
         """Keep provider work serialized without holding the shared database write lock."""
         self._prepare_path()
-        lock = FileLock(self.lock_path, timeout=_LOCK_TIMEOUT_SECONDS, mode=0o600)
+        lock = CoordinationLock(self.lock_path, timeout=_LOCK_TIMEOUT_SECONDS, mode=0o600)
         try:
             lock.acquire()
         except Timeout:

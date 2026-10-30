@@ -357,19 +357,22 @@ class GroupCommitAttemptLedger:
         """Resolve after every previously enqueued operation is durably committed."""
         await self._submit(lambda connection: None)
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: float = 30.0) -> None:
         """Stop the writer thread after draining every queued operation.
 
         Operations enqueued before close still commit durably; the enqueue
         lock guarantees nothing can be queued behind the stop sentinel, and
         every later submission fails fast with a closed-writer error.
         """
+        if timeout_seconds < 0:
+            raise ValueError("writer shutdown timeout cannot be negative")
         with self._submit_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._queue.put(None)
-        self._thread.join(timeout=30)
+            if not self._closed:
+                self._closed = True
+                self._queue.put(None)
+        self._thread.join(timeout=timeout_seconds)
+        if self._thread.is_alive():
+            raise TimeoutError("gateway ledger writer did not stop within its shutdown budget")
 
     def _run(self) -> None:
         """Drain queued operations into one durable SQLite transaction per batch."""

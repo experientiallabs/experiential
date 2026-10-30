@@ -24,6 +24,7 @@ from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
 from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.instance_lock import GatewayOwnership
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
@@ -142,6 +143,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     served: list[tuple[object, str, int]] = []
     control_planes: list[object] = []
     closed: list[float] = []
+    resource_closes: list[tuple[str, float]] = []
     guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
 
     def prepare(project: str, root: Path, *, policy_id: str | None) -> ProjectGatewayCompatibility:
@@ -169,6 +171,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        close=lambda *, timeout_seconds: resource_closes.append(("components", timeout_seconds)),
     )
 
     def load_components(
@@ -196,6 +199,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         assert value is components
         plane = SimpleNamespace(
             components=value,
+            close=lambda *, timeout_seconds: resource_closes.append(("control", timeout_seconds)),
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
         )
@@ -203,7 +207,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         return plane
 
     @contextmanager
-    def instance_lock(root: Path, *, port: int) -> Iterator[None]:
+    def instance_lock(root: Path, *, port: int) -> Iterator[GatewayOwnership]:
         """Capture and provide the local single-instance boundary.
 
         Args:
@@ -211,11 +215,16 @@ def test_project_option_launches_the_native_gateway_on_loopback(
             port: Requested loopback port.
 
         Yields:
-            Control while the test owns the synthetic lock.
+            Ownership on which serving records its finished teardown.
         """
         assert root == Path("/tmp/local-exp")
         assert port == 8123
-        yield
+        ownership = GatewayOwnership()
+        try:
+            yield ownership
+        finally:
+            if ownership.torn_down:
+                resource_closes.append(("lock released", 0.0))
 
     def serve(value: object, *, host: str, port: int, **kwargs: object) -> None:
         """Capture the control plane and loopback bind without serving.
@@ -271,6 +280,9 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
     assert served == ([] if check else [(control_planes[0], "127.0.0.1", 8123)])
     assert closed == [0.25]
+    # Teardown finishes before the instance lock is released, so no second gateway on the
+    # root can reconcile while these workers may still write.
+    assert resource_closes == [("control", 0.25), ("components", 0.25), ("lock released", 0.0)]
     receipt = json.loads(result.stdout)
     assert receipt["launch_mode"] == "project_alias"
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
@@ -318,8 +330,10 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        close=lambda *, timeout_seconds: resource_closes.append(("components", timeout_seconds)),
     )
     closed: list[float] = []
+    resource_closes: list[tuple[str, float]] = []
     guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
     monkeypatch.setattr(
@@ -337,6 +351,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
             reconciled_unknown_attempts=0,
             request_timeout_seconds=120.0,
             guardrail_detectors={},
+            close=lambda *, timeout_seconds: resource_closes.append(("control", timeout_seconds)),
         ),
     )
 
@@ -361,6 +376,10 @@ def test_unbindable_port_fails_before_any_ready_receipt(
     assert "bind" in result.output
     assert '"status":"ready"' not in result.output
     assert closed == [run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS]
+    assert resource_closes == [
+        ("control", run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS),
+        ("components", run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS),
+    ]
 
 
 def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:
@@ -464,10 +483,10 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         )
 
     @contextmanager
-    def instance_lock(root: Path, *, port: int) -> Iterator[None]:
+    def instance_lock(root: Path, *, port: int) -> Iterator[GatewayOwnership]:
         """Provide the single-process seam without creating a real gateway lock."""
         del root, port
-        yield
+        yield GatewayOwnership()
 
     monkeypatch.setattr(run_app, "_console", console)
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", interactive_setup)
@@ -570,3 +589,28 @@ def test_request_timeout_rejects_values_outside_its_bounds(tmp_path: Path) -> No
         )
         assert result.exit_code != 0
         assert "--request-timeout" in result.output
+
+
+def test_a_failed_drain_is_reported_as_unfinished_teardown() -> None:
+    """A drain timeout keeps later dependencies open and keeps this process the root's owner."""
+    from exp.runtime.gateway.instance_lock import GatewayTeardownIncomplete
+    from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+
+    closed: list[str] = []
+
+    def stuck(*, timeout_seconds: float) -> None:
+        """Fail the drain the way a worker that outlives its budget does."""
+        del timeout_seconds
+        raise TimeoutError("selection workers remain active")
+
+    plane = SimpleNamespace(close=stuck)
+    components = SimpleNamespace(close=lambda *, timeout_seconds: closed.append("components"))
+    with pytest.raises(GatewayTeardownIncomplete, match="keeps the root"):
+        run_app._close_owned(
+            cast(NativeControlPlane, plane),
+            cast(LocalGatewayComponents, components),
+            None,
+            0.25,
+        )
+    assert closed == []

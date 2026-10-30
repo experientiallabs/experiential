@@ -7,15 +7,17 @@ import fcntl
 import os
 import pty
 import re
-import select
+import selectors
 import struct
 import subprocess
 import sys
 import termios
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
+from typing import Concatenate
 
 import pytest
 
@@ -234,34 +236,38 @@ def _run_terminal_child(
     settle_at = 0.0
     deadline = time.monotonic() + timeout
     try:
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.05)
-            if readable:
-                try:
-                    output.extend(os.read(master, 65_536))
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
+        with selectors.DefaultSelector() as reader:
+            reader.register(master, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                if reader.select(0.05):
+                    try:
+                        output.extend(os.read(master, 65_536))
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        break
+                if pending:
+                    marker, keys = pending[0]
+                    ready = (
+                        time.monotonic() >= settle_at
+                        if marker is None
+                        else marker.encode() in output[searched:]
+                    )
+                    if ready:
+                        searched = len(output)
+                        settle_at = time.monotonic() + _SETTLE_SECONDS
+                        os.write(master, keys.encode())
+                        pending.pop(0)
+                        continue
+                if process.poll() is not None:
                     break
-            if pending:
-                marker, keys = pending[0]
-                ready = (
-                    time.monotonic() >= settle_at
-                    if marker is None
-                    else marker.encode() in output[searched:]
-                )
-                if ready:
-                    searched = len(output)
-                    settle_at = time.monotonic() + _SETTLE_SECONDS
-                    os.write(master, keys.encode())
-                    pending.pop(0)
-                    continue
-            if process.poll() is not None:
-                break
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
     finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
         os.close(master)
     transcript = output.decode(errors="replace")
     waiting = pending[0][0] if pending else None
@@ -322,3 +328,79 @@ def python_terminal_child(
         return terminal_child([sys.executable, "-c", script], **keywords)
 
     return run
+
+
+def _owned_constructor[Resource, **Arguments](
+    constructor: Callable[Concatenate[Resource, Arguments], None], owners: list[Resource]
+) -> Callable[Concatenate[Resource, Arguments], None]:
+    """Track only successfully initialized test-owned resources without changing arguments."""
+
+    @wraps(constructor)
+    def initialize(
+        resource: Resource, /, *args: Arguments.args, **kwargs: Arguments.kwargs
+    ) -> None:
+        """Construct normally, then retain the successful owner until function teardown."""
+        constructor(resource, *args, **kwargs)
+        owners.append(resource)
+
+    return initialize
+
+
+@pytest.fixture(autouse=True)
+def own_native_gateway_resources() -> Iterator[None]:
+    """Own legacy test-created native resources until this function's bounded teardown.
+
+    Successful real constructors transfer ownership to this test fixture. Cleanup uses the
+    production public close contracts, in control-plane, accounting, guardrail, then component
+    order.
+    Failed constructors remain the production startup rollback's responsibility. Tests that
+    verify explicit shutdown must assert resource release before this fixture tears down, so
+    this lifetime owner cannot conceal a broken close implementation. Module-scoped fixtures
+    retain their own explicit shutdown helpers. Constructor tracking uses its own patch context,
+    independent of test calls to monkeypatch.undo(), and is restored only after public cleanup.
+    No garbage collection or FD limits are changed.
+    """
+    from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+    from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+
+    components: list[LocalGatewayComponents] = []
+    planes: list[NativeControlPlane] = []
+    engines: list[GuardrailEngine] = []
+    accountings: list[NativeAttemptAccounting] = []
+    with pytest.MonkeyPatch.context() as owner_patch:
+        owner_patch.setattr(
+            LocalGatewayComponents,
+            "__init__",
+            _owned_constructor(LocalGatewayComponents.__init__, components),
+        )
+        owner_patch.setattr(
+            NativeControlPlane,
+            "__init__",
+            _owned_constructor(NativeControlPlane.__init__, planes),
+        )
+        owner_patch.setattr(
+            GuardrailEngine,
+            "__init__",
+            _owned_constructor(GuardrailEngine.__init__, engines),
+        )
+        owner_patch.setattr(
+            NativeAttemptAccounting,
+            "__init__",
+            _owned_constructor(NativeAttemptAccounting.__init__, accountings),
+        )
+        try:
+            yield
+        finally:
+            failures: list[Exception] = []
+            for owners in (planes, accountings, engines, components):
+                for resource in reversed(owners):
+                    try:
+                        resource.close(timeout_seconds=5.0)
+                    except Exception as error:  # noqa: BLE001 - close every owner, then report every failure.
+                        failures.append(error)
+            if failures:
+                raise ExceptionGroup(
+                    "test-owned native gateway resources failed to close", failures
+                )
