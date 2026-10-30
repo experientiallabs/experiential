@@ -75,7 +75,7 @@ def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
 
 
 def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> None:
-    """Project owns preparation settings while the selected stage stores only exact pointers."""
+    """Project owns preparation settings; the stage stores exact pointers and their grouping."""
     trace = ArtifactInput(artifact_id="trace-dataset", sha256=_DIGEST)
     task = ArtifactInput(artifact_id="task-set", sha256=_DIGEST)
     stage = ProjectProviderFreeStage(trace_dataset=trace, task_set=task)
@@ -90,6 +90,7 @@ def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> 
         "schema_version": 1,
         "trace_dataset": trace.model_dump(mode="json"),
         "task_set": task.model_dump(mode="json"),
+        "descriptor_embedder": None,
     }
     with pytest.raises(ValueError, match="trace preparation settings"):
         ProjectConfig(project_id="missing-settings", provider_free_stage=stage)

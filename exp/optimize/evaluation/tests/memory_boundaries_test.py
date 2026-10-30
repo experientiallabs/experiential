@@ -11,13 +11,14 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import memory as fidelity_memory
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.memory import saved_memory_receipt, trajectory_record
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_memory import saved_memory_receipt, trajectory_record
 from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     judged,
@@ -302,7 +303,7 @@ def test_saved_reserved_plans_reserve_and_failed_preparation_reserves_nothing(
     held = with_lineage(
         trajectory(base, "held", "gamma", "frozen", checkpoint=1), "held-lineage", reserved=True
     )
-    monkeypatch.setattr(fidelity, "reserve_task_lineage", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fidelity_memory, "reserve_task_lineage", lambda *args, **kwargs: None)
     prepared = prepare_fidelity_evaluation(project, held, code_revision="fixture")
     assert not is_reserved(project.artifacts, "fixture-memory", "held-lineage")
     monkeypatch.undo()

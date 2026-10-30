@@ -49,6 +49,8 @@ class KnownModel:
     reasoning_effort: (
         Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"] | None
     ) = None
+    supports_forced_tool_choice: bool | None = None
+    """Whether ``tool_choice`` ``any``/``tool`` is accepted; ``None`` is unverified."""
     sampling_requires_reasoning_none: bool = False
     chat_max_tokens_field: Literal["max_tokens", "max_completion_tokens"] | None = None
     minimum_temperature: float | None = None
@@ -538,29 +540,45 @@ _OPENAI_MODELS: dict[str, KnownModel] = {
     "text-embedding-ada-002": _embedding(input_usd=0.1, context_window_tokens=8_192),
 }
 
+_OPUS_5 = _anthropic_chat(
+    input_usd=5.0,
+    cached_input_usd=0.5,
+    cache_write_usd=6.25,
+    output_usd=25.0,
+    context_window_tokens=1_000_000,
+    maximum_output_tokens=128_000,
+    adaptive_reasoning=True,
+)
+
 _ANTHROPIC_MODELS: dict[str, KnownModel] = {
     # Verified live 2026-09-01: claude-fable-5-1 keeps claude-fable-5's exact
     # generation contract (adaptive-only thinking, low..max efforts,
     # temperature pinned to 1, top_p floor 0.99, top_k rejected; 1M input,
     # 128k output per the Models API) but discounts cache reads to 0.025x
     # ($0.25/MTok), so its prices are recorded explicitly, never inherited.
-    "claude-fable-5-1": _anthropic_chat(
-        input_usd=10.0,
-        cached_input_usd=0.25,
-        cache_write_usd=12.5,
-        output_usd=50.0,
-        context_window_tokens=1_000_000,
-        maximum_output_tokens=128_000,
-        adaptive_reasoning=True,
+    "claude-fable-5-1": replace(
+        _anthropic_chat(
+            input_usd=10.0,
+            cached_input_usd=0.25,
+            cache_write_usd=12.5,
+            output_usd=50.0,
+            context_window_tokens=1_000_000,
+            maximum_output_tokens=128_000,
+            adaptive_reasoning=True,
+        ),
+        supports_forced_tool_choice=False,
     ),
-    "claude-mythos-5-1": _anthropic_chat(
-        input_usd=10.0,
-        cached_input_usd=0.25,
-        cache_write_usd=12.5,
-        output_usd=50.0,
-        context_window_tokens=1_000_000,
-        maximum_output_tokens=128_000,
-        adaptive_reasoning=True,
+    "claude-mythos-5-1": replace(
+        _anthropic_chat(
+            input_usd=10.0,
+            cached_input_usd=0.25,
+            cache_write_usd=12.5,
+            output_usd=50.0,
+            context_window_tokens=1_000_000,
+            maximum_output_tokens=128_000,
+            adaptive_reasoning=True,
+        ),
+        supports_forced_tool_choice=False,
     ),
     "claude-fable-5": _anthropic_chat(
         input_usd=10.0,
@@ -580,14 +598,15 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
         maximum_output_tokens=128_000,
         adaptive_reasoning=True,
     ),
-    "claude-opus-5": _anthropic_chat(
-        input_usd=5.0,
-        cached_input_usd=0.5,
-        cache_write_usd=6.25,
-        output_usd=25.0,
-        context_window_tokens=1_000_000,
-        maximum_output_tokens=128_000,
-        adaptive_reasoning=True,
+    "claude-opus-5": _OPUS_5,
+    # Opus 5's generation contract; prices stay unrecorded, as they were when it inherited.
+    "claude-opus-5-5": replace(
+        _OPUS_5,
+        input_cost_per_million_tokens_usd=None,
+        output_cost_per_million_tokens_usd=None,
+        cached_input_cost_per_million_tokens_usd=None,
+        cache_write_cost_per_million_tokens_usd=None,
+        supports_forced_tool_choice=False,
     ),
     # https://platform.claude.com/docs/en/models/sonnet-5-5/overview
     "claude-sonnet-5-5": replace(
@@ -601,6 +620,7 @@ _ANTHROPIC_MODELS: dict[str, KnownModel] = {
             adaptive_reasoning=True,
         ),
         reasoning_effort="high",
+        supports_forced_tool_choice=False,
     ),
     "claude-sonnet-5": _anthropic_chat(
         input_usd=2.0,

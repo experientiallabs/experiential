@@ -5,12 +5,13 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Never
+from typing import Annotated, Never
 
 import typer
 from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, Prompt
 
+from exp.cli.optimize.training_job import run_training_job
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -28,7 +29,7 @@ from exp.common.models import (
 )
 from exp.common.observability.telemetry import capture_completion_once
 from exp.common.project import ProjectStore, ProjectStoreError
-from exp.common.release_revision import installed_release_revision
+from exp.common.release_revision import installed_execution_revision, installed_release_revision
 from exp.optimize.model.sft import (
     AutomaticSFTPreparationError,
     InitialSFTModelOptimizationSettings,
@@ -46,6 +47,7 @@ from exp.optimize.model.sft import (
 )
 from exp.optimize.model.sft.selection import load_latest_sft_model_optimization
 from exp.optimize.model.sft.training_contracts import (
+    TinkerSFTError,
     TinkerSFTSpec,
     conservative_training_step_cost,
 )
@@ -65,6 +67,7 @@ _USAGE_ERRORS = (
     SFTModelOptimizationError,
     TinkerSFTDependencyError,
     ValueError,
+    TinkerSFTError,
 )
 
 
@@ -108,6 +111,10 @@ def optimize_model(
         min=0,
         help="Explicit Tinker training price used for conservative local reservation.",
     ),
+    training_job: Annotated[
+        Path | None, typer.Option(help="Frozen JSON job for an existing dataset or initial losses.")
+    ] = None,
+    dry_run: Annotated[bool, typer.Option(help="Validate an explicit job without calls.")] = False,
     non_interactive: bool = typer.Option(
         False,
         "--non-interactive",
@@ -133,11 +140,41 @@ def optimize_model(
         maximum_cost_usd: Optional first-run or consistency-checked managed-training cost cap.
         training_usd_per_million_tokens: Explicit model-specific training price. Zero is accepted
             only when supplied by the user or entered during interactive setup.
+        training_job: Explicit persisted-dataset scoring or training configuration.
+        dry_run: Validate the explicit job without opening clients.
         non_interactive: Require complete flags and refuse every prompt.
 
     Raises:
         typer.BadParameter: Local configuration, preflight, W13, or registration is unsafe.
     """
+    if training_job is not None:
+        if any(
+            value is not None
+            for value in (
+                tinker_connection,
+                tinker_api_key_env,
+                base_model_alias,
+                base_model,
+                maximum_cost_usd,
+                training_usd_per_million_tokens,
+            )
+        ):
+            raise typer.BadParameter("--training-job cannot mix with automatic setup flags")
+        with usage_error(*_USAGE_ERRORS, ProjectStoreError, OSError):
+            run_training_job(
+                ProjectStore(root, project),
+                training_job,
+                console=_console,
+                yes=yes,
+                non_interactive=non_interactive,
+                dry_run=dry_run,
+                code_revision=installed_execution_revision(),
+                local_backend=_LocalPreflightBackend(),
+                compose_backend=_compose_tinker_backend,
+            )
+        return
+    if dry_run:
+        raise typer.BadParameter("--dry-run requires --training-job")
     started = time.monotonic()
     created_at = datetime.now(UTC)
     with usage_error(*_USAGE_ERRORS, ProjectStoreError, AutomaticSFTPreparationError):

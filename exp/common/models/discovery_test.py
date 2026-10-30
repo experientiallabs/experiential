@@ -251,3 +251,14 @@ def test_anthropic_point_release_resolves_a_reasoning_route_without_prices() -> 
     )
     assert inherited.capabilities.supports_reasoning is True
     assert inherited.capabilities.input_cost_per_million_tokens_usd is None
+
+
+def test_maintained_forced_tool_choice_fact_reaches_the_catalog_capabilities() -> None:
+    """A model recorded as unable to force tools is written to the catalog as such."""
+    refusing = resolve_discovered_model(
+        DiscoveredModel(provider="anthropic", model="claude-sonnet-5-5")
+    )
+    unknown = resolve_discovered_model(DiscoveredModel(provider="anthropic", model="claude-opus-5"))
+
+    assert refusing.capabilities.supports_forced_tool_choice is False
+    assert unknown.capabilities.supports_forced_tool_choice is None

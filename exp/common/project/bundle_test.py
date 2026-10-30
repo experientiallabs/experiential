@@ -777,3 +777,65 @@ def test_export_failure_never_replaces_the_destination(
 
     assert not destination.exists()
     assert not tuple(tmp_path.glob(".failed-export.exp-project.*.partial"))
+
+
+def test_evaluation_only_project_exports_selected_task_closure(tmp_path: Path) -> None:
+    """Standalone evaluation tasks travel without inventing a completed build stage."""
+    store = ProjectStore(tmp_path / "source", "evaluation-only")
+    store.initialize(ProjectConfig(project_id="evaluation-only"))
+    envelope = ArtifactEnvelope(schema_version=1, created_at=_CREATED_AT, code_revision=_REVISION)
+    checkpoint = store.artifacts.write_json(
+        artifact_id="candidate-checkpoint",
+        artifact_type="world-checkpoint",
+        envelope=envelope,
+        files={"checkpoint.json": {"state": {"count": 2}}},
+    )
+    checkpoint_ref = artifact_input(checkpoint)
+    task = store.artifacts.write_json(
+        artifact_id="evaluation-task",
+        artifact_type="evaluation-task",
+        envelope=envelope.model_copy(update={"inputs": (checkpoint_ref,)}),
+        files={"task.json": {"instruction": "Read the current count"}},
+    )
+    task_ref = artifact_input(task)
+    store.select_evaluation_task(task_ref)
+    exported = export_project_bundle(store, tmp_path / "task.zip", producer_revision=_REVISION)
+    assert exported.manifest.completed_stages == ()
+    assert exported.manifest.evaluation_tasks == (task_ref,)
+    restored = restore_project_bundle(
+        exported.path,
+        root=tmp_path / "restored",
+        expected_sha256=exported.sha256,
+    )
+    assert restored.load_project() == store.load_project()
+    assert restored.artifacts.list_ids() == ("candidate-checkpoint", "evaluation-task")
+    assert not restored.paths.runtime_directory.exists()
+
+    def change_task_roots(entries: list[tuple[zipfile.ZipInfo, bytes]]) -> None:
+        for index, (info, payload) in enumerate(entries):
+            if info.filename == "bundle.json":
+                manifest = bundle_module.ProjectBundleManifest.model_validate_json(payload)
+                changed = manifest.model_copy(update={"evaluation_tasks": (checkpoint_ref,)})
+                entries[index] = (info, canonical_json_bytes(changed))
+
+    tampered = _rewrite_bundle(exported.path, tmp_path / "tampered.zip", change_task_roots)
+    with pytest.raises(ProjectBundleError, match="evaluation task selection"):
+        restore_project_bundle(
+            tampered,
+            root=tmp_path / "rejected",
+            expected_sha256=sha256_bytes(tampered.read_bytes()),
+        )
+
+
+def test_ordinary_bundle_omits_empty_evaluation_roots(tmp_path: Path) -> None:
+    """The extension leaves ordinary manifest bytes free of an empty optional field."""
+    exported = export_project_bundle(
+        _project_store(tmp_path),
+        tmp_path / "ordinary.zip",
+        producer_revision=_REVISION,
+    )
+    assert "evaluation_tasks" not in exported.manifest.model_dump(mode="json")
+    empty = ProjectStore(tmp_path / "empty", "empty-project")
+    empty.initialize(ProjectConfig(project_id="empty-project"))
+    with pytest.raises(ProjectBundleError):
+        export_project_bundle(empty, tmp_path / "empty.zip", producer_revision=_REVISION)

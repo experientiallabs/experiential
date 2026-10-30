@@ -9,6 +9,14 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import Embedding, ModelRequest, ModelResponse
 
 
+class RequestAdmissionRefused(BaseException):
+    """A model request was locally stopped before provider dispatch or possible billing.
+
+    Budget stops deliberately bypass generic exception handlers that would mark a rollout
+    failed. Evaluation boundaries may retain an explicit not-run outcome instead.
+    """
+
+
 class RequestCapacityExceeded(ValueError):
     """A request was refused locally before provider admission or billing."""
 

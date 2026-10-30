@@ -299,6 +299,12 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
         # so it contributes no honest "got" type.
         if detail["type"] != "missing" and "input" in detail:
             got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
+    if "a string" in expected:
+        # An open vocabulary (``str | Literal[...]``, the SDK's ``model``)
+        # admits any string, so its member list names no constraint; listing
+        # it buried "expected a string" behind every known model id.
+        allowed = []
+        member_error = False
     if allowed:
         expected.insert(0, f"one of {_join_quoted(allowed)}")
     if not expected:

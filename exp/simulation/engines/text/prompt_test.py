@@ -4,11 +4,17 @@ import json
 
 import pytest
 
-from exp.common.core.artifacts import sha256_json
-from exp.common.models import AssistantAction, ModelMessage
+from exp.common.core.artifacts import ArtifactInput, sha256_json
+from exp.common.models import AssistantAction, ModelMessage, ModelRequest
 from exp.common.tasks import TaskCase
+from exp.common.tasks.facts import ConditioningFacts, parse_instance_facts
+from exp.common.tasks.facts_test import fact
+from exp.runtime.environments.artifact_edits import NativeArtifactBinding
 from exp.simulation.engines.text.prompt import (
+    INSTANCE_FACTS_GUIDANCE,
+    NATIVE_ARTIFACT_PLAN_GUIDANCE,
     WORLD_MODEL_TEXT_PROMPT_VERSION,
+    MemoryContext,
     TextWorldModelProtocolError,
     build_world_model_request,
     candidate_rag_actions,
@@ -182,3 +188,73 @@ def test_context_identity_preserves_exact_values_and_first_use_order() -> None:
     ]
     assert examples[0]["context_ref"] == examples[2]["context_ref"]
     assert examples[0]["context_ref"] != examples[3]["context_ref"]
+
+
+def test_instance_facts_have_their_own_channel_separate_from_memory() -> None:
+    """Facts render as ``instance_facts`` with their guidance, never inside memory channels."""
+    facts = parse_instance_facts(
+        {"facts": [fact("input.xlsx/Sheet1/A2", "FACT-PQTW1")]}, "fixture"
+    ).conditioning(0)
+    memory = MemoryContext(observations=({"id": "o", "reply": "MEMORY-ONLY"},))
+
+    def request(supplied: ConditioningFacts | None) -> ModelRequest:
+        """The same prediction request, with or without facts."""
+        return build_world_model_request(
+            _task(),
+            visible_messages=(ModelMessage(role="user", content="Read the workbook."),),
+            candidate_response=AssistantAction(content="Reading."),
+            grounded_examples=(),
+            maximum_output_tokens=1_000,
+            memory=memory,
+            facts=supplied,
+        )
+
+    with_facts, without = request(facts), request(None)
+    evidence = json.loads(with_facts.messages[1].content or "")
+    assert evidence["instance_facts"]["facts"][0]["value"] == "FACT-PQTW1"
+    assert evidence["instance_facts"]["state_version"] == 0
+    for channel in ("memory_observations", "research_history", "task", "environment_state"):
+        assert "FACT-PQTW1" not in json.dumps(evidence[channel])
+    assert INSTANCE_FACTS_GUIDANCE in (with_facts.messages[0].content or "")
+    # Without facts the request is unchanged: no channel and no guidance.
+    plain = json.loads(without.messages[1].content or "")
+    assert "instance_facts" not in plain
+    assert without.messages[0] == with_facts.messages[0].model_copy(
+        update={"content": (with_facts.messages[0].content or "")[: -len(INSTANCE_FACTS_GUIDANCE)]}
+    )
+
+
+def test_native_contract_augments_output_without_restricting_simulated_tools() -> None:
+    """A materializer must not turn an original simulated script into an access refusal."""
+    binding = NativeArtifactBinding(
+        input_artifact=ArtifactInput(artifact_id="input", sha256="0" * 64),
+        adapter_sha256="1" * 64,
+        output_paths=("output.xlsx",),
+    )
+    plain = _task()
+    native = plain.model_copy(
+        update={
+            "initial_context": {
+                **plain.initial_context,
+                "native_artifact_binding": binding.model_dump(mode="json"),
+            }
+        }
+    )
+    requests = [
+        build_world_model_request(
+            task,
+            visible_messages=(),
+            candidate_response=AssistantAction(content="write workbook"),
+            grounded_examples=(),
+            maximum_output_tokens=4096,
+        )
+        for task in (plain, native)
+    ]
+    assert NATIVE_ARTIFACT_PLAN_GUIDANCE not in (requests[0].messages[0].content or "")
+    assert NATIVE_ARTIFACT_PLAN_GUIDANCE in (requests[1].messages[0].content or "")
+    plain_evidence = json.loads(requests[0].messages[1].content or "")
+    native_evidence = json.loads(requests[1].messages[1].content or "")
+    assert "native_artifact_plan_schema" not in plain_evidence
+    assert "expected_projection" in native_evidence["native_artifact_plan_schema"]["properties"]
+    assert requests[0].tools == requests[1].tools == ()
+    assert native_evidence["candidate_response"] == plain_evidence["candidate_response"]

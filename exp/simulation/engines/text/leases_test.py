@@ -16,6 +16,7 @@ import pytest
 from filelock import _unix as filelock_unix
 
 from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.core.host_scope import HostScopeError, current_host
 from exp.common.core.locks import FileLockTimeout, file_write_lock
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.simulation.engines.text import leases
@@ -275,12 +276,65 @@ sys.stdin.read()
             assert recovered.state == TextCellLeaseState.STALE
             assert recovered.lease is not None
             assert recovered.lease.owner_pid == int(ready.read_text())
+            assert recovered.lease.owner_machine == current_host().machine
+            assert recovered.lease.owner_boot == current_host().boot
             assert recovered.lease.reserved_cost_usd == 1.0
             assert recovered.lease.unknown_spend_blocks_budget
         finally:
             if owner.poll() is None:
                 owner.kill()
                 owner.wait(timeout=10)
+
+
+def _owned_claim(store: TextCellLeaseStore) -> TextCellLeaseClaim:
+    """Own lease-a in this process with a finite whole-run ceiling."""
+    return store.acquire(
+        lease_id="lease-a",
+        resolution_id="resolution-a",
+        simulation_id="simulation-a",
+        rollout_id="rollout-a",
+        binding_sha256=_DIGEST,
+        maximum_cost_usd=1.0,
+        observed_spend_usd=lambda: 0.0,
+        rollout_completed=lambda _: False,
+    )
+
+
+def test_claim_from_another_machine_is_refused_and_never_taken_over(tmp_path: Path) -> None:
+    """Only the holder's machine can prove it gone, even after the holder released its lock."""
+    store = TextCellLeaseStore(
+        tmp_path / "projects" / "project-a",
+        clock=lambda: _TIME,
+        wait_timeout_seconds=0.05,
+        poll_interval_seconds=0.001,
+    )
+    claim = _owned_claim(store)
+    assert claim.lease is not None
+    store.abandon(claim.lease)
+    foreign = claim.lease.model_copy(update={"owner_machine": "f" * 32})
+    encoded = canonical_json_bytes(foreign)
+    store._records.write("lease-a", encoded)
+    with pytest.raises(HostScopeError, match="held by a process on another machine"):
+        store.stale_recovery_pending("lease-a")
+    with pytest.raises(HostScopeError, match="remote EnvironmentRuntime"):
+        _owned_claim(store)
+    assert store._records.read("lease-a") == encoded
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows exposes no boot identity")
+def test_claim_from_a_previous_boot_of_this_machine_is_stale(tmp_path: Path) -> None:
+    """A reboot ends every holder, so the claim is recovered without probing its lock."""
+    store = TextCellLeaseStore(tmp_path / "projects" / "project-a", clock=lambda: _TIME)
+    claim = _owned_claim(store)
+    assert claim.lease is not None
+    # The kernel lock is still held here, so only the boot identity can prove the holder gone.
+    earlier = claim.lease.model_copy(update={"owner_boot": "0" * 32})
+    store._records.write("lease-a", canonical_json_bytes(earlier))
+    assert store.stale_recovery_pending("lease-a")
+    recovered = _owned_claim(store)
+    assert recovered.state == TextCellLeaseState.STALE
+    assert recovered.lease is not None and recovered.lease.owner_boot == "0" * 32
+    store.abandon(claim.lease)
 
 
 def test_abandoned_execution_retains_claim_and_unknown_spend(tmp_path: Path) -> None:

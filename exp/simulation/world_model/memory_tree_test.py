@@ -20,6 +20,7 @@ from exp.simulation.world_model.memory_tree import (
     check_line,
     cover,
     fit_line,
+    fit_rule_line,
     overview,
     pending,
     read_summary,
@@ -29,6 +30,33 @@ from exp.simulation.world_model.memory_tree import (
 )
 
 NOW = datetime(2026, 10, 15, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("cue", "claim"),
+    [
+        ("condition " * 100, "Refuse cancellation."),
+        ("Order delivered", "response " * 100),
+        ("条件 " * 100, "応答 " * 100),
+    ],
+)
+def test_rule_preview_preserves_both_parts_and_marks_partial_scope(cue: str, claim: str) -> None:
+    """Long fields cannot starve each other or masquerade as a complete scoped rule."""
+    text = fit_rule_line("unresolved rule", cue, claim)
+    assert check_line(text) == text
+    assert cue.split()[0] in text and claim.split()[0] in text
+    assert "[unresolved rule]" in text and "[preview; read record]" in text
+    if len(cue.encode()) < 100:
+        assert cue in text
+    if len(claim.encode()) < 100:
+        assert claim in text
+
+
+def test_short_rule_preview_preserves_supersession() -> None:
+    """Fitting rules keep their condition, claim and explicit predecessor intact."""
+    assert fit_rule_line("unresolved rule", "delivered", "refuse", "(supersedes r1)") == (
+        "[unresolved rule] when delivered: refuse (supersedes r1)"
+    )
 
 
 def source(store: ArtifactStore, name: str) -> ArtifactInput:

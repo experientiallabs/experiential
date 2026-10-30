@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, JsonValue
 
 import exp.common.project.artifact_sqlite as artifact_sqlite
 import exp.common.project.store as project_store_module
@@ -31,6 +32,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.project.database import project_connection
+from exp.common.project.manifests import ArtifactManifest
 from exp.common.project.testing import RawArtifact
 
 
@@ -496,3 +498,76 @@ def test_secret_boundary_review_draft_and_write_once_model_config_binding(tmp_pa
         store.bind_model_optimization_config(
             artifact_input(different_manifest), artifact_type="sft-model-optimization-config"
         )
+
+
+def _count_payload_scans(monkeypatch: pytest.MonkeyPatch) -> list[BaseModel | JsonValue]:
+    """Record every structured payload scan (manifest scans are not counted)."""
+    scanned: list[BaseModel | JsonValue] = []
+    scan = project_store_module.assert_secret_free
+
+    def counted(value: BaseModel | JsonValue) -> None:
+        """Count one payload scan, then apply the real boundary."""
+        if not isinstance(value, ArtifactManifest):
+            scanned.append(value)
+        scan(value)
+
+    monkeypatch.setattr(project_store_module, "assert_secret_free", counted)
+    return scanned
+
+
+def test_a_verified_payload_is_secret_scanned_once_per_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rereading identical verified bytes skips the scan; their digest is still recomputed."""
+    store = _store(tmp_path)
+    store.artifacts.write_json(
+        artifact_id="task-set-v1",
+        artifact_type="task-set",
+        envelope=_envelope(),
+        files={"tasks.json": {"task_ids": ["task-1"]}},
+    )
+    project_store_module.SECRET_FREE_PAYLOADS.clear()
+    scanned = _count_payload_scans(monkeypatch)
+    digests: list[str] = []
+    verify = artifact_sqlite.verified_payload
+
+    def recorded(payload: bytes, digest: str) -> bytes:
+        """Record every payload digest check."""
+        digests.append(digest)
+        return verify(payload, digest)
+
+    monkeypatch.setattr(artifact_sqlite, "verified_payload", recorded)
+    for _ in range(3):
+        assert store.artifacts.read_bytes("task-set-v1", "tasks.json") == b'{"task_ids":["task-1"]}'
+    assert len(scanned) == 1, "the scan result is reused under the verified digest"
+    assert len(digests) == 3, "every read still verifies every payload digest"
+
+
+def test_a_changed_payload_is_fully_reverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forged bytes fail their digest; a consistently rehashed forgery is scanned and refused."""
+    store = _store(tmp_path)
+    store.artifacts.write_json(
+        artifact_id="task-set-v1",
+        artifact_type="task-set",
+        envelope=_envelope(),
+        files={"tasks.json": {"task_ids": ["task-1"]}},
+    )
+    store.artifacts.read("task-set-v1")  # the clean payload's scan is now remembered
+    scanned = _count_payload_scans(monkeypatch)
+    raw = RawArtifact(store.paths, "task-set-v1")
+    original_manifest = (raw / "manifest.json").read_bytes()
+    forged = b'{"task_ids":["sk-' + b"a" * 32 + b'"]}'
+    (raw / "tasks.json").write_bytes(forged)
+    with pytest.raises(ArtifactCorruptionError, match="digest mismatch|differ from its manifest"):
+        store.artifacts.read("task-set-v1")
+    manifest = ArtifactManifest.model_validate_json(original_manifest)
+    rehashed = manifest.model_copy(
+        update={"files": (project_store_module.file_digest("tasks.json", forged),)}
+    )
+    (raw / "manifest.json").write_bytes(canonical_json_bytes(rehashed))
+    for _ in range(2):  # a failing payload is never remembered
+        with pytest.raises(ArtifactStoreError, match="secret boundary"):
+            store.artifacts.read("task-set-v1")
+    assert len(scanned) == 2

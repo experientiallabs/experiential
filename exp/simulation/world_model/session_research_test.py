@@ -9,25 +9,83 @@ from filelock import Timeout
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
-from exp.common.project import ArtifactStore, ProjectPaths
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
+from exp.common.project import ArtifactStore, ProjectPaths, artifact_input
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_test import source_project, transition_reply
+from exp.optimize.evaluation.fidelity.runner_test import source_project, transition_reply
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.sessions.errors import SessionNotFoundError
 from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.transition import Completion
+from exp.simulation.retrieval.evidence_reading import EvidenceReader, ReadingPolicy
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.retrieval.selection import AllOriginals, SelectionQuery
+from exp.simulation.world_model.memory_tree_test import source as memory_source
+from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.session_research import OnlineResearchPolicy, SessionResearch
 
 
-def deferred_research(tmp_path: Path, complete: Completion) -> SessionResearch:
-    """Open a real durable research owner with two completed single-tool predictions."""
+def deferred_research(
+    tmp_path: Path,
+    complete: Completion,
+    resumption: Resumption | None = None,
+    *,
+    reader: EvidenceReader | None = None,
+    provenance: bool = True,
+    kind: str = "original-observation",
+) -> SessionResearch:
+    """Open a real durable research owner with two completed single-tool predictions.
+
+    Reopening the same directory reuses the saved session; ``resumption`` makes the owner an
+    explicit continuation of an interrupted run.
+    """
     store = SessionStore(tmp_path / "sessions.sqlite")
+    try:
+        store.read_session("session-a")
+    except SessionNotFoundError:
+        _create_session(store)
+    selector = AllOriginals()
+    artifacts = ArtifactStore(ProjectPaths(tmp_path, "research"))
+    prior: dict[str, JsonObject] = {"original-a": {"id": "original-a", "kind": kind, "reply": "A"}}
+    return SessionResearch(
+        session_id="session-a",
+        policy=OnlineResearchPolicy(
+            feedback_source="native",
+            selection_policy_sha256=selector.identity,
+            maximum_updates=1,
+            notes_reach_predictions=False,
+            reading=None if reader is None else reader.policy,
+        ),
+        store=store,
+        artifacts=artifacts,
+        complete=complete,
+        lock_path=tmp_path / "session.lock",
+        clock=lambda: datetime.now(UTC),
+        code_revision="fixture",
+        selection=selector,
+        resumption=resumption,
+        reader=reader,
+        prior=prior if reader is not None else None,
+        prior_identity={"version": 1} if reader is not None else None,
+        prior_sources={
+            "original-a": (
+                artifact_input(artifacts.read("consumed-trajectory-a").manifest)
+                if artifacts.exists("consumed-trajectory-a")
+                else memory_source(artifacts, "a"),
+            )
+        }
+        if reader is not None and provenance
+        else None,
+    )
+
+
+def _create_session(store: SessionStore) -> None:
+    """Save two committed single-tool predictions that both missed."""
     store.create_session(
         "session-a",
         SessionBinding(
@@ -46,23 +104,118 @@ def deferred_research(tmp_path: Path, complete: Completion) -> SessionResearch:
             ]
         },
     )
-    selector = AllOriginals()
-    return SessionResearch(
-        session_id="session-a",
-        policy=OnlineResearchPolicy(
-            feedback_source="native",
-            selection_policy_sha256=selector.identity,
-            maximum_updates=1,
-            notes_reach_predictions=False,
-        ),
-        store=store,
-        artifacts=ArtifactStore(ProjectPaths(tmp_path, "research")),
-        complete=complete,
-        lock_path=tmp_path / "session.lock",
-        clock=lambda: datetime.now(UTC),
-        code_revision="fixture",
-        selection=selector,
+
+
+def test_reader_rejected_original_inherits_provenance_and_completed_work_replays(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        calls.append(identity)
+        if "-plan-" in identity:
+            return {"question": "Does the record explain this discrepancy?", "read_more": True}
+        return investigation_reply()
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        calls.append("reader")
+        return {
+            "answers": {
+                key: {"type": "choice", "choice": "none"} for key in ("support", "contradiction")
+            }
+        }
+
+    reader = EvidenceReader(ReadingPolicy(), decide, lambda row: None)
+    research = deferred_research(tmp_path, complete, reader=reader)
+    result = research.observe_all([("step-0", "right")], "native")
+    row = result[0]
+    assert isinstance(row, dict)
+    assert "consumed-trajectory-a" in json.dumps(row["depends_on"])
+    assert isinstance(row["evidence_reading"], dict)
+    assert row["evidence_reading"]["selected_ids"] == []
+    assert row["evidence_reading"]["inspected_ids"] == ["original-a"]
+    before = list(calls)
+    assert research.observe_all([("step-0", "right")], "native") == result
+    assert calls == before
+
+
+def test_reader_cannot_retire_an_unread_active_note(tmp_path: Path) -> None:
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        if "-plan-" in identity:
+            return {"question": "What evidence is missing?", "read_more": False}
+        return {**investigation_reply(), "supersedes": ["original-a"]}
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        pytest.fail("Planner stopped before inspecting this note")
+
+    research = deferred_research(
+        tmp_path,
+        complete,
+        kind="hypothesis",
+        reader=EvidenceReader(ReadingPolicy(), decide, lambda row: None),
     )
+    result = research.observe_all([("step-0", "right")], "native")
+    assert isinstance(result[0], ValueError)
+    assert "original was not delivered" in str(result[0])
+
+
+def test_reader_archives_originals_without_recursively_embedding_them_in_memory(
+    tmp_path: Path,
+) -> None:
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        if "-plan-" in identity:
+            return {"question": "What historical evidence is relevant?", "read_more": True}
+        return investigation_reply()
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        return {
+            "answers": {
+                "support": {"type": "choice", "choice": "whole"},
+                "contradiction": {"type": "choice", "choice": "none"},
+            }
+        }
+
+    research = deferred_research(
+        tmp_path, complete, reader=EvidenceReader(ReadingPolicy(), decide, lambda row: None)
+    )
+    result = research.observe_all([("step-0", "right")], "native")[0]
+    assert isinstance(result, dict)
+    reading = result["evidence_reading"]
+    assert isinstance(reading, dict)
+    assert "passages" not in reading, "Raw originals must not recursively enter recall packets"
+    receipt = reading["receipt"]
+    assert isinstance(receipt, dict)
+    archive = ArtifactStore(ProjectPaths(tmp_path, "research"))
+    packet = json.loads(archive.read_bytes(str(receipt["artifact_id"]), "packet.json"))
+    assert packet["passages"][0]["original"]["reply"] == "A"
+    assert reading["selected_ids"] == ["original-a"]
+
+
+@pytest.mark.parametrize("provenance", [True, False])
+def test_reader_failure_or_unknown_provenance_does_not_publish_or_rebuy(
+    tmp_path: Path, provenance: bool
+) -> None:
+    calls: list[str] = []
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        calls.append(identity)
+        return {"question": "Support?", "read_more": True}
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        calls.append("reader")
+        raise TimeoutError("outcome unknown")
+
+    reader = EvidenceReader(ReadingPolicy(), decide, lambda row: None)
+    research = deferred_research(tmp_path, complete, reader=reader, provenance=provenance)
+    first = research.observe_all([("step-0", "right")], "native")
+    assert isinstance(first[0], TimeoutError if provenance else ValueError)
+    if not provenance:
+        assert not calls
+    before = list(calls)
+    second = research.observe_all([("step-0", "right")], "native")
+    assert isinstance(second[0], ValueError)
+    assert "--retry-incomplete" in str(second[0])
+    assert calls == before
 
 
 def investigation_reply() -> JsonObject:
@@ -101,6 +254,46 @@ def test_deferred_budget_is_session_wide_even_after_failed_intent(
     assert second[0]["investigation_skipped"] == "session investigation budget exhausted"
     assert research.observe_all([("step-1", "observed")], "native") == second
     assert len(calls) == 1
+
+
+def test_a_resumption_retries_a_failed_intent_without_a_second_budget_unit(
+    tmp_path: Path,
+) -> None:
+    """A lost investigation is flagged and sent again; its unit is not spent twice."""
+    calls: list[str] = []
+
+    def lost(body: JsonObject, identity: str) -> JsonObject:
+        """The first dispatch's outcome is unknown."""
+        calls.append(identity)
+        raise KeyboardInterrupt("process killed with the investigation in flight")
+
+    with pytest.raises(KeyboardInterrupt):
+        deferred_research(tmp_path, lost).observe_all([("step-0", "observed")], "native")
+
+    def ledger(body: JsonObject, identity: str) -> JsonObject:
+        """The request ledger refuses to replay the lost dispatch; a re-dispatch answers."""
+        calls.append(identity)
+        if not identity.endswith("-retry-1"):
+            raise DispatchOutcomeUnknown("saved provider dispatch has unresolved spend")
+        return investigation_reply()
+
+    plain = deferred_research(tmp_path, ledger).observe_all([("step-0", "observed")], "native")
+    assert isinstance(plain[0], ValueError) and "--retry-incomplete" in str(plain[0])
+    assert len(calls) == 1, "without a resumption nothing is sent"
+    retried: list[tuple[str, str, str]] = []
+    resumption = Resumption(
+        window=datetime.now(UTC) + timedelta(hours=3),
+        retried=lambda stage, operation, logical: retried.append((stage, operation, logical)),
+    )
+    settled = deferred_research(tmp_path, ledger, resumption).observe_all(
+        [("step-0", "observed"), ("step-1", "observed")], "native"
+    )
+    assert isinstance(settled[0], dict) and settled[0]["investigation"] == investigation_reply()
+    assert [(stage, operation) for stage, operation, _ in retried] == [("investigation", "step-0")]
+    assert retried[0][2].endswith("-investigate-retry-1")
+    assert isinstance(settled[1], dict)
+    assert settled[1]["investigation_skipped"] == "session investigation budget exhausted"
+    assert len(calls) == 3, "the lost one, its ledger refusal, and one re-dispatch"
 
 
 def test_deferred_feedback_holds_session_lease_during_provider_call(tmp_path: Path) -> None:
@@ -385,3 +578,54 @@ def test_failed_investigation_retains_wrong_step_and_blocks_unqualified_suffix(
     assert store.read_session(prepared.id) == snapshot
     assert execute_fidelity_evaluation(project, prepared) == result
     assert len(wire.requests) == 3
+
+
+def test_reader_response_replays_after_synthesis_interruption(tmp_path: Path) -> None:
+    """Resuming synthesis must not redraw a source judgment that already returned."""
+    reader_calls = []
+    saved: dict[str, JsonObject] = {}
+    failed = False
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        """Return an immutable negative source judgment."""
+        reader_calls.append(request)
+        return {
+            "answers": {
+                key: {"type": "choice", "choice": "none"} for key in ("support", "contradiction")
+            }
+        }
+
+    def complete(body: JsonObject, identity: str) -> JsonObject:
+        """Model the existing durable completion owner with an interrupted synthesis."""
+        nonlocal failed
+        if identity in saved:
+            return saved[identity]
+        if "-plan-" in identity:
+            saved[identity] = {"question": "Support?", "read_more": True}
+            return saved[identity]
+        if not failed:
+            failed = True
+            raise KeyboardInterrupt("interrupted synthesis")
+        if "retry" not in identity:
+            raise DispatchOutcomeUnknown("synthesis response absent")
+        return investigation_reply()
+
+    reader = EvidenceReader(ReadingPolicy(), decide, lambda row: None)
+    with pytest.raises(KeyboardInterrupt):
+        deferred_research(tmp_path, complete, reader=reader).observe_all(
+            [("step-0", "observed")], "native"
+        )
+    assert len(reader_calls) == 1
+    retries = []
+    resumption = Resumption(
+        window=datetime.now(UTC) + timedelta(hours=1), retried=lambda *row: retries.append(row)
+    )
+    result = deferred_research(tmp_path, complete, resumption, reader=reader).observe_all(
+        [("step-0", "observed")], "native"
+    )
+    assert isinstance(result[0], dict)
+    assert len(reader_calls) == 1
+    assert len(retries) == 1
+    receipt = result[0]["evidence_reading"]
+    assert isinstance(receipt, dict)
+    assert receipt["inspected_ids"] == ["original-a"]

@@ -26,7 +26,7 @@ from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
 from exp.cli.shared.consent import SpendBudget, can_prompt, one_cost_warning, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display, qualified
+from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -37,7 +37,7 @@ from exp.common.models import (
     load_model_catalog,
 )
 from exp.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
-from exp.common.progress import ProgressHook, report
+from exp.common.progress import ProgressHook, qualified, report
 from exp.common.project import (
     ArtifactStoreError,
     ProjectBudgetConfiguration,
@@ -175,10 +175,26 @@ def build(
         help="Require complete model flags and never ask setup or cost questions.",
     ),
     provider: list[str] | None = _PROVIDER_OPTION,
+    evidence_reading: bool = typer.Option(
+        False,
+        "--evidence-reading",
+        help=(
+            "Use bounded objective-driven readers during learning investigations; "
+            "saved plans stay pinned."
+        ),
+    ),
+    dream_every: int | None = typer.Option(
+        None,
+        "--dream-every",
+        min=1,
+        max=1000,
+        help="Consolidate cited memory every N traces and at completion; policy stays pinned.",
+    ),
     retry_incomplete: bool = typer.Option(
         False,
         "--retry-incomplete",
-        help="Buy again the calls of a learning trace that stopped incomplete.",
+        help="Resume an interrupted learning trace in place: saved steps replay, and a "
+        "request lost in flight is sent again and reported.",
     ),
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
@@ -207,7 +223,9 @@ def build(
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
-        retry_incomplete: Replace an interrupted learning trace, buying it again.
+        retry_incomplete: Resume an interrupted learning trace in place.
+        evidence_reading: Optional investigation readers; omitted follows a saved learning plan.
+        dream_every: Optional consolidation interval; omitted follows the saved learning plan.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
@@ -227,6 +245,13 @@ def build(
     elif identity is not None:
         raise typer.BadParameter("--identity requires --source gateway")
     if trace_file is None and import_id is None:
+        if dream_every is not None:
+            raise typer.BadParameter("--dream-every requires --traces PATH or --import-id ID")
+        if evidence_reading:
+            raise typer.BadParameter(
+                "--evidence-reading requires --traces PATH or --import-id ID; "
+                "the interactive router wizard does not run this learning profile"
+            )
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
                 "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
@@ -406,6 +431,7 @@ def build(
                     maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
                     provider_spend_authorized=True,
                     trace_import_id=import_id,
+                    trace_source=source.strip().casefold(),
                     progress=pipeline.phase("index"),
                 )
             except BaseException:
@@ -436,6 +462,8 @@ def build(
                 retry_incomplete=retry_incomplete,
                 pipeline=pipeline,
                 command=rerun,
+                evidence_reading=True if evidence_reading else None,
+                dream_every=dream_every,
             )
     except BaseException:
         pipeline.abort()
@@ -746,6 +774,7 @@ def _complete_grounded_build(
     provider_spend_authorized: bool,
     progress: ProgressHook | None = None,
     trace_import_id: str | None = None,
+    trace_source: str | None = None,
 ) -> GroundedBuildCompletion:
     """Select matching grounded artifacts or execute their bounded embedding work.
 
@@ -761,6 +790,7 @@ def _complete_grounded_build(
         maximum_build_cost_usd: Invocation ceiling covering the explicitly approved estimate.
         provider_spend_authorized: Whether new embedding calls are authorized.
         trace_import_id: Exact stored corpus selected atomically with the completed graph.
+        trace_source: Declared format of that corpus, selected with it.
         progress: Optional observer of embedding, RAG, and finalization stages.
 
     Returns:
@@ -789,22 +819,42 @@ def _complete_grounded_build(
                 f"grounded build requires ${estimate:.6f}, above the configured "
                 f"${maximum_build_cost_usd:.6f} ceiling"
             )
-        resolved_embedder = runtime_catalog.preflight(
-            selected.embedder,
-            CapabilityRequirement(requires_embeddings=True),
-        )
-        built = _build_grounded_artifacts(
+        from exp.cli.build.embedding_admission import admitted_embeddings
+
+        with admitted_embeddings(
             store,
             completed,
-            world_alias=selected.world_model,
-            world_snapshot=world_snapshot,
-            resolved_embedder=resolved_embedder,
-            top_k=top_k,
-            progress=progress,
-        )
+            runtime_catalog,
+            alias=selected.embedder,
+            snapshot=embedder_snapshot,
+            maximum_input_tokens=runtime_catalog.snapshot(selected.embedder)[
+                1
+            ].context_window_tokens,
+            estimate=estimate,
+            provider_spend_authorized=provider_spend_authorized,
+        ) as admitted_catalog:
+            resolved_embedder = admitted_catalog.preflight(
+                selected.embedder,
+                CapabilityRequirement(requires_embeddings=True),
+            )
+            built = _build_grounded_artifacts(
+                store,
+                completed,
+                world_alias=selected.world_model,
+                world_snapshot=world_snapshot,
+                resolved_embedder=resolved_embedder,
+                top_k=top_k,
+                progress=progress,
+            )
     save_grounded_checkpoint(store, built)
     report(progress, "finalization")
-    select_completed_build(store, built, completed.review, trace_import_id=trace_import_id)
+    select_completed_build(
+        store,
+        built,
+        completed.review,
+        trace_import_id=trace_import_id,
+        trace_source=trace_source,
+    )
     return GroundedBuildCompletion(artifacts=built, reused=reused)
 
 

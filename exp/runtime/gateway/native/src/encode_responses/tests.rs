@@ -967,3 +967,6 @@ fn text_after_a_refusal_still_fails_closed() {
         .expect("refusal delta encodes");
     assert!(encoder.feed(&Event::TextDelta("Sure".to_string())).is_err());
 }
+
+#[path = "item_order_tests.rs"]
+mod item_order_tests;

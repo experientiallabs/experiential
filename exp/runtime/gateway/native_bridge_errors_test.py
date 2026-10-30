@@ -8,6 +8,7 @@ from exp.runtime.gateway.native_bridge_errors import (
     capability_noun,
     capability_param,
     ledger_capability_message,
+    public_capability_error,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -75,3 +76,17 @@ def test_ledger_message_keeps_the_field_alone_for_an_unnamed_capability() -> Non
     assert ledger_capability_message(_GENERIC, None, "image_input") == (
         f"{_GENERIC} (this model route does not support image input)"
     )
+
+
+def test_a_located_image_refusal_reaches_the_caller_with_its_location() -> None:
+    """The public 400 carries the sentence naming the message that holds the image."""
+    detail = "Message 7 of 9 in this request (role tool) carries an image, and so on."
+    error = public_capability_error(
+        ProviderCapabilityError(capability="image_input", detail=detail),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        public_stream=True,
+        public_tools=False,
+    )
+    assert error.detail.code == "unsupported_capability"
+    assert error.detail.param == "messages"
+    assert error.detail.message == detail

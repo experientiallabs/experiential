@@ -10,7 +10,7 @@ Records are recalled per candidate action by the registered selector.
 from collections.abc import Callable, Sequence
 from threading import Lock
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
+from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue, Sha256, sha256_json
 from exp.common.models import AssistantAction, ModelMessage
 from exp.common.project import ArtifactStore
 from exp.common.tasks import TaskCase
@@ -23,6 +23,11 @@ from exp.simulation.world_model.experience_memory import (
     materialize_log,
     memory_view,
     summary_generations,
+)
+from exp.simulation.world_model.memory_projection import (
+    RESEARCH_HISTORY_ABLATION,
+    observation_overview,
+    without_research,
 )
 from exp.simulation.world_model.memory_tree import overview
 
@@ -39,6 +44,8 @@ class FrozenMemory:
         eligibility: Callable[[TaskCase], Eligibility],
         overview_lines: int,
         pinned: frozenset[tuple[int, int, int]],
+        record: Callable[[JsonObject], None] | None = None,
+        research_history: bool = True,
     ) -> None:
         """Bind the version, its recall selector and the per-task eligibility rule.
 
@@ -49,10 +56,14 @@ class FrozenMemory:
             eligibility: Which consumed sources one task may read.
             overview_lines: Line budget of the overview delivered with every turn.
             pinned: The summaries this version's overview may show (see ``overview_pin``).
+            record: Optional durable recorder for selection and pre-render context receipts.
+            research_history: False opens delivered summaries and withholds research delivery.
         """
         materialize_log(store, version)
         self._store, self._version, self._selection = store, version, selection
         self._eligibility, self._lines, self._pinned = eligibility, overview_lines, pinned
+        self._record = record
+        self._research_history = research_history
         self._views: dict[Eligibility, TaskView] = {}
         self._lock = Lock()
 
@@ -86,7 +97,23 @@ class FrozenMemory:
             generations=summary_generations(self._version),
             pinned=self._pinned,
         )
-        return TaskView(records=view.records, overview=tuple(rows), selection=self._selection)
+        return TaskView(
+            records=view.records,
+            overview=tuple(rows)
+            if self._research_history
+            else observation_overview(
+                self._store,
+                self._version.lineage,
+                tuple(rows),
+                admits=lambda line: (
+                    line.origin not in retired
+                    and all(admits(source) for source in (line.derived_from, *line.depends_on))
+                ),
+            ),
+            selection=self._selection,
+            record=self._record,
+            research_history=self._research_history,
+        )
 
 
 class TaskView:
@@ -98,6 +125,8 @@ class TaskView:
         records: dict[str, JsonObject],
         overview: tuple[JsonObject, ...],
         selection: EvidencePolicy,
+        record: Callable[[JsonObject], None] | None = None,
+        research_history: bool = True,
     ) -> None:
         """Bind the eligible records, the overview and the recall selector.
 
@@ -105,8 +134,28 @@ class TaskView:
             records: Eligible records keyed by identity.
             overview: Admissible overview rows, identical for every turn.
             selection: Registered selector over ``records``.
+            record: Receipt sink, independent of ranking and predictor inputs.
+            research_history: Deliver hypotheses; false removes only their current delivery.
         """
         self.records, self.overview, self._selection = records, overview, selection
+        self._record = record
+        self._research_history = research_history
+
+    @property
+    def identity(self) -> Sha256:
+        """Bind exact eligible records, overview and the action-dependent recall policy."""
+        return sha256_json(
+            {
+                "records": self.records,
+                "overview": list(self.overview),
+                "selection": self._selection.identity,
+                **(
+                    {}
+                    if self._research_history
+                    else {"research_history": RESEARCH_HISTORY_ABLATION}
+                ),
+            }
+        )
 
     def context(
         self,
@@ -123,16 +172,39 @@ class TaskView:
             message.model_dump(mode="json", exclude_none=True) for message in visible_messages
         )
         selected: dict[str, JsonObject] = {}
+        selections: list[JsonValue] = []
         for call in candidate_response.tool_calls:
-            rows, _ = selected_evidence(
+            rows, receipt = selected_evidence(
                 self._selection,
                 SelectionQuery(action=call, state=state, history=history),
                 catalog,
             )
             selected.update({key: row for key, row in rows.items() if isinstance(row, dict)})
+            selections.append({"call_id": call.call_id, "selection": receipt})
         notes = list(selected.values())
-        return MemoryContext(
+        context = MemoryContext(
             observations=tuple(n for n in notes if n.get("kind") == "original-observation"),
             prior_trajectories=tuple(n for n in notes if n.get("kind") != "original-observation"),
             overview=self.overview,
         )
+        if not self._research_history:
+            context = without_research(context)
+        if self._record is not None:
+            self._record(
+                {
+                    "kind": "memory-context-prepared",
+                    "consumer": "simulator",
+                    "view_sha256": self.identity,
+                    "eligible_ids": list(self.records),
+                    "candidate_response": candidate_response.model_dump(mode="json"),
+                    "history_sha256": sha256_json(list(history)),
+                    "state_sha256": sha256_json(state),
+                    "selections": selections,
+                    "selected_ids": list(selected),
+                    "context_sha256": sha256_json(context),
+                    "boundary": (
+                        "before final request framing; delivery requires request verification"
+                    ),
+                }
+            )
+        return context

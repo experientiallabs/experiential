@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,13 +19,16 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.union_find import UnionFind
+from exp.common.evaluations.splits import held_out_count, salted_order
 from exp.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
     ProjectStore,
 )
+from exp.optimize.model.sft.continuation_source import resolve_continuation_source
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
+    ContinuationExampleSource,
     InfrastructureFailureEvent,
     PartitionedSFTExample,
     ProductionSFTSource,
@@ -83,6 +84,7 @@ def build_sft_dataset(
     production_sources: Sequence[ProductionSFTSource],
     teacher_sources: Sequence[TeacherSFTSource],
     runtime_sources: Sequence[RuntimeSFTSource] = (),
+    continuation_sources: Sequence[ArtifactInput] = (),
     spec: SFTBuildSpec,
     created_at: datetime,
     code_revision: str,
@@ -94,6 +96,7 @@ def build_sft_dataset(
         production_sources: Pointers to persisted production-acceptance artifacts.
         teacher_sources: Pointers to persisted teacher-acceptance artifacts.
         runtime_sources: Pointers to verified routed-interaction snapshots.
+        continuation_sources: Witnessed development continuation admission reports.
         spec: Frozen split and sampling controls for this build.
         created_at: Time recorded in the resulting immutable dataset envelope.
         code_revision: Exact revision that built the artifact.
@@ -151,6 +154,16 @@ def build_sft_dataset(
             source_references.append(reference)
         exclusions.extend(resolved.exclusions)
 
+    for reference in sorted(continuation_sources, key=lambda item: item.artifact_id):
+        resolved, omitted, references = resolve_continuation_source(store, reference)
+        for candidate in resolved:
+            _require_unique_source_key(seen_source_keys, (candidate.kind, candidate.source_id))
+            prepared.append(candidate)
+        for source_reference in references:
+            _require_unique_reference(source_references, source_reference)
+            source_references.append(source_reference)
+        exclusions.extend(omitted)
+
     scanned_actions: list[_ScannedAction] = []
     for source in prepared:
         scanned, source_exclusions = _scan_source_actions(source)
@@ -166,7 +179,10 @@ def build_sft_dataset(
     exclusions = sorted(exclusions, key=_exclusion_sort_key)
 
     all_inputs = _sorted_inputs(
-        input_item for source in prepared for input_item in source.direct_inputs
+        (
+            *(input_item for source in prepared for input_item in source.direct_inputs),
+            *continuation_sources,
+        )
     )
     source_references = sorted(source_references, key=lambda item: (item.kind, item.source_id))
     partitions = tuple(sorted(partitions, key=lambda item: item.component_id))
@@ -200,7 +216,15 @@ def build_sft_dataset(
         code_revision=code_revision,
         dataset_id=dataset_id,
         build_sha256=build_sha256,
-        status="accepted" if train_rows else "insufficient",
+        status="insufficient"
+        if not train_rows
+        else "diagnostic"
+        if any(
+            isinstance(row.example.source, ContinuationExampleSource)
+            and row.example.source.qualification is None
+            for row in rows
+        )
+        else "accepted",
         acceptance_rule_ids=tuple(
             sorted(
                 {
@@ -363,7 +387,8 @@ def load_sft_dataset(
     _validate_artifact_rows(artifact)
     if require_accepted and artifact.dataset.status != "accepted":
         raise SFTBuildError(
-            f"SFT dataset {dataset_id} is insufficient and cannot be consumed for training"
+            f"SFT dataset {dataset_id} is {artifact.dataset.status} "
+            "and cannot be consumed for training"
         )
     return artifact
 
@@ -413,6 +438,16 @@ def load_verified_sft_dataset(
             production_sources=production_sources,
             teacher_sources=teacher_sources,
             runtime_sources=runtime_sources,
+            continuation_sources=tuple(
+                sorted(
+                    {
+                        source.acceptance_evidence
+                        for source in loaded.sources
+                        if source.kind == "continuation" and source.acceptance_evidence is not None
+                    },
+                    key=lambda ref: ref.artifact_id,
+                )
+            ),
             spec=build_spec,
             created_at=loaded.dataset.created_at,
             code_revision=loaded.dataset.code_revision,
@@ -513,6 +548,7 @@ def _scan_source_actions(
                     task=source.task,
                     history=history_snapshot,
                     target=event.action,
+                    tools=source.tools,
                 ),
                 target=event,
             )
@@ -563,17 +599,10 @@ def _build_partitions(
         )
         components.append((component_id, lineage_group_ids, fingerprints))
 
-    held_out_component_count = _held_out_component_count(len(components), spec.held_out_fraction)
-    ranked_components = sorted(
-        components,
-        key=lambda item: hashlib.sha256(f"{spec.split_salt}:{item[0]}".encode()).hexdigest(),
+    ranked_component_ids = salted_order((item[0] for item in components), spec.split_salt)
+    held_out_component_ids = set(
+        ranked_component_ids[: held_out_count(len(components), spec.held_out_fraction)]
     )
-    held_out_component_ids = {
-        component_id
-        for component_id, _lineage_group_ids, _fingerprints in ranked_components[
-            :held_out_component_count
-        ]
-    }
     group_partitions: dict[ArtifactId, Literal["train", "held_out"]] = {}
     partitions: list[SFTPartition] = []
     for component_id, lineage_group_ids, fingerprints in components:
@@ -593,22 +622,6 @@ def _build_partitions(
     return group_partitions, tuple(partitions)
 
 
-def _held_out_component_count(component_count: int, held_out_fraction: float) -> int:
-    """Choose the deterministic held-out count, including an explicit all-train mode.
-
-    Args:
-        component_count: Number of complete leakage components eligible for partitioning.
-        held_out_fraction: Persisted fraction, where exactly zero explicitly selects all training.
-
-    Returns:
-        Held-out component count that preserves at least one training component.
-    """
-    if component_count < 2 or held_out_fraction == 0:
-        return 0
-    target = math.floor(component_count * held_out_fraction + 0.5)
-    return min(component_count - 1, max(1, target))
-
-
 def _expand_scanned_actions(
     scanned_actions: Sequence[_ScannedAction],
     group_partitions: dict[ArtifactId, Literal["train", "held_out"]],
@@ -625,6 +638,7 @@ def _expand_scanned_actions(
                     example_id=_example_id(action),
                     leakage_group_id=action.source.leakage_group_id,
                     task=action.source.task,
+                    tools=action.source.tools,
                     history=action.history,
                     target=action.target.action,
                     source=action.source.example_source,
@@ -770,6 +784,15 @@ def _validate_artifact_rows(artifact: SFTDatasetArtifact) -> None:
         sorted(row.example.example_id for row in held_out_rows)
     ):
         raise SFTBuildError("SFT held-out example IDs do not match stored rows")
+    diagnostic = any(
+        isinstance(row.example.source, ContinuationExampleSource)
+        and row.example.source.qualification is None
+        for row in rows
+    )
+    if artifact.dataset.status == "accepted" and diagnostic:
+        raise SFTBuildError("unqualified continuation examples require diagnostic dataset status")
+    if artifact.dataset.status == "diagnostic" and (not diagnostic or not train_rows):
+        raise SFTBuildError("diagnostic dataset status requires unqualified continuation examples")
     if artifact.dataset.status == "accepted" and not train_rows:
         raise SFTBuildError("accepted SFT datasets require at least one train example")
     if artifact.dataset.status == "insufficient" and rows:
@@ -839,6 +862,8 @@ def _source_id_from_example(example: SFTExample) -> str:
         return example.source.trace_id
     if isinstance(example.source, RuntimeInteractionExampleSource):
         return example.source.interaction_id
+    if isinstance(example.source, ContinuationExampleSource):
+        return f"{example.source.study.artifact_id}-branch-{example.source.branch}"
     return example.source.rollout_id
 
 

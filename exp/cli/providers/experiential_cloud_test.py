@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
+import os
+import pty
+import resource
+import termios
 from collections.abc import Iterator, Mapping
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -11,6 +16,7 @@ from urllib.request import urlopen
 import pytest
 from rich.console import Console
 
+from exp.cli.providers import experiential_cloud
 from exp.cli.providers.experiential_cloud import (
     CATALOG_PROVIDER,
     HOSTED_GATEWAY_API_KEY_ENV,
@@ -26,6 +32,38 @@ from exp.cli.providers.experiential_cloud import (
     hosted_platform_url,
 )
 from exp.common.models import ProviderConnection
+
+
+def test_masked_key_accepts_high_terminal_descriptor_and_restores_echo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly opened high-numbered terminal retains bounded input and cleanup behavior."""
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 2048:
+        pytest.skip("process descriptor ceiling cannot exercise high terminal descriptors")
+    master, slave = pty.openpty()
+    descriptor = fcntl.fcntl(slave, fcntl.F_DUPFD_CLOEXEC, 2048)
+    original = termios.tcgetattr(slave)
+    try:
+        os.write(master, b"fixture-value\n")
+        with monkeypatch.context() as patch:
+            patch.setattr(experiential_cloud.os, "open", lambda _path, _flags: descriptor)
+            assert (
+                experiential_cloud.read_masked_key_with_callback(
+                    "Key: ", console=Console(file=io.StringIO()), wait_for_callback=lambda _: None
+                )
+                == "fixture-value"
+            )
+        assert termios.tcgetattr(slave) == original
+        assert os.get_blocking(slave)
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        os.close(master)
+        os.close(slave)
 
 
 @pytest.fixture

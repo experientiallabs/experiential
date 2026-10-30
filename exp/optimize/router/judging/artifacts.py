@@ -47,7 +47,12 @@ from exp.optimize.router.judging.contracts import (
     ManualJudgeSetupArtifact,
     ManualJudgeTraceReviewArtifact,
 )
-from exp.simulation.build import BuildReviewReadiness, coordinate_selected_build_review
+from exp.simulation.build import (
+    BuildReviewReadiness,
+    SupersededBuildReviewError,
+    coordinate_selected_build_review,
+    parse_build_review,
+)
 
 
 class _BuildEvidence(Protocol):
@@ -219,7 +224,9 @@ def load_build_review(store: ProjectStore) -> BuildReviewReadiness:
     if not isinstance(review, dict) or "build_review" not in review:
         raise ManualJudgeError("project has no completed build; run exp build first")
     try:
-        return BuildReviewReadiness.model_validate(review["build_review"])
+        return parse_build_review(review["build_review"])
+    except SupersededBuildReviewError as exc:
+        raise ManualJudgeError(str(exc)) from exc
     except ValueError as exc:
         raise ManualJudgeError("project build review is invalid") from exc
 
