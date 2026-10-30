@@ -135,7 +135,11 @@ A host sets `fast` for a request a caller asked to run faster at the priority ca
 asks for the priority processing tier (`class_throttles.fast_request`) and narrows to rungs that
 carry a priority card; when none does it refuses (`require_fast_path`), never serving it at the
 standard tier. On a third-party rung that is the provider's own priority tier, settled only on
-witnessed evidence (a downgrade settles at standard). On a self-hosted rung (`upstream_priority`)
+witnessed evidence (a downgrade settles at standard). A platform-funded carded rung whose host
+authors `priority_tier_attested` (a dedicated fast lane on a provider that reports no tier) is
+the tier itself: a `:fast` attempt there with no tier evidence settles at the priority card
+instead of holding its reservation unresolved, and it gets none of the self-hosted levers
+below. On a self-hosted rung (`upstream_priority`)
 the tier is ours, so the request gets more of the GPU:
 
 - vLLM priority `-1` (`FAST_UPSTREAM_PRIORITY`), ahead of every class, and no `service_tier`
