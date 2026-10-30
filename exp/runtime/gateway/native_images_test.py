@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 from pathlib import Path
@@ -220,3 +221,29 @@ def test_admit_refuses_url_on_a_gpt_image_model_naming_the_field(tmp_path: Path)
     assert error["param"] == "response_format"
     assert "base64 images only" in str(error["message"])
     assert json.loads(control.usage_json("{}"))["totals"]["requests"] == 1
+
+
+def test_a_url_edit_on_a_gpt_image_model_is_refused_as_not_an_edit_model(
+    tmp_path: Path,
+) -> None:
+    """An edit's ``url`` is not the fault: no OpenAI-wire rung edits images at all."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_image_generation=True),
+        provider_model="gpt-image-1",
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    upload = {
+        "fields": {"model": "coding", "prompt": "a cat", "response_format": "url"},
+        "files": {"image": base64.b64encode(b"not-a-real-png").decode("ascii")},
+    }
+    with pytest.raises(NativeBridgeError) as raised:
+        control.admit_image_edits(json.dumps({"raw_key": raw_key, "upload": upload}))
+    error = _public_error(raised.value)
+    assert error["status_code"] == 400
+    assert error["param"] == "model"
+    assert "does not edit images" in str(error["message"])

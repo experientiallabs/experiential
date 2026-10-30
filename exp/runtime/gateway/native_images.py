@@ -450,9 +450,14 @@ def _admit_accepted(
         supports = None if capabilities is None else capabilities.supports_image_generation
         if not _images_rung(profile.images_url, supports):
             continue
-        if request.response_format == "url" and returns_base64_images_only(profile.model_id):
+        if (
+            request.edit is None
+            and request.response_format == "url"
+            and returns_base64_images_only(profile.model_id)
+        ):
             # A GPT image model answers base64 only and the gateway hosts no
             # images to link to, so the rung cannot honor ``url`` (fail-closed).
+            # An edit is left to ``_rung_wire``: no OpenAI-wire rung edits.
             base64_only = True
             continue
         try:
