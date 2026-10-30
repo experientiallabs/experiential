@@ -529,8 +529,9 @@ def cache_aware_episode_decision(
     proposal for a different alias switches only when the policy's cache-switch
     gate is enabled and the fitted quality gain of the proposed alias strictly
     exceeds the gate's exchange rate times the remaining prompt-cache write
-    amortization. Unknown fit evidence or an incomplete pricing snapshot fails
-    closed to the sticky alias, and every weighed switch records its outcome.
+    amortization. A conservative fallback proposal, unknown fit evidence, or an
+    incomplete pricing snapshot fails closed to the sticky alias, and every
+    weighed switch records its outcome.
 
     Args:
         policy: Frozen router policy owning the cache-switch gate.
@@ -547,7 +548,9 @@ def cache_aware_episode_decision(
     if proposed.selected_alias == episode_decision.selected_alias:
         return sticky_decision(episode_decision, request_sha256)
     gate = policy.guard.cache_switch
-    if not gate.enabled:
+    if not gate.enabled or proposed.fallback_reason is not None:
+        # A conservative fallback proposal carries no fitted challenger, so it
+        # never resets a sticky episode or evicts its warm request cache.
         return sticky_decision(episode_decision, request_sha256)
     gain = fitted_quality_gain(
         bank,

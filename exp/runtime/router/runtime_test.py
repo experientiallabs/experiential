@@ -365,6 +365,33 @@ def test_ordinary_later_turn_reaches_the_cache_switch_gate() -> None:
     assert client.embed_calls == 2
 
 
+def test_fallback_proposal_never_resets_a_sticky_episode() -> None:
+    """A later-turn embedding fallback to baseline keeps the cheaper sticky alias."""
+    runtime, client = _cache_runtime(
+        prices=(
+            CandidateTokenPrice(
+                candidate_alias="baseline",
+                input_usd_per_million_tokens=0.5,
+                output_usd_per_million_tokens=1.5,
+            ),
+            CandidateTokenPrice(
+                candidate_alias="cheap",
+                input_usd_per_million_tokens=0.1,
+                output_usd_per_million_tokens=0.4,
+            ),
+        ),
+    )
+    first = runtime.select(_request(), episode_id="episode-fallback")
+    assert first.selected_alias == "cheap"
+    client.embedding_values = RuntimeError("embed failed")
+
+    later = runtime.select(_request(tool_name="write"), episode_id="episode-fallback")
+
+    assert later.selected_alias == "cheap"
+    assert later.fallback_reason is None
+    assert later.switch_outcome is None
+
+
 def test_disabled_cache_switch_gate_keeps_legacy_unconditional_stickiness() -> None:
     """An explicitly disabled gate never switches and records no outcome."""
     runtime, client = _cache_runtime(
