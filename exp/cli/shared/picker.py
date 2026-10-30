@@ -13,7 +13,7 @@ and back or cancel words.
 from __future__ import annotations
 
 import os
-import select
+import selectors
 import sys
 import termios
 import tty
@@ -416,6 +416,13 @@ def _utf8_length(lead: int) -> int:
     return 1
 
 
+def _terminal_readable(fd: int) -> bool:
+    """Bound one key-fragment wait without select's fixed descriptor-number ceiling."""
+    with selectors.DefaultSelector() as reader:
+        reader.register(fd, selectors.EVENT_READ)
+        return bool(reader.select(0.05))
+
+
 def _completed_utf8(fd: int, first: bytes) -> bytes:
     """Read the continuation bytes of one UTF-8 sequence so typed text survives decoding.
 
@@ -428,8 +435,7 @@ def _completed_utf8(fd: int, first: bytes) -> bytes:
     """
     data = first
     for _ in range(_utf8_length(first[0]) - 1):
-        readable, _, _ = select.select([fd], [], [], 0.05)
-        if not readable:
+        if not _terminal_readable(fd):
             break
         data += os.read(fd, 1)
     return data
@@ -447,13 +453,11 @@ def _read_terminal_key_from_fd(fd: int) -> PickerEvent:
     first = os.read(fd, 1)
     if first != b"\x1b":
         return interpret_key_bytes(_completed_utf8(fd, first))
-    readable, _, _ = select.select([fd], [], [], 0.05)
-    if not readable:
+    if not _terminal_readable(fd):
         return PickerEvent(PickerKey.ESCAPE)
     rest = os.read(fd, 1)
     if rest in {b"[", b"O"}:
-        extra_ready, _, _ = select.select([fd], [], [], 0.05)
-        if extra_ready:
+        if _terminal_readable(fd):
             rest += os.read(fd, 1)
     return interpret_key_bytes(first + rest)
 

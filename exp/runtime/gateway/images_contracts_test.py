@@ -9,6 +9,7 @@ from exp.common.models import BilledUnitKind, GatewayTokenPrices, GatewayUnitPri
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.images_contracts import (
     MAXIMUM_IMAGE_OUTPUT_TOKENS,
+    ImageEditInput,
     ImagesRequest,
     image_variant,
     images_ceiling_nano_usd,
@@ -93,3 +94,22 @@ def test_a_per_image_ceiling_is_n_images() -> None:
         )
         == 60_000_000
     )
+
+
+def test_a_generation_requires_a_prompt_and_an_edit_may_omit_it() -> None:
+    """Background removal or fast upscale carries no prompt; a generation must."""
+    with pytest.raises(ValidationError, match="requires a prompt"):
+        ImagesRequest(prompt="")
+    edit = ImagesRequest(edit=ImageEditInput(image="aW1hZ2U="))
+    assert edit.prompt == ""
+    assert image_variant(edit) == ""
+
+
+def test_edit_options_require_an_edit() -> None:
+    """Image-tool controls never ride a plain generation."""
+    with pytest.raises(ValidationError, match="edit options require"):
+        ImagesRequest(prompt="a fox", edit_options={"seed": 1})
+    request = ImagesRequest(
+        edit=ImageEditInput(image="aW1hZ2U=", mask="bWFzaw=="), edit_options={"seed": 1}
+    )
+    assert request.edit_options == {"seed": 1}

@@ -19,6 +19,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import NumericMeasurement, Usage
 from exp.optimize.model.sft.contracts import SFTExample
+from exp.optimize.model.sft.tail_sft import TailSelection, TailSFTPolicy
 
 
 class TinkerSFTError(RuntimeError):
@@ -51,6 +52,18 @@ class TinkerSFTSpec(ContractModel):
     maximum_datum_tokens: int | None = Field(default=None, gt=1)
     maximum_cost_usd: float | None = Field(default=None, gt=0)
     training_usd_per_million_tokens: float | None = Field(default=None, ge=0)
+    tail_sft: TailSFTPolicy | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    def initialization_identity(self) -> Sha256:
+        """Freeze initial weights and tokenization controls independently of the update schedule."""
+        return sha256_json(
+            {
+                "base_model": self.base_model,
+                "rank": self.lora_rank,
+                "seed": self.seed,
+                "maximum_datum_tokens": self.maximum_datum_tokens,
+            }
+        )
 
     @field_validator(
         "learning_rate",
@@ -98,7 +111,11 @@ def conservative_training_step_cost(
     if price is None or maximum_tokens is None:
         return None
     return NumericMeasurement(
-        value=price * maximum_tokens * batch_example_count / 1_000_000,
+        value=price
+        * maximum_tokens
+        * batch_example_count
+        / 1_000_000
+        * (2 if spec.tail_sft is not None else 1),
         provenance="estimated",
     )
 
@@ -204,8 +221,10 @@ class TinkerSFTRunManifest(ArtifactEnvelope):
         expected_inputs = (
             ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_manifest_sha256),
         )
+        if self.spec.tail_sft is not None:
+            expected_inputs += (self.spec.tail_sft.reference,)
         if self.inputs != expected_inputs:
-            raise ValueError("Tinker SFT manifests must name exactly their frozen dataset build")
+            raise ValueError("Tinker SFT manifests must name their dataset and initial losses")
         if self.spec_sha256 != sha256_json(self.spec):
             raise ValueError("Tinker SFT manifest spec digest does not match settings")
         expected_run_id = stable_id(
@@ -240,6 +259,9 @@ class TinkerSFTMetric(ContractModel):
     usage: Usage | None = None
     cost_usd: NumericMeasurement | None = None
     cumulative_cost_usd: NumericMeasurement | None = None
+    tail_selection: TailSelection | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("loss", "gradient_norm")
     @classmethod
@@ -325,6 +347,9 @@ class TinkerSFTModelArtifact(ArtifactEnvelope):
     final_checkpoint_id: ArtifactId
     final_checkpoint_state_path: str = Field(min_length=1, max_length=2048)
     sampling_handle: str = Field(min_length=1, max_length=2048)
+    initial_losses: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     training_step_count: int = Field(gt=0)
     training_metric_count: int = Field(gt=0)
     total_cost_usd: NumericMeasurement | None = None
@@ -342,8 +367,10 @@ class TinkerSFTModelArtifact(ArtifactEnvelope):
         expected_inputs = (
             ArtifactInput(artifact_id=self.dataset_id, sha256=self.dataset_manifest_sha256),
         )
+        if self.initial_losses is not None:
+            expected_inputs += (self.initial_losses,)
         if self.inputs != expected_inputs:
-            raise ValueError("Tinker SFT models must name exactly their frozen dataset build")
+            raise ValueError("Tinker SFT models must name their dataset and initial losses")
         expected_model_id = stable_id(
             "tinker-sft-model",
             {

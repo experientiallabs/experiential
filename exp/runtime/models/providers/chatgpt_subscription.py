@@ -28,7 +28,7 @@ import httpx
 
 from exp.common.auth import StoredOAuthTokens
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot, ReasoningEffort
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport, RequestDeadline
 from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS, GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
@@ -338,7 +338,7 @@ class ChatGptSubscriptionClient(OpenAIClient):
         supports_temperature: bool = True,
         supports_top_p: bool | None = None,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         sampling_requires_reasoning_none: bool = False,
     ) -> None:
         """Create a client whose credential is minted per request from the token source.

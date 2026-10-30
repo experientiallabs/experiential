@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal, cast
 
-from exp.common.models import ModelClient, ModelFinishReason, ModelMessage, ModelRequest, Usage
+from pydantic import Field
+
+from exp.common.core.artifacts import ContractModel, Sha256, sha256_json
+from exp.common.models import (
+    ModelClient,
+    ModelFinishReason,
+    ModelMessage,
+    ModelRequest,
+    ToolCall,
+    Usage,
+)
 from exp.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from exp.common.tasks import TaskCase
 from exp.runtime.agents.interface import AgentEpisode
@@ -14,6 +24,37 @@ from exp.runtime.environments import EnvironmentSession, Observation
 
 _DEFAULT_MAXIMUM_MODEL_CALLS = 100
 _MAXIMUM_SYSTEM_PROMPT_CHARACTERS = 20_000
+
+
+class InvisibleToolCallError(ValueError):
+    """A proposed actor call refused before environment dispatch.
+
+    Attributes:
+        action: Exact refused call for operator evidence and attempted-action grading.
+    """
+
+    def __init__(self, action: ToolCall) -> None:
+        """Retain the action without copying its arguments into the exception message."""
+        self.action = action
+        super().__init__(
+            f"candidate requested tool {action.name!r}, which is not visible to the task"
+        )
+
+
+class ChatCheckpoint(ContractModel):
+    """Actor-visible state at a completed tool turn, with no hidden model process state.
+
+    Attributes:
+        task_sha256: Exact public task including tools and initial context.
+        runtime_sha256: Chat policy and original model-call ceiling.
+        messages: Complete actor-visible conversation, excluding future outcomes.
+        calls: Completed model calls charged against the original ceiling.
+    """
+
+    task_sha256: Sha256
+    runtime_sha256: Sha256
+    messages: tuple[ModelMessage, ...] = Field(min_length=1)
+    calls: int = Field(ge=0, strict=True)
 
 
 class ChatAgentRuntime:
@@ -39,12 +80,62 @@ class ChatAgentRuntime:
         self._maximum_model_calls = maximum_model_calls
         self._system_prompt = normalize_chat_system_prompt(system_prompt)
 
+    @property
+    def identity(self) -> Sha256:
+        """Bind the stateless actor protocol, instructions and original call ceiling."""
+        return sha256_json(
+            {
+                "protocol": "checkpointable-chat-v1",
+                "system_prompt": self._system_prompt,
+                "maximum_model_calls": self._maximum_model_calls,
+            }
+        )
+
+    def remaining_calls(self, checkpoint: ChatCheckpoint) -> int:
+        """Return the captured policy's remaining allowance, refusing another runtime."""
+        if checkpoint.runtime_sha256 != self.identity:
+            raise ValueError("actor checkpoint belongs to another runtime policy")
+        return max(0, self._maximum_model_calls - checkpoint.calls)
+
+    def resume(
+        self,
+        task: TaskCase,
+        checkpoint: ChatCheckpoint,
+        *,
+        model: ModelClient,
+        environment: EnvironmentSession,
+        on_checkpoint: Callable[[ChatCheckpoint], None] | None = None,
+    ) -> AgentEpisode:
+        """Continue a completed turn without replaying its model or tool calls.
+
+        Args:
+            task: Same public task, permissions and tools as the captured prefix.
+            checkpoint: Full visible conversation at a quiescent turn boundary.
+            model: Fresh sampling client for this continuation's registered policy.
+            environment: World already restored to the same boundary by its owner.
+            on_checkpoint: Optional trusted observer; never passed to the actor model.
+
+        Returns:
+            Only events and usage bought after the checkpoint.
+        """
+        if (
+            checkpoint.task_sha256 != sha256_json(task)
+            or checkpoint.runtime_sha256 != self.identity
+        ):
+            raise ValueError("actor checkpoint differs from task or runtime; use its frozen inputs")
+        if not self.remaining_calls(checkpoint):
+            raise ValueError(
+                "actor checkpoint has no remaining calls; select an earlier checkpoint"
+            )
+        return self._continue(task, model, environment, checkpoint, on_checkpoint)
+
     def run(
         self,
         task: TaskCase,
         *,
         model: ModelClient,
         environment: EnvironmentSession,
+        on_checkpoint: Callable[[ChatCheckpoint], None] | None = None,
     ) -> AgentEpisode:
         """Execute model actions until a final response or the configured call ceiling.
 
@@ -52,6 +143,7 @@ class ChatAgentRuntime:
             task: Real task instruction, context, and task-visible tool schemas.
             model: Candidate completion client selected for this evaluation cell.
             environment: Execute-only environment capability owned by the simulator.
+            on_checkpoint: Trusted callback after each fully observed tool turn and at startup.
 
         Returns:
             Ordered model, tool, and observation spans with the terminal assistant action.
@@ -59,32 +151,41 @@ class ChatAgentRuntime:
         Raises:
             ValueError: The model invokes a tool outside the task-visible schemas.
         """
+        checkpoint = self.initial_checkpoint(task)
+        if on_checkpoint is not None:
+            on_checkpoint(checkpoint)
+        return self._continue(task, model, environment, checkpoint, on_checkpoint)
+
+    def initial_checkpoint(self, task: TaskCase) -> ChatCheckpoint:
+        """Construct the exact initial actor context without credentials or provider calls."""
         messages = (
             [ModelMessage(role="system", content=self._system_prompt)]
             if self._system_prompt is not None
             else []
         )
-        captured = task.initial_context.get("instruction_messages", [])
-        if isinstance(captured, list):
-            for instruction in captured:
-                if isinstance(instruction, dict) and instruction.get("role") in (
-                    "system",
-                    "developer",
-                ):
-                    content = instruction.get("content")
-                    if isinstance(content, str):
-                        messages.append(
-                            ModelMessage(
-                                role=cast(Literal["system", "developer"], instruction["role"]),
-                                content=content,
-                            )
-                        )
-        messages.append(ModelMessage(role="user", content=_task_prompt(task)))
+        messages.extend(task_messages(task))
+        return ChatCheckpoint(
+            task_sha256=sha256_json(task),
+            runtime_sha256=self.identity,
+            messages=tuple(messages),
+            calls=0,
+        )
+
+    def _continue(
+        self,
+        task: TaskCase,
+        model: ModelClient,
+        environment: EnvironmentSession,
+        checkpoint: ChatCheckpoint,
+        on_checkpoint: Callable[[ChatCheckpoint], None] | None,
+    ) -> AgentEpisode:
+        """Run the single chat loop from its exact visible prefix and remaining allowance."""
+        messages = list(checkpoint.messages)
         events: list[RolloutSpan] = []
         usages: list[Usage] = []
         visible_tools = {tool.name for tool in task.tools}
         final_action = None
-        for step in range(self._maximum_model_calls):
+        for step in range(checkpoint.calls, self._maximum_model_calls):
             started_at = datetime.now(UTC)
             response = model.complete(
                 ModelRequest(
@@ -126,9 +227,7 @@ class ChatAgentRuntime:
                 )
             for index, call in enumerate(response.output.tool_calls):
                 if call.name not in visible_tools:
-                    raise ValueError(
-                        f"candidate requested tool {call.name!r}, which is not visible to the task"
-                    )
+                    raise InvisibleToolCallError(call)
                 observation = _execute_and_record(
                     environment,
                     call,
@@ -141,6 +240,15 @@ class ChatAgentRuntime:
                         role="tool",
                         content=observation.content,
                         tool_call_id=call.call_id,
+                    )
+                )
+            if on_checkpoint is not None:
+                on_checkpoint(
+                    ChatCheckpoint(
+                        task_sha256=checkpoint.task_sha256,
+                        runtime_sha256=self.identity,
+                        messages=tuple(messages),
+                        calls=step + 1,
                     )
                 )
         return AgentEpisode(
@@ -171,6 +279,31 @@ def normalize_chat_system_prompt(value: str | None) -> str | None:
     if len(normalized) > _MAXIMUM_SYSTEM_PROMPT_CHARACTERS:
         raise ValueError("system_prompt exceeds 20000 characters")
     return normalized
+
+
+def task_messages(task: TaskCase) -> tuple[ModelMessage, ...]:
+    """Render the same public instructions and initial facts for every maintained actor adapter.
+
+    Args:
+        task: Public task contract; reference answers and evaluator metadata are not rendered.
+
+    Returns:
+        Captured system/developer instructions followed by the user task and public context.
+    """
+    messages = []
+    captured = task.initial_context.get("instruction_messages", [])
+    if isinstance(captured, list):
+        for instruction in captured:
+            if isinstance(instruction, dict) and instruction.get("role") in ("system", "developer"):
+                content = instruction.get("content")
+                if isinstance(content, str):
+                    messages.append(
+                        ModelMessage(
+                            role=cast(Literal["system", "developer"], instruction["role"]),
+                            content=content,
+                        )
+                    )
+    return (*messages, ModelMessage(role="user", content=_task_prompt(task)))
 
 
 def _task_prompt(task: TaskCase) -> str:
@@ -221,8 +354,6 @@ def _execute_and_record(
     Raises:
         TypeError: The supplied action is not a canonical tool call.
     """
-    from exp.common.models import ToolCall
-
     if not isinstance(call, ToolCall):
         raise TypeError("chat agent tool actions must use ToolCall")
     call_started_at = datetime.now(UTC)

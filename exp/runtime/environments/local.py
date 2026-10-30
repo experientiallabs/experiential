@@ -1,24 +1,22 @@
 """A bounded JSONL local-process implementation of the executable environment seam.
 
-This adapter gives every episode a new temporary workspace and a long-lived process. It is an
-execution boundary, not a security boundary: a customer process still has the permissions of the
-user who starts EXP. Customers that need an isolated VM can provide an E2B or other
-``EnvironmentRuntime`` implementation instead.
+This adapter gives every episode a new temporary workspace and a long-lived process. The host
+containment backend, detected once at construction, decides which guarantees every session
+enforces (see :attr:`LocalProcessEnvironmentRuntime.containment`); a session that cannot apply
+them is refused. The customer process still runs as the user who starts EXP, so anything the
+report lists as unavailable is not contained. Customers that need an isolated VM can provide an
+E2B or other ``EnvironmentRuntime`` implementation instead.
 """
 
 from __future__ import annotations
 
-import ctypes
 import json
 import math
 import os
 import queue
-import select
 import selectors
 import shutil
-import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -27,11 +25,21 @@ from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Protocol, cast
+from typing import cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.common.rollouts.containment import ContainmentReport
 from exp.common.tasks import TaskCase
+from exp.runtime.environments.containment.contract import (
+    ContainedProcess,
+    ContainmentBackend,
+    LocalProcessCleanupError,
+    LocalProcessCrashError,
+    ProcessLaunch,
+    ResourceLimits,
+)
+from exp.runtime.environments.containment.host import host_containment
 from exp.runtime.environments.interface import EnvironmentSession, Observation
 
 _WORKSPACE_ENVIRONMENT_VARIABLE = "EXP_SANDBOX_WORKSPACE"
@@ -45,347 +53,22 @@ _DEFAULT_CHILD_ENVIRONMENT = {
 }
 
 
-@dataclass(frozen=True)
-class _ProcessIdentity:
-    """PID plus kernel start time, which prevents signaling a reused PID."""
-
-    pid: int
-    started: tuple[int, int]
-
-
-@dataclass(frozen=True)
-class _ProcessRecord:
-    """One process-tree snapshot row."""
-
-    identity: _ProcessIdentity
-    parent_pid: int
-    zombie: bool
-
-
-class _KqueueEvent(Protocol):
-    fflags: int
-
-
-class _Kqueue(Protocol):
-    """The Darwin queue operations owned by one descendant tracker."""
-
-    def close(self) -> None: ...
-
-    def control(self, changes: object, max_events: int, timeout: int) -> list[_KqueueEvent]: ...
-
-
-class _KqueueFactory(Protocol):
-    def __call__(self) -> _Kqueue: ...
-
-
-class _KeventFactory(Protocol):
-    """Create one Darwin process-notification registration event."""
-
-    def __call__(self, ident: int, *, filter: int, flags: int, fflags: int) -> object: ...
-
-
-@dataclass(frozen=True)
-class _DarwinKqueueBindings:
-    """Dynamically loaded Darwin-only ``select`` bindings for containment proof."""
-
-    kqueue: _KqueueFactory
-    kevent: _KeventFactory
-    filter_process: int
-    event_add: int
-    event_clear: int
-    note_fork: int
-    note_exit: int
-
-
-class _DarwinProcBsdInfo(ctypes.Structure):
-    """ABI layout returned by Darwin ``PROC_PIDTBSDINFO``."""
-
-    _fields_ = [
-        ("flags", ctypes.c_uint32),
-        ("status", ctypes.c_uint32),
-        ("xstatus", ctypes.c_uint32),
-        ("pid", ctypes.c_uint32),
-        ("ppid", ctypes.c_uint32),
-        ("uid", ctypes.c_uint32),
-        ("gid", ctypes.c_uint32),
-        ("ruid", ctypes.c_uint32),
-        ("rgid", ctypes.c_uint32),
-        ("svuid", ctypes.c_uint32),
-        ("svgid", ctypes.c_uint32),
-        ("rfu_1", ctypes.c_uint32),
-        ("comm", ctypes.c_char * 16),
-        ("name", ctypes.c_char * 32),
-        ("nfiles", ctypes.c_uint32),
-        ("pgid", ctypes.c_uint32),
-        ("pjobc", ctypes.c_uint32),
-        ("e_tdev", ctypes.c_uint32),
-        ("e_tpgid", ctypes.c_uint32),
-        ("nice", ctypes.c_int32),
-        ("start_seconds", ctypes.c_uint64),
-        ("start_microseconds", ctypes.c_uint64),
-    ]
-
-
-class _DescendantTracker:
-    """Track exact descendants and kernel fork evidence without trusting numeric groups."""
-
-    def __init__(
-        self,
-        root_identity: _ProcessIdentity,
-        bindings: _DarwinKqueueBindings,
-    ) -> None:
-        snapshot = _process_snapshot()
-        root = snapshot.get(root_identity.pid)
-        if root is None or root.identity != root_identity:
-            raise LocalProcessCleanupError("could not identify local environment process")
-        self._known = {root.identity}
-        self._root = root.identity
-        self._fork_observed = False
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._failure: Exception | None = None
-        self._bindings = bindings
-        self._kqueue = bindings.kqueue()
-        try:
-            event = bindings.kevent(
-                root_identity.pid,
-                filter=bindings.filter_process,
-                flags=bindings.event_add | bindings.event_clear,
-                fflags=bindings.note_fork | bindings.note_exit,
-            )
-            self._kqueue.control((event,), 0, 0)
-            self._thread = threading.Thread(
-                target=self._monitor,
-                name=f"exp-local-descendants-{root_identity.pid}",
-                daemon=True,
-            )
-            self._thread.start()
-        except BaseException:  # noqa: BLE001 - constructor must close its partially-owned FD
-            self._kqueue.close()
-            raise
-
-    def live_identities(self) -> tuple[_ProcessIdentity, ...]:
-        """Refresh and return only identities still owned by the tracked tree."""
-        self._refresh()
-        if self._failure is not None:
-            raise LocalProcessCleanupError("local descendant monitor failed") from self._failure
-        snapshot = _process_snapshot()
-        with self._lock:
-            return tuple(
-                identity
-                for identity in self._known
-                if (record := snapshot.get(identity.pid)) is not None
-                and record.identity == identity
-                and not record.zombie
-            )
-
-    def stop(self, timeout_seconds: float) -> str | None:
-        """Stop the monitor and return any immutable fork-containment failure evidence."""
-        self._stop.set()
-        self._thread.join(timeout_seconds)
-        if self._thread.is_alive():
-            raise LocalProcessCleanupError("local descendant monitor did not stop")
-        try:
-            if self._failure is not None:
-                raise LocalProcessCleanupError("local descendant monitor failed") from self._failure
-            return self.containment_failure()
-        finally:
-            self._kqueue.close()
-
-    def containment_failure(self) -> str | None:
-        """Return immutable root PID evidence when any fork prevents containment proof."""
-        self._read_kernel_events()
-        with self._lock:
-            if not self._fork_observed:
-                return None
-            return (
-                f"fork observed from root pid={self._root.pid} "
-                f"start={self._root.started[0]}.{self._root.started[1]}"
-            )
-
-    def _monitor(self) -> None:
-        """Poll the kernel tree while the root is alive and through teardown."""
-        try:
-            while not self._stop.wait(0.005):
-                self._read_kernel_events()
-                self._refresh()
-        except Exception as exc:  # noqa: BLE001 - surfaced synchronously during cleanup
-            self._failure = exc
-            self._stop.set()
-
-    def _read_kernel_events(self) -> None:
-        """Latch kernel fork evidence even when no numeric child PID remains observable."""
-        for event in self._kqueue.control(None, 8, 0):
-            if event.fflags & self._bindings.note_fork:
-                with self._lock:
-                    self._fork_observed = True
-
-    def _refresh(self) -> None:
-        """Add recursively reachable children without forgetting detached identities."""
-        snapshot = _process_snapshot()
-        with self._lock:
-            live_parent_pids = {
-                identity.pid
-                for identity in self._known
-                if (record := snapshot.get(identity.pid)) is not None
-                and record.identity == identity
-            }
-            changed = True
-            while changed:
-                changed = False
-                for record in snapshot.values():
-                    if record.parent_pid not in live_parent_pids:
-                        continue
-                    if record.identity not in self._known:
-                        self._known.add(record.identity)
-                        changed = True
-                    live_parent_pids.add(record.identity.pid)
-
-
-def _process_snapshot() -> dict[int, _ProcessRecord]:
-    """Read an identity-bearing process table without invoking a shell or ``ps``."""
-    if sys.platform == "darwin":
-        return _darwin_process_snapshot()
-    if sys.platform.startswith("linux"):
-        return _linux_process_snapshot()
-    raise LocalProcessCleanupError("local descendant tracking requires Darwin or Linux")
-
-
-def _require_containment_support() -> _DarwinKqueueBindings:
-    """Load required Darwin queue bindings before allocating process resources."""
-    if sys.platform != "darwin":
-        raise LocalProcessCleanupError(
-            "local process containment requires Darwin kernel fork notifications"
-        )
-
-    def binding(name: str) -> object:
-        """Read one required Darwin-only ``select`` attribute."""
-        return getattr(select, name)
-
-    try:
-        return _DarwinKqueueBindings(
-            kqueue=cast(_KqueueFactory, binding("kqueue")),
-            kevent=cast(_KeventFactory, binding("kevent")),
-            filter_process=cast(int, binding("KQ_FILTER_PROC")),
-            event_add=cast(int, binding("KQ_EV_ADD")),
-            event_clear=cast(int, binding("KQ_EV_CLEAR")),
-            note_fork=cast(int, binding("KQ_NOTE_FORK")),
-            note_exit=cast(int, binding("KQ_NOTE_EXIT")),
-        )
-    except AttributeError as error:
-        raise LocalProcessCleanupError(
-            "local process containment requires Darwin kernel fork notifications"
-        ) from error
-
-
-def _read_process_identity(pid: int) -> _ProcessIdentity:
-    """Read one gated child identity independently from descendant-table initialization."""
-    if sys.platform != "darwin":  # pragma: no cover - support preflight rejects other platforms
-        raise LocalProcessCleanupError("local process identity requires Darwin libproc")
-    record = _darwin_process_record(pid)
-    if record is None:
-        raise LocalProcessCleanupError("could not read gated local process identity")
-    return record.identity
-
-
-def _darwin_process_snapshot() -> dict[int, _ProcessRecord]:
-    """Read Darwin's libproc table with PID start timestamps."""
-    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    count = library.proc_listallpids(None, 0)
-    if count <= 0:
-        raise OSError(ctypes.get_errno(), "proc_listallpids failed")
-    pids = (ctypes.c_int * (count + 64))()
-    returned = library.proc_listallpids(pids, ctypes.sizeof(pids))
-    records: dict[int, _ProcessRecord] = {}
-    for pid in pids[: max(0, returned)]:
-        if pid <= 0:
-            continue
-        if record := _darwin_process_record(pid, library=library):
-            records[pid] = record
-    return records
-
-
-def _darwin_process_record(
-    pid: int,
-    *,
-    library: ctypes.CDLL | None = None,
-) -> _ProcessRecord | None:
-    """Read one Darwin process record with its kernel start timestamp."""
-    proc = library or ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    info = _DarwinProcBsdInfo()
-    size = proc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-    if size != ctypes.sizeof(info):
-        return None
-    identity = _ProcessIdentity(pid=pid, started=(info.start_seconds, info.start_microseconds))
-    return _ProcessRecord(
-        identity=identity,
-        parent_pid=info.ppid,
-        zombie=info.status == 5,
-    )
-
-
-def _linux_process_snapshot() -> dict[int, _ProcessRecord]:
-    """Read Linux procfs process relationships and kernel start ticks."""
-    records: dict[int, _ProcessRecord] = {}
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat = (entry / "stat").read_text(encoding="utf-8")
-            fields = stat[stat.rfind(")") + 2 :].split()
-            pid = int(entry.name)
-            identity = _ProcessIdentity(pid=pid, started=(int(fields[19]), 0))
-            records[pid] = _ProcessRecord(
-                identity=identity,
-                parent_pid=int(fields[1]),
-                zombie=fields[0] == "Z",
-            )
-        except (FileNotFoundError, PermissionError, ValueError, IndexError):
-            continue
-    return records
-
-
-def _signal_exact_identity(identity: _ProcessIdentity, signal_number: int) -> None:
-    """Signal a PID only while its kernel start identity still matches the tracked process."""
-    record = _process_snapshot().get(identity.pid)
-    if record is None or record.identity != identity or record.zombie:
-        return
-    try:
-        os.kill(identity.pid, signal_number)
-    except ProcessLookupError:
-        return
-
-
-def _close_fd(file_descriptor: int) -> None:
-    """Close one owned descriptor while treating an already-closed descriptor as complete."""
-    try:
-        os.close(file_descriptor)
-    except OSError:
-        return
-
-
 class LocalProcessProtocolError(RuntimeError):
     """The local executable did not follow the JSONL environment protocol."""
-
-
-class LocalProcessCrashError(RuntimeError):
-    """The local executable exited before it returned the required response."""
-
-
-class LocalProcessCleanupError(RuntimeError):
-    """The local executable or its temporary workspace could not be cleaned up."""
 
 
 @dataclass(frozen=True)
 class LocalProcessLimits:
     """Finite resource limits applied to each local executable environment session.
 
-    Args:
+    Attributes:
         request_timeout_seconds: Wall-clock limit for one protocol request and response.
         session_timeout_seconds: Wall-clock limit for the complete local process lifetime.
         cleanup_timeout_seconds: Grace period before a live process is force-killed.
         maximum_output_bytes: Largest accepted JSON response line from the environment.
         maximum_stderr_bytes: Bounded tail retained only to drain the child error pipe.
+        resources: Kernel CPU, memory, file-size, and process-count limits, enforced where the
+            containment report lists them and reported unavailable elsewhere.
     """
 
     request_timeout_seconds: float = 30.0
@@ -393,6 +76,7 @@ class LocalProcessLimits:
     cleanup_timeout_seconds: float = 5.0
     maximum_output_bytes: int = 1_000_000
     maximum_stderr_bytes: int = 32_768
+    resources: ResourceLimits = ResourceLimits()
 
     def __post_init__(self) -> None:
         """Validate all resource bounds before a local child process can start."""
@@ -411,6 +95,8 @@ class LocalProcessLimits:
         ):
             if isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.resources, ResourceLimits):
+            raise ValueError("resources must be a ResourceLimits value")
 
 
 class LocalProcessEnvironmentRuntime:
@@ -420,6 +106,9 @@ class LocalProcessEnvironmentRuntime:
     ``close`` line. It must respond to ``open`` with ``{"ready": true}``, then respond to every
     execution request with a canonical :class:`Observation` JSON object. The command is supplied
     by the customer and is never persisted in a simulation artifact.
+
+    Construction detects the host containment once (cached per process) and exposes it as
+    :attr:`containment`; sandbox simulation records its level in every cell binding.
     """
 
     def __init__(
@@ -456,6 +145,12 @@ class LocalProcessEnvironmentRuntime:
         self._limits = limits or LocalProcessLimits()
         self._workspace_parent = workspace_parent
         self._environment = dict(environment or {})
+        self._backend = host_containment()
+
+    @property
+    def containment(self) -> ContainmentReport:
+        """Return the host containment every session from this runtime enforces or refuses."""
+        return self._backend.report
 
     def open(self, task: TaskCase) -> AbstractContextManager[EnvironmentSession]:
         """Return a simulator-owned context that opens a fresh child only when entered.
@@ -467,6 +162,7 @@ class LocalProcessEnvironmentRuntime:
             A context manager that always terminates the child and removes its workspace.
         """
         return _LocalProcessContext(
+            self._backend,
             self._command,
             self._limits,
             self._workspace_parent,
@@ -480,12 +176,15 @@ class _LocalProcessContext(AbstractContextManager[EnvironmentSession]):
 
     def __init__(
         self,
+        backend: ContainmentBackend,
         command: tuple[str, ...],
         limits: LocalProcessLimits,
         workspace_parent: Path | None,
         environment: Mapping[str, str],
         task: TaskCase,
     ) -> None:
+        """Bind one task to the runtime configuration without starting any process."""
+        self._backend = backend
         self._command = command
         self._limits = limits
         self._workspace_parent = workspace_parent
@@ -496,6 +195,7 @@ class _LocalProcessContext(AbstractContextManager[EnvironmentSession]):
     def __enter__(self) -> EnvironmentSession:
         """Start the child and complete its bounded protocol handshake."""
         session = _LocalProcessSession(
+            self._backend,
             self._command,
             self._limits,
             self._workspace_parent,
@@ -528,17 +228,19 @@ class _LocalProcessSession:
 
     def __init__(
         self,
+        backend: ContainmentBackend,
         command: tuple[str, ...],
         limits: LocalProcessLimits,
         workspace_parent: Path | None,
         environment: Mapping[str, str],
     ) -> None:
+        """Hold the session configuration; :meth:`start` allocates every resource."""
+        self._backend = backend
         self._command = command
         self._limits = limits
         self._workspace_parent = workspace_parent
         self._environment = dict(environment)
-        self._process: subprocess.Popen[bytes] | None = None
-        self._descendants: _DescendantTracker | None = None
+        self._contained: ContainedProcess | None = None
         self._workspace: Path | None = None
         self._stdout: queue.Queue[bytes | object] = queue.Queue(maxsize=1)
         self._stderr_tail = bytearray()
@@ -552,7 +254,9 @@ class _LocalProcessSession:
 
     def start(self, task: TaskCase) -> None:
         """Create workspace, launch the child, and verify the mandatory ready response."""
-        bindings = _require_containment_support()
+        refusal = self._backend.report.refusal
+        if refusal is not None:
+            raise LocalProcessCleanupError(refusal)
         workspace_parent = self._workspace_parent
         if workspace_parent is not None:
             workspace_parent.mkdir(parents=True, exist_ok=True)
@@ -570,60 +274,42 @@ class _LocalProcessSession:
         child_environment[_WORKSPACE_ENVIRONMENT_VARIABLE] = str(self._workspace)
         child_environment["HOME"] = str(self._workspace)
         child_environment["TMPDIR"] = str(self._workspace)
-        gate_read, gate_write = os.pipe()
-        gate_program = Path(__file__).with_name("local_exec_gate.py")
+        launch = ProcessLaunch(
+            command=self._command,
+            workspace=self._workspace,
+            environment=child_environment,
+            cleanup_timeout_seconds=self._limits.cleanup_timeout_seconds,
+            startup_timeout_seconds=self._limits.request_timeout_seconds,
+            resources=self._limits.resources,
+        )
         try:
-            self._process = subprocess.Popen(
-                (sys.executable, str(gate_program), str(gate_read), *self._command),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=self._workspace,
-                env=child_environment,
-                start_new_session=True,
-                pass_fds=(gate_read,),
-            )
-        except OSError as error:
-            _close_fd(gate_read)
-            _close_fd(gate_write)
-            launch_error = LocalProcessCrashError(
-                f"local environment process could not start: {type(error).__name__}"
-            )
+            self._contained = self._backend.launch(launch)
+        except BaseException as error:  # noqa: BLE001 - preserve startup errors after cleanup
+            self._closed = True
             try:
                 self._remove_workspace()
-            except OSError as cleanup_error:
-                launch_error.add_note(
+            except BaseException as cleanup_error:  # noqa: BLE001 - evidence must not mask
+                error.add_note(
                     "local startup cleanup evidence: workspace cleanup failed with "
                     f"{type(cleanup_error).__name__}"
                 )
-            raise launch_error from error
-        _close_fd(gate_read)
-        root_identity: _ProcessIdentity | None = None
-        try:
-            root_identity = _read_process_identity(self._process.pid)
-            self._descendants = _DescendantTracker(root_identity, bindings)
-            os.write(gate_write, b"1")
-            _close_fd(gate_write)
-        except BaseException as error:  # noqa: BLE001 - preserve startup errors after no-fail cleanup
-            evidence = self._abort_gated_start(gate_write, root_identity)
-            if evidence:
-                error.add_note("local startup cleanup evidence: " + "; ".join(evidence))
             raise
+        process = self._contained.process
         self._started_at = time.monotonic()
-        assert self._process.stdout is not None
-        assert self._process.stderr is not None
-        assert self._process.stdin is not None
-        for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
+        assert process.stdout is not None
+        assert process.stderr is not None
+        assert process.stdin is not None
+        for stream in (process.stdin, process.stdout, process.stderr):
             os.set_blocking(stream.fileno(), False)
         stdout_thread = threading.Thread(
             target=self._drain_stdout,
-            args=(self._process.stdout.fileno(),),
+            args=(process.stdout.fileno(),),
             name="exp-local-environment-stdout",
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=self._drain_stderr,
-            args=(self._process.stderr.fileno(),),
+            args=(process.stderr.fileno(),),
             name="exp-local-environment-stderr",
             daemon=True,
         )
@@ -635,76 +321,6 @@ class _LocalProcessSession:
             raise LocalProcessProtocolError(
                 "local environment open response must be {'ready': true}"
             )
-
-    def _abort_gated_start(
-        self,
-        gate_write: int,
-        root_identity: _ProcessIdentity | None,
-    ) -> tuple[str, ...]:
-        """Close a failed launch without masking its original exception or leaking resources."""
-        evidence: list[str] = []
-        deadline = time.monotonic() + self._limits.cleanup_timeout_seconds
-        _close_fd(gate_write)
-        process = self._process
-        if process is not None:
-            try:
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                if root_identity is None:
-                    evidence.append("gated root identity unavailable; signal withheld")
-                else:
-                    try:
-                        _signal_exact_identity(root_identity, signal.SIGKILL)
-                    except Exception as error:  # noqa: BLE001 - retained as cleanup evidence
-                        evidence.append(f"identity signal failed with {type(error).__name__}")
-                try:
-                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
-                    evidence.append("gated root did not exit before cleanup deadline")
-                except BaseException as error:  # noqa: BLE001 - cleanup evidence must not mask
-                    evidence.append(f"bounded root wait failed with {type(error).__name__}")
-            except BaseException as error:  # noqa: BLE001 - cleanup evidence must not mask
-                evidence.append(f"initial root wait failed with {type(error).__name__}")
-            tracker = self._descendants
-            if tracker is not None:
-                try:
-                    containment = tracker.stop(max(0.0, deadline - time.monotonic()))
-                    if containment:
-                        evidence.append(containment)
-                except BaseException as error:  # noqa: BLE001 - cleanup evidence must not mask
-                    evidence.append(f"tracker cleanup failed with {type(error).__name__}")
-            try:
-                self._close_unstarted_pipes(process, evidence)
-            except BaseException as error:  # noqa: BLE001 - cleanup evidence must not mask
-                evidence.append(f"pipe cleanup failed with {type(error).__name__}")
-        try:
-            self._remove_workspace()
-        except BaseException as error:  # noqa: BLE001 - cleanup evidence must not mask
-            evidence.append(f"workspace cleanup failed with {type(error).__name__}")
-        self._descendants = None
-        self._closed = True
-        try:
-            self._termination_complete = process is None or process.poll() is not None
-        except BaseException as error:  # noqa: BLE001 - cleanup evidence must not mask
-            evidence.append(f"root status check failed with {type(error).__name__}")
-            self._termination_complete = False
-        return tuple(evidence)
-
-    @staticmethod
-    def _close_unstarted_pipes(
-        process: subprocess.Popen[bytes],
-        evidence: list[str],
-    ) -> None:
-        """Close raw pipes created before any reader worker can exist."""
-        for attribute in ("stdin", "stdout", "stderr"):
-            stream = getattr(process, attribute)
-            if stream is None:
-                continue
-            try:
-                stream.raw.close()
-            except OSError as error:
-                evidence.append(f"{attribute} close failed with {type(error).__name__}")
-            setattr(process, attribute, None)
 
     def execute(self, action: ToolCall) -> Observation:
         """Send one canonical tool call to the child and parse its bounded observation response."""
@@ -798,8 +414,11 @@ class _LocalProcessSession:
 
     def _send_close(self) -> None:
         """Write a non-blocking close hint while preserving cleanup authority in this process."""
-        process = self._process
-        if process is None or process.poll() is not None or process.stdin is None:
+        contained = self._contained
+        if contained is None:
+            return
+        process = contained.process
+        if process.poll() is not None or process.stdin is None:
             return
         try:
             os.write(process.stdin.fileno(), b'{"kind":"close"}\n')
@@ -807,70 +426,24 @@ class _LocalProcessSession:
             return
 
     def _terminate_process(self) -> None:
-        """Terminate every identity-tracked descendant, including detached process groups."""
-        process = self._process
-        if process is None or self._termination_complete:
+        """Terminate the whole contained process tree, then stop and close the pipe workers."""
+        contained = self._contained
+        if contained is None or self._termination_complete:
             return
-        tracker = self._descendants
         cleanup_error: Exception | None = None
-        started = time.monotonic()
-        deadline = started + self._limits.cleanup_timeout_seconds
+        deadline = time.monotonic() + self._limits.cleanup_timeout_seconds
         try:
-            if tracker is None:
-                raise LocalProcessCleanupError("local descendant tracker is unavailable")
-            term_deadline = started + self._limits.cleanup_timeout_seconds * 0.25
-            if not self._signal_until_empty(process, tracker, signal.SIGTERM, term_deadline):
-                kill_deadline = started + self._limits.cleanup_timeout_seconds * 0.75
-                if not self._signal_until_empty(process, tracker, signal.SIGKILL, kill_deadline):
-                    raise subprocess.TimeoutExpired(
-                        self._command,
-                        self._limits.cleanup_timeout_seconds,
-                    )
-        except Exception as exc:  # noqa: BLE001 - re-raised after the monitor is joined
+            contained.terminate(self._limits.cleanup_timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 - re-raised after the pipe workers are joined
             cleanup_error = exc
         finally:
-            if tracker is not None:
-                try:
-                    evidence = tracker.stop(max(0.0, deadline - time.monotonic()))
-                    if evidence:
-                        containment_error = LocalProcessCleanupError(
-                            f"local process containment is unproven: {evidence}"
-                        )
-                        cleanup_error = cleanup_error or containment_error
-                except Exception as exc:  # noqa: BLE001 - combined with termination evidence
-                    cleanup_error = cleanup_error or exc
-            self._descendants = None
             try:
-                self._close_pipe_workers(process, deadline)
+                self._close_pipe_workers(contained.process, deadline)
             except Exception as exc:  # noqa: BLE001 - combined with termination evidence
                 cleanup_error = cleanup_error or exc
         if cleanup_error is not None:
             raise cleanup_error
         self._termination_complete = True
-
-    def _signal_until_empty(
-        self,
-        process: subprocess.Popen[bytes],
-        tracker: _DescendantTracker,
-        signal_number: int,
-        deadline: float,
-    ) -> bool:
-        """Re-scan and signal exact live identities until none remain or grace expires."""
-        while True:
-            identities = tracker.live_identities()
-            for identity in identities:
-                _signal_exact_identity(identity, signal_number)
-            leader_exited = process.poll() is not None
-            if leader_exited and not tracker.live_identities():
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            if not leader_exited:
-                with suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=min(0.01, remaining))
-            else:
-                time.sleep(min(0.005, remaining))
 
     def _close_pipe_workers(
         self,
@@ -915,9 +488,9 @@ class _LocalProcessSession:
 
     def _require_process(self) -> subprocess.Popen[bytes]:
         """Return the active process or fail before attempting an invalid pipe operation."""
-        if self._process is None:
+        if self._contained is None:
             raise LocalProcessProtocolError("local environment session has not started")
-        return self._process
+        return self._contained.process
 
     def _require_within_session_limit(self) -> None:
         """Fail and terminate a child whose complete episode budget has expired."""
@@ -940,7 +513,13 @@ class _LocalProcessSession:
         return min(self._limits.request_timeout_seconds, remaining_session)
 
     def _crash_error(self, process: subprocess.Popen[bytes]) -> LocalProcessCrashError:
-        """Build a non-secret crash error without embedding potentially sensitive child stderr."""
+        """Build a non-secret crash error without embedding potentially sensitive child stderr.
+
+        End of output can precede the root's exit by the supervisor's reap, so the return code
+        is read after a short bounded wait.
+        """
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=min(1.0, self._limits.cleanup_timeout_seconds))
         return LocalProcessCrashError(
             f"local environment process exited before its response (return code {process.poll()})"
         )

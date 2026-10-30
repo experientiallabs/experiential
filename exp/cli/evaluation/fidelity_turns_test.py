@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
-from exp.optimize.evaluation import fidelity
+from exp.optimize.evaluation.fidelity import runner as fidelity
 from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     investigation,

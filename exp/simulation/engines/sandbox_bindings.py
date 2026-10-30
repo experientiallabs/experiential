@@ -22,6 +22,7 @@ from exp.common.core.artifacts import (
 from exp.common.evaluations import EvaluationCell
 from exp.common.models import ModelAlias, ModelClient, ModelSnapshot
 from exp.common.rollouts import SandboxSimulationCellBinding
+from exp.common.rollouts.containment import ContainmentLevel
 from exp.common.tasks import TaskCase, TaskSet
 from exp.simulation.specs import SimulationSpec
 
@@ -120,6 +121,7 @@ def make_sandbox_cell_binding(
     task: TaskCase,
     candidate: CandidateBinding,
     environment_cost: EnvironmentCostBinding,
+    environment_containment: ContainmentLevel | None,
 ) -> SandboxSimulationCellBinding:
     """Bind one selected cell to immutable task, candidate, environment, and spec identity.
 
@@ -132,6 +134,9 @@ def make_sandbox_cell_binding(
         cell: Explicit simulated plan cell.
         task: Canonical task selected by the cell.
         candidate: Resolved candidate identity and optional strict cost reservation.
+        environment_cost: Proven environment cost ceiling and observability capability.
+        environment_containment: Containment level the environment runtime enforces for every
+            session, recorded as the execution receipt, or None when it reports none.
 
     Returns:
         Complete identity used for rollout IDs, leases, and resume validation.
@@ -162,6 +167,7 @@ def make_sandbox_cell_binding(
         simulator_id=SANDBOX_SIMULATOR_ID,
         environment_id=settings.environment_id,
         environment_sha256=settings.environment_sha256,
+        environment_containment=environment_containment,
         simulation_spec_input=simulation_spec_input,
         simulation_spec_sha256=sha256_json(spec),
         simulation_inputs_sha256=sha256_json(

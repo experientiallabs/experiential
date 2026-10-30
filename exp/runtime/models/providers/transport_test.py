@@ -17,10 +17,12 @@ from exp.runtime.models.providers.transport import (
     RetryPolicy,
     ScriptedJsonTransport,
     classify_retry,
+    classify_unrepeatable_retry,
     get_json,
     is_known_unbilled_failure,
     parse_retry_after,
     provider_ssl_context,
+    public_error_code,
     run_with_retry,
 )
 
@@ -162,6 +164,32 @@ def test_retry_classification_is_transport_specific(exception: Exception, retrya
     assert classify_retry(exception).retryable is retryable
 
 
+@pytest.mark.parametrize(
+    ("exception", "retryable"),
+    [
+        (ProviderTransportError("unavailable", status_code=503), False),
+        (ProviderTransportError("rate limited", status_code=429), False),
+        (ProviderTransportError("certified refusal", status_code=429, known_unbilled=True), True),
+        (
+            ProviderTransportError(
+                "lost keyed result", status_code=409, error_code="idempotency_replay_unavailable"
+            ),
+            False,
+        ),
+        (ProviderTransportError("bad request", status_code=400), False),
+        (ProviderTransportError("network"), False),
+        (TimeoutError("slow"), False),
+        (ConnectionResetError("reset"), False),
+        (ValueError("invalid request"), False),
+    ],
+)
+def test_an_unrepeatable_wire_never_resends_an_unknown_outcome(
+    exception: Exception, retryable: bool
+) -> None:
+    """Without deduplication, an HTTP error alone cannot establish a safe resend."""
+    assert classify_unrepeatable_retry(exception).retryable is retryable
+
+
 def test_retry_runs_a_bounded_same_operation() -> None:
     """A retry returns the later success and records deterministic delay behavior."""
     attempts = 0
@@ -180,11 +208,57 @@ def test_retry_runs_a_bounded_same_operation() -> None:
             operation,
             policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.5),
             sleep=delays.append,
+            random_sample=lambda: 1.0,
         )
         == "ok"
     )
     assert attempts == 2
     assert delays == [0.5]
+
+
+def test_ordinary_backoff_waits_a_full_jitter_share_of_a_capped_exponential_window() -> None:
+    """Without a server minimum each wait is a uniform share of ``min(cap, base * 2**n)``."""
+    delays: list[float] = []
+    samples = iter([0.5, 0.25, 1.0, 0.0])
+
+    def operation() -> str:
+        """Fail with ordinary overload every time."""
+        raise ProviderTransportError("busy", status_code=503)
+
+    with pytest.raises(ProviderTransportError):
+        run_with_retry(
+            operation,
+            policy=RetryPolicy(
+                maximum_attempts=5, initial_delay_seconds=0.5, maximum_delay_seconds=1.5
+            ),
+            sleep=delays.append,
+            random_sample=lambda: next(samples),
+        )
+    # Windows 0.5, 1.0, 1.5 (capped), 1.5 (capped); a zero-length wait is not slept.
+    assert delays == [0.25, 0.25, 1.5]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_retry_after_on_overload_is_a_minimum_even_with_a_zero_jitter_sample(status: int) -> None:
+    """A Retry-After on 429 or 503 is never undercut by full jitter."""
+    delays: list[float] = []
+    attempts = 0
+
+    def operation() -> str:
+        """Overload once with a server minimum, then succeed."""
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ProviderTransportError("busy", status_code=status, retry_after_seconds=1.25)
+        return "ok"
+
+    assert (
+        run_with_retry(
+            operation, policy=RetryPolicy(), sleep=delays.append, random_sample=lambda: 0.0
+        )
+        == "ok"
+    )
+    assert delays == [1.25]
 
 
 @pytest.mark.parametrize(
@@ -294,3 +368,28 @@ def test_httpx_preserves_only_retry_delay_on_untrusted_response(body: bytes) -> 
         else:
             assert response.retry_after_seconds == 1
             assert not response.known_unbilled
+
+
+def test_a_refusal_keeps_only_its_identifier_code() -> None:
+    """A short ``error.code`` identifier is retained; messages and free text never are."""
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=400,
+                body={"error": {"code": "invalid_provider_stream", "message": "private detail"}},
+            )
+        ]
+    )
+    with pytest.raises(ProviderTransportError) as raised:
+        get_json(
+            transport,
+            "https://provider.test/v1/models",
+            headers={},
+            timeout_seconds=1.0,
+            retry_policy=_IMMEDIATE_RETRY,
+        )
+    assert raised.value.error_code == "invalid_provider_stream"
+    assert "private detail" not in str(raised.value)
+    assert public_error_code({"error": {"code": "Not An Identifier, sk-123"}}) is None
+    assert public_error_code({"error": "flat"}) is None
+    assert ProviderTransportError("x", status_code=503, error_code="a b").error_code is None

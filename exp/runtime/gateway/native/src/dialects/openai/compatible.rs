@@ -76,6 +76,12 @@ fn synthesized_call_id(index: u32) -> String {
 const FRAME_KEY_NAMES_LIMIT: usize = 8;
 const FRAME_KEY_NAME_CHARS: usize = 32;
 
+/// Above this many reported answer tokens, a natural `stop` that surfaced no
+/// content or tool call is treated as upstream-dropped output and settled
+/// Incomplete rather than a silent empty success. Small so a near-empty
+/// natural end stays Completed, well below any real answer.
+const EMPTY_OUTPUT_ANSWER_TOKEN_FLOOR: u64 = 16;
+
 /// The sorted, bounded key names of one frame: its SHAPE for the ledger, with
 /// no value ever read. A key is provider-supplied text, so only an
 /// identifier-shaped one (ASCII alphanumerics, `_`, `.`, `-`) is named; any
@@ -344,6 +350,7 @@ impl Normalizer {
                                 // arguments accumulated silently meanwhile.
                                 tool.name = repeated_name;
                                 tool.started = true;
+                                self.answer_surfaced = true;
                                 events.push(Event::ToolCallStarted {
                                     custom: false,
                                     index,
@@ -384,6 +391,7 @@ impl Normalizer {
                         tool.id_synthesized = id_synthesized;
                         tool.started = !name.is_empty();
                         if tool.started {
+                            self.answer_surfaced = true;
                             events.push(Event::ToolCallStarted {
                                 custom: false,
                                 index,
@@ -450,7 +458,11 @@ impl Normalizer {
         events: &mut Vec<Event>,
     ) -> Result<(), Failure> {
         if !released.text.is_empty() {
+            self.answer_surfaced = true;
             events.push(Event::TextDelta(released.text));
+        }
+        if !released.calls.is_empty() {
+            self.answer_surfaced = true;
         }
         for call in released.calls {
             let index = self.tools.keys().next_back().map_or(0, |last| last + 1);
@@ -476,6 +488,7 @@ impl Normalizer {
             self.tools.insert(index, tool);
         }
         if !released.trailing_text.is_empty() {
+            self.answer_surfaced = true;
             events.push(Event::TextDelta(released.trailing_text));
         }
         Ok(())
@@ -584,6 +597,17 @@ impl Normalizer {
         // settles Incomplete too; a syntax error inside the arguments
         // keeps the strict contract and stays malformed.
         let unreported = self.usage.is_none();
+        // Answer output the provider reported: completion tokens that are
+        // neither reasoning nor a generated image. A natural `stop` that
+        // reports this while nothing was surfaced is the upstream dropping its
+        // own output (see `answer_surfaced`); such a turn settles Incomplete.
+        let reported_answer_tokens = self.usage.as_ref().map_or(0, |usage| {
+            usage
+                .output_tokens
+                .unwrap_or(0)
+                .saturating_sub(usage.reasoning_tokens.unwrap_or(0))
+                .saturating_sub(usage.image_output_tokens.unwrap_or(0))
+        });
         let mut events = self.finish_dsml()?;
         let finish = self.finish_reason.as_deref();
         let (tool_events, cut_mid_fragment) = if finish == Some("length") {
@@ -618,6 +642,25 @@ impl Normalizer {
             let line = serde_json::json!({
                 "event": "unreported_stop_read_as_length",
                 "output_token_cap": self.output_token_cap,
+            });
+            eprintln!("exp-gateway-native: {line}");
+            events.push(Event::Incomplete);
+        } else if finish == Some("stop")
+            && !self.answer_surfaced
+            && reported_answer_tokens > EMPTY_OUTPUT_ANSWER_TOKEN_FLOOR
+        {
+            // A natural `stop` whose usage reports answer tokens the stream
+            // never surfaced as content or a tool call: the upstream produced
+            // output and then dropped it before our decoder (a provider tool
+            // parser that could not convert its own model's markup and emitted
+            // nothing in its place, deepseek-v4.1-flash on Novita, 2026-10-27).
+            // Settle Incomplete so the caller retries instead of receiving a
+            // silent empty success. Reasoning-only stops never reach here
+            // (`reported_answer_tokens` nets out reasoning), and image-output
+            // turns are excluded too. No content is inspected or logged.
+            let line = serde_json::json!({
+                "event": "stop_reported_output_never_surfaced",
+                "reported_answer_tokens": reported_answer_tokens,
             });
             eprintln!("exp-gateway-native: {line}");
             events.push(Event::Incomplete);

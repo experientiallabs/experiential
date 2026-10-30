@@ -126,6 +126,36 @@ The gateway does not claim support for new provider beta features merely because
 supports them. See the official [model specifications](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
 and [migration contract](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5).
 
+## Forced tool choice on Claude
+
+Claude Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 answer a forced `tool_choice` (`any`, or
+one named tool) with a 400, with or without thinking. Structured calls in Experiential force
+their single answer tool, so the catalog declares whether each alias accepts that:
+
+```toml
+[models.sonnet.capabilities]
+supports_tools = true
+supports_forced_tool_choice = false
+```
+
+With `false`, the Anthropic, Foundry, Claude plan and Vertex Claude clients send a forced choice
+of the only offered tool as `tool_choice = {"type": "auto", "disable_parallel_tool_use": true}`
+and add a system instruction naming that tool. Callers still accept only exactly one call of the
+named tool, so a text-only or two-call answer is retained and refused as with any other invalid
+output. A forced choice among several tools is refused before dispatch, because `auto` would let
+the model pick another one. `true` sends the forced choice unchanged.
+
+When the field is absent, the forced choice is sent unchanged, unless EXP's maintained records
+say the model rejects it. Then the call is refused before dispatch with an error naming
+`supports_forced_tool_choice`. Discovery writes `false` for these four releases on a direct
+Anthropic connection, so a catalog re-synced after this change needs no edit. Azure Foundry
+and Vertex Claude aliases are not filled in by discovery: declare the field by hand, as their
+prices and limits already are. The field does not change the model's identity digest. It
+enters the replay identity of a structured completion plan only once it is declared.
+
+The gateway decides forced tool choice on its own wire path, by its capability-preservation
+policy described under Claude Sonnet 5.5.
+
 ## Plan connections (ChatGPT and Claude)
 
 A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`
@@ -211,6 +241,16 @@ all three question types; replace `systemone` with the decision alias your gatew
 | `noul` | Optional object with `true` and `false` text, object, or array descriptions | `type`, `noul` (probability from 0 to 1) |
 | `choice` | Object mapping 2 through 64 category names to text, object, or array descriptions, or `null` | `type`, `choice`, `confidence`, `probabilities` keyed by the requested names |
 | `score` | Ordered array of 2 through 10 text, object, or array descriptions | `type`, `score`, `confidence`, `legend`, `probabilities` keyed by zero-based index strings |
+
+A lone UTF-16 surrogate escape (`\ud83d` without its pair, which JavaScript's `JSON.stringify`
+writes for a string cut inside an emoji) has no UTF-8 form, so the gateway replaces each one with
+U+FFFD in content (state, instructions, criteria descriptions, and the keys inside them) and
+names the rewrite in the answer's `x-experiential-ignored-parameters` list
+(`state->replaced(lone_surrogate)`, `questions.instructions->replaced(lone_surrogate)`,
+`questions.criteria->replaced(lone_surrogate)`). Identifiers the answer is keyed by (`model`,
+question IDs, choice category names, asset references) are refused instead, and so are two
+content keys that would become equal. A body whose bytes are not UTF-8 is refused as invalid
+JSON.
 
 The response contains `id`, the requested public `model` alias, `answers` under the original
 question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
@@ -620,6 +660,61 @@ provider header is forwarded, and `retry-after` appears only on a refusal the ga
 answers. Retry and failover ceilings per request are the `gateway.retry` object
 ([request policy](gateway-request-policy.md)); concurrency is bounded by
 `exp run --max-active-requests` and each deployment's `dispatch_concurrency_bound`.
+
+## Host-wide admission, backoff and idempotency
+
+Every request sent through the admitted transport (the evaluation, analysis and review commands
+that record physical attempts) first passes a host-wide admission shared by all `exp` processes
+on the machine. Its state is `provider-admission.sqlite` in the same user-data directory as
+`auth.json`:
+
+- **Concurrency.** A request holds one in-flight slot of its provider and one of its model alias
+  only while it is on the wire. Defaults are 8 per provider and 4 per alias. A slot whose
+  process has exited, crashed or been killed is reclaimed by the next request. A request that
+  cannot get a slot within its attempt timeout is refused before dispatch.
+- **Circuit breaker.** After 5 consecutive overload responses (HTTP 429, 503 or 529) from one
+  provider, its breaker opens and new requests to that provider are refused before dispatch for
+  30 seconds, or for the server's `Retry-After` when that is longer. Then exactly one probe is
+  sent: a definite non-overload response closes the breaker, anything else reopens it. A 503
+  that refuses one exact request (a gateway `invalid_provider_stream`) is not overload.
+- **Refusals are resumable.** Both refusals happen before a dispatch-ledger slot is claimed and
+  before any network I/O. They are recorded as not dispatched; the run stops incomplete and
+  resumes in place. They are never scored as misses.
+- **Attempt receipts.** Each admitted request leaves an intent receipt holding the request body
+  and the digest of the exact body sent. Bodies are kept whole and must pass the credential
+  boundary, except embedding requests: their input texts are chunks of the project's own stored
+  evidence, so the receipt cites each by SHA-256 and length instead. Agent traces routinely quote
+  placeholder credentials, such as `Authorization: token ${GITHUB_TOKEN}`, and copying them
+  would refuse the build. Any other embedding field still passes the boundary.
+
+Override the limits in `provider-admission.toml` beside the database:
+
+```toml
+provider_max_in_flight = 8      # default for every provider
+alias_max_in_flight = 4         # default for every alias
+breaker_threshold = 5           # consecutive overloads that open a breaker
+breaker_cooldown_seconds = 30
+
+[providers.openrouter]
+max_in_flight = 16
+
+[aliases."judge"]
+max_in_flight = 2
+```
+
+Retries of one request back off exponentially with full jitter: each wait is a uniform sample of
+`[0, min(cap, base * 2^n)]` with the cap set by the retry policy (2 seconds by default). A
+`Retry-After` on any retryable status, including 429 and 503, is a minimum the wait never
+undercuts.
+
+On the OpenAI-family wire (`openai`, `azure`, `openai-compatible`, `openrouter`) a request made
+under a recorded call intent carries an `Idempotency-Key` derived from that intent, the endpoint
+and the exact body. A resend of the same intent after an ambiguous failure, in the same process
+or a resumed one, therefore carries the same key, and an endpoint that honours the header (such
+as an Experiential gateway) replays rather than executes it twice. Whether a given upstream
+deduplicates by this header is that endpoint's contract. The Anthropic Messages and Gemini
+protocols define no idempotency header, so no intent key is derived for them; for those, and for
+any endpoint that ignores the header, an ambiguous outcome is never redrawn.
 
 ## Errors
 

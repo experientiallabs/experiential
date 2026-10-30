@@ -82,7 +82,8 @@ class _ServedGateway:
         self.thread.join(timeout=10)
         assert not self.thread.is_alive()
         assert self.error is None, f"native gateway failed: {self.error}"
-        self.components.write_ledger.close()
+        self.control_plane.close()
+        self.components.close()
 
 
 class _LoopbackProvider(BaseHTTPRequestHandler):

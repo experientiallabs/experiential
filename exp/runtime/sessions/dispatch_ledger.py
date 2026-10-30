@@ -157,6 +157,23 @@ class DispatchLedger:
         finally:
             connection.close()
 
+    def attempt_ids(self) -> tuple[str, ...]:
+        """Return an immutable snapshot of claimed attempts in dispatch sequence order.
+
+        Includes failed and ambiguous invocations. Reading does not claim a slot.
+
+        Returns:
+            Attempt identities ordered by their durable sequence number.
+        """
+        connection = connect_database(self._path)
+        try:
+            rows = connection.execute(
+                "SELECT attempt_id FROM invocation_slots ORDER BY seq"
+            ).fetchall()
+            return tuple(str(row[0]) for row in rows)
+        finally:
+            connection.close()
+
     def claim(self, claimed_at: str) -> tuple[int, str]:
         """Claim one slot before an invocation, or refuse without writing.
 

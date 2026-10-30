@@ -37,6 +37,11 @@ from exp.common.rollouts import (
     SimulationMode,
     StopReason,
 )
+from exp.common.rollouts.containment import (
+    ContainmentGuarantee,
+    ContainmentReport,
+    containment_report,
+)
 from exp.common.tasks import TaskCase, TaskSet
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import EnvironmentRuntime, EnvironmentSession, Observation
@@ -564,6 +569,57 @@ def test_harbor_cleanup_failure_or_hang_holds_ledger_and_partial_transcript(
     assert ledger_state.released_ids == ()
 
 
+@pytest.mark.parametrize(
+    "required",
+    [ContainmentGuarantee.NETWORK_DENIED, ContainmentGuarantee.HOST_PROCESS_ISOLATION],
+)
+def test_required_containment_is_refused_before_any_environment_opens(
+    tmp_path: Path, required: ContainmentGuarantee
+) -> None:
+    """An unmet containment requirement stops the run before any session or dispatch."""
+    store, plan, plan_input, task_input = _persist_fixture(tmp_path, ("task-a",))
+    spec = _spec(
+        plan_input,
+        task_input,
+        ("cell-a",),
+        required_containment=tuple(sorted((required, ContainmentGuarantee.VERIFIED_CLEANUP))),
+    )
+    contained = _ContainedEnvironmentRuntime((ContainmentGuarantee.VERIFIED_CLEANUP,))
+    unreported = _EnvironmentRuntime()
+
+    for runtime in (contained, unreported):
+        simulator = _simulator(store, plan, plan_input, task_input, runtime)
+        with pytest.raises(SandboxSimulationError, match=f"required containment: {required.value}"):
+            simulator.run(spec)
+        assert runtime.opened_task_ids == []
+
+
+def test_enforced_containment_level_is_recorded_as_the_rollout_receipt(tmp_path: Path) -> None:
+    """The runtime's exact level is bound into each rollout; an unreported one is omitted."""
+    store, plan, plan_input, task_input = _persist_fixture(tmp_path, ("task-a",))
+    runtime = _ContainedEnvironmentRuntime(
+        (ContainmentGuarantee.NETWORK_DENIED, ContainmentGuarantee.VERIFIED_CLEANUP)
+    )
+    simulator = _simulator(store, plan, plan_input, task_input, runtime, agent_factory=_ToolAgent)
+    spec = _spec(
+        plan_input,
+        task_input,
+        ("cell-a",),
+        required_containment=(ContainmentGuarantee.NETWORK_DENIED,),
+    )
+
+    result = simulator.run(spec)
+
+    binding = _load_rollout(store, result.artifact_ids[0]).sandbox_binding
+    assert binding is not None
+    assert binding.environment_containment == runtime.containment.level
+    unreported = binding.model_copy(update={"environment_containment": None})
+    assert "environment_containment" not in unreported.model_dump(mode="json")
+    assert unreported != binding
+    plain = _spec(plan_input, task_input, ("cell-a",)).sandbox
+    assert plain is not None and "required_containment" not in plain.model_dump(mode="json")
+
+
 def _persist_fixture(
     root: Path,
     task_ids: tuple[str, ...],
@@ -661,6 +717,7 @@ def _spec(
     maximum_cost_usd: float | None = None,
     environment_sha256: str = _ENVIRONMENT_DIGEST,
     stop_on_overspend: bool = False,
+    required_containment: tuple[ContainmentGuarantee, ...] = (),
 ) -> SimulationSpec:
     """Create one exact shared W8 sandbox specification."""
     return SimulationSpec(
@@ -677,6 +734,7 @@ def _spec(
             environment_id="customer-environment",
             environment_sha256=environment_sha256,
             maximum_time_seconds=maximum_time_seconds,
+            required_containment=required_containment,
         ),
         seed=7,
         maximum_steps=maximum_steps,
@@ -895,6 +953,25 @@ class _EnvironmentRuntime:
         """Open one task-bound in-memory environment."""
         self.opened_task_ids.append(task.task_id)
         return _EnvironmentContext(self)
+
+
+class _ContainedEnvironmentRuntime(_EnvironmentRuntime):
+    """An in-memory environment that reports a fixed host containment level."""
+
+    def __init__(self, guarantees: tuple[ContainmentGuarantee, ...]) -> None:
+        super().__init__()
+        self._report = containment_report(
+            platform="test",
+            protocol="test-containment-v1",
+            enforced=guarantees,
+            reasons={guarantee: "not in this fixture" for guarantee in ContainmentGuarantee},
+            mechanisms=("fixture",),
+        )
+
+    @property
+    def containment(self) -> ContainmentReport:
+        """Return the fixed containment report."""
+        return self._report
 
 
 class _EnvironmentContext(AbstractContextManager[EnvironmentSession]):

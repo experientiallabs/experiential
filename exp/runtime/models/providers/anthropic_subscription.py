@@ -31,7 +31,7 @@ from pydantic import Field, field_validator, model_validator
 
 from exp.common.auth import StoredOAuthTokens
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models import ModelSnapshot
+from exp.common.models import ModelSnapshot, ReasoningEffort
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS, GatewayWireProfile
@@ -338,7 +338,8 @@ class AnthropicSubscriptionClient(AnthropicClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create a client whose credential is minted per request from the token source.
 
@@ -353,6 +354,8 @@ class AnthropicSubscriptionClient(AnthropicClient):
             supports_top_k: Catalog declaration for top-k sampling.
             supports_reasoning: Catalog declaration that the model accepts thinking controls.
             reasoning_effort: Optional catalog-pinned reasoning-effort level.
+            supports_forced_tool_choice: Catalog declaration that the model accepts a forced
+                ``tool_choice``; ``None`` is unknown.
         """
         # The base client requires a non-empty static credential; this client never sends
         # it. Every request reads the current bearer from the token source instead.
@@ -368,6 +371,7 @@ class AnthropicSubscriptionClient(AnthropicClient):
             supports_reasoning=supports_reasoning,
             reasoning_effort=reasoning_effort,
             authorization_bearer=True,
+            supports_forced_tool_choice=supports_forced_tool_choice,
         )
         self._tokens = tokens
         self._app = app

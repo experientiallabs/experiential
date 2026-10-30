@@ -7,8 +7,8 @@ import pytest
 
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,

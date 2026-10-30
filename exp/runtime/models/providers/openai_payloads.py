@@ -36,6 +36,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
 )
+from exp.runtime.models.providers.tool_turn_order import fold_assistant_text_into_tool_turns
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
     fold_tool_result_attachments,
@@ -68,7 +69,8 @@ def _without_probability_metadata(item: JsonObject) -> JsonObject:
 def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """Shape one replayed Responses item for the OpenAI wire; ``None`` drops it.
 
-    Two client habits are repaired, everything else re-emits verbatim: an
+    Two client habits are repaired, everything else (an ``item_reference``
+    included, whose id is the reference itself) re-emits verbatim: an
     input MESSAGE or REASONING item loses the output-only ``status`` OpenAI
     rejects on it, and an item carrying a foreign ``id`` loses the id (a
     reasoning item with a foreign id is dropped whole: without its encrypted
@@ -78,6 +80,10 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
     item_type = shaped.get("type")
+    if item_type == "item_reference":
+        # The id IS the reference: the issuing provider judges whether it
+        # resolves (a dangling one is the caller's 400, see ``upstream.rs``).
+        return shaped
     if isinstance(item_id, str) and (
         item_id.startswith(_FOREIGN_ITEM_ID_PREFIX)
         or not openai_issued_item_id(
@@ -408,6 +414,9 @@ def openai_compatible_stream_payload(
         request.messages,
         route_sha256=reasoning_route_sha256,
     )
+    # Chat requires a tool turn's results right after the message that called
+    # them; Responses history can carry progress text in between.
+    messages = fold_assistant_text_into_tool_turns(messages)
     if deepseek_reasoning_history or is_deepseek_model_id(model_id):
         # DeepSeek ends a tools+reasoning turn empty when the conversation
         # ends on an instruction; see fold_trailing_instruction_turns.

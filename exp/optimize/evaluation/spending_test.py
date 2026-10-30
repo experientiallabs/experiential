@@ -20,13 +20,20 @@ from exp.common.models import (
     OperationEconomics,
     Usage,
     completion_cost_reservation,
+    load_model_catalog,
 )
 from exp.common.models.pricing_test import _model
 from exp.common.models.token_cost_test import prices
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ProjectConfig, ProjectStore, artifact_input
 from exp.common.project.request_budget import RequestBudgetStore
 from exp.common.rollouts import RolloutArtifact
-from exp.optimize.evaluation.spending import BudgetedCompletion
+from exp.optimize.evaluation.audit.panel_test import write_catalog
+from exp.optimize.evaluation.spending import (
+    BudgetedCompletion,
+    alias_tariffs,
+    operation_spend_ceiling,
+    save_spend_receipt,
+)
 from exp.optimize.router.composition_test import _completion_reservation
 from exp.optimize.router.judging.artifacts import write_production_rollout
 from exp.optimize.router.judging.protocol import TemplateJudgeClient
@@ -42,6 +49,7 @@ from exp.optimize.router.judging.service_test import (
     _template,
     _wide_axes,
 )
+from exp.runtime.gateway.decisions_contracts import MAX_DECISION_CRITERIA, MAX_DECISION_QUESTIONS
 from exp.runtime.models.budget import RequestBudget, SpendLimitReached
 from exp.runtime.models.providers import async_transport, base
 from exp.runtime.models.providers.async_transport import (
@@ -61,6 +69,7 @@ from exp.runtime.models.providers.transport import (
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.registry_test import _catalog as _runtime_catalog
+from exp.runtime.models.spend_ceiling import UnpricedDispatchRefused
 from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
@@ -701,3 +710,76 @@ def test_known_charge_can_exceed_an_uncapped_incomplete_tariff_estimate(tmp_path
         input_tokens=Utf8UpperBoundTokenCounter().count(request), output_tokens=1
     )
     assert not store.has_unbounded_liability()
+
+
+def test_alias_tariffs_price_exactly_the_aliases_the_estimate_prices(tmp_path: Path) -> None:
+    """Priced aliases get worst-case tariffs; the decision wire repeats its input per question."""
+    write_catalog(tmp_path)
+    catalog = load_model_catalog(tmp_path / "models.toml")
+    world = catalog.models["world"]
+    jev = catalog.models["jev"]
+    assert world.capabilities is not None and jev.capabilities is not None
+    priced = catalog.model_copy(
+        update={
+            "models": {
+                **catalog.models,
+                "world": world.model_copy(
+                    update={
+                        "capabilities": world.capabilities.model_copy(
+                            update={
+                                "input_cost_per_million_tokens_usd": 1.0,
+                                "cached_input_cost_per_million_tokens_usd": 0.1,
+                                "cache_write_cost_per_million_tokens_usd": 1.25,
+                                "output_cost_per_million_tokens_usd": 2.0,
+                            }
+                        )
+                    }
+                ),
+                "jev": jev.model_copy(
+                    update={
+                        "capabilities": jev.capabilities.model_copy(
+                            update={
+                                "input_cost_per_million_tokens_usd": 0.5,
+                                "output_cost_per_million_tokens_usd": 0.5,
+                            }
+                        )
+                    }
+                ),
+            }
+        }
+    )
+    tariffs = alias_tariffs(priced)
+    # The judge has no price; the embedder prices input only.
+    assert set(tariffs) == {"world", "embed", "jev"}
+    assert tariffs["world"].input_usd_per_million == 1.25
+    assert tariffs["world"].output_usd_per_million == 2.0
+    assert tariffs["world"].context_window_tokens == 200_000
+    assert tariffs["world"].default_output_tokens == 8_192
+    assert tariffs["world"].output_uses_context_bound
+    assert tariffs["embed"].output_usd_per_million is None
+    decision = tariffs["jev"]
+    assert decision.repeated_input == MAX_DECISION_QUESTIONS
+    assert decision.default_output_tokens == MAX_DECISION_QUESTIONS * (
+        1024 + 512 * MAX_DECISION_CRITERIA
+    )
+    assert decision.context_window_tokens is None
+    assert not decision.output_uses_context_bound
+
+
+def test_operation_ceiling_of_a_project_without_a_catalog_prices_nothing(
+    tmp_path: Path,
+) -> None:
+    """Without a catalog every request is unpriced, and the receipt records the consent."""
+    project = ProjectStore(tmp_path, "case")
+    project.initialize(ProjectConfig(project_id="case"))
+    ceiling = operation_spend_ceiling(project, "operation-case")
+    ceiling.authorize("stage", ceiling_usd=1.0)
+    with pytest.raises(UnpricedDispatchRefused):
+        ceiling.reserve(alias="world", url="https://fixture.invalid/v1/chat", payload={})
+    path = save_spend_receipt(project, "operation-case", ceiling, "exp eval case")
+    receipt = json.loads(path.read_text())
+    assert path.parent == project.paths.runtime_directory / "spend" / "operation-case"
+    assert receipt["command"] == "exp eval case" and receipt["ceiling_usd"] == 1.0
+    assert receipt["accounted_usd"] == 0 and receipt["authorizations"][0]["stage"] == "stage"
+    with pytest.raises(ValueError, match="spend operation"):
+        operation_spend_ceiling(project, "../escape")

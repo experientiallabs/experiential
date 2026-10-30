@@ -16,8 +16,9 @@ import os
 import re
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 from click import unstyle
@@ -25,6 +26,7 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.config.settings import set_maximum_command_cost_usd
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -47,7 +49,8 @@ from exp.common.traces import load_trace_dataset
 from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
 from exp.optimize.router.judging.service import prepare_manual_judge_calibration
 from exp.runtime.models import CatalogRoleName, ResolvedModel
-from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from exp.runtime.models.registry import ProviderTransport, RuntimeModelCatalog
 
 TRACES_URL = (
     "https://huggingface.co/datasets/experiential-labs/wmo-terminal-tasks-traces/resolve/"
@@ -71,6 +74,29 @@ class _EmbeddingClient:
             norm = math.sqrt(sum(value * value for value in raw))
             embeddings.append(Embedding(values=tuple(value / norm for value in raw)))
         return tuple(embeddings)
+
+
+class _EmbeddingTransport(JsonHttpTransport):
+    """Serve the deterministic vectors through the admitted embedding wire."""
+
+    def post(
+        self, url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Answer one embeddings request with one vector per input text."""
+        assert url.endswith("/embeddings")
+        texts = payload["input"]
+        assert isinstance(texts, list) and all(isinstance(text, str) for text in texts)
+        vectors = _EmbeddingClient().embed(cast(list[str], texts))
+        return JsonHttpResponse(
+            200,
+            {
+                "data": [
+                    {"index": i, "embedding": list(vector.values)}
+                    for i, vector in enumerate(vectors)
+                ],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            },
+        )
 
 
 class _JudgeClient:
@@ -117,6 +143,7 @@ class _RuntimeCatalog:
 
     def __init__(self, catalog: ModelCatalog) -> None:
         """Wrap the real catalog so every snapshot stays exactly as configured."""
+        self._catalog = catalog
         self._real = RuntimeModelCatalog(catalog)
         self._embedding = _EmbeddingClient()
 
@@ -152,10 +179,22 @@ class _RuntimeCatalog:
         del role
         return self.preflight(alias)
 
+    def with_transport_wrapper(
+        self, wrapper: Callable[[ProviderTransport], ProviderTransport]
+    ) -> RuntimeModelCatalog:
+        """Exercise real embedding framing and admission around the deterministic wire."""
+        return RuntimeModelCatalog(
+            self._catalog,
+            environment={"FIXTURE_API_KEY": "fixture-only"},
+            transport_factory=_EmbeddingTransport,
+        ).with_transport_wrapper(wrapper)
+
 
 @pytest.fixture(name="pinned_traces")
 def _pinned_traces(request: pytest.FixtureRequest) -> Path:
     """Return the cached pinned public export, skipping when it cannot be fetched."""
+    if getattr(request.config, "cache", None) is None:
+        pytest.skip("the pinned public export needs pytest's cacheprovider plugin")
     cache = Path(str(request.config.cache.mkdir("exp-public-fixtures")))
     path = cache / "terminal-tasks-traces.otel.jsonl"
     if not path.is_file() or _sha256(path) != TRACES_SHA256:
@@ -209,6 +248,7 @@ def _write_catalog(root: Path) -> None:
                     model="embed-id",
                     capabilities=ModelCapabilities(
                         supports_embeddings=True,
+                        context_window_tokens=8_192,
                         input_cost_per_million_tokens_usd=0,
                     ),
                 ),

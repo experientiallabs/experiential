@@ -498,6 +498,14 @@ pub struct Normalizer {
     unreported_stop_read_as_length: bool,
     // OpenAI-compatible content held back while it could be DSML markup.
     dsml: openai::dsml::DsmlGuard,
+    // Whether a caller-visible ANSWER (content text or a started tool call,
+    // not reasoning of either carrier) has been surfaced on an
+    // OpenAI-compatible stream. A natural `stop` that reported answer output
+    // tokens while this stayed false is the upstream dropping its own output
+    // (a provider tool parser that swallowed markup it could not convert,
+    // deepseek-v4.1-flash on Novita, 2026-10-27): it settles Incomplete, not a
+    // silent empty Completed.
+    answer_surfaced: bool,
 }
 
 /// Longest upstream label kept from a stream (mirrors the python settlement bound).
@@ -551,6 +559,7 @@ impl Normalizer {
             output_token_cap: None,
             unreported_stop_read_as_length: false,
             dsml: Default::default(),
+            answer_surfaced: false,
         }
     }
 
