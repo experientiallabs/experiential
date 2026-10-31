@@ -294,6 +294,50 @@ def test_submit_quarantines_lines_the_provider_client_cannot_carry() -> None:
     assert ledger.reserved == ["a"]
 
 
+@pytest.mark.parametrize(
+    ("poison", "poison_id"),
+    [
+        (
+            '{"custom_id": "poison", "method": "POST", '
+            '"url": "/v1/chat/completions", "body": '
+            '{"model": "gpt-oss-120b-batch", "messages": '
+            '[{"role": "user", "content": "\\ud800"}], "max_tokens": 16}}',
+            "poison",
+        ),
+        (
+            '{"custom_id": "\\ud800", "method": "POST", '
+            '"url": "/v1/chat/completions", "body": '
+            '{"model": "gpt-oss-120b-batch", "messages": [], "max_tokens": 16}}',
+            None,
+        ),
+    ],
+    ids=["body", "custom-id"],
+)
+def test_submit_quarantines_a_line_that_cannot_be_encoded_as_utf8_json(
+    poison: str,
+    poison_id: str | None,
+) -> None:
+    """A lone surrogate in any provider-bound field rejects only its line."""
+    engine, store, _, ledger, client = _engine()
+    file_id = _upload(engine, [_chat_line("a"), poison, _chat_line("b")])
+
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+
+    assert [line.custom_id for line in job.lines] == ["a", "b"]
+    assert [(error.custom_id, error.code) for error in job.line_errors] == [
+        (poison_id, "invalid_request")
+    ]
+    assert ledger.reserved == ["a", "b"]
+    assert client.submitted == ["key-for-secret://openrouter"]
+    assert store.jobs[job.batch_id].status is BatchStatus.IN_PROGRESS
+
+
 def test_rejected_lines_do_not_taint_the_provider_binding() -> None:
     """A line rejected at the client checks never joins the provider set, so a valid
     remainder on one provider submits instead of tripping the mixed-provider refusal."""
