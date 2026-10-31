@@ -348,6 +348,53 @@ def test_a_flagged_rung_on_another_wire_fails_closed() -> None:
     assert excinfo.value.capability == ZDR_CONSTRAINT_CAPABILITY
 
 
+def _access_programs_rung(programs: dict[str, str] | None) -> ExactModelDeployment:
+    """An openai rung whose dispatch policy authors ``access_programs``."""
+    base = _deployment("sol-rung", "openai")
+    return base.model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+                dispatch=GatewayRungDispatchPolicy(access_programs=programs),
+            )
+        }
+    )
+
+
+def test_access_programs_are_injected_on_the_responses_wire() -> None:
+    """A deployment that authors access_programs ships them in the Responses body.
+
+    The caller never sends the field (the Messages lane has none); the host
+    injects the operator-authored opt-in for this one lane. Daybreak Blue.
+    """
+    rung = _access_programs_rung({"cyber": "daybreak_blue"})
+    entry = _dispatch(_route((rung,)), rung, dialect="openai_responses").wire_entry
+
+    payload = entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["access_programs"] == {"cyber": "daybreak_blue"}
+
+
+def test_access_programs_are_omitted_without_an_authored_policy() -> None:
+    """An unflagged responses rung carries no access_programs field."""
+    rung = _access_programs_rung(None)
+    entry = _dispatch(_route((rung,)), rung, dialect="openai_responses").wire_entry
+
+    assert "access_programs" not in json.dumps(entry["upstream_payload"])
+
+
+def test_access_programs_never_reach_a_non_responses_wire() -> None:
+    """The same authored policy is dropped on a wire that is not the Responses wire.
+
+    access_programs is an OpenAI Responses field; every other provider would
+    receive an unknown field, so the injection is gated on ``openai_responses``.
+    """
+    rung = _access_programs_rung({"cyber": "daybreak_blue"})
+    entry = _dispatch(_route((rung,)), rung, dialect="openai_compatible").wire_entry
+
+    assert "access_programs" not in json.dumps(entry["upstream_payload"])
+
+
 def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the_flag() -> None:
     """Only the caller's data-policy keys reach OpenRouter; routing keys never do.
 

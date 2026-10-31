@@ -237,6 +237,21 @@ class GatewayRungDispatchPolicy(ContractModel):
     priority_overflow_pro: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
     upstream_priority: bool = False
     priority_tier_attested: bool = False
+    access_programs: dict[str, str] | None = None
+    """OpenAI access-program opt-ins written into the Responses request body.
+
+    OpenAI gates certain behaviors (Daybreak Blue's reduced cybersecurity
+    refusals on its mainline models) behind a request field,
+    ``{"access_programs": {"cyber": "daybreak_blue"}}``, admitted only for a
+    project approved for the program. The caller never sends it: Claude Code
+    speaks the Messages lane, which carries no such field, so the host injects
+    it for the one deployment an operator authored with it. Deployment-authored,
+    never caller-sent, and built at resolve time into the per-request payload
+    (not published in the snapshot), so an unflagged fleet simply never injects
+    it. The Responses wire is the only dialect that carries it, so
+    ``build_rung_dispatch`` injects it only on ``openai_responses``. ``None``
+    injects nothing.
+    """
     max_prompt_tokens: int | None = Field(default=None, ge=1)
     """The longest prompt this rung takes, by the prompt's lower-bound estimate.
 

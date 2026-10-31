@@ -225,6 +225,20 @@ def build_rung_dispatch(
             # vLLM bills no processing tier: a :fast request's tier is ours
             # to serve (class_throttles), so the field never reaches it.
             upstream_payload.pop("service_tier", None)
+    if (
+        dispatch_policy is not None
+        and dispatch_policy.access_programs
+        and profile.dialect == "openai_responses"
+    ):
+        # Deployment-authored OpenAI access-program opt-ins (Daybreak). The
+        # caller never sends these: the Messages lane has no such field, so the
+        # host injects them for the one lane an operator authored with them.
+        # Only the Responses wire carries access_programs; every other provider
+        # would receive an unknown field.
+        upstream_payload = {
+            **upstream_payload,
+            "access_programs": dict(dispatch_policy.access_programs),
+        }
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"
