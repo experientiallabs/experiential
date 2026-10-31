@@ -220,7 +220,7 @@ class NativeControlPlane(
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Shared policy engine. ``None`` skips inspection.
             capture: Optional identity-scoped native capture controller.
-            web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
+            web_search: Gateway web-search backend; ``None`` uses ``default_web_search_backend()``.
             default_lane_bound: Default per-worker in-flight cap for rungs without
                 an authored ``concurrency_bound``; ``None`` leaves them unbounded.
             automatic_cache: Opt-in Vertex prefix selection and durable host accounting.

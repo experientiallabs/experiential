@@ -3,7 +3,8 @@
 A loopback Exa fixture answers the search, a loopback OpenAI-compatible provider
 answers the model turn (citing one of the injected URLs), and the real Rust data
 plane renders citations, blocks, and the per-search count on Chat, Responses, and
-Messages. Without ``EXA_API_KEY`` the same request serves with a disclosed drop.
+Messages. Without ``EXA_API_KEY`` the same request serves with a disclosed drop;
+with ``EXP_WEB_SEARCH_BACKEND=keenable`` a loopback Keenable fixture answers it.
 """
 
 from __future__ import annotations
@@ -44,10 +45,11 @@ def _provider_body() -> bytes:
 
 
 class _Fixtures:
-    """Loopback Exa and provider servers recording what the gateway sent them."""
+    """Loopback Exa, Keenable, and provider servers recording what the gateway sent them."""
 
     def __init__(self) -> None:
         self.search_requests: list[JsonObject] = []
+        self.keenable_requests: list[tuple[str, dict[str, str], JsonObject]] = []
         self.provider_requests: list[JsonObject] = []
         fixtures = self
 
@@ -78,6 +80,36 @@ class _Fixtures:
             def log_message(self, format: str, *args: object) -> None:
                 del format, args
 
+        class Keenable(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                fixtures.keenable_requests.append(
+                    (
+                        self.path,
+                        {name.lower(): value for name, value in self.headers.items()},
+                        json.loads(self.rfile.read(int(self.headers["content-length"]))),
+                    )
+                )
+                body = json.dumps(
+                    {
+                        "results": [
+                            {
+                                "url": _URL,
+                                "title": "Announcing Rust 1.99",
+                                "description": "",
+                                "snippet": "# Announcing Rust 1.99\n\nRust 1.99 is out.",
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
         class Provider(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
                 fixtures.provider_requests.append(
@@ -94,16 +126,17 @@ class _Fixtures:
                 del format, args
 
         self.exa = ThreadingHTTPServer(("127.0.0.1", 0), Exa)
+        self.keenable = ThreadingHTTPServer(("127.0.0.1", 0), Keenable)
         self.provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
         self.threads = [
             threading.Thread(target=server.serve_forever, daemon=True)
-            for server in (self.exa, self.provider)
+            for server in (self.exa, self.keenable, self.provider)
         ]
         for thread in self.threads:
             thread.start()
 
     def close(self) -> None:
-        for server in (self.exa, self.provider):
+        for server in (self.exa, self.keenable, self.provider):
             server.shutdown()
             server.server_close()
         for thread in self.threads:
@@ -334,6 +367,8 @@ def test_without_a_backend_the_ask_is_dropped_with_disclosure(
     fixtures = _Fixtures()
     monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
     monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    monkeypatch.delenv("EXP_WEB_SEARCH_BACKEND", raising=False)
     raw_key = _configure(tmp_path, f"http://127.0.0.1:{fixtures.provider.server_port}/v1")
     gateway = _ServedGateway(tmp_path, _unused_port())
     try:
@@ -357,6 +392,48 @@ def test_without_a_backend_the_ask_is_dropped_with_disclosure(
         assert "annotations" not in body["choices"][0]["message"]
         assert "server_tool_use_details" not in body["usage"]
         assert "web_search_options" not in fixtures.provider_requests[0]
+    finally:
+        gateway.stop()
+        fixtures.close()
+
+
+def test_chat_web_search_is_served_by_keenable_when_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixtures = _Fixtures()
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    monkeypatch.setenv("EXP_WEB_SEARCH_BACKEND", "keenable")
+    monkeypatch.setenv(
+        "KEENABLE_SEARCH_URL", f"http://127.0.0.1:{fixtures.keenable.server_port}/v1/search"
+    )
+    raw_key = _configure(tmp_path, f"http://127.0.0.1:{fixtures.provider.server_port}/v1")
+    gateway = _ServedGateway(tmp_path, _unused_port())
+    try:
+        gateway.start()
+        response = httpx.post(
+            f"http://127.0.0.1:{gateway.port}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            json={
+                "model": "coding",
+                "messages": [{"role": "user", "content": "What is the latest Rust release?"}],
+                "plugins": [{"id": "web", "max_results": 2}],
+            },
+            timeout=20,
+        )
+        assert response.status_code == 200, response.text
+        assert fixtures.search_requests == []
+        path, headers, sent_search = fixtures.keenable_requests[0]
+        assert path == "/v1/search"
+        assert headers["x-keenable-title"] == "Experiential"
+        assert "x-api-key" not in headers
+        assert sent_search == {"query": "What is the latest Rust release?", "max_results": 2}
+        instruction = _injected_instruction(fixtures.provider_requests[0])
+        assert _URL in instruction and "Rust 1.99 is out." in instruction
+        body = response.json()
+        assert body["choices"][0]["message"]["annotations"][0]["url_citation"]["url"] == _URL
+        assert body["usage"]["server_tool_use_details"] == {"web_search_requests": 1}
     finally:
         gateway.stop()
         fixtures.close()
