@@ -68,6 +68,11 @@ class JsonNode:
         }
 
 
+def _strip_utf8_bom(data: bytes) -> bytes:
+    """Remove one UTF-8 BOM at the start of a byte sequence."""
+    return data.removeprefix(codecs.BOM_UTF8)
+
+
 class JsonArchive:
     """A verified source snapshot whose JSON containers remain on temporary disk.
 
@@ -111,6 +116,9 @@ class JsonArchive:
         )
         try:
             with snapshot.open("rb") as stream:
+                prefix = stream.read(len(codecs.BOM_UTF8))
+                if prefix != codecs.BOM_UTF8:
+                    stream.seek(0)
                 self._parse(stream)
         except ijson.JSONError:
             self.jsonl = True
@@ -122,13 +130,15 @@ class JsonArchive:
                         continue
                     database.execute("SAVEPOINT json_line")
                     duplicate_keys = self.duplicate_keys
+                    line_data = _strip_utf8_bom(line) if line_number == 1 else line
+
                     try:
-                        self._parse(io.BytesIO(line))
+                        self._parse(io.BytesIO(line_data))
                     except ijson.JSONError:
                         database.execute("ROLLBACK TO json_line")
                         self.duplicate_keys = duplicate_keys
                         try:
-                            json.loads(line)
+                            json.loads(line_data)
                         except json.JSONDecodeError as exc:
                             message = exc.msg
                         else:
