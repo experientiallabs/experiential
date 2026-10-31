@@ -23,6 +23,27 @@ class GatewaySchemaError(RuntimeError):
     """The gateway database schema cannot be opened safely."""
 
 
+def _schema_error(
+    exc: sqlite3.DatabaseError | OSError,
+    *,
+    fallback: str,
+) -> GatewaySchemaError:
+    """Classify transient SQLite lock contention before generic schema failures."""
+    if isinstance(exc, sqlite3.OperationalError):
+        code = getattr(exc, "sqlite_errorcode", None)
+        primary_code = code & 0xFF if isinstance(code, int) else None
+        detail = str(exc).lower()
+        if primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} or detail in {
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+        }:
+            return GatewaySchemaError(
+                "gateway database is locked by another exp process; stop it or retry"
+            )
+    return GatewaySchemaError(fallback)
+
+
 MigrationStep = str | Callable[[sqlite3.Connection], None]
 """One forward-migration step: a plain SQL statement, or a callable for a step
 that must read before it writes (the v20 money-unit move guards every amount
@@ -822,13 +843,13 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
         Backup path when an existing older schema was migrated, otherwise ``None``.
 
     Raises:
-        GatewaySchemaError: State is corrupt, newer, or cannot migrate atomically.
+        GatewaySchemaError: State is locked, corrupt, newer, or cannot migrate atomically.
     """
     _create_private_database_file(path)
     try:
         connection = connect_database(path, busy_timeout_ms=busy_timeout_ms, enable_wal=False)
     except sqlite3.DatabaseError as exc:
-        raise GatewaySchemaError("gateway database is corrupt or unreadable") from exc
+        raise _schema_error(exc, fallback="gateway database is corrupt or unreadable") from exc
     backup: Path | None = None
     try:
         connection.execute("BEGIN EXCLUSIVE")
@@ -862,9 +883,9 @@ def initialize_database(path: Path, *, busy_timeout_ms: int = 5_000) -> Path | N
             raise
         except (sqlite3.DatabaseError, OSError) as exc:
             connection.execute("ROLLBACK")
-            raise GatewaySchemaError("gateway database migration failed") from exc
+            raise _schema_error(exc, fallback="gateway database migration failed") from exc
     except sqlite3.DatabaseError as exc:
-        raise GatewaySchemaError("gateway database is corrupt or unreadable") from exc
+        raise _schema_error(exc, fallback="gateway database is corrupt or unreadable") from exc
     finally:
         connection.close()
     os.chmod(path, 0o600)
