@@ -110,6 +110,33 @@ result = report_router(store, fit, report_config)
 `fit_router` locks the policy before `report_router` reads held-out evidence. `optimize_router`
 performs both calls in that order for a complete `RouterOptimizationConfig`.
 
+## Cache-aware rare-switch sticky routing
+
+A retained episode alias keeps its provider prompt cache warm, so the frozen runtime treats a
+mid-episode alias change as a priced decision rather than a free improvement. `KnnGuard` carries a
+`cache_switch` gate with two optional fields:
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Defaults to `true`. Setting `false` restores unconditional episode stickiness. |
+| `switch_gain_per_amortized_usd` | Fitted quality gain required per US dollar of forfeited prompt-cache write amortization. Defaults to `10.0` and must be positive and finite. |
+
+When a fresh guarded selection proposes a different alias for an episode that already holds a
+sticky decision, the runtime prices the remaining amortization from the frozen pricing snapshot:
+the proposed alias's cache-write rate (never below its ordinary input rate) against the sticky
+alias's cached-read rate, over the conservative request token ceiling. The switch happens only
+when the workload-weighted fitted quality gain of the proposed alias strictly exceeds
+`switch_gain_per_amortized_usd` times that amortization. A capability-rejected sticky alias still
+switches to an eligible candidate. Missing fit pairing between the two candidates, or a pricing
+snapshot without either candidate row, fails closed to the sticky alias with no silent zero
+substitution.
+
+Every weighed comparison is recorded on the `RoutingDecision` as `switch_outcome`, either
+`"switched"` or `"switch_suppressed_cache"`, and the field stays absent for turns that never
+weighed a switch. A guard whose gate keeps all defaults serializes without the `cache_switch`
+field, so existing policy bytes, replayed policy identities, and persisted decision identities are
+unchanged.
+
 ## Separate world-model fidelity measurement
 
 Fidelity testing is an explicit common-evaluation workflow. Call

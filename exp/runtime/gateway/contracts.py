@@ -21,6 +21,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPoolId,
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
+from exp.common.routing.policy import SwitchOutcome
 from exp.runtime.gateway.client_apps import ClientAttribution
 from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock as EncryptedReasoningBlock
@@ -922,6 +923,7 @@ class ProjectSelection(ContractModel):
     selected_alias: ArtifactId
     activation_ref: ActivationRef
     fallback_reason: str | None = Field(default=None, max_length=512)
+    switch_outcome: SwitchOutcome | None = None
 
 
 class AuthorizationSnapshot(ClientAttribution):

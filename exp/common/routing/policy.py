@@ -16,6 +16,32 @@ from pydantic import (
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactId, ContractModel, Sha256
 from exp.common.models import ModelAlias, ModelSnapshot, RoutedCandidateSnapshot
 
+SwitchOutcome = Literal["switched", "switch_suppressed_cache"]
+"""How one sticky-episode decision resolved a proposed mid-episode alias change."""
+
+
+class CacheSwitchGuard(ContractModel):
+    """Cache-amortization gate on switching a sticky episode to a different alias.
+
+    A retained episode alias keeps its provider prompt cache warm. Switching to a
+    slightly better candidate forfeits that amortization, so an enabled gate allows
+    a mid-episode switch only when the fitted quality gain of the proposed alias
+    over the sticky alias strictly exceeds ``switch_gain_per_amortized_usd`` times
+    the conservative remaining prompt-cache write amortization in US dollars.
+    Disabling the gate restores unconditional episode stickiness.
+    """
+
+    enabled: bool = True
+    switch_gain_per_amortized_usd: float = Field(default=10.0, gt=0)
+
+    @field_validator("switch_gain_per_amortized_usd")
+    @classmethod
+    def _require_finite_rate(cls, value: float) -> float:
+        """Reject a non-finite quality-gain exchange rate."""
+        if not math.isfinite(value):
+            raise ValueError("cache-switch gain per amortized USD must be finite")
+        return value
+
 
 class KnnGuard(ContractModel):
     """Conservative evidence thresholds used by the offline guarded kNN policy."""
@@ -25,6 +51,7 @@ class KnnGuard(ContractModel):
     relative_similarity_threshold: float = Field(ge=0, le=1)
     uncertainty_multiplier: float = Field(gt=0)
     quality_tolerance: float
+    cache_switch: CacheSwitchGuard = Field(default_factory=CacheSwitchGuard)
 
     @field_validator("relative_similarity_threshold", "uncertainty_multiplier", "quality_tolerance")
     @classmethod
@@ -38,6 +65,23 @@ class KnnGuard(ContractModel):
         if self.minimum_paired_observations > self.maximum_neighbors:
             raise ValueError("minimum paired observations cannot exceed maximum neighbors")
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_default_cache_switch(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Omit an all-default cache-switch gate so default guard bytes stay stable.
+
+        Args:
+            handler: Standard field-by-field guard serializer.
+
+        Returns:
+            Serialized guard carrying the cache-switch gate only when configured.
+        """
+        serialized: dict[str, object] = handler(self)
+        if self.cache_switch == CacheSwitchGuard():
+            serialized.pop("cache_switch", None)
+        return serialized
 
 
 class RoutingDecision(ContractModel):
@@ -56,6 +100,7 @@ class RoutingDecision(ContractModel):
     estimated_quality_difference: float | None = None
     uncertainty: float | None = Field(default=None, ge=0)
     fallback_reason: str | None = Field(default=None, max_length=512)
+    switch_outcome: SwitchOutcome | None = None
 
     @field_validator("best_similarity", "estimated_quality_difference", "uncertainty")
     @classmethod
@@ -71,6 +116,23 @@ class RoutingDecision(ContractModel):
                 "routing decisions cannot have more paired observations than neighbors"
             )
         return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_absent_switch_outcome(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Omit an absent switch outcome so switch-free decision bytes stay stable.
+
+        Args:
+            handler: Standard field-by-field decision serializer.
+
+        Returns:
+            Serialized decision carrying the switch outcome only when one was weighed.
+        """
+        serialized: dict[str, object] = handler(self)
+        if self.switch_outcome is None:
+            serialized.pop("switch_outcome", None)
+        return serialized
 
 
 class KnnRouterPolicy(ArtifactEnvelope):

@@ -18,7 +18,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelPool,
     NormalizedGatewayCatalog,
 )
-from exp.common.routing.policy import RoutingDecision
+from exp.common.routing.policy import RoutingDecision, SwitchOutcome
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -97,6 +97,7 @@ class GatewayRoute(ContractModel):
     fallback_deployments: tuple[ExactModelDeployment, ...] = ()
     route_reason: str
     fallback_reason: str | None = None
+    switch_outcome: SwitchOutcome | None = None
     resolved_route_id: RequestedRouteId | None = None
     reasoning_pinned_deployment_id: str | None = None
     """The deployment whose credential sealed the request's active reasoning.
@@ -342,6 +343,7 @@ class CatalogRouteResolver:
             pool=pool,
             route_reason="learned_router",
             fallback_reason=selection.fallback_reason,
+            switch_outcome=selection.switch_outcome,
         )
 
     def requires_model_chain_authority(self, authorization: AuthorizationSnapshot) -> bool:
@@ -542,6 +544,7 @@ class CatalogRouteResolver:
         pool: ExactModelPool,
         route_reason: str,
         fallback_reason: str | None,
+        switch_outcome: SwitchOutcome | None = None,
     ) -> GatewayRoute:
         """Build one ordered execution route from a certified exact-model pool."""
         try:
@@ -565,6 +568,7 @@ class CatalogRouteResolver:
             fallback_deployments=tuple(deployments[1:]),
             route_reason=route_reason,
             fallback_reason=fallback_reason,
+            switch_outcome=switch_outcome,
         )
 
 
@@ -889,6 +893,7 @@ class RouterProjectTargetResolver:
             selected_alias=decision.selected_alias,
             activation_ref=target.activation_ref,
             fallback_reason=decision.fallback_reason,
+            switch_outcome=decision.switch_outcome,
         )
 
 

@@ -17,11 +17,19 @@ from exp.common.routing.features import (
     RouterFeatureExtractor,
     RouterFeatureRecord,
 )
-from exp.common.routing.policy import KnnGuard, KnnRouterPolicy, RouterPolicy, RoutingDecision
+from exp.common.routing.policy import (
+    CacheSwitchGuard,
+    KnnGuard,
+    KnnRouterPolicy,
+    RouterPolicy,
+    RoutingDecision,
+    SwitchOutcome,
+)
 
 __all__ = [
     "ROUTER_FEATURE_EXTRACTOR_ID",
     "ROUTER_FEATURE_SCHEMA_SHA256",
+    "CacheSwitchGuard",
     "KnnGuard",
     "KnnRouterPolicy",
     "RouterFeatureExtractor",
@@ -29,6 +37,7 @@ __all__ = [
     "RouterEmbeddingReservation",
     "RouterPolicy",
     "RoutingDecision",
+    "SwitchOutcome",
     "FrozenEmbedding",
     "FrozenEmbeddingClient",
     "FrozenEmbeddingSet",
