@@ -69,10 +69,10 @@ and activates the alias.
   `fallback_reason` `capability_eligibility`, as in learned routing. The episode then stays on
   the candidate that served it.
 - When no rule matches, the default serves with `fallback_reason` `no_rule_matched`. When the
-  decision model fails or times out, when 32 classifications are already in flight, or when the
-  request has no text to classify, the default serves with `classifier_unavailable`,
-  `classifier_busy` or `no_classifiable_text`. Routing never fails a request; only an expired
-  request deadline does.
+  decision model fails or times out, when 32 classifications are already in flight across the
+  gateway, or when the request has no text to classify, the default serves with
+  `classifier_unavailable`, `classifier_busy` or `no_classifiable_text`. Routing never fails a
+  request; only an expired request deadline does.
 - An episode's decision serves its later turns, as in learned routing, so a conversation
   keeps one model while it stays active; an idle episode expires after a day, or
   sooner when many other episodes arrive. A default chosen because the decision model had no
