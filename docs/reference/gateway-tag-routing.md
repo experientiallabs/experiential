@@ -40,8 +40,8 @@ should come from measured quality and cost.
   [classification guardrail](gateway-classification-guardrails.md) declares one: endpoint,
   model, categories with their questions, aggregate and threshold, window, timeout and cache.
   A category is flagged when its score reaches its threshold. The classifier names no
-  credential (`bearer_env` is refused): a frozen policy carries none, so point it at a
-  decision-model server that needs no token, such as one on the same host.
+  credential (`bearer_env` and URL query strings are refused): a frozen policy carries none,
+  so point it at a decision-model server that needs no token, such as one on the same host.
 - A rule matches when every `when_all` category is flagged and no `when_none` category is.
   Rules apply in order and the first match wins. Every rule must route to a candidate and name
   only the classifier's categories.

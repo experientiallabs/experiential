@@ -700,10 +700,10 @@ def _project_policy(
 ) -> tuple[tuple[RoutedCandidateSnapshot, ...], str]:
     """Return a project policy's pinned candidates and identity, verified for activation.
 
-    A tag-rules policy is verified by binding its selector to ``snapshot``, the
-    exact catalog this alias revision will serve, so a catalog edit between the
-    check and the snapshot cannot activate a revision the gateway then refuses.
-    A learned policy is loaded once, through the optimizer-owned verification.
+    Both kinds are verified against ``snapshot``, the exact catalog this alias
+    revision will serve, so a catalog edit between the check and the snapshot
+    cannot activate a revision the gateway then refuses. A learned policy is loaded
+    once, through the optimizer-owned verification.
     """
     try:
         store = ProjectStore(root, project)
@@ -722,7 +722,9 @@ def _project_policy(
     if isinstance(activation, TagRulesActivation):
         TagRulesSelector.from_activation(activation, RuntimeModelCatalog(snapshot, environment={}))
         return activation.policy.candidates, activation.activation_ref
-    runtime = load_project_router(project, root, policy_id=policy_id)
+    runtime = load_project_router(
+        project, root, policy_id=policy_id, runtime_catalog=RuntimeModelCatalog(snapshot)
+    )
     return runtime.policy.candidates, runtime.policy.policy_id
 
 
