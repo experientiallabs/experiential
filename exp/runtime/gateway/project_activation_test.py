@@ -49,6 +49,7 @@ def test_caller_supplied_activation_selects_without_a_local_project_directory(
         project_ref="platform-project",
         activation_ref=policy.policy_id,
     )
+    assert isinstance(activation, ProjectActivation)
     repository = _StaticActivationRepository(activation)
 
     supplied = repository.load(
