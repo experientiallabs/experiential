@@ -5,12 +5,17 @@ travel together because a decision is cached against the exact text that produce
 question is a new question, and reusing its identity would silently replay an answer to a question
 nobody asked.
 
-Banks ship as package data in TOML, one file per bank, so a caller gets the same questions on every
-machine without a project store, a network call, or a configuration file. The packaged
-``situation-v1`` bank asks what one case turned out to contain, as revealed by the environment:
-whether sources disagreed, whether a lookup returned namesakes, whether no option satisfied the
-requirements. Those are properties of the case rather than of the agent that worked it, which is
-what makes them useful for grouping traces that one rubric covers.
+A real bank is local configuration rather than package data. The exact wording of a proposition is
+the asset: it decides what the geometry can tell apart, it is hashed into every decision's cache
+key, and it is not something a distribution should carry. So :func:`resolve_question_bank` reads
+``<bank_id>.toml`` out of a local directory, ``.exp/question_banks`` by default and
+:data:`LOCAL_BANK_ROOT_VARIABLE` when that is set, beside the model catalog and equally untracked.
+
+The packaged directory holds one deliberately generic ``example-v1`` bank and nothing else. It
+exists so tests and documentation have a bank to load with no setup, and it is never a fallback for
+a real one: resolution ends in a failure naming both places it looked, because tagging with the
+wrong propositions still returns a matrix, still clusters and still reports coverage, so a quiet
+substitution is indistinguishable from success and costs real money to discover.
 
 Every question is a proposition, so an answer is a probability in ``[0, 1]`` and a bank's answers
 form a vector of fixed width and fixed column order. Families partition a bank, because the
@@ -19,6 +24,7 @@ families need different views and are batched separately.
 
 from __future__ import annotations
 
+import os
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -30,8 +36,14 @@ from exp.common.core.artifacts import ContractModel, validate_artifact_id
 PACKAGED_BANK_DIRECTORY = "question_banks"
 """Package-data directory holding one TOML file per packaged bank, named ``<bank_id>.toml``."""
 
-DEFAULT_BANK_ID = "situation-v1"
-"""The packaged bank asked about the observations view: 28 propositions about the case."""
+EXAMPLE_BANK_ID = "example-v1"
+"""The only packaged bank: generic propositions for tests and documentation, never a real run."""
+
+LOCAL_BANK_DIRECTORY = Path(".exp/question_banks")
+"""Where a real bank is read from, beside the local model catalog and equally untracked."""
+
+LOCAL_BANK_ROOT_VARIABLE = "EXP_QUESTION_BANK_ROOT"
+"""Environment variable overriding :data:`LOCAL_BANK_DIRECTORY`, for a bank kept elsewhere."""
 
 
 class QuestionBankError(ValueError):
@@ -44,7 +56,7 @@ class Question(ContractModel):
     Attributes:
         question_id: Stable column identity, such as ``sit.clean``. It names the proposition
             across banks, matrices, and caches, so it never changes meaning once published.
-        family: The group this question belongs to, such as ``situation``. A family is asked
+        family: The group this question belongs to, such as ``requirement``. A family is asked
             about one view and is batched as a unit.
         text: The exact instruction sent to the decision model. It is part of the cache key, so
             editing it invalidates every answer previously bought for this column.
@@ -163,7 +175,7 @@ def load_question_bank(path: Path) -> QuestionBank:
     return _validated(bank, str(path))
 
 
-def packaged_question_bank(bank_id: str = DEFAULT_BANK_ID) -> QuestionBank:
+def packaged_question_bank(bank_id: str = EXAMPLE_BANK_ID) -> QuestionBank:
     """Read a bank that ships inside this package.
 
     Args:
@@ -206,6 +218,53 @@ def packaged_question_bank(bank_id: str = DEFAULT_BANK_ID) -> QuestionBank:
             f"packaged question bank file {bank_id!r} declares bank_id {bank.bank_id!r}"
         )
     return _validated(bank, repr(bank_id))
+
+
+def local_bank_root() -> Path:
+    """Return the directory real banks are read from.
+
+    Returns:
+        :data:`LOCAL_BANK_DIRECTORY`, or the path named by :data:`LOCAL_BANK_ROOT_VARIABLE` when
+        that variable is set to something non-empty.
+    """
+    override = os.environ.get(LOCAL_BANK_ROOT_VARIABLE, "").strip()
+    return Path(override) if override else LOCAL_BANK_DIRECTORY
+
+
+def resolve_question_bank(bank_id: str, *, root: Path | None = None) -> QuestionBank:
+    """Read the bank one identity names, from local configuration before package data.
+
+    Args:
+        bank_id: Stable bank identity, which is also its file name.
+        root: Directory to read local banks from, or None for :func:`local_bank_root`.
+
+    Returns:
+        The parsed bank, in file order.
+
+    Raises:
+        QuestionBankError: The identity is not a stable identifier, or no local file and no
+            packaged bank carries it. The failure names both places that were searched, because
+            the fix is either installing the bank or correcting the identity and the message
+            cannot tell which.
+    """
+    try:
+        validate_artifact_id(bank_id)
+    except ValueError as exc:
+        raise QuestionBankError(
+            f"question bank id {bank_id!r} must be lowercase components separated by "
+            "'.', '_', or '-'"
+        ) from exc
+    directory = local_bank_root() if root is None else root
+    path = directory / f"{bank_id}.toml"
+    if path.is_file():
+        return load_question_bank(path)
+    if bank_id in packaged_bank_ids():
+        return packaged_question_bank(bank_id)
+    raise QuestionBankError(
+        f"no question bank named {bank_id!r}: {path} does not exist and the only packaged banks "
+        f"are {list(packaged_bank_ids())}. Install the bank at that path, set "
+        f"{LOCAL_BANK_ROOT_VARIABLE} to the directory holding it, or name a bank that is there"
+    )
 
 
 def packaged_bank_ids() -> tuple[str, ...]:

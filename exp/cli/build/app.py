@@ -17,6 +17,17 @@ from exp.cli.build.checkpoints import (
 from exp.cli.build.checkpoints import (
     save_grounded_checkpoint,
 )
+from exp.cli.build.mining_options import (
+    CLUSTER_WITH_OPTION,
+    MINE_WITH_OPTION,
+    MINING_SEED_OPTION,
+    QUESTION_BANK_OPTION,
+    SAMPLE_WITH_OPTION,
+    TAGGER_CONCURRENCY_OPTION,
+    TAGGER_OPTION,
+    build_tagger,
+    mining_geometry,
+)
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
 from exp.cli.build.stops import paid_work_stops, require_learning_consent, rerun_command
@@ -180,6 +191,13 @@ def build(
         "--retry-incomplete",
         help="Buy again the calls of a learning trace that stopped incomplete.",
     ),
+    mine_with: str = MINE_WITH_OPTION,
+    tagger: str | None = TAGGER_OPTION,
+    question_bank: str | None = QUESTION_BANK_OPTION,
+    cluster_with: str = CLUSTER_WITH_OPTION,
+    sample_with: str = SAMPLE_WITH_OPTION,
+    mining_seed: int = MINING_SEED_OPTION,
+    tagger_concurrency: int = TAGGER_CONCURRENCY_OPTION,
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
@@ -208,6 +226,15 @@ def build(
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
         retry_incomplete: Replace an interrupted learning trace, buying it again.
+        mine_with: Selection geometry for representative-task mining.
+        tagger: Decision-model alias answering the question bank, required by ``decision-tag``.
+        question_bank: Question bank identity the decision-tag geometry reads, required by
+            ``decision-tag``. It resolves from local configuration, never from package data.
+        cluster_with: Clustering backend grouping the selection candidates.
+        sample_with: How representative budget beyond the guaranteed slots is spent.
+        mining_seed: Seed for a clustering backend with random initialization.
+        tagger_concurrency: Decision calls in flight at once, which changes only how
+            long tagging takes.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
@@ -265,6 +292,14 @@ def build(
                 raise typer.BadParameter(str(exc)) from exc
         return
     source = source or "otlp"
+    mining_spec = mining_geometry(
+        mine_with=mine_with,
+        cluster_with=cluster_with,
+        sample_with=sample_with,
+        tagger=tagger,
+        question_bank=question_bank,
+        seed=mining_seed,
+    )
     rerun = rerun_command(project, trace_file, import_id, source, identity)
     started = time.monotonic()
     with usage_error(
@@ -336,6 +371,18 @@ def build(
                 store,
                 created_at=datetime.now(UTC),
                 code_revision=code_revision,
+                mining_spec=mining_spec,
+                tagger=(
+                    None
+                    if tagger is None
+                    else build_tagger(
+                        tagger,
+                        catalog=catalog,
+                        root=root,
+                        project=project,
+                        maximum_concurrency=tagger_concurrency,
+                    )
+                ),
             )
             task_count = len(completed.artifacts.mining.tasks)
             report(

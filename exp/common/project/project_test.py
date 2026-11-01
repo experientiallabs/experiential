@@ -75,7 +75,13 @@ def test_trace_first_config_omits_late_setup_without_changing_existing_defaults(
 
 
 def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> None:
-    """Project owns preparation settings while the selected stage stores only exact pointers."""
+    """Project owns preparation settings while the selected stage stores only exact pointers.
+
+    The field set is pinned so preparation settings stay the small, deliberate record of what was
+    fixed before mining ran, rather than drifting into a general project configuration. The mining
+    geometry fields belong here for that same reason: they are chosen before trace preparation
+    starts and a later run rebuilds the same mining spec from them.
+    """
     trace = ArtifactInput(artifact_id="trace-dataset", sha256=_DIGEST)
     task = ArtifactInput(artifact_id="task-set", sha256=_DIGEST)
     stage = ProjectProviderFreeStage(trace_dataset=trace, task_set=task)
@@ -85,6 +91,12 @@ def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> 
         "fit_task_budget",
         "held_out_task_budget",
         "descriptor_dimensions",
+        "mining_geometry",
+        "mining_bank",
+        "mining_cluster",
+        "mining_sampling",
+        "mining_tagger_alias",
+        "mining_seed",
     }
     assert stage.model_dump(mode="json") == {
         "schema_version": 1,

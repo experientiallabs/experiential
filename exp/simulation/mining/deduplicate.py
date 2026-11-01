@@ -12,6 +12,7 @@ from exp.common.core.artifacts import stable_id
 from exp.common.core.union_find import UnionFind
 from exp.common.traces import Trace
 from exp.simulation.mining.descriptors import CoverageDescriptor, RoutingDescriptor
+from exp.simulation.mining.geometry import cosine
 from exp.simulation.mining.lineage import LineageAssignment
 
 DEFAULT_SEMANTIC_DUPLICATE_THRESHOLD = 0.95
@@ -371,7 +372,7 @@ def _duplicate_edges(
             pair = (left_trace_id, right_trace_id)
             if pair in edge_keys:
                 continue
-            similarity = _cosine(vector_by_trace[left_trace_id], vector_by_trace[right_trace_id])
+            similarity = cosine(vector_by_trace[left_trace_id], vector_by_trace[right_trace_id])
             if similarity >= semantic_duplicate_threshold:
                 edges.append(
                     _edge(
@@ -452,7 +453,7 @@ def _candidate_from_duplicate_group(
     representative_trace_id = min(
         trace_ids,
         key=lambda trace_id: (
-            -sum(_cosine(vector_by_trace[trace_id], vector_by_trace[other]) for other in trace_ids),
+            -sum(cosine(vector_by_trace[trace_id], vector_by_trace[other]) for other in trace_ids),
             trace_id,
         ),
     )
@@ -510,6 +511,35 @@ def _groups_by_root(values: Iterable[str], union: UnionFind) -> dict[str, list[s
     return grouped
 
 
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    """Return a bounded dot product for pre-normalized vectors."""
-    return max(-1.0, min(1.0, sum(a * b for a, b in zip(left, right, strict=True))))
+def validate_selection_geometry(candidates: Sequence[DeduplicatedTrace]) -> None:
+    """Reject a partition whose candidates were positioned in different geometries.
+
+    Core-set distance is a dot product over paired coordinates, so two vectors of different widths
+    have no distance between them. Without this check the mismatch surfaces as a bare ``zip()``
+    argument error several frames inside the metric, naming neither the trace nor the cause. The
+    usual way to get here is tagging only part of a corpus and letting the untagged candidates keep
+    their descriptor vector.
+
+    Args:
+        candidates: Deduplicated candidates from exactly one partition.
+
+    Raises:
+        ValueError: A selection vector is empty, or two candidates carry different widths.
+    """
+    widths: dict[int, str] = {}
+    for candidate in candidates:
+        width = len(candidate.selection_vector)
+        if width == 0:
+            raise ValueError(
+                f"candidate {candidate.representative_trace_id} has an empty selection vector, so "
+                "it has no position relative to the others; build selection vectors for every "
+                "candidate or leave them unset to use the request-visible descriptor vector"
+            )
+        widths.setdefault(width, candidate.representative_trace_id)
+    if len(widths) > 1:
+        (first_width, first_id), (other_width, other_id) = sorted(widths.items())[:2]
+        raise ValueError(
+            f"candidates in one partition must share one selection geometry, but "
+            f"{first_id} carries {first_width} coordinates and {other_id} carries {other_width}; "
+            "tag every candidate the selection covers with the same question families"
+        )

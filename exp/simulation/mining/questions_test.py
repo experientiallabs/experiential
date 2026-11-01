@@ -1,4 +1,4 @@
-"""Tests for packaged and local decision-question banks."""
+"""Tests for local decision-question banks and the packaged example."""
 
 from __future__ import annotations
 
@@ -8,13 +8,17 @@ import pytest
 
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.simulation.mining.questions import (
-    DEFAULT_BANK_ID,
+    EXAMPLE_BANK_ID,
+    LOCAL_BANK_DIRECTORY,
+    LOCAL_BANK_ROOT_VARIABLE,
     Question,
     QuestionBank,
     QuestionBankError,
     load_question_bank,
+    local_bank_root,
     packaged_bank_ids,
     packaged_question_bank,
+    resolve_question_bank,
 )
 
 _BANK = """
@@ -40,40 +44,90 @@ def _write(tmp_path: Path, text: str, name: str = "bank.toml") -> Path:
     return path
 
 
-def test_packaged_situation_bank_loads_without_any_project_setup() -> None:
-    """An out-of-repo harness imports the bank and gets its questions, with no store or network."""
+def test_the_packaged_example_loads_without_any_project_setup() -> None:
+    """Tests and documentation need one bank that is always there, with no store or network."""
     bank = packaged_question_bank()
-    assert bank.bank_id == DEFAULT_BANK_ID
+    assert bank.bank_id == EXAMPLE_BANK_ID
     assert bank.version == 1
-    assert len(bank.questions) == 28
-    assert {question.family for question in bank.questions} == {"situation"}
-    assert bank.question_ids()[0] == "sit.clean"
+    assert bank.questions
+    assert bank.question_ids()[0] == "example.single_step"
 
 
-def test_packaged_situation_bank_fits_one_decision_call() -> None:
-    """The bank is sized so one unit costs one call; chunking exists for larger banks."""
+def test_the_packaged_example_is_the_only_bank_in_the_distribution() -> None:
+    """A real bank's wording is the asset and is local configuration, so it never ships."""
+    assert packaged_bank_ids() == (EXAMPLE_BANK_ID,)
+
+
+def test_the_packaged_example_fits_one_decision_call() -> None:
+    """One unit costs one call at this size; chunking exists for a bank that outgrows it."""
     assert len(packaged_question_bank().questions) <= MAX_DECISION_QUESTIONS
-
-
-def test_packaged_bank_ids_lists_what_can_be_loaded() -> None:
-    """An unknown bank id must be answerable with the set that does exist."""
-    assert DEFAULT_BANK_ID in packaged_bank_ids()
 
 
 def test_packaged_bank_question_text_is_the_full_instruction() -> None:
     """The text is sent verbatim to the model, so it must not be an abbreviated label."""
     bank = packaged_question_bank()
-    ambiguous = next(q for q in bank.questions if q.question_id == "sit.ambiguous_matches")
-    assert ambiguous.text == (
-        "Was the task completed in a single step, with no intermediate "
-        "lookups?"
-    )
+    single = next(q for q in bank.questions if q.question_id == "example.single_step")
+    assert single.text.endswith("?")
+    assert len(single.text.split()) > 5
+
+
+def test_a_local_bank_is_preferred_over_a_packaged_one(tmp_path: Path) -> None:
+    """A real bank lives outside the distribution, so a local file must win by identity alone."""
+    local = _BANK.replace('bank_id = "fixture-v1"', f'bank_id = "{EXAMPLE_BANK_ID}"')
+    _write(tmp_path, local, f"{EXAMPLE_BANK_ID}.toml")
+
+    bank = resolve_question_bank(EXAMPLE_BANK_ID, root=tmp_path)
+
+    assert bank.question_ids() == ("sit.clean", "req.retrieve")
+    assert packaged_question_bank(EXAMPLE_BANK_ID).question_ids() != bank.question_ids()
+
+
+def test_resolution_falls_back_to_the_packaged_example(tmp_path: Path) -> None:
+    """The example stays loadable with nothing installed, which is what tests rely on."""
+    assert resolve_question_bank(EXAMPLE_BANK_ID, root=tmp_path).bank_id == EXAMPLE_BANK_ID
+
+
+def test_an_unresolvable_bank_names_both_places_it_looked(tmp_path: Path) -> None:
+    """The fix is either installing the bank or fixing the id, and the message cannot tell which."""
+    with pytest.raises(QuestionBankError) as caught:
+        resolve_question_bank("situation-v1", root=tmp_path)
+
+    message = str(caught.value)
+    assert str(tmp_path / "situation-v1.toml") in message
+    assert EXAMPLE_BANK_ID in message
+    assert LOCAL_BANK_ROOT_VARIABLE in message
+
+
+def test_resolution_never_substitutes_a_bank_for_the_one_asked_for(tmp_path: Path) -> None:
+    """Tagging with the wrong propositions still returns a matrix, so it must fail instead."""
+    _write(tmp_path, _BANK, "fixture-v1.toml")
+
+    with pytest.raises(QuestionBankError, match="no question bank named"):
+        resolve_question_bank("requirement-v1", root=tmp_path)
+
+
+def test_a_resolved_bank_id_cannot_escape_the_bank_directory(tmp_path: Path) -> None:
+    """A bank id becomes a path component, so traversal is refused before any read."""
+    with pytest.raises(QuestionBankError, match="lowercase components"):
+        resolve_question_bank("../../../etc/passwd", root=tmp_path)
+
+
+def test_the_local_bank_root_is_overridable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bank kept outside the working directory still has to be readable."""
+    monkeypatch.delenv(LOCAL_BANK_ROOT_VARIABLE, raising=False)
+    assert local_bank_root() == LOCAL_BANK_DIRECTORY
+
+    monkeypatch.setenv(LOCAL_BANK_ROOT_VARIABLE, "/srv/banks")
+    assert local_bank_root() == Path("/srv/banks")
+
+    monkeypatch.setenv(LOCAL_BANK_ROOT_VARIABLE, "   ")
+    assert local_bank_root() == LOCAL_BANK_DIRECTORY
 
 
 def test_unknown_packaged_bank_names_the_available_banks() -> None:
     """A typo in a bank id must say what to type instead."""
     with pytest.raises(QuestionBankError, match="no packaged question bank"):
-        packaged_question_bank("situation-v9")
+        packaged_question_bank("example-v9")
 
 
 def test_bank_id_cannot_escape_the_packaged_directory() -> None:

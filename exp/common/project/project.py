@@ -172,12 +172,44 @@ class ProjectHostedSetup(ContractModel):
 
 
 class ProjectTracePreparationSettings(ContractModel):
-    """Provider-free settings fixed before canonical trace preparation starts."""
+    """Provider-free settings fixed before canonical trace preparation starts.
+
+    The mining geometry is stored as names rather than as the typed specs themselves, because this
+    module is shared contract and may not import the simulation package that owns them. Names plus
+    a seed are also exactly what the command line exposes, and the one function that turns them
+    into specs lives beside the build, so a build and the readiness record reconstructed from these
+    settings can never disagree about what was mined.
+
+    Attributes:
+        source_kind: Declared canonical trace source format.
+        fit_task_budget: Representative tasks reserved for fit-only work.
+        held_out_task_budget: Representative tasks sealed for final reporting.
+        descriptor_dimensions: Width of the request-visible hashing descriptor vector.
+        mining_geometry: Which geometry core-set selection measures in.
+        mining_cluster: Which clustering backend groups the selection candidates.
+        mining_sampling: How representative budget beyond the guaranteed slots is spent.
+        mining_bank: Identity of the question bank the decision-tag geometry reads, resolved from
+            local configuration rather than package data. Empty for a provider-free build, and
+            required by the decision-tag geometry: the bank decides what the geometry can tell
+            apart, so it is recorded here rather than defaulted.
+        mining_tagger_alias: Catalog alias answering the question bank, or None for a
+            provider-free build. It is recorded so a rerun resolves the same model.
+        mining_seed: Seed for a clustering backend whose initialization is random. The default
+            path has no random source at all.
+    """
 
     source_kind: str = Field(min_length=1, max_length=64)
     fit_task_budget: int = Field(default=50, ge=0)
     held_out_task_budget: int = Field(default=20, ge=0)
     descriptor_dimensions: int = Field(default=64, ge=8)
+    mining_geometry: Literal["hashing", "decision_tag"] = "hashing"
+    mining_cluster: Literal["descriptor", "kmeans", "bernoulli_mixture", "atoms_hierarchy"] = (
+        "descriptor"
+    )
+    mining_sampling: Literal["medoid", "proportional", "diversity", "stratified"] = "medoid"
+    mining_bank: str = Field(default="", max_length=128)
+    mining_tagger_alias: str | None = Field(default=None, min_length=1, max_length=512)
+    mining_seed: int = 42
 
     @field_validator("source_kind")
     @classmethod

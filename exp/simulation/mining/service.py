@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactInput,
@@ -29,6 +29,11 @@ from exp.simulation.mining.cleanup import (
     InstructionCleanupResult,
     clean_instruction,
 )
+from exp.simulation.mining.clustering import (
+    BernoulliMixtureClusterSpec,
+    ClusterSpec,
+    DescriptorClusterSpec,
+)
 from exp.simulation.mining.coverage import (
     DEFAULT_COVERAGE_SIMILARITY_THRESHOLD,
     CoverageReport,
@@ -48,16 +53,49 @@ from exp.simulation.mining.descriptors import (
     normalized_vectors,
     routing_descriptor,
 )
+from exp.simulation.mining.features import (
+    DecisionTagSelectionSpec,
+    HashingSelectionSpec,
+    SelectionGeometryError,
+    SelectionSpec,
+    selection_probabilities,
+    selection_vectors,
+)
 from exp.simulation.mining.lineage import (
     DEFAULT_LINEAGE_TIME_BUCKET_SECONDS,
     LineageAssignment,
     assign_source_lineages,
 )
+from exp.simulation.mining.questions import resolve_question_bank
+from exp.simulation.mining.sampling import MedoidSamplingSpec, SamplingSpec
 from exp.simulation.mining.select import PartitionSelection, select_partition_representatives
+from exp.simulation.mining.tagging import TraceTagger
+from exp.simulation.mining.views import build_units
 
 
 class MiningSpec(ContractModel):
-    """Versioned representative-task mining controls with fixed 50-fit and 20-held-out defaults."""
+    """Versioned representative-task mining controls with fixed 50-fit and 20-held-out defaults.
+
+    Every geometry field defaults to the provider-free path, so ``MiningSpec()`` is the mining a
+    build has always done and a corpus mined with it reproduces its existing artifacts. Choosing
+    anything else is explicit, and because the choice is part of this persisted spec it travels
+    into the build's content identity rather than being a detail of how the command was invoked.
+
+    Attributes:
+        fit_task_budget: Representative tasks reserved for fit-only work.
+        held_out_task_budget: Representative tasks sealed for final reporting.
+        semantic_duplicate_threshold: Inclusive cosine threshold joining request descriptors into
+            one duplicate component.
+        coverage_similarity_threshold: Nearest-representative similarity below which a trace is
+            reported as weakly covered.
+        lineage_time_bucket_seconds: Window grouping one conversation's traces into a lineage.
+        selection: Which geometry core-set selection measures in. Hashing embeds request-visible
+            descriptor text and needs no provider; decision_tag embeds a decision model's answers
+            about what each case turned out to contain.
+        cluster: Which clustering backend groups the candidates.
+        sampling: How representative budget left over after the reserved slots and lineage anchors
+            is spent.
+    """
 
     fit_task_budget: int = Field(default=50, ge=0)
     held_out_task_budget: int = Field(default=20, ge=0)
@@ -72,6 +110,40 @@ class MiningSpec(ContractModel):
         le=1.0,
     )
     lineage_time_bucket_seconds: int = Field(default=DEFAULT_LINEAGE_TIME_BUCKET_SECONDS, gt=0)
+    selection: SelectionSpec = HashingSelectionSpec()
+    cluster: ClusterSpec = DescriptorClusterSpec()
+    sampling: SamplingSpec = MedoidSamplingSpec()
+
+    @model_validator(mode="after")
+    def _compatible_geometry(self) -> MiningSpec:
+        """Reject a geometry and backend that cannot describe the same evidence.
+
+        Both refusals are about a combination that would still run and still return tasks while
+        measuring something nobody asked for, which is the one failure mode a mining run cannot
+        detect from its own output.
+
+        Returns:
+            The validated spec.
+
+        Raises:
+            ValueError: The Bernoulli mixture has no probabilities to read, or a selection
+                geometry would hand the core-set metric vectors it cannot use.
+        """
+        tagged = isinstance(self.selection, DecisionTagSelectionSpec)
+        if isinstance(self.cluster, BernoulliMixtureClusterSpec) and not tagged:
+            raise ValueError(
+                "the bernoulli_mixture backend models per-tag probabilities, which only the "
+                "decision_tag selection geometry produces; select with decision_tag, or cluster "
+                "with descriptor, kmeans or atoms_hierarchy"
+            )
+        if tagged and self.selection.transform == "none":
+            raise ValueError(
+                "core-set selection measures distance as a dot product of unit vectors, and raw "
+                "probability rows saturate it so every pair looks identical; choose the l2, "
+                "hellinger or logit transform for the selection geometry (a clusterer that needs "
+                "untransformed answers reads them directly)"
+            )
+        return self
 
 
 @dataclass(frozen=True)
@@ -101,6 +173,7 @@ def mine_tasks(
     *,
     embedder: DescriptorEmbedder | None = None,
     instruction_cleanup_model: InstructionCleanupModel | None = None,
+    tagger: TraceTagger | None = None,
     input_trace_count: int | None = None,
     invalid_trace_count: int = 0,
 ) -> TaskMiningResult:
@@ -118,6 +191,10 @@ def mine_tasks(
         embedder: Explicit request-descriptor embedder. ``None`` is rejected to avoid a hidden
             model or low-fidelity fallback.
         instruction_cleanup_model: Optional injected proposal model. ``None`` makes no model call.
+        tagger: Explicit decision-model tagger, required by a ``decision_tag`` selection geometry
+            and rejected by a ``hashing`` one. Taking it as an injected argument keeps this
+            function free of any provider, credential or endpoint knowledge, exactly as the
+            embedder does.
         input_trace_count: Source record count before invalid exclusions. Defaults to valid count.
         invalid_trace_count: Source record count excluded by canonical normalization.
 
@@ -125,8 +202,10 @@ def mine_tasks(
         Canonical tasks, coverage evidence, duplicate lineage evidence, and frozen split membership.
 
     Raises:
-        ValueError: Inputs are empty, invalid counts are inconsistent, or selection cannot be
-            audited.
+        ValueError: Inputs are empty, invalid counts are inconsistent, the selection geometry and
+            the supplied tagger disagree, or selection cannot be audited.
+        TraceTaggingError: Tagging could not answer the bank about every candidate.
+        SelectionGeometryError: The answers cannot be turned into the requested geometry.
     """
     if not traces:
         raise ValueError("task mining needs at least one eligible canonical trace")
@@ -142,6 +221,7 @@ def mine_tasks(
     if input_trace_count < len(traces) + invalid_trace_count:
         raise ValueError("input trace count cannot be smaller than valid plus invalid trace counts")
     spec = mining_spec or MiningSpec()
+    _require_matching_tagger(spec.selection, tagger)
     assignments = assign_source_lineages(
         traces,
         time_bucket_seconds=spec.lineage_time_bucket_seconds,
@@ -157,6 +237,12 @@ def mine_tasks(
         vectors,
         semantic_duplicate_threshold=spec.semantic_duplicate_threshold,
     )
+    probabilities: dict[str, tuple[float, ...]] | None = None
+    if isinstance(spec.selection, DecisionTagSelectionSpec):
+        assert tagger is not None  # _require_matching_tagger has already established this.
+        analysis, probabilities = _tagged_selection_geometry(
+            spec.selection, traces, analysis, tagger
+        )
     partition = freeze_task_partition(
         analysis.leakage_groups,
         fit_lineage_target=spec.fit_task_budget,
@@ -177,11 +263,17 @@ def mine_tasks(
         fit_candidates,
         partition="fit",
         budget=fit_budget,
+        cluster=spec.cluster,
+        sampling=spec.sampling,
+        probabilities=probabilities,
     )
     held_out_selection = select_partition_representatives(
         held_out_candidates,
         partition="held_out",
         budget=held_out_budget,
+        cluster=spec.cluster,
+        sampling=spec.sampling,
+        probabilities=probabilities,
     )
     tasks, task_ids, weights, cleanup_results = _materialize_tasks(
         traces,
@@ -210,6 +302,99 @@ def mine_tasks(
         partition=partition,
         cleanup_results=cleanup_results,
     )
+
+
+def _require_matching_tagger(selection: SelectionSpec, tagger: TraceTagger | None) -> None:
+    """Require exactly the tagger the selection geometry needs, in both directions.
+
+    Refusing an unused tagger looks pedantic until the alias is a paid one: a caller who passed a
+    tagger believes the geometry they configured is the one being measured, and a run that quietly
+    ignored it would produce a hashing task set that looks like a tagged one.
+
+    Args:
+        selection: The configured selection geometry.
+        tagger: The injected tagger, if any.
+
+    Raises:
+        ValueError: A decision-tag geometry has no tagger, or a hashing geometry has one.
+    """
+    if isinstance(selection, DecisionTagSelectionSpec) and tagger is None:
+        raise ValueError(
+            f"the decision_tag selection geometry needs an explicit tagger for bank "
+            f"{selection.bank_id!r}; pass a configured TraceTagger (--tagger ALIAS on the command "
+            "line), or select with the hashing geometry to mine request-visible text alone"
+        )
+    if isinstance(selection, HashingSelectionSpec) and tagger is not None:
+        raise ValueError(
+            "the hashing selection geometry never calls a tagger, so the supplied tagger would "
+            "go unused; select with the decision_tag geometry to tag the traces, or drop the "
+            "tagger"
+        )
+
+
+def _tagged_selection_geometry(
+    selection: DecisionTagSelectionSpec,
+    traces: Sequence[Trace],
+    analysis: DuplicateAnalysis,
+    tagger: TraceTagger,
+) -> tuple[DuplicateAnalysis, dict[str, tuple[float, ...]]]:
+    """Tag the selection candidates and re-attach the answers as their core-set geometry.
+
+    Only the candidates are tagged, not every trace. Duplicates have already collapsed by this
+    point, so a corpus pays once per distinct request rather than once per occurrence.
+
+    The vectors have to be attached here rather than when a candidate is built, because duplicate
+    collapse runs before any tagging and leaves ``selection_vector`` defaulted to the
+    request-visible descriptor vector. That default is what keeps provider-free mining on one
+    geometry, and it is also why an empty vector is refused below: it would silently restore the
+    hashing geometry under a spec that asked for tags, and selection would still run, still return
+    tasks and still report coverage.
+
+    Args:
+        selection: Which bank, families, transform and view to tag with.
+        traces: Canonical traces, covering every candidate's representative.
+        analysis: Duplicate evidence whose candidates need positioning.
+        tagger: Explicit decision-model tagger.
+
+    Returns:
+        The analysis with tagged candidates, and the untransformed answers per candidate for a
+        clusterer that reads probabilities directly.
+
+    Raises:
+        SelectionGeometryError: A candidate received no usable position.
+    """
+    by_trace_id = {trace.trace_id: trace for trace in traces}
+    candidates = analysis.candidates
+    descriptors = tuple(candidate.routing_descriptor for candidate in candidates)
+    bank = resolve_question_bank(selection.bank_id).families(*selection.families)
+    units = tuple(
+        build_units(
+            by_trace_id[candidate.representative_trace_id],
+            (selection.view,),
+            selection.view_spec,
+        )[selection.view]
+        for candidate in candidates
+    )
+    matrix = tagger.tag(units, bank)
+    vectors = selection_vectors(selection, descriptors=descriptors, tag_matrix=matrix, bank=bank)
+    rows = selection_probabilities(selection, descriptors=descriptors, tag_matrix=matrix, bank=bank)
+    for candidate, vector in zip(candidates, vectors, strict=True):
+        if not vector:
+            raise SelectionGeometryError(
+                f"the {selection.transform} transform left candidate "
+                f"{candidate.representative_trace_id} with no coordinates, which would silently "
+                "restore the request-visible descriptor geometry; select families this corpus "
+                "triggers or choose a transform that keeps a confident no finite"
+            )
+    tagged = tuple(
+        replace(candidate, selection_vector=vector)
+        for candidate, vector in zip(candidates, vectors, strict=True)
+    )
+    probabilities = {
+        candidate.representative_trace_id: row
+        for candidate, row in zip(candidates, rows, strict=True)
+    }
+    return replace(analysis, candidates=tagged), probabilities
 
 
 def persist_task_set(

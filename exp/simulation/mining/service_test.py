@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, StructuredFailure
 from exp.common.project import ArtifactStore
@@ -16,9 +17,31 @@ from exp.common.project.paths import ProjectPaths
 from exp.common.tasks import TaskSet, ToolSchema
 from exp.common.traces import Trace, TraceOutcome, TraceSource, TraceSpan
 from exp.common.traces.ingest.vendor_trace import SYNTHETIC_TIME_ATTRIBUTE
+from exp.simulation.mining.clustering import (
+    AtomsHierarchyClusterSpec,
+    BernoulliMixtureClusterSpec,
+    ClusterSpec,
+    DescriptorClusterSpec,
+    KMeansClusterSpec,
+)
 from exp.simulation.mining.descriptors import HashingDescriptorEmbedder, routing_descriptor
+from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSelectionSpec
 from exp.simulation.mining.lineage import assign_source_lineages
+from exp.simulation.mining.questions import (
+    EXAMPLE_BANK_ID,
+    QuestionBank,
+    packaged_question_bank,
+)
+from exp.simulation.mining.sampling import (
+    DiversitySamplingSpec,
+    MedoidSamplingSpec,
+    ProportionalSamplingSpec,
+    SamplingSpec,
+    StratifiedSamplingSpec,
+)
 from exp.simulation.mining.service import MiningSpec, mine_tasks, persist_task_set
+from exp.simulation.mining.tagging import TagMatrix, TagRow, tagged_view
+from exp.simulation.mining.views import Unit
 
 
 class IndexEmbedder:
@@ -629,3 +652,230 @@ def test_persisted_task_set_reuses_the_w2_task_and_artifact_contracts(tmp_path: 
     assert task_set.task_ids == tuple(task.task_id for task in result.tasks)
     assert store.read("tasks-a").manifest.artifact_type == "task-set"
     assert TaskSet.model_validate_json(store.read_bytes("tasks-a", "task-set.json")) == task_set
+
+
+class _ProfileTagger:
+    """A no-network tagger whose answers describe the fixture corpus rather than hashing it.
+
+    Traces split into two readable profiles by index parity, with a third group of long episodes.
+    Unlike the hashing tagger this carries real signal, so a test can check that the geometry
+    changed the selection for a reason rather than by accident.
+    """
+
+    def tag(self, units: Sequence[Unit], bank: QuestionBank) -> TagMatrix:
+        """Answer every question about every unit from the unit's own trace index."""
+        rows = []
+        for unit in units:
+            index = int(unit.trace_id.rsplit("-", 1)[1])
+            profile = index % 3
+            rows.append(
+                TagRow(
+                    trace_id=unit.trace_id,
+                    unit_hash=unit.unit_hash,
+                    values=tuple(
+                        0.9 if position % 3 == profile else 0.05
+                        for position in range(len(bank.questions))
+                    ),
+                )
+            )
+        return TagMatrix(
+            bank_id=bank.bank_id,
+            bank_version=bank.version,
+            question_ids=bank.question_ids(),
+            view=tagged_view(units),
+            rows=tuple(rows),
+        )
+
+
+def _geometry_corpus(count: int = 40) -> tuple[Trace, ...]:
+    """Return a corpus of distinct lineages whose descriptor text carries no profile signal."""
+    return tuple(
+        _trace(index, task=f"Handle workflow {index}", conversation_id=f"lineage-{index}")
+        for index in range(count)
+    )
+
+
+def _tag_spec(
+    cluster: ClusterSpec | None = None, sampling: SamplingSpec | None = None
+) -> MiningSpec:
+    """Return a mining spec selecting on the packaged bank with the fixture tagger."""
+    return MiningSpec(
+        fit_task_budget=8,
+        held_out_task_budget=3,
+        selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+        cluster=cluster or DescriptorClusterSpec(),
+        sampling=sampling or MedoidSamplingSpec(),
+    )
+
+
+def test_a_decision_tag_geometry_selects_differently_from_the_hashing_one() -> None:
+    """If the tags did not move the selection, paying for them bought nothing."""
+    corpus = _geometry_corpus()
+
+    hashing = mine_tasks(
+        corpus,
+        MiningSpec(fit_task_budget=8, held_out_task_budget=3),
+        embedder=ContentStableEmbedder(),
+    )
+    tagged = mine_tasks(
+        corpus, _tag_spec(), embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    assert {task.task_id for task in tagged.tasks} != {task.task_id for task in hashing.tasks}
+    assert len(tagged.tasks) == len(hashing.tasks)
+    assert tagged.coverage.split_separation_verified
+
+
+def test_the_tag_geometry_reaches_the_persisted_coverage_distances() -> None:
+    """Coverage has to describe the geometry that selected, or the audit is of something else."""
+    corpus = _geometry_corpus()
+
+    hashing = mine_tasks(
+        corpus,
+        MiningSpec(fit_task_budget=8, held_out_task_budget=3),
+        embedder=ContentStableEmbedder(),
+    )
+    tagged = mine_tasks(
+        corpus, _tag_spec(), embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    hashing_similarity = {item.trace_id: item.similarity for item in hashing.coverage.distances}
+    tagged_similarity = {item.trace_id: item.similarity for item in tagged.coverage.distances}
+    assert set(hashing_similarity) == set(tagged_similarity)
+    assert hashing_similarity != tagged_similarity
+
+
+def test_the_duplicate_and_partition_evidence_is_untouched_by_the_geometry() -> None:
+    """Selection geometry must never move the leakage boundary."""
+    corpus = _geometry_corpus()
+
+    hashing = mine_tasks(
+        corpus,
+        MiningSpec(fit_task_budget=8, held_out_task_budget=3),
+        embedder=ContentStableEmbedder(),
+    )
+    tagged = mine_tasks(
+        corpus, _tag_spec(), embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    assert tagged.analysis.edges == hashing.analysis.edges
+    assert tagged.analysis.leakage_groups == hashing.analysis.leakage_groups
+    assert tagged.partition == hashing.partition
+    assert [candidate.vector for candidate in tagged.analysis.candidates] == [
+        candidate.vector for candidate in hashing.analysis.candidates
+    ]
+
+
+def test_tagged_candidates_carry_the_tag_vector_not_the_descriptor_vector() -> None:
+    """A defaulted selection vector would silently restore the hashing geometry."""
+    result = mine_tasks(
+        _geometry_corpus(), _tag_spec(), embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    for candidate in result.analysis.candidates:
+        assert candidate.selection_vector != candidate.vector
+        assert len(candidate.selection_vector) == len(packaged_question_bank().questions)
+
+
+def test_the_bernoulli_mixture_runs_end_to_end_on_tagged_answers() -> None:
+    """The one backend that needs untransformed answers has to receive them through mining."""
+    result = mine_tasks(
+        _geometry_corpus(),
+        _tag_spec(BernoulliMixtureClusterSpec(k=3, seed=1)),
+        embedder=ContentStableEmbedder(),
+        tagger=_ProfileTagger(),
+    )
+
+    assert len(result.tasks) == 11
+    assert all(item.cluster_id >= 0 for item in result.coverage.selections)
+    assert all(item.candidate_count > 0 for item in result.coverage.fit.clusters)
+
+
+@pytest.mark.parametrize(
+    ("cluster", "sampling"),
+    [
+        (KMeansClusterSpec(k=4, seed=1), None),
+        (AtomsHierarchyClusterSpec(atom_count=8, groups=3, seed=1), None),
+        (None, ProportionalSamplingSpec()),
+        (None, DiversitySamplingSpec()),
+        (None, StratifiedSamplingSpec()),
+        (
+            AtomsHierarchyClusterSpec(atom_count=8, groups=3, seed=1),
+            StratifiedSamplingSpec(),
+        ),
+    ],
+)
+def test_every_alternative_stage_satisfies_the_downstream_validators(
+    cluster: ClusterSpec | None, sampling: SamplingSpec | None
+) -> None:
+    """The coverage contract is strict, so an alternative stage has to honour all of it."""
+    corpus = _geometry_corpus()
+
+    result = mine_tasks(
+        corpus,
+        _tag_spec(cluster, sampling),
+        embedder=ContentStableEmbedder(),
+        tagger=_ProfileTagger(),
+    )
+
+    fit_ids = {task.task_id for task in result.tasks if task.partition == "fit"}
+    held_out_ids = {task.task_id for task in result.tasks if task.partition == "held_out"}
+    assert not fit_ids & held_out_ids
+    assert sum(task.workload_weight for task in result.tasks) == pytest.approx(1.0)
+    assert sum(item.workload_mass for item in result.coverage.selections) == len(corpus)
+    assert result.coverage.split_separation_verified
+    assert all(item.workload_mass > 0 for item in result.coverage.selections)
+
+
+def test_an_alternative_stage_is_still_input_order_independent() -> None:
+    """A seeded backend must not let corpus order into the result."""
+    corpus = _geometry_corpus()
+    spec = _tag_spec(cluster=KMeansClusterSpec(k=4, seed=7), sampling=ProportionalSamplingSpec())
+
+    forward = mine_tasks(corpus, spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger())
+    backward = mine_tasks(
+        tuple(reversed(corpus)), spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    assert tuple(task.task_id for task in forward.tasks) == tuple(
+        task.task_id for task in backward.tasks
+    )
+    assert forward.coverage == backward.coverage
+
+
+def test_a_decision_tag_geometry_without_a_tagger_is_refused() -> None:
+    """A hidden fallback to hashing would be indistinguishable from success."""
+    with pytest.raises(ValueError, match="needs an explicit tagger"):
+        mine_tasks(_geometry_corpus(), _tag_spec(), embedder=ContentStableEmbedder())
+
+
+def test_a_tagger_that_would_go_unused_is_refused() -> None:
+    """Passing a paid tagger and silently ignoring it is the expensive version of the same bug."""
+    with pytest.raises(ValueError, match="would go unused"):
+        mine_tasks(
+            _geometry_corpus(),
+            MiningSpec(fit_task_budget=8, held_out_task_budget=3),
+            embedder=ContentStableEmbedder(),
+            tagger=_ProfileTagger(),
+        )
+
+
+def test_the_mixture_backend_needs_a_tag_geometry() -> None:
+    """Caught when the spec is built, not after a corpus has been tagged."""
+    with pytest.raises(ValidationError, match="only the decision_tag selection geometry"):
+        MiningSpec(cluster=BernoulliMixtureClusterSpec())
+
+
+def test_an_untransformed_selection_geometry_is_refused() -> None:
+    """Raw probability rows saturate the core-set metric and collapse every medoid."""
+    with pytest.raises(ValidationError, match="saturate it"):
+        MiningSpec(selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID, transform="none"))
+
+
+def test_the_default_spec_names_the_provider_free_path() -> None:
+    """Everything above rests on the default being today's geometry."""
+    spec = MiningSpec()
+
+    assert spec.selection == HashingSelectionSpec()
+    assert spec.cluster == DescriptorClusterSpec()
+    assert spec.sampling == MedoidSamplingSpec()

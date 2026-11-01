@@ -35,25 +35,40 @@ from exp.simulation.mining.descriptors import (
 from exp.simulation.mining.questions import (
     QuestionBank,
     QuestionBankError,
-    packaged_question_bank,
+    resolve_question_bank,
 )
 from exp.simulation.mining.tagging import TagMatrix
+from exp.simulation.mining.views import TraceViewName, TraceViewSpec
 
 TagTransform = Literal["none", "l2", "hellinger", "logit"]
 """How tag probabilities become coordinates.
 
 ``none`` passes the probabilities through unchanged and is the one transform that does not
-normalize, so distances keep reflecting how many tags a case triggered. ``l2`` unit-normalizes,
-making distance reflect which tags a case triggered rather than how many. ``hellinger`` takes the
-elementwise square root first, which is the natural metric between probability vectors and pulls
-apart cases whose probabilities are small but not zero. ``logit`` takes clamped log-odds first,
-which spreads confident answers away from uncertain ones instead of compressing them at the
-interval's ends.
+normalize, so distances keep reflecting how many tags a case triggered. It is what a clusterer
+reading probabilities as probabilities consumes, and it is not a selection geometry: core-set
+distance is a dot product of pre-normalized vectors, and raw probability rows saturate its clamp.
+
+``l2`` unit-normalizes, making distance reflect which tags a case triggered rather than how many.
+
+``hellinger`` is the Hellinger embedding of independent Bernoulli tags: each probability ``p``
+becomes the pair ``(sqrt(p), sqrt(1 - p))``, so the result has ``2T`` columns and squared Euclidean
+distance equals the summed per-tag squared Hellinger distance. Carrying both outcomes is what makes
+it a metric between distributions rather than between the ``sqrt(p)`` numbers alone: under the
+one-sided form two cases that agree about which tags fired but disagree about how strongly come out
+closer than they are, and a case that triggers nothing has no position at all.
+
+``logit`` takes clamped log-odds first, which spreads confident answers away from uncertain ones
+instead of compressing them at the interval's ends.
 """
 
-LOGIT_CLAMP = 1e-3
+LOGIT_CLAMP = 1e-4
 """Probabilities are clamped into ``[LOGIT_CLAMP, 1 - LOGIT_CLAMP]`` before log-odds, because a
 certain answer has infinite log-odds and one such column would otherwise dominate every distance.
+
+``1e-4`` rather than something looser because the clamp is the only thing deciding how far a
+certain answer sits from a merely confident one: at ``1e-3`` the extreme coordinate is log(999) and
+at ``1e-4`` it is log(9999), and anything that moves this bound changes every distance in the
+geometry.
 """
 
 
@@ -82,15 +97,23 @@ class DecisionTagSelectionSpec(ContractModel):
     Attributes:
         kind: Fixed decision-tag discriminator, defaulting to ``decision_tag``.
         bank_id: Packaged question bank whose families define the columns and their order.
-        families: Families of that bank to use, in bank order. Defaults to ``situation``, the
-            family describing what the case turned out to contain.
+        families: Families of that bank to use, in bank order. Empty, the default, uses every
+            family the bank declares, so a spec never has to name one bank's internals.
         transform: How probabilities become coordinates. See :data:`TagTransform`.
+        view: Which rendered view the questions are asked about. ``observations`` shows what the
+            episode revealed without the agent's own commentary, which is what makes two runs of
+            one case look alike.
+        view_spec: Rendering controls for that view. They belong to the spec because they decide
+            the exact text that was tagged, and answers about differently capped text are answers
+            about different evidence.
     """
 
     kind: Literal["decision_tag"] = "decision_tag"
     bank_id: str = Field(min_length=1)
-    families: tuple[str, ...] = ("situation",)
+    families: tuple[str, ...] = ()
     transform: TagTransform = "l2"
+    view: TraceViewName = "observations"
+    view_spec: TraceViewSpec = TraceViewSpec()
 
 
 SelectionSpec = Annotated[
@@ -137,16 +160,40 @@ def selection_vectors(
             "tag the traces with a TraceTagger and pass tag_matrix, or choose a "
             "HashingSelectionSpec to select on request-visible text alone"
         )
-    return _tag_vectors(spec, descriptors, tag_matrix, bank)
+    rows = selection_probabilities(spec, descriptors=descriptors, tag_matrix=tag_matrix, bank=bank)
+    return tuple(
+        _transformed(values, spec.transform, descriptor.trace_id)
+        for values, descriptor in zip(rows, descriptors, strict=True)
+    )
 
 
-def _tag_vectors(
+def selection_probabilities(
     spec: DecisionTagSelectionSpec,
+    *,
     descriptors: Sequence[RoutingDescriptor],
     tag_matrix: TagMatrix,
-    bank: QuestionBank | None,
+    bank: QuestionBank | None = None,
 ) -> tuple[tuple[float, ...], ...]:
-    """Read the selected columns out of a tag matrix and transform each descriptor's row."""
+    """Read the spec's columns out of a tag matrix without transforming them.
+
+    These are the answers as the decision model gave them. A clusterer that models tags as
+    probabilities needs them in that form, and deriving them back out of a normalized or log-odds
+    geometry is not possible, so the untransformed rows are published alongside the vectors rather
+    than reconstructed.
+
+    Args:
+        spec: Which bank, families and columns to read.
+        descriptors: Request-visible descriptors of the selection candidates, in order.
+        tag_matrix: Decision-model answers covering every descriptor's trace.
+        bank: The bank whose families name the columns. Omit it for a packaged bank.
+
+    Returns:
+        One row of probabilities per descriptor, in input order, in bank column order.
+
+    Raises:
+        SelectionGeometryError: The matrix or the bank carries a different bank identity, or the
+            matrix omits a descriptor's trace or a selected column.
+    """
     for identity, source in ((tag_matrix.bank_id, "tag matrix"), (bank and bank.bank_id, "bank")):
         if identity is not None and identity != spec.bank_id:
             raise SelectionGeometryError(
@@ -161,10 +208,7 @@ def _tag_vectors(
         except ValueError as exc:
             raise SelectionGeometryError(str(exc)) from exc
         rows.append(tuple(row.values[index] for index in indexes))
-    return tuple(
-        _transformed(values, spec.transform, descriptor.trace_id)
-        for values, descriptor in zip(rows, descriptors, strict=True)
-    )
+    return tuple(rows)
 
 
 def _column_indexes(
@@ -176,7 +220,7 @@ def _column_indexes(
     produce the same coordinate meaning even if their columns were stored differently.
     """
     try:
-        resolved = bank or packaged_question_bank(spec.bank_id)
+        resolved = bank or resolve_question_bank(spec.bank_id)
         selected = resolved.families(*spec.families).question_ids()
     except QuestionBankError as exc:
         raise SelectionGeometryError(str(exc)) from exc
@@ -209,7 +253,16 @@ def _transformed(
     if transform == "none":
         return values
     if transform == "hellinger":
-        return _unit(tuple(math.sqrt(value) for value in values), trace_id, transform)
+        # Both outcomes of every tag, which is what makes squared Euclidean distance equal the
+        # summed squared Hellinger distance exactly. Every row leaves this with norm sqrt(T),
+        # since the two halves sum to T, so the unit scaling below divides every row by the same
+        # constant: distances shrink by 1 / T and no ratio, ordering or cosine moves. The
+        # reference form's sqrt(w / 2) factor is a second such constant under uniform weights and
+        # washes out identically, which is why it is not applied here. Unit length is what the
+        # core-set metric requires of a selection vector.
+        roots = tuple(math.sqrt(value) for value in values)
+        complements = tuple(math.sqrt(max(0.0, 1.0 - value)) for value in values)
+        return _unit((*roots, *complements), trace_id, transform)
     if transform == "logit":
         clamped = (min(max(value, LOGIT_CLAMP), 1.0 - LOGIT_CLAMP) for value in values)
         return _unit(tuple(math.log(value / (1.0 - value)) for value in clamped), trace_id, "logit")
@@ -222,8 +275,8 @@ def _unit(values: tuple[float, ...], trace_id: str, transform: str) -> tuple[flo
     if not math.isfinite(norm) or norm == 0.0:
         raise SelectionGeometryError(
             f"the {transform} transform left trace {trace_id} with no direction: every selected "
-            "tag is zero, so this case has no position relative to the others. Use the 'logit' "
-            "transform, which keeps a confident no at a finite coordinate, or select families "
-            "that this corpus actually triggers"
+            "tag is zero, so this case has no position relative to the others. Use the 'logit' or "
+            "'hellinger' transform, either of which keeps a confident no at a finite coordinate, "
+            "or select families that this corpus actually triggers"
         )
     return tuple(value / norm for value in values)

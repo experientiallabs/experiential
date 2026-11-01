@@ -14,6 +14,7 @@ from exp.simulation.mining.features import (
     HashingSelectionSpec,
     SelectionGeometryError,
     SelectionSpec,
+    selection_probabilities,
     selection_vectors,
 )
 from exp.simulation.mining.questions import Question, QuestionBank, packaged_question_bank
@@ -105,7 +106,7 @@ def test_vectors_follow_descriptor_order_not_matrix_order() -> None:
     """The result is assigned positionally, so a reordered matrix must not shuffle rows."""
     bank = _bank()
     matrix = _matrix({"b": (0.0, 1.0, 0.0, 0.0), "a": (1.0, 0.0, 0.0, 0.0)}, bank)
-    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="none")
+    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="none")
     vectors = selection_vectors(
         spec, descriptors=[_descriptor("a"), _descriptor("b")], tag_matrix=matrix, bank=bank
     )
@@ -117,7 +118,7 @@ def test_only_the_selected_families_become_coordinates() -> None:
     bank = _bank()
     matrix = _matrix({"a": (1.0, 0.0, 0.0, 1.0)}, bank)
     situation = selection_vectors(
-        DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="none"),
+        DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="none"),
         descriptors=[_descriptor("a")],
         tag_matrix=matrix,
         bank=bank,
@@ -138,7 +139,7 @@ def test_transform_none_passes_probabilities_through() -> None:
     """Keeping the raw values keeps distance sensitive to how many tags a case triggered."""
     bank = _bank()
     vectors = selection_vectors(
-        DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="none"),
+        DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="none"),
         descriptors=[_descriptor("a")],
         tag_matrix=_matrix({"a": (0.25, 0.5, 0.0, 1.0)}, bank),
         bank=bank,
@@ -150,7 +151,7 @@ def test_transform_l2_unit_normalizes_the_selected_values() -> None:
     """Unit length makes distance reflect which tags fired rather than how many."""
     bank = _bank()
     vectors = selection_vectors(
-        DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="l2"),
+        DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="l2"),
         descriptors=[_descriptor("a")],
         tag_matrix=_matrix({"a": (1.0, 1.0, 0.0, 0.0)}, bank),
         bank=bank,
@@ -159,25 +160,104 @@ def test_transform_l2_unit_normalizes_the_selected_values() -> None:
     assert vectors[0] == pytest.approx((root, root, 0.0))
 
 
-def test_transform_hellinger_takes_the_root_before_normalizing() -> None:
-    """The Hellinger metric is the natural distance between probability vectors."""
+def test_transform_hellinger_carries_both_outcomes_of_every_tag() -> None:
+    """The Hellinger embedding of a Bernoulli tag is the pair, not the root of the probability."""
     bank = _bank()
     vectors = selection_vectors(
-        DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="hellinger"),
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="hellinger"
+        ),
         descriptors=[_descriptor("a")],
         tag_matrix=_matrix({"a": (0.25, 0.75, 0.0, 0.0)}, bank),
         bank=bank,
     )
-    roots = (math.sqrt(0.25), math.sqrt(0.75), 0.0)
-    norm = math.sqrt(sum(value**2 for value in roots))
-    assert vectors[0] == pytest.approx(tuple(value / norm for value in roots))
+    probabilities = (0.25, 0.75, 0.0)
+    expanded = tuple(math.sqrt(value) for value in probabilities) + tuple(
+        math.sqrt(1.0 - value) for value in probabilities
+    )
+    norm = math.sqrt(sum(value**2 for value in expanded))
+    assert len(vectors[0]) == 2 * len(probabilities)
+    assert vectors[0] == pytest.approx(tuple(value / norm for value in expanded))
+
+
+def test_hellinger_squared_distance_is_the_summed_squared_hellinger_distance() -> None:
+    """That identity is the only reason to prefer this embedding, so it is worth pinning.
+
+    The embedding's two halves sum to T, so every row has norm sqrt(T) before scaling and the unit
+    step divides them all by that one constant. The identity therefore survives exactly, shrunk by
+    1 / T.
+    """
+    bank = _bank()
+    left, right = (0.1, 0.9, 0.4, 0.0), (0.7, 0.2, 0.4, 0.0)
+    vectors = selection_vectors(
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="hellinger"
+        ),
+        descriptors=[_descriptor("a"), _descriptor("b")],
+        tag_matrix=_matrix({"a": left, "b": right}, bank),
+        bank=bank,
+    )
+
+    embedded = sum(
+        (first - second) ** 2 for first, second in zip(vectors[0], vectors[1], strict=True)
+    )
+    per_tag = sum(
+        (math.sqrt(one) - math.sqrt(other)) ** 2
+        + (math.sqrt(1.0 - one) - math.sqrt(1.0 - other)) ** 2
+        for one, other in zip(left[:3], right[:3], strict=True)
+    )
+    columns = 3
+    assert embedded == pytest.approx(per_tag / columns)
+
+
+def test_hellinger_keeps_an_all_zero_row_usable() -> None:
+    """A case that triggers nothing is ordinary evidence; the one-sided form lost it entirely."""
+    bank = _bank()
+    vectors = selection_vectors(
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="hellinger"
+        ),
+        descriptors=[_descriptor("clean")],
+        tag_matrix=_matrix({"clean": (0.0, 0.0, 0.0, 0.0)}, bank),
+        bank=bank,
+    )
+
+    assert math.isclose(math.sqrt(sum(value**2 for value in vectors[0])), 1.0, abs_tol=1e-9)
+
+
+def test_untransformed_probabilities_are_published_for_a_probability_clusterer() -> None:
+    """A clusterer modelling tags as coin flips cannot recover them from a normalized geometry."""
+    bank = _bank()
+    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="l2")
+    matrix = _matrix({"a": (0.25, 0.75, 0.5, 0.0)}, bank)
+
+    rows = selection_probabilities(
+        spec, descriptors=[_descriptor("a")], tag_matrix=matrix, bank=bank
+    )
+
+    assert rows == ((0.25, 0.75, 0.5),)
+
+
+def test_untransformed_probabilities_follow_bank_order_and_name_a_gap() -> None:
+    """Column meaning comes from the bank, and a missing row must say which trace."""
+    bank = _bank()
+    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",))
+    matrix = _matrix({"a": (0.1, 0.2, 0.3, 0.9)}, bank)
+
+    assert selection_probabilities(
+        spec, descriptors=[_descriptor("a")], tag_matrix=matrix, bank=bank
+    ) == ((0.1, 0.2, 0.3),)
+    with pytest.raises(SelectionGeometryError, match="no row for trace trace-9"):
+        selection_probabilities(
+            spec, descriptors=[_descriptor("trace-9")], tag_matrix=matrix, bank=bank
+        )
 
 
 def test_transform_logit_clamps_a_certain_answer_to_a_finite_coordinate() -> None:
     """A certain answer has infinite log-odds, and one such column would dominate."""
     bank = _bank()
     vectors = selection_vectors(
-        DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="logit"),
+        DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="logit"),
         descriptors=[_descriptor("a")],
         tag_matrix=_matrix({"a": (1.0, 0.5, 0.0, 0.0)}, bank),
         bank=bank,
@@ -197,7 +277,11 @@ def test_logit_separates_a_confident_case_that_l2_cannot_tell_apart() -> None:
 
     def _cosine(transform: str) -> float:
         """Return the cosine between the two cases under one transform."""
-        spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, transform=transform)  # ty: ignore[invalid-argument-type]
+        spec = DecisionTagSelectionSpec(
+            bank_id=bank.bank_id,
+            families=("situation",),
+            transform=transform,  # ty: ignore[invalid-argument-type]
+        )
         left, right = selection_vectors(spec, descriptors=descriptors, tag_matrix=matrix, bank=bank)
         return sum(first * second for first, second in zip(left, right, strict=True))
 
@@ -208,7 +292,7 @@ def test_logit_separates_a_confident_case_that_l2_cannot_tell_apart() -> None:
 def test_an_all_zero_row_is_refused_rather_than_placed_at_the_origin() -> None:
     """A case at the origin is nearest to nothing meaningful, so it must not pass silently."""
     bank = _bank()
-    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="l2")
+    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="l2")
     with pytest.raises(SelectionGeometryError, match="no direction") as caught:
         selection_vectors(
             spec,
@@ -224,7 +308,7 @@ def test_logit_keeps_an_all_zero_row_usable() -> None:
     """A wholly unremarkable case is ordinary evidence, so one transform must handle it."""
     bank = _bank()
     vectors = selection_vectors(
-        DecisionTagSelectionSpec(bank_id=bank.bank_id, transform="logit"),
+        DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",), transform="logit"),
         descriptors=[_descriptor("clean")],
         tag_matrix=_matrix({"clean": (0.0, 0.0, 0.0, 0.0)}, bank),
         bank=bank,
@@ -235,7 +319,7 @@ def test_logit_keeps_an_all_zero_row_usable() -> None:
 def test_an_untagged_descriptor_is_named() -> None:
     """Selection covers every candidate, so a gap in the matrix must say which trace."""
     bank = _bank()
-    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id)
+    spec = DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",))
     with pytest.raises(SelectionGeometryError, match="no row for trace trace-9"):
         selection_vectors(
             spec,
@@ -270,7 +354,7 @@ def test_a_matrix_missing_a_selected_column_is_refused() -> None:
     )
     with pytest.raises(SelectionGeometryError, match="missing columns"):
         selection_vectors(
-            DecisionTagSelectionSpec(bank_id=bank.bank_id),
+            DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",)),
             descriptors=[_descriptor("a")],
             tag_matrix=narrow,
             bank=bank,
@@ -301,7 +385,7 @@ def test_the_packaged_bank_resolves_without_being_passed() -> None:
             TagRow(
                 trace_id="a",
                 unit_hash="h",
-                values=tuple(1.0 if index == 0 else 0.0 for index in range(28)),
+                values=tuple(1.0 if index == 0 else 0.0 for index in range(len(bank.questions))),
             ),
         ),
     )
@@ -310,7 +394,7 @@ def test_the_packaged_bank_resolves_without_being_passed() -> None:
         descriptors=[_descriptor("a")],
         tag_matrix=matrix,
     )
-    assert len(vectors[0]) == 28
+    assert len(vectors[0]) == len(bank.questions)
     assert vectors[0][0] == 1.0
 
 

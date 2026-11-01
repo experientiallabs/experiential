@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import threading
+import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
     ModelCapabilities,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
@@ -18,6 +25,7 @@ from exp.common.models import (
 )
 from exp.common.project.paths import ProjectPaths
 from exp.runtime.models.registry import ResolvedModel
+from exp.simulation.mining.intents import CLAIM_LEASE_SECONDS, new_claim
 from exp.simulation.mining.questions import Question, QuestionBank, packaged_question_bank
 from exp.simulation.mining.tagging import (
     ANSWER_SCALE,
@@ -489,3 +497,315 @@ def test_a_row_refuses_a_value_that_is_not_a_probability() -> None:
     """Tag values feed transforms defined only on probabilities."""
     with pytest.raises(ValueError, match="probabilities"):
         TagRow(trace_id="t", unit_hash="h", values=(1.5,))
+
+
+def _any_request() -> ModelRequest:
+    """Return one request standing in for whatever a tagger would have built."""
+    return ModelRequest(messages=(ModelMessage(role="user", content="one episode"),))
+
+
+def test_a_decision_is_bought_with_no_project_lock_held(tmp_path: Path) -> None:
+    """This is what makes a parallel pass possible, so it is pinned rather than assumed.
+
+    A decision takes seconds on the wire. Holding the project-wide lock across it would
+    serialize every call every run makes, which is the difference between tagging a large
+    corpus in minutes and in hours. The probe below takes the lock the way a second run would
+    while a call is in flight, and succeeds only because the call holds nothing.
+    """
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    acquired = threading.Event()
+
+    def probe() -> None:
+        """Take the project lock while the decision is being bought."""
+        with FileLock(cache.lock_path, timeout=5.0):
+            acquired.set()
+
+    def dispatch() -> JsonObject:
+        """Buy one decision while another run competes for the project lock."""
+        competitor = threading.Thread(target=probe, name="competing-run")
+        competitor.start()
+        competitor.join(5.0)
+        return {"answer": "q0 4\nq1 4"}
+
+    cache.purchase("decision-key-1", _any_request(), dispatch)
+
+    assert acquired.is_set()
+    assert cache.saved("decision-key-1") == {"answer": "q0 4\nq1 4"}
+
+
+def test_an_intent_another_run_left_behind_still_refuses_by_name(tmp_path: Path) -> None:
+    """The money-safety guarantee: an unknown outcome is never quietly bought a second time.
+
+    The two caches stand in for two runs. They share nothing but the project's records, which
+    is exactly what two processes share, so the refusal has to come from the intent on disk.
+    """
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+    interrupted = DecisionCache(paths)
+    key = "a" * 64
+
+    def crash() -> JsonObject:
+        """Die the way a killed process does, after the intent is already written."""
+        raise RuntimeError("process killed mid-call")
+
+    with pytest.raises(RuntimeError, match="process killed"):
+        interrupted.purchase(key, _any_request(), crash)
+
+    def unexpected() -> JsonObject:
+        """Fail if the next run buys the decision again."""
+        raise AssertionError("a retained intent was repurchased")
+
+    with pytest.raises(TraceTaggingError, match=f"decision {key[:12]} was dispatched"):
+        DecisionCache(paths).purchase(key, _any_request(), unexpected)
+    with pytest.raises(TraceTaggingError, match="may already have been billed"):
+        DecisionCache(paths).purchase(key, _any_request(), unexpected)
+
+
+def test_two_workers_on_one_key_buy_it_once_and_both_read_that_answer(tmp_path: Path) -> None:
+    """A sibling worker's live intent is not an interrupted call and must not be refused.
+
+    One tagging pass cannot reach this: it decides distinct rendered texts against disjoint
+    question batches, so no two of its workers share a key. A process that tags two corpora at
+    once through one cache can, and the second worker there has to wait for the first answer
+    rather than refuse it or pay for it again.
+    """
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    in_flight = threading.Event()
+    sibling_started = threading.Event()
+    calls: list[int] = []
+    guard = threading.Lock()
+
+    def buyer() -> JsonObject:
+        """Hold the call open until the sibling has started asking for the same key."""
+
+        def dispatch() -> JsonObject:
+            """Record the one payment, and stay in flight while the sibling arrives."""
+            with guard:
+                calls.append(1)
+            in_flight.set()
+            sibling_started.wait(10.0)
+            time.sleep(0.2)
+            return {"answer": "bought exactly once"}
+
+        return cache.purchase("shared-key", _any_request(), dispatch)
+
+    def sibling() -> JsonObject:
+        """Ask for the same key while that call is still in flight."""
+
+        def unexpected() -> JsonObject:
+            """Fail if the sibling pays for a decision that is already being bought."""
+            raise AssertionError("one key was bought twice in one process")
+
+        in_flight.wait(10.0)
+        sibling_started.set()
+        return cache.purchase("shared-key", _any_request(), unexpected)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answers = [future.result() for future in [pool.submit(buyer), pool.submit(sibling)]]
+
+    assert len(calls) == 1
+    assert answers == [{"answer": "bought exactly once"}] * 2
+    assert [name.split("/")[0] for name in cache.records.list_ids()] == ["decision"]
+
+
+def test_a_second_run_waits_for_an_in_flight_claim_and_replays_its_answer(tmp_path: Path) -> None:
+    """Two runs over one corpus cooperate: neither buys what the other has in flight.
+
+    This is the whole point of keeping the claim record rather than the lock. The second run
+    finds the first one's claim, waits for it, and reads the answer the first committed. Refusing
+    instead would report an active run as an interrupted one and send its user to discard a claim
+    that is about to be used.
+    """
+    key = "c" * 64
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+    owner = DecisionCache(paths)
+    second = DecisionCache(paths)
+    in_flight = threading.Event()
+    waiter_started = threading.Event()
+    calls: list[str] = []
+    guard = threading.Lock()
+
+    def buy() -> JsonObject:
+        """Hold the call open until the second run is waiting on the claim."""
+
+        def dispatch() -> JsonObject:
+            """Record the one payment and stay in flight while the waiter arrives."""
+            with guard:
+                calls.append("owner")
+            in_flight.set()
+            waiter_started.wait(10.0)
+            time.sleep(0.2)
+            return {"answer": "q0 4\nq1 4"}
+
+        return owner.purchase(key, _any_request(), dispatch)
+
+    def wait_for_it() -> JsonObject:
+        """Ask for the same decision while the other run is buying it."""
+
+        def unexpected() -> JsonObject:
+            """Fail if the second run buys a decision the first is already paying for."""
+            raise AssertionError("one decision was bought by two runs")
+
+        in_flight.wait(10.0)
+        waiter_started.set()
+        return second.purchase(key, _any_request(), unexpected)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answers = [future.result() for future in [pool.submit(buy), pool.submit(wait_for_it)]]
+
+    assert calls == ["owner"]
+    assert answers == [{"answer": "q0 4\nq1 4"}] * 2
+    assert owner.saved(key) == {"answer": "q0 4\nq1 4"}
+    assert [name.split("/")[0] for name in owner.records.list_ids()] == ["decision"]
+
+
+def test_an_in_flight_call_still_commits_when_its_claim_is_discarded(tmp_path: Path) -> None:
+    """A discarded claim may cost a duplicate purchase; it must never cost a paid answer.
+
+    Dropping the claim and saving the answer is one transaction, so a claim that moved underneath
+    used to roll the whole commit back: the provider had been paid and nothing was stored. The
+    answer is now written whatever became of the claim.
+    """
+    key = "c" * 64
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+    owner = DecisionCache(paths)
+    other_run = DecisionCache(paths)
+
+    def dispatch() -> JsonObject:
+        """Buy the decision while another run discards the claim covering it."""
+        other_run.discard_intent(key)
+        return {"answer": "q0 7\nq1 7"}
+
+    answer = owner.purchase(key, _any_request(), dispatch)
+
+    assert answer == {"answer": "q0 7\nq1 7"}
+    assert owner.saved(key) == {"answer": "q0 7\nq1 7"}
+    assert [name.split("/")[0] for name in owner.records.list_ids()] == ["decision"]
+
+    def unexpected() -> JsonObject:
+        """Fail if the committed answer is bought again."""
+        raise AssertionError("a committed answer was bought again")
+
+    assert DecisionCache(paths).purchase(key, _any_request(), unexpected) == answer
+
+
+def test_a_failed_call_marks_its_own_claim_so_the_next_run_refuses_at_once(
+    tmp_path: Path,
+) -> None:
+    """The common interruption is a call that raised, and it needs no waiting to diagnose.
+
+    The next run has a patience of minutes for a claim that may still be live. A failed call
+    therefore says so in its own claim, which is what keeps the refusal by name immediate.
+    """
+    key = "c" * 64
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+
+    def crash() -> JsonObject:
+        """Fail the way a timeout or a transport error does."""
+        raise RuntimeError("the call failed")
+
+    with pytest.raises(RuntimeError, match="the call failed"):
+        DecisionCache(paths).purchase(key, _any_request(), crash)
+
+    def unexpected() -> JsonObject:
+        """Fail if an unknown outcome is bought again."""
+        raise AssertionError("an unknown outcome was repurchased")
+
+    started = time.monotonic()
+    with pytest.raises(TraceTaggingError, match="outcome is unknown"):
+        DecisionCache(paths).purchase(key, _any_request(), unexpected)
+    assert time.monotonic() - started < 5.0
+
+
+def test_a_claim_older_than_its_lease_is_refused_by_name(tmp_path: Path) -> None:
+    """A run killed outright marks nothing, so age is what makes its claim refusable."""
+    key = "c" * 64
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+    cache = DecisionCache(paths)
+    stale = new_claim(key, "killed-run", now=time.time() - CLAIM_LEASE_SECONDS - 1.0)
+    cache.records.write(f"intent/{key}", stale.payload(), exclusive=True)
+
+    def unexpected() -> JsonObject:
+        """Fail if an unknown outcome is bought again."""
+        raise AssertionError("an unknown outcome was repurchased")
+
+    started = time.monotonic()
+    with pytest.raises(TraceTaggingError, match="outcome is unknown"):
+        cache.purchase(key, _any_request(), unexpected)
+    assert time.monotonic() - started < 5.0
+
+
+def test_a_claim_record_of_an_older_shape_is_refused_and_can_still_be_discarded(
+    tmp_path: Path,
+) -> None:
+    """A claim this code cannot account for is exactly the interrupted call it must refuse.
+
+    That is also the whole migration story for a project whose claim record predates owners and
+    times: it fails closed, says what to do, and the named call releases it.
+    """
+    key = "c" * 64
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+    cache = DecisionCache(paths)
+    cache.records.write(
+        f"intent/{key}", json.dumps({"schema_version": 1, "key": key}).encode(), exclusive=True
+    )
+
+    def unexpected() -> JsonObject:
+        """Fail if an unaccountable claim is bought over."""
+        raise AssertionError("an unaccountable claim was bought over")
+
+    with pytest.raises(TraceTaggingError, match="outcome is unknown"):
+        cache.purchase(key, _any_request(), unexpected)
+
+    cache.discard_intent(key)
+
+    def buy() -> JsonObject:
+        """Buy the decision now that the claim is released."""
+        return {"answer": "q0 1\nq1 1"}
+
+    assert cache.purchase(key, _any_request(), buy) == {"answer": "q0 1\nq1 1"}
+
+
+def test_a_run_out_of_patience_refuses_without_sending_anyone_to_discard(tmp_path: Path) -> None:
+    """Giving up on another run's claim is not a diagnosis of an interrupted call."""
+    key = "c" * 64
+    paths = ProjectPaths(root=tmp_path, project_id="fixture")
+    seeded = DecisionCache(paths)
+    live = new_claim(key, "other-run", now=time.time())
+    seeded.records.write(f"intent/{key}", live.payload(), exclusive=True)
+
+    def unexpected() -> JsonObject:
+        """Fail if a decision another run claimed is bought anyway."""
+        raise AssertionError("a claimed decision was bought by a second run")
+
+    with pytest.raises(TraceTaggingError, match="committed no answer yet") as caught:
+        DecisionCache(paths, claim_wait_seconds=0.0).purchase(key, _any_request(), unexpected)
+
+    assert "discard" not in str(caught.value)
+    assert seeded.records.read(f"intent/{key}") == live.payload()
+
+
+def test_discarding_a_claim_this_run_is_buying_right_now_is_refused(tmp_path: Path) -> None:
+    """The one claim a run can judge with certainty is its own, and its own is never stale."""
+    key = "c" * 64
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    refusals: list[str] = []
+
+    def dispatch() -> JsonObject:
+        """Try to discard the claim covering the call being made under it."""
+        with pytest.raises(TraceTaggingError, match="being bought by this run right now") as caught:
+            cache.discard_intent(key)
+        refusals.append(str(caught.value))
+        return {"answer": "q0 2\nq1 2"}
+
+    answer = cache.purchase(key, _any_request(), dispatch)
+
+    assert len(refusals) == 1
+    assert cache.saved(key) == answer
+
+
+def test_discarding_a_claim_that_is_not_there_says_so(tmp_path: Path) -> None:
+    """The operator path out of a refusal has to fail clearly when it is used twice."""
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+
+    with pytest.raises(TraceTaggingError, match="has no retained claim"):
+        cache.discard_intent("d" * 64)

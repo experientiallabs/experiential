@@ -15,6 +15,7 @@ from exp.simulation.mining.deduplicate import (
     FrozenTaskPartition,
 )
 from exp.simulation.mining.descriptors import CoverageDescriptor
+from exp.simulation.mining.geometry import cosine
 from exp.simulation.mining.select import (
     ClusterSelection,
     PartitionSelection,
@@ -232,7 +233,7 @@ def _partition_coverage(
         by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
         for candidate in candidates:
             best_similarity = max(
-                _cosine(
+                cosine(
                     candidate.selection_vector,
                     by_id[selected.representative_trace_id].selection_vector,
                 )
@@ -283,7 +284,7 @@ def _distances(
         selected_ids = tuple(selection.representative_trace_id for selection in selected)
         for candidate in candidates:
             nearest_id = nearest_representative(candidate, selected_ids, by_id)
-            similarity = _cosine(candidate.selection_vector, by_id[nearest_id].selection_vector)
+            similarity = cosine(candidate.selection_vector, by_id[nearest_id].selection_vector)
             for trace_id in candidate.source_trace_ids:
                 distances.append(
                     TraceCoverageDistance(
@@ -351,8 +352,3 @@ def _operating_range(trace_count: int) -> Literal["below", "within", "above"]:
     if trace_count > 1_000:
         return "above"
     return "within"
-
-
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    """Return a bounded dot product for pre-normalized vectors."""
-    return max(-1.0, min(1.0, sum(a * b for a, b in zip(left, right, strict=True))))

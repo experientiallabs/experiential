@@ -45,8 +45,28 @@ from exp.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,
 )
+from exp.simulation.mining.clustering import (
+    AtomsHierarchyClusterSpec,
+    BernoulliMixtureClusterSpec,
+    ClusterSpec,
+    DescriptorClusterSpec,
+    KMeansClusterSpec,
+)
 from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
+from exp.simulation.mining.features import (
+    DecisionTagSelectionSpec,
+    HashingSelectionSpec,
+    SelectionSpec,
+)
+from exp.simulation.mining.sampling import (
+    DiversitySamplingSpec,
+    MedoidSamplingSpec,
+    ProportionalSamplingSpec,
+    SamplingSpec,
+    StratifiedSamplingSpec,
+)
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
+from exp.simulation.mining.tagging import TraceTagger
 
 _BUILD_SCOPED_REVIEW_KEYS = (
     "manual_judge",
@@ -111,6 +131,55 @@ class ProjectBuild:
     review: BuildReviewReadiness
 
 
+def mining_spec_for(settings: ProjectTracePreparationSettings) -> MiningSpec:
+    """Build the mining spec one project's persisted preparation settings describe.
+
+    This is the single place names become specs. Both the build and the readiness record that is
+    later reconstructed from the same settings call it, so the record always binds the geometry the
+    build actually used.
+
+    Args:
+        settings: Persisted provider-free preparation settings.
+
+    Returns:
+        The mining spec, which is the provider-free default when no geometry was chosen.
+
+    Raises:
+        ValueError: The named geometry and backend cannot describe the same evidence, or the
+            decision-tag geometry was named without the bank that decides its columns.
+    """
+    if settings.mining_geometry == "decision_tag" and not settings.mining_bank:
+        raise ValueError(
+            "the decision_tag geometry reads a question bank, and which bank decides what the "
+            "geometry can tell apart, so there is no default to fall back on; record a bank in "
+            "mining_bank and install it where resolve_question_bank looks"
+        )
+    selection: SelectionSpec = (
+        DecisionTagSelectionSpec(bank_id=settings.mining_bank)
+        if settings.mining_geometry == "decision_tag"
+        else HashingSelectionSpec(dimensions=settings.descriptor_dimensions)
+    )
+    clusters: dict[str, ClusterSpec] = {
+        "descriptor": DescriptorClusterSpec(),
+        "kmeans": KMeansClusterSpec(seed=settings.mining_seed),
+        "bernoulli_mixture": BernoulliMixtureClusterSpec(seed=settings.mining_seed),
+        "atoms_hierarchy": AtomsHierarchyClusterSpec(seed=settings.mining_seed),
+    }
+    samplings: dict[str, SamplingSpec] = {
+        "medoid": MedoidSamplingSpec(),
+        "proportional": ProportionalSamplingSpec(),
+        "diversity": DiversitySamplingSpec(),
+        "stratified": StratifiedSamplingSpec(),
+    }
+    return MiningSpec(
+        fit_task_budget=settings.fit_task_budget,
+        held_out_task_budget=settings.held_out_task_budget,
+        selection=selection,
+        cluster=clusters[settings.mining_cluster],
+        sampling=samplings[settings.mining_sampling],
+    )
+
+
 def prepare_project_traces(
     project: str,
     trace_file: Path,
@@ -118,6 +187,7 @@ def prepare_project_traces(
     root: Path,
     source_id: str,
     settings: ProjectTracePreparationSettings,
+    tagger: TraceTagger | None = None,
 ) -> ProjectProviderFreeStage:
     """Prepare and select provider-free Project evidence from one acquired trace file.
 
@@ -127,6 +197,8 @@ def prepare_project_traces(
         root: Local EXP artifact root.
         source_id: Stable caller-owned source label that remains valid after the worker exits.
         settings: Declared source kind and deterministic representative-task controls.
+        tagger: Explicit decision-model tagger, required when the settings name the decision-tag
+            geometry and rejected otherwise.
 
     Returns:
         The exact selected trace and task manifest pointers for the completed provider-free stage.
@@ -160,11 +232,9 @@ def prepare_project_traces(
         store,
         created_at=datetime.now(UTC),
         code_revision=code_revision,
-        mining_spec=MiningSpec(
-            fit_task_budget=settings.fit_task_budget,
-            held_out_task_budget=settings.held_out_task_budget,
-        ),
+        mining_spec=mining_spec_for(settings),
         embedder=HashingDescriptorEmbedder(dimensions=settings.descriptor_dimensions),
+        tagger=tagger,
     )
     trace_dataset = artifact_input(completed.artifacts.trace_dataset.manifest)
     task_set = artifact_input(
@@ -232,10 +302,7 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
     source = loaded.dataset.source
     if source is None:
         raise ValueError("provider-free trace dataset has no durable source identity")
-    mining_spec = MiningSpec(
-        fit_task_budget=settings.fit_task_budget,
-        held_out_task_budget=settings.held_out_task_budget,
-    )
+    mining_spec = mining_spec_for(settings)
     provider_free_config = _provider_free_review_config(config)
     binding = {
         "schema_version": 1,
@@ -310,6 +377,7 @@ def build_task_set(
     code_revision: str,
     mining_spec: MiningSpec | None = None,
     embedder: DescriptorEmbedder | None = None,
+    tagger: TraceTagger | None = None,
 ) -> TaskSetBuild:
     """Persist normalized evidence, mine representatives, and persist a dependent task set.
 
@@ -326,6 +394,8 @@ def build_task_set(
             out tasks.
         embedder: Explicit descriptor embedder. The deterministic local hashing embedder is used
             when omitted.
+        tagger: Explicit decision-model tagger, required by a decision-tag selection geometry and
+            rejected by the provider-free one.
 
     Returns:
         Immutable trace-dataset and task-set artifacts plus the mining evidence between them.
@@ -340,6 +410,7 @@ def build_task_set(
         trace_dataset.traces,
         mining_spec,
         embedder=embedder or HashingDescriptorEmbedder(),
+        tagger=tagger,
         input_trace_count=len(trace_dataset.traces) + trace_dataset.dataset.invalid_trace_count,
         invalid_trace_count=trace_dataset.dataset.invalid_trace_count,
     )
@@ -363,6 +434,7 @@ def build_project(
     code_revision: str,
     mining_spec: MiningSpec | None = None,
     embedder: DescriptorEmbedder | None = None,
+    tagger: TraceTagger | None = None,
 ) -> ProjectBuild:
     """Build local evidence and stop before any model proposal or judge operation.
 
@@ -373,6 +445,7 @@ def build_project(
         code_revision: Exact EXP revision producing the artifacts.
         mining_spec: Optional deterministic representative-selection controls.
         embedder: Optional explicit descriptor embedder.
+        tagger: Explicit decision-model tagger, required by a decision-tag selection geometry.
 
     Returns:
         Completed artifacts and a local ``proposals_pending`` review handoff.
@@ -394,6 +467,7 @@ def build_project(
         code_revision=code_revision,
         mining_spec=resolved_spec,
         embedder=resolved_embedder,
+        tagger=tagger,
     )
     trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
     task_stored = store.artifacts.read(artifacts.task_set.task_set_id)

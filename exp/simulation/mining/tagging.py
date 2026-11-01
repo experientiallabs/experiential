@@ -13,16 +13,23 @@ Three properties make this safe to run on a corpus that costs money to tag:
 - **Decisions are content-addressed.** A decision is keyed by the rendered text, the exact
   question text, and the resolved model identity. A rerun pays only for units it has not tagged
   and questions whose text changed; everything else replays from the project's records.
-- **An interrupted call is never silently repurchased.** The cache writes an intent record before
-  dispatch and removes it only once the answer is committed. A surviving intent means one call's
-  outcome is unknown, and the next run refuses it by name instead of buying it again.
+- **An interrupted call is never silently repurchased.** The cache claims a decision before
+  dispatch and drops the claim only once the answer is committed. A claim whose call is still in
+  flight is waited for and its answer replayed; a claim nobody will resolve means one call's
+  outcome is unknown, and a run refuses it by name instead of buying it again. See
+  :mod:`exp.simulation.mining.intents` for how the two are told apart.
 
 The endpoint is never named here. A tagger receives an injected
 :class:`~exp.common.models.client.ModelClient` plus the resolved model identity that client
 serves, so pointing tagging at a different endpoint means resolving a different alias or
-injecting a different client, never editing this module. Chat completions are the wire because
-they are the one every configured connection speaks; :class:`TraceTagger` is the seam, so an
-implementation on a typed-decision wire can be added later without touching a caller.
+injecting a different client, never editing this module.
+
+:class:`TraceTagger` is the seam between the wire and everything above it, and which wire a
+decision model speaks is a property of that model rather than a given. Chat completions are the
+portable contract, but a decision model may serve none at all: the deployment this project is
+configured against refuses them outright, which is why
+:class:`~exp.simulation.mining.decisions.DecisionsTraceTagger` exists on the typed decisions
+surface. :class:`ChatTraceTagger` below stays the implementation for a chat-capable model.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -51,6 +59,20 @@ from exp.common.models.client import ModelClient
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.records import ProjectRecordError, ProjectRecords
 from exp.runtime.models.registry import ResolvedModel
+from exp.simulation.mining.intents import (
+    CLAIM_POLL_SECONDS,
+    CLAIM_WAIT_SECONDS,
+    ClaimReading,
+    ClaimState,
+    DecisionClaim,
+    abandoned_claim_refusal,
+    absent_claim_discard_refusal,
+    in_flight_claim_refusal,
+    new_claim,
+    new_owner,
+    own_claim_discard_refusal,
+    read_claim,
+)
 from exp.simulation.mining.questions import Question, QuestionBank
 from exp.simulation.mining.views import Unit
 
@@ -343,28 +365,71 @@ def decision_key(unit: Unit, questions: Sequence[Question], model_identity: Json
     )
 
 
+@dataclass(frozen=True)
+class _Reservation:
+    """The outcome of one locked attempt to reserve one decision.
+
+    Attributes:
+        response: The committed answer to replay, when there was one.
+        claim: The claim this run now owns, when it holds the one dispatch this key allows.
+        waiting: Another run's in-flight claim, when neither of the above applies and the caller
+            has to wait for that run to resolve it.
+    """
+
+    response: JsonObject | None = None
+    claim: DecisionClaim | None = None
+    waiting: ClaimReading | None = None
+
+
 class DecisionCache:
     """Project-scoped decisions, saved once by content and replayed on every later run.
 
-    One process lock covers lookup, dispatch, and commit, so two runs over one corpus each pay
-    only for what the other has not committed. The lock file and the records hold no rendered
-    text: a decision is stored under the digest of its request, together with the response.
+    The project lock covers lookup and claim, then commit. It never covers the provider call: a
+    decision takes seconds on the wire, and holding a project-wide lock across it would serialize
+    every call a run makes and make a large corpus unbuyable in practice. What the lock protects
+    is the short read-modify-write around each call, which is exactly the contract
+    :meth:`~exp.common.project.records.ProjectRecords.transaction` states.
+
+    Buying exactly once therefore rests on the claim record rather than on the lock's duration. A
+    claim is written exclusively before dispatch and dropped together with the answer in one
+    transaction, and two runs over one corpus cooperate through it: the second finds the first's
+    claim, waits for it, and replays the answer the first committed, so each pays only for what
+    the other has not. A claim nobody will resolve is refused by name instead, and the two are
+    told apart rather than guessed at: :mod:`exp.simulation.mining.intents` owns that judgment and
+    the sentences it produces.
+
+    Workers of one run are in exactly that arrangement and need nothing else. One ``tag()`` pass
+    only ever claims distinct keys, since a key covers the rendered text, the exact questions and
+    the model identity, and a pass asks disjoint question batches about distinct rendered texts. A
+    process that does ask for one key twice at once has its second asker wait for the first, the
+    same way a second run would.
+
+    The lock file and the records hold no rendered text: a decision is stored under the digest of
+    its request, together with the response.
 
     Attributes:
         paths: Content root and project identity owning the records.
         records: The project's ``trace-decisions`` namespace.
         lock_path: Per-project coordination file, holding no decision data.
+        claim_wait_seconds: How long this run waits for another run's in-flight claim before
+            refusing without buying anything. Zero refuses immediately instead of waiting.
     """
 
-    def __init__(self, paths: ProjectPaths) -> None:
+    def __init__(
+        self, paths: ProjectPaths, *, claim_wait_seconds: float = CLAIM_WAIT_SECONDS
+    ) -> None:
         """Bind a project namespace without creating storage or opening a connection.
 
         Args:
             paths: Explicit content root and project identity, normally ``store.paths``.
+            claim_wait_seconds: Patience for another run's in-flight claim. See
+                :data:`~exp.simulation.mining.intents.CLAIM_WAIT_SECONDS`.
         """
         self.paths = paths
         self.records = ProjectRecords(paths.root, paths.project_id, DECISION_RECORDS_NAMESPACE)
         self.lock_path = paths.runtime_directory / DECISION_RECORDS_NAMESPACE / "decisions.lock"
+        self.claim_wait_seconds = claim_wait_seconds
+        self._owner = new_owner()
 
     def saved(self, key: str) -> JsonObject | None:
         """Return a committed decision response, or None when it was never bought."""
@@ -387,47 +452,146 @@ class DecisionCache:
         """Authorize one interrupted decision to be bought again.
 
         Call this only after establishing that the interrupted call was never billed. It removes
-        the intent record alone and never touches a committed decision.
+        the claim record alone and never touches a committed decision.
+
+        A claim this run is buying right now is refused, because it is demonstrably not an
+        interrupted call and removing it would let a second run buy the same decision. A claim
+        another run wrote cannot be told apart from an abandoned one from here, which is why the
+        precondition above is the caller's to establish: discarding one costs that run nothing of
+        its answer, which is committed whatever happened to its claim, but it does allow one
+        duplicate purchase.
 
         Args:
             key: Content identity reported by the refusal.
+
+        Raises:
+            TraceTaggingError: There is no claim to discard, or this run is buying it right now.
         """
-        self.records.replace(f"intent/{key}", expected=self._intent_payload(key), replacement=None)
+        with self._locked():
+            raw = self.records.read(f"intent/{key}")
+            if raw is None:
+                raise TraceTaggingError(absent_claim_discard_refusal(key))
+            reading = read_claim(raw, key=key, now=time.time())
+            if (
+                reading.state is ClaimState.IN_FLIGHT
+                and reading.claim is not None
+                and reading.claim.owner == self._owner
+            ):
+                raise TraceTaggingError(own_claim_discard_refusal(key))
+            self.records.replace(f"intent/{key}", expected=raw, replacement=None)
 
     def purchase(
         self, key: str, request: ContractModel, dispatch: Callable[[], JsonObject]
     ) -> JsonObject:
         """Replay a saved decision, or buy it once and commit it durably.
 
+        The three steps are deliberately separated. Claiming takes the project lock, looks the
+        decision up and takes the exclusive right to buy it; ``dispatch`` then runs with no lock
+        held, so a run may have many calls in flight at once; committing takes the lock again to
+        save the answer and drop the claim together. A call that returns no answer marks its own
+        claim abandoned on the way out, so the next reader refuses it by name immediately instead
+        of waiting out the lease for an answer that is not coming.
+
         Args:
             key: Content identity of this decision.
             request: The exact request whose digest is stored beside the response.
-            dispatch: Provider boundary, called only when nothing is saved.
+            dispatch: Provider boundary, called only when nothing is saved. It is called on the
+                calling thread, so a concurrent run calls this method from several threads.
 
         Returns:
             The decision response body.
 
         Raises:
-            TraceTaggingError: A retained intent means one call's outcome is unknown, or the
+            TraceTaggingError: A claim nobody will resolve means one call's outcome is unknown,
+                another run's claim outlasted this run's patience, or the project's records cannot
+                be read or committed.
+        """
+        reserved = self._reserve(key)
+        if reserved.response is not None:
+            return reserved.response
+        claim = reserved.claim
+        assert claim is not None  # _reserve returns an answer to replay or a claim to buy under.
+        try:
+            response = dispatch()
+        except BaseException:
+            self._abandon(claim)
+            raise
+        self._commit(key, request, response, claim=claim)
+        return response
+
+    def _reserve(self, key: str) -> _Reservation:
+        """Replay a committed answer, or take the exclusive right to buy this decision once.
+
+        Another run's in-flight claim is waited for rather than refused. That run is about to
+        commit an answer this one can replay, and refusing it would both report an active run as
+        an interrupted one and send its user to discard a claim that is about to be used. The wait
+        polls with no lock held and is bounded by ``claim_wait_seconds``.
+
+        Args:
+            key: Content identity of this decision.
+
+        Returns:
+            The committed answer to replay, or the claim this run now owns.
+
+        Raises:
+            TraceTaggingError: A claim nobody will resolve means one call's outcome is unknown,
+                another run's claim outlasted this run's patience, or the project's records cannot
+                be read or committed.
+        """
+        deadline = time.monotonic() + max(0.0, self.claim_wait_seconds)
+        announced = False
+        while True:
+            reserved = self._claim(key)
+            if reserved.waiting is None:
+                return reserved
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TraceTaggingError(in_flight_claim_refusal(key, reserved.waiting))
+            if not announced:
+                announced = True
+                logger.info(
+                    "decision %s is claimed by another run; waiting up to %.0fs for its answer",
+                    key[:12],
+                    max(0.0, self.claim_wait_seconds),
+                )
+            time.sleep(min(CLAIM_POLL_SECONDS, remaining))
+
+    def _claim(self, key: str) -> _Reservation:
+        """Make one locked attempt to replay this decision, claim it, or find who holds it.
+
+        Args:
+            key: Content identity of this decision.
+
+        Returns:
+            The answer, this run's new claim, or the in-flight claim to wait for.
+
+        Raises:
+            TraceTaggingError: The claim on this decision is one nobody will resolve, or the
                 project's records cannot be read or committed.
         """
         with self._locked():
             response = self.saved(key)
             if response is not None:
-                return response
-            if self.records.read(f"intent/{key}") is not None:
-                raise TraceTaggingError(
-                    f"decision {key[:12]} was dispatched and its outcome is unknown; it may "
-                    "already have been billed, so tagging will not buy it again. Confirm the "
-                    "call was not billed, then call DecisionCache.discard_intent with that key"
-                )
-            self.records.write(f"intent/{key}", self._intent_payload(key), exclusive=True)
-            response = dispatch()
-            self._commit(key, request, response)
-            return response
+                return _Reservation(response=response)
+            reading = read_claim(self.records.read(f"intent/{key}"), key=key, now=time.time())
+            if reading.state is ClaimState.ABANDONED:
+                raise TraceTaggingError(abandoned_claim_refusal(key))
+            if reading.state is ClaimState.IN_FLIGHT:
+                return _Reservation(waiting=reading)
+            claim = new_claim(key, self._owner, now=time.time())
+            self.records.write(f"intent/{key}", claim.payload(), exclusive=True)
+            return _Reservation(claim=claim)
 
-    def _commit(self, key: str, request: ContractModel, response: JsonObject) -> None:
-        """Save one answer and drop its intent in one transaction."""
+    def _commit(
+        self, key: str, request: ContractModel, response: JsonObject, *, claim: DecisionClaim
+    ) -> None:
+        """Save one answer and drop this run's claim on it, in one transaction.
+
+        The answer is written whatever became of the claim. It was paid for, so losing it because
+        the claim moved underneath, which is what a mistaken ``discard_intent`` does, would turn a
+        bookkeeping surprise into a billed answer nobody holds. The claim is dropped only while it
+        is still exactly the one this run wrote.
+        """
         payload = canonical_json_bytes(
             {
                 "schema_version": TAG_SCHEMA_VERSION,
@@ -436,19 +600,44 @@ class DecisionCache:
                 "response": response,
             }
         )
-        with self.records.transaction():
+        held = claim.payload()
+        with self._locked(), self.records.transaction():
             self.records.write(f"decision/{key}", payload)
-            self.records.replace(
-                f"intent/{key}", expected=self._intent_payload(key), replacement=None
-            )
+            if self.records.read(f"intent/{key}") == held:
+                self.records.replace(f"intent/{key}", expected=held, replacement=None)
 
-    def _intent_payload(self, key: str) -> bytes:
-        """Return the exact bytes an intent record holds for one decision."""
-        return canonical_json_bytes({"schema_version": TAG_SCHEMA_VERSION, "key": key})
+    def _abandon(self, claim: DecisionClaim) -> None:
+        """Mark this run's claim as a call that committed no answer.
+
+        The claim stays, because a failed call's outcome is unknown and may have been billed. What
+        changes is that it now says so, which is what lets the next reader refuse it by name on
+        the spot rather than wait out the lease for an answer that is not coming.
+
+        This runs on a failure path, so its own failure is logged rather than raised: the call's
+        error is the one the caller needs, and a claim left in flight is still refused by name
+        once it outlives the lease.
+
+        Args:
+            claim: The claim this run wrote before the call that failed.
+        """
+        held = claim.payload()
+        try:
+            with self._locked():
+                if self.records.read(f"intent/{claim.key}") != held:
+                    return
+                self.records.replace(
+                    f"intent/{claim.key}", expected=held, replacement=claim.abandon().payload()
+                )
+        except (TraceTaggingError, ProjectRecordError):
+            logger.warning(
+                "the claim on decision %s could not be marked abandoned; it stays in flight "
+                "until its lease runs out",
+                claim.key[:12],
+            )
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        """Serialize lookup, dispatch, and commit across processes sharing this project."""
+        """Serialize one short records operation across processes sharing this project."""
         directory = self.lock_path.parent
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if directory.is_symlink() or not directory.is_dir():
@@ -472,13 +661,14 @@ class DecisionCache:
 
 
 class ChatTraceTagger:
-    """Buys tags from a decision model over the portable chat-completions contract.
+    """Buys tags from a chat-capable decision model over the portable completions contract.
 
-    Chat completions are the wire because every configured connection speaks them; a typed
-    decision wire is reachable only from the one provider that serves it. The client and the
-    model identity are both injected, so tagging a different endpoint means resolving a
-    different alias or injecting a different client, and nothing here reads a URL or an
-    environment variable.
+    Use this for a model that serves chat completions. Not every decision model does: one that
+    exposes only a typed decisions surface refuses this wire with an unsupported-capability
+    error, and :class:`~exp.simulation.mining.decisions.DecisionsTraceTagger` is the
+    implementation for that case. The client and the model identity are both injected, so tagging
+    a different endpoint means resolving a different alias or injecting a different client, and
+    nothing here reads a URL or an environment variable.
 
     The models worth tagging with declare neither structured output nor tool calling, so the
     answer format is a fixed-order plain-text list, one line per question, parsed strictly: see

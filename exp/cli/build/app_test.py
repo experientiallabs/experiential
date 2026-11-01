@@ -1794,3 +1794,114 @@ def test_replacement_import_is_selected_with_its_completed_build(tmp_path: Path)
     assert store.load_project().trace_import_id == second.import_id
     assert store.load_project().build != original.build
     assert frozen.load_project() == original
+
+
+def test_build_help_describes_the_mining_geometry_choices() -> None:
+    """The second mining route is only usable if its flags are discoverable."""
+    help_text = unstyle(_RUNNER.invoke(app, ["build", "--help"]).output)
+
+    assert "--mine-with" in help_text
+    assert "--tagger" in help_text
+    assert "--cluster-with" in help_text
+    assert "--sample-with" in help_text
+
+
+def test_build_refuses_an_unknown_mining_geometry_before_touching_a_project(
+    tmp_path: Path,
+) -> None:
+    """A misspelled geometry must not create project state or read a trace file."""
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "project-a",
+            "-t",
+            str(source),
+            "--root",
+            str(root),
+            "--mine-with",
+            "tags",
+            "--non-interactive",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "must be one of: hashing, decision-tag" in unstyle(result.output)
+    assert not (root / "projects").exists()
+
+
+def test_build_refuses_a_tag_geometry_with_no_tagger(tmp_path: Path) -> None:
+    """Tagging is paid work, so the missing alias is reported before any of it starts."""
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "project-a",
+            "-t",
+            str(source),
+            "--root",
+            str(root),
+            "--mine-with",
+            "decision-tag",
+            "--non-interactive",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "needs --tagger ALIAS" in unstyle(result.output)
+
+
+def test_naming_the_default_mining_geometry_builds_the_same_tasks(tmp_path: Path) -> None:
+    """Spelling out today's geometry has to be the same build as omitting the flags entirely.
+
+    This is the command-level half of the artifact-level golden: the flags default to the
+    provider-free route, so an existing invocation keeps mining exactly as it did.
+    """
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    base = ["build", "support", "--traces", str(source), "--root", str(root)]
+
+    implicit = _RUNNER.invoke(app, [*base, "--dry-run"])
+    explicit = _RUNNER.invoke(
+        app,
+        [
+            *base,
+            "--dry-run",
+            "--mine-with",
+            "hashing",
+            "--cluster-with",
+            "descriptor",
+            "--sample-with",
+            "medoid",
+        ],
+    )
+
+    assert implicit.exit_code == 0, implicit.output
+    assert explicit.exit_code == 0, explicit.output
+    assert unstyle(explicit.output) == unstyle(implicit.output)
+
+
+def test_an_alternative_sampling_strategy_reaches_the_build(tmp_path: Path) -> None:
+    """A named strategy has to change the mining, not just be accepted by the parser."""
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    base = ["build", "support", "--traces", str(source), "--root", str(root), "--dry-run"]
+
+    default = _RUNNER.invoke(app, base)
+    diverse = _RUNNER.invoke(app, [*base, "--sample-with", "diversity"])
+
+    assert default.exit_code == 0, default.output
+    assert diverse.exit_code == 0, diverse.output
+    assert "dry run complete" in unstyle(diverse.output)

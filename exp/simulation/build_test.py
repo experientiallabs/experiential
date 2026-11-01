@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import exp
 import exp.runtime.models.registry as runtime_model_registry
@@ -28,7 +29,11 @@ from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
-from exp.simulation.build import build_project, build_task_set
+from exp.simulation.build import build_project, build_task_set, mining_spec_for
+from exp.simulation.mining.clustering import BernoulliMixtureClusterSpec
+from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSelectionSpec
+from exp.simulation.mining.questions import EXAMPLE_BANK_ID
+from exp.simulation.mining.sampling import StratifiedSamplingSpec
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40
@@ -503,3 +508,76 @@ def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_pay
             code_revision="test-revision",
             mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
         )
+
+
+def test_mining_spec_for_defaults_to_the_provider_free_geometry() -> None:
+    """Settings written before the geometry existed must keep mining as they always did."""
+    settings = ProjectTracePreparationSettings(source_kind="otlp")
+
+    assert mining_spec_for(settings) == MiningSpec(
+        fit_task_budget=settings.fit_task_budget,
+        held_out_task_budget=settings.held_out_task_budget,
+        selection=HashingSelectionSpec(dimensions=settings.descriptor_dimensions),
+    )
+
+
+def test_mining_spec_for_rebuilds_the_named_geometry() -> None:
+    """A build and the readiness record rebuilt from one project's settings must agree."""
+    settings = ProjectTracePreparationSettings(
+        source_kind="otlp",
+        mining_geometry="decision_tag",
+        mining_cluster="bernoulli_mixture",
+        mining_sampling="stratified",
+        mining_tagger_alias="clef-decisions",
+        mining_bank=EXAMPLE_BANK_ID,
+        mining_seed=5,
+    )
+
+    spec = mining_spec_for(settings)
+
+    assert isinstance(spec.selection, DecisionTagSelectionSpec)
+    assert spec.selection.bank_id == EXAMPLE_BANK_ID
+    assert spec.cluster == BernoulliMixtureClusterSpec(seed=5)
+    assert spec.sampling == StratifiedSamplingSpec()
+
+
+def test_mining_spec_for_refuses_an_incompatible_pairing() -> None:
+    """Persisted settings can name a combination that cannot describe one corpus."""
+    settings = ProjectTracePreparationSettings(
+        source_kind="otlp", mining_cluster="bernoulli_mixture"
+    )
+
+    with pytest.raises(ValidationError, match="only the decision_tag selection geometry"):
+        mining_spec_for(settings)
+
+
+def test_a_tagged_build_without_a_tagger_fails_closed(tmp_path: Path) -> None:
+    """A replay that silently mined a hashing geometry would publish the wrong evidence.
+
+    This is the state `exp optimize router` reaches when it replays a decision-tag build without
+    being handed a tagger: it wraps this refusal as a composition error rather than mining a
+    different geometry and reporting success.
+    """
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    normalized = TraceNormalizationResult(traces=(_trace(1), _trace(2)), issues=())
+
+    with pytest.raises(ValueError, match="needs an explicit tagger"):
+        build_task_set(
+            normalized,
+            store,
+            created_at=datetime(2026, 8, 12, tzinfo=UTC),
+            code_revision="test-revision",
+            mining_spec=MiningSpec(
+                fit_task_budget=1,
+                held_out_task_budget=1,
+                selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+            ),
+        )
+
+
+def test_mining_spec_for_refuses_a_tag_geometry_with_no_bank() -> None:
+    """Which propositions are asked decides what the geometry tells apart, so it has no default."""
+    settings = ProjectTracePreparationSettings(source_kind="otlp", mining_geometry="decision_tag")
+
+    with pytest.raises(ValueError, match="reads a question bank"):
+        mining_spec_for(settings)
