@@ -37,13 +37,14 @@ from exp.runtime.gateway.model_plan import (
     project_stage_selection,
     stage_start_authorized,
 )
-from exp.runtime.gateway.project_activation import SelectorActivation
+from exp.runtime.gateway.project_activation import ProjectActivationError, SelectorActivation
 from exp.runtime.gateway.project_episode_identity import (
     project_episode_identity as project_episode_identity,
 )
 from exp.runtime.gateway.request_policy import RequestedRouteId
 from exp.runtime.gateway.tag_router import (
     TAG_ROUTER_ROUTE_REASON,
+    TagRouterIntegrityError,
     TagRulesActivation,
     TagRulesSelector,
 )
@@ -72,9 +73,15 @@ def project_selector(
 
     Returns:
         A learned ``RouterRuntime`` or a ``TagRulesSelector``.
+
+    Raises:
+        ProjectActivationError: A tag-rules candidate differs from its frozen identity.
     """
     if isinstance(activation, TagRulesActivation):
-        return TagRulesSelector.from_activation(activation, catalog)
+        try:
+            return TagRulesSelector.from_activation(activation, catalog)
+        except TagRouterIntegrityError as exc:
+            raise ProjectActivationError(str(exc)) from exc
     return RouterRuntime.from_activation(activation, catalog, decision_sink=decision_sink)
 
 
