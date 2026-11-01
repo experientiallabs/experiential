@@ -136,8 +136,17 @@ python-version = "3.12"
 # certifi release is eligible.
 # filelock: 4.2.1 (uploaded 2026-10-17) fixes ReadWriteLock reopening its database
 # by name (GHSA-v4x8-3wr5-3wq8, high). Remove this entry after 2026-10-24.
+# pyasn1: 0.6.5 fixes the ASN.1 decoder denial-of-service advisories.
+# Remove the cutoff after 2026-11-04, once the seven-day window admits it.
 exclude-newer = "7 days"
-exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z" }
+exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z", pyasn1 = "2026-10-28T00:00:00Z" }
+
+# Keep the transitive native fork on the same immutable source as the direct pin.
+override-dependencies = [
+    "exp-mitmproxy-rs==0.12.11.post1; python_version >= '3.13'",
+    # Preserve the security-patched version despite the proxy's stale 1.2.2 ceiling.
+    "msgpack==1.2.3",
+]
 
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the
