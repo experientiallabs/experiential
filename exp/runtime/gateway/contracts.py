@@ -919,6 +919,10 @@ class ProjectSelection(ContractModel):
     """One frozen project selection resolved before provider execution.
 
     Attributes:
+        exact_model_id: Exact logical model the selected candidate serves.
+        selected_alias: Policy candidate alias the selector chose.
+        activation_ref: Project activation that made the selection.
+        fallback_reason: Why the selector fell back from its first choice, or None.
         route_reason: ``learned_router`` for a learned policy, ``tag_router`` for tag rules.
     """
 

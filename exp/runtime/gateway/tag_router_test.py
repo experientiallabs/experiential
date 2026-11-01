@@ -322,14 +322,21 @@ def test_a_candidate_that_cannot_serve_the_request_yields_to_an_eligible_one() -
         CAPABILITY_ELIGIBILITY,
     )
     plain = selector.select_blocking(_request("more"), episode_id="one", deadline=_deadline())
-    assert (plain.selected_alias, plain.fallback_reason) == ("coder", None)
+    assert (plain.selected_alias, plain.fallback_reason) == ("generalist", CAPABILITY_ELIGIBILITY)
 
 
-def test_a_policy_names_no_classifier_credential() -> None:
-    """A credential reference never enters an immutable policy artifact."""
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("bearer_env", "DECISION_TOKEN", "names no credential"),
+        ("url", "https://decisions.example.invalid/systemone?api_key=secret", "no query string"),
+    ],
+)
+def test_a_policy_names_no_classifier_credential(field: str, value: str, message: str) -> None:
+    """Neither a credential reference nor a query-borne key enters a policy artifact."""
     document = _document(_catalog())
-    classifier = {**cast("JsonObject", document["classifier"]), "bearer_env": "DECISION_TOKEN"}
-    with pytest.raises(ValueError, match="names no credential"):
+    classifier = {**cast("JsonObject", document["classifier"]), field: value}
+    with pytest.raises(ValueError, match=message):
         TagRulesRouterPolicy.model_validate({**document, "classifier": classifier})
 
 

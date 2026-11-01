@@ -27,6 +27,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 
@@ -110,7 +111,8 @@ class TagRulesRouterPolicy(ArtifactEnvelope):
         candidates: Candidate aliases with their frozen model identities.
         default_alias: Candidate serving requests no rule matches.
         classifier: Decision-model document scoring the request before dispatch. It
-            names no credential, so the endpoint must accept requests without one.
+            names no credential and its URL has no query string, so the endpoint must
+            accept requests without a credential.
         rules: Ordered rules; the first match routes the request.
     """
 
@@ -139,6 +141,8 @@ class TagRulesRouterPolicy(ArtifactEnvelope):
             raise ValueError("tag router default_alias must name a candidate")
         if self.classifier.bearer_env is not None:
             raise ValueError("a tag-rules policy names no credential; omit classifier.bearer_env")
+        if urlsplit(self.classifier.url).query:
+            raise ValueError("a tag-rules classifier URL carries no query string")
         categories = set(self.classifier.categories)
         for rule in self.rules:
             if rule.route not in aliases:
@@ -490,8 +494,10 @@ class TagRulesSelector:
             if episode is None:
                 self._record(used)
                 if decision.fallback_reason not in _UNPINNED:
+                    # Pin what was served, so later turns stay on the model that began
+                    # the episode even when a capability fallback chose it.
                     now = self._clock()
-                    self._episodes[keys[0]] = (now + self._ttl_seconds, decision)
+                    self._episodes[keys[0]] = (now + self._ttl_seconds, used)
                     while self._episodes and (
                         len(self._episodes) > self._capacity
                         or next(iter(self._episodes.values()))[0] <= now
