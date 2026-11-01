@@ -73,6 +73,9 @@ CLASSIFIER_BUSY: Final = "classifier_busy"
 _UNPINNED: Final = frozenset({CLASSIFIER_UNAVAILABLE, CLASSIFIER_BUSY, NO_CLASSIFIABLE_TEXT})
 _MAX_RULES: Final = 64
 _PENDING_DECISION_ID: Final = "routing-decision-pending"
+# Every selector in the process takes permits from this one pool, so the bound on
+# decision-model calls in flight covers all activations and reloaded generations.
+_CLASSIFICATIONS: Final = threading.BoundedSemaphore(32)
 
 type TagDecisionSink = Callable[[RoutingDecision], None]
 """Recorder for every tag routing decision, with the learned router's sink contract."""
@@ -229,7 +232,7 @@ class TagRulesSelector:
         *,
         classifier: DecisionModelClassifier | None = None,
         decision_sink: TagDecisionSink | None = None,
-        maximum_concurrent_classifications: int = 32,
+        classifications: threading.BoundedSemaphore = _CLASSIFICATIONS,
         decision_capacity: int = 4_096,
         decision_ttl_seconds: float = 24 * 60 * 60,
         clock: Callable[[], float] = time.monotonic,
@@ -244,8 +247,9 @@ class TagRulesSelector:
             catalog: Runtime catalog resolving the candidate aliases.
             classifier: Optional injected classifier; ``None`` builds one from the policy.
             decision_sink: Optional recorder called with every decision before it is used.
-            maximum_concurrent_classifications: Decision-model calls in flight at once,
-                default 32; a request beyond the bound takes the default unclassified.
+            classifications: Permits for decision-model calls in flight. The default
+                pool of 32 is shared by every selector in the process; a request
+                beyond it takes the default unclassified.
             decision_capacity: Most retained episode decisions, default 4,096.
             decision_ttl_seconds: Seconds an idle episode's decision stays valid, default one day.
             clock: Monotonic clock for decision expiry.
@@ -254,11 +258,7 @@ class TagRulesSelector:
             ValueError: A decision bound is not positive.
             TagRouterIntegrityError: A candidate does not resolve to its frozen identity.
         """
-        if (
-            decision_capacity < 1
-            or decision_ttl_seconds <= 0
-            or maximum_concurrent_classifications < 1
-        ):
+        if decision_capacity < 1 or decision_ttl_seconds <= 0:
             raise ValueError("tag router decision bounds must be positive")
         self._capabilities: dict[str, ModelCapabilities] = {}
         for candidate in policy.candidates:
@@ -292,7 +292,7 @@ class TagRulesSelector:
         )
         self._policy_sha256 = sha256_json(policy)
         self._decision_sink = decision_sink
-        self._classifications = threading.BoundedSemaphore(maximum_concurrent_classifications)
+        self._classifications = classifications
         self._capacity = decision_capacity
         self._ttl_seconds = decision_ttl_seconds
         self._clock = clock
