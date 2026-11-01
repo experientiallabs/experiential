@@ -46,6 +46,7 @@ EXPECTED_GATEWAY_GROUPS = {
     "key": {"check", "issue", "list", "revoke"},
     "pool": {"certify"},
     "provider": {"add", "disable", "list", "remove", "update"},
+    "router": {"tags"},
 }
 
 

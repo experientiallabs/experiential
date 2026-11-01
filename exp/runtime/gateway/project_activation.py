@@ -151,7 +151,7 @@ class LocalArtifactProjectActivationRepository:
         project = ProjectStore(self.root, project_ref)
         try:
             project.load_project()
-            resolved_ref = activation_ref or _only_policy(project.artifacts)
+            resolved_ref = activation_ref or only_router_policy(project.artifacts)
             activation = load_project_activation(
                 project.artifacts,
                 project_ref=project_ref,
@@ -231,7 +231,7 @@ def _policy_kind(raw: bytes) -> object:
     return document.get("kind", "knn") if isinstance(document, dict) else None
 
 
-def _only_policy(store: ArtifactStore) -> ArtifactId:
+def only_router_policy(store: ArtifactStore) -> ArtifactId:
     """Resolve the only completed router policy in one project artifact store."""
     policies = tuple(
         artifact_id

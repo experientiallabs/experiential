@@ -23,6 +23,7 @@ from exp.cli.gateway.key_output import (
 from exp.cli.gateway.pool import pool_app
 from exp.cli.gateway.provider import provider_app
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
+from exp.cli.gateway.router import router_app
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
@@ -42,6 +43,7 @@ gateway_app.add_typer(identity_app, name="identity")
 gateway_app.add_typer(key_app, name="key")
 gateway_app.add_typer(alias_app, name="alias")
 gateway_app.add_typer(pool_app, name="pool")
+gateway_app.add_typer(router_app, name="router")
 gateway_app.add_typer(grant_app, name="grant")
 gateway_app.command("call")(caller_call)
 gateway_app.command("models")(caller_models)

@@ -17,9 +17,12 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+    RoutedCandidateSnapshot,
+    load_model_catalog,
     read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
+from exp.common.project import ProjectStore
 from exp.optimize.router.activation import load_project_router
 from exp.runtime.gateway.catalog_authority import (
     authored_snapshot_path,
@@ -28,10 +31,13 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.project_activation import load_project_activation, only_router_policy
 from exp.runtime.gateway.provider_certification import (
     ProviderCapability,
     provider_has_certified_capability,
 )
+from exp.runtime.gateway.tag_router import TagRulesActivation, TagRulesSelector
+from exp.runtime.models import RuntimeModelCatalog
 
 alias_app = typer.Typer(help="Manage public gateway model aliases.", no_args_is_help=True)
 _JSON_OPTION = typer.Option(False, "--json")
@@ -654,16 +660,14 @@ def _activate(
             revision_id,
             catalog_sha256,
         )
-    runtime = load_project_router(project or "", root, policy_id=policy)
+    candidates, activation_ref = _project_policy(project or "", root, policy)
     catalog, normalized, snapshot = snapshot_current_catalog(
         root,
         serving_connections=serving_connections,
     )
     deployment_aliases = {item.source_alias for item in normalized.deployments}
     missing = sorted(
-        candidate.alias
-        for candidate in runtime.policy.candidates
-        if candidate.alias not in deployment_aliases
+        candidate.alias for candidate in candidates if candidate.alias not in deployment_aliases
     )
     if missing:
         raise ValueError(
@@ -676,7 +680,7 @@ def _activate(
             alias_name=alias,
             revision_id=revision_id,
             project_ref=project or "",
-            activation_ref=runtime.policy.policy_id,
+            activation_ref=activation_ref,
             snapshot_ref=f"catalog-snapshots/{snapshot.name}",
             catalog_sha256=catalog_sha256,
             provider_connections=manager.provider_bindings(catalog),
@@ -685,6 +689,30 @@ def _activate(
         revision_id,
         catalog_sha256,
     )
+
+
+def _project_policy(
+    project: str, root: Path, policy: str | None
+) -> tuple[tuple[RoutedCandidateSnapshot, ...], str]:
+    """Return a project policy's pinned candidates and identity, verified for activation.
+
+    A tag-rules policy is verified by binding its selector to the local catalog;
+    a learned policy is loaded through the optimizer-owned verification.
+    """
+    store = ProjectStore(root, project)
+    store.load_project()
+    policy_id = policy or only_router_policy(store.artifacts)
+    activation = load_project_activation(
+        store.artifacts, project_ref=project, activation_ref=policy_id
+    )
+    if isinstance(activation, TagRulesActivation):
+        TagRulesSelector.from_activation(
+            activation,
+            RuntimeModelCatalog(load_model_catalog(root / "models.toml"), environment={}),
+        )
+        return activation.policy.candidates, activation.activation_ref
+    runtime = load_project_router(project, root, policy_id=policy_id)
+    return runtime.policy.candidates, runtime.policy.policy_id
 
 
 def _revision_id(alias: str, *, revision: str | None, operation_id: str | None) -> str:

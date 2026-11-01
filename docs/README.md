@@ -21,6 +21,7 @@ results, and plans do not live here.
 | `reference/gateway-failover-rules.md` | Per-rung conditional failover (`failover_only_on`): the token vocabulary, first-dial and successor rules, the ledger `fallback_reason`, and the fail-closed cases. |
 | `reference/gateway-guardrails.md` | Identity-scoped gateway guardrails: data flow, latency, privacy, standard pack, http_json adapters, and inappropriate-content use. |
 | `reference/gateway-classification-guardrails.md` | Decision-model classification checks: configuration, request window, verdict cache, model scope, observe-then-enforce rollout, and a self-hosted SystemOne server. |
+| `reference/gateway-tag-routing.md` | Tag-rules router policies: a decision model's answers pick each request's model before dispatch; the rules file, freezing, alias activation, and fallbacks. |
 | `reference/gateway-reasoning-display.md` | Reasoning text every rung returns by default: per-surface rendering, request defaults, failover, opt-out and capture. |
 | `reference/gateway-latency.md` | Routine CI gateway-latency report against a local mock: schedule, artifact schema, and numeric latency badge. |
 | `reference/openai-compatible-recipes.md` | Verified Fireworks, Modal, and Experiential Cloud connection recipes through the openai-compatible provider family. |
