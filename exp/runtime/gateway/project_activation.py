@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 from exp.common.core.artifacts import (
     ArtifactId,
@@ -28,7 +27,11 @@ from exp.common.project import (
 from exp.common.routing import KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes, load_knn_bank
 from exp.common.tasks import load_task_set
-from exp.runtime.gateway.tag_router import TagRulesActivation, TagRulesRouterPolicy
+from exp.runtime.gateway.tag_router import (
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
+    TagRulesActivation,
+    TagRulesRouterPolicy,
+)
 from exp.runtime.models import RuntimeModelCatalog
 
 ProjectActivationVerifier = Callable[
@@ -91,6 +94,9 @@ class ProjectActivation:
             other.pricing_sha256,
         )
 
+
+_ROUTER_POLICY_TYPES: Final = frozenset({"router-policy", TAG_RULES_POLICY_ARTIFACT_TYPE})
+"""Learned router policies and tag-rules router policies, each its own artifact type."""
 
 type SelectorActivation = ProjectActivation | TagRulesActivation
 """Verified material for one project selector: learned kNN or tag rules."""
@@ -181,10 +187,10 @@ def load_project_activation(
     """Load and cross-check one complete immutable project selection bundle."""
     try:
         stored = store.read(activation_ref)
-        if stored.manifest.artifact_type != "router-policy":
+        if stored.manifest.artifact_type not in _ROUTER_POLICY_TYPES:
             raise ValueError(f"artifact {activation_ref} is not a router policy")
         raw = store.read_bytes(activation_ref, "policy.json")
-        if _policy_kind(raw) == "tag_rules":
+        if stored.manifest.artifact_type == TAG_RULES_POLICY_ARTIFACT_TYPE:
             rules = TagRulesRouterPolicy.model_validate_json(raw)
             if rules.policy_id != activation_ref:
                 raise ValueError("router policy ID differs from its artifact")
@@ -225,21 +231,18 @@ def load_project_activation(
         raise ProjectActivationError(f"router policy {activation_ref} is invalid") from exc
 
 
-def _policy_kind(raw: bytes) -> object:
-    """Return a stored policy's ``kind``; a policy written before kinds existed is kNN."""
-    document = json.loads(raw)
-    return document.get("kind", "knn") if isinstance(document, dict) else None
-
-
 def only_router_policy(store: ArtifactStore) -> ArtifactId:
     """Resolve the only completed router policy in one project artifact store."""
     policies = tuple(
         artifact_id
         for artifact_id in store.list_ids()
-        if store.read(artifact_id).manifest.artifact_type == "router-policy"
+        if store.read(artifact_id).manifest.artifact_type in _ROUTER_POLICY_TYPES
     )
     if not policies:
-        raise ProjectActivationError("project has no frozen router policy; run exp optimize router")
+        raise ProjectActivationError(
+            "project has no frozen router policy; run exp optimize router "
+            "or exp config gateway router tags"
+        )
     if len(policies) > 1:
         raise ProjectActivationError(
             "project has multiple frozen router policies; pass --policy with one of: "

@@ -8,7 +8,10 @@ once; the first rule whose ``when_all`` categories all reached their thresholds
 and whose ``when_none`` categories all stayed below them names the candidate.
 No match routes to the default, and so does a classifier that fails, times out,
 or finds no text, so routing never fails a request. Like learned routing, the
-first decision of an episode serves its later turns.
+first decision of an episode serves its later turns while the episode stays
+active; a decision made without a classifier answer is never pinned to it.
+Tag-rules policies are stored as their own artifact type, so commands that read
+learned router policies never see them.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.async_transport import RequestDeadline
 
+TAG_RULES_POLICY_ARTIFACT_TYPE: Final = "tag-router-policy"
 TAG_ROUTER_ROUTE_REASON: Final = "tag_router"
 NO_RULE_MATCHED: Final = "no_rule_matched"
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
@@ -289,8 +293,11 @@ class TagRulesSelector:
         try:
             async with asyncio.timeout(timeout):
                 verdict = await self._classifier.inspect_input(request=request, check=self._check)
-        except asyncio.CancelledError:
-            raise
+        except TimeoutError:
+            # The request's own deadline fails the request, as learned routing does;
+            # only the classifier's shorter timeout falls back to the default.
+            deadline.attempt_timeout()
+            return frozenset(), CLASSIFIER_UNAVAILABLE
         except Exception:  # noqa: BLE001 - routing falls back; it never fails the request.
             return frozenset(), CLASSIFIER_UNAVAILABLE
         if not isinstance(verdict, ScoredVerdict):
@@ -330,27 +337,52 @@ class TagRulesSelector:
     def _reuse(self, keys: tuple[Sha256, Sha256]) -> RoutingDecision | None:
         """Return this request's decision, or the episode's choice bound to this request."""
         with self._lock:
-            cached = _live(self._requests, keys, self._clock())
+            cached = self._hit(self._requests, keys)
             if cached is not None:
                 return cached
-            episode = _live(self._episodes, keys[0], self._clock())
+            episode = self._hit(self._episodes, keys[0])
             if episode is None:
                 return None
             return self._store(self._requests, keys, _for_request(episode, keys[1]))
 
     def _retain(self, keys: tuple[Sha256, Sha256], decision: RoutingDecision) -> RoutingDecision:
-        """Publish a fresh decision unless a concurrent request already chose for the episode."""
+        """Publish a fresh decision unless a concurrent request already chose for the episode.
+
+        A decision made without a classifier answer is returned unretained, so the
+        next request asks again instead of keeping the default for the episode. A
+        request with no classifiable text is retained for itself only.
+        """
+        if decision.fallback_reason == CLASSIFIER_UNAVAILABLE:
+            return decision
         with self._lock:
-            now = self._clock()
-            cached = _live(self._requests, keys, now)
+            cached = self._hit(self._requests, keys)
             if cached is not None:
                 return cached
-            episode = _live(self._episodes, keys[0], now)
-            if episode is None:
-                self._store(self._episodes, keys[0], decision)
-            else:
+            episode = self._hit(self._episodes, keys[0])
+            if episode is not None:
                 decision = _for_request(episode, keys[1])
+            elif decision.fallback_reason != NO_CLASSIFIABLE_TEXT:
+                self._store(self._episodes, keys[0], decision)
             return self._store(self._requests, keys, decision)
+
+    def _hit[KeyT](
+        self, store: OrderedDict[KeyT, tuple[float, RoutingDecision]], key: KeyT
+    ) -> RoutingDecision | None:
+        """Return an unexpired decision and renew it, or drop an expired one.
+
+        A hit moves to the newest end with a fresh lifetime, so an active episode
+        outlives idle ones and order stays expiry order. Callers hold the lock.
+        """
+        entry = store.get(key)
+        if entry is None:
+            return None
+        now = self._clock()
+        if entry[0] <= now:
+            del store[key]
+            return None
+        store.move_to_end(key)
+        store[key] = (now + self._ttl_seconds, entry[1])
+        return entry[1]
 
     def _store[KeyT](
         self,
@@ -358,29 +390,17 @@ class TagRulesSelector:
         key: KeyT,
         decision: RoutingDecision,
     ) -> RoutingDecision:
-        """Retain one decision in insertion order under the TTL and capacity bounds.
+        """Retain one decision at the newest end under the TTL and capacity bounds.
 
-        Every entry lives exactly ``decision_ttl_seconds``, so insertion order is
-        expiry order and trimming from the oldest end is enough. Callers hold the lock.
+        Every write and hit renews the entry for ``decision_ttl_seconds``, so order
+        is expiry order and trimming from the oldest end is enough. Callers hold the lock.
         """
         now = self._clock()
         store[key] = (now + self._ttl_seconds, decision)
+        store.move_to_end(key)
         while store and (len(store) > self._capacity or next(iter(store.values()))[0] <= now):
             store.popitem(last=False)
         return decision
-
-
-def _live[KeyT](
-    store: OrderedDict[KeyT, tuple[float, RoutingDecision]], key: KeyT, now: float
-) -> RoutingDecision | None:
-    """Return an unexpired retained decision, dropping an expired one."""
-    entry = store.get(key)
-    if entry is None:
-        return None
-    if entry[0] <= now:
-        del store[key]
-        return None
-    return entry[1]
 
 
 def _for_request(decision: RoutingDecision, request_sha256: Sha256) -> RoutingDecision:
