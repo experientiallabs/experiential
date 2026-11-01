@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -369,33 +370,36 @@ def test_a_failed_classification_follows_a_concurrent_episode_choice() -> None:
     assert (answered.selected_alias, failed.selected_alias) == ("coder", "coder")
 
 
-def test_a_request_beyond_the_classification_bound_takes_the_default_unpinned() -> None:
-    """A burst sheds to the default instead of queueing on the decision model."""
+def test_a_burst_across_activations_sheds_at_one_shared_bound() -> None:
+    """Selectors share one in-flight bound, so a burst sheds instead of queueing."""
     catalog = _catalog()
-    classifier = _ScriptedClassifier(
-        {"coding": 0.9, "cyber": 0.1}, {"coding": 0.9, "cyber": 0.1}, delays=(0.2, 0.0)
-    )
-    selector = TagRulesSelector(
-        _policy(catalog),
-        catalog,
-        classifier=cast("DecisionModelClassifier", classifier),
-        maximum_concurrent_classifications=1,
+    permits = threading.BoundedSemaphore(1)
+    slow = _ScriptedClassifier({"coding": 0.9, "cyber": 0.1}, delay=0.2)
+    other = _ScriptedClassifier({"coding": 0.9, "cyber": 0.1})
+    first, second = (
+        TagRulesSelector(
+            _policy(catalog),
+            catalog,
+            classifier=cast("DecisionModelClassifier", classifier),
+            classifications=permits,
+        )
+        for classifier in (slow, other)
     )
 
     async def burst() -> tuple[RoutingDecision, RoutingDecision]:
-        """Start a slow classification, then a second episode while it runs."""
-        slow = asyncio.create_task(
-            selector.select(_request("fix"), episode_id="one", deadline=_deadline())
+        """Start a slow classification, then another activation's request while it runs."""
+        answered = asyncio.create_task(
+            first.select(_request("fix"), episode_id="one", deadline=_deadline())
         )
         await asyncio.sleep(0.05)
-        shed = await selector.select(_request("fix"), episode_id="two", deadline=_deadline())
-        return await slow, shed
+        shed = await second.select(_request("fix"), episode_id="two", deadline=_deadline())
+        return await answered, shed
 
     answered, shed = asyncio.run(burst())
     assert (answered.selected_alias, shed.selected_alias) == ("coder", "generalist")
     assert shed.fallback_reason == CLASSIFIER_BUSY
-    later = selector.select_blocking(_request("fix"), episode_id="two", deadline=_deadline())
-    assert (later.selected_alias, classifier.calls) == ("coder", 2)
+    later = second.select_blocking(_request("fix"), episode_id="two", deadline=_deadline())
+    assert (later.selected_alias, slow.calls, other.calls) == ("coder", 1, 1)
 
 
 def test_an_expired_deadline_fails_the_request_before_the_classifier() -> None:
