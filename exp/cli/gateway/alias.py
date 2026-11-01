@@ -9,16 +9,15 @@ import typer
 
 from exp.cli.gateway.capability_authority import retained_streaming_tool_arguments
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
-from exp.cli.gateway.router import serving_catalog
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.common.core.artifacts import sha256_json
 from exp.common.core.locks import FileLockTimeout
 from exp.common.models import (
     BillingSource,
-    ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelCatalog,
     RoutedCandidateSnapshot,
     read_model_catalog_document,
 )
@@ -37,7 +36,12 @@ from exp.runtime.gateway.provider_certification import (
     ProviderCapability,
     provider_has_certified_capability,
 )
-from exp.runtime.gateway.tag_router import TagRulesActivation, TagRulesSelector
+from exp.runtime.gateway.tag_router import (
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
+    TagRulesActivation,
+    TagRulesSelector,
+)
+from exp.runtime.models import RuntimeModelCatalog
 
 alias_app = typer.Typer(help="Manage public gateway model aliases.", no_args_is_help=True)
 _JSON_OPTION = typer.Option(False, "--json")
@@ -660,13 +664,11 @@ def _activate(
             revision_id,
             catalog_sha256,
         )
-    candidates, activation_ref = _project_policy(
-        project or "", root, policy, serving_connections=serving_connections
-    )
     catalog, normalized, snapshot = snapshot_current_catalog(
         root,
         serving_connections=serving_connections,
     )
+    candidates, activation_ref = _project_policy(project or "", root, policy, snapshot=catalog)
     deployment_aliases = {item.source_alias for item in normalized.deployments}
     missing = sorted(
         candidate.alias for candidate in candidates if candidate.alias not in deployment_aliases
@@ -694,30 +696,31 @@ def _activate(
 
 
 def _project_policy(
-    project: str,
-    root: Path,
-    policy: str | None,
-    *,
-    serving_connections: dict[str, ConnectionConfig],
+    project: str, root: Path, policy: str | None, *, snapshot: ModelCatalog
 ) -> tuple[tuple[RoutedCandidateSnapshot, ...], str]:
     """Return a project policy's pinned candidates and identity, verified for activation.
 
-    A tag-rules policy is verified by binding its selector to the serving catalog,
-    the authored models with the gateway's current connections, which is what the
-    alias snapshot serves; a learned policy is loaded through the optimizer-owned
-    verification.
+    A tag-rules policy is verified by binding its selector to ``snapshot``, the
+    exact catalog this alias revision will serve, so a catalog edit between the
+    check and the snapshot cannot activate a revision the gateway then refuses.
+    A learned policy is loaded once, through the optimizer-owned verification.
     """
     try:
         store = ProjectStore(root, project)
         store.load_project()
         policy_id = policy or only_router_policy(store.artifacts)
-        activation = load_project_activation(
-            store.artifacts, project_ref=project, activation_ref=policy_id
+        tag_rules = store.artifacts.read(policy_id).manifest.artifact_type == (
+            TAG_RULES_POLICY_ARTIFACT_TYPE
+        )
+        activation = (
+            load_project_activation(store.artifacts, project_ref=project, activation_ref=policy_id)
+            if tag_rules
+            else None
         )
     except (ArtifactStoreError, ProjectStoreError) as exc:
         raise ValueError(str(exc)) from exc
     if isinstance(activation, TagRulesActivation):
-        TagRulesSelector.from_activation(activation, serving_catalog(root, serving_connections))
+        TagRulesSelector.from_activation(activation, RuntimeModelCatalog(snapshot, environment={}))
         return activation.policy.candidates, activation.activation_ref
     runtime = load_project_router(project, root, policy_id=policy_id)
     return runtime.policy.candidates, runtime.policy.policy_id

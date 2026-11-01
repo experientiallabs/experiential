@@ -15,6 +15,8 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from exp.cli.app import app
+from exp.cli.gateway import router as gateway_router
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     ConnectionConfig,
     GatewayDeploymentCapabilities,
@@ -73,7 +75,7 @@ def _systemone(probability: float) -> Iterator[str]:
         thread.join(timeout=5)
 
 
-def _rules(url: str) -> dict[str, object]:
+def _rules(url: str) -> JsonObject:
     """Return a rules file routing coding requests to ``secondary``."""
     return {
         "candidates": ["primary", "secondary"],
@@ -94,7 +96,7 @@ def _rules(url: str) -> dict[str, object]:
     }
 
 
-def _author(root: Path, rules: dict[str, object]) -> str:
+def _author(root: Path, rules: JsonObject) -> str:
     """Freeze the rules into project ``project-one`` through the CLI; return the policy ID."""
     ProjectStore(root, "project-one").initialize(ProjectConfig(project_id="project-one"))
     path = root / "rules.json"
@@ -197,3 +199,19 @@ def test_alias_create_reports_a_missing_project_as_a_usage_error(tmp_path: Path)
     _two_model_gateway(tmp_path)
     result = _alias_create(tmp_path, "missing-project")
     assert result.exit_code == 2, result.output
+
+
+def test_refreezing_after_an_upgrade_adopts_the_stored_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same routing content under a newer release is the same policy, unchanged."""
+    _two_model_gateway(tmp_path)
+    policy_id = _author(tmp_path, _rules("https://decisions.example.invalid/systemone"))
+    monkeypatch.setattr(gateway_router, "installed_release_revision", lambda: "next-release")
+    command = ["config", "gateway", "router", "tags", str(tmp_path / "rules.json")]
+    result = CliRunner().invoke(
+        app, [*command, "--project", "project-one", "--root", str(tmp_path), "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    receipt = json.loads(result.output)
+    assert (receipt["resource_id"], receipt["changed"]) == (policy_id, False)

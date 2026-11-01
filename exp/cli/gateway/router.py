@@ -14,10 +14,11 @@ from exp.common.core.artifacts import ContractModel, canonical_json_bytes
 from exp.common.models import (
     ConnectionConfig,
     ModelAlias,
+    ModelSnapshot,
     RoutedCandidateSnapshot,
     load_model_catalog,
 )
-from exp.common.project import ArtifactStoreError, ProjectStore, ProjectStoreError
+from exp.common.project import ArtifactStore, ArtifactStoreError, ProjectStore, ProjectStoreError
 from exp.common.release_revision import installed_release_revision
 from exp.runtime.gateway.guardrails.classification import DecisionModelAdapterDocument
 from exp.runtime.gateway.management import GatewayManagement
@@ -78,11 +79,11 @@ def tag_rules_policy(
     """Pin each candidate's catalog identity and freeze one content-addressed policy.
 
     Raises:
-        ModelConnectionError: A candidate alias is not in the catalog.
-        ValueError: The rules name an unknown candidate or category.
+        ValueError: A candidate is not in the catalog or has no active serving
+            connection, or the rules name an unknown candidate or category.
     """
     candidates = tuple(
-        RoutedCandidateSnapshot(alias=alias, model=catalog.snapshot(alias)[0])
+        RoutedCandidateSnapshot(alias=alias, model=_pinned(catalog, alias))
         for alias in document.candidates
     )
     return TagRulesRouterPolicy(
@@ -100,6 +101,39 @@ def tag_rules_policy(
         classifier=document.classifier,
         rules=document.rules,
     )
+
+
+def _pinned(catalog: RuntimeModelCatalog, alias: str) -> ModelSnapshot:
+    """Return one candidate's frozen identity, or say why it cannot be pinned."""
+    try:
+        return catalog.snapshot(alias)[0]
+    except KeyError as exc:
+        message = f"candidate {alias!r} has no active serving connection"
+        raise ValueError(message) from exc
+
+
+def _store(store: ArtifactStore, policy: TagRulesRouterPolicy) -> bool:
+    """Store the policy, or adopt an already stored one; return whether this run wrote it.
+
+    The identity covers only routing content, so a stored policy with this ID routes
+    identically even when another release wrote it; its provenance is kept as stored.
+    """
+    try:
+        stored, _manifest = store.write_or_replay(
+            artifact_id=policy.policy_id,
+            artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
+            envelope=policy,
+            envelope_path="policy.json",
+            envelope_type=TagRulesRouterPolicy,
+            files={"policy.json": canonical_json_bytes(policy)},
+        )
+    except ValueError:
+        existing = store.read(policy.policy_id)
+        if existing.manifest.artifact_type != TAG_RULES_POLICY_ARTIFACT_TYPE:
+            raise
+        TagRulesRouterPolicy.model_validate_json(store.read_bytes(policy.policy_id, "policy.json"))
+        return False
+    return stored.created_at == policy.created_at
 
 
 @router_app.command("tags")
@@ -125,15 +159,7 @@ def router_tags(
         )
         store = ProjectStore(root, project)
         store.load_project()
-        stored, _manifest = store.artifacts.write_or_replay(
-            artifact_id=policy.policy_id,
-            artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
-            envelope=policy,
-            envelope_path="policy.json",
-            envelope_type=TagRulesRouterPolicy,
-            files={"policy.json": canonical_json_bytes(policy)},
-        )
-        changed = stored.created_at == policy.created_at
+        changed = _store(store.artifacts, policy)
     emit_receipt(
         GatewayReceipt(
             operation="router.tags",
