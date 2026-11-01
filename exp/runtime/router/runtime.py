@@ -210,6 +210,8 @@ class RouterRuntime:
             )
         except ValueError as exc:
             raise RouterRuntimeIntegrityError(f"router policy {policy_id} is invalid") from exc
+        if not isinstance(activation, ProjectActivation):
+            raise RouterRuntimeIntegrityError(f"router policy {policy_id} is not a learned policy")
         if pricing_snapshot_id != activation.pricing.pricing_snapshot_id:
             raise RouterRuntimeIntegrityError(f"router policy {policy_id} is invalid")
         return cls.from_activation(
