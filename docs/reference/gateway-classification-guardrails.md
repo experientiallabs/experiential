@@ -200,6 +200,31 @@ observation records add policy, check, outcome, and latency as for every guardra
 bucket counts, cache hits and misses, errors, and the summed latency of model calls. Window
 text, question text, and classifier payloads are never logged or retained.
 
+### Per-request scores
+
+An application that embeds the gateway can receive every answered classification as a
+record. Pass `record_classification` to `GuardrailEngine`:
+
+```python
+from exp.runtime.gateway.guardrails import ClassificationRecord, GuardrailEngine
+
+def keep_scores(record: ClassificationRecord) -> None:
+    ...  # for example, write record.request_id and record.scores to a store
+
+engine = GuardrailEngine(store=store, client=client, monotonic=time.monotonic,
+                         record_classification=keep_scores)
+```
+
+Each record names the request, the policy with its mode and revision, the check, the outcome
+(`allow` or `flagged`), every category's score with whether it reached its threshold, the
+SHA-256 of the exact window text the model read, whether the answer came from the cache, and
+the latency. A blocked request produces a record too, so the application can act on what
+was refused. Records carry no request text. The sink runs on its own bounded worker, never
+on a serving thread; records beyond `max_classification_records` (default 1,024) are dropped
+and counted in `classification_recording_dropped`. Checks that time out or fail produce no
+record. Only an in-process decision-model adapter reports scores: a remote `http_json`
+classifier answer cannot carry them.
+
 ## Observe, then enforce
 
 1. Deploy the policy with `"mode": "observe"`. Requests are served normally while every

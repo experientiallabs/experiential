@@ -27,6 +27,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
     OutputGuardrailMode,
+    ScoredVerdict,
     coverage_failure,
     guardrail_failure,
     request_exceeds_inspection_limit,
@@ -36,7 +37,11 @@ from exp.runtime.gateway.guardrails.observation import (
     ObservationLease,
     ObservationOwner,
 )
-from exp.runtime.gateway.guardrails.recording import ObservationRecord, ObservationRecorder
+from exp.runtime.gateway.guardrails.recording import (
+    ClassificationRecord,
+    ObservationRecord,
+    ObservationRecorder,
+)
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
@@ -73,6 +78,8 @@ class GuardrailEngine:
         max_observations: int = 8,
         max_observation_bytes: int = 8 * 1024 * 1024,
         max_observation_records: int = 128,
+        record_classification: Callable[[ClassificationRecord], None] | None = None,
+        max_classification_records: int = 1_024,
     ) -> None:
         """Bind lookup, the internal client, and the deadline clock.
 
@@ -90,6 +97,12 @@ class GuardrailEngine:
             max_observations: Maximum retained asynchronous observation jobs, default 8.
             max_observation_bytes: Maximum complete subject bytes retained, default 8 MiB.
             max_observation_records: Maximum queued plus active metadata records, default 128.
+            record_classification: Optional host sink for the category scores of
+                every decision-model check that answered, enforced or observed.
+                It runs on its own bounded metadata worker, never on a serving
+                thread. ``None`` records no scores.
+            max_classification_records: Maximum queued plus active score records,
+                default 1,024.
         """
         self.deterministic_specifications: Mapping[str, str] = dict(
             deterministic_specifications or {}
@@ -105,6 +118,11 @@ class GuardrailEngine:
         )
         self._observation_records = ObservationRecorder(
             self._deliver_observation, max_records=max_observation_records
+        )
+        self._classification_records = (
+            None
+            if record_classification is None
+            else ObservationRecorder(record_classification, max_records=max_classification_records)
         )
         self.input_invocations = 0
         self.output_invocations = 0
@@ -122,7 +140,10 @@ class GuardrailEngine:
         if not policies:
             return None
         return GuardrailSession(
-            engine=self, policies=policies, deadline_monotonic=deadline_monotonic
+            engine=self,
+            policies=policies,
+            deadline_monotonic=deadline_monotonic,
+            request_id=authorization.request_id,
         )
 
     def revision_for(self, authorization: AuthorizationSnapshot) -> str | None:
@@ -185,6 +206,7 @@ class GuardrailEngine:
         policy: GuardrailPolicy,
         request: GatewayRequest,
         deadline_monotonic: float,
+        request_id: str | None = None,
     ) -> GatewayRequest:
         """Run the input chain once and return the validated or transformed request.
 
@@ -192,6 +214,8 @@ class GuardrailEngine:
             policy: Assigned identity policy.
             request: Canonical request after continuation expansion.
             deadline_monotonic: Remaining request-wide deadline.
+            request_id: Authenticated request identity for score records, or
+                ``None`` to record no scores.
 
         Returns:
             The original request, or the last successful modification.
@@ -201,11 +225,17 @@ class GuardrailEngine:
         """
         if policy.mode == "observe":
             self.observe_input(
-                policy=policy, request=request, deadline_monotonic=deadline_monotonic
+                policy=policy,
+                request=request,
+                deadline_monotonic=deadline_monotonic,
+                request_id=request_id,
             )
             return request
         return await self._inspect_input(
-            policy=policy, request=request, deadline_monotonic=deadline_monotonic
+            policy=policy,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            request_id=request_id,
         )
 
     async def _inspect_input(
@@ -215,6 +245,7 @@ class GuardrailEngine:
         request: GatewayRequest,
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
+        request_id: str | None = None,
     ) -> GatewayRequest:
         """Evaluate the same bounded checks while granting actions only to enforcing policies."""
         self.input_invocations += 1
@@ -235,6 +266,7 @@ class GuardrailEngine:
                 ),
                 deadline_monotonic=deadline_monotonic,
                 retention=retention,
+                request_id=request_id,
             )
             if verdict is None or policy.mode == "observe":
                 continue
@@ -242,7 +274,12 @@ class GuardrailEngine:
         return current
 
     def observe_input(
-        self, *, policy: GuardrailPolicy, request: GatewayRequest, deadline_monotonic: float
+        self,
+        *,
+        policy: GuardrailPolicy,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+        request_id: str | None = None,
     ) -> None:
         """Submit one ephemeral input to the shared executor without gating its request.
 
@@ -253,7 +290,10 @@ class GuardrailEngine:
         if policy.mode != "observe":
             raise ValueError("observation requires an observe policy")
         self.observe_inputs(
-            policies=(policy,), request=request, deadline_monotonic=deadline_monotonic
+            policies=(policy,),
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            request_id=request_id,
         )
 
     def observe_inputs(
@@ -263,6 +303,7 @@ class GuardrailEngine:
         request: GatewayRequest,
         deadline_monotonic: float,
         observed: ObservedSubjects | None = None,
+        request_id: str | None = None,
     ) -> None:
         """Prepare one bounded complete subject under the shared nonblocking permit.
 
@@ -288,6 +329,7 @@ class GuardrailEngine:
                     request=request,
                     deadline_monotonic=deadline_monotonic,
                     observed=observed,
+                    request_id=request_id,
                 )
             except Exception:  # noqa: BLE001 - optional preparation cannot reject serving.
                 pass
@@ -315,6 +357,7 @@ class GuardrailEngine:
         request: GatewayRequest,
         deadline_monotonic: float,
         observed: ObservedSubjects | None,
+        request_id: str | None,
     ) -> None:
         """Release every projection/hash temporary before returning the preparation permit."""
         retained = self._observations.max_subject_bytes
@@ -370,6 +413,7 @@ class GuardrailEngine:
                 request=request,
                 deadline_monotonic=deadline_monotonic,
                 size=size,
+                request_id=request_id,
             )
 
     def _observation_projection(
@@ -400,6 +444,7 @@ class GuardrailEngine:
         request: GatewayRequest,
         deadline_monotonic: float,
         size: int,
+        request_id: str | None,
     ) -> None:
         """Reserve one policy's subject using the exact shared encoded size."""
         bound = self._input_limit(policy)
@@ -420,6 +465,7 @@ class GuardrailEngine:
                 request=request,
                 deadline_monotonic=deadline_monotonic,
                 retention=lease,
+                request_id=request_id,
             )
 
         def interrupted(cancelled: bool) -> None:
@@ -456,6 +502,10 @@ class GuardrailEngine:
         if self._owns_inspects:
             self._inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         self._observation_records.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
+        if self._classification_records is not None:
+            self._classification_records.close(
+                timeout_seconds=max(0.0, deadline - time.monotonic())
+            )
 
     @property
     def observation_recording_dropped(self) -> int:
@@ -466,6 +516,18 @@ class GuardrailEngine:
     def observation_recording_failed(self) -> int:
         """Count sink exceptions without exposing recorder diagnostics."""
         return self._observation_records.failed_count
+
+    @property
+    def classification_recording_dropped(self) -> int:
+        """Count score records lost to bounded capacity, shutdown, or worker startup."""
+        records = self._classification_records
+        return 0 if records is None else records.dropped_count
+
+    @property
+    def classification_recording_failed(self) -> int:
+        """Count score sink exceptions without exposing recorder diagnostics."""
+        records = self._classification_records
+        return 0 if records is None else records.failed_count
 
     async def enforce_output(
         self,
@@ -642,11 +704,13 @@ class GuardrailEngine:
         inspect: Callable[[], Awaitable[ClassifierVerdict]],
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
+        request_id: str | None = None,
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
 
         The inspect itself runs on an isolation worker. This caller only waits
-        until the remaining budget elapses.
+        until the remaining budget elapses. A decision-model answer also queues
+        its category scores for the host's score sink when the request is known.
 
         Returns:
             The verdict, or ``None`` when a non-protected check is skipped.
@@ -693,11 +757,40 @@ class GuardrailEngine:
                 policy, check, GuardrailOutcome.UNAVAILABLE, self._monotonic() - started
             )
         elapsed = self._monotonic() - started
+        outcome = GuardrailOutcome.FLAGGED if verdict.flagged else GuardrailOutcome.ALLOW
+        if isinstance(verdict, ScoredVerdict) and request_id is not None:
+            self._submit_classification(request_id, policy, check, outcome, verdict, elapsed)
         if not verdict.flagged:
-            self._decision(policy, check, GuardrailAction.ALLOW, GuardrailOutcome.ALLOW, elapsed)
+            self._decision(policy, check, GuardrailAction.ALLOW, outcome, elapsed)
             return None
-        self._decision(policy, check, check.action, GuardrailOutcome.FLAGGED, elapsed)
+        self._decision(policy, check, check.action, outcome, elapsed)
         return verdict
+
+    def _submit_classification(
+        self,
+        request_id: str,
+        policy: GuardrailPolicy,
+        check: GuardrailCheck,
+        outcome: GuardrailOutcome,
+        verdict: ScoredVerdict,
+        latency_seconds: float,
+    ) -> None:
+        """Queue scores and the subject digest only; sink latency never enters serving."""
+        records = self._classification_records
+        if records is None:
+            return
+        records.submit(
+            ClassificationRecord(
+                request_id=request_id,
+                policy=policy,
+                check=check,
+                outcome=outcome,
+                scores=verdict.scores,
+                subject_sha256=verdict.subject_sha256,
+                cached=verdict.cached,
+                latency_seconds=latency_seconds,
+            )
+        )
 
     def _uncertain(
         self,

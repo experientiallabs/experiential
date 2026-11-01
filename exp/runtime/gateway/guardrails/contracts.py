@@ -7,7 +7,13 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, canonical_json_bytes
+from exp.common.core.artifacts import (
+    ArtifactId,
+    ContractModel,
+    JsonObject,
+    Sha256,
+    canonical_json_bytes,
+)
 from exp.common.models.gateway_catalog import ExactModelPoolId
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS
 from exp.runtime.gateway.contracts import (
@@ -239,6 +245,38 @@ class ClassifierVerdict(ContractModel):
     flagged: bool
     replacement_text: str | None = None
     replacement_messages: tuple[GatewayMessage, ...] | None = None
+
+
+class CategoryScore(ContractModel):
+    """One decision-model category's combined score for one classified subject.
+
+    Attributes:
+        category: Operator category identity.
+        score: Combined question probability in ``[0, 1]``.
+        flagged: Whether the score reached the category's threshold.
+    """
+
+    category: ArtifactId
+    score: float = Field(ge=0, le=1, allow_inf_nan=False)
+    flagged: bool
+
+
+class ScoredVerdict(ClassifierVerdict):
+    """A decision-model verdict that also carries every category score.
+
+    Only an in-process classification adapter builds one. A remote classifier
+    answer is parsed as a plain ``ClassifierVerdict``, so it can never report
+    scores of its own.
+
+    Attributes:
+        scores: Every configured category's score, in authored order.
+        subject_sha256: SHA-256 of the exact window text the model read.
+        cached: Whether the scores came from the verdict cache.
+    """
+
+    scores: tuple[CategoryScore, ...] = Field(min_length=1)
+    subject_sha256: Sha256
+    cached: bool
 
 
 class GuardrailOutcome(StrEnum):
