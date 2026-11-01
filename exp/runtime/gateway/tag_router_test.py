@@ -10,7 +10,7 @@ from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject, canonical_json_bytes
+from exp.common.core.artifacts import JsonObject, JsonValue, canonical_json_bytes
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -83,7 +83,7 @@ def _catalog() -> RuntimeModelCatalog:
     )
 
 
-def _document(catalog: RuntimeModelCatalog, **overrides: object) -> JsonObject:
+def _document(catalog: RuntimeModelCatalog, **overrides: JsonValue) -> JsonObject:
     """Return a policy routing cyber work to ``secure`` and other coding to ``coder``."""
     document: JsonObject = {
         "schema_version": 1,
@@ -300,7 +300,7 @@ def test_an_expired_deadline_fails_the_request_before_the_classifier() -> None:
     ],
 )
 def test_a_policy_names_only_its_candidates_and_categories(
-    overrides: dict[str, object], message: str
+    overrides: dict[str, JsonValue], message: str
 ) -> None:
     """A rule that could never route correctly is refused when the policy is built."""
     with pytest.raises(ValueError, match=message):
