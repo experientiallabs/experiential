@@ -761,7 +761,7 @@ fn exposed_reasoning_streams_as_an_unsigned_thinking_block() {
     // A Tencent/DeepSeek rung marked reasoning_output_exposed returns its
     // plaintext reasoning on the Chat wire as `reasoning_content`; on the
     // Messages wire the same text is a thinking block whose signature stays
-    // absent (Anthropic always signs, so an unsigned block is recognizably the
+    // empty (Anthropic always signs, so an unsigned block is recognizably the
     // gateway's plaintext when the caller replays it).
     let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
     encoder.set_reasoning_output(true.into());
@@ -785,7 +785,7 @@ fn exposed_reasoning_streams_as_an_unsigned_thinking_block() {
             "message_stop",
         ]
     );
-    assert!(frames[2].contains("{\"type\":\"thinking\",\"thinking\":\"\"}"));
+    assert!(frames[2].contains("{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}"));
     assert!(frames[3].contains("{\"type\":\"thinking_delta\",\"thinking\":\"step \"}"));
     assert!(frames[4].contains("{\"type\":\"thinking_delta\",\"thinking\":\"one\"}"));
     assert!(!frames.iter().any(|frame| frame.contains("signature_delta")));
@@ -803,7 +803,7 @@ fn exposed_reasoning_streams_as_an_unsigned_thinking_block() {
     assert_eq!(
         aggregated.body["content"],
         json!([
-            {"type": "thinking", "thinking": "step one"},
+            {"type": "thinking", "thinking": "step one", "signature": ""},
             {"type": "text", "text": "answer"},
         ])
     );
@@ -840,7 +840,7 @@ fn exposed_tool_turn_replays_plaintext_without_a_redundant_carrier() {
     assert!(!frames
         .iter()
         .any(|frame| frame.contains("redacted_thinking")));
-    assert!(!frames.iter().any(|frame| frame.contains("signature")));
+    assert!(!frames.iter().any(|frame| frame.contains("signature_delta")));
     assert!(frames.iter().any(|frame| frame.contains("think privately")));
     let aggregated = completed_messages_body_with_reasoning(
         "request-abc",
@@ -854,7 +854,7 @@ fn exposed_tool_turn_replays_plaintext_without_a_redundant_carrier() {
     assert_eq!(
         aggregated.body["content"],
         json!([
-            {"type": "thinking", "thinking": "think privately"},
+            {"type": "thinking", "thinking": "think privately", "signature": ""},
             {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
         ])
     );

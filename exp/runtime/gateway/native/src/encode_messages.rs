@@ -244,7 +244,7 @@ impl MessagesSseEncoder {
     /// Off by default. Exposure (rungs the catalog marks
     /// `reasoning_output_exposed`, Tencent/DeepSeek) and display (every rung
     /// that has not opted out) both render readable non-Anthropic reasoning
-    /// in one block without a signature: Anthropic signs every
+    /// in one block carrying an EMPTY signature: Anthropic signs every
     /// thinking block it issues, so an unsigned block is recognizably the
     /// gateway's own plaintext when the caller replays it.
     pub fn set_reasoning_output(&mut self, output: ReasoningOutput) {
@@ -818,11 +818,8 @@ impl MessagesSseEncoder {
             block.anthropic_index = Some(anthropic_index);
             let content_block = match block.kind {
                 BlockKind::Text => json!({"type": "text", "text": ""}),
-                // Gateway-owned plaintext has no signature. Native Anthropic
-                // blocks keep their signature field and signature deltas.
-                BlockKind::Thinking(EXPOSED_REASONING_BLOCK_INDEX) => {
-                    json!({"type": "thinking", "thinking": ""})
-                }
+                // The SDK requires the signature field even for unsigned plaintext.
+                // Native Anthropic signatures arrive in subsequent deltas.
                 BlockKind::Thinking(_) => {
                     json!({"type": "thinking", "thinking": "", "signature": ""})
                 }
