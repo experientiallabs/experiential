@@ -68,6 +68,8 @@ NO_RULE_MATCHED: Final = "no_rule_matched"
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 NO_CLASSIFIABLE_TEXT: Final = "no_classifiable_text"
 CAPABILITY_ELIGIBILITY: Final = "capability_eligibility"
+CLASSIFIER_BUSY: Final = "classifier_busy"
+_UNPINNED: Final = frozenset({CLASSIFIER_UNAVAILABLE, CLASSIFIER_BUSY, NO_CLASSIFIABLE_TEXT})
 _MAX_RULES: Final = 64
 _PENDING_DECISION_ID: Final = "routing-decision-pending"
 
@@ -223,6 +225,7 @@ class TagRulesSelector:
         *,
         classifier: DecisionModelClassifier | None = None,
         decision_sink: TagDecisionSink | None = None,
+        maximum_concurrent_classifications: int = 32,
         decision_capacity: int = 4_096,
         decision_ttl_seconds: float = 24 * 60 * 60,
         clock: Callable[[], float] = time.monotonic,
@@ -237,6 +240,8 @@ class TagRulesSelector:
             catalog: Runtime catalog resolving the candidate aliases.
             classifier: Optional injected classifier; ``None`` builds one from the policy.
             decision_sink: Optional recorder called with every decision before it is used.
+            maximum_concurrent_classifications: Decision-model calls in flight at once,
+                default 32; a request beyond the bound takes the default unclassified.
             decision_capacity: Most retained episode decisions, default 4,096.
             decision_ttl_seconds: Seconds an idle episode's decision stays valid, default one day.
             clock: Monotonic clock for decision expiry.
@@ -245,7 +250,11 @@ class TagRulesSelector:
             ValueError: A decision bound is not positive.
             TagRouterIntegrityError: A candidate does not resolve to its frozen identity.
         """
-        if decision_capacity < 1 or decision_ttl_seconds <= 0:
+        if (
+            decision_capacity < 1
+            or decision_ttl_seconds <= 0
+            or maximum_concurrent_classifications < 1
+        ):
             raise ValueError("tag router decision bounds must be positive")
         self._capabilities: dict[str, ModelCapabilities] = {}
         for candidate in policy.candidates:
@@ -279,6 +288,7 @@ class TagRulesSelector:
         )
         self._policy_sha256 = sha256_json(policy)
         self._decision_sink = decision_sink
+        self._classifications = threading.BoundedSemaphore(maximum_concurrent_classifications)
         self._capacity = decision_capacity
         self._ttl_seconds = decision_ttl_seconds
         self._clock = clock
@@ -315,7 +325,8 @@ class TagRulesSelector:
         keys = self._keys(request, episode_id)
         decision = self._reuse(keys)
         if decision is None:
-            flagged, reason = await self._classify(request, deadline)
+            flagged, reason = await self._bounded_classify(request, deadline)
+            deadline.attempt_timeout()
             decision = self._retain(keys, self._decision(keys, flagged, reason))
         return self._record(self._eligible(request, decision))
 
@@ -330,7 +341,8 @@ class TagRulesSelector:
         keys = self._keys(request, episode_id)
         decision = self._reuse(keys)
         if decision is None:
-            flagged, reason = run_on_native_loop(self._classify(request, deadline))
+            flagged, reason = run_on_native_loop(self._bounded_classify(request, deadline))
+            deadline.attempt_timeout()
             decision = self._retain(keys, self._decision(keys, flagged, reason))
         return self._record(self._eligible(request, decision))
 
@@ -343,7 +355,12 @@ class TagRulesSelector:
         """
         if not self._restricted:
             return decision
-        provider_request = model_request(request)
+        try:
+            provider_request = model_request(request)
+        except ValueError:
+            # A shape the provider projection cannot express is left to admission;
+            # routing itself never fails the request.
+            return decision
         if capabilities_support(self._capabilities[decision.selected_alias], provider_request):
             return decision
         eligible = [
@@ -379,6 +396,21 @@ class TagRulesSelector:
             hashlib.sha256(episode_id.encode("utf-8")).hexdigest(),
             hashlib.sha256(window.encode("utf-8")).hexdigest(),
         )
+
+    async def _bounded_classify(
+        self, request: GatewayRequest, deadline: RequestDeadline
+    ) -> tuple[frozenset[str], str | None]:
+        """Classify within the in-flight bound; a request beyond it is not classified.
+
+        Shedding instead of queueing keeps bursts from holding admission threads
+        or overloading the decision model; such a request takes the default unpinned.
+        """
+        if not self._classifications.acquire(blocking=False):
+            return frozenset(), CLASSIFIER_BUSY
+        try:
+            return await self._classify(request, deadline)
+        finally:
+            self._classifications.release()
 
     async def _classify(
         self, request: GatewayRequest, deadline: RequestDeadline
@@ -444,15 +476,16 @@ class TagRulesSelector:
     def _retain(self, keys: tuple[Sha256, Sha256], decision: RoutingDecision) -> RoutingDecision:
         """Pin a fresh decision unless a concurrent request already chose for the episode.
 
-        A decision made without a classifier answer, or for a request with no
-        classifiable text, is returned unpinned, so a later request asks again
-        instead of keeping the default for the whole episode.
+        A decision made without a classifier answer (failed, timed out, or shed
+        at the in-flight bound), or for a request with no classifiable text, is
+        returned unpinned, so a later request asks again instead of keeping the
+        default for the whole episode.
         """
         with self._lock:
             episode = self._hit(keys[0])
             if episode is not None:
                 return _for_request(episode, keys[1])
-            if decision.fallback_reason in {CLASSIFIER_UNAVAILABLE, NO_CLASSIFIABLE_TEXT}:
+            if decision.fallback_reason in _UNPINNED:
                 return decision
             now = self._clock()
             self._episodes[keys[0]] = (now + self._ttl_seconds, decision)

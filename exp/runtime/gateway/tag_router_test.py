@@ -43,6 +43,7 @@ from exp.runtime.gateway.project_activation import load_project_activation
 from exp.runtime.gateway.routing import RouterProjectTargetResolver
 from exp.runtime.gateway.tag_router import (
     CAPABILITY_ELIGIBILITY,
+    CLASSIFIER_BUSY,
     CLASSIFIER_UNAVAILABLE,
     NO_CLASSIFIABLE_TEXT,
     NO_RULE_MATCHED,
@@ -345,6 +346,35 @@ def test_a_failed_classification_follows_a_concurrent_episode_choice() -> None:
 
     failed, answered = asyncio.run(both())
     assert (answered.selected_alias, failed.selected_alias) == ("coder", "coder")
+
+
+def test_a_request_beyond_the_classification_bound_takes_the_default_unpinned() -> None:
+    """A burst sheds to the default instead of queueing on the decision model."""
+    catalog = _catalog()
+    classifier = _ScriptedClassifier(
+        {"coding": 0.9, "cyber": 0.1}, {"coding": 0.9, "cyber": 0.1}, delays=(0.2, 0.0)
+    )
+    selector = TagRulesSelector(
+        _policy(catalog),
+        catalog,
+        classifier=cast("DecisionModelClassifier", classifier),
+        maximum_concurrent_classifications=1,
+    )
+
+    async def burst() -> tuple[RoutingDecision, RoutingDecision]:
+        """Start a slow classification, then a second episode while it runs."""
+        slow = asyncio.create_task(
+            selector.select(_request("fix"), episode_id="one", deadline=_deadline())
+        )
+        await asyncio.sleep(0.05)
+        shed = await selector.select(_request("fix"), episode_id="two", deadline=_deadline())
+        return await slow, shed
+
+    answered, shed = asyncio.run(burst())
+    assert (answered.selected_alias, shed.selected_alias) == ("coder", "generalist")
+    assert shed.fallback_reason == CLASSIFIER_BUSY
+    later = selector.select_blocking(_request("fix"), episode_id="two", deadline=_deadline())
+    assert (later.selected_alias, classifier.calls) == ("coder", 2)
 
 
 def test_an_expired_deadline_fails_the_request_before_the_classifier() -> None:
