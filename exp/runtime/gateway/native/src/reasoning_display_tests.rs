@@ -168,7 +168,7 @@ fn messages_render_non_anthropic_reasoning_as_one_unsigned_thinking_block() {
     // Provider units stay separate paragraphs, exactly as on Chat.
     assert_eq!(thinking, "plain\n\n summary");
     assert!(chunks.iter().any(|chunk| chunk["content_block"]
-        == json!({"type": "thinking", "thinking": "", "signature": ""})));
+        == json!({"type": "thinking", "thinking": ""})));
 
     let body =
         completed_messages_body_with_reasoning("request-1", "m", &events, &[], None, DISPLAYED)
@@ -176,7 +176,7 @@ fn messages_render_non_anthropic_reasoning_as_one_unsigned_thinking_block() {
             .body;
     assert_eq!(
         body["content"][0],
-        json!({"type": "thinking", "thinking": "plain\n\n summary", "signature": ""})
+        json!({"type": "thinking", "thinking": "plain\n\n summary"})
     );
     let hidden =
         completed_messages_body_with_reasoning("request-1", "m", &events, &[], None, false)
@@ -263,9 +263,9 @@ fn messages_aggregate_keeps_interleaved_reasoning_in_provider_order() {
     assert_eq!(
         body["content"],
         json!([
-            {"type": "thinking", "thinking": "first", "signature": ""},
+            {"type": "thinking", "thinking": "first"},
             {"type": "text", "text": "partial "},
-            {"type": "thinking", "thinking": "second", "signature": ""},
+            {"type": "thinking", "thinking": "second"},
             {"type": "text", "text": "answer"},
         ])
     );

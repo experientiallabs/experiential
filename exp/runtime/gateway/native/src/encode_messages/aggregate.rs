@@ -204,9 +204,7 @@ pub fn completed_messages_body_with_reasoning(
                     }
                     None => {
                         display_position = Some(slots.len());
-                        slots.push(Some(
-                            json!({"type": "thinking", "thinking": delta, "signature": ""}),
-                        ));
+                        slots.push(Some(json!({"type": "thinking", "thinking": delta})));
                     }
                 }
             }
@@ -274,6 +272,7 @@ pub fn completed_messages_body_with_reasoning(
     if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_))
         && saw_tool_use
         && reasoning.is_some()
+        && !reasoning_output.exposed
     {
         let carrier = reasoning_content_carrier.ok_or_else(|| {
             PublicError::new(
