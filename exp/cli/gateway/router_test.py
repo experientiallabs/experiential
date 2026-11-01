@@ -28,7 +28,12 @@ from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_sing
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
-from exp.runtime.gateway.tag_router import NO_RULE_MATCHED, TAG_ROUTER_ROUTE_REASON
+from exp.runtime.gateway.tag_router import (
+    NO_RULE_MATCHED,
+    TAG_ROUTER_ROUTE_REASON,
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
+    TagRulesRouterPolicy,
+)
 from exp.runtime.openai_protocol.requests import decode_chat
 
 _ENVIRONMENT = {"PRIMARY_PROVIDER_KEY": "available", "SECONDARY_PROVIDER_KEY": "available"}
@@ -215,3 +220,29 @@ def test_refreezing_after_an_upgrade_adopts_the_stored_policy(
     assert result.exit_code == 0, result.output
     receipt = json.loads(result.output)
     assert (receipt["resource_id"], receipt["changed"]) == (policy_id, False)
+
+
+def test_refreezing_refuses_a_stored_policy_the_gateway_would_not_activate(
+    tmp_path: Path,
+) -> None:
+    """A stored policy whose manifest disagrees with its payload is refused, not adopted."""
+    _two_model_gateway(tmp_path)
+    policy_id = _author(tmp_path, _rules("https://decisions.example.invalid/systemone"))
+    authored = ProjectStore(tmp_path, "project-one")
+    authored.load_project()
+    payload = authored.artifacts.read_bytes(policy_id, "policy.json")
+    policy = TagRulesRouterPolicy.model_validate_json(payload)
+    planted = ProjectStore(tmp_path, "project-two")
+    planted.initialize(ProjectConfig(project_id="project-two"))
+    planted.artifacts.write(
+        artifact_id=policy_id,
+        artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
+        envelope=policy.model_copy(update={"code_revision": "other-release"}),
+        files={"policy.json": payload},
+    )
+    command = ["config", "gateway", "router", "tags", str(tmp_path / "rules.json")]
+    result = CliRunner().invoke(
+        app, [*command, "--project", "project-two", "--root", str(tmp_path), "--json"]
+    )
+    assert result.exit_code == 2, result.output
+    assert policy_id in result.output

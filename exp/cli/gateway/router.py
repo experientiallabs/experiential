@@ -22,9 +22,11 @@ from exp.common.project import ArtifactStore, ArtifactStoreError, ProjectStore, 
 from exp.common.release_revision import installed_release_revision
 from exp.runtime.gateway.guardrails.classification import DecisionModelAdapterDocument
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.project_activation import load_project_activation
 from exp.runtime.gateway.tag_router import (
     TAG_RULES_POLICY_ARTIFACT_TYPE,
     TagRule,
+    TagRulesActivation,
     TagRulesRouterPolicy,
     tag_rules_policy_id,
 )
@@ -62,6 +64,15 @@ def serving_catalog(
 
     This is the catalog an alias snapshot serves, so candidate identities pinned
     or checked against it match what the gateway resolves at startup.
+
+    Args:
+        root: Gateway root holding the authored ``models.toml``.
+        serving_connections: The gateway's active provider connections by ID. They
+            replace the connections ``models.toml`` declares.
+
+    Returns:
+        A catalog that reads no environment: it pins and checks candidate
+        identities but never resolves a credential or builds a provider client.
     """
     authored = load_model_catalog(root / "models.toml")
     return RuntimeModelCatalog(
@@ -112,11 +123,12 @@ def _pinned(catalog: RuntimeModelCatalog, alias: str) -> ModelSnapshot:
         raise ValueError(message) from exc
 
 
-def _store(store: ArtifactStore, policy: TagRulesRouterPolicy) -> bool:
+def _store(store: ArtifactStore, policy: TagRulesRouterPolicy, *, project: str) -> bool:
     """Store the policy, or adopt an already stored one; return whether this run wrote it.
 
     The identity covers only routing content, so a stored policy with this ID routes
-    identically even when another release wrote it; its provenance is kept as stored.
+    identically even when another release wrote it. Such a policy is adopted with its
+    provenance as stored, but only when the gateway would activate it.
     """
     try:
         stored, _manifest = store.write_or_replay(
@@ -128,10 +140,13 @@ def _store(store: ArtifactStore, policy: TagRulesRouterPolicy) -> bool:
             files={"policy.json": canonical_json_bytes(policy)},
         )
     except ValueError:
-        existing = store.read(policy.policy_id)
-        if existing.manifest.artifact_type != TAG_RULES_POLICY_ARTIFACT_TYPE:
+        # The activation loader is the acceptance check, so a stored policy this run
+        # reports as unchanged is one alias create can activate.
+        existing = load_project_activation(
+            store, project_ref=project, activation_ref=policy.policy_id
+        )
+        if not isinstance(existing, TagRulesActivation):
             raise
-        TagRulesRouterPolicy.model_validate_json(store.read_bytes(policy.policy_id, "policy.json"))
         return False
     return stored.created_at == policy.created_at
 
@@ -159,7 +174,7 @@ def router_tags(
         )
         store = ProjectStore(root, project)
         store.load_project()
-        changed = _store(store.artifacts, policy)
+        changed = _store(store.artifacts, policy, project=project)
     emit_receipt(
         GatewayReceipt(
             operation="router.tags",
