@@ -807,7 +807,6 @@ class RouterProjectTargetResolver:
         episode_id = project_episode_identity(episode_namespace)
         if isinstance(runtime, TagRulesSelector):
             decision = await runtime.select(request, episode_id=episode_id, deadline=deadline)
-            deadline.attempt_timeout()
             return self._selection(target, decision, route_reason=TAG_ROUTER_ROUTE_REASON)
         model_request = gateway_model_request(request)
         decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
@@ -870,7 +869,6 @@ class RouterProjectTargetResolver:
         episode_id = project_episode_identity(episode_namespace)
         if isinstance(runtime, TagRulesSelector):
             decision = runtime.select_blocking(request, episode_id=episode_id, deadline=deadline)
-            deadline.attempt_timeout()
             return self._selection(target, decision, route_reason=TAG_ROUTER_ROUTE_REASON)
         model_request = gateway_model_request(request)
         decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
