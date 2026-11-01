@@ -8,9 +8,11 @@ once; the first rule whose ``when_all`` categories all reached their thresholds
 and whose ``when_none`` categories all stayed below them names the candidate.
 No match routes to the default, and so does a classifier that fails, times out,
 or finds no text, so routing never fails a request; only an expired request
-deadline does. Like learned routing, the first decision of an episode serves its
-later turns while the episode stays active; a decision made without a
-classifier answer is never pinned to it.
+deadline does. A selected candidate whose declared capabilities rule out the
+request (tools, or its output-token limit) yields to the default or the first
+eligible candidate, as in learned routing. Like learned routing, the first
+decision of an episode serves its later turns while the episode stays active; a
+decision made without a classifier answer is never pinned to it.
 Tag-rules policies are stored as their own artifact type, so commands that read
 learned router policies never see them.
 """
@@ -36,7 +38,8 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from exp.common.models import ModelAlias, RoutedCandidateSnapshot
+from exp.common.models import ModelAlias, ModelCapabilities, RoutedCandidateSnapshot
+from exp.common.models.capability_fit import capabilities_support
 from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import run_on_native_loop
@@ -57,12 +60,14 @@ from exp.runtime.models.providers.async_transport import (
     ProviderDeadlineExceeded,
     RequestDeadline,
 )
+from exp.runtime.openai_protocol.model_adapter import model_request
 
 TAG_RULES_POLICY_ARTIFACT_TYPE: Final = "tag-router-policy"
 TAG_ROUTER_ROUTE_REASON: Final = "tag_router"
 NO_RULE_MATCHED: Final = "no_rule_matched"
 CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 NO_CLASSIFIABLE_TEXT: Final = "no_classifiable_text"
+CAPABILITY_ELIGIBILITY: Final = "capability_eligibility"
 _MAX_RULES: Final = 64
 _PENDING_DECISION_ID: Final = "routing-decision-pending"
 
@@ -102,7 +107,8 @@ class TagRulesRouterPolicy(ArtifactEnvelope):
         policy_id: Identity derived from the candidates, default, classifier and rules.
         candidates: Candidate aliases with their frozen model identities.
         default_alias: Candidate serving requests no rule matches.
-        classifier: Decision-model document scoring the request before dispatch.
+        classifier: Decision-model document scoring the request before dispatch. It
+            names no credential, so the endpoint must accept requests without one.
         rules: Ordered rules; the first match routes the request.
     """
 
@@ -129,6 +135,8 @@ class TagRulesRouterPolicy(ArtifactEnvelope):
             raise ValueError("tag router candidate aliases must be unique")
         if self.default_alias not in aliases:
             raise ValueError("tag router default_alias must name a candidate")
+        if self.classifier.bearer_env is not None:
+            raise ValueError("a tag-rules policy names no credential; omit classifier.bearer_env")
         categories = set(self.classifier.categories)
         for rule in self.rules:
             if rule.route not in aliases:
@@ -239,6 +247,7 @@ class TagRulesSelector:
         """
         if decision_capacity < 1 or decision_ttl_seconds <= 0:
             raise ValueError("tag router decision bounds must be positive")
+        self._capabilities: dict[str, ModelCapabilities] = {}
         for candidate in policy.candidates:
             try:
                 snapshot, capabilities = catalog.snapshot(candidate.alias)
@@ -253,6 +262,11 @@ class TagRulesSelector:
                 raise TagRouterIntegrityError(
                     f"runtime alias {candidate.alias!r} differs from its frozen identity"
                 )
+            self._capabilities[candidate.alias] = capabilities
+        self._restricted = any(
+            item.supports_tools is False or item.maximum_output_tokens is not None
+            for item in self._capabilities.values()
+        )
         self.policy = policy
         self._classifier = classifier or DecisionModelClassifier(policy.classifier)
         self._check = GuardrailCheck(
@@ -303,7 +317,7 @@ class TagRulesSelector:
         if decision is None:
             flagged, reason = await self._classify(request, deadline)
             decision = self._retain(keys, self._decision(keys, flagged, reason))
-        return self._record(decision)
+        return self._record(self._eligible(request, decision))
 
     def select_blocking(
         self, request: GatewayRequest, *, episode_id: str, deadline: RequestDeadline
@@ -318,7 +332,37 @@ class TagRulesSelector:
         if decision is None:
             flagged, reason = run_on_native_loop(self._classify(request, deadline))
             decision = self._retain(keys, self._decision(keys, flagged, reason))
-        return self._record(decision)
+        return self._record(self._eligible(request, decision))
+
+    def _eligible(self, request: GatewayRequest, decision: RoutingDecision) -> RoutingDecision:
+        """Keep the choice, or move this request to a candidate that can serve it.
+
+        Only an explicit declaration rules a candidate out. The default is preferred,
+        then candidate order; when no candidate can serve the request the choice
+        stands and admission refuses it. The episode's pinned choice is unchanged.
+        """
+        if not self._restricted:
+            return decision
+        provider_request = model_request(request)
+        if capabilities_support(self._capabilities[decision.selected_alias], provider_request):
+            return decision
+        eligible = [
+            candidate.alias
+            for candidate in self.policy.candidates
+            if capabilities_support(self._capabilities[candidate.alias], provider_request)
+        ]
+        if not eligible:
+            return decision
+        alias = self.policy.default_alias if self.policy.default_alias in eligible else eligible[0]
+        return _content_addressed(
+            decision.model_copy(
+                update={
+                    "decision_id": _PENDING_DECISION_ID,
+                    "selected_alias": alias,
+                    "fallback_reason": CAPABILITY_ELIGIBILITY,
+                }
+            )
+        )
 
     def _record(self, decision: RoutingDecision) -> RoutingDecision:
         """Send one decision to the sink before it is used, as learned routing does."""
@@ -404,12 +448,12 @@ class TagRulesSelector:
         classifiable text, is returned unpinned, so a later request asks again
         instead of keeping the default for the whole episode.
         """
-        if decision.fallback_reason in {CLASSIFIER_UNAVAILABLE, NO_CLASSIFIABLE_TEXT}:
-            return decision
         with self._lock:
             episode = self._hit(keys[0])
             if episode is not None:
                 return _for_request(episode, keys[1])
+            if decision.fallback_reason in {CLASSIFIER_UNAVAILABLE, NO_CLASSIFIABLE_TEXT}:
+                return decision
             now = self._clock()
             self._episodes[keys[0]] = (now + self._ttl_seconds, decision)
             while self._episodes and (

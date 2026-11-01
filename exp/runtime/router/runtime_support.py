@@ -16,6 +16,7 @@ from exp.common.models import (
     OperationEconomics,
     Usage,
 )
+from exp.common.models.capability_fit import capabilities_support
 from exp.common.models.token_cost import (
     schedule_maximum_cost_nano_usd,
     schedule_prices_complete,
@@ -290,26 +291,6 @@ def _candidate_input_cost_usd(price: CandidateTokenPrice, usage: Usage) -> float
     return total / 1_000_000
 
 
-def requires_tool_protocol(request: ModelRequest) -> bool:
-    """Return whether preserving this request requires structured tool support.
-
-    Args:
-        request: Provider-neutral request to inspect.
-
-    Returns:
-        Whether the request requires structured tool-call semantics.
-    """
-    return bool(
-        request.tools
-        or request.tool_choice is not None
-        or any(
-            message.role == "tool"
-            or (message.assistant_action is not None and bool(message.assistant_action.tool_calls))
-            for message in request.messages
-        )
-    )
-
-
 def decision_content_id(decision: RoutingDecision) -> str:
     """Return the canonical content identity for a routing decision.
 
@@ -352,11 +333,7 @@ def supports_request(resolved: ResolvedModel, request: ModelRequest) -> bool:
     Returns:
         Whether no explicit declaration rules out the required tools or output-token capacity.
     """
-    if requires_tool_protocol(request) and resolved.capabilities.supports_tools is False:
-        return False
-    requested = request.maximum_output_tokens
-    available = resolved.capabilities.maximum_output_tokens
-    return requested is None or available is None or requested <= available
+    return capabilities_support(resolved.capabilities, request)
 
 
 def eligible_decision(
