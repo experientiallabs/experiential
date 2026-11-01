@@ -39,7 +39,9 @@ should come from measured quality and cost.
 - `classifier` is a `decision_model` document, exactly as a
   [classification guardrail](gateway-classification-guardrails.md) declares one: endpoint,
   model, categories with their questions, aggregate and threshold, window, timeout and cache.
-  A category is flagged when its score reaches its threshold.
+  A category is flagged when its score reaches its threshold. The classifier names no
+  credential (`bearer_env` is refused): a frozen policy carries none, so point it at a
+  decision-model server that needs no token, such as one on the same host.
 - A rule matches when every `when_all` category is flagged and no `when_none` category is.
   Rules apply in order and the first match wins. Every rule must route to a candidate and name
   only the classifier's categories.
@@ -62,6 +64,9 @@ and activates the alias.
   serial: the model has to be chosen before it is called.
 - The selected candidate's exact model and certified pool serve the request, with
   `route_reason` `tag_router`.
+- A selected candidate whose declared capabilities rule out the request (tools, or an output
+  token limit below the request) yields to the default, then the first eligible candidate, with
+  `fallback_reason` `capability_eligibility`, as in learned routing.
 - When no rule matches, the default serves with `fallback_reason` `no_rule_matched`. When the
   decision model fails, times out, or the request has no text to classify, the default serves
   with `classifier_unavailable` or `no_classifiable_text`. Routing never fails a request; only
