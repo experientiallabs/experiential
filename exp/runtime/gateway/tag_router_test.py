@@ -41,6 +41,7 @@ from exp.runtime.gateway.tag_router import (
     NO_CLASSIFIABLE_TEXT,
     NO_RULE_MATCHED,
     TAG_ROUTER_ROUTE_REASON,
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
     TagRouterIntegrityError,
     TagRulesActivation,
     TagRulesRouterPolicy,
@@ -123,9 +124,10 @@ def _policy(catalog: RuntimeModelCatalog) -> TagRulesRouterPolicy:
 class _ScriptedClassifier:
     """Answer each inspection from a queue of scores, failures, or text-free verdicts."""
 
-    def __init__(self, *answers: dict[str, float] | Exception | None) -> None:
-        """Queue answers in call order."""
+    def __init__(self, *answers: dict[str, float] | Exception | None, delay: float = 0.0) -> None:
+        """Queue answers in call order, each given after ``delay`` seconds."""
         self._answers = list(answers)
+        self._delay = delay
         self.calls = 0
 
     async def inspect_input(
@@ -134,6 +136,7 @@ class _ScriptedClassifier:
         """Return the next scripted verdict."""
         del request, check
         self.calls += 1
+        await asyncio.sleep(self._delay)
         answer = self._answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
@@ -153,12 +156,17 @@ class _ScriptedClassifier:
 
 def _selector(
     *answers: dict[str, float] | Exception | None,
+    delay: float = 0.0,
+    capacity: int = 4_096,
 ) -> tuple[TagRulesSelector, _ScriptedClassifier]:
     """Return a selector over the test policy and its scripted classifier."""
     catalog = _catalog()
-    classifier = _ScriptedClassifier(*answers)
+    classifier = _ScriptedClassifier(*answers, delay=delay)
     selector = TagRulesSelector(
-        _policy(catalog), catalog, classifier=cast("DecisionModelClassifier", classifier)
+        _policy(catalog),
+        catalog,
+        classifier=cast("DecisionModelClassifier", classifier),
+        decision_capacity=capacity,
     )
     return selector, classifier
 
@@ -225,6 +233,50 @@ def test_an_episode_keeps_its_first_choice_without_asking_again() -> None:
     assert classifier.calls == 2
 
 
+def test_an_active_episode_outlives_idle_ones_at_capacity() -> None:
+    """Reuse renews an episode, so other traffic evicts idle episodes first."""
+    selector, classifier = _selector(
+        {"coding": 0.9, "cyber": 0.1},
+        {"coding": 0.1, "cyber": 0.9},
+        {"coding": 0.1, "cyber": 0.9},
+        capacity=2,
+    )
+    turns = [("a", "fix"), ("b", "hi"), ("a", "more"), ("c", "hi"), ("a", "again")]
+    selected = [
+        selector.select_blocking(_request(text), episode_id=episode, deadline=_deadline())
+        for episode, text in turns
+    ]
+    assert [decision.selected_alias for decision in selected] == [
+        "coder",
+        "secure",
+        "coder",
+        "secure",
+        "coder",
+    ]
+    assert classifier.calls == 3
+
+
+def test_a_failed_classifier_does_not_pin_the_default_to_the_episode() -> None:
+    """The next turn asks again instead of keeping the fallback for the conversation."""
+    selector, classifier = _selector(RuntimeError("down"), {"coding": 0.9, "cyber": 0.1})
+    first = selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
+    later = selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
+    assert (first.selected_alias, first.fallback_reason) == ("generalist", CLASSIFIER_UNAVAILABLE)
+    assert (later.selected_alias, later.fallback_reason) == ("coder", None)
+    assert classifier.calls == 2
+
+
+def test_a_deadline_that_ends_during_classification_fails_and_keeps_nothing() -> None:
+    """Running out of request time is a request failure, not a routing fallback."""
+    selector, classifier = _selector({"coding": 0.9}, {"coding": 0.9, "cyber": 0.1}, delay=0.3)
+    with pytest.raises(ProviderDeadlineExceeded):
+        selector.select_blocking(
+            _request("fix"), episode_id="one", deadline=RequestDeadline(time.monotonic() + 0.1)
+        )
+    later = selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
+    assert (later.selected_alias, classifier.calls) == ("coder", 2)
+
+
 def test_an_expired_deadline_fails_the_request_before_the_classifier() -> None:
     """Routing does not outlive its request."""
     selector, classifier = _selector({"coding": 0.9})
@@ -272,7 +324,7 @@ def test_a_stored_tag_rules_policy_loads_as_its_own_activation(tmp_path: Path) -
     policy = _policy(_catalog())
     store.write_or_verify_exact(
         artifact_id=policy.policy_id,
-        artifact_type="router-policy",
+        artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
         envelope=policy,
         files={"policy.json": canonical_json_bytes(policy)},
     )
