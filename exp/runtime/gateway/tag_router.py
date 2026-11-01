@@ -327,9 +327,9 @@ class TagRulesSelector:
             ProviderDeadlineExceeded: The request deadline expired.
         """
         keys = self._keys(request, episode_id)
-        reused = self._reuse(keys)
+        reused = self._reuse(request, keys)
         if reused is not None:
-            return self._record(self._eligible(request, reused))
+            return reused
         flagged, reason = await self._bounded_classify(request, deadline)
         deadline.attempt_timeout()
         return self._publish(request, keys, self._decision(keys, flagged, reason))
@@ -343,9 +343,9 @@ class TagRulesSelector:
         guardrail inspection uses, so the calling bridge thread only waits.
         """
         keys = self._keys(request, episode_id)
-        reused = self._reuse(keys)
+        reused = self._reuse(request, keys)
         if reused is not None:
-            return self._record(self._eligible(request, reused))
+            return reused
         flagged, reason = run_on_native_loop(self._bounded_classify(request, deadline))
         deadline.attempt_timeout()
         return self._publish(request, keys, self._decision(keys, flagged, reason))
@@ -355,7 +355,7 @@ class TagRulesSelector:
 
         Only an explicit declaration rules a candidate out. The default is preferred,
         then candidate order; when no candidate can serve the request the choice
-        stands and admission refuses it. The episode's pinned choice is unchanged.
+        stands and admission refuses it.
         """
         if not self._restricted:
             return decision
@@ -471,11 +471,13 @@ class TagRulesSelector:
             )
         )
 
-    def _reuse(self, keys: tuple[Sha256, Sha256]) -> RoutingDecision | None:
-        """Return the episode's choice bound to this request, renewing the episode."""
+    def _reuse(
+        self, request: GatewayRequest, keys: tuple[Sha256, Sha256]
+    ) -> RoutingDecision | None:
+        """Serve the episode's choice to this request, or ``None`` when it has none."""
         with self._lock:
             episode = self._hit(keys[0])
-        return None if episode is None else _for_request(episode, keys[1])
+            return None if episode is None else self._serve_pinned(request, keys, episode)
 
     def _publish(
         self, request: GatewayRequest, keys: tuple[Sha256, Sha256], decision: RoutingDecision
@@ -491,20 +493,42 @@ class TagRulesSelector:
         used = self._eligible(request, decision)
         with self._lock:
             episode = self._hit(keys[0])
-            if episode is None:
-                self._record(used)
-                if decision.fallback_reason not in _UNPINNED:
-                    # Pin what was served, so later turns stay on the model that began
-                    # the episode even when a capability fallback chose it.
-                    now = self._clock()
-                    self._episodes[keys[0]] = (now + self._ttl_seconds, used)
-                    while self._episodes and (
-                        len(self._episodes) > self._capacity
-                        or next(iter(self._episodes.values()))[0] <= now
-                    ):
-                        self._episodes.popitem(last=False)
-                return used
-        return self._record(self._eligible(request, _for_request(episode, keys[1])))
+            if episode is not None:
+                return self._serve_pinned(request, keys, episode)
+            self._record(used)
+            if decision.fallback_reason not in _UNPINNED:
+                # Pin what was served, so later turns stay on the model that began
+                # the episode even when a capability fallback chose it.
+                self._pin(keys[0], used)
+            return used
+
+    def _serve_pinned(
+        self, request: GatewayRequest, keys: tuple[Sha256, Sha256], episode: RoutingDecision
+    ) -> RoutingDecision:
+        """Serve an episode's pinned choice, repinning when this request needs another.
+
+        A capability fallback replaces the pin, as learned routing does, so an
+        episode never alternates models as its requests' needs change. Callers
+        hold the lock.
+        """
+        used = self._record(self._eligible(request, _for_request(episode, keys[1])))
+        if used.selected_alias != episode.selected_alias:
+            self._pin(keys[0], used)
+        return used
+
+    def _pin(self, episode_sha256: Sha256, decision: RoutingDecision) -> None:
+        """Retain an episode's decision with a fresh lifetime.
+
+        Expired episodes, and the least recent beyond capacity, are evicted.
+        Callers hold the lock.
+        """
+        now = self._clock()
+        self._episodes[episode_sha256] = (now + self._ttl_seconds, decision)
+        self._episodes.move_to_end(episode_sha256)
+        while self._episodes and (
+            len(self._episodes) > self._capacity or next(iter(self._episodes.values()))[0] <= now
+        ):
+            self._episodes.popitem(last=False)
 
     def _hit(self, episode_sha256: Sha256) -> RoutingDecision | None:
         """Return an episode's unexpired decision and renew it, or drop an expired one.

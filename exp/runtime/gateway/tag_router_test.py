@@ -325,6 +325,20 @@ def test_a_candidate_that_cannot_serve_the_request_yields_to_an_eligible_one() -
     assert (plain.selected_alias, plain.fallback_reason) == ("generalist", CAPABILITY_ELIGIBILITY)
 
 
+def test_a_later_capability_fallback_moves_the_episode_for_good() -> None:
+    """A turn the pinned candidate cannot serve repins the episode to its fallback."""
+    selector, classifier = _selector({"coding": 0.9, "cyber": 0.1}, without_tools=("coder",))
+    tools = _request("run them").model_copy(
+        update={"tools": (GatewayToolDefinition(name="run_tests", parameters={"type": "object"}),)}
+    )
+    aliases = [
+        selector.select_blocking(request, episode_id="one", deadline=_deadline()).selected_alias
+        for request in (_request("fix"), tools, _request("thanks"))
+    ]
+    assert aliases == ["coder", "generalist", "generalist"]
+    assert classifier.calls == 1
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
