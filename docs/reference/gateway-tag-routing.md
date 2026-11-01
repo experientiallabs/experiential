@@ -66,13 +66,15 @@ and activates the alias.
   `route_reason` `tag_router`.
 - A selected candidate whose declared capabilities rule out the request (tools, or an output
   token limit below the request) yields to the default, then the first eligible candidate, with
-  `fallback_reason` `capability_eligibility`, as in learned routing.
+  `fallback_reason` `capability_eligibility`, as in learned routing. The episode then stays on
+  the candidate that served it.
 - When no rule matches, the default serves with `fallback_reason` `no_rule_matched`. When the
-  decision model fails, times out, or the request has no text to classify, the default serves
-  with `classifier_unavailable` or `no_classifiable_text`. Routing never fails a request; only
-  an expired request deadline does.
-- The first decision of an episode serves its later turns, as in learned routing, so a
-  conversation keeps one model while it stays active; an idle episode expires after a day, or
+  decision model fails or times out, when 32 classifications are already in flight, or when the
+  request has no text to classify, the default serves with `classifier_unavailable`,
+  `classifier_busy` or `no_classifiable_text`. Routing never fails a request; only an expired
+  request deadline does.
+- An episode's decision serves its later turns, as in learned routing, so a conversation
+  keeps one model while it stays active; an idle episode expires after a day, or
   sooner when many other episodes arrive. A default chosen because the decision model had no
   answer is not kept for the episode, so the next turn asks again. Requests with no episode
   identity are routed one by one. Verdicts are cached by window, so the tool loop that follows
