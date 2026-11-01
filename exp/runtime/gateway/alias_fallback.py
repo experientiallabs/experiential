@@ -22,7 +22,6 @@ from exp.runtime.gateway.project_activation import (
     require_project_activation_authority,
 )
 from exp.runtime.gateway.routing import ProjectSelector, project_selector
-from exp.runtime.gateway.tag_router import TagRouterIntegrityError
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.router.errors import RouterApplicationError
@@ -152,7 +151,6 @@ def load_last_good_fallback(
             ProjectActivationError,
             RouterApplicationError,
             RouterRuntimeIntegrityError,
-            TagRouterIntegrityError,
         ):
             continue
     return None

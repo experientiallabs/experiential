@@ -66,7 +66,6 @@ from exp.runtime.gateway.routing import (
     project_selector,
 )
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
-from exp.runtime.gateway.tag_router import TagRouterIntegrityError
 from exp.runtime.gateway.video.store import SQLiteVideoJobStore, VideoJobStore
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
@@ -705,11 +704,7 @@ def _load_alias_state(
                     )
                 except ProjectActivationError as exc:
                     raise GatewayLifecycleError(str(exc)) from exc
-                runtime = project_selector(
-                    activation,
-                    runtime_catalog,
-                    decision_sink=decision_sink,
-                )
+                runtime = project_selector(activation, runtime_catalog, decision_sink=decision_sink)
                 proof = _project_readiness(
                     manager,
                     alias,
@@ -724,7 +719,6 @@ def _load_alias_state(
                 ModelCredentialError,
                 ProjectActivationError,
                 RouterRuntimeIntegrityError,
-                TagRouterIntegrityError,
             ) as exc:
                 if isinstance(exc, MissingModelCredentialError):
                     unavailable_aliases.append((alias.alias_name, exc.detail))
