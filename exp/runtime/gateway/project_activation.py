@@ -241,7 +241,7 @@ def only_router_policy(store: ArtifactStore) -> ArtifactId:
     if not policies:
         raise ProjectActivationError(
             "project has no frozen router policy; run exp optimize router "
-            "or store a tag-rules router policy"
+            "or exp config gateway router tags"
         )
     if len(policies) > 1:
         raise ProjectActivationError(

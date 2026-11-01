@@ -1,4 +1,4 @@
-"""End-to-end tag routing: authoring, alias activation, a loaded gateway, a live classifier."""
+"""Tag-rules authoring end to end: router tags, alias create, a gateway, a live classifier."""
 
 from __future__ import annotations
 

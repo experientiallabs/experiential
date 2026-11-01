@@ -9,16 +9,17 @@ import typer
 
 from exp.cli.gateway.capability_authority import retained_streaming_tool_arguments
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
+from exp.cli.gateway.router import serving_catalog
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.common.core.artifacts import sha256_json
 from exp.common.core.locks import FileLockTimeout
 from exp.common.models import (
     BillingSource,
+    ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
     RoutedCandidateSnapshot,
-    load_model_catalog,
     read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
@@ -37,7 +38,6 @@ from exp.runtime.gateway.provider_certification import (
     provider_has_certified_capability,
 )
 from exp.runtime.gateway.tag_router import TagRulesActivation, TagRulesSelector
-from exp.runtime.models import RuntimeModelCatalog
 
 alias_app = typer.Typer(help="Manage public gateway model aliases.", no_args_is_help=True)
 _JSON_OPTION = typer.Option(False, "--json")
@@ -660,7 +660,9 @@ def _activate(
             revision_id,
             catalog_sha256,
         )
-    candidates, activation_ref = _project_policy(project or "", root, policy)
+    candidates, activation_ref = _project_policy(
+        project or "", root, policy, serving_connections=serving_connections
+    )
     catalog, normalized, snapshot = snapshot_current_catalog(
         root,
         serving_connections=serving_connections,
@@ -692,12 +694,18 @@ def _activate(
 
 
 def _project_policy(
-    project: str, root: Path, policy: str | None
+    project: str,
+    root: Path,
+    policy: str | None,
+    *,
+    serving_connections: dict[str, ConnectionConfig],
 ) -> tuple[tuple[RoutedCandidateSnapshot, ...], str]:
     """Return a project policy's pinned candidates and identity, verified for activation.
 
-    A tag-rules policy is verified by binding its selector to the local catalog;
-    a learned policy is loaded through the optimizer-owned verification.
+    A tag-rules policy is verified by binding its selector to the serving catalog,
+    the authored models with the gateway's current connections, which is what the
+    alias snapshot serves; a learned policy is loaded through the optimizer-owned
+    verification.
     """
     try:
         store = ProjectStore(root, project)
@@ -709,10 +717,7 @@ def _project_policy(
     except (ArtifactStoreError, ProjectStoreError) as exc:
         raise ValueError(str(exc)) from exc
     if isinstance(activation, TagRulesActivation):
-        TagRulesSelector.from_activation(
-            activation,
-            RuntimeModelCatalog(load_model_catalog(root / "models.toml"), environment={}),
-        )
+        TagRulesSelector.from_activation(activation, serving_catalog(root, serving_connections))
         return activation.policy.candidates, activation.activation_ref
     runtime = load_project_router(project, root, policy_id=policy_id)
     return runtime.policy.candidates, runtime.policy.policy_id

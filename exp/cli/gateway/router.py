@@ -10,15 +10,22 @@ from pydantic import Field
 
 from exp.cli.gateway.receipts import GatewayReceipt, emit_receipt
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.common.core.artifacts import ContractModel, canonical_json_bytes, stable_id
-from exp.common.models import ModelAlias, RoutedCandidateSnapshot, load_model_catalog
+from exp.common.core.artifacts import ContractModel, canonical_json_bytes
+from exp.common.models import (
+    ConnectionConfig,
+    ModelAlias,
+    RoutedCandidateSnapshot,
+    load_model_catalog,
+)
 from exp.common.project import ArtifactStoreError, ProjectStore, ProjectStoreError
 from exp.common.release_revision import installed_release_revision
 from exp.runtime.gateway.guardrails.classification import DecisionModelAdapterDocument
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tag_router import (
     TAG_RULES_POLICY_ARTIFACT_TYPE,
     TagRule,
     TagRulesRouterPolicy,
+    tag_rules_policy_id,
 )
 from exp.runtime.models import RuntimeModelCatalog
 
@@ -47,6 +54,20 @@ class TagRulesDocument(ContractModel):
     rules: tuple[TagRule, ...] = Field(min_length=1)
 
 
+def serving_catalog(
+    root: Path, serving_connections: dict[str, ConnectionConfig]
+) -> RuntimeModelCatalog:
+    """Return the authored models with the gateway's current provider connections.
+
+    This is the catalog an alias snapshot serves, so candidate identities pinned
+    or checked against it match what the gateway resolves at startup.
+    """
+    authored = load_model_catalog(root / "models.toml")
+    return RuntimeModelCatalog(
+        authored.model_copy(update={"connections": serving_connections}), environment={}
+    )
+
+
 def tag_rules_policy(
     document: TagRulesDocument,
     catalog: RuntimeModelCatalog,
@@ -56,10 +77,6 @@ def tag_rules_policy(
 ) -> TagRulesRouterPolicy:
     """Pin each candidate's catalog identity and freeze one content-addressed policy.
 
-    The identity covers the candidates' pinned models, the classifier, the rules
-    and the default, not the authoring time, so the same file against the same
-    catalog always names the same policy.
-
     Raises:
         ModelConnectionError: A candidate alias is not in the catalog.
         ValueError: The rules name an unknown candidate or category.
@@ -68,18 +85,16 @@ def tag_rules_policy(
         RoutedCandidateSnapshot(alias=alias, model=catalog.snapshot(alias)[0])
         for alias in document.candidates
     )
-    material = {
-        "version": "tag-rules-policy-v1",
-        "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
-        "default_alias": document.default,
-        "classifier": document.classifier.model_dump(mode="json"),
-        "rules": [rule.model_dump(mode="json") for rule in document.rules],
-    }
     return TagRulesRouterPolicy(
         schema_version=1,
         created_at=created_at,
         code_revision=code_revision,
-        policy_id=stable_id("tag-router-policy", material),
+        policy_id=tag_rules_policy_id(
+            candidates=candidates,
+            default_alias=document.default,
+            classifier=document.classifier,
+            rules=document.rules,
+        ),
         candidates=candidates,
         default_alias=document.default,
         classifier=document.classifier,
@@ -97,23 +112,28 @@ def router_tags(
     """Freeze a tag-rules router policy into a project for ``alias create --project``."""
     with usage_error(ValueError, ProjectStoreError, ArtifactStoreError):
         document = TagRulesDocument.model_validate_json(rules_file.read_bytes())
-        catalog = RuntimeModelCatalog(load_model_catalog(root / "models.toml"), environment={})
+        manager = GatewayManagement(root)
+        manager.require_initialized()
+        # The same connection authority alias create reads before it snapshots.
+        manager.migrate_legacy_provider_connections()
+        connections = {item.connection_id: item.config for item in manager.provider_connections()}
         policy = tag_rules_policy(
             document,
-            catalog,
+            serving_catalog(root, connections),
             created_at=datetime.now(tz=UTC),
             code_revision=installed_release_revision(),
         )
         store = ProjectStore(root, project)
         store.load_project()
-        changed = policy.policy_id not in store.artifacts.list_ids()
-        if changed:
-            store.artifacts.write_or_verify_exact(
-                artifact_id=policy.policy_id,
-                artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
-                envelope=policy,
-                files={"policy.json": canonical_json_bytes(policy)},
-            )
+        stored, _manifest = store.artifacts.write_or_replay(
+            artifact_id=policy.policy_id,
+            artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
+            envelope=policy,
+            envelope_path="policy.json",
+            envelope_type=TagRulesRouterPolicy,
+            files={"policy.json": canonical_json_bytes(policy)},
+        )
+        changed = stored.created_at == policy.created_at
     emit_receipt(
         GatewayReceipt(
             operation="router.tags",
