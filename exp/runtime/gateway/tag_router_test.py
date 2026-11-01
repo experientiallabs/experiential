@@ -26,6 +26,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
+    GatewayToolDefinition,
     ProjectTarget,
 )
 from exp.runtime.gateway.guardrails.classification import (
@@ -41,6 +42,7 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.project_activation import load_project_activation
 from exp.runtime.gateway.routing import RouterProjectTargetResolver
 from exp.runtime.gateway.tag_router import (
+    CAPABILITY_ELIGIBILITY,
     CLASSIFIER_UNAVAILABLE,
     NO_CLASSIFIABLE_TEXT,
     NO_RULE_MATCHED,
@@ -60,15 +62,19 @@ _ALIASES = ("coder", "secure", "generalist")
 _THRESHOLDS = {"coding": 0.7, "cyber": 0.8}
 
 
-def _catalog() -> RuntimeModelCatalog:
+def _catalog(*, without_tools: tuple[str, ...] = ()) -> RuntimeModelCatalog:
     """Return a credential-free runtime catalog with three candidates."""
-    capabilities = ModelCapabilities(
-        supports_completions=True,
-        supports_tools=True,
-        supports_structured_output=True,
-        context_window_tokens=128_000,
-        maximum_output_tokens=16_000,
-    )
+
+    def capabilities(alias: str) -> ModelCapabilities:
+        """Declare tools for every candidate except those named."""
+        return ModelCapabilities(
+            supports_completions=True,
+            supports_tools=alias not in without_tools,
+            supports_structured_output=True,
+            context_window_tokens=128_000,
+            maximum_output_tokens=16_000,
+        )
+
     return RuntimeModelCatalog(
         ModelCatalog(
             connections={
@@ -79,7 +85,7 @@ def _catalog() -> RuntimeModelCatalog:
                     billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="provider",
                     model=f"model-{alias}",
-                    capabilities=capabilities,
+                    capabilities=capabilities(alias),
                 )
                 for alias in _ALIASES
             },
@@ -142,10 +148,16 @@ def _policy(catalog: RuntimeModelCatalog) -> TagRulesRouterPolicy:
 class _ScriptedClassifier:
     """Answer each inspection from a queue of scores, failures, or text-free verdicts."""
 
-    def __init__(self, *answers: dict[str, float] | Exception | None, delay: float = 0.0) -> None:
-        """Queue answers in call order, each given after ``delay`` seconds."""
+    def __init__(
+        self,
+        *answers: dict[str, float] | Exception | None,
+        delay: float = 0.0,
+        delays: tuple[float, ...] = (),
+    ) -> None:
+        """Queue answers in call order, each given after its delay (``delay`` by default)."""
         self._answers = list(answers)
         self._delay = delay
+        self._delays = list(delays)
         self.calls = 0
 
     async def inspect_input(
@@ -154,8 +166,8 @@ class _ScriptedClassifier:
         """Return the next scripted verdict."""
         del request, check
         self.calls += 1
-        await asyncio.sleep(self._delay)
         answer = self._answers.pop(0)
+        await asyncio.sleep(self._delays.pop(0) if self._delays else self._delay)
         if isinstance(answer, Exception):
             raise answer
         if answer is None:
@@ -175,11 +187,13 @@ class _ScriptedClassifier:
 def _selector(
     *answers: dict[str, float] | Exception | None,
     delay: float = 0.0,
+    delays: tuple[float, ...] = (),
     capacity: int = 4_096,
+    without_tools: tuple[str, ...] = (),
 ) -> tuple[TagRulesSelector, _ScriptedClassifier]:
     """Return a selector over the test policy and its scripted classifier."""
-    catalog = _catalog()
-    classifier = _ScriptedClassifier(*answers, delay=delay)
+    catalog = _catalog(without_tools=without_tools)
+    classifier = _ScriptedClassifier(*answers, delay=delay, delays=delays)
     selector = TagRulesSelector(
         _policy(catalog),
         catalog,
@@ -293,6 +307,44 @@ def test_a_deadline_that_ends_during_classification_fails_and_keeps_nothing() ->
         )
     later = selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
     assert (later.selected_alias, classifier.calls) == ("coder", 2)
+
+
+def test_a_candidate_that_cannot_serve_the_request_yields_to_an_eligible_one() -> None:
+    """A tool request never lands on a candidate that declares no tools."""
+    selector, _ = _selector({"coding": 0.9, "cyber": 0.1}, without_tools=("coder",))
+    request = _request("fix").model_copy(
+        update={"tools": (GatewayToolDefinition(name="run_tests", parameters={"type": "object"}),)}
+    )
+    decision = selector.select_blocking(request, episode_id="one", deadline=_deadline())
+    assert (decision.selected_alias, decision.fallback_reason) == (
+        "generalist",
+        CAPABILITY_ELIGIBILITY,
+    )
+    plain = selector.select_blocking(_request("more"), episode_id="one", deadline=_deadline())
+    assert (plain.selected_alias, plain.fallback_reason) == ("coder", None)
+
+
+def test_a_policy_names_no_classifier_credential() -> None:
+    """A credential reference never enters an immutable policy artifact."""
+    document = _document(_catalog())
+    classifier = {**cast("JsonObject", document["classifier"]), "bearer_env": "DECISION_TOKEN"}
+    with pytest.raises(ValueError, match="names no credential"):
+        TagRulesRouterPolicy.model_validate({**document, "classifier": classifier})
+
+
+def test_a_failed_classification_follows_a_concurrent_episode_choice() -> None:
+    """One episode never mixes models because its classifier failed for one request."""
+    selector, _ = _selector(RuntimeError("down"), {"coding": 0.9, "cyber": 0.1}, delays=(0.2, 0.0))
+
+    async def both() -> tuple[RoutingDecision, RoutingDecision]:
+        """Run a slow failing request and a fast answered one in the same episode."""
+        return await asyncio.gather(
+            selector.select(_request("first"), episode_id="one", deadline=_deadline()),
+            selector.select(_request("second"), episode_id="one", deadline=_deadline()),
+        )
+
+    failed, answered = asyncio.run(both())
+    assert (answered.selected_alias, failed.selected_alias) == ("coder", "coder")
 
 
 def test_an_expired_deadline_fails_the_request_before_the_classifier() -> None:
