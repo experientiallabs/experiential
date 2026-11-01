@@ -69,7 +69,7 @@ def project_selector(
     Args:
         activation: Verified learned or tag-rules project activation.
         catalog: Runtime catalog resolving the policy's pinned aliases.
-        decision_sink: Optional learned-router decision recorder.
+        decision_sink: Optional recorder for every routing decision.
 
     Returns:
         A learned ``RouterRuntime`` or a ``TagRulesSelector``.
@@ -79,7 +79,9 @@ def project_selector(
     """
     if isinstance(activation, TagRulesActivation):
         try:
-            return TagRulesSelector.from_activation(activation, catalog)
+            return TagRulesSelector.from_activation(
+                activation, catalog, decision_sink=decision_sink
+            )
         except TagRouterIntegrityError as exc:
             raise ProjectActivationError(str(exc)) from exc
     return RouterRuntime.from_activation(activation, catalog, decision_sink=decision_sink)
@@ -805,6 +807,7 @@ class RouterProjectTargetResolver:
         episode_id = project_episode_identity(episode_namespace)
         if isinstance(runtime, TagRulesSelector):
             decision = await runtime.select(request, episode_id=episode_id, deadline=deadline)
+            deadline.attempt_timeout()
             return self._selection(target, decision, route_reason=TAG_ROUTER_ROUTE_REASON)
         model_request = gateway_model_request(request)
         decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
@@ -867,6 +870,7 @@ class RouterProjectTargetResolver:
         episode_id = project_episode_identity(episode_namespace)
         if isinstance(runtime, TagRulesSelector):
             decision = runtime.select_blocking(request, episode_id=episode_id, deadline=deadline)
+            deadline.attempt_timeout()
             return self._selection(target, decision, route_reason=TAG_ROUTER_ROUTE_REASON)
         model_request = gateway_model_request(request)
         decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.

@@ -7,9 +7,10 @@ default candidate. Before dispatch the classifier reads its window of the reques
 once; the first rule whose ``when_all`` categories all reached their thresholds
 and whose ``when_none`` categories all stayed below them names the candidate.
 No match routes to the default, and so does a classifier that fails, times out,
-or finds no text, so routing never fails a request. Like learned routing, the
-first decision of an episode serves its later turns while the episode stays
-active; a decision made without a classifier answer is never pinned to it.
+or finds no text, so routing never fails a request; only an expired request
+deadline does. Like learned routing, the first decision of an episode serves its
+later turns while the episode stays active; a decision made without a
+classifier answer is never pinned to it.
 Tag-rules policies are stored as their own artifact type, so commands that read
 learned router policies never see them.
 """
@@ -21,7 +22,7 @@ import hashlib
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -52,7 +53,10 @@ from exp.runtime.gateway.guardrails.contracts import (
     ScoredVerdict,
 )
 from exp.runtime.models import RuntimeModelCatalog
-from exp.runtime.models.providers.async_transport import RequestDeadline
+from exp.runtime.models.providers.async_transport import (
+    ProviderDeadlineExceeded,
+    RequestDeadline,
+)
 
 TAG_RULES_POLICY_ARTIFACT_TYPE: Final = "tag-router-policy"
 TAG_ROUTER_ROUTE_REASON: Final = "tag_router"
@@ -61,6 +65,9 @@ CLASSIFIER_UNAVAILABLE: Final = "classifier_unavailable"
 NO_CLASSIFIABLE_TEXT: Final = "no_classifiable_text"
 _MAX_RULES: Final = 64
 _PENDING_DECISION_ID: Final = "routing-decision-pending"
+
+type TagDecisionSink = Callable[[RoutingDecision], None]
+"""Recorder for every tag routing decision, with the learned router's sink contract."""
 
 
 class TagRouterIntegrityError(ValueError):
@@ -92,7 +99,7 @@ class TagRulesRouterPolicy(ArtifactEnvelope):
 
     Attributes:
         kind: Always ``tag_rules``.
-        policy_id: Content-addressed router-policy identity.
+        policy_id: Identity derived from the candidates, default, classifier and rules.
         candidates: Candidate aliases with their frozen model identities.
         default_alias: Candidate serving requests no rule matches.
         classifier: Decision-model document scoring the request before dispatch.
@@ -130,12 +137,50 @@ class TagRulesRouterPolicy(ArtifactEnvelope):
                 raise ValueError("tag rules may name only the classifier's categories")
             if set(rule.when_all) & set(rule.when_none):
                 raise ValueError("a tag rule cannot require and forbid the same category")
+        expected = tag_rules_policy_id(
+            candidates=self.candidates,
+            default_alias=self.default_alias,
+            classifier=self.classifier,
+            rules=self.rules,
+        )
+        if self.policy_id != expected:
+            raise ValueError("tag router policy_id differs from its content identity")
         return self
+
+
+def tag_rules_policy_id(
+    *,
+    candidates: Sequence[RoutedCandidateSnapshot],
+    default_alias: str,
+    classifier: DecisionModelAdapterDocument,
+    rules: Sequence[TagRule],
+) -> ArtifactId:
+    """Return the identity of a tag-rules policy's routing content.
+
+    It covers the pinned candidates, the default, the classifier and the rules,
+    not provenance such as the authoring time, so equal content is one policy.
+    """
+    return stable_id(
+        "tag-router-policy",
+        {
+            "version": "tag-rules-policy-v1",
+            "candidates": [candidate.model_dump(mode="json") for candidate in candidates],
+            "default_alias": default_alias,
+            "classifier": classifier.model_dump(mode="json"),
+            "rules": [rule.model_dump(mode="json") for rule in rules],
+        },
+    )
 
 
 @dataclass(frozen=True)
 class TagRulesActivation:
-    """Verified immutable material for one tag-rules exact-model selector."""
+    """Verified immutable material for one tag-rules exact-model selector.
+
+    Attributes:
+        project_ref: Project that stores the policy.
+        activation_ref: Activated policy identity, equal to ``policy.policy_id``.
+        policy: The frozen tag-rules policy.
+    """
 
     project_ref: str
     activation_ref: ArtifactId
@@ -169,6 +214,7 @@ class TagRulesSelector:
         catalog: RuntimeModelCatalog,
         *,
         classifier: DecisionModelClassifier | None = None,
+        decision_sink: TagDecisionSink | None = None,
         decision_capacity: int = 4_096,
         decision_ttl_seconds: float = 24 * 60 * 60,
         clock: Callable[[], float] = time.monotonic,
@@ -182,8 +228,9 @@ class TagRulesSelector:
             policy: Frozen tag-rules policy.
             catalog: Runtime catalog resolving the candidate aliases.
             classifier: Optional injected classifier; ``None`` builds one from the policy.
-            decision_capacity: Most retained episode and request decisions, default 4,096.
-            decision_ttl_seconds: Seconds a retained decision stays valid, default one day.
+            decision_sink: Optional recorder called with every decision before it is used.
+            decision_capacity: Most retained episode decisions, default 4,096.
+            decision_ttl_seconds: Seconds an idle episode's decision stays valid, default one day.
             clock: Monotonic clock for decision expiry.
 
         Raises:
@@ -217,21 +264,23 @@ class TagRulesSelector:
             adapter_id=policy.classifier.adapter_id,
         )
         self._policy_sha256 = sha256_json(policy)
+        self._decision_sink = decision_sink
         self._capacity = decision_capacity
         self._ttl_seconds = decision_ttl_seconds
         self._clock = clock
         self._lock = threading.Lock()
         self._episodes: OrderedDict[Sha256, tuple[float, RoutingDecision]] = OrderedDict()
-        self._requests: OrderedDict[tuple[Sha256, Sha256], tuple[float, RoutingDecision]] = (
-            OrderedDict()
-        )
 
     @classmethod
     def from_activation(
-        cls, activation: TagRulesActivation, catalog: RuntimeModelCatalog
+        cls,
+        activation: TagRulesActivation,
+        catalog: RuntimeModelCatalog,
+        *,
+        decision_sink: TagDecisionSink | None = None,
     ) -> TagRulesSelector:
         """Bind one verified activation to runtime-owned model resolution."""
-        return cls(activation.policy, catalog)
+        return cls(activation.policy, catalog, decision_sink=decision_sink)
 
     async def select(
         self, request: GatewayRequest, *, episode_id: str, deadline: RequestDeadline
@@ -250,11 +299,11 @@ class TagRulesSelector:
             ProviderDeadlineExceeded: The request deadline expired.
         """
         keys = self._keys(request, episode_id)
-        reused = self._reuse(keys)
-        if reused is not None:
-            return reused
-        flagged, reason = await self._classify(request, deadline)
-        return self._retain(keys, self._decision(keys, flagged, reason))
+        decision = self._reuse(keys)
+        if decision is None:
+            flagged, reason = await self._classify(request, deadline)
+            decision = self._retain(keys, self._decision(keys, flagged, reason))
+        return self._record(decision)
 
     def select_blocking(
         self, request: GatewayRequest, *, episode_id: str, deadline: RequestDeadline
@@ -265,11 +314,17 @@ class TagRulesSelector:
         guardrail inspection uses, so the calling bridge thread only waits.
         """
         keys = self._keys(request, episode_id)
-        reused = self._reuse(keys)
-        if reused is not None:
-            return reused
-        flagged, reason = run_on_native_loop(self._classify(request, deadline))
-        return self._retain(keys, self._decision(keys, flagged, reason))
+        decision = self._reuse(keys)
+        if decision is None:
+            flagged, reason = run_on_native_loop(self._classify(request, deadline))
+            decision = self._retain(keys, self._decision(keys, flagged, reason))
+        return self._record(decision)
+
+    def _record(self, decision: RoutingDecision) -> RoutingDecision:
+        """Send one decision to the sink before it is used, as learned routing does."""
+        if self._decision_sink is not None:
+            self._decision_sink(decision)
+        return decision
 
     def _keys(self, request: GatewayRequest, episode_id: str) -> tuple[Sha256, Sha256]:
         """Return the episode and request digests: the request is the classified window."""
@@ -289,14 +344,16 @@ class TagRulesSelector:
         Raises:
             ProviderDeadlineExceeded: The request deadline expired before the call.
         """
-        timeout = deadline.attempt_timeout(self.policy.classifier.timeout_ms / 1000.0)
+        classifier_seconds = self.policy.classifier.timeout_ms / 1000.0
+        budget = deadline.attempt_timeout(classifier_seconds)
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout(budget):
                 verdict = await self._classifier.inspect_input(request=request, check=self._check)
         except TimeoutError:
-            # The request's own deadline fails the request, as learned routing does;
-            # only the classifier's shorter timeout falls back to the default.
-            deadline.attempt_timeout()
+            # A budget cut short by the request's deadline fails the request, as
+            # learned routing does; only the classifier's own timeout falls back.
+            if budget < classifier_seconds:
+                raise ProviderDeadlineExceeded("tag router selection deadline exceeded") from None
             return frozenset(), CLASSIFIER_UNAVAILABLE
         except Exception:  # noqa: BLE001 - routing falls back; it never fails the request.
             return frozenset(), CLASSIFIER_UNAVAILABLE
@@ -335,72 +392,49 @@ class TagRulesSelector:
         )
 
     def _reuse(self, keys: tuple[Sha256, Sha256]) -> RoutingDecision | None:
-        """Return this request's decision, or the episode's choice bound to this request."""
+        """Return the episode's choice bound to this request, renewing the episode."""
         with self._lock:
-            cached = self._hit(self._requests, keys)
-            if cached is not None:
-                return cached
-            episode = self._hit(self._episodes, keys[0])
-            if episode is None:
-                return None
-            return self._store(self._requests, keys, _for_request(episode, keys[1]))
+            episode = self._hit(keys[0])
+        return None if episode is None else _for_request(episode, keys[1])
 
     def _retain(self, keys: tuple[Sha256, Sha256], decision: RoutingDecision) -> RoutingDecision:
-        """Publish a fresh decision unless a concurrent request already chose for the episode.
+        """Pin a fresh decision unless a concurrent request already chose for the episode.
 
-        A decision made without a classifier answer is returned unretained, so the
-        next request asks again instead of keeping the default for the episode. A
-        request with no classifiable text is retained for itself only.
+        A decision made without a classifier answer, or for a request with no
+        classifiable text, is returned unpinned, so a later request asks again
+        instead of keeping the default for the whole episode.
         """
-        if decision.fallback_reason == CLASSIFIER_UNAVAILABLE:
+        if decision.fallback_reason in {CLASSIFIER_UNAVAILABLE, NO_CLASSIFIABLE_TEXT}:
             return decision
         with self._lock:
-            cached = self._hit(self._requests, keys)
-            if cached is not None:
-                return cached
-            episode = self._hit(self._episodes, keys[0])
+            episode = self._hit(keys[0])
             if episode is not None:
-                decision = _for_request(episode, keys[1])
-            elif decision.fallback_reason != NO_CLASSIFIABLE_TEXT:
-                self._store(self._episodes, keys[0], decision)
-            return self._store(self._requests, keys, decision)
+                return _for_request(episode, keys[1])
+            now = self._clock()
+            self._episodes[keys[0]] = (now + self._ttl_seconds, decision)
+            while self._episodes and (
+                len(self._episodes) > self._capacity
+                or next(iter(self._episodes.values()))[0] <= now
+            ):
+                self._episodes.popitem(last=False)
+        return decision
 
-    def _hit[KeyT](
-        self, store: OrderedDict[KeyT, tuple[float, RoutingDecision]], key: KeyT
-    ) -> RoutingDecision | None:
-        """Return an unexpired decision and renew it, or drop an expired one.
+    def _hit(self, episode_sha256: Sha256) -> RoutingDecision | None:
+        """Return an episode's unexpired decision and renew it, or drop an expired one.
 
         A hit moves to the newest end with a fresh lifetime, so an active episode
-        outlives idle ones and order stays expiry order. Callers hold the lock.
+        outlives idle ones and insertion order stays expiry order. Callers hold the lock.
         """
-        entry = store.get(key)
+        entry = self._episodes.get(episode_sha256)
         if entry is None:
             return None
         now = self._clock()
         if entry[0] <= now:
-            del store[key]
+            del self._episodes[episode_sha256]
             return None
-        store.move_to_end(key)
-        store[key] = (now + self._ttl_seconds, entry[1])
+        self._episodes.move_to_end(episode_sha256)
+        self._episodes[episode_sha256] = (now + self._ttl_seconds, entry[1])
         return entry[1]
-
-    def _store[KeyT](
-        self,
-        store: OrderedDict[KeyT, tuple[float, RoutingDecision]],
-        key: KeyT,
-        decision: RoutingDecision,
-    ) -> RoutingDecision:
-        """Retain one decision at the newest end under the TTL and capacity bounds.
-
-        Every write and hit renews the entry for ``decision_ttl_seconds``, so order
-        is expiry order and trimming from the oldest end is enough. Callers hold the lock.
-        """
-        now = self._clock()
-        store[key] = (now + self._ttl_seconds, decision)
-        store.move_to_end(key)
-        while store and (len(store) > self._capacity or next(iter(store.values()))[0] <= now):
-            store.popitem(last=False)
-        return decision
 
 
 def _for_request(decision: RoutingDecision, request_sha256: Sha256) -> RoutingDecision:

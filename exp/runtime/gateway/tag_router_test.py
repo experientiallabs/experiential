@@ -21,13 +21,17 @@ from exp.common.models import (
     RoutedCandidateSnapshot,
 )
 from exp.common.project import ArtifactStore, ProjectPaths
+from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
     ProjectTarget,
 )
-from exp.runtime.gateway.guardrails.classification import DecisionModelClassifier
+from exp.runtime.gateway.guardrails.classification import (
+    DecisionModelAdapterDocument,
+    DecisionModelClassifier,
+)
 from exp.runtime.gateway.guardrails.contracts import (
     CategoryScore,
     ClassifierVerdict,
@@ -43,9 +47,11 @@ from exp.runtime.gateway.tag_router import (
     TAG_ROUTER_ROUTE_REASON,
     TAG_RULES_POLICY_ARTIFACT_TYPE,
     TagRouterIntegrityError,
+    TagRule,
     TagRulesActivation,
     TagRulesRouterPolicy,
     TagRulesSelector,
+    tag_rules_policy_id,
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
@@ -89,7 +95,6 @@ def _document(catalog: RuntimeModelCatalog, **overrides: JsonValue) -> JsonObjec
         "schema_version": 1,
         "created_at": datetime(2026, 11, 1, tzinfo=UTC).isoformat(),
         "code_revision": "test",
-        "policy_id": "router-policy-tags",
         "candidates": [
             RoutedCandidateSnapshot(alias=alias, model=catalog.snapshot(alias)[0]).model_dump(
                 mode="json"
@@ -113,7 +118,20 @@ def _document(catalog: RuntimeModelCatalog, **overrides: JsonValue) -> JsonObjec
         ],
     }
     document.update(overrides)
-    return document
+    return _identified(document)
+
+
+def _identified(document: JsonObject) -> JsonObject:
+    """Return the document carrying the content identity of its current fields."""
+    rules = cast("list[JsonObject]", document["rules"])
+    candidates = cast("list[JsonObject]", document["candidates"])
+    policy_id = tag_rules_policy_id(
+        candidates=[RoutedCandidateSnapshot.model_validate(item) for item in candidates],
+        default_alias=str(document["default_alias"]),
+        classifier=DecisionModelAdapterDocument.model_validate(document["classifier"]),
+        rules=[TagRule.model_validate(rule) for rule in rules],
+    )
+    return {**document, "policy_id": policy_id}
 
 
 def _policy(catalog: RuntimeModelCatalog) -> TagRulesRouterPolicy:
@@ -314,8 +332,34 @@ def test_a_candidate_whose_identity_drifted_refuses_activation() -> None:
     candidates = cast("list[JsonObject]", document["candidates"])
     model = cast("JsonObject", candidates[0]["model"])
     model["model_id"] = "a-different-model"
+    drifted = TagRulesRouterPolicy.model_validate(_identified(document))
     with pytest.raises(TagRouterIntegrityError, match="frozen identity"):
-        TagRulesSelector(TagRulesRouterPolicy.model_validate(document), catalog)
+        TagRulesSelector(drifted, catalog)
+
+
+def test_a_policy_id_must_be_its_content_identity() -> None:
+    """Two different policies can never share an identity."""
+    document = {**_document(_catalog()), "policy_id": "tag-router-policy-chosen-by-hand"}
+    with pytest.raises(ValueError, match="content identity"):
+        TagRulesRouterPolicy.model_validate(document)
+
+
+def test_every_decision_reaches_the_sink_before_it_is_used() -> None:
+    """Fresh and reused decisions are both recorded, each bound to its request."""
+    catalog = _catalog()
+    records: list[RoutingDecision] = []
+    selector = TagRulesSelector(
+        _policy(catalog),
+        catalog,
+        classifier=cast(
+            "DecisionModelClassifier", _ScriptedClassifier({"coding": 0.9, "cyber": 0.1})
+        ),
+        decision_sink=records.append,
+    )
+    first = selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
+    later = selector.select_blocking(_request("more"), episode_id="one", deadline=_deadline())
+    assert records == [first, later]
+    assert [record.selected_alias for record in records] == ["coder", "coder"]
 
 
 def test_a_stored_tag_rules_policy_loads_as_its_own_activation(tmp_path: Path) -> None:
@@ -339,7 +383,7 @@ def test_a_stored_tag_rules_policy_loads_as_its_own_activation(tmp_path: Path) -
 def test_the_project_resolver_reports_tag_routing_and_the_selected_exact_model() -> None:
     """A tag-rules activation resolves without the learned lane and names its reason."""
     selector, _ = _selector({"coding": 0.9, "cyber": 0.1})
-    key = ("project-a", "router-policy-tags", "e" * 64)
+    key = ("project-a", selector.policy.policy_id, "e" * 64)
     resolver = RouterProjectTargetResolver(
         {key: selector},
         {(*key, alias): f"exact-{alias}" for alias in _ALIASES},
