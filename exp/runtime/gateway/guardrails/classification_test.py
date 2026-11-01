@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable
 
@@ -24,6 +25,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    ScoredVerdict,
 )
 from exp.runtime.gateway.guardrails.http_json import ClassifierProtocolError
 
@@ -320,3 +322,42 @@ def test_document_rejects_repeated_question_ids_and_oversized_questions() -> Non
                 }
             )
         )
+
+
+def test_verdict_reports_every_category_score_and_the_digest_of_the_state_sent() -> None:
+    """Scores, per-category flags and the subject digest describe the exact model call."""
+    states: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record the posted state and answer with one flagged mean category."""
+        states.append(json.loads(request.content)["state"])
+        return httpx.Response(
+            200,
+            json=_answers(overrides_instructions=0.25, unrelated_task=0.9, unrelated_domain=0.7),
+        )
+
+    async def scenario() -> list[ScoredVerdict]:
+        """Ask twice so the second verdict comes from the cache."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = DecisionModelClassifier(
+                DecisionModelAdapterDocument.model_validate(_document(bearer_env=None)),
+                client=client,
+            )
+            verdicts = [
+                await adapter.inspect_input(request=_request(), check=_CHECK) for _ in range(2)
+            ]
+        assert all(isinstance(verdict, ScoredVerdict) for verdict in verdicts)
+        return [verdict for verdict in verdicts if isinstance(verdict, ScoredVerdict)]
+
+    first, second = asyncio.run(scenario())
+    assert len(states) == 1
+    assert first.flagged
+    assert [(score.category, score.flagged) for score in first.scores] == [
+        ("prompt_injection", False),
+        ("off_topic", True),
+    ]
+    assert [score.score for score in first.scores] == pytest.approx([0.25, 0.8])
+    assert first.subject_sha256 == hashlib.sha256(states[0].encode("utf-8")).hexdigest()
+    assert not first.cached
+    assert second.cached
+    assert (second.scores, second.subject_sha256) == (first.scores, first.subject_sha256)

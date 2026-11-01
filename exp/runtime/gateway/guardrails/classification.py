@@ -43,10 +43,12 @@ from exp.runtime.gateway.guardrails.classification_window import (
     window_projection,
 )
 from exp.runtime.gateway.guardrails.contracts import (
+    CategoryScore,
     ClassifierCoverageError,
     ClassifierVerdict,
     GuardrailCheck,
     GuardrailCompletion,
+    ScoredVerdict,
 )
 from exp.runtime.gateway.guardrails.http_json import (
     DEFAULT_HTTP_JSON_MAX_RESPONSE_BYTES,
@@ -281,7 +283,9 @@ class DecisionModelClassifier:
     ) -> ClassifierVerdict:
         """Flag the request when any category score reaches its threshold.
 
-        A request with no classifiable text is allowed without a model call.
+        A request with no classifiable text is allowed without a model call and
+        carries no scores. Otherwise the verdict carries every category's score
+        and the digest of the window text the model read.
 
         Raises:
             ClassifierProtocolError: The decision call did not return a valid answer.
@@ -325,8 +329,15 @@ class DecisionModelClassifier:
             ",".join(f"{name}:{score_bucket(value) / SCORE_BUCKETS:.2f}" for name, value in scores),
         )
         categories = self._document.categories
-        return ClassifierVerdict(
-            flagged=any(value >= categories[name].threshold for name, value in scores)
+        category_scores = tuple(
+            CategoryScore(category=name, score=value, flagged=value >= categories[name].threshold)
+            for name, value in scores
+        )
+        return ScoredVerdict(
+            flagged=any(score.flagged for score in category_scores),
+            scores=category_scores,
+            subject_sha256=sha256(state.encode("utf-8")).hexdigest(),
+            cached=cached,
         )
 
     async def inspect_output(

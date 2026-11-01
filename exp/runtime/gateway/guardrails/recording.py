@@ -1,4 +1,4 @@
-"""Bound content-free observation recording independently of request and classifier work."""
+"""Bound content-free observation and score recording independently of request work."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from exp.runtime.gateway.guardrails.contracts import (
+    CategoryScore,
     GuardrailCheck,
     GuardrailOutcome,
     GuardrailPolicy,
@@ -31,17 +32,42 @@ class ObservationRecord:
     latency_seconds: float
 
 
-class ObservationRecorder:
+@dataclass(frozen=True)
+class ClassificationRecord:
+    """Content-free scores of one decision-model check on one request subject.
+
+    Attributes:
+        request_id: Authenticated request the classified subject belongs to.
+        policy: Frozen policy that ran the check, with its scope, mode and revision.
+        check: Frozen check identity, capability and authored action.
+        outcome: ``allow`` or ``flagged``.
+        scores: Every configured category's score, in authored order.
+        subject_sha256: SHA-256 of the exact window text the model read.
+        cached: Whether the scores came from the verdict cache.
+        latency_seconds: Measured bounded inspection duration.
+    """
+
+    request_id: str
+    policy: GuardrailPolicy
+    check: GuardrailCheck
+    outcome: GuardrailOutcome
+    scores: tuple[CategoryScore, ...]
+    subject_sha256: str
+    cached: bool
+    latency_seconds: float
+
+
+class ObservationRecorder[RecordT]:
     """Send finite metadata to one daemon sink worker without blocking serving threads."""
 
-    def __init__(self, record: Callable[[ObservationRecord], None], *, max_records: int) -> None:
+    def __init__(self, record: Callable[[RecordT], None], *, max_records: int) -> None:
         """Bound queued plus active records, including a sink that ignores shutdown."""
         if max_records < 1:
             raise ValueError("observation recording capacity must be positive")
         self._record = record
         self._max_records = max_records
         self._condition = threading.Condition()
-        self._queued: deque[ObservationRecord] = deque()
+        self._queued: deque[RecordT] = deque()
         self._pending = 0
         self._dropped = 0
         self._failed = 0
@@ -62,7 +88,7 @@ class ObservationRecorder:
         with self._condition:
             return self._failed
 
-    def submit(self, record: ObservationRecord) -> bool:
+    def submit(self, record: RecordT) -> bool:
         """Enqueue metadata without waiting for sink completion or free capacity."""
         with self._condition:
             if self._closed or self._pending >= self._max_records:

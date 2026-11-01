@@ -60,6 +60,7 @@ class GuardrailSession:
         engine: Shared bounded classifier executor and decision recorder.
         policies: All applicable policies, captured once under authenticated authority.
         deadline_monotonic: Original absolute deadline, never renewed by polls or retries.
+        request_id: Authenticated request identity for score records, or None for none.
         detectors: Pure native detector implementations, empty until configured.
         _input: Pending parallel input inspection, or None before it starts.
         _input_failure: Retained input or required capture rejection, or None before failure.
@@ -72,6 +73,7 @@ class GuardrailSession:
     engine: GuardrailEngine
     policies: tuple[GuardrailPolicy, ...]
     deadline_monotonic: float
+    request_id: str | None = None
     detectors: Mapping[str, NativeDetector] = field(default_factory=dict, repr=False)
     _input: Future[None] | None = field(default=None, init=False, repr=False)
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
@@ -97,6 +99,7 @@ class GuardrailSession:
             request=request,
             deadline_monotonic=self.deadline_monotonic,
             observed=self._observed,
+            request_id=self.request_id,
         )
 
     def can_overlap_input(self, request: GatewayRequest) -> bool:
@@ -171,7 +174,10 @@ class GuardrailSession:
             native
             if native is not None
             else await self.engine.enforce_input(
-                policy=policy, request=request, deadline_monotonic=self.deadline_monotonic
+                policy=policy,
+                request=request,
+                deadline_monotonic=self.deadline_monotonic,
+                request_id=self.request_id,
             )
         )
 
