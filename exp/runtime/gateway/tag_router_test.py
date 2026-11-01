@@ -479,3 +479,27 @@ def test_the_project_resolver_reports_tag_routing_and_the_selected_exact_model()
     assert (selection.selected_alias, selection.exact_model_id) == ("coder", "exact-coder")
     assert selection.route_reason == TAG_ROUTER_ROUTE_REASON
     assert selection.fallback_reason is None
+
+
+def test_a_decision_the_sink_refuses_is_not_pinned() -> None:
+    """A failed recording leaves the episode free, so a retry classifies again."""
+    catalog = _catalog()
+    refusals = [RuntimeError("journal unavailable")]
+
+    def sink(decision: RoutingDecision) -> None:
+        """Refuse the first recording only."""
+        del decision
+        if refusals:
+            raise refusals.pop()
+
+    classifier = _ScriptedClassifier({"coding": 0.9, "cyber": 0.1}, {"coding": 0.1, "cyber": 0.9})
+    selector = TagRulesSelector(
+        _policy(catalog),
+        catalog,
+        classifier=cast("DecisionModelClassifier", classifier),
+        decision_sink=sink,
+    )
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
+    retried = selector.select_blocking(_request("fix"), episode_id="one", deadline=_deadline())
+    assert (retried.selected_alias, classifier.calls) == ("secure", 2)

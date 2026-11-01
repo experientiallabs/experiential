@@ -323,12 +323,12 @@ class TagRulesSelector:
             ProviderDeadlineExceeded: The request deadline expired.
         """
         keys = self._keys(request, episode_id)
-        decision = self._reuse(keys)
-        if decision is None:
-            flagged, reason = await self._bounded_classify(request, deadline)
-            deadline.attempt_timeout()
-            decision = self._retain(keys, self._decision(keys, flagged, reason))
-        return self._record(self._eligible(request, decision))
+        reused = self._reuse(keys)
+        if reused is not None:
+            return self._record(self._eligible(request, reused))
+        flagged, reason = await self._bounded_classify(request, deadline)
+        deadline.attempt_timeout()
+        return self._publish(request, keys, self._decision(keys, flagged, reason))
 
     def select_blocking(
         self, request: GatewayRequest, *, episode_id: str, deadline: RequestDeadline
@@ -339,12 +339,12 @@ class TagRulesSelector:
         guardrail inspection uses, so the calling bridge thread only waits.
         """
         keys = self._keys(request, episode_id)
-        decision = self._reuse(keys)
-        if decision is None:
-            flagged, reason = run_on_native_loop(self._bounded_classify(request, deadline))
-            deadline.attempt_timeout()
-            decision = self._retain(keys, self._decision(keys, flagged, reason))
-        return self._record(self._eligible(request, decision))
+        reused = self._reuse(keys)
+        if reused is not None:
+            return self._record(self._eligible(request, reused))
+        flagged, reason = run_on_native_loop(self._bounded_classify(request, deadline))
+        deadline.attempt_timeout()
+        return self._publish(request, keys, self._decision(keys, flagged, reason))
 
     def _eligible(self, request: GatewayRequest, decision: RoutingDecision) -> RoutingDecision:
         """Keep the choice, or move this request to a candidate that can serve it.
@@ -473,28 +473,32 @@ class TagRulesSelector:
             episode = self._hit(keys[0])
         return None if episode is None else _for_request(episode, keys[1])
 
-    def _retain(self, keys: tuple[Sha256, Sha256], decision: RoutingDecision) -> RoutingDecision:
-        """Pin a fresh decision unless a concurrent request already chose for the episode.
+    def _publish(
+        self, request: GatewayRequest, keys: tuple[Sha256, Sha256], decision: RoutingDecision
+    ) -> RoutingDecision:
+        """Record and pin a fresh decision unless the episode already chose.
 
-        A decision made without a classifier answer (failed, timed out, or shed
-        at the in-flight bound), or for a request with no classifiable text, is
-        returned unpinned, so a later request asks again instead of keeping the
-        default for the whole episode.
+        The decision reaches the sink before it is pinned, so a recording failure
+        pins nothing. A concurrent request's earlier choice for the episode wins.
+        A decision made without a classifier answer (failed, timed out, or shed at
+        the in-flight bound), or for a request with no classifiable text, is never
+        pinned, so a later request asks again instead of keeping the default.
         """
+        used = self._eligible(request, decision)
         with self._lock:
             episode = self._hit(keys[0])
-            if episode is not None:
-                return _for_request(episode, keys[1])
-            if decision.fallback_reason in _UNPINNED:
-                return decision
-            now = self._clock()
-            self._episodes[keys[0]] = (now + self._ttl_seconds, decision)
-            while self._episodes and (
-                len(self._episodes) > self._capacity
-                or next(iter(self._episodes.values()))[0] <= now
-            ):
-                self._episodes.popitem(last=False)
-        return decision
+            if episode is None:
+                self._record(used)
+                if decision.fallback_reason not in _UNPINNED:
+                    now = self._clock()
+                    self._episodes[keys[0]] = (now + self._ttl_seconds, decision)
+                    while self._episodes and (
+                        len(self._episodes) > self._capacity
+                        or next(iter(self._episodes.values()))[0] <= now
+                    ):
+                        self._episodes.popitem(last=False)
+                return used
+        return self._record(self._eligible(request, _for_request(episode, keys[1])))
 
     def _hit(self, episode_sha256: Sha256) -> RoutingDecision | None:
         """Return an episode's unexpired decision and renew it, or drop an expired one.
