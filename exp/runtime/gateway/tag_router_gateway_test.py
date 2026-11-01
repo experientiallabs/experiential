@@ -9,26 +9,24 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from exp.cli.app import app
-from exp.common.models import load_model_catalog
+from exp.common.models import (
+    ConnectionConfig,
+    GatewayDeploymentCapabilities,
+    GatewayTokenPrices,
+    ModelCapabilities,
+)
 from exp.common.project import ProjectConfig, ProjectStore
+from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle import load_gateway_components
-from exp.runtime.gateway.lifecycle_test import (
-    _configured_project_pool,
-    _granted_authorities,
-    _ReadinessProjectRepository,
-)
-from exp.runtime.gateway.project_activation import ProjectActivation, load_project_activation
-from exp.runtime.gateway.tag_router import (
-    NO_RULE_MATCHED,
-    TAG_ROUTER_ROUTE_REASON,
-    TagRulesActivation,
-)
+from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.project_activation import LocalArtifactProjectActivationRepository
+from exp.runtime.gateway.tag_router import NO_RULE_MATCHED, TAG_ROUTER_ROUTE_REASON
 from exp.runtime.openai_protocol.requests import decode_chat
 
 _ENVIRONMENT = {"PRIMARY_PROVIDER_KEY": "available", "SECONDARY_PROVIDER_KEY": "available"}
@@ -114,74 +112,88 @@ def _author(root: Path, rules: dict[str, object]) -> str:
     return str(receipt["resource_id"])
 
 
-@pytest.mark.parametrize(("probability", "reason"), [(0.9, None), (0.1, NO_RULE_MATCHED)])
+def _two_model_gateway(root: Path) -> GatewayManagement:
+    """Initialize a gateway with one singleton deployment of each of two exact models."""
+    manager = GatewayManagement(root)
+    manager.initialize()
+    for name in ("primary", "secondary"):
+        upsert_connection(
+            root,
+            name=f"{name}-provider",
+            connection=ConnectionConfig(
+                provider="openai-compatible",
+                base_url="http://127.0.0.1:9/v1",
+                api_key_env=f"{name.upper()}_PROVIDER_KEY",
+            ),
+            replace=False,
+        )
+        upsert_singleton_deployment(
+            root,
+            deployment_alias=name,
+            connection_name=f"{name}-provider",
+            provider_model=f"{name}-model",
+            exact_model_id=f"model-{name}",
+            revision=None,
+            capabilities=ModelCapabilities(),
+            gateway_capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+            prices=GatewayTokenPrices(),
+            pricing_source=None,
+            replace=False,
+        )
+    manager.create_identity(identity_id="default", display_name="Default")
+    return manager
+
+
+def _alias_create(root: Path, project: str, *policy: str) -> Result:
+    """Run ``alias create tagged --project PROJECT [--policy ID]`` and return the result."""
+    command = ["config", "gateway", "alias", "create", "tagged", "--project", project]
+    if policy:
+        command.extend(["--policy", *policy])
+    return CliRunner().invoke(app, [*command, "--root", str(root), "--non-interactive", "--json"])
+
+
+@pytest.mark.parametrize(
+    ("probability", "exact_model", "reason"),
+    [(0.9, "model-secondary", None), (0.1, "model-primary", NO_RULE_MATCHED)],
+)
 def test_a_tag_rules_alias_routes_by_the_live_classifier(
-    tmp_path: Path, probability: float, reason: str | None
+    tmp_path: Path, probability: float, exact_model: str, reason: str | None
 ) -> None:
-    """A coding request matches the rule; any other takes the default, and says so."""
-    _manager, raw_key = _configured_project_pool(tmp_path)
+    """Authored, activated and served for real: the live answer picks the exact model."""
+    manager = _two_model_gateway(tmp_path)
     with _systemone(probability) as url:
         policy_id = _author(tmp_path, _rules(url))
-        activation = load_project_activation(
-            ProjectStore(tmp_path, "project-one").artifacts,
-            project_ref="project-one",
-            activation_ref=policy_id,
-        )
-        assert isinstance(activation, TagRulesActivation)
-        # The fixture alias names activation-one; serve this policy under that reference.
-        policy = activation.policy.model_copy(update={"policy_id": "activation-one"})
-        served = TagRulesActivation(
-            project_ref="project-one", activation_ref="activation-one", policy=policy
-        )
+        created = _alias_create(tmp_path, "project-one", policy_id)
+        assert created.exit_code == 0, created.output
+        manager.add_grant(identity_id="default", alias_id="tagged")
+        raw_key = manager.issue_key(identity_id="default", key_id="key-one").raw_key
         components = load_gateway_components(
             tmp_path,
             environment=_ENVIRONMENT,
-            project_repository=_ReadinessProjectRepository(cast("ProjectActivation", served)),
+            project_repository=LocalArtifactProjectActivationRepository(tmp_path),
         )
         assert components.unavailable_aliases == ()
-        assert _granted_authorities(components, raw_key) == {"coding": "revision-project-one"}
         request = decode_chat(
-            {"model": "coding", "messages": [{"role": "user", "content": "Fix the failing test."}]}
+            {"model": "tagged", "messages": [{"role": "user", "content": "Fix the failing test."}]}
         ).request
         authorization = components.store.authorize_request(
             raw_key=raw_key,
-            alias="coding",
+            alias="tagged",
             request=request,
             deadline_monotonic=time.monotonic() + 30.0,
         )
         route = components.routes.resolve_project_blocking(
             authorization=authorization,
             request=request,
-            episode_namespace=("org", "identity", "revision-project-one", "episode"),
+            episode_namespace=("org", "identity", authorization.alias_revision_id, "episode"),
         )
+    assert route.snapshot.exact_model_id == exact_model
     assert (route.route_reason, route.fallback_reason) == (TAG_ROUTER_ROUTE_REASON, reason)
     assert _FakeSystemOne.states == ["[latest user]\nFix the failing test."]
 
 
-def test_alias_create_activates_a_stored_tag_rules_policy(tmp_path: Path) -> None:
-    """The authored policy activates as a project alias; its candidates must be served."""
-    manager, _raw_key = _configured_project_pool(tmp_path)
-    policy_id = _author(tmp_path, _rules("https://decisions.example.invalid/systemone"))
-    result = CliRunner().invoke(
-        app,
-        [
-            "config",
-            "gateway",
-            "alias",
-            "create",
-            "tagged",
-            "--project",
-            "project-one",
-            "--policy",
-            policy_id,
-            "--root",
-            str(tmp_path),
-            "--non-interactive",
-            "--json",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    alias = next(item for item in manager.aliases() if item.alias_name == "tagged")
-    assert (alias.target_kind, alias.activation_ref) == ("project", policy_id)
-    catalog = load_model_catalog(tmp_path / "models.toml")
-    assert {"primary", "secondary"} <= set(catalog.models)
+def test_alias_create_reports_a_missing_project_as_a_usage_error(tmp_path: Path) -> None:
+    """A project that does not exist is a usage error, not a crash."""
+    _two_model_gateway(tmp_path)
+    result = _alias_create(tmp_path, "missing-project")
+    assert result.exit_code == 2, result.output

@@ -15,7 +15,11 @@ from exp.common.models import ModelAlias, RoutedCandidateSnapshot, load_model_ca
 from exp.common.project import ArtifactStoreError, ProjectStore, ProjectStoreError
 from exp.common.release_revision import installed_release_revision
 from exp.runtime.gateway.guardrails.classification import DecisionModelAdapterDocument
-from exp.runtime.gateway.tag_router import TagRule, TagRulesRouterPolicy
+from exp.runtime.gateway.tag_router import (
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
+    TagRule,
+    TagRulesRouterPolicy,
+)
 from exp.runtime.models import RuntimeModelCatalog
 
 router_app = typer.Typer(help="Author router policies for project aliases.", no_args_is_help=True)
@@ -75,7 +79,7 @@ def tag_rules_policy(
         schema_version=1,
         created_at=created_at,
         code_revision=code_revision,
-        policy_id=stable_id("router-policy", material),
+        policy_id=stable_id("tag-router-policy", material),
         candidates=candidates,
         default_alias=document.default,
         classifier=document.classifier,
@@ -106,7 +110,7 @@ def router_tags(
         if changed:
             store.artifacts.write_or_verify_exact(
                 artifact_id=policy.policy_id,
-                artifact_type="router-policy",
+                artifact_type=TAG_RULES_POLICY_ARTIFACT_TYPE,
                 envelope=policy,
                 files={"policy.json": canonical_json_bytes(policy)},
             )

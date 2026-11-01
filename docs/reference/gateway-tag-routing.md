@@ -33,8 +33,9 @@ should come from measured quality and cost.
 ```
 
 - `candidates` are aliases in `ROOT/models.toml`. Each one's model identity is pinned when the
-  policy is frozen; a later catalog change to a candidate makes the alias unavailable until the
-  policy is frozen again.
+  policy is frozen. An active alias keeps serving the catalog snapshot it was created with; after
+  a catalog change to a candidate, freeze the policy again before the next `alias create`, which
+  refuses a candidate whose identity changed.
 - `classifier` is a `decision_model` document, exactly as a
   [classification guardrail](gateway-classification-guardrails.md) declares one: endpoint,
   model, categories with their questions, aggregate and threshold, window, timeout and cache.
@@ -66,10 +67,15 @@ and activates the alias.
   with `classifier_unavailable` or `no_classifiable_text`. Routing never fails a request; only
   an expired request deadline does.
 - The first decision of an episode serves its later turns, as in learned routing, so a
-  conversation keeps one model. Requests with no episode identity are routed one by one.
-  Verdicts are cached by window, so the tool loop that follows one user message asks once.
+  conversation keeps one model while it stays active; an idle episode expires after a day, or
+  sooner when many other episodes arrive. A default chosen because the decision model had no
+  answer is not kept for the episode, so the next turn asks again. Requests with no episode
+  identity are routed one by one. Verdicts are cached by window, so the tool loop that follows
+  one user message asks once.
+- A request whose deadline runs out while the decision model is answering fails, as in learned
+  routing.
 - Selection runs on the gateway's callback loop, not in the learned selection lane, and is
   bounded by the classifier timeout and the request deadline.
 
-Tag-rules policies serve through gateway aliases. Entry points that run only learned policies,
-such as the optimizer's composition and replay, refuse them by name.
+Tag-rules policies are stored as their own artifact type, so the optimizer's commands never see
+them, and they serve through gateway aliases.

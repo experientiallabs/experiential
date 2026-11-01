@@ -22,7 +22,7 @@ from exp.common.models import (
     read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
-from exp.common.project import ProjectStore
+from exp.common.project import ArtifactStoreError, ProjectStore, ProjectStoreError
 from exp.optimize.router.activation import load_project_router
 from exp.runtime.gateway.catalog_authority import (
     authored_snapshot_path,
@@ -699,12 +699,15 @@ def _project_policy(
     A tag-rules policy is verified by binding its selector to the local catalog;
     a learned policy is loaded through the optimizer-owned verification.
     """
-    store = ProjectStore(root, project)
-    store.load_project()
-    policy_id = policy or only_router_policy(store.artifacts)
-    activation = load_project_activation(
-        store.artifacts, project_ref=project, activation_ref=policy_id
-    )
+    try:
+        store = ProjectStore(root, project)
+        store.load_project()
+        policy_id = policy or only_router_policy(store.artifacts)
+        activation = load_project_activation(
+            store.artifacts, project_ref=project, activation_ref=policy_id
+        )
+    except (ArtifactStoreError, ProjectStoreError) as exc:
+        raise ValueError(str(exc)) from exc
     if isinstance(activation, TagRulesActivation):
         TagRulesSelector.from_activation(
             activation,
