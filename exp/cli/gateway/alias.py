@@ -17,9 +17,12 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+    ModelCatalog,
+    RoutedCandidateSnapshot,
     read_model_catalog_document,
 )
 from exp.common.models.known_models import known_model_metadata
+from exp.common.project import ArtifactStoreError, ProjectStore, ProjectStoreError
 from exp.optimize.router.activation import load_project_router
 from exp.runtime.gateway.catalog_authority import (
     authored_snapshot_path,
@@ -28,10 +31,17 @@ from exp.runtime.gateway.catalog_authority import (
     upsert_singleton_deployment,
 )
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.project_activation import load_project_activation, only_router_policy
 from exp.runtime.gateway.provider_certification import (
     ProviderCapability,
     provider_has_certified_capability,
 )
+from exp.runtime.gateway.tag_router import (
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
+    TagRulesActivation,
+    TagRulesSelector,
+)
+from exp.runtime.models import RuntimeModelCatalog
 
 alias_app = typer.Typer(help="Manage public gateway model aliases.", no_args_is_help=True)
 _JSON_OPTION = typer.Option(False, "--json")
@@ -654,16 +664,14 @@ def _activate(
             revision_id,
             catalog_sha256,
         )
-    runtime = load_project_router(project or "", root, policy_id=policy)
     catalog, normalized, snapshot = snapshot_current_catalog(
         root,
         serving_connections=serving_connections,
     )
+    candidates, activation_ref = _project_policy(project or "", root, policy, snapshot=catalog)
     deployment_aliases = {item.source_alias for item in normalized.deployments}
     missing = sorted(
-        candidate.alias
-        for candidate in runtime.policy.candidates
-        if candidate.alias not in deployment_aliases
+        candidate.alias for candidate in candidates if candidate.alias not in deployment_aliases
     )
     if missing:
         raise ValueError(
@@ -676,7 +684,7 @@ def _activate(
             alias_name=alias,
             revision_id=revision_id,
             project_ref=project or "",
-            activation_ref=runtime.policy.policy_id,
+            activation_ref=activation_ref,
             snapshot_ref=f"catalog-snapshots/{snapshot.name}",
             catalog_sha256=catalog_sha256,
             provider_connections=manager.provider_bindings(catalog),
@@ -685,6 +693,39 @@ def _activate(
         revision_id,
         catalog_sha256,
     )
+
+
+def _project_policy(
+    project: str, root: Path, policy: str | None, *, snapshot: ModelCatalog
+) -> tuple[tuple[RoutedCandidateSnapshot, ...], str]:
+    """Return a project policy's pinned candidates and identity, verified for activation.
+
+    Both kinds are verified against ``snapshot``, the exact catalog this alias
+    revision will serve, so a catalog edit between the check and the snapshot
+    cannot activate a revision the gateway then refuses. A learned policy is loaded
+    once, through the optimizer-owned verification.
+    """
+    try:
+        store = ProjectStore(root, project)
+        store.load_project()
+        policy_id = policy or only_router_policy(store.artifacts)
+        tag_rules = store.artifacts.read(policy_id).manifest.artifact_type == (
+            TAG_RULES_POLICY_ARTIFACT_TYPE
+        )
+        activation = (
+            load_project_activation(store.artifacts, project_ref=project, activation_ref=policy_id)
+            if tag_rules
+            else None
+        )
+    except (ArtifactStoreError, ProjectStoreError) as exc:
+        raise ValueError(str(exc)) from exc
+    if isinstance(activation, TagRulesActivation):
+        TagRulesSelector.from_activation(activation, RuntimeModelCatalog(snapshot, environment={}))
+        return activation.policy.candidates, activation.activation_ref
+    runtime = load_project_router(
+        project, root, policy_id=policy_id, runtime_catalog=RuntimeModelCatalog(snapshot)
+    )
+    return runtime.policy.candidates, runtime.policy.policy_id
 
 
 def _revision_id(alias: str, *, revision: str | None, operation_id: str | None) -> str:

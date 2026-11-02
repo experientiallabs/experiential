@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 from exp.common.core.artifacts import (
     ArtifactId,
@@ -27,6 +27,11 @@ from exp.common.project import (
 from exp.common.routing import KnnRouterPolicy
 from exp.common.routing.bank import KnnBankManifest, KnnEvidenceBank, bank_bytes, load_knn_bank
 from exp.common.tasks import load_task_set
+from exp.runtime.gateway.tag_router import (
+    TAG_RULES_POLICY_ARTIFACT_TYPE,
+    TagRulesActivation,
+    TagRulesRouterPolicy,
+)
 from exp.runtime.models import RuntimeModelCatalog
 
 ProjectActivationVerifier = Callable[
@@ -90,6 +95,13 @@ class ProjectActivation:
         )
 
 
+_ROUTER_POLICY_TYPES: Final = frozenset({"router-policy", TAG_RULES_POLICY_ARTIFACT_TYPE})
+"""Learned router policies and tag-rules router policies, each its own artifact type."""
+
+type SelectorActivation = ProjectActivation | TagRulesActivation
+"""Verified material for one project selector: learned kNN or tag rules."""
+
+
 class ProjectActivationRepository(Protocol):
     """Load verified immutable project activations without provider execution."""
 
@@ -99,13 +111,13 @@ class ProjectActivationRepository(Protocol):
         activation_ref: ArtifactId | None,
         *,
         runtime_catalog: RuntimeModelCatalog,
-    ) -> ProjectActivation:
+    ) -> SelectorActivation:
         """Return one exact activation with no filesystem or credential references."""
         ...
 
 
 def require_project_activation_authority(
-    activation: ProjectActivation,
+    activation: SelectorActivation,
     *,
     project_ref: str,
     activation_ref: ArtifactId | None,
@@ -136,17 +148,23 @@ class LocalArtifactProjectActivationRepository:
         activation_ref: ArtifactId | None,
         *,
         runtime_catalog: RuntimeModelCatalog,
-    ) -> ProjectActivation:
-        """Load and verify one local project activation without issuing model requests."""
+    ) -> SelectorActivation:
+        """Load and verify one local project activation without issuing model requests.
+
+        A tag-rules policy has no fit evidence to verify: its candidates are
+        checked against the runtime catalog when its selector activates.
+        """
         project = ProjectStore(self.root, project_ref)
         try:
             project.load_project()
-            resolved_ref = activation_ref or _only_policy(project.artifacts)
+            resolved_ref = activation_ref or only_router_policy(project.artifacts)
             activation = load_project_activation(
                 project.artifacts,
                 project_ref=project_ref,
                 activation_ref=resolved_ref,
             )
+            if isinstance(activation, TagRulesActivation):
+                return activation
             _verify_policy_inputs(
                 project.artifacts,
                 activation.policy,
@@ -165,15 +183,23 @@ def load_project_activation(
     *,
     project_ref: str,
     activation_ref: ArtifactId,
-) -> ProjectActivation:
+) -> SelectorActivation:
     """Load and cross-check one complete immutable project selection bundle."""
     try:
         stored = store.read(activation_ref)
-        if stored.manifest.artifact_type != "router-policy":
+        if stored.manifest.artifact_type not in _ROUTER_POLICY_TYPES:
             raise ValueError(f"artifact {activation_ref} is not a router policy")
-        policy = KnnRouterPolicy.model_validate_json(
-            store.read_bytes(activation_ref, "policy.json")
-        )
+        raw = store.read_bytes(activation_ref, "policy.json")
+        if stored.manifest.artifact_type == TAG_RULES_POLICY_ARTIFACT_TYPE:
+            rules = TagRulesRouterPolicy.model_validate_json(raw)
+            if rules.policy_id != activation_ref:
+                raise ValueError("router policy ID differs from its artifact")
+            if not envelope_matches_manifest(rules, stored.manifest):
+                raise ValueError("router policy payload differs from its artifact manifest")
+            return TagRulesActivation(
+                project_ref=project_ref, activation_ref=activation_ref, policy=rules
+            )
+        policy = KnnRouterPolicy.model_validate_json(raw)
         if policy.policy_id != activation_ref:
             raise ValueError("router policy ID differs from its artifact")
         if not envelope_matches_manifest(policy, stored.manifest):
@@ -205,15 +231,18 @@ def load_project_activation(
         raise ProjectActivationError(f"router policy {activation_ref} is invalid") from exc
 
 
-def _only_policy(store: ArtifactStore) -> ArtifactId:
+def only_router_policy(store: ArtifactStore) -> ArtifactId:
     """Resolve the only completed router policy in one project artifact store."""
     policies = tuple(
         artifact_id
         for artifact_id in store.list_ids()
-        if store.read(artifact_id).manifest.artifact_type == "router-policy"
+        if store.read(artifact_id).manifest.artifact_type in _ROUTER_POLICY_TYPES
     )
     if not policies:
-        raise ProjectActivationError("project has no frozen router policy; run exp optimize router")
+        raise ProjectActivationError(
+            "project has no frozen router policy; run exp optimize router "
+            "or exp config gateway router tags"
+        )
     if len(policies) > 1:
         raise ProjectActivationError(
             "project has multiple frozen router policies; pass --policy with one of: "

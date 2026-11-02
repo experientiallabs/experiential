@@ -177,7 +177,7 @@ alias revision, and catalog digest used by authorization.
 An alias targets either:
 
 1. a direct exact-model pool, or
-2. one immutable project activation.
+2. one immutable project activation: a learned or [tag-rules](gateway-tag-routing.md) policy.
 
 A singleton alias creates a one-deployment pool. `exp config gateway pool certify` can replace that
 with an ordered pool only when every member has the same exact logical model identity and an

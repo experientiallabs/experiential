@@ -60,14 +60,16 @@ from exp.runtime.gateway.project_activation import (
 from exp.runtime.gateway.routing import (
     CatalogRouteResolver,
     GatewayRoutingError,
+    ProjectSelector,
     RouterProjectTargetResolver,
     SelectionWorkerPool,
+    project_selector,
 )
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.gateway.video.store import SQLiteVideoJobStore, VideoJobStore
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
-from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
+from exp.runtime.router.runtime import DecisionSink, RouterRuntimeIntegrityError
 
 _RETIRED_REVISION_RETENTION_SECONDS = 600.0
 
@@ -95,7 +97,7 @@ class _AliasAuthorityState:
     authorities: frozenset[tuple[str, str, str]]
     normalized_catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog]
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog]
-    activations: Mapping[tuple[str, str, str], RouterRuntime]
+    activations: Mapping[tuple[str, str, str], ProjectSelector]
     exact_models: Mapping[tuple[str, str, str, str], str]
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
@@ -551,7 +553,7 @@ def load_gateway_components(
 
 
 def _project_resolver(
-    activations: Mapping[tuple[str, str, str], RouterRuntime],
+    activations: Mapping[tuple[str, str, str], ProjectSelector],
     exact_models: Mapping[tuple[str, str, str, str], str],
     *,
     selection_workers: SelectionWorkerPool,
@@ -598,7 +600,7 @@ def _load_alias_state(
 
     normalized_catalogs: dict[tuple[str, str], NormalizedGatewayCatalog] = {}
     runtime_catalogs: dict[tuple[str, str], RuntimeModelCatalog] = {}
-    activations: dict[tuple[str, str, str], RouterRuntime] = {}
+    activations: dict[tuple[str, str, str], ProjectSelector] = {}
     exact_models: dict[tuple[str, str, str, str], str] = {}
     readiness: list[ExecutionSnapshot] = []
     unavailable_aliases: list[tuple[str, str]] = []
@@ -702,11 +704,7 @@ def _load_alias_state(
                     )
                 except ProjectActivationError as exc:
                     raise GatewayLifecycleError(str(exc)) from exc
-                runtime = RouterRuntime.from_activation(
-                    activation,
-                    runtime_catalog,
-                    decision_sink=decision_sink,
-                )
+                runtime = project_selector(activation, runtime_catalog, decision_sink=decision_sink)
                 proof = _project_readiness(
                     manager,
                     alias,
@@ -911,7 +909,7 @@ def _project_readiness(
     manager: GatewayManagement,
     alias: GatewayAliasView,
     catalog: NormalizedGatewayCatalog,
-    runtime: RouterRuntime,
+    runtime: ProjectSelector,
     runtime_catalog: RuntimeModelCatalog,
     *,
     exact_models: dict[tuple[str, str, str, str], str],

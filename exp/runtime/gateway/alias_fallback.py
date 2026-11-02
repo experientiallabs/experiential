@@ -21,10 +21,11 @@ from exp.runtime.gateway.project_activation import (
     ProjectActivationRepository,
     require_project_activation_authority,
 )
+from exp.runtime.gateway.routing import ProjectSelector, project_selector
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.router.errors import RouterApplicationError
-from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
+from exp.runtime.router.runtime import DecisionSink, RouterRuntimeIntegrityError
 
 # Bound on how many prior revisions the last-good fallback walks when an alias's
 # active revision pins an unservable snapshot. A dead pin's immediate
@@ -40,7 +41,7 @@ class LoadedRevision:
     normalized: NormalizedGatewayCatalog
     runtime_catalog: RuntimeModelCatalog
     proof: ExecutionSnapshot
-    activation: tuple[tuple[str, str, str], RouterRuntime] | None
+    activation: tuple[tuple[str, str, str], ProjectSelector] | None
 
 
 def load_alias_revision(
@@ -100,9 +101,7 @@ def load_alias_revision(
         )
     except ProjectActivationError as exc:
         raise GatewayLifecycleError(str(exc)) from exc
-    runtime = RouterRuntime.from_activation(
-        activation, runtime_catalog, decision_sink=decision_sink
-    )
+    runtime = project_selector(activation, runtime_catalog, decision_sink=decision_sink)
     proof = _project_readiness(
         manager, alias, normalized, runtime, runtime_catalog, exact_models=exact_models
     )
