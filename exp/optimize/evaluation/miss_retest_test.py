@@ -34,7 +34,8 @@ def rebuild(root: Path, store_import: str, *flags: str) -> tuple[int, str]:
     """Run ``exp build`` again on the stored import and return its exit code and output."""
     result = CliRunner().invoke(
         app,
-        ["build", PROJECT, "--import-id", store_import, "--root", str(root), "--non-interactive"]
+        ["build", PROJECT, "--import-id", store_import, "--root", str(root)]
+        + ["--mine-with", "hashing", "--non-interactive"]
         + list(flags),
     )
     return result.exit_code, " ".join(result.output.split())

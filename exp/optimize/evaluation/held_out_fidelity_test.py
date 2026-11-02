@@ -490,6 +490,10 @@ def build_project(
             "--root",
             str(root),
             "--yes",
+            # Named, not defaulted: the default mining route calls a decision model and this
+            # fixture prepares its evidence from the provider-free route alone.
+            "--mine-with",
+            "hashing",
             "--non-interactive",
             *flags,
         ],

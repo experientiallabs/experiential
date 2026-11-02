@@ -19,6 +19,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+import numpy as np
+
 
 def cosine(left: Sequence[float], right: Sequence[float]) -> float:
     """Return a bounded dot product for pre-normalized vectors.
@@ -99,6 +101,112 @@ class CoreSetGeometry:
                 candidate_id,
             ),
         )
+
+    def representatives(
+        self,
+        member_ids: Sequence[str],
+        count: int,
+        *,
+        covered_ids: Sequence[str] = (),
+    ) -> tuple[str, ...]:
+        """Return the members most of a group looks like, most typical first.
+
+        Each pick is the member that most increases the workload-weighted similarity of the group
+        to its nearest chosen representative. That makes the first pick exactly :meth:`medoid`,
+        and every later one the centre of whatever mass the earlier picks stand in for badly. The
+        objective is monotone and submodular, so this order is within ``1 - 1/e`` of the best set
+        of its size, and nothing has to be configured to say how much "typical" to prefer over
+        "spread": taking the common case first is what maximizing it does.
+
+        This is the opposite emphasis to :meth:`farthest_first`, which spends budget on the cases
+        least like anything chosen so far. Both are defensible and which one a run wants is what a
+        sampling spec records, so neither is reachable without naming it.
+
+        The gains are computed in numpy rather than pair by pair, because the objective is
+        quadratic in the group size and a mining partition is routinely thousands of candidates:
+        scoring one pick over two thousand members costs seconds in a Python double loop and
+        milliseconds as a matmul. The candidates are scored in blocks so a large group never
+        materializes a members-by-members matrix.
+
+        Args:
+            member_ids: Identities whose workload is to be represented, at least one. Repeats are
+                ignored, since an identity cannot be represented twice.
+            count: Representatives to return, clamped to the number of members still eligible.
+            covered_ids: Identities already retained elsewhere. Mass they already represent well
+                is not paid for twice, so a group whose centre a reserved slot already took
+                contributes its next most typical case rather than repeating that centre.
+
+        Returns:
+            Representatives in greedy order, each appearing once and none of them in
+            ``covered_ids``. Shorter than ``count`` when the group runs out of members.
+
+        Raises:
+            ValueError: ``count`` is negative, which no caller means, or the members were
+                positioned in different geometries, between which no distance is defined.
+        """
+        if count < 0:
+            raise ValueError("a group cannot be asked for a negative number of representatives")
+        members = tuple(dict.fromkeys(member_ids))
+        taken = set(covered_ids)
+        eligible = tuple(member_id for member_id in members if member_id not in taken)
+        if not eligible or count == 0:
+            return ()
+        positions = self._positions(members)
+        mass = np.asarray([float(self.masses[member_id]) for member_id in members])
+        row_of = {member_id: row for row, member_id in enumerate(members)}
+        live = [row_of[member_id] for member_id in eligible]
+        # How well each member is represented already. A member no representative covers sits at
+        # -1, below any similarity, so the first pick is scored against the whole group's mass and
+        # lands on its weighted centre.
+        best = np.full(len(members), -1.0)
+        for covered_id in covered_ids:
+            best = np.maximum(best, self._similarities(positions, self.vectors[covered_id]))
+        chosen: list[str] = []
+        while len(chosen) < min(count, len(eligible)):
+            rows = np.asarray(live, dtype=np.int64)
+            gains = self._gains(positions, mass, best, rows)
+            # The tie-break is the whole of this method's input-order independence: among the
+            # candidates that would add the most, the lowest identity wins, exactly as every other
+            # core-set question here breaks a tie.
+            peak = gains.max()
+            pick = min(members[int(row)] for row in rows[gains == peak])
+            chosen.append(pick)
+            live.remove(row_of[pick])
+            best = np.maximum(best, self._similarities(positions, self.vectors[pick]))
+        return tuple(chosen)
+
+    def _positions(self, member_ids: Sequence[str]) -> np.ndarray:
+        """Stack one row per member, refusing positions built in different geometries."""
+        widths = {len(self.vectors[member_id]) for member_id in member_ids}
+        if len(widths) > 1:
+            raise ValueError(
+                "core-set geometry cannot measure between positions of different widths, so "
+                f"these {len(member_ids)} members were not all positioned in one geometry"
+            )
+        return np.asarray([self.vectors[member_id] for member_id in member_ids], dtype=np.float64)
+
+    @staticmethod
+    def _similarities(positions: np.ndarray, vector: tuple[float, ...]) -> np.ndarray:
+        """Return every stacked position's bounded similarity to one vector."""
+        return np.clip(positions @ np.asarray(vector, dtype=np.float64), -1.0, 1.0)
+
+    @staticmethod
+    def _gains(
+        positions: np.ndarray, mass: np.ndarray, best: np.ndarray, rows: np.ndarray
+    ) -> np.ndarray:
+        """Return the workload-weighted similarity each named candidate would add to the group.
+
+        One candidate's gain is ``sum(mass * max(0, similarity - best))`` over the whole group,
+        which is a clipped similarity block reduced against the mass vector. The block height is
+        chosen so the intermediate stays a few tens of megabytes whatever the group size.
+        """
+        gains = np.empty(len(rows))
+        height = max(1, 4_000_000 // max(1, positions.shape[0]))
+        for start in range(0, len(rows), height):
+            block = rows[start : start + height]
+            similarity = np.clip(positions[block] @ positions.T, -1.0, 1.0)
+            gains[start : start + len(block)] = np.maximum(0.0, similarity - best) @ mass
+        return gains
 
     def farthest_first(
         self, selected_ids: Sequence[str], within: Sequence[str] | None = None

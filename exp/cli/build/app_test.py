@@ -70,7 +70,16 @@ def test_malformed_release_revision_fails_before_build_state(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(tmp_path / "missing.jsonl"), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(tmp_path / "missing.jsonl"),
+            "--root",
+            str(root),
+        ],
     )
 
     assert result.exit_code == 2
@@ -366,6 +375,8 @@ def test_first_build_provider_flags_skip_the_opening_list(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -386,7 +397,16 @@ def test_first_build_provider_flags_skip_the_opening_list(
 
     replay = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         input="\n" * 7 + "y\n",
     )
 
@@ -411,6 +431,8 @@ def test_first_build_rejects_bad_provider_flags_before_any_write(tmp_path: Path)
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -452,7 +474,16 @@ def test_first_build_configures_providers_and_models_through_the_picker(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         input="/openai\n1\n\nall\n\n1\n\n1\n\n2\n\ny\n",
     )
 
@@ -468,7 +499,16 @@ def test_first_build_configures_providers_and_models_through_the_picker(
 
     replay = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         input="\n" * 7 + "y\n",
     )
 
@@ -492,7 +532,19 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
     root.mkdir()
     _catalog(root)
 
-    result = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     assert "100 to 1,000 traces is the usual starting range" in result.output
@@ -528,7 +580,19 @@ def test_build_positional_happy_path_creates_two_rags_and_executable_artifact(
         raise AssertionError("exact replay must not rebuild provider-backed RAG artifacts")
 
     monkeypatch.setattr("exp.cli.build.app._build_grounded_artifacts", forbid_rebuild)
-    replay = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
+    replay = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
+    )
     assert replay.exit_code == 0, replay.output
     assert "Complete" in replay.output
 
@@ -560,7 +624,16 @@ def test_build_package_upgrade_creates_new_immutable_graph(
 
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -592,7 +665,16 @@ def test_build_package_upgrade_creates_new_immutable_graph(
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", fail_after_readiness)
     failed_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
     assert failed_result.exit_code == 2
@@ -603,7 +685,16 @@ def test_build_package_upgrade_creates_new_immutable_graph(
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", original_build_grounded)
     second_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
 
@@ -639,7 +730,16 @@ def test_build_package_upgrade_creates_new_immutable_graph(
     monkeypatch.setattr("exp.cli.build.app._build_grounded_artifacts", forbid_rebuild)
     replay_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
     assert replay_result.exit_code == 0, replay_result.output
@@ -665,7 +765,16 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     _catalog(root)
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -674,7 +783,16 @@ def test_build_package_upgrade_graphs_remain_independently_verified(
     assert first_build is not None
     second_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
     assert second_result.exit_code == 0, second_result.output
@@ -708,7 +826,16 @@ def test_build_package_upgrade_over_ceiling_preserves_selected_review(
     _catalog(root)
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -721,7 +848,16 @@ def test_build_package_upgrade_over_ceiling_preserves_selected_review(
 
     blocked = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
 
@@ -773,7 +909,16 @@ def test_unconfirmed_budget_overrun_stops_before_provider_resolution(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
     )
 
     assert result.exit_code == 2
@@ -820,6 +965,8 @@ def test_noninteractive_build_above_half_requires_yes_before_provider_work(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -856,6 +1003,8 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -887,7 +1036,17 @@ def test_unpriced_embedder_reports_an_undefined_cost_and_requires_manual_overrid
 
     blocked = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root), "--no-interactive"],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+        ],
     )
 
     assert blocked.exit_code == 2
@@ -900,6 +1059,8 @@ def test_unpriced_embedder_reports_an_undefined_cost_and_requires_manual_overrid
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -937,7 +1098,16 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         input="y\n",
     )
 
@@ -960,7 +1130,16 @@ def test_explicit_build_can_authorize_both_command_and_embedding_overruns(
     set_maximum_command_cost_usd(1.0, root)
     monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 7.9447329)
     monkeypatch.setattr(consent_module, "can_prompt", lambda _console: not yes_flag)
-    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    arguments = [
+        "build",
+        "--mine-with",
+        "hashing",
+        "support",
+        "--traces",
+        str(source),
+        "--root",
+        str(root),
+    ]
     if yes_flag:
         arguments.extend(["--yes", "--no-interactive"])
 
@@ -1017,7 +1196,16 @@ def test_first_build_failure_does_not_publish_review_readiness(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "a" * 40},
     )
 
@@ -1045,7 +1233,16 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     _catalog(root)
     first_result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "a" * 40},
     )
     assert first_result.exit_code == 0, first_result.output
@@ -1088,7 +1285,16 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     monkeypatch.setattr(simulation_build, "select_build_review", fail_review_selection)
     interrupted = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
     assert interrupted.exit_code == 2
@@ -1111,7 +1317,16 @@ def test_build_package_upgrade_recovers_selection_before_review_crash(
     monkeypatch.setattr(build_command, "_build_grounded_artifacts", forbid_rebuild)
     recovered = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
         env={"EXP_RELEASE_REVISION": "b" * 40},
     )
 
@@ -1152,7 +1367,19 @@ def test_build_accepts_trace_counts_outside_or_inside_guidance(
     root.mkdir()
     _catalog(root)
 
-    result = _RUNNER.invoke(app, ["build", "support", "--traces", str(source), "--root", str(root)])
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     config = ProjectStore(root, "support").load_project()
@@ -1182,7 +1409,17 @@ def test_missing_config_noninteractive_fails_before_project_write(tmp_path: Path
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root), "--no-interactive"],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+        ],
     )
 
     assert result.exit_code == 2
@@ -1205,6 +1442,8 @@ def test_missing_config_is_reported_before_a_missing_trace_path(tmp_path: Path) 
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(tmp_path / "missing.jsonl"),
@@ -1280,7 +1519,16 @@ def test_interactive_first_build_commits_setup_before_trace_validation(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(tmp_path / "missing.jsonl"), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(tmp_path / "missing.jsonl"),
+            "--root",
+            str(root),
+        ],
     )
 
     assert result.exit_code == 2
@@ -1302,10 +1550,10 @@ def test_build_retains_active_positional_trace_consumer_but_rejects_project_opti
     """
     monkeypatch.chdir(tmp_path)
     source = _otlp_export(tmp_path)
-    positional = _RUNNER.invoke(app, ["build", "support", str(source)])
+    positional = _RUNNER.invoke(app, ["build", "--mine-with", "hashing", "support", str(source)])
     project_option = _RUNNER.invoke(
         app,
-        ["build", "--project", "support", "--traces", str(source)],
+        ["build", "--mine-with", "hashing", "--project", "support", "--traces", str(source)],
     )
 
     assert positional.exit_code == 2
@@ -1344,7 +1592,16 @@ def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
     )
     assert result.exit_code == 0, result.output
     output = unstyle(result.output)
@@ -1381,6 +1638,8 @@ def test_over_ceiling_build_fails_before_provider_construction(tmp_path: Path) -
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -1419,6 +1678,8 @@ def test_dry_run_has_zero_calls_and_no_completed_selection(tmp_path: Path) -> No
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -1447,7 +1708,16 @@ def test_build_stores_traces_and_mines_a_reusable_twenty_scenario_set(tmp_path: 
     root = tmp_path / ".exp"
     root.mkdir()
     _catalog(root)
-    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    arguments = [
+        "build",
+        "--mine-with",
+        "hashing",
+        "support",
+        "--traces",
+        str(source),
+        "--root",
+        str(root),
+    ]
     result = _RUNNER.invoke(app, arguments)
     assert result.exit_code == 0, result.output
     imports = SQLiteTraceStore(trace_database_path(root)).list_imports("support")
@@ -1494,6 +1764,8 @@ def test_build_from_gateway_mines_only_the_selected_identity(tmp_path: Path) -> 
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(source),
@@ -1574,7 +1846,16 @@ def test_exact_replay_has_zero_calls_and_no_prompt(
     root = tmp_path / ".exp"
     root.mkdir()
     _catalog(root, embedder_input_usd_per_million=1.0)
-    arguments = ["build", "support", "--traces", str(source), "--root", str(root)]
+    arguments = [
+        "build",
+        "--mine-with",
+        "hashing",
+        "support",
+        "--traces",
+        str(source),
+        "--root",
+        str(root),
+    ]
     first = _RUNNER.invoke(app, arguments)
     assert first.exit_code == 0, first.output
     first_build = ProjectStore(root, "support").load_project().build
@@ -1631,7 +1912,16 @@ def test_provider_failure_does_not_publish_build_selection(
     monkeypatch.setattr(_EmbeddingClient, "embed", fail_embed)
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(source), "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+        ],
     )
 
     assert result.exit_code == 2
@@ -1703,6 +1993,8 @@ def test_build_accepts_a_declared_vendor_source_through_the_source_flag(tmp_path
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--traces",
             str(export),
@@ -1736,7 +2028,18 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--traces", str(export), "--source", "helicone", "--root", str(root)],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--traces",
+            str(export),
+            "--source",
+            "helicone",
+            "--root",
+            str(root),
+        ],
     )
 
     assert result.exit_code == 2
@@ -1758,7 +2061,17 @@ def test_build_pins_stored_import_after_original_source_is_removed(
     source.unlink()
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--import-id", receipt.import_id, "--root", str(root), "--dry-run"],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--import-id",
+            receipt.import_id,
+            "--root",
+            str(root),
+            "--dry-run",
+        ],
     )
     assert result.exit_code == 0, result.output
     store = ProjectStore(root, "support")
@@ -1775,7 +2088,7 @@ def test_replacement_import_is_selected_with_its_completed_build(tmp_path: Path)
     source = _otlp_export(tmp_path, count=1)
     _, first = ingest_traces("support", root=root, source_format="otlp", path=source)
     assert first is not None
-    command = ["build", "support", "--root", str(root), "--import-id"]
+    command = ["build", "--mine-with", "hashing", "support", "--root", str(root), "--import-id"]
     result = _RUNNER.invoke(app, [*command, first.import_id])
     assert result.exit_code == 0, result.output
     store = ProjectStore(root, "support")
@@ -1859,24 +2172,24 @@ def test_build_refuses_a_tag_geometry_with_no_tagger(tmp_path: Path) -> None:
     assert "needs --tagger ALIAS" in unstyle(result.output)
 
 
-def test_naming_the_default_mining_geometry_builds_the_same_tasks(tmp_path: Path) -> None:
-    """Spelling out today's geometry has to be the same build as omitting the flags entirely.
+def test_naming_the_provider_free_route_builds_the_same_tasks(tmp_path: Path) -> None:
+    """Spelling out the hashing route has to be the same build as naming it alone.
 
-    This is the command-level half of the artifact-level golden: the flags default to the
-    provider-free route, so an existing invocation keeps mining exactly as it did.
+    This is the command-level half of the artifact-level golden. The flags no longer default to
+    this route, so what is pinned here is that ``--mine-with hashing`` still reaches exactly the
+    provider-free pipeline it always did, with the backend and strategy it always used.
     """
     source = _otlp_export(tmp_path, count=20)
     root = tmp_path / ".exp"
     root.mkdir()
     _catalog(root)
-    base = ["build", "support", "--traces", str(source), "--root", str(root)]
+    base = ["build", "support", "--traces", str(source), "--root", str(root), "--dry-run"]
 
-    implicit = _RUNNER.invoke(app, [*base, "--dry-run"])
-    explicit = _RUNNER.invoke(
+    named = _RUNNER.invoke(app, [*base, "--mine-with", "hashing"])
+    spelled_out = _RUNNER.invoke(
         app,
         [
             *base,
-            "--dry-run",
             "--mine-with",
             "hashing",
             "--cluster-with",
@@ -1886,9 +2199,32 @@ def test_naming_the_default_mining_geometry_builds_the_same_tasks(tmp_path: Path
         ],
     )
 
-    assert implicit.exit_code == 0, implicit.output
-    assert explicit.exit_code == 0, explicit.output
-    assert unstyle(explicit.output) == unstyle(implicit.output)
+    assert named.exit_code == 0, named.output
+    assert spelled_out.exit_code == 0, spelled_out.output
+    assert unstyle(spelled_out.output) == unstyle(named.output)
+
+
+def test_a_build_with_no_mining_flags_asks_for_the_tag_route_prerequisites(
+    tmp_path: Path,
+) -> None:
+    """The default route is paid and needs a bank, so a bare build says so before doing anything.
+
+    Discovering the missing alias after a corpus has been tagged costs real money, and discovering
+    it after a build silently mined request-visible text instead would cost a wrong task set.
+    """
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(
+        app,
+        ["build", "support", "--traces", str(source), "--root", str(root), "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "needs --tagger ALIAS" in unstyle(result.output)
+    assert not (root / "projects" / "support").exists()
 
 
 def test_an_alternative_sampling_strategy_reaches_the_build(tmp_path: Path) -> None:
@@ -1897,7 +2233,17 @@ def test_an_alternative_sampling_strategy_reaches_the_build(tmp_path: Path) -> N
     root = tmp_path / ".exp"
     root.mkdir()
     _catalog(root)
-    base = ["build", "support", "--traces", str(source), "--root", str(root), "--dry-run"]
+    base = [
+        "build",
+        "support",
+        "--traces",
+        str(source),
+        "--root",
+        str(root),
+        "--dry-run",
+        "--mine-with",
+        "hashing",
+    ]
 
     default = _RUNNER.invoke(app, base)
     diverse = _RUNNER.invoke(app, [*base, "--sample-with", "diversity"])

@@ -43,6 +43,50 @@ def default_cluster_count(candidate_count: int, target: int) -> int:
     return min(candidate_count, max(1, round(math.sqrt(candidate_count))), target)
 
 
+def default_k_grid(candidate_count: int) -> tuple[int, ...]:
+    """Return the group counts a backend searches when nobody has said how many groups there are.
+
+    A fixed grid cannot answer that question on two corpora of different sizes: a grid topping out
+    at fifty is most of the plausible range for a thousand candidates and a narrow slice of it for
+    a hundred thousand. The grid doubles from two up to ``2 * sqrt(n)``, which spans the orders of
+    magnitude a selection criterion has to choose between while staying short enough that every
+    candidate count is actually fitted.
+
+    Args:
+        candidate_count: Deduplicated candidates in this partition.
+
+    Returns:
+        Ascending distinct group counts, at least ``(1,)`` for a partition too small to split.
+    """
+    ceiling = min(candidate_count, max(2, round(2 * math.sqrt(candidate_count))))
+    if ceiling < 2:
+        return (max(1, candidate_count),)
+    grid = {2}
+    while max(grid) * 2 < ceiling:
+        grid.add(max(grid) * 2)
+    grid.add(ceiling)
+    return tuple(sorted(grid))
+
+
+def default_atom_count(candidate_count: int, groups: int) -> int:
+    """Return the number of fine atoms a hierarchy is built over.
+
+    Atoms exist so the tree above them can be re-cut to any group count without refitting, which
+    only works when there are several atoms per group. ``4 * sqrt(n)`` keeps that ratio roughly
+    constant as a corpus grows, and the result is never below the cut it has to support or above
+    the candidates there are to fit.
+
+    Args:
+        candidate_count: Deduplicated candidates in this partition.
+        groups: Groups the tree will be cut into.
+
+    Returns:
+        The atom count, at least ``groups`` and never above ``candidate_count``.
+    """
+    scaled = min(candidate_count, round(4 * math.sqrt(candidate_count)))
+    return max(scaled, min(groups, candidate_count))
+
+
 def descriptor_clusters(geometry: CoreSetGeometry, cluster_count: int) -> dict[str, int]:
     """Assign every candidate to a deterministic cluster around a real central trace.
 

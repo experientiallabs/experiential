@@ -290,7 +290,19 @@ def test_public_terminal_tasks_path_stays_provider_free_and_keeps_labels(
     runner = CliRunner()
 
     build = runner.invoke(
-        app, ["build", _PROJECT, "--traces", str(pinned_traces), "--root", str(root)]
+        app,
+        [
+            "build",
+            _PROJECT,
+            "--traces",
+            str(pinned_traces),
+            "--root",
+            str(root),
+            # This path is the provider-free one, and the default mining route calls a decision
+            # model, so the hashing geometry is named rather than left to the default.
+            "--mine-with",
+            "hashing",
+        ],
     )
     assert build.exit_code == 0, build.output
     setup = runner.invoke(

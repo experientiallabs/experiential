@@ -107,6 +107,31 @@ def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> 
         ProjectConfig(project_id="missing-settings", provider_free_stage=stage)
 
 
+def test_preparation_settings_default_to_the_decision_tag_route() -> None:
+    """The default route is the product decision, so it is pinned where it is persisted.
+
+    A representative task set is supposed to stand for the work, and how a request happened to be
+    worded is not the work, so the route that asks a decision model what each episode contained is
+    the default. It is the paid route and it needs a question bank, which is why ``mining_bank``
+    has no default of its own: there is no bank that describes an unknown corpus.
+    """
+    settings = ProjectTracePreparationSettings(source_kind="otlp")
+
+    assert settings.mining_geometry == "decision_tag"
+    assert settings.mining_bank == ""
+    assert settings.mining_tagger_alias is None
+    # The absence of a backend or strategy is carried as None rather than as the name of one, so
+    # the record says "the geometry's default was wanted" instead of freezing today's answer.
+    assert settings.mining_cluster is None
+    assert settings.mining_sampling is None
+    assert (
+        ProjectTracePreparationSettings(
+            source_kind="otlp", mining_cluster="pattern_hierarchy"
+        ).mining_cluster
+        == "pattern_hierarchy"
+    )
+
+
 def test_project_config_has_one_optional_project_scoped_catalog_pointer() -> None:
     """Provider-free Projects need no catalog while configured Projects bind one artifact."""
     pointer = ArtifactInput(artifact_id="project-model-catalog", sha256=_DIGEST)

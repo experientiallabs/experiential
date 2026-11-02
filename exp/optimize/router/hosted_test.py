@@ -2026,6 +2026,9 @@ def _restored_prepared_project(
         fit_task_budget=2,
         held_out_task_budget=1,
         descriptor_dimensions=64,
+        # Named, not defaulted: the default mining route calls a decision model and this fixture
+        # prepares its evidence without any provider call.
+        mining_geometry="hashing",
     )
     store.initialize(
         ProjectConfig(

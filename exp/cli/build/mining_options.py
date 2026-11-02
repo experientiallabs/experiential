@@ -1,11 +1,16 @@
 """Command-line choice of mining geometry, clustering backend and sampling strategy.
 
-A build mines representative tasks by one of two routes. The default route reads the text a
-request made visible: it needs no provider, costs nothing, and groups cases by how they were
-worded. The second route asks a decision model what each episode turned out to contain and groups
-cases by that, which separates two runs of one template that differ in what the environment
-revealed. Those two look alike in the first geometry and belong apart in the second, and that is
-the whole reason the choice exists.
+A build mines representative tasks by one of two routes. The default route asks a decision model
+what each episode turned out to contain and groups cases by that, which separates two runs of one
+template that differ in what the environment revealed. The other route reads the text a request
+made visible: it needs no provider, costs nothing, and groups cases by how they were worded, so
+two such runs look alike in it. That distinction is the whole reason the choice exists, and it is
+why the paid route is the default: a task set is supposed to represent the work, and how a request
+was worded is not the work.
+
+The default route is not free and it is not configuration-free. It makes one decision call per
+distinct case, and it reads a question bank that only the user can supply, so ``--mine-with
+hashing`` is the one-flag way back to a build that calls nothing.
 
 The options live here rather than in the command module for two reasons. The command module is
 near its line limit, and more usefully, every refusal in this file is a sentence a user reads
@@ -35,16 +40,30 @@ from exp.simulation.mining.service import MiningSpec
 from exp.simulation.mining.tagging import DecisionCache, TraceTagger
 
 MINE_WITH_CHOICES = ("hashing", "decision-tag")
-CLUSTER_WITH_CHOICES = ("descriptor", "kmeans", "bernoulli-mixture", "atoms-hierarchy")
-SAMPLE_WITH_CHOICES = ("medoid", "proportional", "diversity", "stratified")
+CLUSTER_WITH_CHOICES = (
+    "descriptor",
+    "kmeans",
+    "bernoulli-mixture",
+    "atoms-hierarchy",
+    "pattern-hierarchy",
+)
+SAMPLE_WITH_CHOICES = (
+    "medoid",
+    "proportional",
+    "diversity",
+    "stratified",
+    "representative",
+    "balanced",
+)
 
 MINE_WITH_OPTION = typer.Option(
-    "hashing",
+    "decision-tag",
     "--mine-with",
     metavar="GEOMETRY",
     help=(
-        "Selection geometry: hashing reads request-visible text and needs no provider; "
-        "decision-tag asks --tagger what each episode contained (paid, cached per episode)."
+        "Selection geometry: decision-tag (default) asks --tagger what each episode contained "
+        "and needs --question-bank (paid, cached per episode); hashing reads request-visible "
+        "text alone and needs no provider."
     ),
 )
 QUESTION_BANK_OPTION = typer.Option(
@@ -64,21 +83,26 @@ TAGGER_OPTION = typer.Option(
     help="Decision-model alias answering the question bank. Required by --mine-with decision-tag.",
 )
 CLUSTER_WITH_OPTION = typer.Option(
-    "descriptor",
+    None,
     "--cluster-with",
     metavar="BACKEND",
     help=(
-        "Clustering backend: descriptor (default, seedless), kmeans, bernoulli-mixture "
-        "(needs decision-tag) or atoms-hierarchy."
+        "Clustering backend. Unset means the chosen geometry's own: pattern-hierarchy under "
+        "decision-tag, which groups cases by how far their fired propositions overlap, and the "
+        "seedless descriptor clustering under hashing. Name descriptor, kmeans or "
+        "atoms-hierarchy for either geometry, or bernoulli-mixture or pattern-hierarchy, which "
+        "both need decision-tag."
     ),
 )
 SAMPLE_WITH_OPTION = typer.Option(
-    "medoid",
+    None,
     "--sample-with",
     metavar="STRATEGY",
     help=(
-        "How leftover task budget is spent: medoid (default), proportional to workload, "
-        "diversity, or stratified evenly across groups."
+        "How leftover task budget is spent. Unset means the chosen geometry's own: "
+        "representative under decision-tag, which spends each group's share on its most typical "
+        "cases, and medoid under hashing. Name medoid, proportional to workload, diversity, "
+        "stratified evenly across groups, or balanced, which is representative with equal shares."
     ),
 )
 MINING_SEED_OPTION = typer.Option(
@@ -101,8 +125,8 @@ TAGGER_CONCURRENCY_OPTION = typer.Option(
 def mining_geometry(
     *,
     mine_with: str,
-    cluster_with: str,
-    sample_with: str,
+    cluster_with: str | None,
+    sample_with: str | None,
     tagger: str | None,
     question_bank: str | None = None,
     seed: int = 42,
@@ -114,8 +138,8 @@ def mining_geometry(
 
     Args:
         mine_with: Selection geometry name.
-        cluster_with: Clustering backend name.
-        sample_with: Sampling strategy name.
+        cluster_with: Clustering backend name, or None for the geometry's own.
+        sample_with: Sampling strategy name, or None for the geometry's own.
         tagger: Decision-model alias, or None.
         question_bank: Question bank identity, or None.
         seed: Seed for a randomly initialized backend.
@@ -124,7 +148,8 @@ def mining_geometry(
         descriptor_dimensions: Width of the request-visible hashing vector.
 
     Returns:
-        The mining spec, identical to the provider-free default when nothing was named.
+        The mining spec the named geometry's own defaults produce, which is the provider-free
+        pipeline exactly when ``mine_with`` is ``hashing``.
 
     Raises:
         typer.BadParameter: A name is unknown, or the combination cannot describe one corpus.
@@ -164,8 +189,8 @@ def mining_preparation_settings(
     *,
     source_kind: str,
     mine_with: str,
-    cluster_with: str,
-    sample_with: str,
+    cluster_with: str | None,
+    sample_with: str | None,
     tagger: str | None,
     question_bank: str | None = None,
     seed: int = 42,
@@ -178,8 +203,8 @@ def mining_preparation_settings(
     Args:
         source_kind: Declared canonical trace source format.
         mine_with: Selection geometry name.
-        cluster_with: Clustering backend name.
-        sample_with: Sampling strategy name.
+        cluster_with: Clustering backend name, or None for the geometry's own.
+        sample_with: Sampling strategy name, or None for the geometry's own.
         tagger: Decision-model alias, or None.
         question_bank: Question bank identity, or None.
         seed: Seed for a randomly initialized backend.
@@ -254,8 +279,8 @@ def _settings(
     *,
     source_kind: str = "otlp",
     mine_with: str,
-    cluster_with: str,
-    sample_with: str,
+    cluster_with: str | None,
+    sample_with: str | None,
     tagger: str | None,
     question_bank: str | None,
     seed: int,
@@ -263,14 +288,19 @@ def _settings(
     held_out_task_budget: int,
     descriptor_dimensions: int,
 ) -> ProjectTracePreparationSettings:
-    """Build preparation settings from validated command-line names."""
+    """Build preparation settings from validated command-line names.
+
+    An unnamed backend or strategy is persisted as None rather than as the name of one, so the
+    settings record that the geometry's default was wanted rather than freezing today's answer.
+    """
+    cluster = None if cluster_with is None else cluster_with.replace("-", "_")
     return ProjectTracePreparationSettings(
         source_kind=source_kind,
         fit_task_budget=fit_task_budget,
         held_out_task_budget=held_out_task_budget,
         descriptor_dimensions=descriptor_dimensions,
         mining_geometry="decision_tag" if mine_with == "decision-tag" else "hashing",
-        mining_cluster=cluster_with.replace("-", "_"),  # ty: ignore[invalid-argument-type]
+        mining_cluster=cluster,  # ty: ignore[invalid-argument-type]
         mining_sampling=sample_with,  # ty: ignore[invalid-argument-type]
         mining_tagger_alias=tagger,
         mining_bank=question_bank or "",
@@ -303,7 +333,7 @@ def _require_bank(mine_with: str, question_bank: str | None) -> None:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
-    """Reject an unknown name by listing the ones that exist."""
-    if value not in choices:
+def _require_choice(flag: str, value: str | None, choices: tuple[str, ...]) -> None:
+    """Reject an unknown name by listing the ones that exist, leaving an unnamed flag alone."""
+    if value is not None and value not in choices:
         raise typer.BadParameter(f"{flag} must be one of: {', '.join(choices)}; got {value!r}")

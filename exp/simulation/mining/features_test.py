@@ -9,6 +9,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from exp.simulation.mining.descriptors import RoutingDescriptor
 from exp.simulation.mining.features import (
+    INDICATOR_THRESHOLD,
     LOGIT_CLAMP,
     DecisionTagSelectionSpec,
     HashingSelectionSpec,
@@ -425,3 +426,130 @@ def test_an_unknown_transform_is_refused() -> None:
     """Transform names are the contract, so a typo must not silently pass values through."""
     with pytest.raises(ValidationError):
         DecisionTagSelectionSpec(bank_id="x-v1", transform="sqrt")  # ty: ignore[invalid-argument-type]
+
+
+def test_the_tag_geometry_defaults_to_a_continuous_router_safe_view() -> None:
+    """The defaults are the route's product decision, so they are pinned rather than implied.
+
+    ``l2`` keeps the geometry continuous and unit length, which is what the core-set metric
+    measures in and what every phase after clustering reads. ``task`` is the request-visible view:
+    the one view a live request could also produce, so the only router-safe one, and about a third
+    of the observations view's tokens.
+    """
+    spec = DecisionTagSelectionSpec(bank_id="fixture-v1")
+
+    assert spec.transform == "l2"
+    assert spec.view == "task"
+    assert "indicator_threshold" not in type(spec).model_fields
+
+
+def test_indicator_rounds_each_answer_to_whether_the_proposition_fired() -> None:
+    """The transform is an explicit opt-in, and what it produces is set membership and nothing."""
+    bank = _bank()
+    vectors = selection_vectors(
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="indicator"
+        ),
+        descriptors=[_descriptor("a")],
+        tag_matrix=_matrix({"a": (0.51, 0.5, 0.49, 1.0)}, bank),
+        bank=bank,
+    )
+
+    assert vectors == ((1.0, 0.0, 0.0),)
+    assert INDICATOR_THRESHOLD == 0.5
+
+
+def test_the_geometry_carries_no_threshold_of_its_own() -> None:
+    """Which propositions count as fired decides which patterns exist, which is a cluster choice.
+
+    A geometry field would invite a run to threshold the vectors selection measures in, and binary
+    vectors saturate the core-set metric. The one backend that needs the sets thresholds the
+    answers itself, so the only threshold here is the even split a probability reads at.
+    """
+    bank = _bank()
+    matrix = _matrix({"a": (0.2, 0.4, 0.6, 0.0)}, bank)
+
+    fired = selection_vectors(
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="indicator"
+        ),
+        descriptors=[_descriptor("a")],
+        tag_matrix=matrix,
+        bank=bank,
+    )
+
+    assert fired == ((0.0, 0.0, 1.0),)
+    with pytest.raises(ValidationError):
+        DecisionTagSelectionSpec(bank_id="x-v1", indicator_threshold=0.3)  # ty: ignore[unknown-argument]
+
+
+def test_indicator_does_not_unit_normalize() -> None:
+    """A set-overlap distance reads cardinality, which scaling a row by its own norm destroys."""
+    bank = _bank()
+    vectors = selection_vectors(
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="indicator"
+        ),
+        descriptors=[_descriptor("rich"), _descriptor("spare")],
+        tag_matrix=_matrix({"rich": (0.9, 0.9, 0.9, 0.0), "spare": (0.9, 0.0, 0.0, 0.0)}, bank),
+        bank=bank,
+    )
+
+    assert vectors == ((1.0, 1.0, 1.0), (1.0, 0.0, 0.0))
+    assert math.sqrt(sum(value**2 for value in vectors[0])) == pytest.approx(math.sqrt(3.0))
+
+
+def test_indicator_returns_an_all_zero_row_rather_than_refusing_it() -> None:
+    """Firing nothing is a readable position in set space, so it must not reach the unit guard."""
+    bank = _bank()
+    vectors = selection_vectors(
+        DecisionTagSelectionSpec(
+            bank_id=bank.bank_id, families=("situation",), transform="indicator"
+        ),
+        descriptors=[_descriptor("clean")],
+        tag_matrix=_matrix({"clean": (0.0, 0.1, 0.4, 1.0)}, bank),
+        bank=bank,
+    )
+
+    assert vectors == ((0.0, 0.0, 0.0),)
+
+
+def test_the_normalizing_transforms_still_refuse_a_row_with_no_direction() -> None:
+    """An all-zero row being legal for ``indicator`` must not weaken the guard for the others.
+
+    ``l2`` is the transform an all-zero row leaves at the origin. Hellinger and logit place such a
+    row at a finite coordinate on purpose, so the guard is proved still reachable for logit with
+    the row that does leave it there: every answer exactly even, whose log-odds are all zero.
+    """
+    bank = _bank()
+    for transform, row in (("l2", (0.0, 0.0, 0.0, 1.0)), ("logit", (0.5, 0.5, 0.5, 0.9))):
+        with pytest.raises(SelectionGeometryError, match="no direction"):
+            selection_vectors(
+                DecisionTagSelectionSpec(
+                    bank_id=bank.bank_id, families=("situation",), transform=transform
+                ),
+                descriptors=[_descriptor("clean")],
+                tag_matrix=_matrix({"clean": row}, bank),
+                bank=bank,
+            )
+
+
+def test_the_default_geometry_keeps_more_than_set_membership() -> None:
+    """Selection measures in this geometry, so it cannot collapse to which propositions fired.
+
+    Two cases that agree about which propositions fired but disagree about how strongly have to
+    come out at different positions, because the phases after clustering pick one of them.
+    """
+    bank = _bank()
+    matrix = _matrix({"sure": (0.95, 0.9, 0.1, 0.0), "unsure": (0.6, 0.55, 0.45, 0.0)}, bank)
+
+    left, right = selection_vectors(
+        DecisionTagSelectionSpec(bank_id=bank.bank_id, families=("situation",)),
+        descriptors=[_descriptor("sure"), _descriptor("unsure")],
+        tag_matrix=matrix,
+        bank=bank,
+    )
+
+    assert left != right
+    assert math.isclose(math.sqrt(sum(value**2 for value in left)), 1.0, abs_tol=1e-9)
+    assert len({round(value, 6) for value in (*left, *right)}) > 2

@@ -580,6 +580,14 @@ and association; changed source content produces a new import without overwritin
 It then mines scenarios from that saved evidence, writes immutable task sets and prepares
 world-model grounding. Model roles belong to the project; embedding work uses the normal cost
 preflight. An unchanged completed build reuses its scenarios and indexes without new provider calls.
+
+Mining defaults to the decision-tag geometry, which tags each trace with a question bank you supply
+and clusters those answers. Experiential ships only a deliberately generic `example-v1` bank and
+never falls back to it, so this route requires installing your own bank at
+`.exp/question_banks/<bank_id>.toml` and naming it with `--question-bank`. Use
+`--mine-with hashing` for the provider-free route that needs no bank. See
+[representative-task mining](reference/trace-mining.md) for the bank format, the views, and the
+clustering and sampling options.
 `--dry-run` uses temporary SQLite for source ingestion and may checkpoint deterministic project
 evidence, but makes no provider calls, durable trace imports, or completed-build selection.
 The interactive build prompts for an explicit source file and detects chat JSON, native capture,

@@ -9,8 +9,11 @@ import typer
 
 from exp.cli.build.mining_options import (
     CLUSTER_WITH_CHOICES,
+    CLUSTER_WITH_OPTION,
     MINE_WITH_CHOICES,
+    MINE_WITH_OPTION,
     SAMPLE_WITH_CHOICES,
+    SAMPLE_WITH_OPTION,
     TAGGER_CONCURRENCY_OPTION,
     build_tagger,
     mining_geometry,
@@ -33,6 +36,7 @@ from exp.simulation.mining.clustering import (
     BernoulliMixtureClusterSpec,
     DescriptorClusterSpec,
     KMeansClusterSpec,
+    PatternHierarchyClusterSpec,
 )
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSelectionSpec
@@ -41,17 +45,18 @@ from exp.simulation.mining.sampling import (
     DiversitySamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
+    RepresentativeSamplingSpec,
     StratifiedSamplingSpec,
 )
 from exp.simulation.mining.service import MiningSpec
 
 
 def _spec(**overrides: str | None) -> MiningSpec:
-    """Build a spec from the defaults with the named flags changed."""
+    """Build a spec from the declared flag defaults with the named flags changed."""
     arguments: dict[str, str | None] = {
         "mine_with": "hashing",
-        "cluster_with": "descriptor",
-        "sample_with": "medoid",
+        "cluster_with": None,
+        "sample_with": None,
         "tagger": None,
     }
     arguments.update(overrides)
@@ -60,9 +65,29 @@ def _spec(**overrides: str | None) -> MiningSpec:
     return mining_geometry(**arguments)  # ty: ignore[invalid-argument-type]
 
 
-def test_no_flags_is_the_provider_free_default() -> None:
-    """Every existing invocation has to keep mining exactly as it did."""
+def test_naming_hashing_is_the_provider_free_default() -> None:
+    """--mine-with hashing is the one-flag way back to a build that calls nothing."""
     assert _spec() == MiningSpec()
+
+
+def test_the_declared_defaults_are_the_tag_route_and_its_settled_pipeline() -> None:
+    """What a bare `exp build` mines is a product decision, so the flag defaults are pinned.
+
+    The library default stays the provider-free one, because a stored task set mined with
+    ``MiningSpec()`` has to keep reproducing itself. The command line is where the product choice
+    lives, and it chooses the paid route.
+    """
+    assert MINE_WITH_OPTION.default == "decision-tag"
+    assert CLUSTER_WITH_OPTION.default is None
+    assert SAMPLE_WITH_OPTION.default is None
+
+    spec = _spec(mine_with="decision-tag", tagger="clef-decisions")
+
+    assert spec.cluster == PatternHierarchyClusterSpec()
+    assert spec.sampling == RepresentativeSamplingSpec()
+    assert isinstance(MiningSpec().selection, HashingSelectionSpec)
+    assert MiningSpec().cluster == DescriptorClusterSpec()
+    assert MiningSpec().sampling == MedoidSamplingSpec()
 
 
 def test_each_cluster_name_selects_its_backend() -> None:
@@ -74,6 +99,10 @@ def test_each_cluster_name_selects_its_backend() -> None:
         mine_with="decision-tag", tagger="clef-decisions", cluster_with="bernoulli-mixture"
     )
     assert tagged.cluster == BernoulliMixtureClusterSpec(seed=42)
+    patterns = _spec(
+        mine_with="decision-tag", tagger="clef-decisions", cluster_with="pattern-hierarchy"
+    )
+    assert patterns.cluster == PatternHierarchyClusterSpec()
 
 
 def test_each_sampling_name_selects_its_strategy() -> None:
@@ -90,7 +119,8 @@ def test_the_decision_tag_geometry_records_the_bank_it_was_given() -> None:
 
     assert isinstance(spec.selection, DecisionTagSelectionSpec)
     assert spec.selection.bank_id == EXAMPLE_BANK_ID
-    assert spec.selection.view == "observations"
+    assert spec.selection.view == "task"
+    assert spec.selection.transform == "l2"
     assert isinstance(MiningSpec().selection, HashingSelectionSpec)
 
 
@@ -143,6 +173,12 @@ def test_the_mixture_backend_without_a_tag_geometry_is_refused() -> None:
         _spec(cluster_with="bernoulli-mixture")
 
 
+def test_the_pattern_backend_without_a_tag_geometry_is_refused() -> None:
+    """It thresholds per-tag probabilities, and the hashing geometry has none to give it."""
+    with pytest.raises(typer.BadParameter, match="decision_tag selection geometry"):
+        _spec(cluster_with="pattern-hierarchy")
+
+
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
@@ -161,7 +197,7 @@ def test_the_choice_lists_match_the_specs_they_map_to() -> None:
     """A name added to one list and not the mapping would fail only when someone used it."""
     assert MINE_WITH_CHOICES == ("hashing", "decision-tag")
     for name in CLUSTER_WITH_CHOICES:
-        tagged = name == "bernoulli-mixture"
+        tagged = name in {"bernoulli-mixture", "pattern-hierarchy"}
         spec = _spec(
             cluster_with=name,
             mine_with="decision-tag" if tagged else "hashing",
@@ -295,9 +331,41 @@ def test_concurrency_never_enters_the_mined_evidence() -> None:
         mining_preparation_settings(
             source_kind="otlp",
             mine_with="decision-tag",
-            cluster_with="descriptor",
-            sample_with="medoid",
+            cluster_with=None,
+            sample_with=None,
             tagger="clef-decisions",
             question_bank=EXAMPLE_BANK_ID,
         )
     )
+
+
+def test_an_unnamed_backend_takes_each_geometry_s_default_and_a_named_one_is_literal() -> None:
+    """A name is never reinterpreted, which is the whole reason the unset value is not a name.
+
+    A run that asks for descriptor clustering on the tag route gets descriptor clustering. What
+    the tag route defaults to is only what it does when nothing was asked for.
+    """
+    tagged: dict[str, str | None] = {"mine_with": "decision-tag", "tagger": "clef-decisions"}
+
+    assert _spec(**tagged).cluster == PatternHierarchyClusterSpec()
+    assert _spec(**tagged).sampling == RepresentativeSamplingSpec()
+    assert _spec(**tagged, cluster_with="descriptor").cluster == DescriptorClusterSpec()
+    assert _spec(**tagged, sample_with="medoid").sampling == MedoidSamplingSpec()
+    assert _spec().cluster == DescriptorClusterSpec()
+    assert _spec().sampling == MedoidSamplingSpec()
+
+
+def test_leaving_a_flag_unnamed_is_persisted_as_a_default_rather_than_a_name() -> None:
+    """Freezing today's answer into the settings would make the default impossible to change."""
+    settings = mining_preparation_settings(
+        source_kind="otlp",
+        mine_with="decision-tag",
+        cluster_with=None,
+        sample_with=None,
+        tagger="clef-decisions",
+        question_bank=EXAMPLE_BANK_ID,
+    )
+
+    assert settings.mining_cluster is None
+    assert settings.mining_sampling is None
+    assert mining_spec_for(settings).cluster == PatternHierarchyClusterSpec()

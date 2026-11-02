@@ -30,10 +30,18 @@ from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 from exp.simulation.build import build_project, build_task_set, mining_spec_for
-from exp.simulation.mining.clustering import BernoulliMixtureClusterSpec
+from exp.simulation.mining.clustering import (
+    BernoulliMixtureClusterSpec,
+    DescriptorClusterSpec,
+    PatternHierarchyClusterSpec,
+)
 from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSelectionSpec
 from exp.simulation.mining.questions import EXAMPLE_BANK_ID
-from exp.simulation.mining.sampling import StratifiedSamplingSpec
+from exp.simulation.mining.sampling import (
+    MedoidSamplingSpec,
+    RepresentativeSamplingSpec,
+    StratifiedSamplingSpec,
+)
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40
@@ -56,12 +64,17 @@ def _provider_free_settings(
     *,
     source_kind: str = "chat-json",
 ) -> ProjectTracePreparationSettings:
-    """Return fast deterministic provider-free settings for application-service tests."""
+    """Return fast deterministic provider-free settings for application-service tests.
+
+    The geometry is named rather than defaulted because the default route is the paid one: these
+    tests make no provider call, so hashing is the route they mean.
+    """
     return ProjectTracePreparationSettings(
         source_kind=source_kind,
         fit_task_budget=1,
         held_out_task_budget=1,
         descriptor_dimensions=8,
+        mining_geometry="hashing",
     )
 
 
@@ -510,15 +523,53 @@ def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_pay
         )
 
 
-def test_mining_spec_for_defaults_to_the_provider_free_geometry() -> None:
-    """Settings written before the geometry existed must keep mining as they always did."""
-    settings = ProjectTracePreparationSettings(source_kind="otlp")
+def test_the_hashing_route_still_rebuilds_the_provider_free_geometry_exactly() -> None:
+    """Naming hashing is the one-flag way back to a build that calls nothing, so it cannot drift."""
+    settings = ProjectTracePreparationSettings(source_kind="otlp", mining_geometry="hashing")
 
     assert mining_spec_for(settings) == MiningSpec(
         fit_task_budget=settings.fit_task_budget,
         held_out_task_budget=settings.held_out_task_budget,
         selection=HashingSelectionSpec(dimensions=settings.descriptor_dimensions),
     )
+
+
+def test_mining_spec_for_defaults_a_tagged_project_to_the_settled_pipeline() -> None:
+    """The decision-tag route's default is the geometry a tagged corpus actually has.
+
+    Thresholded fired-proposition sets agglomerated by Jaccard average linkage, filled with the
+    facility-location sampler. The selection geometry itself stays continuous, because that is
+    what the sampler and every later phase measure in; only the clusterer thresholds.
+    """
+    settings = ProjectTracePreparationSettings(
+        source_kind="otlp", mining_geometry="decision_tag", mining_bank=EXAMPLE_BANK_ID
+    )
+
+    assert settings.mining_cluster is None
+    assert settings.mining_sampling is None
+    spec = mining_spec_for(settings)
+
+    assert isinstance(spec.selection, DecisionTagSelectionSpec)
+    assert spec.selection.transform == "l2"
+    assert spec.selection.view == "task"
+    assert spec.cluster == PatternHierarchyClusterSpec()
+    assert spec.sampling == RepresentativeSamplingSpec()
+
+
+def test_mining_spec_for_takes_a_named_backend_literally_on_either_route() -> None:
+    """Reinterpreting a name a user typed would be worse than having no default at all."""
+    tagged = ProjectTracePreparationSettings(
+        source_kind="otlp",
+        mining_geometry="decision_tag",
+        mining_bank=EXAMPLE_BANK_ID,
+        mining_cluster="descriptor",
+        mining_sampling="medoid",
+    )
+
+    spec = mining_spec_for(tagged)
+
+    assert spec.cluster == DescriptorClusterSpec()
+    assert spec.sampling == MedoidSamplingSpec()
 
 
 def test_mining_spec_for_rebuilds_the_named_geometry() -> None:
@@ -544,7 +595,17 @@ def test_mining_spec_for_rebuilds_the_named_geometry() -> None:
 def test_mining_spec_for_refuses_an_incompatible_pairing() -> None:
     """Persisted settings can name a combination that cannot describe one corpus."""
     settings = ProjectTracePreparationSettings(
-        source_kind="otlp", mining_cluster="bernoulli_mixture"
+        source_kind="otlp", mining_geometry="hashing", mining_cluster="bernoulli_mixture"
+    )
+
+    with pytest.raises(ValidationError, match="only the decision_tag selection geometry"):
+        mining_spec_for(settings)
+
+
+def test_mining_spec_for_refuses_the_pattern_hierarchy_without_fired_sets() -> None:
+    """Set overlap between coordinates that are not set membership is not a grouping."""
+    settings = ProjectTracePreparationSettings(
+        source_kind="otlp", mining_geometry="hashing", mining_cluster="pattern_hierarchy"
     )
 
     with pytest.raises(ValidationError, match="only the decision_tag selection geometry"):

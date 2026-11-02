@@ -9,9 +9,11 @@ import pytest
 
 from exp.simulation.mining.geometry import CoreSetGeometry
 from exp.simulation.mining.sampling import (
+    BalancedSamplingSpec,
     DiversitySamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
+    RepresentativeSamplingSpec,
     SamplingSpec,
     StratifiedSamplingSpec,
     _largest_remainder,
@@ -24,6 +26,8 @@ _SPECS: tuple[SamplingSpec, ...] = (
     ProportionalSamplingSpec(),
     DiversitySamplingSpec(),
     StratifiedSamplingSpec(),
+    RepresentativeSamplingSpec(),
+    BalancedSamplingSpec(),
 )
 
 
@@ -249,3 +253,62 @@ def test_proportional_records_a_covered_centre_like_the_medoid_strategy() -> Non
 
     assert "cluster-medoid:0" in reasons[taken]
     assert len(selected) == 4
+
+
+def test_representative_fill_never_falls_through_to_farthest_first() -> None:
+    """Spending the tail on outliers is the one emphasis these two strategies exist to avoid."""
+    geometry = _ring(12)
+    labels = _labels(geometry, 3)
+
+    for spec in (RepresentativeSamplingSpec(), BalancedSamplingSpec()):
+        selected, reasons = _run(spec, geometry, labels, 9)
+        assert len(selected) == 9
+        assert all(
+            reason.startswith("cluster-representative:")
+            for identity in selected
+            for reason in reasons[identity]
+        )
+
+
+def test_representative_fill_reaches_the_budget_when_a_cluster_runs_dry() -> None:
+    """Slots a tiny cluster cannot spend go to clusters that can, not to the farthest-first tail."""
+    geometry = _ring(10)
+    labels = {identity: (0 if index else 1) for index, identity in enumerate(geometry.ids)}
+
+    selected, reasons = _run(BalancedSamplingSpec(), geometry, labels, 8)
+
+    assert len(selected) == 8
+    assert sum(1 for identity in selected if labels[identity] == 1) == 1
+    assert all(
+        reason.startswith("cluster-representative:")
+        for identity in selected
+        for reason in reasons[identity]
+    )
+
+
+def test_representative_weights_clusters_by_mass_and_balanced_does_not() -> None:
+    """The two strategies differ in allocation alone, which is the choice between them."""
+    masses = {f"trace-{index:02d}": (20 if index % 3 == 0 else 1) for index in range(12)}
+    geometry = _ring(12, masses=masses)
+    labels = {identity: index % 3 for index, identity in enumerate(geometry.ids)}
+
+    def heavy_picks(spec: SamplingSpec) -> int:
+        return sum(1 for i in _run(spec, geometry, labels, 6)[0] if labels[i] == 0)
+
+    heavy = heavy_picks(RepresentativeSamplingSpec())
+    even = heavy_picks(BalancedSamplingSpec())
+
+    assert heavy > even
+    assert even == 2
+
+
+def test_representative_fill_starts_from_each_cluster_centre() -> None:
+    """One slot per cluster has to land on the cluster's medoid, as every other strategy's does."""
+    geometry = _ring(9)
+    labels = _labels(geometry, 9)
+
+    selected, _ = _run(RepresentativeSamplingSpec(), geometry, labels, 9)
+
+    assert sorted(selected) == sorted(
+        geometry.medoid(members) for members in members_by_group(labels).values()
+    )

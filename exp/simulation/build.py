@@ -51,6 +51,7 @@ from exp.simulation.mining.clustering import (
     ClusterSpec,
     DescriptorClusterSpec,
     KMeansClusterSpec,
+    PatternHierarchyClusterSpec,
 )
 from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
 from exp.simulation.mining.features import (
@@ -59,9 +60,11 @@ from exp.simulation.mining.features import (
     SelectionSpec,
 )
 from exp.simulation.mining.sampling import (
+    BalancedSamplingSpec,
     DiversitySamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
+    RepresentativeSamplingSpec,
     SamplingSpec,
     StratifiedSamplingSpec,
 )
@@ -138,11 +141,23 @@ def mining_spec_for(settings: ProjectTracePreparationSettings) -> MiningSpec:
     later reconstructed from the same settings call it, so the record always binds the geometry the
     build actually used.
 
+    The two routes carry different defaults, because a default is only useful if it is the right
+    answer for the evidence the route produces. Settings that name no backend and no strategy get
+    the chosen geometry's own: hashing keeps the provider-free pipeline exactly, descriptor
+    clustering and medoid fill, while decision_tag gets the geometry a tagged corpus actually has,
+    the thresholded fired-proposition sets agglomerated by Jaccard average linkage, filled by the
+    facility-location sampler so each group contributes the cases most of it looks like.
+
+    A name is never reinterpreted. ``mining_cluster="descriptor"`` means descriptor clustering on
+    either route, and the absence of a choice is carried as None rather than as the name of one,
+    so nothing here has to guess whether a stored name was typed or defaulted. That is what makes
+    a project's settings rebuild the same spec on every later run.
+
     Args:
         settings: Persisted provider-free preparation settings.
 
     Returns:
-        The mining spec, which is the provider-free default when no geometry was chosen.
+        The mining spec, which is the chosen geometry's own default when nothing was named.
 
     Raises:
         ValueError: The named geometry and backend cannot describe the same evidence, or the
@@ -152,11 +167,13 @@ def mining_spec_for(settings: ProjectTracePreparationSettings) -> MiningSpec:
         raise ValueError(
             "the decision_tag geometry reads a question bank, and which bank decides what the "
             "geometry can tell apart, so there is no default to fall back on; record a bank in "
-            "mining_bank and install it where resolve_question_bank looks"
+            "mining_bank and install it where resolve_question_bank looks. See "
+            "docs/reference/trace-mining.md for the bank format and where it is installed"
         )
+    tagged = settings.mining_geometry == "decision_tag"
     selection: SelectionSpec = (
         DecisionTagSelectionSpec(bank_id=settings.mining_bank)
-        if settings.mining_geometry == "decision_tag"
+        if tagged
         else HashingSelectionSpec(dimensions=settings.descriptor_dimensions)
     )
     clusters: dict[str, ClusterSpec] = {
@@ -164,19 +181,24 @@ def mining_spec_for(settings: ProjectTracePreparationSettings) -> MiningSpec:
         "kmeans": KMeansClusterSpec(seed=settings.mining_seed),
         "bernoulli_mixture": BernoulliMixtureClusterSpec(seed=settings.mining_seed),
         "atoms_hierarchy": AtomsHierarchyClusterSpec(seed=settings.mining_seed),
+        "pattern_hierarchy": PatternHierarchyClusterSpec(),
     }
     samplings: dict[str, SamplingSpec] = {
         "medoid": MedoidSamplingSpec(),
         "proportional": ProportionalSamplingSpec(),
         "diversity": DiversitySamplingSpec(),
         "stratified": StratifiedSamplingSpec(),
+        "representative": RepresentativeSamplingSpec(),
+        "balanced": BalancedSamplingSpec(),
     }
+    default_cluster = "pattern_hierarchy" if tagged else "descriptor"
+    default_sampling = "representative" if tagged else "medoid"
     return MiningSpec(
         fit_task_budget=settings.fit_task_budget,
         held_out_task_budget=settings.held_out_task_budget,
         selection=selection,
-        cluster=clusters[settings.mining_cluster],
-        sampling=samplings[settings.mining_sampling],
+        cluster=clusters[settings.mining_cluster or default_cluster],
+        sampling=samplings[settings.mining_sampling or default_sampling],
     )
 
 

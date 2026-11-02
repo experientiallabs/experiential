@@ -2732,7 +2732,18 @@ def _installed_release_driver() -> None:
     try:
         assert not root.exists()
         build_output = run_tty(
-            ["build", "support-agent", "--traces", str(traces), "--root", str(root)],
+            [
+                "build",
+                "support-agent",
+                "--traces",
+                str(traces),
+                "--root",
+                str(root),
+                # This flow proves the installed release spends nothing, and the default mining
+                # route calls a decision model, so the provider-free route is named.
+                "--mine-with",
+                "hashing",
+            ],
             setup_answers,
         )
         plain_build_output = unstyle(build_output)
@@ -2770,6 +2781,8 @@ def _installed_release_driver() -> None:
             str(traces),
             "--root",
             str(root),
+            "--mine-with",
+            "hashing",
             "--no-interactive",
         )
         assert "reuse exact completed indexes, $0.000000 new spend" in replay_output.stdout
@@ -2784,6 +2797,8 @@ def _installed_release_driver() -> None:
             "--root",
             str(root),
             "--dry-run",
+            "--mine-with",
+            "hashing",
             "--no-interactive",
         )
         assert "Build preflight" in dry_run_output.stdout
@@ -3141,6 +3156,8 @@ def _installed_release_driver() -> None:
             str(one_trace),
             "--root",
             str(root),
+            "--mine-with",
+            "hashing",
             "--no-interactive",
         )
         assert "100 to 1,000 traces is the usual starting range" in one_result.stdout

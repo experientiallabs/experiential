@@ -361,7 +361,7 @@ def test_automation_without_yes_refuses_before_buying_indexes(
     result = CliRunner().invoke(
         app,
         ["build", PROJECT, "-t", str(package), "--source", "otel-genai", "--root", str(root)]
-        + ["--non-interactive"],
+        + ["--mine-with", "hashing", "--non-interactive"],
     )
     output = " ".join(result.output.split())
     assert result.exit_code == 2, result.output
@@ -408,7 +408,7 @@ def test_an_embedding_failure_in_a_configured_build_stops_readably(
     result = CliRunner().invoke(
         app,
         ["build", PROJECT, "-t", str(package), "--source", "otel-genai", "--root", str(root)]
-        + ["--yes", "--non-interactive"],
+        + ["--mine-with", "hashing", "--yes", "--non-interactive"],
     )
     output = " ".join(result.output.split())
     assert result.exit_code == 1, result.output

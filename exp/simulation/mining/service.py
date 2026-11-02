@@ -33,6 +33,7 @@ from exp.simulation.mining.clustering import (
     BernoulliMixtureClusterSpec,
     ClusterSpec,
     DescriptorClusterSpec,
+    PatternHierarchyClusterSpec,
 )
 from exp.simulation.mining.coverage import (
     DEFAULT_COVERAGE_SIMILARITY_THRESHOLD,
@@ -126,8 +127,8 @@ class MiningSpec(ContractModel):
             The validated spec.
 
         Raises:
-            ValueError: The Bernoulli mixture has no probabilities to read, or a selection
-                geometry would hand the core-set metric vectors it cannot use.
+            ValueError: The Bernoulli mixture or the pattern hierarchy has no probabilities to
+                read, or a selection geometry would hand the core-set metric vectors it cannot use.
         """
         tagged = isinstance(self.selection, DecisionTagSelectionSpec)
         if isinstance(self.cluster, BernoulliMixtureClusterSpec) and not tagged:
@@ -136,12 +137,19 @@ class MiningSpec(ContractModel):
                 "decision_tag selection geometry produces; select with decision_tag, or cluster "
                 "with descriptor, kmeans or atoms_hierarchy"
             )
+        if isinstance(self.cluster, PatternHierarchyClusterSpec) and not tagged:
+            raise ValueError(
+                "the pattern_hierarchy backend thresholds per-tag probabilities into the sets of "
+                "propositions each case fired, and only the decision_tag selection geometry "
+                "produces them; select with decision_tag, or cluster with descriptor, kmeans or "
+                "atoms_hierarchy"
+            )
         if tagged and self.selection.transform == "none":
             raise ValueError(
                 "core-set selection measures distance as a dot product of unit vectors, and raw "
-                "probability rows saturate it so every pair looks identical; choose the l2, "
-                "hellinger or logit transform for the selection geometry (a clusterer that needs "
-                "untransformed answers reads them directly)"
+                "probability rows saturate it so every pair looks identical; choose the "
+                "indicator, l2, hellinger or logit transform for the selection geometry (a "
+                "clusterer that needs untransformed answers reads them directly)"
             )
         return self
 

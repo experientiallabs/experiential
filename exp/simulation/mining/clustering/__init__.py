@@ -8,6 +8,7 @@ from exp.simulation.mining.clustering.specs import (
     ClusterSpec,
     DescriptorClusterSpec,
     KMeansClusterSpec,
+    PatternHierarchyClusterSpec,
     cluster_candidates,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "ClusteringError",
     "DescriptorClusterSpec",
     "KMeansClusterSpec",
+    "PatternHierarchyClusterSpec",
     "cluster_candidates",
 ]

@@ -194,8 +194,8 @@ def build(
     mine_with: str = MINE_WITH_OPTION,
     tagger: str | None = TAGGER_OPTION,
     question_bank: str | None = QUESTION_BANK_OPTION,
-    cluster_with: str = CLUSTER_WITH_OPTION,
-    sample_with: str = SAMPLE_WITH_OPTION,
+    cluster_with: str | None = CLUSTER_WITH_OPTION,
+    sample_with: str | None = SAMPLE_WITH_OPTION,
     mining_seed: int = MINING_SEED_OPTION,
     tagger_concurrency: int = TAGGER_CONCURRENCY_OPTION,
 ) -> None:

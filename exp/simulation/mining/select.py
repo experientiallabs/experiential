@@ -120,7 +120,8 @@ def select_partition_representatives(
         sampling: How the remaining budget is spent. None fills with one real cluster medoid each
             and then farthest-first coverage.
         probabilities: Untransformed decision-model answers per candidate, required only by a
-            clustering backend that reads tag probabilities directly.
+            clustering backend that reads tag probabilities directly, which is the Bernoulli
+            mixture and the pattern hierarchy.
 
     Returns:
         Selected real traces, workload assignment, and unavailable tail-slot reasons.

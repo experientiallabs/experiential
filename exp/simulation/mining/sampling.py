@@ -19,6 +19,17 @@ Each strategy answers the same question differently:
   uncertain and what matters is covering the space.
 - **stratified** spends it *evenly across groups*, so a small but distinct group is not outvoted by
   a large one. This is the one to use when rare behaviour matters more than common behaviour.
+- **representative** spends it on the cases *most of the corpus looks like*: each cluster's share
+  goes to its most typical members rather than its most distinctive ones. This is what a set of
+  evaluation seeds wants, because an eval built from a group's outliers measures behaviour the
+  group mostly does not exhibit.
+- **balanced** is ``representative`` with equal shares instead of mass-proportional ones, for when
+  every kind of work has to be evaluated whether or not it is common.
+
+The four older strategies all end in farthest-first, so they all spend leftover budget on the cases
+least like anything chosen. That is deliberate for ``diversity`` and incidental for the rest, and it
+is the one emphasis an eval seed set does not want, which is why the two newer strategies refill
+from their own clusters instead of falling through to it.
 
 Every strategy is bound by the same rules, and the tests check all of them rather than trusting the
 prose: never exceed the target, never select one identity twice, always terminate, and break every
@@ -92,8 +103,44 @@ class StratifiedSamplingSpec(ContractModel):
     kind: Literal["stratified"] = "stratified"
 
 
+class RepresentativeSamplingSpec(ContractModel):
+    """Split the remaining budget by cluster mass, then spend each share on typical members.
+
+    Shares are the same largest-remainder apportionment ``proportional`` uses; what differs is how
+    a cluster spends its share. Instead of one centre and then the points furthest from everything
+    chosen, a cluster hands back the members that most of it looks like, in
+    :meth:`~exp.simulation.mining.geometry.CoreSetGeometry.representatives` order. A cluster that
+    runs out of members returns its slots to the apportionment rather than leaking them into
+    farthest-first, so the whole budget stays inside the clusters.
+
+    Attributes:
+        kind: Fixed representative discriminator, defaulting to ``representative``.
+    """
+
+    kind: Literal["representative"] = "representative"
+
+
+class BalancedSamplingSpec(ContractModel):
+    """Give every cluster the same share, and spend each share on typical members.
+
+    The picker is ``representative``'s; the allocation is ``stratified``'s. Use it when every kind
+    of work has to be evaluated at comparable depth whatever share of traffic it carries, and use
+    ``representative`` when the seed set should look like the traffic.
+
+    Attributes:
+        kind: Fixed balanced discriminator, defaulting to ``balanced``.
+    """
+
+    kind: Literal["balanced"] = "balanced"
+
+
 SamplingSpec = Annotated[
-    MedoidSamplingSpec | ProportionalSamplingSpec | DiversitySamplingSpec | StratifiedSamplingSpec,
+    MedoidSamplingSpec
+    | ProportionalSamplingSpec
+    | DiversitySamplingSpec
+    | StratifiedSamplingSpec
+    | RepresentativeSamplingSpec
+    | BalancedSamplingSpec,
     Field(discriminator="kind"),
 ]
 
@@ -165,6 +212,15 @@ def fill_budget(
         _fill_proportional(geometry, labels, selected_ids, reasons, target)
     elif isinstance(spec, StratifiedSamplingSpec):
         _fill_stratified(geometry, strata or labels, selected_ids, reasons, target)
+    elif isinstance(spec, RepresentativeSamplingSpec | BalancedSamplingSpec):
+        _fill_representative(
+            geometry,
+            labels,
+            selected_ids,
+            reasons,
+            target,
+            even=isinstance(spec, BalancedSamplingSpec),
+        )
     elif not isinstance(spec, DiversitySamplingSpec):  # pragma: no cover - union is exhaustive
         raise ValueError(
             f"no sampling strategy is wired for spec kind {spec.kind!r}; a spec added to the "
@@ -238,6 +294,60 @@ def _fill_proportional(
                 geometry.farthest_first(selected_ids, within=member_ids),
                 f"cluster-fill:{cluster_id}",
             )
+
+
+def _fill_representative(
+    geometry: CoreSetGeometry,
+    labels: Mapping[str, int],
+    selected_ids: list[str],
+    reasons: MutableMapping[str, list[str]],
+    target: int,
+    *,
+    even: bool,
+) -> None:
+    """Spend the budget on each cluster's most typical members, by mass or evenly.
+
+    Apportionment is recomputed each pass over the clusters, and a cluster with nothing left to
+    offer is dropped from it, so slots a small cluster cannot use are handed to clusters that can
+    rather than falling through to the farthest-first tail. Every pass either selects something or
+    returns, which is what makes the loop terminate on a partition the target overshoots.
+
+    Every pick records ``cluster-representative``. The medoid is the first of them whenever no
+    earlier phase took it, but it is not labelled as one: once a reserved slot has covered a
+    cluster's centre the first pick here is deliberately the next most typical case, and a
+    ``cluster-medoid`` reason on it would describe a centre this phase did not choose.
+    """
+    groups = members_by_group(labels)
+    while len(selected_ids) < target:
+        live = {
+            cluster_id: member_ids
+            for cluster_id, member_ids in groups.items()
+            if any(member_id not in selected_ids for member_id in member_ids)
+        }
+        if not live:
+            return
+        weights = (
+            dict.fromkeys(live, 1)
+            if even
+            else {
+                cluster_id: sum(geometry.masses[member_id] for member_id in member_ids)
+                for cluster_id, member_ids in live.items()
+            }
+        )
+        progressed = False
+        shares = _largest_remainder(weights, target - len(selected_ids))
+        for cluster_id, share in sorted(shares.items()):
+            for member_id in geometry.representatives(
+                live[cluster_id], share, covered_ids=selected_ids
+            ):
+                if len(selected_ids) >= target:
+                    return
+                record_selection(
+                    selected_ids, reasons, member_id, f"cluster-representative:{cluster_id}"
+                )
+                progressed = True
+        if not progressed:
+            return
 
 
 def _fill_stratified(

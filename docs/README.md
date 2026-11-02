@@ -25,6 +25,7 @@ results, and plans do not live here.
 | `reference/gateway-latency.md` | Routine CI gateway-latency report against a local mock: schedule, artifact schema, and numeric latency badge. |
 | `reference/openai-compatible-recipes.md` | Verified Fireworks, Modal, and Experiential Cloud connection recipes through the openai-compatible provider family. |
 | `reference/ingest.md` | Current declared local trace source contract for every supported source. |
+| `reference/trace-mining.md` | Representative-task mining: the decision-tag and hashing geometries, the question bank you must supply, views, tag clustering, and cost. |
 | `reference/immutable-real-trace-rag.md` | Immutable real-trace retrieval provenance, leakage, persistence, and historical restoration contract. |
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |
 | `release-scope.md` | Supported and explicitly excluded release claims. |

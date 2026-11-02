@@ -23,6 +23,7 @@ from exp.simulation.mining.clustering import (
     ClusterSpec,
     DescriptorClusterSpec,
     KMeansClusterSpec,
+    PatternHierarchyClusterSpec,
 )
 from exp.simulation.mining.descriptors import HashingDescriptorEmbedder, routing_descriptor
 from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSelectionSpec
@@ -36,6 +37,7 @@ from exp.simulation.mining.sampling import (
     DiversitySamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
+    RepresentativeSamplingSpec,
     SamplingSpec,
     StratifiedSamplingSpec,
 )
@@ -879,3 +881,56 @@ def test_the_default_spec_names_the_provider_free_path() -> None:
     assert spec.selection == HashingSelectionSpec()
     assert spec.cluster == DescriptorClusterSpec()
     assert spec.sampling == MedoidSamplingSpec()
+
+
+def test_the_tagged_pattern_pipeline_mines_the_same_tasks_in_any_order() -> None:
+    """The settled decision-tag pipeline has to be order independent end to end.
+
+    This is the pipeline `exp build` reaches by default: fired-proposition sets, Jaccard average
+    linkage over the distinct ones, and the facility-location fill. Every tie inside it is broken
+    by identity, so the corpus arriving reversed must mine the same task set.
+    """
+    corpus = _geometry_corpus()
+    spec = _tag_spec(cluster=PatternHierarchyClusterSpec(), sampling=RepresentativeSamplingSpec())
+
+    forward = mine_tasks(corpus, spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger())
+    backward = mine_tasks(
+        tuple(reversed(corpus)), spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    assert {task.task_id for task in forward.tasks} == {task.task_id for task in backward.tasks}
+    assert forward.coverage.split_separation_verified
+    assert all(selection.cluster_id >= 0 for selection in forward.coverage.selections)
+
+
+def test_the_tagged_pattern_pipeline_keeps_a_continuous_selection_geometry() -> None:
+    """The backend thresholds the answers, so the vectors selection measures stay continuous.
+
+    This is the whole point of thresholding inside the clusterer. Every member of a cluster cut at
+    zero fired the same propositions, so a thresholded selection vector would put them at the same
+    position and leave the medoid and facility-location phases nothing but the identity tie-break.
+    """
+    corpus = _geometry_corpus(12)
+    spec = _tag_spec(cluster=PatternHierarchyClusterSpec(cut=0.0))
+
+    result = mine_tasks(corpus, spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger())
+
+    values = {
+        round(value, 6)
+        for candidate in result.analysis.candidates
+        for value in candidate.selection_vector
+    }
+    assert not values <= {0.0, 1.0}
+    assert len({selection.cluster_id for selection in result.coverage.selections}) > 1
+
+
+def test_the_pattern_backend_needs_a_tagged_selection_at_the_spec() -> None:
+    """Catching the pairing when the spec is written beats discovering it after a paid tagging."""
+    with pytest.raises(ValidationError, match="only the decision_tag selection geometry"):
+        MiningSpec(cluster=PatternHierarchyClusterSpec())
+    tagged = MiningSpec(
+        selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+        cluster=PatternHierarchyClusterSpec(),
+    )
+    assert isinstance(tagged.selection, DecisionTagSelectionSpec)
+    assert tagged.selection.transform == "l2"

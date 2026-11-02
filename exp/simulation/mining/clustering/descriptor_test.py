@@ -5,9 +5,13 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+import pytest
+
 from exp.simulation.mining.clustering.descriptor import (
     MAXIMUM_ITERATIONS,
+    default_atom_count,
     default_cluster_count,
+    default_k_grid,
     descriptor_clusters,
 )
 from exp.simulation.mining.geometry import CoreSetGeometry, cosine
@@ -135,3 +139,27 @@ def test_one_group_needs_no_iteration() -> None:
 
     assert set(descriptor_clusters(geometry, 1).values()) == {0}
     assert MAXIMUM_ITERATIONS == 20
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 7, 40, 1000, 12192])
+def test_a_derived_grid_is_usable_at_every_corpus_size(count: int) -> None:
+    """The grid exists so an unlabelled corpus can pick its own k, at any size it arrives in."""
+    grid = default_k_grid(count)
+
+    assert grid == tuple(sorted(set(grid)))
+    assert all(1 <= candidate <= count for candidate in grid)
+    assert grid
+
+
+def test_a_derived_grid_grows_with_the_corpus() -> None:
+    """A fixed grid is most of the plausible range at one size and a slice of it at another."""
+    assert max(default_k_grid(1000)) < max(default_k_grid(100_000))
+    assert len(default_k_grid(100_000)) > len(default_k_grid(40))
+
+
+@pytest.mark.parametrize(("count", "groups"), [(1, 1), (5, 4), (40, 6), (12192, 110)])
+def test_derived_atoms_always_support_the_cut_above_them(count: int, groups: int) -> None:
+    """Re-cutting the tree is the point of atoms, and a cut finer than its atoms cannot be made."""
+    atoms = default_atom_count(count, groups)
+
+    assert min(groups, count) <= atoms <= count

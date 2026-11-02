@@ -40,13 +40,30 @@ from exp.simulation.mining.questions import (
 from exp.simulation.mining.tagging import TagMatrix
 from exp.simulation.mining.views import TraceViewName, TraceViewSpec
 
-TagTransform = Literal["none", "l2", "hellinger", "logit"]
+TagTransform = Literal["none", "l2", "hellinger", "logit", "indicator"]
 """How tag probabilities become coordinates.
 
 ``none`` passes the probabilities through unchanged and is the one transform that does not
 normalize, so distances keep reflecting how many tags a case triggered. It is what a clusterer
 reading probabilities as probabilities consumes, and it is not a selection geometry: core-set
 distance is a dot product of pre-normalized vectors, and raw probability rows saturate its clamp.
+
+``indicator`` rounds every probability to 0.0 or 1.0 at :data:`INDICATOR_THRESHOLD`, so a case
+becomes the *set* of propositions it fired. It is the second transform that does not normalize, and
+deliberately so: a set-overlap distance such as Jaccard reads how large each set is, and dividing a
+row by its own norm destroys exactly that. An all-zero row is a legal position here, meaning "this
+case fired nothing", rather than the failure it is for a normalizing transform.
+
+It is an explicit opt-in and must not become a default, for two reasons that compound. These rows
+are not unit vectors, so the core-set dot product saturates on them exactly as it does on ``none``:
+two cases sharing one fired proposition come out at the clamp, and on a real tagged corpus that is
+most pairs. Worse, a selection phase cannot recover from that by rescaling, because every member of
+one ``pattern_hierarchy`` cluster cut at ``0.0`` carries, by construction, the identical row. There
+is nothing left for a within-cluster medoid or a facility-location pick to measure, so the choice
+falls entirely to the identity tie-break. A clusterer that wants these sets therefore thresholds
+the untransformed answers itself, which is what
+:class:`~exp.simulation.mining.clustering.specs.PatternHierarchyClusterSpec` does, and selection
+keeps measuring in a continuous geometry.
 
 ``l2`` unit-normalizes, making distance reflect which tags a case triggered rather than how many.
 
@@ -59,6 +76,16 @@ closer than they are, and a case that triggers nothing has no position at all.
 
 ``logit`` takes clamped log-odds first, which spreads confident answers away from uncertain ones
 instead of compressing them at the interval's ends.
+"""
+
+INDICATOR_THRESHOLD = 0.5
+"""Probability above which the ``indicator`` transform counts a proposition as fired.
+
+It is a module constant rather than a spec field because the only consumer that needs to choose a
+threshold is a clusterer, and
+:attr:`~exp.simulation.mining.clustering.specs.PatternHierarchyClusterSpec.threshold` is where that
+choice is recorded. A caller selecting on ``indicator`` directly is asking for the ordinary reading
+of a probability, which is the even split.
 """
 
 LOGIT_CLAMP = 1e-4
@@ -99,10 +126,18 @@ class DecisionTagSelectionSpec(ContractModel):
         bank_id: Packaged question bank whose families define the columns and their order.
         families: Families of that bank to use, in bank order. Empty, the default, uses every
             family the bank declares, so a spec never has to name one bank's internals.
-        transform: How probabilities become coordinates. See :data:`TagTransform`.
-        view: Which rendered view the questions are asked about. ``observations`` shows what the
-            episode revealed without the agent's own commentary, which is what makes two runs of
-            one case look alike.
+        transform: How probabilities become coordinates. See :data:`TagTransform`. It defaults to
+            ``l2``, which keeps the geometry continuous and unit length, because that is what the
+            core-set metric measures in and what every selection phase after clustering reads. A
+            clusterer that wants the thresholded fired-proposition sets derives them from the
+            untransformed answers rather than asking for them here.
+        view: Which rendered view the questions are asked about. It defaults to ``task``, the
+            request-visible view: it is the one view a live request could also produce, so it is
+            the only router-safe one and it is already audited for leakage, and it is about 3.6k
+            tokens against the observations view's 11.8k, which is most of what tagging a corpus
+            costs. ``observations`` shows what the episode revealed without the agent's own
+            commentary, which separates two runs of one template that differ in what the
+            environment returned; choose it when that distinction is the one being mined.
         view_spec: Rendering controls for that view. They belong to the spec because they decide
             the exact text that was tagged, and answers about differently capped text are answers
             about different evidence.
@@ -112,7 +147,7 @@ class DecisionTagSelectionSpec(ContractModel):
     bank_id: str = Field(min_length=1)
     families: tuple[str, ...] = ()
     transform: TagTransform = "l2"
-    view: TraceViewName = "observations"
+    view: TraceViewName = "task"
     view_spec: TraceViewSpec = TraceViewSpec()
 
 
@@ -131,7 +166,9 @@ def selection_vectors(
     """Build one core-set geometry vector per descriptor.
 
     The result is positional: vector ``i`` belongs to ``descriptors[i]`` and is ready to assign
-    to that candidate's ``selection_vector``. Every transform but ``none`` returns unit vectors.
+    to that candidate's ``selection_vector``. Every transform returns unit vectors except ``none``,
+    which passes the probabilities through, and ``indicator``, which returns raw 0/1 membership
+    because a set-overlap distance has to read cardinality.
 
     Args:
         spec: Which geometry to build.
@@ -244,7 +281,8 @@ def _transformed(
         trace_id: Trace the row describes, named in a failure.
 
     Returns:
-        The row's coordinates. Unit length for every transform but ``none``.
+        The row's coordinates. Unit length for every transform except ``none``, which is returned
+        unchanged, and ``indicator``, which returns unnormalized 0/1 membership.
 
     Raises:
         SelectionGeometryError: A normalizing transform received a row with no direction, which
@@ -252,6 +290,11 @@ def _transformed(
     """
     if transform == "none":
         return values
+    if transform == "indicator":
+        # Deliberately returned without reaching _unit. A case that fired nothing is a real,
+        # readable position in set space, and it is the position a Jaccard backend handles by
+        # naming it rather than by refusing it, so the no-direction guard must not see this row.
+        return tuple(1.0 if value > INDICATOR_THRESHOLD else 0.0 for value in values)
     if transform == "hellinger":
         # Both outcomes of every tag, which is what makes squared Euclidean distance equal the
         # summed squared Hellinger distance exactly. Every row leaves this with norm sqrt(T),

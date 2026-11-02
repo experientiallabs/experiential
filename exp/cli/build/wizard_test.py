@@ -404,7 +404,7 @@ def test_default_build_prepares_saved_scenarios_without_rollouts(
     root = tmp_path / ".exp"
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(root), "--provider", "openai"],
+        ["build", "--mine-with", "hashing", "support", "--root", str(root), "--provider", "openai"],
         input=f"\ntraces.otel.jsonl\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -439,7 +439,16 @@ def test_wizard_reports_rejected_evidence_without_a_traceback(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(tmp_path / ".exp"), "--provider", "openai"],
+        [
+            "build",
+            "--mine-with",
+            "hashing",
+            "support",
+            "--root",
+            str(tmp_path / ".exp"),
+            "--provider",
+            "openai",
+        ],
         input=f"\ntraces.otel.jsonl\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -472,7 +481,7 @@ def test_bare_build_chat_export_completes_with_saved_provider_roles(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "powerset"],
+        ["build", "--mine-with", "hashing", "powerset"],
         input=f"\nresearch.jsonl\n{_SAVED_SETUP}y\n",
         env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -504,7 +513,9 @@ def test_bare_build_chat_export_completes_with_saved_provider_roles(
             update={"roles": saved.roles.model_copy(update={"world_model": "candidate"})}
         ),
     )
-    replay = _RUNNER.invoke(app, ["build", "powerset"], input=f"\n{_SAVED_SETUP}")
+    replay = _RUNNER.invoke(
+        app, ["build", "--mine-with", "hashing", "powerset"], input=f"\n{_SAVED_SETUP}"
+    )
     assert replay.exit_code == 0, replay.output
     assert "Providers" in unstyle(replay.output)
     assert "Models to configure" in unstyle(replay.output)
@@ -529,7 +540,11 @@ def test_new_project_setup_can_cancel_without_changing_catalog_or_paid_work(
     lister = _install_integrated_runtime(monkeypatch, state)
     answers = "q\n" if cancel_at == "providers" else "\nq\n"
 
-    result = _RUNNER.invoke(app, ["build", "new-project"], input=f"\nresearch.jsonl\n{answers}")
+    result = _RUNNER.invoke(
+        app,
+        ["build", "--mine-with", "hashing", "new-project"],
+        input=f"\nresearch.jsonl\n{answers}",
+    )
 
     assert result.exit_code == 1
     assert "Providers" in unstyle(result.output)
@@ -550,7 +565,7 @@ def test_new_project_uses_models_chosen_from_an_existing_catalog(
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
 
-    arguments = ["build", "new-project"]
+    arguments = ["build", "--mine-with", "hashing", "new-project"]
     prefix = "\nresearch.jsonl\n"
     if explicit_trace:
         arguments.extend(
@@ -576,14 +591,20 @@ def test_completed_build_rejects_changed_roles_before_saving_shared_catalog(
     write_model_catalog(root / "models.toml", _catalog())
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
-    built = _RUNNER.invoke(app, ["build", "powerset"], input=f"\nresearch.jsonl\n{_SAVED_SETUP}y\n")
+    built = _RUNNER.invoke(
+        app,
+        ["build", "--mine-with", "hashing", "powerset"],
+        input=f"\nresearch.jsonl\n{_SAVED_SETUP}y\n",
+    )
     assert built.exit_code == 0, built.output
     catalog_before = (root / "models.toml").read_bytes()
     store = wizard.ProjectStore(root, "powerset")
     project_before = store.load_project()
     embedding_calls = tuple(state.embedding_calls)
 
-    result = _RUNNER.invoke(app, ["build", "powerset"], input="\n\n\n/candidate\n1\n\n\n\ny\n")
+    result = _RUNNER.invoke(
+        app, ["build", "--mine-with", "hashing", "powerset"], input="\n\n\n/candidate\n1\n\n\n\ny\n"
+    )
 
     assert result.exit_code == 2, result.output
     assert "role overrides differ" in unstyle(result.output)
@@ -612,7 +633,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(root), "--provider", "openai"],
+        ["build", "--mine-with", "hashing", "support", "--root", str(root), "--provider", "openai"],
         input=f"1,4\ntraces.otel.jsonl\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -812,7 +833,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
     )
     successor = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(root)],
+        ["build", "--mine-with", "hashing", "support", "--root", str(root)],
         input=f"1,4\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -853,6 +874,8 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--root",
             str(root),
@@ -891,7 +914,7 @@ def test_fresh_wizard_refusal_after_discovery_makes_no_paid_calls_or_selected_bu
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(root)],
+        ["build", "--mine-with", "hashing", "support", "--root", str(root)],
         input=f"1,4\ntraces.otel.jsonl\n2\n\n{_NEW_SETUP}n\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -929,6 +952,8 @@ def test_explicit_router_budget_overrun_offers_a_choice_before_paid_calls(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--root",
             str(root),
@@ -970,7 +995,7 @@ def test_bare_build_budget_warning_can_continue_or_decline(
 
     result = _RUNNER.invoke(
         app,
-        ["build", "support"],
+        ["build", "--mine-with", "hashing", "support"],
         input=f"\ntraces.otel.jsonl\n{_SAVED_SETUP}{answer}\n",
         env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -991,7 +1016,7 @@ def test_bare_build_budget_warning_can_continue_or_decline(
         # The same command can resume after a decline without changing project configuration.
         resumed = _RUNNER.invoke(
             app,
-            ["build", "support"],
+            ["build", "--mine-with", "hashing", "support"],
             input=f"\ntraces.otel.jsonl\n{_SAVED_SETUP}y\n",
             env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
         )
@@ -1020,6 +1045,8 @@ def test_explicit_router_cap_above_required_consents_only_to_exact_plan(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--root",
             str(root),
@@ -1109,7 +1136,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
 
     explicit = _RUNNER.invoke(
         app,
-        ["build", "explicit", "-t", str(traces), "--root", str(root)],
+        ["build", "--mine-with", "hashing", "explicit", "-t", str(traces), "--root", str(root)],
         input="2\n\nall\n\n1\n\n1\n\n1\n1,2\n\n\n\n1\ny\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -1117,7 +1144,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
 
     guided = _RUNNER.invoke(
         app,
-        ["build", "guided", "--root", str(root)],
+        ["build", "--mine-with", "hashing", "guided", "--root", str(root)],
         input=f"1,4\n{traces}\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -1211,7 +1238,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
         monkeypatch.setattr(wizard, "preflight_automatic_router", stop_after_calibration)
     first = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(root)],
+        ["build", "--mine-with", "hashing", "support", "--root", str(root)],
         input=f"1,4\ntraces.otel.jsonl\n2\n\n{_NEW_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -1226,7 +1253,7 @@ def test_interrupted_wizard_resumes_durable_stages_without_duplicate_build_calls
 
     resumed = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(root)],
+        ["build", "--mine-with", "hashing", "support", "--root", str(root)],
         input=f"1,4\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"OPENAI_API_KEY": "openai-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -1279,7 +1306,7 @@ def test_approved_calibration_resume_builds_human_calibrated_successor(
     monkeypatch.setattr(wizard, "bootstrap_provisional_judge", unexpected)
     result = _RUNNER.invoke(
         app,
-        ["build", "support", "--root", str(store.paths.root)],
+        ["build", "--mine-with", "hashing", "support", "--root", str(store.paths.root)],
         input=f"1,4\n{_SAVED_DISCOVERED_SETUP}y\n",
         env={"FIXTURE_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
     )
@@ -1315,7 +1342,7 @@ def test_bare_build_dispatches_wizard_without_required_trace_option(
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
-    result = _RUNNER.invoke(app, ["build", "support"])
+    result = _RUNNER.invoke(app, ["build", "--mine-with", "hashing", "support"])
 
     assert result.exit_code == 0, result.output
     assert calls and calls[0][0] == ("support",)
@@ -1636,6 +1663,8 @@ def test_completed_replay_rejects_role_override_before_replay_probe(
         app,
         [
             "build",
+            "--mine-with",
+            "hashing",
             "support",
             "--root",
             str(store.paths.root),
