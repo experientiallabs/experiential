@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.dispatch_policy import GatewayFleetLanePolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.fleet_lanes import FleetLane, FleetLaneShed, FleetLeases
+from exp.runtime.gateway.fleet_lanes import FleetLane, FleetLaneShed, FleetLeases, FleetUsage
 from exp.runtime.gateway.lane_saturation import overflow_target
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_accounting_test import (
@@ -19,7 +21,7 @@ from exp.runtime.gateway.native_accounting_test import (
     _settle_with_usage,
     _start,
 )
-from exp.runtime.gateway.native_rung_policy import settled_tokens
+from exp.runtime.gateway.native_rung_policy import settled_usage
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 
 _FLEET = GatewayFleetLanePolicy(requests_per_minute=100)
@@ -35,6 +37,8 @@ class _Gate:
         self.reserved: list[int] = []
         self.released: list[tuple[str, float | None, bool]] = []
         self.used: list[int | None] = []
+        self.outputs: list[int | None] = []
+        self.first_tokens: list[float | None] = []
         self.raise_on_acquire = False
         self.raise_on_release = False
 
@@ -55,11 +59,15 @@ class _Gate:
         duration_seconds: float | None,
         throttled: bool,
         used_tokens: int | None,
+        output_tokens: int | None,
+        first_token_seconds: float | None,
     ) -> None:
         if self.raise_on_release:
             raise ConnectionError("store unreachable")
         self.released.append((lease, duration_seconds, throttled))
         self.used.append(used_tokens)
+        self.outputs.append(output_tokens)
+        self.first_tokens.append(first_token_seconds)
 
 
 class _Clock:
@@ -295,24 +303,41 @@ def test_settled_usage_reaches_the_gate_for_token_reconciliation() -> None:
         input_tokens=40,
     )
     assert gate.used == [45]
+    assert gate.outputs == [5]
     assert gate.reserved[0] > 45
 
 
 @pytest.mark.parametrize(
     ("usage", "expected"),
     [
-        (None, None),
-        ({"input_tokens": 3, "output_tokens": 4}, 7),
-        ({"input_tokens": 3}, None),
-        ({"input_tokens": True, "output_tokens": 4}, None),
-        ({"input_tokens": -1, "output_tokens": 4}, None),
+        (None, (None, None)),
+        ({"input_tokens": 3, "output_tokens": 4}, (7, 4)),
+        ({"input_tokens": 3}, (None, None)),
+        ({"input_tokens": True, "output_tokens": 4}, (None, 4)),
+        ({"input_tokens": -1, "output_tokens": 4}, (None, 4)),
     ],
 )
-def test_settled_tokens_reads_only_well_formed_usage(
-    usage: JsonObject | None, expected: int | None
+def test_settled_usage_reads_only_well_formed_counts(
+    usage: JsonObject | None, expected: tuple[int | None, int | None]
 ) -> None:
     """Malformed or partial usage never credits tokens back."""
-    assert settled_tokens(None if usage is None else {"usage": usage}) == expected
+    read = settled_usage(None if usage is None else {"usage": usage})
+    assert (read.used_tokens, read.output_tokens) == expected
+
+
+def test_first_token_time_reaches_the_gate_relative_to_the_lease() -> None:
+    """TTFT is the first token's wall time minus the lease's wall time, never negative."""
+    gate = _Gate()
+    leases = FleetLeases(gate)
+    leases.acquire("ticket-1", _LANE, reserved_tokens=10)
+    leases.bind("ticket-1", "attempt-1")
+    leases.release_attempt(
+        "attempt-1", throttled=False, usage=FleetUsage(first_token_at=time.time() + 3600.0)
+    )
+    first = gate.first_tokens[0]
+    assert first is not None
+    assert 3590.0 < first < 3610.0
+    assert settled_usage({"first_token_at": "2026-11-02T00:00:00Z"}).first_token_at is not None
 
 
 @pytest.mark.parametrize(
@@ -320,6 +345,9 @@ def test_settled_tokens_reads_only_well_formed_usage(
     [
         {},
         {"inflight_headroom": 0.5, "max_inflight": 4},
+        {"inflight_auto": True, "max_inflight": 4},
+        {"requests_per_minute": 10, "inflight_headroom": 0.5},
+        {"requests_per_minute": 10, "arrival_fast_seconds": 60, "arrival_slow_seconds": 30},
         {"requests_per_minute": 10, "saturation": "queue"},
         {"requests_per_minute": 10, "queue_milliseconds": 50},
     ],
@@ -331,11 +359,12 @@ def test_incoherent_fleet_policies_are_refused(fields: JsonObject) -> None:
 
 
 def test_a_coherent_fleet_policy_validates() -> None:
-    """The worked example: 100 RPM, burst 2, auto in-flight at 50% headroom, queue 250 ms."""
+    """The worked example: 100 RPM, burst 2, auto in-flight at 95%, queue 250 ms."""
     policy = GatewayFleetLanePolicy(
         requests_per_minute=100,
         burst_requests=2,
-        inflight_headroom=0.5,
+        inflight_auto=True,
+        confidence=0.95,
         saturation="queue",
         queue_milliseconds=250,
     )

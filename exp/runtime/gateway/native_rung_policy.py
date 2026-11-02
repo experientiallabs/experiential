@@ -36,7 +36,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
-from exp.runtime.gateway.fleet_lanes import FleetLane
+from exp.runtime.gateway.fleet_lanes import FleetLane, FleetUsage
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import failover_overflow_cap, priority_overflow_ceiling
 from exp.runtime.gateway.native_execution import (
@@ -51,6 +51,7 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules
 from exp.runtime.gateway.native_settlement import (
+    first_token_at_from_settlement,
     graceful_transport_retirement,
     settlement_rate_limit,
 )
@@ -603,7 +604,7 @@ def record_attempt_health(
     loads.release_attempt(
         attempt_id,
         throttled=failure is not None and failure.failure_class == GatewayFailureClass.THROTTLED,
-        used_tokens=settled_tokens(settlement),
+        usage=settled_usage(settlement),
     )
     depth = entry.attempt_depths.get(attempt_id)
     if depth is None:
@@ -639,18 +640,34 @@ def record_attempt_health(
         health.exhausted(key, exhausted)
 
 
-def settled_tokens(settlement: JsonObject | None) -> int | None:
-    """Return a settlement's reported input plus output tokens, else ``None``."""
-    usage = None if settlement is None else settlement.get("usage")
-    if not isinstance(usage, dict):
+def _count(usage: dict[str, object], key: str) -> int | None:
+    value = usage.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
-    total = 0
-    for key in ("input_tokens", "output_tokens"):
-        value = usage.get(key)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            return None
-        total += value
-    return total
+    return value
+
+
+def settled_usage(settlement: JsonObject | None) -> FleetUsage:
+    """Return what a settlement reports for the fleet gate (fields ``None`` when absent).
+
+    Malformed or partial usage reports no tokens, so the gate keeps the full
+    reservation counted rather than crediting back a guess.
+    """
+    if settlement is None:
+        return FleetUsage()
+    first = first_token_at_from_settlement(settlement)
+    first_token_at = None if first is None else first.timestamp()
+    usage = settlement.get("usage")
+    if not isinstance(usage, dict):
+        return FleetUsage(first_token_at=first_token_at)
+    input_tokens, output_tokens = _count(usage, "input_tokens"), _count(usage, "output_tokens")
+    return FleetUsage(
+        used_tokens=None
+        if input_tokens is None or output_tokens is None
+        else input_tokens + output_tokens,
+        output_tokens=output_tokens,
+        first_token_at=first_token_at,
+    )
 
 
 LANE_EJECTED = "lane_ejected"

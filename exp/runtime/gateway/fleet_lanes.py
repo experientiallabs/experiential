@@ -106,6 +106,8 @@ class FleetLaneGate(Protocol):
         duration_seconds: float | None,
         throttled: bool,
         used_tokens: int | None,
+        output_tokens: int | None,
+        first_token_seconds: float | None,
     ) -> None:
         """Return one lease.
 
@@ -120,8 +122,22 @@ class FleetLaneGate(Protocol):
             used_tokens: The settled input plus output tokens, ``None`` when
                 unknown (never dispatched, abandoned, or no usage reported):
                 the reservation then stays counted in full.
+            output_tokens: The settled output tokens, when reported (the
+                lane's decode-rate estimate).
+            first_token_seconds: Seconds from the lease to the dispatch's first
+                token, when the data plane reported one (the lane's TTFT).
         """
         ...
+
+
+@dataclass(frozen=True)
+class FleetUsage:
+    """What one settled dispatch reports back to the gate (all ``None`` when unknown)."""
+
+    used_tokens: int | None = None
+    output_tokens: int | None = None
+    first_token_at: float | None = None
+    """Wall-clock (epoch seconds) time of the first token."""
 
 
 @dataclass
@@ -129,6 +145,7 @@ class _Held:
     lane: FleetLane
     lease: str
     acquired_at: float
+    acquired_wall: float
 
 
 class FleetLeases:
@@ -183,7 +200,7 @@ class FleetLeases:
                 self.sheds += 1
             return verdict
         with self._lock:
-            self._by_ticket[ticket] = _Held(lane, verdict, self._clock())
+            self._by_ticket[ticket] = _Held(lane, verdict, self._clock(), time.time())
         return None
 
     def bind(self, ticket: str, attempt_id: str) -> None:
@@ -197,17 +214,17 @@ class FleetLeases:
         with self._lock:
             held = self._by_ticket.pop(ticket, None)
         if held is not None:
-            self._release(held, dispatched=False, throttled=False, used_tokens=None)
+            self._release(held, dispatched=False, throttled=False, usage=FleetUsage())
 
     def release_attempt(
-        self, attempt_id: str, *, throttled: bool, used_tokens: int | None = None
+        self, attempt_id: str, *, throttled: bool, usage: FleetUsage | None = None
     ) -> None:
         """Release the lease held by one settled or abandoned attempt; idempotent."""
         with self._lock:
             ticket = self._ticket_by_attempt.pop(attempt_id, None)
             held = None if ticket is None else self._by_ticket.pop(ticket, None)
         if held is not None:
-            self._release(held, dispatched=True, throttled=throttled, used_tokens=used_tokens)
+            self._release(held, dispatched=True, throttled=throttled, usage=usage or FleetUsage())
 
     def held(self) -> int:
         """Return how many leases this worker holds (metrics and tests)."""
@@ -215,16 +232,22 @@ class FleetLeases:
             return len(self._by_ticket)
 
     def _release(
-        self, held: _Held, *, dispatched: bool, throttled: bool, used_tokens: int | None
+        self, held: _Held, *, dispatched: bool, throttled: bool, usage: FleetUsage
     ) -> None:
         duration = max(0.0, self._clock() - held.acquired_at) if dispatched else None
+        first = usage.first_token_at
+        first_token_seconds = (
+            None if first is None or not dispatched else max(0.0, first - held.acquired_wall)
+        )
         try:
             self._gate.release(
                 held.lane,
                 held.lease,
                 duration_seconds=duration,
                 throttled=throttled,
-                used_tokens=used_tokens,
+                used_tokens=usage.used_tokens,
+                output_tokens=usage.output_tokens,
+                first_token_seconds=first_token_seconds,
             )
         except Exception:  # noqa: BLE001 - the host's lease expiry reclaims it.
             with self._lock:

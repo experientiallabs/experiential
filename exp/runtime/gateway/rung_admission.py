@@ -42,7 +42,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from exp.runtime.gateway.fleet_lanes import FleetLane, FleetLaneGate, FleetLaneShed, FleetLeases
+from exp.runtime.gateway.fleet_lanes import (
+    FleetLane,
+    FleetLaneGate,
+    FleetLaneShed,
+    FleetLeases,
+    FleetUsage,
+)
 
 # Physical lane identity: the deployment and its credentialed connection.
 # Deliberately NOT revision-scoped (unlike health keys): a catalog write does
@@ -818,21 +824,21 @@ class RungLoadRegistry:
             self.fleet.release_ticket(ticket)
 
     def release_attempt(
-        self, attempt_id: str, *, throttled: bool = False, used_tokens: int | None = None
+        self, attempt_id: str, *, throttled: bool = False, usage: FleetUsage | None = None
     ) -> None:
         """Release the reservation held by one settled attempt; idempotent.
 
         Args:
             attempt_id: The settled or abandoned attempt.
             throttled: The provider throttled it (passed to the fleet gate).
-            used_tokens: Its settled input plus output tokens, when reported.
+            usage: Its settled usage and first-token time, when reported.
         """
         with self._lock:
             ticket = self._attempts.pop(attempt_id, None)
             if ticket is not None:
                 self._release_locked(ticket)
         if self.fleet is not None:
-            self.fleet.release_attempt(attempt_id, throttled=throttled, used_tokens=used_tokens)
+            self.fleet.release_attempt(attempt_id, throttled=throttled, usage=usage)
 
     def inflight(self, key: RungLoadKey, organization_id: str | None = None) -> int:
         """Return one rung's total or per-organization in-flight count.

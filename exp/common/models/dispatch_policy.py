@@ -102,9 +102,13 @@ class GatewayFleetLanePolicy(ContractModel):
     the provider accepts everything. The host paces dispatches onto the lane
     (one every ``60 / requests_per_minute`` seconds on average, with
     ``burst_requests`` extra allowed back to back), weighs a token budget the
-    same way, and caps the lane's fleet-wide in-flight count. What the host
-    does at a limit is ``saturation``. Every field is optional and the whole
-    policy is opt-in: an unauthored rung contributes zero identity bytes.
+    same way, and caps the lane's fleet-wide in-flight count, either at a fixed
+    ``max_inflight`` or automatically from live estimates of the lane's
+    arrival rate and request durations (``inflight_auto``). Hard caps always
+    win over estimates. What the host does at a limit is ``saturation``. The
+    estimator knobs (``confidence``, ``horizon_seconds``, the two arrival
+    windows) are host defaults when unset. Every field is optional and the
+    whole policy is opt-in: an unauthored rung contributes zero identity bytes.
     """
 
     requests_per_minute: int | None = Field(default=None, ge=1, le=1_000_000)
@@ -118,11 +122,22 @@ class GatewayFleetLanePolicy(ContractModel):
     """Dispatches allowed back to back above the steady pace (host default 2)."""
     max_inflight: int | None = Field(default=None, ge=1, le=1_000_000)
     """Fixed cap on the lane's fleet-wide in-flight dispatches; ``None`` = none."""
+    inflight_auto: bool = False
+    """Cap in-flight automatically at the ``confidence`` quantile of the count a
+    lane running at its pace holds (Little's law: mean ``rate * avg_duration``,
+    Poisson-distributed), and admit only while the predicted in-flight over the
+    next ``horizon_seconds`` stays under the cap at that confidence. Needs
+    ``requests_per_minute``. With ``max_inflight`` too, the lower binds."""
     inflight_headroom: float | None = Field(default=None, ge=0, le=10, allow_inf_nan=False)
-    """Automatic in-flight cap by Little's law: ``ceil(rate * avg_duration * (1 + headroom))``.
-
-    Needs ``requests_per_minute`` (the rate). With ``max_inflight`` too, the
-    lower of the two binds."""
+    """Extra fraction on the automatic cap (host default 0). Needs ``inflight_auto``."""
+    confidence: float | None = Field(default=None, ge=0.5, le=0.999, allow_inf_nan=False)
+    """Probability the estimate-based checks must hold with (host default 0.95)."""
+    horizon_seconds: float | None = Field(default=None, gt=0, le=600, allow_inf_nan=False)
+    """How far ahead the in-flight prediction looks (host default 5 s)."""
+    arrival_fast_seconds: int | None = Field(default=None, ge=1, le=3_600)
+    """Window of the fast arrival-rate estimate (host default 30 s)."""
+    arrival_slow_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    """Window of the slow arrival-rate estimate (host default 300 s)."""
     throttle_backoff_factor: float | None = Field(default=None, gt=0, le=64, allow_inf_nan=False)
     """Optional extra slowdown on a provider throttle; ``None`` = off (the default).
 
@@ -147,8 +162,16 @@ class GatewayFleetLanePolicy(ContractModel):
             raise ValueError(
                 "a fleet policy needs requests_per_minute, tokens_per_minute or max_inflight"
             )
-        if self.inflight_headroom is not None and self.requests_per_minute is None:
-            raise ValueError("inflight_headroom needs requests_per_minute (the rate it scales)")
+        if self.inflight_auto and self.requests_per_minute is None:
+            raise ValueError("inflight_auto needs requests_per_minute (the rate it scales)")
+        if self.inflight_headroom is not None and not self.inflight_auto:
+            raise ValueError("inflight_headroom needs inflight_auto")
+        if (
+            self.arrival_fast_seconds is not None
+            and self.arrival_slow_seconds is not None
+            and self.arrival_fast_seconds >= self.arrival_slow_seconds
+        ):
+            raise ValueError("arrival_fast_seconds must be shorter than arrival_slow_seconds")
         if (self.saturation == "queue") != (self.queue_milliseconds is not None):
             raise ValueError("queue_milliseconds is required by saturation=queue and only by it")
         return self
