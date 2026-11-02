@@ -3220,3 +3220,35 @@ def test_tool_changes_the_gateway_cannot_serve_are_named(
         )
     assert excinfo.value.detail.param == param
     assert fragment in excinfo.value.detail.message
+
+
+def test_exposed_messages_tool_loop_replays_unsigned_reasoning_for_each_turn() -> None:
+    """Ten tool continuations preserve each unsigned thinking block on exposed routes."""
+    history: list[JsonValue] = [{"role": "user", "content": "check the weather"}]
+    for turn in range(10):
+        history.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": f"check city {turn}"},
+                        {"type": "tool_use", "id": f"call-{turn}", "name": "weather", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": f"call-{turn}", "content": "sunny"},
+                    ],
+                },
+            ]
+        )
+        decoded = decode_messages(_body(messages=history))
+        assistants = [
+            message for message in decoded.request.messages if message.role == "assistant"
+        ]
+        assert len(assistants) == turn + 1
+        for index, assistant in enumerate(assistants):
+            payload = openai_chat_message(assistant, reasoning_output_exposed=True)
+            assert payload["reasoning_content"] == f"check city {index}"
+            assert "reasoning_content" not in openai_chat_message(assistant)

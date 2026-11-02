@@ -356,8 +356,9 @@ impl MessagesSseEncoder {
             // An exposure-gated or reasoning-displaying rung's plaintext
             // reasoning (route reasoning, plaintext reasoning, OpenAI summaries)
             // streams as one unsigned thinking block, the Messages twin of the
-            // Chat wire's reasoning fields; elsewhere it stays dropped. The
-            // sealed tool-turn carrier rides independently.
+            // Chat wire's reasoning fields; elsewhere it stays dropped.
+            // Hidden/display-only routes retain a sealed tool-turn carrier;
+            // exposed routes replay the plaintext itself.
             Event::ReasoningContentDelta { .. }
             | Event::ReasoningTextDelta(_)
             | Event::ReasoningSummaryDelta { .. } => self.displayed_thinking(event),
@@ -481,6 +482,7 @@ impl MessagesSseEncoder {
                 let mut frames = Vec::new();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_))
                     && self.reasoning.candidate()?.is_some()
+                    && !self.reasoning_output.exposed
                 {
                     // The carrier is known only once every tool call has
                     // completed, after the sequential thinking block closed,
@@ -816,8 +818,8 @@ impl MessagesSseEncoder {
             block.anthropic_index = Some(anthropic_index);
             let content_block = match block.kind {
                 BlockKind::Text => json!({"type": "text", "text": ""}),
-                // The SDK thinking block type requires both fields, so the
-                // start frame carries their empty forms like the provider.
+                // The SDK requires the signature field even for unsigned plaintext.
+                // Native Anthropic signatures arrive in subsequent deltas.
                 BlockKind::Thinking(_) => {
                     json!({"type": "thinking", "thinking": "", "signature": ""})
                 }

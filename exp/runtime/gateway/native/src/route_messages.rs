@@ -367,7 +367,8 @@ async fn respond_from_messages_events(
     // A tool turn's hidden reasoning leaves only as the sealed carrier, so it
     // is sealed under the gateway authority before the body is assembled,
     // exactly like the Chat surface (`respond_from_chat_events`).
-    let carrier = if refusal_completed.is_some() {
+    let exposed = admission.reasoning_output_at(depth);
+    let carrier = if refusal_completed.is_some() || exposed.exposed {
         None
     } else {
         match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
@@ -380,7 +381,6 @@ async fn respond_from_messages_events(
             }
         }
     };
-    let exposed = admission.reasoning_output_at(depth);
     let aggregated =
         match completed_messages_body_for(&admission, &events, carrier.as_deref(), exposed) {
             Ok(aggregated) => aggregated,
@@ -782,17 +782,19 @@ async fn stream_messages(
                             ))
                         }
                     };
-                    match seal_reasoning_candidate(
-                        &guard.bridge,
-                        &request_id,
-                        committed.depth,
-                        candidate,
-                    )
-                    .await
-                    {
-                        Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
-                        Ok(None) => {}
-                        Err(failure) => fail_stream!(failure),
+                    if !admission.reasoning_output_at(committed.depth).exposed {
+                        match seal_reasoning_candidate(
+                            &guard.bridge,
+                            &request_id,
+                            committed.depth,
+                            candidate,
+                        )
+                        .await
+                        {
+                            Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
+                            Ok(None) => {}
+                            Err(failure) => fail_stream!(failure),
+                        }
                     }
                     if !encoder.has_content_blocks()
                         && (billed_empty_completion(&event, usage.as_ref())

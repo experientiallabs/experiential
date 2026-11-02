@@ -828,66 +828,38 @@ fn unexposed_reasoning_stays_dropped_on_the_messages_surface() {
 }
 
 #[test]
-fn tool_turn_reasoning_round_trips_as_a_trailing_redacted_thinking_carrier() {
-    // A tool turn's reasoning must come back as the sealed opaque carrier
-    // (never raw plaintext: a CoT-injection vector on the way back in). The
-    // carrier is only known once every tool call completed, after the
-    // sequential thinking block has closed, so it rides one trailing
-    // `redacted_thinking` block: Anthropic's own "opaque, replay verbatim"
-    // shape, which every Messages client (Claude Code) echoes untouched.
-    let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
+fn exposed_tool_turn_replays_plaintext_without_a_redundant_carrier() {
+    // Exposed routes already admit caller-owned plaintext reasoning. Match
+    // Chat's replay contract without adding an opaque Messages block.
     let mut encoder = MessagesSseEncoder::new("request-abc", "coding");
     encoder.set_reasoning_output(true.into());
-    encoder.set_reasoning_content_carrier(carrier.to_string());
     let mut frames = encoder.start().expect("starts");
     for event in &tool_turn_reasoning_events() {
         frames.extend(encoder.feed(event).expect("streams"));
     }
-    assert_eq!(
-        frame_names(&frames),
-        vec![
-            "message_start",
-            "ping",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "content_block_start",
-            "content_block_delta",
-            "content_block_stop",
-            "content_block_start",
-            "content_block_stop",
-            "message_delta",
-            "message_stop",
-        ]
-    );
-    assert!(frames[3].contains("{\"type\":\"thinking_delta\",\"thinking\":\"think privately\"}"));
-    assert!(frames[5].contains("\"type\":\"tool_use\""));
-    assert!(frames[8].contains(&format!(
-        "{{\"type\":\"redacted_thinking\",\"data\":\"{carrier}\"}}"
-    )));
-    assert!(frames[10].contains("\"stop_reason\":\"tool_use\""));
-
+    assert!(!frames
+        .iter()
+        .any(|frame| frame.contains("redacted_thinking")));
+    assert!(!frames.iter().any(|frame| frame.contains("signature_delta")));
+    assert!(frames.iter().any(|frame| frame.contains("think privately")));
     let aggregated = completed_messages_body_with_reasoning(
         "request-abc",
         "coding",
         &tool_turn_reasoning_events(),
         &[],
-        Some(carrier),
+        None,
         true,
     )
-    .expect("aggregates");
+    .expect("aggregates without a carrier");
     assert_eq!(
         aggregated.body["content"],
         json!([
             {"type": "thinking", "thinking": "think privately", "signature": ""},
             {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
-            {"type": "redacted_thinking", "data": carrier},
         ])
     );
     assert_eq!(aggregated.body["stop_reason"], json!("tool_use"));
-
-    // Exposure only governs the plaintext display block; the carrier rides
-    // regardless (Fireworks-style hidden reasoning on a tool turn).
+    let carrier = "x-experiential-hunyuan-reasoning-v1:ZGVw:c2VhbGVk";
     let hidden = completed_messages_body_with_reasoning(
         "request-abc",
         "coding",
@@ -896,7 +868,7 @@ fn tool_turn_reasoning_round_trips_as_a_trailing_redacted_thinking_carrier() {
         Some(carrier),
         false,
     )
-    .expect("aggregates");
+    .expect("hidden reasoning retains its carrier");
     assert_eq!(
         hidden.body["content"],
         json!([
@@ -925,6 +897,6 @@ fn tool_turn_reasoning_without_a_sealed_carrier_fails_closed() {
     assert!(error.message.contains("not sealed"));
 
     let aggregated =
-        completed_messages_body_with_reasoning("request-abc", "coding", &events, &[], None, true);
+        completed_messages_body_with_reasoning("request-abc", "coding", &events, &[], None, false);
     assert!(aggregated.is_err());
 }
