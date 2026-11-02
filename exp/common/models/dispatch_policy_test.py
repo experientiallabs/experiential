@@ -151,6 +151,7 @@ def test_priority_tier_attested_is_off_by_default_and_independent_of_upstream_pr
         {"inflight_headroom": 0.5, "max_inflight": 4},
         {"inflight_auto": True, "max_inflight": 4},
         {"max_inflight": 4, "burst_requests": 3},
+        {"max_inflight": 4, "burst_requests": 0},
         {"max_inflight": 4, "throttle_backoff_factor": 2.0},
         {"requests_per_minute": 10, "arrival_fast_seconds": 600},
         {"requests_per_minute": 10, "arrival_slow_seconds": 20},

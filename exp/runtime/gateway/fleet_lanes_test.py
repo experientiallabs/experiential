@@ -370,3 +370,41 @@ def test_the_control_plane_attaches_a_host_gate(tmp_path: Path) -> None:
         assert plain._accounting.loads.fleet is None  # noqa: SLF001 - the seam under test
     finally:
         plain.close()
+
+
+def test_an_all_zero_usage_report_never_credits_the_reservation() -> None:
+    """A settled dispatch processed tokens: zeros are the provider failing to count."""
+    read = settled_usage({"usage": {"input_tokens": 0, "output_tokens": 0}})
+    assert read.used_tokens is None
+    assert read.output_tokens == 0
+
+
+def test_a_queued_admission_restamps_the_local_window() -> None:
+    """The worker's own rate window counts a queued dispatch when it really leaves."""
+    clock = _Clock()
+
+    class _SlowGate(_Gate):
+        def acquire(
+            self, lane: FleetLane, *, reserved_tokens: int, deadline_seconds: float
+        ) -> str | FleetLaneShed:
+            clock.now += 10.0
+            return super().acquire(
+                lane, reserved_tokens=reserved_tokens, deadline_seconds=deadline_seconds
+            )
+
+    loads = RungLoadRegistry(clock=clock)
+    loads.attach_fleet_gate(_SlowGate())
+    key = ("deployment-a", "b" * 64)
+    ticket = loads.reserve(
+        key, organization_id="org", weight=1, bound=None, fair_share=False, requests_per_minute=1
+    )
+    assert isinstance(ticket, str)
+    assert loads.fleet_acquire(ticket, _LANE) is None
+    # 55 s after the dispatch really left (65 s after the reservation) the
+    # one-per-minute local window still holds it.
+    clock.now += 55.0
+    again = loads.reserve(
+        key, organization_id="org", weight=1, bound=None, fair_share=False, requests_per_minute=1
+    )
+    assert isinstance(again, RungShed)
+    assert again.reason == "rate_limit"

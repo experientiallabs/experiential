@@ -178,8 +178,14 @@ class GatewayFleetLanePolicy(ContractModel):
                 "a fleet policy needs requests_per_minute, tokens_per_minute or max_inflight"
             )
         if self.requests_per_minute is None:
-            for name in ("inflight_auto", "burst_requests", "throttle_backoff_factor"):
-                if getattr(self, name) not in (None, False):
+            # Explicit None checks: an authored burst of 0 is still authored.
+            authored = {
+                "inflight_auto": self.inflight_auto,
+                "burst_requests": self.burst_requests is not None,
+                "throttle_backoff_factor": self.throttle_backoff_factor is not None,
+            }
+            for name, present in authored.items():
+                if present:
                     raise ValueError(f"{name} needs requests_per_minute (the pace it scales)")
         if self.inflight_headroom is not None and not self.inflight_auto:
             raise ValueError("inflight_headroom needs inflight_auto")

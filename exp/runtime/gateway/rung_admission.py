@@ -270,6 +270,22 @@ class RungLoadRegistry:
         self._lock = threading.Lock()
         self.fleet: FleetLeases | None = None
 
+    def _restamp_window(self, ticket: str, now: float) -> None:
+        """Move one ticket's dispatch-window entry to ``now`` (time order kept)."""
+        with self._lock:
+            entry = self._ticket_windows.get(ticket)
+            key = self._tickets.get(ticket, (None, ""))[0]
+            rung = None if key is None else self._rungs.get(key)
+            if entry is None or rung is None or now <= entry[0]:
+                return
+            try:
+                rung.window.remove(entry)
+            except ValueError:
+                return
+            moved = (now, entry[1])
+            rung.window.append(moved)
+            self._ticket_windows[ticket] = moved
+
     def attach_fleet_gate(self, gate: FleetLaneGate) -> None:
         """Bind the host's fleet-wide lane gate (``fleet_lanes``); call before serving."""
         self.fleet = FleetLeases(gate, clock=self._clock)
@@ -294,7 +310,12 @@ class RungLoadRegistry:
         shed = self.fleet.acquire(
             ticket, lane, reserved_tokens=reserved_tokens, deadline_seconds=deadline_seconds
         )
-        if shed is not None:
+        if shed is None:
+            # A queue lane may have held the dispatch for its slot: the
+            # worker's own window counts it when it really leaves, so a
+            # stricter local rate keeps binding after the wait.
+            self._restamp_window(ticket, self._clock())
+        else:
             with self._lock:
                 entry = self._ticket_windows.pop(ticket, None)
                 key = self._tickets.get(ticket, (None, ""))[0]

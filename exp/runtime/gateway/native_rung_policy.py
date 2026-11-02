@@ -666,10 +666,12 @@ def settled_usage(settlement: JsonObject | None) -> FleetUsage:
     if not isinstance(usage, dict):
         return FleetUsage(first_token_at=first_token_at)
     input_tokens, output_tokens = _count(usage, "input_tokens"), _count(usage, "output_tokens")
+    # A dispatch that settled with usage processed tokens: an all-zero report is
+    # the provider failing to count (native_settlement._credible_usage), never a
+    # reason to credit the whole reservation back.
+    total = None if input_tokens is None or output_tokens is None else input_tokens + output_tokens
     return FleetUsage(
-        used_tokens=None
-        if input_tokens is None or output_tokens is None
-        else input_tokens + output_tokens,
+        used_tokens=total if total else None,
         output_tokens=output_tokens,
         first_token_at=first_token_at,
     )
