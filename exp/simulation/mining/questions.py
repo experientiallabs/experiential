@@ -18,8 +18,9 @@ wrong propositions still returns a matrix, still clusters and still reports cove
 substitution is indistinguishable from success and costs real money to discover.
 
 Every question is a proposition, so an answer is a probability in ``[0, 1]`` and a bank's answers
-form a vector of fixed width and fixed column order. Families partition a bank, because the
-families need different views and are batched separately.
+form a vector of fixed width and fixed column order. Families partition a bank and are the unit
+of selection, so a run can buy part of one. A run asks every question it selected about a single
+view, and batching is positional over that selection rather than per family.
 """
 
 from __future__ import annotations
@@ -56,8 +57,10 @@ class Question(ContractModel):
     Attributes:
         question_id: Stable column identity, such as ``sit.clean``. It names the proposition
             across banks, matrices, and caches, so it never changes meaning once published.
-        family: The group this question belongs to, such as ``requirement``. A family is asked
-            about one view and is batched as a unit.
+        family: The group this question belongs to, such as ``requirement``. A family is the unit
+            of selection, so a run can buy part of a bank by naming families. It is not a unit of
+            batching and it carries no view: a run asks everything it selected about one view, and
+            batching is positional over that whole selection.
         text: The exact instruction sent to the decision model. It is part of the cache key, so
             editing it invalidates every answer previously bought for this column.
     """

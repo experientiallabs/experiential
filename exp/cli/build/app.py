@@ -28,6 +28,12 @@ from exp.cli.build.mining_options import (
     build_tagger,
     mining_geometry,
 )
+from exp.cli.build.preflight import (
+    authorize_tagging,
+    embedding_cost_ceiling,
+    lineage_bindings,
+    render_preflight,
+)
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
 from exp.cli.build.stops import paid_work_stops, require_learning_consent, rerun_command
@@ -37,7 +43,7 @@ from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
 from exp.cli.shared.consent import SpendBudget, can_prompt, one_cost_warning, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display, qualified
+from exp.cli.shared.progress import Phase, ProgressDisplay, progress_phases, qualified
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -73,18 +79,16 @@ from exp.runtime.models import (
 from exp.runtime.models.preflight import preflight_capabilities
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
+from exp.simulation.mining_cost import tagging_work
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
-    RAGLineageBinding,
     load_rag_index,
     persist_trace_rag,
 )
 from exp.simulation.retrieval.embedding import RAGEmbeddingCache
 from exp.simulation.retrieval.embedding_inputs import (
     embedding_chunk_bytes,
-    plan_rag_embedding_inputs,
 )
-from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.world_model.artifact import (
     persist_grounded_world_model,
 )
@@ -99,6 +103,8 @@ BUILD_PHASES = (
     Phase("learning", "Learning", 0.7, driver="Learning from traces", unit="traces"),
     Phase("retest", "Retesting misses", 0.2, driver="Replaying traces", unit="traces"),
 )
+# Importing evidence and mining it is one phase of its own, before the priced build phases.
+_LOADING_PHASES = (Phase("loading", "", 1.0),)
 _PROJECT_ARGUMENT = typer.Argument(..., metavar="PROJECT", help="Local project name.")
 _LEGACY_TRACE_ARGUMENT = typer.Argument(None, metavar="TRACES", hidden=True)
 _TRACE_FILE_OPTION = typer.Option(
@@ -177,7 +183,11 @@ def build(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Show the complete preflight without credentials, provider calls, or selection.",
+        help=(
+            "Show the preflight without credentials, provider calls or selection. On the "
+            "decision-tag route it stops at the tagging quote, because the rest is measured "
+            "on the task set tagging mines."
+        ),
     ),
     no_interactive: bool = typer.Option(
         False,
@@ -201,11 +211,20 @@ def build(
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
-    Shared spend consent covers provider embedding calls and any configured budget overrun.
     Model setup runs first when required catalog state is absent and both terminal streams are
     interactive. The shared catalog commits before project creation. Noninteractive missing state
-    fails before any project or artifact write. Configured builds compute and display a complete
-    provider-free preflight before reading credentials or constructing provider clients.
+    fails before any project or artifact write.
+
+    The build has two priced phases and quotes each of them before it starts: tagging, when the
+    mining geometry is ``decision-tag``, and embedding. Each quote is computed with no credential
+    read and no provider client built, is displayed as its own preflight line, and is authorized
+    through the shared spend-consent path together with any configured budget overrun. Tagging is
+    quoted first because tagging is how that geometry mines, so its authorization has to come
+    before mining rather than after it. ``--dry-run`` stops at the first quote it reaches.
+
+    The mining flags apply to both shapes of the command. ``exp build PROJECT -t TRACES`` and the
+    guided ``exp build PROJECT`` select the same route from the same flags, so neither can mine a
+    geometry the other would refuse.
 
     Args:
         project: Safe local project identifier below ``<root>/projects``.
@@ -222,7 +241,8 @@ def build(
         maximum_build_cost_usd: Embedding budget requiring confirmation when exceeded.
         yes: Explicit confirmation for the estimate, including any budget warning.
         maximum_router_cost_usd: Optional router budget requiring confirmation when exceeded.
-        dry_run: Print the complete preflight and stop before credentials or selection.
+        dry_run: Print the preflight the run reaches and stop before credentials, provider
+            calls or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
         retry_incomplete: Replace an interrupted learning trace, buying it again.
@@ -253,12 +273,23 @@ def build(
         trace_file = trace_file or local_capture_path(root)
     elif identity is not None:
         raise typer.BadParameter("--identity requires --source gateway")
-    if trace_file is None and import_id is None:
-        if dry_run or no_interactive or not can_prompt(_console):
-            raise typer.BadParameter(
-                "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
-                "`exp build PROJECT` is the interactive end-to-end build"
-            )
+    guided = trace_file is None and import_id is None
+    if guided and (dry_run or no_interactive or not can_prompt(_console)):
+        raise typer.BadParameter(
+            "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
+            "`exp build PROJECT` is the interactive end-to-end build"
+        )
+    # One mining choice for both paths. The guided build mines exactly what the flags say, so
+    # `exp build PROJECT` and `exp build PROJECT -t TRACES` cannot disagree about the route.
+    mining_spec = mining_geometry(
+        mine_with=mine_with,
+        cluster_with=cluster_with,
+        sample_with=sample_with,
+        tagger=tagger,
+        question_bank=question_bank,
+        seed=mining_seed,
+    )
+    if guided:
         from exp.cli.build.wizard import run_build_wizard
 
         with paid_work_stops(_console):
@@ -276,6 +307,9 @@ def build(
                     providers=tuple(provider or ()),
                     console=_console,
                     retry_incomplete=retry_incomplete,
+                    mining_spec=mining_spec,
+                    tagger_alias=tagger,
+                    tagger_concurrency=tagger_concurrency,
                 )
             except ArtifactStoreError as exc:
                 raise typer.BadParameter(
@@ -292,14 +326,6 @@ def build(
                 raise typer.BadParameter(str(exc)) from exc
         return
     source = source or "otlp"
-    mining_spec = mining_geometry(
-        mine_with=mine_with,
-        cluster_with=cluster_with,
-        sample_with=sample_with,
-        tagger=tagger,
-        question_bank=question_bank,
-        seed=mining_seed,
-    )
     rerun = rerun_command(project, trace_file, import_id, source, identity)
     started = time.monotonic()
     with usage_error(
@@ -334,7 +360,8 @@ def build(
             selected,
         )
         _console.print("[dim]loading[/dim] Import trace evidence and mine scenarios")
-        with progress_display(_console) as progress:
+        with progress_phases(_console, _LOADING_PHASES) as loading:
+            progress = loading.phase("loading")
             report(progress, "normalization")
             if import_id is not None:
                 source, normalized = load_stored_build_import(root, project, import_id)
@@ -365,6 +392,32 @@ def build(
                     ),
                 ),
             )
+            # Tagging is mining, so its quote and its authorization come before mining starts.
+            # The progress line is released while the operator is asked.
+            work = tagging_work(normalized.traces, mining_spec)
+            tagging_estimate = None
+            if work is not None:
+                assert tagger is not None  # mining_geometry has already required the alias.
+                tagger_snapshot, tagger_capabilities = runtime_catalog.snapshot(tagger)
+                with loading.paused():
+                    authorization = authorize_tagging(
+                        _console,
+                        work=work,
+                        tagger_alias=tagger,
+                        tagger_model_id=tagger_snapshot.model_id,
+                        capabilities=tagger_capabilities,
+                        accepted=len(normalized.traces),
+                        invalid=len(normalized.issues),
+                        root=root,
+                        command=rerun,
+                        maximum_cost_usd=maximum_build_cost_usd,
+                        yes=yes,
+                        no_interactive=no_interactive,
+                        dry_run=dry_run,
+                    )
+                if not authorization.approved:
+                    return
+                tagging_estimate = authorization.ceiling
             report(progress, "task construction")
             completed = build_project(
                 normalized,
@@ -395,7 +448,7 @@ def build(
         tasks = completed.artifacts.mining.tasks
         fit_count = sum(task.partition == "fit" for task in tasks)
         held_out_count = sum(task.partition == "held_out" for task in tasks)
-        estimate = _embedding_cost_ceiling(completed, embedder_capabilities)
+        estimate = embedding_cost_ceiling(completed, embedder_capabilities)
         built = _reuse_completed_grounded_artifacts(
             store,
             completed,
@@ -405,7 +458,8 @@ def build(
             top_k=top_k,
         )
         reused = built is not None
-        _render_preflight(
+        render_preflight(
+            _console,
             accepted=len(completed.artifacts.trace_dataset.dataset.trace_ids),
             invalid=completed.artifacts.trace_dataset.dataset.invalid_trace_count,
             fit_count=fit_count,
@@ -415,6 +469,8 @@ def build(
             embedder_alias=selected.embedder,
             embedder_model_id=embedder_snapshot.model_id,
             estimate=estimate,
+            tagging=tagging_estimate,
+            tagged=work is not None,
             ceiling=maximum_build_cost_usd,
             reused=reused,
         )
@@ -654,40 +710,6 @@ def _validated_role_snapshots(
     return world_snapshot, embedder_snapshot, embedder_capabilities
 
 
-def _embedding_cost_ceiling(
-    completed: ProjectBuild,
-    capabilities: ModelCapabilities,
-) -> float | None:
-    """Bound retry-inclusive embedding spend from the exact rendered retrieval inputs.
-
-    Args:
-        completed: Persisted trace and task build whose transitions will be embedded.
-        capabilities: Static embedder capabilities and price metadata.
-
-    Returns:
-        Conservative USD ceiling across serving and fit-only index construction, or ``None``
-        when the embedder has no catalog input price and the spend cannot be estimated.
-    """
-    price = capabilities.input_cost_per_million_tokens_usd
-    if price is None:
-        return None
-    bindings = _lineage_bindings(completed)
-    traces = completed.artifacts.trace_dataset.traces
-    serving = extract_real_transitions(
-        traces,
-        bindings,
-        included_partitions=frozenset({"fit", "held_out"}),
-    )
-    # Fit is a strict subset of serving. The same invocation reuses exact text vectors across
-    # indexes, without sharing transition membership or observations between partitions.
-    plan = plan_rag_embedding_inputs(
-        tuple(transition.key_text for transition in serving),
-        maximum_chunk_bytes=embedding_chunk_bytes(capabilities.context_window_tokens),
-    )
-    maximum_input_tokens = plan.maximum_input_tokens * RetryPolicy().maximum_attempts
-    return maximum_input_tokens * price / 1_000_000
-
-
 def _build_grounded_artifacts(
     store: ProjectStore,
     completed: ProjectBuild,
@@ -722,7 +744,7 @@ def _build_grounded_artifacts(
     task_input = artifact_input(
         store.artifacts.read(completed.artifacts.task_set.task_set_id).manifest
     )
-    bindings = _lineage_bindings(completed)
+    bindings = lineage_bindings(completed)
     assert resolved_embedder.embedding_client is not None
     embedding_price = resolved_embedder.capabilities.input_cost_per_million_tokens_usd
     rag_embedder = RAGEmbedderBinding(
@@ -855,30 +877,6 @@ def _complete_grounded_build(
     return GroundedBuildCompletion(artifacts=built, reused=reused)
 
 
-def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:
-    """Convert frozen duplicate groups into complete RAG lineage partition bindings.
-
-    Args:
-        completed: Persisted mining output with leakage groups and split assignments.
-
-    Returns:
-        Deterministically ordered trace-to-lineage partition bindings.
-    """
-    mining = completed.artifacts.mining
-    result = []
-    for group in mining.analysis.leakage_groups:
-        partition = mining.partition.partition_for(group.lineage_group_id)
-        result.extend(
-            RAGLineageBinding(
-                trace_id=trace_id,
-                lineage_id=group.lineage_group_id,
-                partition=partition,
-            )
-            for trace_id in group.source_trace_ids
-        )
-    return tuple(sorted(result, key=lambda item: item.trace_id))
-
-
 def _resolve_trace_file(trace_file: Path) -> Path:
     """Validate one explicit local trace-file selection without opening its content.
 
@@ -942,50 +940,3 @@ def _rag_transition_count(store: ProjectStore, artifact_id: str) -> int:
         Count of persisted real transitions.
     """
     return load_rag_index(store.artifacts, artifact_id).index.transition_count
-
-
-def _render_preflight(
-    *,
-    accepted: int,
-    invalid: int,
-    fit_count: int,
-    held_out_count: int,
-    world_alias: str,
-    world_model_id: str,
-    embedder_alias: str,
-    embedder_model_id: str,
-    estimate: float | None,
-    ceiling: float,
-    reused: bool,
-) -> None:
-    """Print the complete build preflight before credentials or provider dispatch.
-
-    Args:
-        accepted: Count of valid normalized traces.
-        invalid: Count of rejected input traces.
-        fit_count: Representative fit-task count.
-        held_out_count: Representative held-out task count.
-        world_alias: Selected world-model catalog alias.
-        world_model_id: Provider model ID bound to that alias.
-        embedder_alias: Selected embedder catalog alias.
-        embedder_model_id: Provider embedding model ID bound to that alias.
-        estimate: Conservative maximum embedding cost in USD, or ``None`` when undefined.
-        ceiling: Configured ``--max-build-cost-usd`` value.
-        reused: Whether an exact completed grounded build already exists.
-    """
-    _console.print("[bold]Build preflight[/bold]")
-    _console.print(f"  [dim]traces[/dim]       {accepted} accepted, {invalid} invalid")
-    _console.print(f"  [dim]split[/dim]        {fit_count} fit, {held_out_count} held out")
-    _console.print(f"  [dim]world model[/dim]  {world_alias} [dim]({world_model_id})[/dim]")
-    _console.print(f"  [dim]embedder[/dim]     {embedder_alias} [dim]({embedder_model_id})[/dim]")
-    if reused:
-        _console.print(
-            "  [dim]embedding[/dim]    reuse exact completed indexes, $0.000000 new spend"
-        )
-    elif estimate is None:
-        _console.print(
-            "  [dim]embedding[/dim]    [yellow]undefined[/yellow] (embedder has no catalog price)"
-        )
-    else:
-        _console.print(f"  [dim]embedding[/dim]    at most ${estimate:.6f}")
-    _console.print(f"  [dim]budget[/dim]       ${ceiling:.6f}")

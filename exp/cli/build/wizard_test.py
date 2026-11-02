@@ -18,7 +18,7 @@ import exp.cli.build.app as build_command
 import exp.cli.build.wizard as wizard
 import exp.cli.build.wizard_screens as screens
 from exp.cli.app import app
-from exp.cli.build.app_test import _otlp_export
+from exp.cli.build.app_test import _FakeTagger, _otlp_export, _question_bank
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.providers.setup_test import _FakeLister
 from exp.cli.shared.picker_test import ScriptedConsole
@@ -54,7 +54,8 @@ from exp.optimize.router.automatic.service_test import (
     _ProviderState,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
-from exp.simulation.build import ProjectBuild
+from exp.simulation.build import BuildReviewReadiness, ProjectBuild
+from exp.simulation.mining.service import MiningSpec
 
 _RUNNER = CliRunner()
 _REVISION = "a" * 40
@@ -991,7 +992,7 @@ def test_bare_build_budget_warning_can_continue_or_decline(
     write_model_catalog(root / "models.toml", _catalog())
     state = _ProviderState()
     _install_integrated_runtime(monkeypatch, state)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 7.9447329)
+    monkeypatch.setattr(wizard, "embedding_cost_ceiling", lambda *_args: 7.9447329)
 
     result = _RUNNER.invoke(
         app,
@@ -1388,6 +1389,9 @@ def test_invalid_traces_fail_before_provider_discovery(
             code_revision="a" * 40,
             providers=(),
             console=Console(file=StringIO(), force_terminal=False),
+            mining_spec=MiningSpec(),
+            tagger_alias=None,
+            tagger_concurrency=1,
         )
 
 
@@ -1570,6 +1574,9 @@ def test_refused_named_consent_stops_before_paid_provider_stages(
         maximum_router_cost_usd=None,
         providers=(),
         console=ScriptedConsole(_SAVED_SETUP),
+        mining_spec=MiningSpec(),
+        tagger_alias=None,
+        tagger_concurrency=1,
     )
 
     assert len(authorizations) == 1
@@ -1628,6 +1635,9 @@ def test_completed_replay_confirms_models_without_paid_provider_work(
         maximum_router_cost_usd=None,
         providers=(),
         console=console,
+        mining_spec=MiningSpec(),
+        tagger_alias=None,
+        tagger_concurrency=1,
     )
 
     printed = unstyle(console.output)
@@ -1676,3 +1686,67 @@ def test_completed_replay_rejects_role_override_before_replay_probe(
 
     assert result.exit_code == 2
     assert "world_model='different' (selected 'world')" in unstyle(result.output)
+
+
+def test_the_guided_build_mines_the_route_the_flags_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guided build takes its mining route from the same flags the explicit build does.
+
+    Without a trace path the command dispatches the wizard, and the wizard used to mine the
+    provider-free geometry whatever the mining flags said. That gave one command two different
+    defaults depending on whether ``-t`` was present, and it silently discarded seven flags.
+    """
+    _default_trace_corpus(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / ".exp"
+    catalog = _catalog()
+    write_model_catalog(
+        root / "models.toml",
+        catalog.model_copy(
+            update={
+                "models": {
+                    **catalog.models,
+                    "tagger": ModelRecord(
+                        connection="provider",
+                        model="tagger",
+                        billing_source=BillingSource.CUSTOMER_MANAGED,
+                        capabilities=ModelCapabilities(input_cost_per_million_tokens_usd=0.1),
+                    ),
+                }
+            }
+        ),
+    )
+    state = _ProviderState()
+    _install_integrated_runtime(monkeypatch, state)
+    bank_id = _question_bank(tmp_path, monkeypatch)
+    tagger = _FakeTagger()
+    monkeypatch.setattr(wizard, "build_tagger", lambda *_args, **_kwargs: tagger)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--mine-with",
+            "decision-tag",
+            "--tagger",
+            "tagger",
+            "--question-bank",
+            bank_id,
+        ],
+        input=f"\ntraces.otel.jsonl\n{_SAVED_SETUP}",
+        env={"OPENAI_API_KEY": "fixture-secret", "EXP_RELEASE_REVISION": _REVISION},
+    )
+
+    output = unstyle(result.output)
+    assert result.exit_code == 0, output
+    assert "Mining preflight" in output
+    assert f"decision-tag (bank {bank_id}, 4 questions)" in output
+    assert len(tagger.passes) == 1
+    store = wizard.ProjectStore(root, "support")
+    review_state = store.read_review()
+    assert isinstance(review_state, dict)
+    review = BuildReviewReadiness.model_validate(review_state["build_review"])
+    assert review.mining_spec.selection.kind == "decision_tag"
+    assert review.mining_spec.selection.bank_id == bank_id

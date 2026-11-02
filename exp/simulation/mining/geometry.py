@@ -21,6 +21,22 @@ from dataclasses import dataclass
 
 import numpy as np
 
+GAIN_TIE_TOLERANCE = 1e-12
+"""Width of the facility-location gain tie set, relative to the mass the gains are measured in.
+
+:meth:`CoreSetGeometry.representatives` scores its candidates with a blocked matmul, which does not
+return bitwise-identical rows for bitwise-identical inputs: a row scored inside the micro-kernel and
+a row scored on the remainder path accumulate in different orders. Two candidates that are
+mathematically tied, two duplicate vectors for instance, therefore come out a few last bits apart,
+and an exactly-equal tie set holds one of them, leaving the documented identity tie-break nothing to
+break. The tie set is built with a tolerance instead.
+
+It has to be relative because a gain is a sum of ``mass * similarity`` terms, so it scales with the
+workload mass of the group: an absolute epsilon that is generous on a group carrying ten traces is
+no tolerance at all on one carrying a million. Scaled this way it is many orders of magnitude above
+that rounding and far below any difference between two candidates a reviewer would call different.
+"""
+
 
 def cosine(left: Sequence[float], right: Sequence[float]) -> float:
     """Return a bounded dot product for pre-normalized vectors.
@@ -112,11 +128,18 @@ class CoreSetGeometry:
         """Return the members most of a group looks like, most typical first.
 
         Each pick is the member that most increases the workload-weighted similarity of the group
-        to its nearest chosen representative. That makes the first pick exactly :meth:`medoid`,
-        and every later one the centre of whatever mass the earlier picks stand in for badly. The
-        objective is monotone and submodular, so this order is within ``1 - 1/e`` of the best set
-        of its size, and nothing has to be configured to say how much "typical" to prefer over
-        "spread": taking the common case first is what maximizing it does.
+        to its nearest chosen representative. The first pick maximizes :meth:`medoid`'s own
+        objective shifted by a constant, so it is that medoid, and every later one is the centre of
+        whatever mass the earlier picks stand in for badly. The objective is monotone and
+        submodular, so this order is within ``1 - 1/e`` of the best set of its size, and nothing
+        has to be configured to say how much "typical" to prefer over "spread": taking the common
+        case first is what maximizing it does.
+
+        The two measure that shared objective in different arithmetic, numpy here and pure Python
+        there, which is visible only on a group whose centre two members hold to within the last
+        bits of a double: this method hands those to the lowest identity while :meth:`medoid` hands
+        them to whichever measured higher. Members positioned identically are a tie in both, and
+        both resolve a tie to the lowest identity.
 
         This is the opposite emphasis to :meth:`farthest_first`, which spends budget on the cases
         least like anything chosen so far. Both are defensible and which one a run wants is what a
@@ -138,7 +161,9 @@ class CoreSetGeometry:
 
         Returns:
             Representatives in greedy order, each appearing once and none of them in
-            ``covered_ids``. Shorter than ``count`` when the group runs out of members.
+            ``covered_ids``. Shorter than ``count`` when the group runs out of members. The order
+            does not depend on the order ``member_ids`` arrived in: every pick comes from the gain
+            tie set :data:`GAIN_TIE_TOLERANCE` defines, by lowest identity.
 
         Raises:
             ValueError: ``count`` is negative, which no caller means, or the members were
@@ -162,14 +187,18 @@ class CoreSetGeometry:
         for covered_id in covered_ids:
             best = np.maximum(best, self._similarities(positions, self.vectors[covered_id]))
         chosen: list[str] = []
+        width = GAIN_TIE_TOLERANCE * float(mass.sum())
         while len(chosen) < min(count, len(eligible)):
             rows = np.asarray(live, dtype=np.int64)
             gains = self._gains(positions, mass, best, rows)
             # The tie-break is the whole of this method's input-order independence: among the
             # candidates that would add the most, the lowest identity wins, exactly as every other
-            # core-set question here breaks a tie.
-            peak = gains.max()
-            pick = min(members[int(row)] for row in rows[gains == peak])
+            # core-set question here breaks a tie. The tie set is taken within
+            # GAIN_TIE_TOLERANCE of the peak rather than at it, because the blocked matmul that
+            # scored these candidates leaves mathematically tied rows a few last bits apart and an
+            # exactly-equal tie set would hold whichever of them rounded upwards.
+            peak = float(gains.max())
+            pick = min(members[int(row)] for row in rows[gains >= peak - width])
             chosen.append(pick)
             live.remove(row_of[pick])
             best = np.maximum(best, self._similarities(positions, self.vectors[pick]))

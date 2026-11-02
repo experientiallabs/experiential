@@ -54,6 +54,7 @@ from exp.optimize.router.composition_test import (
     _resolved,
     _snapshot,
 )
+from exp.optimize.router.evaluation.build import VerifiedProjectBuild
 from exp.optimize.router.judgment_budget import JudgmentDispatchReceipt
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.simulation.engines.text.simulator import WorldModelSimulator
@@ -82,7 +83,7 @@ class _EvidenceSetupSupplier:
     def __call__(
         self,
         project: ProjectStore,
-        build: exp.ProjectBuild,
+        build: VerifiedProjectBuild,
         review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
@@ -90,7 +91,7 @@ class _EvidenceSetupSupplier:
 
         Args:
             project: Project owning the completed build and release evidence.
-            build: Deterministic trace and task-set build reused by composition.
+            build: Verified completed trace and task-set build reused by composition.
             review: Approved rubric and calibration identifiers.
             budget: Finite composition budget already validated by the workflow.
 
@@ -101,7 +102,7 @@ class _EvidenceSetupSupplier:
         completed = project.load_project().build
         assert completed is not None
         fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
-        tasks = load_task_set(project.artifacts, build.artifacts.task_set.task_set_id).tasks
+        tasks = load_task_set(project.artifacts, build.task_set.task_set_id).tasks
         candidates = tuple(
             RoutedCandidateSnapshot(alias=alias, model=_snapshot(alias))
             for alias in ("candidate-baseline", "candidate-economy")
@@ -557,7 +558,7 @@ class _EvidenceReviewSupplier:
     def __call__(
         self,
         project: ProjectStore,
-        build: exp.ProjectBuild,
+        build: VerifiedProjectBuild,
         budget: RouterCompositionBudget,
     ) -> ApprovedRouterReview:
         """Persist or replay one exact approved rubric and calibration."""

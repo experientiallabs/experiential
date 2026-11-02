@@ -172,7 +172,12 @@ class ProjectHostedSetup(ContractModel):
 
 
 class ProjectTracePreparationSettings(ContractModel):
-    """Provider-free settings fixed before canonical trace preparation starts.
+    """Settings fixed before canonical trace preparation starts.
+
+    Preparation makes no completion, judge or embedding call on any of these settings. It is
+    provider-free outright on their defaults, which select the geometry that reads
+    request-visible text alone; ``mining_geometry="decision_tag"`` buys one decision per distinct
+    case while mining, and nothing else here reaches a provider.
 
     The mining geometry is stored as names rather than as the typed specs themselves, because this
     module is shared contract and may not import the simulation package that owns them. Names plus
@@ -185,23 +190,31 @@ class ProjectTracePreparationSettings(ContractModel):
         fit_task_budget: Representative tasks reserved for fit-only work.
         held_out_task_budget: Representative tasks sealed for final reporting.
         descriptor_dimensions: Width of the request-visible hashing descriptor vector.
-        mining_geometry: Which geometry core-set selection measures in. It defaults to
-            ``decision_tag``, which groups cases by what a decision model found each episode to
-            contain rather than by how its request happened to be worded. That is the distinction
-            a representative task set is for, and it is one request-visible text cannot draw. The
-            route costs one decision call per distinct case and requires ``mining_bank``, so
-            ``hashing`` remains the provider-free choice for a build that must make no call.
+        mining_geometry: Which geometry core-set selection measures in. ``decision_tag`` groups
+            cases by what a decision model found each episode to contain rather than by how its
+            request happened to be worded. That is the distinction a representative task set is
+            for, and it is one request-visible text cannot draw, which is why it is the route the
+            command line defaults to. It is not the default here. This field is persisted, so its
+            default is also the value every record written without it resolves to, and a record
+            that names no geometry names no ``mining_bank`` either, which the tagged route cannot
+            run without. ``hashing`` is therefore the default: a stored record says "tag" only
+            when something stored that word, and the route that calls nothing is the one a
+            settings record falls back to. A caller that wants the tagged route records it, and
+            :func:`~exp.simulation.mining_cost.tagging_work` prices it before the first call.
         mining_cluster: Which clustering backend groups the selection candidates, or None for
             whichever one the chosen geometry defaults to. A name is always taken literally, so a
             run that asks for ``descriptor`` gets it on either route. See
             :func:`~exp.simulation.build.mining_spec_for`.
         mining_sampling: How representative budget beyond the guaranteed slots is spent, or None
             for the chosen geometry's own default. As with ``mining_cluster``, a name is literal.
+            ``hierarchical`` descends the clustering's tree, so it goes with a backend that
+            publishes one and is refused with any other.
         mining_bank: Identity of the question bank the decision-tag geometry reads, resolved from
             local configuration rather than package data. Empty for a provider-free build, and
             required by the decision-tag geometry: the bank decides what the geometry can tell
-            apart, so it is recorded here rather than defaulted. It has no default even though the
-            geometry does, because there is no bank that describes an unknown corpus.
+            apart, so it is recorded here rather than defaulted: there is no bank that describes
+            an unknown corpus, which is the other reason the geometry above falls back to the
+            route that reads no bank.
         mining_tagger_alias: Catalog alias answering the question bank, or None for a
             provider-free build. It is recorded so a rerun resolves the same model.
         mining_seed: Seed for a clustering backend whose initialization is random. Neither the
@@ -212,13 +225,21 @@ class ProjectTracePreparationSettings(ContractModel):
     fit_task_budget: int = Field(default=50, ge=0)
     held_out_task_budget: int = Field(default=20, ge=0)
     descriptor_dimensions: int = Field(default=64, ge=8)
-    mining_geometry: Literal["hashing", "decision_tag"] = "decision_tag"
+    mining_geometry: Literal["hashing", "decision_tag"] = "hashing"
     mining_cluster: (
         Literal["descriptor", "kmeans", "bernoulli_mixture", "atoms_hierarchy", "pattern_hierarchy"]
         | None
     ) = None
     mining_sampling: (
-        Literal["medoid", "proportional", "diversity", "stratified", "representative", "balanced"]
+        Literal[
+            "medoid",
+            "proportional",
+            "diversity",
+            "stratified",
+            "representative",
+            "balanced",
+            "hierarchical",
+        ]
         | None
     ) = None
     mining_bank: str = Field(default="", max_length=128)

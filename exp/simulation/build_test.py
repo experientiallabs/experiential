@@ -14,7 +14,7 @@ from pydantic import ValidationError
 import exp
 import exp.runtime.models.registry as runtime_model_registry
 import exp.simulation.build as build_module
-from exp.common.core.artifacts import SourceIdentity
+from exp.common.core.artifacts import SourceIdentity, stable_id
 from exp.common.project import (
     ArtifactCorruptionError,
     ArtifactStore,
@@ -29,7 +29,12 @@ from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
-from exp.simulation.build import build_project, build_task_set, mining_spec_for
+from exp.simulation.build import (
+    BuildReviewReadiness,
+    build_project,
+    build_task_set,
+    mining_spec_for,
+)
 from exp.simulation.mining.clustering import (
     BernoulliMixtureClusterSpec,
     DescriptorClusterSpec,
@@ -38,6 +43,7 @@ from exp.simulation.mining.clustering import (
 from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSelectionSpec
 from exp.simulation.mining.questions import EXAMPLE_BANK_ID
 from exp.simulation.mining.sampling import (
+    HierarchicalSamplingSpec,
     MedoidSamplingSpec,
     RepresentativeSamplingSpec,
     StratifiedSamplingSpec,
@@ -537,9 +543,11 @@ def test_the_hashing_route_still_rebuilds_the_provider_free_geometry_exactly() -
 def test_mining_spec_for_defaults_a_tagged_project_to_the_settled_pipeline() -> None:
     """The decision-tag route's default is the geometry a tagged corpus actually has.
 
-    Thresholded fired-proposition sets agglomerated by Jaccard average linkage, filled with the
-    facility-location sampler. The selection geometry itself stays continuous, because that is
-    what the sampler and every later phase measure in; only the clusterer thresholds.
+    Thresholded fired-proposition sets agglomerated by Jaccard average linkage, with the leftover
+    budget spent by descending that agglomeration so a family of near-identical groups is weighed
+    as one before any budget is split inside it. The selection geometry itself stays continuous,
+    because that is what the sampler and every later phase measure in; only the clusterer
+    thresholds.
     """
     settings = ProjectTracePreparationSettings(
         source_kind="otlp", mining_geometry="decision_tag", mining_bank=EXAMPLE_BANK_ID
@@ -553,7 +561,7 @@ def test_mining_spec_for_defaults_a_tagged_project_to_the_settled_pipeline() -> 
     assert spec.selection.transform == "l2"
     assert spec.selection.view == "task"
     assert spec.cluster == PatternHierarchyClusterSpec()
-    assert spec.sampling == RepresentativeSamplingSpec()
+    assert spec.sampling == HierarchicalSamplingSpec()
 
 
 def test_mining_spec_for_takes_a_named_backend_literally_on_either_route() -> None:
@@ -602,6 +610,42 @@ def test_mining_spec_for_refuses_an_incompatible_pairing() -> None:
         mining_spec_for(settings)
 
 
+def test_mining_spec_for_follows_the_named_backend_with_an_unnamed_strategy() -> None:
+    """Descending a tree is only defined for a backend that has one, so the default follows it.
+
+    The tag route's unnamed strategy is the descent for the two backends that publish a tree and
+    the facility-location fill for the rest. Naming a backend therefore never forces a strategy to
+    be named with it, which is the property that keeps the two settings independent.
+    """
+    settings = ProjectTracePreparationSettings(
+        source_kind="otlp",
+        mining_geometry="decision_tag",
+        mining_bank=EXAMPLE_BANK_ID,
+        mining_cluster="descriptor",
+    )
+
+    assert mining_spec_for(settings).sampling == RepresentativeSamplingSpec()
+    atoms = settings.model_copy(update={"mining_cluster": "atoms_hierarchy"})
+    assert mining_spec_for(atoms).sampling == HierarchicalSamplingSpec()
+
+
+def test_mining_spec_for_refuses_the_descent_without_a_tree_to_descend() -> None:
+    """Only an explicit pair of names reaches this, and it is refused before any tagging."""
+    settings = ProjectTracePreparationSettings(
+        source_kind="otlp",
+        mining_geometry="decision_tag",
+        mining_bank=EXAMPLE_BANK_ID,
+        mining_cluster="kmeans",
+        mining_sampling="hierarchical",
+    )
+
+    with pytest.raises(ValidationError, match="kmeans backend publishes none") as caught:
+        mining_spec_for(settings)
+
+    assert "atoms_hierarchy" in str(caught.value)
+    assert "representative" in str(caught.value)
+
+
 def test_mining_spec_for_refuses_the_pattern_hierarchy_without_fired_sets() -> None:
     """Set overlap between coordinates that are not set membership is not a grouping."""
     settings = ProjectTracePreparationSettings(
@@ -642,3 +686,92 @@ def test_mining_spec_for_refuses_a_tag_geometry_with_no_bank() -> None:
 
     with pytest.raises(ValueError, match="reads a question bank"):
         mining_spec_for(settings)
+
+
+def test_settings_written_before_the_tagged_route_rebuild_the_free_spec() -> None:
+    """A stored record that names no geometry mines the route that calls nothing.
+
+    Projects prepared before the command line defaulted to the tagged route stored no mining
+    keys at all. Their settings are reconstructed on every later run, and an absent key resolves
+    to its default, so the default of a persisted field is also its migration value: it decides
+    what every one of those records means now. For this field the only safe meaning is the route
+    that needs neither a bank nor a credential, because those records carry neither.
+    """
+    settings = ProjectTracePreparationSettings.model_validate(
+        {
+            "source_kind": "otlp_json",
+            "fit_task_budget": 50,
+            "held_out_task_budget": 20,
+            "descriptor_dimensions": 64,
+        }
+    )
+
+    spec = mining_spec_for(settings)
+
+    assert settings.mining_geometry == "hashing"
+    assert spec.selection == HashingSelectionSpec(dimensions=64)
+    assert spec.cluster == DescriptorClusterSpec()
+    assert spec.sampling == MedoidSamplingSpec()
+
+
+def _legacy_review_binding() -> dict[str, object]:
+    """Return a build-review binding as it was written before the geometry fields existed."""
+    spec = MiningSpec().model_dump(mode="json")
+    return {
+        "schema_version": 1,
+        "status": "proposals_pending",
+        "trace_dataset": {"artifact_id": "trace-dataset-1", "sha256": "a" * 64},
+        "task_set": {"artifact_id": "task-set-1", "sha256": "b" * 64},
+        "project_config": ProjectConfig(project_id="support").model_dump(mode="json"),
+        "source": {"kind": "otlp", "source_id": "fixture.otlp", "sha256": "a" * 64},
+        "mining_spec": {
+            key: value
+            for key, value in spec.items()
+            if key not in {"selection", "cluster", "sampling"}
+        },
+        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_dimensions": 64,
+        "code_revision": _PROVIDER_FREE_REVISION,
+        "paid_calls_made": 0,
+    }
+
+
+def test_a_build_review_written_before_the_geometry_fields_still_loads() -> None:
+    """Every stored review predates the geometry fields, and each one is still the same build.
+
+    A readiness record is rejected unless its identity binds its content, and the identity is
+    recomputed on every load. Adding fields to the mining spec would therefore have invalidated
+    every record ever written, which is what `exp optimize router` reads before it replays a
+    build. The identity rule is that it binds the values something chose: a geometry field at
+    the provider-free default is not one, so a record written when the field did not exist and a
+    record that defaulted it are one identity, and the replay those records exist for still runs.
+    """
+    binding = _legacy_review_binding()
+    stored_id = stable_id("build-review", binding)
+
+    review = BuildReviewReadiness.model_validate({**binding, "readiness_id": stored_id})
+
+    assert review.readiness_id == stored_id
+    assert review.mining_spec == MiningSpec()
+
+
+def test_a_named_geometry_is_part_of_the_build_review_identity() -> None:
+    """Only a defaulted choice leaves the identity alone; a named one has to change it."""
+    binding = _legacy_review_binding()
+    stored_id = stable_id("build-review", binding)
+    tagged = MiningSpec(
+        selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+        cluster=PatternHierarchyClusterSpec(),
+        sampling=HierarchicalSamplingSpec(),
+    )
+    named = {**binding, "mining_spec": tagged.model_dump(mode="json")}
+
+    tagged_id = stable_id("build-review", named)
+
+    assert tagged_id != stored_id
+    assert (
+        BuildReviewReadiness.model_validate({**named, "readiness_id": tagged_id}).mining_spec
+        == tagged
+    )
+    with pytest.raises(ValidationError, match="differs from its complete binding"):
+        BuildReviewReadiness.model_validate({**named, "readiness_id": stored_id})

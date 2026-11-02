@@ -48,6 +48,11 @@ from exp.common.traces.sqlite_schema import trace_database_path
 from exp.runtime.gateway.ingest import load_gateway_capture
 from exp.runtime.gateway.ingest.conversion_test import _database, _experience
 from exp.runtime.models import CatalogRoleName, ResolvedModel
+from exp.simulation.build import BuildReviewReadiness
+from exp.simulation.mining.questions import QuestionBank
+from exp.simulation.mining.service import MiningSpec
+from exp.simulation.mining.tagging import TagMatrix, TagRow
+from exp.simulation.mining.views import Unit
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model import GroundedWorldModelArtifact
 
@@ -105,6 +110,7 @@ def _otlp_export(
     count: int = 1,
     *,
     distinct_lineages: bool = True,
+    lineage_count: int | None = None,
 ) -> Path:
     """Write real two-turn traces with one observed assistant-to-user transition each.
 
@@ -112,6 +118,9 @@ def _otlp_export(
         tmp_path: Temporary directory receiving the trace export.
         count: Number of traces to write.
         distinct_lineages: Whether each trace receives distinct lineage attributes.
+        lineage_count: Number of lineages to spread distinct cases over, or None to keep one
+            case per lineage. Several distinct cases inside one lineage is what makes a task
+            budget bind, because the budget reserves a slot per lineage before anything else.
 
     Returns:
         Path to the completed OTLP JSON export.
@@ -119,6 +128,9 @@ def _otlp_export(
     records = []
     for index in range(count):
         lineage_index = index if distinct_lineages else 0
+        case_index = lineage_index
+        if lineage_count is not None:
+            lineage_index, case_index = index % lineage_count, index
         trace_id = f"{index + 1:032x}"
         base = 1_760_000_000_000_000_000 + index * 10_000_000_000
         common = [
@@ -144,7 +156,7 @@ def _otlp_export(
                                 [
                                     {
                                         "role": "user",
-                                        "content": f"Support request {lineage_index}",
+                                        "content": f"Support request {case_index}",
                                     }
                                 ]
                             ),
@@ -170,7 +182,7 @@ def _otlp_export(
                                     {"role": "assistant", "content": "What account email?"},
                                     {
                                         "role": "user",
-                                        "content": f"customer-{lineage_index}@example.test",
+                                        "content": f"customer-{case_index}@example.test",
                                     },
                                 ]
                             ),
@@ -301,14 +313,35 @@ class _RuntimeCatalog:
         return ResolvedModel(alias, snapshot, capabilities, self._completion, embedding)
 
 
-def _catalog(root: Path, *, embedder_input_usd_per_million: float | None = 0.0) -> None:
+def _catalog(
+    root: Path,
+    *,
+    embedder_input_usd_per_million: float | None = 0.0,
+    tagger_input_usd_per_million: float | None = None,
+) -> None:
     """Write complete secret-free build roles while leaving router candidates empty.
 
     Args:
         root: Temporary EXP root receiving ``models.toml``.
         embedder_input_usd_per_million: Explicit fixture embedding input price, or ``None``
             for an unpriced embedder.
+        tagger_input_usd_per_million: Input price of an extra ``tagger`` alias the decision-tag
+            route can name, or ``None`` to leave that alias out of the catalog entirely.
     """
+    tagger = (
+        {}
+        if tagger_input_usd_per_million is None
+        else {
+            "tagger": ModelRecord(
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                connection="fixture",
+                model="tagger-id",
+                capabilities=ModelCapabilities(
+                    input_cost_per_million_tokens_usd=tagger_input_usd_per_million,
+                ),
+            )
+        }
+    )
     write_model_catalog(
         root / "models.toml",
         ModelCatalog(
@@ -316,6 +349,7 @@ def _catalog(root: Path, *, embedder_input_usd_per_million: float | None = 0.0) 
                 "fixture": ConnectionConfig(provider="openai", api_key_env="FIXTURE_API_KEY")
             },
             models={
+                **tagger,
                 "world": ModelRecord(
                     billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="fixture",
@@ -844,7 +878,7 @@ def test_build_package_upgrade_over_ceiling_preserves_selected_review(
     first_review = store.read_review()
     assert first_build is not None
     _RESOLVE_CALLS.clear()
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
+    monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 6.0)
 
     blocked = _RUNNER.invoke(
         app,
@@ -883,7 +917,7 @@ def test_unconfirmed_budget_overrun_stops_before_provider_resolution(
     root.mkdir()
     _catalog(root)
     set_maximum_command_cost_usd(0.5, root)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 1.0)
+    monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 1.0)
     provider_resolutions: list[str] = []
 
     def forbidden_preflight(
@@ -947,7 +981,7 @@ def test_noninteractive_build_above_half_requires_yes_before_provider_work(
     root.mkdir()
     _catalog(root)
     set_maximum_command_cost_usd(1.0, root)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+    monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 0.75)
     provider_calls: list[bool] = []
 
     def forbidden_build(*_args: object, **_kwargs: object) -> None:
@@ -997,7 +1031,7 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
     root.mkdir()
     _catalog(root)
     set_maximum_command_cost_usd(1.0, root)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+    monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 0.75)
 
     result = _RUNNER.invoke(
         app,
@@ -1093,7 +1127,7 @@ def test_interactive_build_uses_the_cost_specific_confirmation(
     root.mkdir()
     _catalog(root)
     set_maximum_command_cost_usd(1.0, root)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+    monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 0.75)
     monkeypatch.setattr(consent_module, "can_prompt", lambda _console: True)
 
     result = _RUNNER.invoke(
@@ -1128,7 +1162,7 @@ def test_explicit_build_can_authorize_both_command_and_embedding_overruns(
     root.mkdir()
     _catalog(root)
     set_maximum_command_cost_usd(1.0, root)
-    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 7.9447329)
+    monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 7.9447329)
     monkeypatch.setattr(consent_module, "can_prompt", lambda _console: not yes_flag)
     arguments = [
         "build",
@@ -1181,7 +1215,7 @@ def test_first_build_failure_does_not_publish_review_readiness(
     root.mkdir()
     _catalog(root)
     if failure_mode == "cost":
-        monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 6.0)
+        monkeypatch.setattr(build_command, "embedding_cost_ceiling", lambda *_args: 6.0)
     else:
 
         def fail_grounded_build(*_args: object, **_kwargs: object) -> None:
@@ -1818,6 +1852,10 @@ def test_wizard_preconsent_plan_persists_only_provider_free_unselected_evidence(
         code_revision="a" * 40,
         providers=(),
         console=ScriptedConsole("\n" * 5 + "y\n"),
+        # The provider-free geometry, named: this plan is the one that must stay credential-free.
+        mining_spec=MiningSpec(),
+        tagger_alias=None,
+        tagger_concurrency=1,
     )
 
     store = ProjectStore(root, "support")
@@ -2172,36 +2210,68 @@ def test_build_refuses_a_tag_geometry_with_no_tagger(tmp_path: Path) -> None:
     assert "needs --tagger ALIAS" in unstyle(result.output)
 
 
+def _mined_task_ids(root: Path, project: str = "support") -> tuple[str, ...]:
+    """Return the task ids of the one task set a build persisted under this root.
+
+    Args:
+        root: Local EXP root a build wrote its immutable artifacts into.
+        project: Project that owns them.
+
+    Returns:
+        The mined task identities, in task-set order.
+    """
+    store = ProjectStore(root, project)
+    task_sets = tuple(
+        artifact_id
+        for artifact_id in store.artifacts.list_ids()
+        if store.artifacts.read(artifact_id).manifest.artifact_type == "task-set"
+    )
+    assert len(task_sets) == 1, task_sets
+    return tuple(task.task_id for task in load_task_set(store.artifacts, task_sets[0]).tasks)
+
+
 def test_naming_the_provider_free_route_builds_the_same_tasks(tmp_path: Path) -> None:
     """Spelling out the hashing route has to be the same build as naming it alone.
 
     This is the command-level half of the artifact-level golden. The flags no longer default to
     this route, so what is pinned here is that ``--mine-with hashing`` still reaches exactly the
-    provider-free pipeline it always did, with the backend and strategy it always used.
+    provider-free pipeline it always did, with the backend and strategy it always used. The two
+    runs are compared by the task identities they mined, because identical preflight counts are
+    the one thing two completely different task sets would also have in common.
     """
     source = _otlp_export(tmp_path, count=20)
-    root = tmp_path / ".exp"
-    root.mkdir()
-    _catalog(root)
-    base = ["build", "support", "--traces", str(source), "--root", str(root), "--dry-run"]
+    named_root = tmp_path / "named"
+    spelled_root = tmp_path / "spelled-out"
+    for root in (named_root, spelled_root):
+        root.mkdir()
+        _catalog(root)
 
-    named = _RUNNER.invoke(app, [*base, "--mine-with", "hashing"])
-    spelled_out = _RUNNER.invoke(
-        app,
-        [
-            *base,
+    def arguments(root: Path, *extra: str) -> list[str]:
+        """Return one dry-run hashing build under the given root."""
+        return [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--dry-run",
             "--mine-with",
             "hashing",
-            "--cluster-with",
-            "descriptor",
-            "--sample-with",
-            "medoid",
-        ],
+            *extra,
+        ]
+
+    named = _RUNNER.invoke(app, arguments(named_root))
+    spelled_out = _RUNNER.invoke(
+        app,
+        arguments(spelled_root, "--cluster-with", "descriptor", "--sample-with", "medoid"),
     )
 
     assert named.exit_code == 0, named.output
     assert spelled_out.exit_code == 0, spelled_out.output
     assert unstyle(spelled_out.output) == unstyle(named.output)
+    assert _mined_task_ids(spelled_root) == _mined_task_ids(named_root)
+    assert len(_mined_task_ids(named_root)) == 20
 
 
 def test_a_build_with_no_mining_flags_asks_for_the_tag_route_prerequisites(
@@ -2227,27 +2297,248 @@ def test_a_build_with_no_mining_flags_asks_for_the_tag_route_prerequisites(
     assert not (root / "projects" / "support").exists()
 
 
-def test_an_alternative_sampling_strategy_reaches_the_build(tmp_path: Path) -> None:
-    """A named strategy has to change the mining, not just be accepted by the parser."""
-    source = _otlp_export(tmp_path, count=20)
-    root = tmp_path / ".exp"
-    root.mkdir()
-    _catalog(root)
-    base = [
+def test_an_alternative_sampling_strategy_changes_the_mined_task_set(tmp_path: Path) -> None:
+    """A named strategy has to change the mining, not just be accepted by the parser.
+
+    The corpus is larger than the 50-fit, 20-held-out budget and spreads its distinct cases over
+    a handful of lineages on purpose. A strategy only decides how the budget left over after the
+    reserved per-lineage slots is spent, so on a corpus where every case fits every strategy
+    selects every case, and a run that discarded the flag entirely would look identical.
+    """
+    source = _otlp_export(tmp_path, count=100, lineage_count=5)
+    default_root = tmp_path / "default"
+    diverse_root = tmp_path / "diverse"
+    for root in (default_root, diverse_root):
+        root.mkdir()
+        _catalog(root)
+
+    def arguments(root: Path, *extra: str) -> list[str]:
+        """Return one dry-run hashing build under the given root."""
+        return [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--dry-run",
+            "--mine-with",
+            "hashing",
+            *extra,
+        ]
+
+    default = _RUNNER.invoke(app, arguments(default_root))
+    diverse = _RUNNER.invoke(app, arguments(diverse_root, "--sample-with", "diversity"))
+
+    assert default.exit_code == 0, default.output
+    assert diverse.exit_code == 0, diverse.output
+    medoid_tasks = _mined_task_ids(default_root)
+    diverse_tasks = _mined_task_ids(diverse_root)
+    assert len(medoid_tasks) == len(diverse_tasks) == 50
+    assert set(diverse_tasks) != set(medoid_tasks)
+
+
+class _FakeTagger:
+    """Answers a bank from the trace identity alone, with no transport and no network.
+
+    Attributes:
+        passes: One entry per ``tag`` call, holding the traces that pass asked about. A build
+            that was never authorized to tag leaves it empty, which is the whole point of it.
+    """
+
+    def __init__(self) -> None:
+        """Start with no recorded passes."""
+        self.passes: list[tuple[str, ...]] = []
+
+    def tag(self, units: Sequence[Unit], bank: QuestionBank) -> TagMatrix:
+        """Return deterministic probabilities for every supplied unit.
+
+        Args:
+            units: Rendered views the mining service built for the selection candidates.
+            bank: The resolved question bank whose columns are being answered.
+
+        Returns:
+            One row per unit, in unit order, with values derived from the unit's own text.
+        """
+        rows = []
+        for unit in units:
+            digest = hashlib.sha256(unit.unit_hash.encode()).digest()
+            rows.append(
+                TagRow(
+                    trace_id=unit.trace_id,
+                    unit_hash=unit.unit_hash,
+                    values=tuple(
+                        0.05 + 0.9 * (digest[index % len(digest)] / 255)
+                        for index in range(len(bank.questions))
+                    ),
+                )
+            )
+        self.passes.append(tuple(row.trace_id for row in rows))
+        return TagMatrix(
+            bank_id=bank.bank_id,
+            bank_version=bank.version,
+            question_ids=bank.question_ids(),
+            view=units[0].view if units else "task",
+            rows=tuple(rows),
+        )
+
+
+def _question_bank(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Install a four-question local bank and point the resolver at it.
+
+    Args:
+        tmp_path: Pytest-owned state directory.
+        monkeypatch: Fixture setting the local bank root for this test only.
+
+    Returns:
+        The installed bank identity.
+    """
+    banks = tmp_path / "question-banks"
+    banks.mkdir()
+    questions = "\n".join(
+        f'[[questions]]\nquestion_id = "probe.q{index}"\nfamily = "probe"\n'
+        f'text = "Did the episode show behavior number {index}?"\n'
+        for index in range(4)
+    )
+    (banks / "probe-v1.toml").write_text(f'bank_id = "probe-v1"\nversion = 1\n\n{questions}')
+    monkeypatch.setenv("EXP_QUESTION_BANK_ROOT", str(banks))
+    return "probe-v1"
+
+
+def _tag_route_arguments(source: Path, root: Path, bank_id: str) -> list[str]:
+    """Return the complete argument list of one decision-tag build.
+
+    Args:
+        source: Trace export to build from.
+        root: Local EXP root.
+        bank_id: Installed question bank identity.
+
+    Returns:
+        Arguments naming the tagged route and everything it requires.
+    """
+    return [
         "build",
         "support",
         "--traces",
         str(source),
         "--root",
         str(root),
-        "--dry-run",
         "--mine-with",
-        "hashing",
+        "decision-tag",
+        "--tagger",
+        "tagger",
+        "--question-bank",
+        bank_id,
     ]
 
-    default = _RUNNER.invoke(app, base)
-    diverse = _RUNNER.invoke(app, [*base, "--sample-with", "diversity"])
 
-    assert default.exit_code == 0, default.output
-    assert diverse.exit_code == 0, diverse.output
-    assert "dry run complete" in unstyle(diverse.output)
+def test_a_tag_route_dry_run_quotes_the_decisions_and_buys_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run on the paid route has to price tagging and then not tag.
+
+    The quote comes from the free part of mining, so it can be shown before the first call: the
+    distinct cases left after duplicate collapse, the bank's own question count, and the batch
+    limit the decisions surface imposes. A dry run that tagged would be a dry run that spent.
+    """
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root, tagger_input_usd_per_million=2.0)
+    bank_id = _question_bank(tmp_path, monkeypatch)
+    tagger = _FakeTagger()
+    monkeypatch.setattr(build_command, "build_tagger", lambda *_args, **_kwargs: tagger)
+
+    result = _RUNNER.invoke(
+        app,
+        [*_tag_route_arguments(source, root, bank_id), "--dry-run", "--non-interactive"],
+    )
+
+    output = unstyle(result.output)
+    assert result.exit_code == 0, output
+    assert "Mining preflight" in output
+    assert f"decision-tag (bank {bank_id}, 4 questions)" in output
+    assert "tagger       tagger (tagger-id)" in output
+    assert "20 distinct cases, 1 request each, 20 calls" in output
+    assert "tagging      at most $0.0" in output
+    assert "dry run complete" in output
+    # The split and the embedding quote are measured on the mined task set, which does not exist.
+    assert "Build preflight" not in output
+    assert tagger.passes == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_the_tag_route_refuses_to_tag_before_the_spend_is_authorized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tagging is the first paid phase, so an unauthorized estimate stops before it, not after.
+
+    Mining is what buys the tags, so a consent question asked after mining would be asked after
+    the money was gone. This drives the real refusal path: an over-budget estimate with no
+    terminal to confirm at stops the command, and nothing was tagged.
+    """
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root, tagger_input_usd_per_million=500.0)
+    set_maximum_command_cost_usd(0.5, root)
+    bank_id = _question_bank(tmp_path, monkeypatch)
+    tagger = _FakeTagger()
+    monkeypatch.setattr(build_command, "build_tagger", lambda *_args, **_kwargs: tagger)
+
+    result = _RUNNER.invoke(
+        app,
+        [*_tag_route_arguments(source, root, bank_id), "--non-interactive"],
+    )
+
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert result.exit_code == 2, output
+    assert "exceeds the $0.50 budget" in output
+    assert "interactive terminal to proceed, or use --yes" in output
+    assert tagger.passes == []
+    store = ProjectStore(root, "support")
+    assert store.load_project().build is None
+    assert store.read_review() is None
+
+
+def test_an_authorized_tag_route_build_tags_once_and_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The authorized route tags every distinct case exactly once and then builds normally.
+
+    The build preflight that follows shows the authorized tagging beside the embedding estimate,
+    so one screen states everything this build is allowed to spend.
+    """
+    source = _otlp_export(tmp_path, count=20)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root, tagger_input_usd_per_million=2.0)
+    bank_id = _question_bank(tmp_path, monkeypatch)
+    tagger = _FakeTagger()
+    monkeypatch.setattr(build_command, "build_tagger", lambda *_args, **_kwargs: tagger)
+
+    result = _RUNNER.invoke(
+        app,
+        [*_tag_route_arguments(source, root, bank_id), "--non-interactive", "--yes"],
+    )
+
+    output = unstyle(result.output)
+    assert result.exit_code == 0, output
+    assert len(tagger.passes) == 1
+    assert len(tagger.passes[0]) == 20
+    assert "Build preflight" in output
+    assert "tagging      $0.0" in output and "authorized" in output
+    assert "embedding    at most $" in output
+    store = ProjectStore(root, "support")
+    build = store.load_project().build
+    assert build is not None
+    review_state = store.read_review()
+    assert isinstance(review_state, dict)
+    review = BuildReviewReadiness.model_validate(review_state["build_review"])
+    assert review.mining_spec.selection.kind == "decision_tag"
+    assert review.mining_spec.selection.bank_id == bank_id

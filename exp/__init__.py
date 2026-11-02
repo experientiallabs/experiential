@@ -84,6 +84,9 @@ if TYPE_CHECKING:
     )
     from exp.optimize.router.composition import RouterWorkflowServices as RouterWorkflowServices
     from exp.optimize.router.composition import compose_router as compose_router
+    from exp.optimize.router.evaluation.build import (
+        VerifiedProjectBuild as VerifiedProjectBuild,
+    )
     from exp.optimize.router.fit.workflow import EvaluationInputs as EvaluationInputs
     from exp.optimize.router.fit.workflow import RouterFitConfig as RouterFitConfig
     from exp.optimize.router.fit.workflow import (
@@ -169,6 +172,7 @@ if TYPE_CHECKING:
         load_project_provider_free_stage as load_project_provider_free_stage,
     )
     from exp.simulation.build import prepare_project_traces as prepare_project_traces
+    from exp.simulation.mining_cost import tagging_work as tagging_work
     from exp.simulation.world_model.application import WorldModel as WorldModel
     from exp.simulation.world_model.application import (
         WorldModelLoadError as WorldModelLoadError,
@@ -239,9 +243,11 @@ _EXPORT_MODULES = {
     "ProjectTracePreparationSettings": "exp.common.project",
     "BuildReviewReadiness": "exp.simulation.build",
     "ProjectBuild": "exp.simulation.build",
+    "VerifiedProjectBuild": "exp.optimize.router.evaluation.build",
     "TaskSetBuild": "exp.simulation.build",
     "build_project": "exp.simulation.build",
     "build_task_set": "exp.simulation.build",
+    "tagging_work": "exp.simulation.mining_cost",
     "load_project_provider_free_stage": "exp.simulation.build",
     "prepare_project_traces": "exp.simulation.build",
     "WorldModel": "exp.simulation.world_model.application",

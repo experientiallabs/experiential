@@ -81,6 +81,13 @@ uv run pytest -q
   and binds the grounded world model without a completion or judge call. Route each corpus
   through an explicit canonical source loader. The interactive wizard defaults to provider
   configuration and build preparation; router optimization requires an explicit selection.
+  Mining is the build's other paid phase: the CLI default `--mine-with decision-tag` buys one
+  decision per distinct case from `--tagger` while it selects representatives, so it is quoted
+  from the free part of mining and authorized through the same spend-consent path before the
+  first call, and `--dry-run` stops at that quote. Both shapes of the command, explicit and
+  guided, take the route from the same flags. `--mine-with hashing` keeps mining provider-free,
+  and the Python API defaults to it, so `build_project` and `prepare_project_traces` make no
+  provider call unless a caller hands them a decision-tag spec and a tagger.
 - New file trace sources belong in `exp/common/traces/ingest/`, normalize into the `Trace` and
   `TraceSpan` contracts in `exp/common/traces/`, and register with the explicit shared source table.
   Runtime-specific source adapters stay with their runtime owner. Common ingestion never imports
@@ -96,6 +103,13 @@ uv run pytest -q
   Human calibration is recommended but optional. The command freezes one shared provider ceiling
   before calls, simulates and judges missing fit evidence, locks the fit policy before held-out
   execution, and exactly replays completed work.
+  It verifies the completed build from what the project stored and never mines the stored traces
+  again: it loads the task set with its coverage and its complete lineage bindings, recomputes
+  their content-addressed identities, and requires the canonical traces handed to composition,
+  which this command loads from that same stored dataset, to still normalize to it. That proves
+  the selected task set is the one the build stored, unaltered, not that it is derivable again,
+  which is what keeps verification independent of the mining geometry, so a project mined with
+  the paid decision-tag default optimizes exactly like a provider-free one.
   World-model fidelity testing is a separately invoked common-evaluation mode with no authority
   over router fitting or runtime activation. Its reports contain measurements only and never carry
   an approval, denial, gate, threshold, or decision.
@@ -381,6 +395,7 @@ uv run pytest -q
     | --- | --- | --- |
     | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
     | Spend consent and cost warnings | `exp/cli/shared/consent.py` | `require_spend_consent` |
+    | What a build will spend, quoted before it spends it | `exp/simulation/mining_cost.py`, `exp/cli/build/preflight.py` | `tagging_work` counts the decision calls a tagged mining run will buy, from the free part of mining and with no credential; `tagging_cost_ceiling` and `embedding_cost_ceiling` price the two phases; `authorize_tagging` and `render_preflight` display them and take consent through the owner above |
     | Command results and saved detail | `exp/optimize/evaluation/export.py`, `exp/cli/build/summary.py` | A short summary on the terminal; the full output saved atomically beside the saved run under the project's runtime directory (`export_report`, `save_details`), then a `Report: <path>` line |
     | Usage errors | `exp/cli/shared/options.py` | `usage_error` |
     | Interactive choices | `exp/cli/shared/picker.py` | `choose_one` |

@@ -107,17 +107,17 @@ def test_provider_free_contract_keeps_settings_and_stage_ownership_minimal() -> 
         ProjectConfig(project_id="missing-settings", provider_free_stage=stage)
 
 
-def test_preparation_settings_default_to_the_decision_tag_route() -> None:
-    """The default route is the product decision, so it is pinned where it is persisted.
+def test_preparation_settings_without_a_recorded_route_read_as_the_free_one() -> None:
+    """A stored field's default is the value every record written without it resolves to.
 
-    A representative task set is supposed to stand for the work, and how a request happened to be
-    worded is not the work, so the route that asks a decision model what each episode contained is
-    the default. It is the paid route and it needs a question bank, which is why ``mining_bank``
-    has no default of its own: there is no bank that describes an unknown corpus.
+    The command line defaults to the tagged route, and this record does not, on purpose: a
+    settings record carrying no geometry carries no ``mining_bank`` either, and the tagged route
+    cannot run without one. A record therefore says "tag" only when something stored that word.
+    The property under test is that reading one of those records needs no key to be present.
     """
-    settings = ProjectTracePreparationSettings(source_kind="otlp")
+    settings = ProjectTracePreparationSettings.model_validate({"source_kind": "otlp_json"})
 
-    assert settings.mining_geometry == "decision_tag"
+    assert settings.mining_geometry == "hashing"
     assert settings.mining_bank == ""
     assert settings.mining_tagger_alias is None
     # The absence of a backend or strategy is carried as None rather than as the name of one, so
@@ -129,6 +129,12 @@ def test_preparation_settings_default_to_the_decision_tag_route() -> None:
             source_kind="otlp", mining_cluster="pattern_hierarchy"
         ).mining_cluster
         == "pattern_hierarchy"
+    )
+    assert (
+        ProjectTracePreparationSettings(
+            source_kind="otlp", mining_geometry="decision_tag", mining_bank="example-v1"
+        ).mining_geometry
+        == "decision_tag"
     )
 
 

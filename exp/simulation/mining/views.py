@@ -1,7 +1,7 @@
 """Rendered views of one canonical trace, as a decision model is shown them.
 
-A view is the text a question is asked about. Three exist, and a question bank names one per
-question family, because the families need different evidence:
+A view is the text a question is asked about. Two exist, and a run names the one its questions are
+asked about, so families needing different evidence belong to different runs:
 
 - **task**: what was known before the agent acted. This is exactly the request-visible
   :class:`~exp.simulation.mining.descriptors.RoutingDescriptor`, so there is one definition of
@@ -19,10 +19,10 @@ structurally, and a view that included it would need an extractor that does not 
 
 The observations view is the one to prefer for grouping cases into archetypes. Two agents working
 the same case produce nearly the same observations and very different reasoning, so dropping the
-agent makes the view describe the case instead of the run. On a 545-episode benchmark corpus it
-held every episode inside a 64k-token decision model while the full trace view overflowed on 18%
-of them, which matters beyond cost: a corpus that overflows is split across two models by episode
-length, and episode length is not independent of what the case contained.
+agent makes the view describe the case instead of the run. Dropping it also keeps long episodes
+inside a decision model's context window where a view carrying the whole trace would overflow,
+which matters beyond cost: a corpus that overflows is split across two models by episode length,
+and episode length is not independent of what the case contained.
 
 Views are keyed by the hash of their text, so one unit is decided once however many tasks repeat
 it, and ``VIEW_VERSION`` changes whenever rendering changes.
@@ -106,9 +106,9 @@ class TraceViewSpec(ContractModel):
     Attributes:
         observations_max_tokens: Token ceiling for the observations view.
         result_cap: Starting per-result character budget, applied uniformly. Repeated calls to
-            one tool are not penalized: on a benchmark corpus 68% of calls repeated a tool and
-            92% of those returned a different result, so a per-tool-first budget would discard
-            most of the evidence that distinguishes one case from another.
+            one tool are not penalized, because a repeated call commonly returns a different
+            result, so a per-tool-first budget would discard most of the evidence that
+            distinguishes one case from another.
         minimum_result_cap: Lowest cap the fitting search may apply before it gives up and
             truncates the rendered text outright.
         argument_cap: Per-call character budget for tool arguments.

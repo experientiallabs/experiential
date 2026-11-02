@@ -35,6 +35,7 @@ from exp.simulation.mining.questions import (
 )
 from exp.simulation.mining.sampling import (
     DiversitySamplingSpec,
+    HierarchicalSamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
     RepresentativeSamplingSpec,
@@ -697,6 +698,20 @@ def _geometry_corpus(count: int = 40) -> tuple[Trace, ...]:
     )
 
 
+def _shared_lineage_corpus(count: int = 24, lineages: int = 4) -> tuple[Trace, ...]:
+    """Return a corpus whose cases share a few lineages, leaving budget for a strategy to spend.
+
+    One anchor per lineage is paid for before the discretionary half of selection begins, so a
+    fixture of distinct lineages leaves nothing for a sampling strategy to decide.
+    """
+    return tuple(
+        _trace(
+            index, task=f"Handle workflow {index}", conversation_id=f"lineage-{index % lineages}"
+        )
+        for index in range(count)
+    )
+
+
 def _tag_spec(
     cluster: ClusterSpec | None = None, sampling: SamplingSpec | None = None
 ) -> MiningSpec:
@@ -805,6 +820,11 @@ def test_the_bernoulli_mixture_runs_end_to_end_on_tagged_answers() -> None:
             AtomsHierarchyClusterSpec(atom_count=8, groups=3, seed=1),
             StratifiedSamplingSpec(),
         ),
+        (PatternHierarchyClusterSpec(), HierarchicalSamplingSpec()),
+        (
+            AtomsHierarchyClusterSpec(atom_count=8, groups=3, seed=1),
+            HierarchicalSamplingSpec(),
+        ),
     ],
 )
 def test_every_alternative_stage_satisfies_the_downstream_validators(
@@ -884,11 +904,12 @@ def test_the_default_spec_names_the_provider_free_path() -> None:
 
 
 def test_the_tagged_pattern_pipeline_mines_the_same_tasks_in_any_order() -> None:
-    """The settled decision-tag pipeline has to be order independent end to end.
+    """The decision-tag route's clustering has to be order independent end to end.
 
-    This is the pipeline `exp build` reaches by default: fired-proposition sets, Jaccard average
-    linkage over the distinct ones, and the facility-location fill. Every tie inside it is broken
-    by identity, so the corpus arriving reversed must mine the same task set.
+    This is the tagged route's clustering with the facility-location fill over flat clusters:
+    fired-proposition sets and Jaccard average linkage over the distinct ones, spent by cluster
+    mass. Every tie inside it is broken by identity, so the corpus arriving reversed must mine the
+    same task set.
     """
     corpus = _geometry_corpus()
     spec = _tag_spec(cluster=PatternHierarchyClusterSpec(), sampling=RepresentativeSamplingSpec())
@@ -934,3 +955,73 @@ def test_the_pattern_backend_needs_a_tagged_selection_at_the_spec() -> None:
     )
     assert isinstance(tagged.selection, DecisionTagSelectionSpec)
     assert tagged.selection.transform == "l2"
+
+
+def test_the_hierarchical_sampler_descends_the_pattern_tree_through_mining() -> None:
+    """The tag route's default pipeline has to reach the tree the clusterer published.
+
+    Every discretionary slot is bought by a node of the agglomeration, so the audit reasons name
+    tree nodes rather than flat clusters. The reserved tail slots and the lineage anchors are
+    untouched by the strategy and keep their own reasons, which is the phase boundary this check
+    is really protecting.
+
+    The corpus shares four lineages between twenty-four cases on purpose. One case per lineage is
+    anchored before any strategy runs, so a corpus of distinct lineages spends the whole budget on
+    anchors and leaves a sampling strategy nothing to decide.
+    """
+    corpus = _shared_lineage_corpus()
+    spec = _tag_spec(cluster=PatternHierarchyClusterSpec(), sampling=HierarchicalSamplingSpec())
+
+    result = mine_tasks(corpus, spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger())
+
+    reasons = [
+        reason for selection in result.coverage.selections for reason in selection.selection_reasons
+    ]
+    assert len(result.tasks) == 11
+    assert "hierarchy-representative" in reasons
+    assert not any(reason.startswith("cluster-representative:") for reason in reasons)
+    assert any(reason.startswith("reserved:") for reason in reasons)
+    assert all(
+        reason.startswith(("reserved:", "lineage-anchor", "hierarchy-representative"))
+        for reason in reasons
+    )
+    assert result.coverage.split_separation_verified
+    assert sum(item.workload_mass for item in result.coverage.selections) == len(corpus)
+
+
+def test_the_tagged_hierarchical_pipeline_mines_the_same_tasks_in_any_order() -> None:
+    """Descending a tree adds two more tie-breaks, both of which have to be order independent.
+
+    Children are visited in ascending node order and the apportionment breaks its ties by node id,
+    so the corpus arriving reversed must mine the identical task set in the identical order.
+    """
+    corpus = _shared_lineage_corpus()
+    spec = _tag_spec(cluster=PatternHierarchyClusterSpec(), sampling=HierarchicalSamplingSpec())
+
+    forward = mine_tasks(corpus, spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger())
+    backward = mine_tasks(
+        tuple(reversed(corpus)), spec, embedder=ContentStableEmbedder(), tagger=_ProfileTagger()
+    )
+
+    assert tuple(task.task_id for task in forward.tasks) == tuple(
+        task.task_id for task in backward.tasks
+    )
+    assert forward.coverage == backward.coverage
+
+
+def test_the_hierarchical_sampler_needs_a_backend_that_publishes_a_tree() -> None:
+    """Caught when the spec is written, long before a corpus has been tagged."""
+    with pytest.raises(ValidationError, match="descriptor backend publishes none"):
+        MiningSpec(sampling=HierarchicalSamplingSpec())
+    with pytest.raises(ValidationError, match="bernoulli_mixture backend publishes none"):
+        MiningSpec(
+            selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+            cluster=BernoulliMixtureClusterSpec(),
+            sampling=HierarchicalSamplingSpec(),
+        )
+    paired = MiningSpec(
+        selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+        cluster=PatternHierarchyClusterSpec(),
+        sampling=HierarchicalSamplingSpec(),
+    )
+    assert paired.sampling == HierarchicalSamplingSpec()

@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from exp.cli.build.app import _lineage_bindings
+from exp.cli.build.preflight import lineage_bindings
 from exp.common.core.artifacts import (
     ArtifactInput,
     FailureAttribution,
@@ -73,6 +73,7 @@ from exp.optimize.router.errors import (
     JudgeDispatchExhaustedError,
     JudgeTranscriptAdmissionError,
 )
+from exp.optimize.router.evaluation.build import VerifiedProjectBuild
 from exp.optimize.router.evaluation.spend import observed_rollout_spend
 from exp.optimize.router.fit.workflow_test import _persist_embeddings, _persist_pricing
 from exp.optimize.router.judgment_budget import (
@@ -82,7 +83,7 @@ from exp.optimize.router.judgment_budget import (
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.router.runtime_test import _Client, _request
-from exp.simulation.build import ProjectBuild, build_project, select_completed_build
+from exp.simulation.build import build_project, select_completed_build
 from exp.simulation.engines.text import simulator as text_simulator_module
 from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
 from exp.simulation.engines.text.simulator import WorldModelSimulator
@@ -91,7 +92,13 @@ from exp.simulation.engines.text.simulator_test import (
     _response,
     _ScriptedClient,
 )
+from exp.simulation.mining.clustering import PatternHierarchyClusterSpec
+from exp.simulation.mining.features import DecisionTagSelectionSpec
+from exp.simulation.mining.questions import EXAMPLE_BANK_ID
+from exp.simulation.mining.sampling import HierarchicalSamplingSpec
 from exp.simulation.mining.service import MiningSpec
+from exp.simulation.mining.service_test import _ProfileTagger
+from exp.simulation.mining.tagging import TraceTagger
 from exp.simulation.orchestration import Simulator
 from exp.simulation.retrieval import (
     load_fit_rag_retriever,
@@ -111,6 +118,15 @@ from exp.simulation.world_model import bind_fit_grounded_world_model, persist_gr
 _TIME = datetime(2026, 8, 12, tzinfo=UTC)
 _DIGEST = "a" * 64
 _COMPACT_MINING_SPEC = MiningSpec(fit_task_budget=12, held_out_task_budget=4)
+# The geometry `exp build` mines with by default: decisions bought per distinct case,
+# clustered on the propositions they fired and sampled by descending that clustering.
+_TAGGED_MINING_SPEC = MiningSpec(
+    fit_task_budget=12,
+    held_out_task_budget=4,
+    selection=DecisionTagSelectionSpec(bank_id=EXAMPLE_BANK_ID),
+    cluster=PatternHierarchyClusterSpec(),
+    sampling=HierarchicalSamplingSpec(),
+)
 
 
 def _compact_normalized_traces() -> TraceNormalizationResult:
@@ -131,6 +147,7 @@ def _bind_completed_build(
     *,
     revision: str,
     mining_spec: MiningSpec | None = None,
+    tagger: TraceTagger | None = None,
 ) -> ProjectBuildArtifacts:
     """Persist and select the exact grounded build consumed by router composition.
 
@@ -139,6 +156,8 @@ def _bind_completed_build(
         normalized: Canonical real traces used for tasks and retrieval.
         revision: Exact source revision bound to every artifact.
         mining_spec: Optional representative-task budgets for the focused test.
+        tagger: Offline decision tagger, which a decision-tag selection geometry requires and
+            the provider-free geometry refuses.
 
     Returns:
         Completed project build pointers selected in ``project.toml``.
@@ -149,10 +168,11 @@ def _bind_completed_build(
         created_at=_TIME,
         code_revision=revision,
         mining_spec=mining_spec,
+        tagger=tagger,
     )
     trace_input = artifact_input(built.artifacts.trace_dataset.manifest)
     task_input = built.review.task_set
-    bindings = _lineage_bindings(built)
+    bindings = lineage_bindings(built)
     serving = persist_trace_rag(
         project.artifacts,
         (trace_input,),
@@ -298,7 +318,7 @@ class _ReviewSupplier:
     def __call__(
         self,
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         budget: RouterCompositionBudget,
     ) -> ApprovedRouterReview:
         """Persist or replay one exact approved rubric and calibration."""
@@ -357,7 +377,7 @@ class _SetupSupplier:
     def __call__(
         self,
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
@@ -365,7 +385,7 @@ class _SetupSupplier:
 
         Args:
             project: Project owning the completed build and evaluation artifacts.
-            build: Deterministic trace and task-set build reused by composition.
+            build: Verified completed trace and task-set build reused by composition.
             review: Approved rubric and manual calibration identifiers.
             budget: Finite composition budget already validated by the workflow.
 
@@ -376,7 +396,7 @@ class _SetupSupplier:
         completed = project.load_project().build
         assert completed is not None
         fit_index = load_rag_index(project.artifacts, completed.fit_rag.artifact_id).index
-        tasks = load_task_set(project.artifacts, build.artifacts.task_set.task_set_id).tasks
+        tasks = load_task_set(project.artifacts, build.task_set.task_set_id).tasks
         candidate = RoutedCandidateSnapshot(alias="candidate-a", model=_snapshot("candidate-a"))
         observed = []
         fit = tuple(task for task in tasks if task.partition == "fit")
@@ -490,7 +510,7 @@ class _ReservedSetupSupplier(_SetupSupplier):
     def __call__(
         self,
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
@@ -498,7 +518,7 @@ class _ReservedSetupSupplier(_SetupSupplier):
 
         Args:
             project: Project owning the completed build and evaluation artifacts.
-            build: Deterministic trace and task-set build reused by composition.
+            build: Verified completed trace and task-set build reused by composition.
             review: Approved rubric and manual calibration identifiers.
             budget: Finite composition budget already validated by the workflow.
 
@@ -551,7 +571,7 @@ class _MismatchedSetupSupplier(_SetupSupplier):
     def __call__(
         self,
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
@@ -559,7 +579,7 @@ class _MismatchedSetupSupplier(_SetupSupplier):
 
         Args:
             project: Project owning the completed build and evaluation artifacts.
-            build: Deterministic trace and task-set build reused by composition.
+            build: Verified completed trace and task-set build reused by composition.
             review: Approved rubric and manual calibration identifiers.
             budget: Finite composition budget already validated by the workflow.
 
@@ -2011,3 +2031,67 @@ def test_per_cell_judge_failures_exclude_cells_durably_and_replay_without_redisp
     assert second.optimization == first.optimization
     assert judge.calls == dispatched
     assert len(_artifact_ids("judgment-exclusion")) == len(exclusions)
+
+
+def test_a_decision_tag_build_composes_a_complete_frozen_router(tmp_path: Path) -> None:
+    """The build command's default mining route reaches a fitted router, not a refusal.
+
+    Completed-build verification reads the stored build instead of mining the stored traces
+    again, so the geometry that selected the task set no longer decides whether a router can be
+    optimized over it. A task set mined by asking a decision model is the case that could not be
+    reproduced here, and this composes it end to end with no provider call: the tagger is offline
+    and every model client is a fake.
+
+    Args:
+        tmp_path: Isolated project root for the tagged build and composed router.
+    """
+    project = ProjectStore(tmp_path, "project-a")
+    project.initialize(ProjectConfig(project_id="project-a"))
+    normalized = _compact_normalized_traces()
+    completed = _bind_completed_build(
+        project,
+        normalized,
+        revision="test-revision",
+        mining_spec=_TAGGED_MINING_SPEC,
+        tagger=_ProfileTagger(),
+    )
+    services = RouterWorkflowServices(
+        review_supplier=_ReviewSupplier(),
+        setup_supplier=_SetupSupplier(),
+        simulator_factory=_SimulatorFactory(),
+        judge=_Judge(),
+        runtime_catalog=cast(
+            RuntimeModelCatalog,
+            _Catalog(
+                {
+                    "candidate-a": _snapshot("candidate-a"),
+                    "embedder": _snapshot("embedder"),
+                },
+                _Client(),
+            ),
+        ),
+    )
+    budget = RouterCompositionBudget(maximum_simulation_cost_usd=10.0, maximum_judgments=100)
+
+    result = compose_router(
+        project,
+        normalized,
+        services=services,
+        budget=budget,
+        created_at=_TIME,
+        code_revision="test-revision",
+    )
+
+    assert isinstance(result.build.review.mining_spec.selection, DecisionTagSelectionSpec)
+    assert result.build.task_set.task_set_id == completed.task_set.artifact_id
+    assert result.build.lineage.task_set_id == completed.task_set.artifact_id
+    assert tuple(binding.trace_id for binding in result.build.lineage.bindings) == tuple(
+        sorted(trace.trace_id for trace in normalized.traces)
+    )
+    assert result.build.tasks
+    assert all(task.origin == "mined" for task in result.build.tasks)
+    assert result.plan.cells
+    assert result.policy_lock_id
+    assert result.total_simulation_spend_usd <= budget.maximum_simulation_cost_usd
+    decision = result.runtime.select(_request(), episode_id="customer-episode")
+    assert result.runtime.select(_request(), episode_id="customer-episode") == decision

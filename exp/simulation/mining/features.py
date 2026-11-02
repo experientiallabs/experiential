@@ -123,7 +123,10 @@ class DecisionTagSelectionSpec(ContractModel):
 
     Attributes:
         kind: Fixed decision-tag discriminator, defaulting to ``decision_tag``.
-        bank_id: Packaged question bank whose families define the columns and their order.
+        bank_id: Identity of the question bank whose families define the columns and their order.
+            :func:`~exp.simulation.mining.questions.resolve_question_bank` reads it from local
+            configuration first and package data second, because the wording of a proposition is
+            the asset and a real bank is local rather than shipped.
         families: Families of that bank to use, in bank order. Empty, the default, uses every
             family the bank declares, so a spec never has to name one bank's internals.
         transform: How probabilities become coordinates. See :data:`TagTransform`. It defaults to
@@ -133,8 +136,8 @@ class DecisionTagSelectionSpec(ContractModel):
             untransformed answers rather than asking for them here.
         view: Which rendered view the questions are asked about. It defaults to ``task``, the
             request-visible view: it is the one view a live request could also produce, so it is
-            the only router-safe one and it is already audited for leakage, and it is about 3.6k
-            tokens against the observations view's 11.8k, which is most of what tagging a corpus
+            the only router-safe one and it is already audited for leakage, and it is several
+            times smaller than the observations view, which is most of what tagging a corpus
             costs. ``observations`` shows what the episode revealed without the agent's own
             commentary, which separates two runs of one template that differ in what the
             environment returned; choose it when that distinction is the one being mined.
@@ -175,8 +178,10 @@ def selection_vectors(
         descriptors: Request-visible descriptors of the selection candidates, in order.
         tag_matrix: Decision-model answers covering every descriptor's trace. Required by a
             ``decision_tag`` spec and unused by a ``hashing`` one.
-        bank: The bank whose families name the columns. Omit it for a packaged bank, which is
-            read by ``spec.bank_id``; supply it when the bank came from a local file.
+        bank: The bank whose families name the columns, overriding resolution. Omit it and
+            ``spec.bank_id`` is resolved, from local configuration first and package data second.
+            Supply it to name columns from a bank already in hand, which saves re-reading it and
+            is the only way to use one that is neither installed locally nor packaged.
 
     Returns:
         One vector per descriptor, in input order, all of the same width.
@@ -222,7 +227,8 @@ def selection_probabilities(
         spec: Which bank, families and columns to read.
         descriptors: Request-visible descriptors of the selection candidates, in order.
         tag_matrix: Decision-model answers covering every descriptor's trace.
-        bank: The bank whose families name the columns. Omit it for a packaged bank.
+        bank: The bank whose families name the columns, overriding resolution. Omit it and
+            ``spec.bank_id`` is resolved, from local configuration first and package data second.
 
     Returns:
         One row of probabilities per descriptor, in input order, in bank column order.

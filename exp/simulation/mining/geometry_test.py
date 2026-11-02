@@ -232,6 +232,66 @@ def test_identical_members_are_separated_by_identity_alone() -> None:
     assert picked == ("t-000", "t-900", "t-001", "t-002")
 
 
+def test_a_duplicate_position_cannot_win_the_tie_by_rounding() -> None:
+    """Two members at one position are a tie, and a blocked matmul does not score them alike.
+
+    These seven positions are a case where the two identical ones, c5 and c6, came out of the gain
+    block a few last bits apart because one of them was scored on the micro-kernel's remainder
+    path. Taking the tie set at exact equality then kept whichever of them had rounded upwards: the
+    forward order picked c6, the reversed order picked c5, and the first pick stopped agreeing with
+    the medoid. A tie set with a relative width keeps all three answers the same.
+    """
+    positions = (
+        (-0.021918319141423906, 0.27968806551190006, 0.3987815278953793, 0.8730793012697372),
+        (-0.8128018861330295, -0.27685338729947667, -0.32979286397002566, -0.39235438408898154),
+        (0.3649784658700542, 0.5211577676108774, 0.7695416256699352, 0.054689917455245464),
+        (0.8208466778196538, 0.40055544498623513, -0.13835869445181825, 0.382913748347986),
+        (0.5934313182973872, -0.14027434083583057, -0.7137768237312463, 0.34450693123801096),
+        (0.6463038672665558, -0.7103480953076188, 0.26812515717603924, 0.0761957658827365),
+    )
+    vectors = {f"c{index}": position for index, position in enumerate(positions)}
+    vectors["c6"] = vectors["c5"]
+    candidates = CoreSetGeometry.of(vectors, dict.fromkeys(vectors, 1))
+    members = tuple(vectors)
+
+    assert candidates.representatives(members, 1) == ("c5",)
+    assert candidates.representatives(tuple(reversed(members)), 1) == ("c5",)
+    assert candidates.representatives(members, 1) == (candidates.medoid(members),)
+
+
+def test_tied_picks_stay_put_across_many_random_geometries() -> None:
+    """One corpus cannot show a rounding tie-break is gone, so the three claims are swept.
+
+    Every geometry here carries duplicate positions, which is what a tagged corpus produces and
+    what makes the gain tie set non-trivial. Each one has to keep all three of the documented
+    properties: the first pick is the medoid, the order does not depend on the member order, and a
+    tied pick is the lowest identity of its tie.
+    """
+    generator = random.Random(9)
+    for _ in range(60):
+        count = generator.randint(5, 40)
+        width = generator.randint(2, 8)
+        vectors: dict[str, tuple[float, ...]] = {}
+        for index in range(count):
+            raw = [generator.gauss(0, 1) for _ in range(width)]
+            norm = math.sqrt(sum(value * value for value in raw)) or 1.0
+            vectors[f"c{index:03d}"] = tuple(value / norm for value in raw)
+        for index in range(1, count, 3):
+            vectors[f"c{index:03d}"] = vectors[f"c{index - 1:03d}"]
+        candidates = CoreSetGeometry.of(
+            vectors, {identity: generator.randint(1, 9) for identity in vectors}
+        )
+        members = tuple(vectors)
+        shuffled = list(members)
+        generator.shuffle(shuffled)
+
+        picked = candidates.representatives(members, 4)
+
+        assert picked[0] == candidates.medoid(members)
+        assert picked == candidates.representatives(shuffled, 4)
+        assert picked[0] == min(name for name in members if vectors[name] == vectors[picked[0]])
+
+
 def test_members_positioned_in_different_geometries_are_refused() -> None:
     """A distance between two widths is undefined, so it fails by name rather than inside numpy."""
     mixed = CoreSetGeometry.of({"a": (1.0, 0.0), "b": (1.0,)}, {"a": 1, "b": 1})

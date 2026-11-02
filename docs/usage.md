@@ -423,6 +423,11 @@ provisional judgment provenance remains visible, and later approval creates an i
 human-calibrated successor. Running the endpoint records traffic by default so a later optimization
 can use newly attributed outcomes. Completed grounded projects can use
 [`router-optimization.json`](reference/router_optimization_config.md) with `exp optimize router`.
+That command checks the completed build it finds rather than rebuilding it: the stored scenarios,
+their coverage and their lineage bindings must still match the identities the build recorded, and
+the build's own traces must still normalize to the dataset it wrote. It never mines those traces
+again, so a project built with either mining route can be optimized, and a project whose stored
+evidence has been edited or replaced needs a fresh build.
 Router fitting never invokes world-model fidelity testing. Applications that need a world-model
 quality measurement can call the separate `build_fidelity_evaluation_plan` and
 `build_fidelity_report` APIs; those results never enter router fitting or activation. Fidelity
@@ -582,10 +587,16 @@ world-model grounding. Model roles belong to the project; embedding work uses th
 preflight. An unchanged completed build reuses its scenarios and indexes without new provider calls.
 
 Mining defaults to the decision-tag geometry, which tags each trace with a question bank you supply
-and clusters those answers. Experiential ships only a deliberately generic `example-v1` bank and
-never falls back to it, so this route requires installing your own bank at
-`.exp/question_banks/<bank_id>.toml` and naming it with `--question-bank`. Use
-`--mine-with hashing` for the provider-free route that needs no bank. See
+and clusters those answers. It is a paid route: it buys one decision per distinct case, quotes that
+spend from the free part of mining, and asks for it before the first call. `--dry-run` prints the
+quote and stops. Use `--mine-with hashing` for the provider-free route, which needs no bank and no
+decision model; the Python API defaults to that route rather than to this one.
+
+The bank is yours to write. Experiential ships one deliberately generic `example-v1` bank, for tests
+and documentation, and it is never substituted for a bank id you asked for: a bank id resolves from
+`.exp/question_banks/<bank_id>.toml` (or `$EXP_QUESTION_BANK_ROOT`) and a missing file is an error
+naming both places that were searched. Naming `example-v1` itself does load the packaged bank, so
+nothing stops you trying the route before writing a bank, and nothing picks it for you. See
 [representative-task mining](reference/trace-mining.md) for the bank format, the views, and the
 clustering and sampling options.
 `--dry-run` uses temporary SQLite for source ingestion and may checkpoint deterministic project

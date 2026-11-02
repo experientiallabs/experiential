@@ -35,7 +35,12 @@ class SelectedRepresentative:
         lineage_group_id: Connected lineage that fixes the task partition.
         partition: Frozen fit or held-out partition.
         cluster_id: Deterministic request-descriptor cluster used for selection audit.
-        selection_reasons: Medoid, tail-slot, and farthest-first selection reasons.
+        selection_reasons: Why each phase retained this trace, in the order the phases ran. One
+            value per claim, from the closed set: ``reserved:<slot>`` for a tail slot,
+            ``lineage-anchor``, ``cluster-medoid:<cluster_id>``, ``cluster-fill:<cluster_id>``,
+            ``cluster-representative:<cluster_id>``, ``stratum:<stratum>``, ``farthest-first``, and
+            ``hierarchy-representative``. A trace can carry several, since a later phase records
+            that it wanted a trace an earlier phase already took.
         source_trace_ids: Direct duplicate-source provenance for the retained real task.
         workload_mass: Unnormalized source workload represented by this task.
     """
@@ -118,7 +123,9 @@ def select_partition_representatives(
         cluster: Which clustering backend groups the candidates. None uses the provider-free
             descriptor clustering, which is seedless and needs no model.
         sampling: How the remaining budget is spent. None fills with one real cluster medoid each
-            and then farthest-first coverage.
+            and then farthest-first coverage. A strategy that reads the clustering's structure
+            above its flat partition, which is the hierarchical one, is handed the tree and the
+            assignment units the backend published, and refuses when the backend published none.
         probabilities: Untransformed decision-model answers per candidate, required only by a
             clustering backend that reads tag probabilities directly, which is the Bernoulli
             mixture and the pattern hierarchy.
@@ -127,8 +134,10 @@ def select_partition_representatives(
         Selected real traces, workload assignment, and unavailable tail-slot reasons.
 
     Raises:
-        ValueError: The budget is negative, candidates repeat source identities, or their
-            selection vectors do not share one width.
+        ValueError: The budget is negative, candidates repeat source identities, their selection
+            vectors do not share one width, or the sampling strategy could not spend the budget,
+            which is what the hierarchical strategy raises when it is handed a clustering that
+            published no tree to descend.
         ClusteringError: The clustering backend cannot read the supplied evidence.
     """
     if budget < 0:
@@ -216,6 +225,8 @@ def select_partition_representatives(
         reasons=reasons,
         target=target,
         strata=assignment.strata,
+        hierarchy=assignment.hierarchy,
+        units=assignment.units,
     )
 
     selected = _assign_workload(candidates, selected_ids, reasons, clusters, partition)

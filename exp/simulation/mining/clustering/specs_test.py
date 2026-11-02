@@ -18,6 +18,7 @@ from exp.simulation.mining.clustering.specs import (
     KMeansClusterSpec,
     PatternHierarchyClusterSpec,
     cluster_candidates,
+    publishes_tree,
 )
 from exp.simulation.mining.geometry import CoreSetGeometry
 from exp.simulation.mining.sampling import members_by_group
@@ -268,7 +269,11 @@ def test_the_pattern_backend_groups_identical_fired_sets_at_the_finest_cut() -> 
         frozenset({"trace-02"}),
         frozenset({"trace-03"}),
     }
-    assert assignment.strata is None
+    # The strata, the units and the tree come with every pattern-hierarchy assignment now that the
+    # backend publishes the agglomeration it already built, so this cut publishes them too.
+    assert assignment.strata is not None
+    assert assignment.units is not None
+    assert assignment.hierarchy is not None
 
 
 def test_raising_the_pattern_cut_rolls_near_identical_cases_together() -> None:
@@ -426,3 +431,113 @@ def test_the_pattern_cut_and_threshold_stay_in_their_intervals() -> None:
     for threshold in (0.0, 1.0):
         with pytest.raises(ValidationError):
             PatternHierarchyClusterSpec(threshold=threshold)
+
+
+def test_the_pattern_backend_publishes_strata_coarser_than_its_clusters() -> None:
+    """Strata are what a sampler covers before spending inside one, so they have to be coarser."""
+    geometry, answers = _tagged("1100", "1110", "0011", "0111", "0000")
+
+    assignment = cluster_candidates(
+        PatternHierarchyClusterSpec(cut=0.1, strata_cut=0.8),
+        geometry=geometry,
+        target=5,
+        probabilities=answers,
+    )
+
+    assert assignment.strata is not None
+    clusters = _grouping(assignment.labels)
+    strata = _grouping(assignment.strata)
+    assert len(strata) < len(clusters)
+    # Each cluster sits inside exactly one stratum, which is what makes the pair a hierarchy of
+    # two partitions rather than two unrelated groupings.
+    assert all(any(cluster <= stratum for stratum in strata) for cluster in clusters)
+
+
+def test_a_stratum_finer_than_its_cluster_is_refused() -> None:
+    """One cluster spread across several strata is not a coarser grouping of anything."""
+    with pytest.raises(ValidationError, match="at or above cut"):
+        PatternHierarchyClusterSpec(cut=0.6, strata_cut=0.3)
+    assert PatternHierarchyClusterSpec().strata_cut == 0.6
+    assert PatternHierarchyClusterSpec(cut=0.6, strata_cut=0.6).strata_cut == 0.6
+
+
+def test_the_pattern_backend_publishes_the_units_its_tree_is_indexed_by() -> None:
+    """A tree is only descendable if something says which leaf a candidate sits under."""
+    geometry, answers = _tagged("1100", "1100", "1110", "0011", "0000")
+
+    assignment = cluster_candidates(
+        PatternHierarchyClusterSpec(cut=0.3), geometry=geometry, target=5, probabilities=answers
+    )
+
+    assert assignment.units is not None
+    assert assignment.hierarchy is not None
+    # The unit is the fired-proposition set, so the two identical cases share one and the tree has
+    # one leaf per distinct pattern.
+    assert assignment.units["trace-00"] == assignment.units["trace-01"]
+    assert len(set(assignment.units.values())) == 4
+    leaves = {int(assignment.hierarchy.leaf_of_unit[unit]) for unit in assignment.units.values()}
+    assert leaves <= set(assignment.hierarchy.leaves(assignment.hierarchy.root))
+
+
+def test_the_atoms_backend_states_that_its_units_are_its_atoms() -> None:
+    """Leaving a consumer to infer that the labels happen to be the units would be a trap."""
+    geometry = _ring(16)
+
+    assignment = cluster_candidates(
+        AtomsHierarchyClusterSpec(atom_count=8, groups=3, seed=1), geometry=geometry, target=8
+    )
+
+    assert assignment.units is not None
+    assert assignment.units == assignment.labels
+    assert assignment.hierarchy is not None
+    assert sorted(set(assignment.units.values())) == list(range(8))
+
+
+@pytest.mark.parametrize(
+    ("spec", "tagged"),
+    [
+        (DescriptorClusterSpec(), False),
+        (KMeansClusterSpec(k=3, seed=3), False),
+        (AtomsHierarchyClusterSpec(atom_count=6, groups=3, seed=3), False),
+        (BernoulliMixtureClusterSpec(k=2, seed=3), True),
+        (PatternHierarchyClusterSpec(), True),
+    ],
+)
+def test_the_units_and_the_tree_are_published_together_or_not_at_all(
+    spec: ClusterSpec, tagged: bool
+) -> None:
+    """One without the other names a mapping into nothing, or a tree nothing maps into."""
+    geometry = _ring(12)
+    answers = _probabilities(geometry) if tagged else None
+
+    assignment = cluster_candidates(spec, geometry=geometry, target=6, probabilities=answers)
+
+    assert (assignment.units is None) == (assignment.hierarchy is None)
+    assert (assignment.units is None) == (assignment.strata is None)
+
+
+@pytest.mark.parametrize(
+    ("spec", "tagged"),
+    [
+        (DescriptorClusterSpec(), False),
+        (KMeansClusterSpec(k=3, seed=3), False),
+        (AtomsHierarchyClusterSpec(atom_count=6, groups=3, seed=3), False),
+        (BernoulliMixtureClusterSpec(k=2, seed=3), True),
+        (PatternHierarchyClusterSpec(), True),
+    ],
+)
+def test_the_tree_predicate_answers_what_the_dispatch_actually_published(
+    spec: ClusterSpec, tagged: bool
+) -> None:
+    """One owner for "does this backend publish a tree?", checked against the dispatch itself.
+
+    Everything that has to know the answer before a fit runs, a spec validator or a CLI option
+    table, reads the predicate, so the predicate disagreeing with what the dispatch fills would
+    refuse a usable combination or accept an unusable one.
+    """
+    geometry = _ring(12)
+    answers = _probabilities(geometry) if tagged else None
+
+    assignment = cluster_candidates(spec, geometry=geometry, target=6, probabilities=answers)
+
+    assert publishes_tree(spec) == (assignment.hierarchy is not None)

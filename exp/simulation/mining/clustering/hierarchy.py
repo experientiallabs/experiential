@@ -1,10 +1,12 @@
 """Fine atoms plus a re-cuttable tree over them.
 
-Two things make this the only backend that answers "how many groups?" after the fact. The atoms are
-the stable unit of assignment, so the tree above them can be cut at any level without reassigning a
-single trace, and the merges are Ward merges, so a cut reproduces exactly the partition Ward would
-have produced on the traces themselves had every atom been forced to stay whole. A reviewer who
-wants eight groups and then sixteen pays for one fit.
+Two things let this backend answer "how many groups?" after the fact. The atoms are the stable unit
+of assignment, so the tree above them can be cut at any level without reassigning a single trace,
+and the merges are Ward merges, so a cut reproduces exactly the partition Ward would have produced
+on the traces themselves had every atom been forced to stay whole. A reviewer who wants eight groups
+and then sixteen pays for one fit. The pattern agglomeration re-cuts without refitting too, through
+:func:`~exp.simulation.mining.clustering.patterns.pattern_labels_at`, and the difference is what the
+question is: a height there, a group count here.
 
 Ward over weighted points is what makes that equivalence hold. The merge cost
 ``n_i n_j / (n_i + n_j) * ||c_i - c_j||^2`` is the increase in within-group sum of squares that

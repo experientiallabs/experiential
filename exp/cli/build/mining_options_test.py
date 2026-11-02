@@ -17,7 +17,6 @@ from exp.cli.build.mining_options import (
     TAGGER_CONCURRENCY_OPTION,
     build_tagger,
     mining_geometry,
-    mining_preparation_settings,
 )
 from exp.common.models import (
     BillingSource,
@@ -43,6 +42,7 @@ from exp.simulation.mining.features import DecisionTagSelectionSpec, HashingSele
 from exp.simulation.mining.questions import EXAMPLE_BANK_ID
 from exp.simulation.mining.sampling import (
     DiversitySamplingSpec,
+    HierarchicalSamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
     RepresentativeSamplingSpec,
@@ -84,7 +84,7 @@ def test_the_declared_defaults_are_the_tag_route_and_its_settled_pipeline() -> N
     spec = _spec(mine_with="decision-tag", tagger="clef-decisions")
 
     assert spec.cluster == PatternHierarchyClusterSpec()
-    assert spec.sampling == RepresentativeSamplingSpec()
+    assert spec.sampling == HierarchicalSamplingSpec()
     assert isinstance(MiningSpec().selection, HashingSelectionSpec)
     assert MiningSpec().cluster == DescriptorClusterSpec()
     assert MiningSpec().sampling == MedoidSamplingSpec()
@@ -111,6 +111,12 @@ def test_each_sampling_name_selects_its_strategy() -> None:
     assert _spec(sample_with="proportional").sampling == ProportionalSamplingSpec()
     assert _spec(sample_with="diversity").sampling == DiversitySamplingSpec()
     assert _spec(sample_with="stratified").sampling == StratifiedSamplingSpec()
+    assert _spec(sample_with="representative").sampling == RepresentativeSamplingSpec()
+    # The one strategy that reads a tree is only usable with a backend that publishes one.
+    assert (
+        _spec(cluster_with="atoms-hierarchy", sample_with="hierarchical").sampling
+        == HierarchicalSamplingSpec()
+    )
 
 
 def test_the_decision_tag_geometry_records_the_bank_it_was_given() -> None:
@@ -205,32 +211,9 @@ def test_the_choice_lists_match_the_specs_they_map_to() -> None:
         )
         assert spec.cluster.kind == name.replace("-", "_")
     for name in SAMPLE_WITH_CHOICES:
-        assert _spec(sample_with=name).sampling.kind == name
-
-
-def test_preparation_settings_round_trip_to_the_same_spec() -> None:
-    """A project stores names, so rebuilding from them must give back the same geometry."""
-    from exp.simulation.build import mining_spec_for
-
-    settings = mining_preparation_settings(
-        source_kind="otlp",
-        mine_with="decision-tag",
-        cluster_with="bernoulli-mixture",
-        sample_with="stratified",
-        tagger="clef-decisions",
-        question_bank=EXAMPLE_BANK_ID,
-        seed=11,
-    )
-
-    assert settings.mining_geometry == "decision_tag"
-    assert settings.mining_tagger_alias == "clef-decisions"
-    assert settings.mining_bank == EXAMPLE_BANK_ID
-    assert mining_spec_for(settings) == _spec(
-        mine_with="decision-tag",
-        cluster_with="bernoulli-mixture",
-        sample_with="stratified",
-        tagger="clef-decisions",
-    ).model_copy(update={"cluster": BernoulliMixtureClusterSpec(seed=11)})
+        # hierarchical descends the clustering's tree, so it is named with a backend that has one.
+        tree = "atoms-hierarchy" if name == "hierarchical" else None
+        assert _spec(sample_with=name, cluster_with=tree).sampling.kind == name
 
 
 def _decision_alias() -> ResolvedModel:
@@ -328,13 +311,11 @@ def test_concurrency_never_enters_the_mined_evidence() -> None:
 
     assert not [name for name in fields if "concurrency" in name]
     assert _spec(mine_with="decision-tag", tagger="clef-decisions") == mining_spec_for(
-        mining_preparation_settings(
+        ProjectTracePreparationSettings(
             source_kind="otlp",
-            mine_with="decision-tag",
-            cluster_with=None,
-            sample_with=None,
-            tagger="clef-decisions",
-            question_bank=EXAMPLE_BANK_ID,
+            mining_geometry="decision_tag",
+            mining_bank=EXAMPLE_BANK_ID,
+            mining_tagger_alias="clef-decisions",
         )
     )
 
@@ -348,24 +329,39 @@ def test_an_unnamed_backend_takes_each_geometry_s_default_and_a_named_one_is_lit
     tagged: dict[str, str | None] = {"mine_with": "decision-tag", "tagger": "clef-decisions"}
 
     assert _spec(**tagged).cluster == PatternHierarchyClusterSpec()
-    assert _spec(**tagged).sampling == RepresentativeSamplingSpec()
+    assert _spec(**tagged).sampling == HierarchicalSamplingSpec()
     assert _spec(**tagged, cluster_with="descriptor").cluster == DescriptorClusterSpec()
     assert _spec(**tagged, sample_with="medoid").sampling == MedoidSamplingSpec()
     assert _spec().cluster == DescriptorClusterSpec()
     assert _spec().sampling == MedoidSamplingSpec()
 
 
-def test_leaving_a_flag_unnamed_is_persisted_as_a_default_rather_than_a_name() -> None:
-    """Freezing today's answer into the settings would make the default impossible to change."""
-    settings = mining_preparation_settings(
-        source_kind="otlp",
-        mine_with="decision-tag",
-        cluster_with=None,
-        sample_with=None,
-        tagger="clef-decisions",
-        question_bank=EXAMPLE_BANK_ID,
+def test_the_unnamed_strategy_follows_the_backend_that_was_named() -> None:
+    """Descending a tree is only defined for a backend that has one, so the default follows it.
+
+    Naming a backend must never force a strategy to be named with it. The tag route's unnamed
+    strategy is therefore the descent for the two backends that publish a tree and the
+    facility-location fill for the rest, and either way the flags stay independent.
+    """
+    tagged: dict[str, str | None] = {"mine_with": "decision-tag", "tagger": "clef-decisions"}
+
+    assert _spec(**tagged, cluster_with="atoms-hierarchy").sampling == HierarchicalSamplingSpec()
+    assert _spec(**tagged, cluster_with="descriptor").sampling == RepresentativeSamplingSpec()
+    assert _spec(**tagged, cluster_with="kmeans").sampling == RepresentativeSamplingSpec()
+    assert (
+        _spec(**tagged, cluster_with="bernoulli-mixture").sampling == RepresentativeSamplingSpec()
     )
 
-    assert settings.mining_cluster is None
-    assert settings.mining_sampling is None
-    assert mining_spec_for(settings).cluster == PatternHierarchyClusterSpec()
+
+def test_naming_the_descent_against_a_treeless_backend_says_what_to_do() -> None:
+    """A strategy that reads a tree and a backend with none is refused before any tagging.
+
+    This is the combination only an explicit pair of flags can produce, and the refusal is the
+    interface: it names the backends that publish a tree and the strategies that need none, so
+    the way out is one flag rather than a guess.
+    """
+    with pytest.raises(typer.BadParameter, match="descriptor backend publishes none") as caught:
+        _spec(sample_with="hierarchical")
+
+    assert "atoms_hierarchy" in str(caught.value)
+    assert "representative" in str(caught.value)

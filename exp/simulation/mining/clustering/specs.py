@@ -14,7 +14,7 @@ argued with later.
   an axis, and it can choose the group count itself by BIC, which matters on a corpus nobody has
   labelled. It needs the untransformed answers, so it is available only behind a decision-tag
   selection geometry.
-- **atoms_hierarchy** is the only one that produces a tree. Fine atoms stay fixed while the tree
+- **atoms_hierarchy** produces a tree over k-means atoms. Fine atoms stay fixed while the tree
   above them is cut at any number of groups, so changing the group count costs nothing and
   stratified sampling has coarse strata to work with.
 - **pattern_hierarchy** is the second one to read the untransformed answers, and the only one to
@@ -24,7 +24,12 @@ argued with later.
   than at a group count, so what a run names is how alike two cases have to be rather than how many
   groups it wants. Thresholding here rather than in the selection geometry is deliberate: binary
   rows leave the core-set metric nothing to measure, so the geometry selection reads stays
-  continuous.
+  continuous. It publishes a tree as well, over the distinct patterns rather than over atoms.
+
+The two tree-publishing backends are the two a sampler can descend, and they publish the same three
+things beside their labels: coarse ``strata``, the ``hierarchy`` itself, and the ``units`` its
+leaves are indexed by. Everything else publishes labels alone. :func:`publishes_tree` answers which
+is which, for every caller that has to know before a fit has run.
 
 Three further backends were considered and left out. Non-negative matrix factorization and a
 threshold tree both need machinery of their own before they answer anything, and nothing here asks
@@ -61,7 +66,12 @@ from exp.simulation.mining.clustering.descriptor import (
 from exp.simulation.mining.clustering.hierarchy import Hierarchy, atoms_hierarchy_fit
 from exp.simulation.mining.clustering.kmeans import kmeans_fit
 from exp.simulation.mining.clustering.mixture import bernoulli_mixture_fit
-from exp.simulation.mining.clustering.patterns import pattern_hierarchy_fit
+from exp.simulation.mining.clustering.patterns import (
+    PatternHierarchyFit,
+    pattern_hierarchy_fit,
+    pattern_labels_at,
+    pattern_tree,
+)
 from exp.simulation.mining.geometry import CoreSetGeometry
 
 
@@ -150,8 +160,11 @@ class AtomsHierarchyClusterSpec(ContractModel):
         atom_count: Atoms to fit, clamped to the candidate count, or None for
             ``4 * sqrt(n)``. See
             :func:`~exp.simulation.mining.clustering.descriptor.default_atom_count`.
-        groups: Groups the tree is cut into for cluster identities, or None for the group count the
-            provider-free path would use at this budget.
+        groups: Groups the tree is cut into for the coarse ``strata`` a sampler covers, or None for
+            the group count the provider-free path would use at this budget. The cluster identity
+            under this backend is the atom index, which is also its assignment unit, so this field
+            sets how many strata the atoms are gathered into rather than how many clusters there
+            are.
         n_init: k-means restarts for the atom fit.
         max_iter: k-means iterations per restart.
         tol: k-means convergence bound.
@@ -204,6 +217,12 @@ class PatternHierarchyClusterSpec(ContractModel):
             true of their members on average, so ``0.3`` joins cases agreeing on about seven tenths
             of what either mentions. ``1.0`` is one cluster. Cases that fired nothing always share
             one cluster of their own, at every cut.
+        strata_cut: Height the same dendrogram is cut at for ``strata``, which is the coarser
+            partition a sampler covers before it spends any budget inside one group. It has to be
+            at or above ``cut``, because a stratum coarser than the cluster it contains is the only
+            consistent reading of the two: each cluster then sits inside exactly one stratum. The
+            default pairs a cut that groups near-identical cases with strata that hold the broad
+            archetypes those cases belong to.
         threshold: Probability above which a proposition counts as fired. Strictly inside
             ``(0, 1)``, since a bound at either end would fire every proposition or none. It
             decides which patterns exist at all, so it belongs to the backend that reads them
@@ -212,7 +231,19 @@ class PatternHierarchyClusterSpec(ContractModel):
 
     kind: Literal["pattern_hierarchy"] = "pattern_hierarchy"
     cut: float = Field(default=0.3, ge=0.0, le=1.0)
+    strata_cut: float = Field(default=0.6, ge=0.0, le=1.0)
     threshold: float = Field(default=0.5, gt=0.0, lt=1.0)
+
+    @model_validator(mode="after")
+    def _coarser_strata(self) -> PatternHierarchyClusterSpec:
+        """Reject strata finer than the clusters they are supposed to contain."""
+        if self.strata_cut < self.cut:
+            raise ValueError(
+                "strata are the coarse groups a sampler covers before it spends budget inside "
+                f"one, so strata_cut must be at or above cut; strata_cut {self.strata_cut} is "
+                f"below cut {self.cut}, which would put one cluster across several strata"
+            )
+        return self
 
 
 ClusterSpec = Annotated[
@@ -225,6 +256,24 @@ ClusterSpec = Annotated[
 ]
 
 
+def publishes_tree(spec: ClusterSpec) -> bool:
+    """Return whether this backend publishes a tree beside its labels.
+
+    One owner for the question, because the answer is a property of the backend rather than of any
+    one caller: a spec validator, a CLI option table and a sampler all have to agree about it, and
+    a new tree-publishing backend has to become descendable everywhere at once rather than wherever
+    someone remembered to widen an isinstance check.
+
+    Args:
+        spec: Which backend a run named.
+
+    Returns:
+        True when :func:`cluster_candidates` fills ``hierarchy`` and ``units`` for this spec, which
+        is what the hierarchical sampling strategy needs to descend.
+    """
+    return isinstance(spec, AtomsHierarchyClusterSpec | PatternHierarchyClusterSpec)
+
+
 @dataclass(frozen=True)
 class ClusterAssignment:
     """One partition's grouping, and the coarse strata a sampler may fill evenly.
@@ -234,11 +283,18 @@ class ClusterAssignment:
             identity is nonnegative, because a cluster identity is persisted coverage evidence.
         strata: Coarser groups for stratified sampling, or None when the backend publishes no
             hierarchy and the flat clusters are the only grouping available.
+        units: Finest assignment unit index per candidate, which is the index
+            :attr:`~exp.simulation.mining.clustering.hierarchy.Hierarchy.leaf_of_unit` is read by:
+            the atom index under ``atoms_hierarchy`` and the pattern index under
+            ``pattern_hierarchy``. It is published together with ``hierarchy`` or not at all, since
+            a tree nothing maps a candidate into cannot be descended and a mapping with no tree
+            names nothing.
         hierarchy: The tree over assignment units, when the backend built one.
     """
 
     labels: Mapping[str, int]
     strata: Mapping[str, int] | None = None
+    units: Mapping[str, int] | None = None
     hierarchy: Hierarchy | None = None
 
 
@@ -259,7 +315,8 @@ def cluster_candidates(
             Bernoulli mixture and the pattern hierarchy and unused by the others.
 
     Returns:
-        The grouping, plus strata and a tree when the backend produces them.
+        The grouping, plus coarse strata, the assignment units and a tree when the backend
+        produces them.
 
     Raises:
         ClusteringError: The backend cannot read the evidence it was given.
@@ -286,8 +343,12 @@ def cluster_candidates(
             labels=_labels(geometry, _mixture_labels(spec, geometry, probabilities))
         )
     if isinstance(spec, PatternHierarchyClusterSpec):
+        patterns = _pattern_fit(spec, geometry, probabilities)
         return ClusterAssignment(
-            labels=_labels(geometry, _pattern_labels(spec, geometry, probabilities))
+            labels=_labels(geometry, patterns.labels),
+            strata=_labels(geometry, pattern_labels_at(patterns, spec.strata_cut)),
+            units=_labels(geometry, patterns.pattern_of_row),
+            hierarchy=pattern_tree(patterns),
         )
     if not isinstance(spec, AtomsHierarchyClusterSpec):  # pragma: no cover - union is exhaustive
         raise ClusteringError(
@@ -307,6 +368,10 @@ def cluster_candidates(
     return ClusterAssignment(
         labels=_labels(geometry, fit.atoms),
         strata=_labels(geometry, fit.labels),
+        # The atom index is both this backend's cluster identity and its assignment unit. Stating
+        # it rather than leaving a consumer to infer that the two coincide is what keeps the
+        # published contract the same shape under both tree-publishing backends.
+        units=_labels(geometry, fit.atoms),
         hierarchy=fit.hierarchy,
     )
 
@@ -345,11 +410,11 @@ def _mixture_labels(
     return fit.labels
 
 
-def _pattern_labels(
+def _pattern_fit(
     spec: PatternHierarchyClusterSpec,
     geometry: CoreSetGeometry,
     probabilities: Mapping[str, tuple[float, ...]] | None,
-) -> np.ndarray:
+) -> PatternHierarchyFit:
     """Threshold the untransformed answers into fired-proposition sets and agglomerate them.
 
     The threshold is applied here, to the answers, rather than read out of the selection geometry.
@@ -376,10 +441,9 @@ def _pattern_labels(
         for candidate_id in geometry.ids
     }
     try:
-        fit = pattern_hierarchy_fit(_matrix(geometry, fired), cut=spec.cut)
+        return pattern_hierarchy_fit(_matrix(geometry, fired), cut=spec.cut)
     except ValueError as exc:
         raise ClusteringError(str(exc)) from exc
-    return fit.labels
 
 
 def _matrix(geometry: CoreSetGeometry, rows: Mapping[str, tuple[float, ...]]) -> np.ndarray:

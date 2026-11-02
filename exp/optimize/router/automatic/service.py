@@ -45,6 +45,7 @@ from exp.optimize.router.composition import (
     RouterWorkflowServices,
     compose_router,
 )
+from exp.optimize.router.evaluation.build import VerifiedProjectBuild
 from exp.optimize.router.fit.workflow import RouterFitWorkflowResult
 from exp.runtime.agents import (
     AgentFactory,
@@ -57,7 +58,6 @@ from exp.runtime.models import (
     ResolvedModel,
     RuntimeModelCatalog,
 )
-from exp.simulation.build import ProjectBuild
 from exp.simulation.engines.text import (
     WORLD_MODEL_TEXT_PROMPT_ID,
     WORLD_MODEL_TEXT_PROMPT_VERSION,
@@ -532,7 +532,7 @@ def _workflow_services(
 
     def review_supplier(
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         budget: RouterCompositionBudget,
     ) -> ApprovedRouterReview | ProvisionalRouterReview:
         """Supply exact typed judge provenance to composition.
@@ -563,7 +563,7 @@ def _workflow_services(
 
     def setup_supplier(
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         review: ApprovedRouterReview | ProvisionalRouterReview,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:

@@ -69,8 +69,11 @@ A bank is asked about one rendered view of each trace, chosen per mining run.
   the same request-visible descriptor the router reads, so it adds no leakage surface, and it is
   substantially smaller than the alternative.
 - `observations` renders everything the agent received and nothing it produced: person turns, the
-  tool call and result stream with large results condensed, failures, the final answer and the
-  recorded outcome. It carries no agent reasoning.
+  tool call and result stream with large results condensed, failures, and the agent's final answer.
+  It carries no agent reasoning. The recorded episode outcome is off by default
+  (`include_terminal_outcome`), because a rubric should cover the successful and the failed
+  instances of one case alike; outcome already reaches selection through coverage descriptors and
+  reserved slots. Turn it on in the view spec when the outcome is the distinction being mined.
 
 One mining run asks every question about one view. Propositions that need the trace body therefore
 belong in their own families so they can be selected and bought separately.
@@ -104,6 +107,11 @@ decides which patterns exist at all, so changing it rebuilds the tree itself.
 The backend also publishes that tree and a coarser partition cut at `strata_cut`, so a sampler can
 spend budget across broad groups rather than across the finest clusters.
 
+`cut`, `threshold` and `strata_cut` are reachable only from the Python API today. No CLI flag and
+no persisted project setting writes them, so a build through `exp build` always gets the defaults
+described here; to change them, build a `PatternHierarchyClusterSpec` yourself and pass the spec
+to `build_task_set`.
+
 Traces where no proposition fired share a single cluster. Jaccard distance between two empty sets is
 undefined, and these are the least distinctive traces in the corpus, so isolating each one would be
 backwards.
@@ -125,10 +133,17 @@ reproducing an existing task set that was built with it.
 
 ## Cost
 
-Each decision call carries at most 32 questions, so a bank is asked in consecutive batches of that
-size and the rendered view is re-sent with each batch. Mining cost therefore scales with the number
-of batches, the size of the chosen view, and the number of traces. Keeping a bank near a multiple of
-32 avoids paying for a batch that is nearly empty.
+Each decision call carries at most 32 questions. That is the decisions surface's own per-request
+limit (`MAX_DECISION_QUESTIONS`), not the unrelated 48-question limit the chat tagger batches with.
+A bank is asked in consecutive batches of that size and the rendered view is re-sent with each
+batch, so mining cost scales with the number of batches, the size of the chosen view, and the
+number of traces. Keeping a bank near a multiple of 32 avoids paying for a batch that is nearly
+empty.
+
+`exp build` quotes that cost before it buys any of it: the distinct cases left after duplicate
+collapse, times the batches the bank needs, times the tokens of the rendered view, priced at the
+tagger's catalog input price and its retry allowance. The quote is a preflight line of its own and
+the spend is authorized separately from embedding.
 
 Answers are bought once and stored per trace, question set and model identity, so repeating a mining
 run over an unchanged corpus makes no new provider calls.

@@ -47,7 +47,7 @@ from exp.optimize.evaluation.simulation import SimulatorFactory, run_or_load_sim
 from exp.optimize.router.activation import load_project_router
 from exp.optimize.router.errors import RouterCompositionError
 from exp.optimize.router.evaluation.build import (
-    completed_project_build,
+    VerifiedProjectBuild,
     reconstruct_completed_project_build,
 )
 from exp.optimize.router.evaluation.setup import verify_router_evaluation_setup
@@ -66,7 +66,6 @@ from exp.optimize.router.fit.workflow import (
 from exp.optimize.router.judgment_budget import complete_cell_evidence
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.router import RouterRuntime
-from exp.simulation.build import ProjectBuild
 from exp.simulation.specs import SimulationSpec
 
 logger = logging.getLogger(__name__)
@@ -163,7 +162,7 @@ class ReviewSupplier(Protocol):
     def __call__(
         self,
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         budget: RouterCompositionBudget,
     ) -> RouterReviewProvenance:
         """Return manifest-persisted review artifacts."""
@@ -175,7 +174,7 @@ class EvaluationSetupSupplier(Protocol):
     def __call__(
         self,
         project: ProjectStore,
-        build: ProjectBuild,
+        build: VerifiedProjectBuild,
         review: RouterReviewProvenance,
         budget: RouterCompositionBudget,
     ) -> RouterEvaluationSetup:
@@ -209,7 +208,7 @@ class RouterWorkflowServices:
 class RouterCompositionResult:
     """Complete local artifact chain and loaded frozen online runtime."""
 
-    build: ProjectBuild
+    build: VerifiedProjectBuild
     review: RouterReviewProvenance
     plan: EvaluationPlan
     simulation_spec: SimulationSpec
@@ -238,7 +237,8 @@ def compose_router(
 
     Args:
         project: Initialized local project store.
-        trace_source: Canonical normalized traces used to build task evidence.
+        trace_source: Canonical normalized traces for this project. They are verified
+            against the completed build's stored trace dataset, never mined again.
         services: Review, simulation, judging, and runtime dependencies. None are auto-resolved.
         budget: Finite simulation spend and judgment-call ceilings.
         created_at: Timezone-aware artifact completion time. Once the evaluation plan is
@@ -259,7 +259,6 @@ def compose_router(
     started = time.monotonic()
     report(progress, "preflight")
     _preflight(project, services, budget, code_revision)
-    completed_build = completed_project_build(project)
     built = reconstruct_completed_project_build(
         project,
         trace_source,
@@ -274,7 +273,7 @@ def compose_router(
             "router evaluation judgment status differs from its calibration provenance"
         )
     verify_router_evaluation_setup(
-        completed=completed_build,
+        completed=built.completed,
         fit_rag_input=setup.fit_rag_input,
         grounded_world_model_input=setup.world_model_settings.grounded_world_model_input,
         production_protocol=setup.production_protocol,
@@ -285,7 +284,7 @@ def compose_router(
 
     plan = build_evaluation_plan(
         project.artifacts,
-        task_set_id=built.artifacts.task_set.task_set_id,
+        task_set_id=built.task_set.task_set_id,
         candidate_snapshots=setup.candidates,
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=setup.observed_cells,

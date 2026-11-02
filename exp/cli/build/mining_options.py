@@ -54,6 +54,7 @@ SAMPLE_WITH_CHOICES = (
     "stratified",
     "representative",
     "balanced",
+    "hierarchical",
 )
 
 MINE_WITH_OPTION = typer.Option(
@@ -99,10 +100,14 @@ SAMPLE_WITH_OPTION = typer.Option(
     "--sample-with",
     metavar="STRATEGY",
     help=(
-        "How leftover task budget is spent. Unset means the chosen geometry's own: "
-        "representative under decision-tag, which spends each group's share on its most typical "
-        "cases, and medoid under hashing. Name medoid, proportional to workload, diversity, "
-        "stratified evenly across groups, or balanced, which is representative with equal shares."
+        "How leftover task budget is spent. Unset means the chosen geometry's own: hierarchical "
+        "under decision-tag, which splits the budget down the clustering tree so a family of "
+        "related groups is weighed as one, or representative there when --cluster-with names a "
+        "backend with no tree, and medoid under hashing. Name "
+        "representative to spend each group's share on its most typical cases, medoid, "
+        "proportional to workload, diversity, stratified evenly across groups, or balanced, which "
+        "is representative with equal shares. hierarchical needs a clustering backend that "
+        "publishes a tree, which is pattern-hierarchy or atoms-hierarchy."
     ),
 )
 MINING_SEED_OPTION = typer.Option(
@@ -185,51 +190,6 @@ def mining_geometry(
         raise typer.BadParameter(str(exc)) from exc
 
 
-def mining_preparation_settings(
-    *,
-    source_kind: str,
-    mine_with: str,
-    cluster_with: str | None,
-    sample_with: str | None,
-    tagger: str | None,
-    question_bank: str | None = None,
-    seed: int = 42,
-    fit_task_budget: int = 50,
-    held_out_task_budget: int = 20,
-    descriptor_dimensions: int = 64,
-) -> ProjectTracePreparationSettings:
-    """Return the persisted preparation settings for one named geometry.
-
-    Args:
-        source_kind: Declared canonical trace source format.
-        mine_with: Selection geometry name.
-        cluster_with: Clustering backend name, or None for the geometry's own.
-        sample_with: Sampling strategy name, or None for the geometry's own.
-        tagger: Decision-model alias, or None.
-        question_bank: Question bank identity, or None.
-        seed: Seed for a randomly initialized backend.
-        fit_task_budget: Representative tasks reserved for fit-only work.
-        held_out_task_budget: Representative tasks sealed for final reporting.
-        descriptor_dimensions: Width of the request-visible hashing vector.
-
-    Returns:
-        Settings a project stores, from which the same spec is rebuilt on every later run.
-    """
-    _require_bank(mine_with, question_bank)
-    return _settings(
-        source_kind=source_kind,
-        mine_with=mine_with,
-        cluster_with=cluster_with,
-        sample_with=sample_with,
-        tagger=tagger,
-        question_bank=question_bank,
-        seed=seed,
-        fit_task_budget=fit_task_budget,
-        held_out_task_budget=held_out_task_budget,
-        descriptor_dimensions=descriptor_dimensions,
-    )
-
-
 def build_tagger(
     alias: str,
     *,
@@ -277,7 +237,6 @@ def build_tagger(
 
 def _settings(
     *,
-    source_kind: str = "otlp",
     mine_with: str,
     cluster_with: str | None,
     sample_with: str | None,
@@ -288,14 +247,20 @@ def _settings(
     held_out_task_budget: int,
     descriptor_dimensions: int,
 ) -> ProjectTracePreparationSettings:
-    """Build preparation settings from validated command-line names.
+    """Build the settings record one validated set of command-line names describes.
 
-    An unnamed backend or strategy is persisted as None rather than as the name of one, so the
-    settings record that the geometry's default was wanted rather than freezing today's answer.
+    An unnamed backend or strategy becomes None rather than the name of one, so the record says
+    that the geometry's default was wanted rather than freezing today's answer.
+
+    These settings are the one input :func:`~exp.simulation.build.mining_spec_for` takes, which
+    is why the command line builds them even though it does not store them: a project's stored
+    settings and a command's flags reach the same spec through the same function. The declared
+    source kind is not one of those flags, so it is fixed here and the record is never persisted
+    from this path.
     """
     cluster = None if cluster_with is None else cluster_with.replace("-", "_")
     return ProjectTracePreparationSettings(
-        source_kind=source_kind,
+        source_kind="otlp",
         fit_task_budget=fit_task_budget,
         held_out_task_budget=held_out_task_budget,
         descriptor_dimensions=descriptor_dimensions,

@@ -52,6 +52,7 @@ from exp.simulation.mining.clustering import (
     DescriptorClusterSpec,
     KMeansClusterSpec,
     PatternHierarchyClusterSpec,
+    publishes_tree,
 )
 from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
 from exp.simulation.mining.features import (
@@ -62,6 +63,7 @@ from exp.simulation.mining.features import (
 from exp.simulation.mining.sampling import (
     BalancedSamplingSpec,
     DiversitySamplingSpec,
+    HierarchicalSamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
     RepresentativeSamplingSpec,
@@ -79,6 +81,10 @@ _BUILD_SCOPED_REVIEW_KEYS = (
 )
 _MINIMUM_PROVIDER_FREE_TRACE_COUNT = 100
 _MAXIMUM_PROVIDER_FREE_TRACE_COUNT = 1000
+# The mining fields that name a geometry, and the values they hold when nothing named one. A
+# field at its value here is a choice nobody made, so it stays out of a build review's identity.
+_GEOMETRY_FIELDS = ("selection", "cluster", "sampling")
+_PROVIDER_FREE_GEOMETRY: dict[str, object] = MiningSpec().model_dump(mode="json")
 
 
 @dataclass(frozen=True)
@@ -97,7 +103,30 @@ class TaskSetBuild:
 
 
 class BuildReviewReadiness(ContractModel):
-    """Manifest-bound provider-free handoff from deterministic mining to rubric review."""
+    """Manifest-bound handoff from deterministic mining to rubric review.
+
+    Attributes:
+        schema_version: Version of the stored handoff contract.
+        readiness_id: Content identity of every other field, checked on every load. See
+            :func:`_build_review_id` for which of them it binds.
+        status: Fixed pending-review state, the only state this handoff describes.
+        trace_dataset: Exact immutable normalized trace evidence the task set was mined from.
+        task_set: Exact immutable representative task artifact.
+        project_config: Project setup with provider-backed results removed, so the identity
+            covers what was configured rather than what has since been built.
+        source: Durable identity of the raw evidence behind the trace dataset.
+        mining_spec: The complete mining controls the build ran, including the selection
+            geometry, so a reader can tell a tagged task set from a provider-free one.
+        descriptor_embedder: The one request-descriptor embedder a project build accepts.
+        descriptor_dimensions: Width of that embedder's vectors.
+        code_revision: Exact EXP revision that produced the artifacts.
+        paid_calls_made: Completion, judge and rubric-proposal calls made to reach this handoff,
+            which is zero because the build stops before every one of them. It is not a
+            statement about the mining geometry's own calls: the ``decision_tag`` geometry buys
+            one decision per distinct case before this record exists, and ``mining_spec``
+            names that geometry. A build whose mining called nothing is exactly a build whose
+            ``mining_spec.selection`` is the hashing geometry.
+    """
 
     schema_version: int = 1
     readiness_id: ArtifactId
@@ -145,13 +174,20 @@ def mining_spec_for(settings: ProjectTracePreparationSettings) -> MiningSpec:
     answer for the evidence the route produces. Settings that name no backend and no strategy get
     the chosen geometry's own: hashing keeps the provider-free pipeline exactly, descriptor
     clustering and medoid fill, while decision_tag gets the geometry a tagged corpus actually has,
-    the thresholded fired-proposition sets agglomerated by Jaccard average linkage, filled by the
-    facility-location sampler so each group contributes the cases most of it looks like.
+    the thresholded fired-proposition sets agglomerated by Jaccard average linkage, with the
+    leftover budget spent by descending that agglomeration, so a family of near-identical groups
+    is weighed as one before any budget is split inside it.
 
     A name is never reinterpreted. ``mining_cluster="descriptor"`` means descriptor clustering on
     either route, and the absence of a choice is carried as None rather than as the name of one,
     so nothing here has to guess whether a stored name was typed or defaulted. That is what makes
     a project's settings rebuild the same spec on every later run.
+
+    The one place the two halves are read together is the tag route's unnamed strategy. Descending
+    a tree is only defined for a backend that publishes one, so a named backend that publishes
+    none takes the facility-location fill instead of a strategy it cannot run. Naming the
+    hierarchical strategy against such a backend is still refused, by the mining spec itself,
+    rather than quietly given a different fill.
 
     Args:
         settings: Persisted provider-free preparation settings.
@@ -190,15 +226,21 @@ def mining_spec_for(settings: ProjectTracePreparationSettings) -> MiningSpec:
         "stratified": StratifiedSamplingSpec(),
         "representative": RepresentativeSamplingSpec(),
         "balanced": BalancedSamplingSpec(),
+        "hierarchical": HierarchicalSamplingSpec(),
     }
-    default_cluster = "pattern_hierarchy" if tagged else "descriptor"
-    default_sampling = "representative" if tagged else "medoid"
+    cluster = clusters[settings.mining_cluster or ("pattern_hierarchy" if tagged else "descriptor")]
+    # The tag route's default strategy descends the clustering's tree, which only two backends
+    # publish, so it is the default for those two and the facility-location fill for the rest.
+    # Both halves stay independent that way: naming a backend never forces a strategy to be named
+    # with it, and a named strategy is still taken exactly as it was typed.
+    descendable = publishes_tree(cluster)
+    tag_default = "hierarchical" if descendable else "representative"
     return MiningSpec(
         fit_task_budget=settings.fit_task_budget,
         held_out_task_budget=settings.held_out_task_budget,
         selection=selection,
-        cluster=clusters[settings.mining_cluster or default_cluster],
-        sampling=samplings[settings.mining_sampling or default_sampling],
+        cluster=cluster,
+        sampling=samplings[settings.mining_sampling or (tag_default if tagged else "medoid")],
     )
 
 
@@ -211,7 +253,14 @@ def prepare_project_traces(
     settings: ProjectTracePreparationSettings,
     tagger: TraceTagger | None = None,
 ) -> ProjectProviderFreeStage:
-    """Prepare and select provider-free Project evidence from one acquired trace file.
+    """Prepare and select one Project's trace and task evidence from one acquired trace file.
+
+    The stage makes no completion, judge or embedding call on any settings. It is provider-free
+    outright exactly when the settings name the hashing geometry, which is their default; the
+    decision-tag geometry buys one decision per distinct case while mining, through the supplied
+    tagger. A caller that must spend nothing names the hashing geometry, and a caller that must
+    authorize the decision spend first prices it with
+    :func:`~exp.simulation.mining_cost.tagging_work`.
 
     Args:
         project: Safe local Project identifier below ``root/projects``.
@@ -223,7 +272,7 @@ def prepare_project_traces(
             geometry and rejected otherwise.
 
     Returns:
-        The exact selected trace and task manifest pointers for the completed provider-free stage.
+        The exact selected trace and task manifest pointers for the completed stage.
 
     Raises:
         ValueError: The source label, source kind, normalized trace count, or evidence is invalid.
@@ -403,9 +452,11 @@ def build_task_set(
 ) -> TaskSetBuild:
     """Persist normalized evidence, mine representatives, and persist a dependent task set.
 
-    This is the supported no-network Python composition path. It intentionally accepts a
-    pre-normalized result rather than a file path, so the only raw-source read remains in one
-    selected canonical source loader.
+    This is the supported Python composition path, and it is the no-network one on every spec
+    whose selection geometry is hashing, which is what ``MiningSpec()`` describes. A decision-tag
+    spec mines by asking the supplied tagger about each distinct case, so that spec is the one
+    way this function reaches a provider. It intentionally accepts a pre-normalized result rather
+    than a file path, so the only raw-source read remains in one selected canonical source loader.
 
     Args:
         normalized: Canonical traces and explicit validation exclusions from one source loader.
@@ -459,6 +510,12 @@ def build_project(
     tagger: TraceTagger | None = None,
 ) -> ProjectBuild:
     """Build local evidence and stop before any model proposal or judge operation.
+
+    The descriptor embedder is required to be the local hashing one, so this path never buys an
+    embedding. The mining spec decides whether it buys anything at all: a hashing selection
+    geometry calls nothing, and a decision-tag one asks ``tagger`` about each distinct case.
+    Price that with :func:`~exp.simulation.mining_cost.tagging_work` before calling, because
+    mining starts buying as soon as this function does.
 
     Args:
         normalized: Canonical local traces from one explicit loader.
@@ -819,5 +876,40 @@ def _task_set_id(dataset_input: ArtifactInput, mining: TaskMiningResult) -> str:
 
 
 def _build_review_id(binding: dict[str, object]) -> str:
-    """Return the content ID for one complete manifest-bound build review handoff."""
-    return stable_id("build-review", binding)
+    """Return the content ID for one manifest-bound build review handoff.
+
+    The identity binds every chosen value. A mining geometry field that holds the provider-free
+    default is not a chosen value, so it is left out: the digest states which geometry was asked
+    for, and "none was asked for" is the absence of that statement. The rule keeps one identity
+    for one mining, whether or not the spec carried a field for the choice when the record was
+    written, and it stays exact in both directions, because a binding with a geometry field
+    omitted reconstructs that field at its default and nothing else.
+
+    Args:
+        binding: Complete readiness content, without the identity field itself.
+
+    Returns:
+        The content-addressed readiness identity.
+    """
+    return stable_id("build-review", _chosen_content(binding))
+
+
+def _chosen_content(binding: dict[str, object]) -> dict[str, object]:
+    """Return one readiness binding with every defaulted mining geometry field removed.
+
+    Args:
+        binding: Complete readiness content, without the identity field itself.
+
+    Returns:
+        The same content, with any mining geometry field equal to the provider-free default
+        dropped from the mining spec.
+    """
+    spec = binding.get("mining_spec")
+    if not isinstance(spec, dict):
+        return binding
+    chosen = {
+        key: value
+        for key, value in spec.items()
+        if not (key in _GEOMETRY_FIELDS and value == _PROVIDER_FREE_GEOMETRY.get(key))
+    }
+    return {**binding, "mining_spec": chosen}

@@ -2,8 +2,14 @@
 
 Before spend authorization the wizard may persist normalized traces and deterministic task/split
 evidence as resumable checkpoints. Provider setup may authenticate for read-only model discovery,
-but planning never performs paid inference or generation, builds RAG or world-model artifacts, or
+and planning never builds RAG or world-model artifacts, performs paid inference or generation, or
 selects a completed project build.
+
+Mining is the one exception, and it is not an exception to the authorization rule. The guided
+build mines with whatever the mining flags selected, exactly as the explicit build does, so the
+decision-tag route buys one decision per distinct case here too. That spend is quoted from the
+free part of mining and authorized on its own, before the first call, by the same consent path
+the embedding estimate uses.
 """
 
 from __future__ import annotations
@@ -13,10 +19,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+from exp.cli.build.mining_options import build_tagger
+from exp.cli.build.preflight import authorize_tagging, embedding_cost_ceiling
 from exp.cli.build.providers import (
     configure_build_providers as _configure_build_providers,
 )
@@ -86,6 +95,8 @@ from exp.optimize.router.judging.service import (
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.simulation.build import build_project
+from exp.simulation.mining.service import MiningSpec
+from exp.simulation.mining_cost import tagging_work
 from exp.simulation.world_model import load_grounded_world_model_artifact
 
 
@@ -102,6 +113,9 @@ def run_build_wizard(
     maximum_router_cost_usd: float | None,
     providers: tuple[str, ...],
     console: Console,
+    mining_spec: MiningSpec,
+    tagger_alias: str | None,
+    tagger_concurrency: int,
     retry_incomplete: bool = False,
 ) -> None:
     """Run one resumable interactive project build, learning and router completion.
@@ -118,6 +132,12 @@ def run_build_wizard(
         maximum_router_cost_usd: Optional router budget requiring confirmation when exceeded.
         providers: Repeatable provider names that skip the opening provider list.
         console: Interactive terminal for prompts and progress.
+        mining_spec: The validated mining geometry this invocation selected. The guided build
+            takes it from the same flags the explicit build does, so neither path can mine a
+            route the other would not.
+        tagger_alias: Decision-model alias the decision-tag geometry asks, or None on the route
+            that asks nothing.
+        tagger_concurrency: Decision calls in flight at once while tagging.
         retry_incomplete: Replace an interrupted learning trace, buying it again.
 
     Raises:
@@ -166,6 +186,9 @@ def run_build_wizard(
             code_revision=code_revision,
             providers=providers,
             console=console,
+            mining_spec=mining_spec,
+            tagger_alias=tagger_alias,
+            tagger_concurrency=tagger_concurrency,
         )
     else:
         catalog = _configure_build_providers(
@@ -539,8 +562,15 @@ def _prepare_new_build(
     code_revision: str,
     providers: tuple[str, ...],
     console: Console,
+    mining_spec: MiningSpec,
+    tagger_alias: str | None,
+    tagger_concurrency: int,
 ) -> WizardBuildPlan:
-    """Materialize deterministic build evidence and return a credential-free plan.
+    """Materialize build evidence and return a plan whose only priced phases are still ahead.
+
+    The plan itself is credential-free on the mining route that reads request-visible text. The
+    decision-tag route buys its tags here, because tagging is how it selects, so the quote and
+    the authorization for those calls happen here too, before the first one.
 
     Args:
         project: Local project identifier.
@@ -555,15 +585,18 @@ def _prepare_new_build(
         code_revision: Installed producer revision.
         providers: Repeatable provider names that skip the opening provider list.
         console: Interactive terminal.
+        mining_spec: The validated mining geometry this invocation selected.
+        tagger_alias: Decision-model alias the decision-tag geometry asks, or None.
+        tagger_concurrency: Decision calls in flight at once while tagging.
 
     Returns:
-        Complete provider-free plan with deterministic persisted evidence.
+        Complete plan with deterministic persisted evidence.
 
     Raises:
         ValueError: Traces, confirmed model roles, or existing project settings are invalid.
+        typer.Exit: The operator declined the decision spend the tagged route needs.
     """
     from exp.cli.build.app import (
-        _embedding_cost_ceiling,
         _reuse_completed_grounded_artifacts,
         _selected_roles,
         _validated_role_snapshots,
@@ -602,11 +635,45 @@ def _prepare_new_build(
             ),
         ),
     )
+    work = tagging_work(normalized.traces, mining_spec)
+    if work is not None:
+        assert tagger_alias is not None  # mining_geometry has already required the alias.
+        tagger_snapshot, tagger_capabilities = runtime.snapshot(tagger_alias)
+        authorized = authorize_tagging(
+            console,
+            work=work,
+            tagger_alias=tagger_alias,
+            tagger_model_id=tagger_snapshot.model_id,
+            capabilities=tagger_capabilities,
+            accepted=len(normalized.traces),
+            invalid=len(normalized.issues),
+            root=root,
+            command=f"exp build {project}",
+            maximum_cost_usd=maximum_build_cost_usd,
+            yes=False,
+            no_interactive=False,
+            dry_run=False,
+        )
+        if not authorized.approved:
+            console.print("Stopped before paid mining, build or router work.")
+            raise typer.Exit
     completed = build_project(
         normalized,
         store,
         created_at=datetime.now(UTC),
         code_revision=code_revision,
+        mining_spec=mining_spec,
+        tagger=(
+            None
+            if tagger_alias is None
+            else build_tagger(
+                tagger_alias,
+                catalog=catalog,
+                root=root,
+                project=project,
+                maximum_concurrency=tagger_concurrency,
+            )
+        ),
     )
     built = _reuse_completed_grounded_artifacts(
         store,
@@ -629,7 +696,7 @@ def _prepare_new_build(
         invalid_traces=completed.artifacts.trace_dataset.dataset.invalid_trace_count,
         fit_tasks=sum(task.partition == "fit" for task in tasks),
         held_out_tasks=sum(task.partition == "held_out" for task in tasks),
-        build_estimate_usd=_embedding_cost_ceiling(completed, embedder_capabilities),
+        build_estimate_usd=embedding_cost_ceiling(completed, embedder_capabilities),
         build_reused=built is not None,
     )
 

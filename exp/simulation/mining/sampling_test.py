@@ -5,12 +5,15 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
+import numpy as np
 import pytest
 
+from exp.simulation.mining.clustering import Hierarchy
 from exp.simulation.mining.geometry import CoreSetGeometry
 from exp.simulation.mining.sampling import (
     BalancedSamplingSpec,
     DiversitySamplingSpec,
+    HierarchicalSamplingSpec,
     MedoidSamplingSpec,
     ProportionalSamplingSpec,
     RepresentativeSamplingSpec,
@@ -28,6 +31,7 @@ _SPECS: tuple[SamplingSpec, ...] = (
     StratifiedSamplingSpec(),
     RepresentativeSamplingSpec(),
     BalancedSamplingSpec(),
+    HierarchicalSamplingSpec(),
 )
 
 
@@ -48,10 +52,31 @@ def _labels(geometry: CoreSetGeometry, groups: int) -> dict[str, int]:
     return {identity: index % groups for index, identity in enumerate(geometry.ids)}
 
 
+def _cascade(groups: int) -> Hierarchy:
+    """Build a tree over `groups` leaves, each joined in turn to the one root above it.
+
+    One leaf per flat cluster, so a tree-reading strategy can be exercised on the same fixtures as
+    every other strategy. The heights ascend with the merges, which is what a cut reads.
+    """
+    parent = np.full(max(2 * groups - 1, 1), -1)
+    height = np.zeros(len(parent))
+    current = 0
+    for leaf in range(1, groups):
+        node = groups + leaf - 1
+        parent[current] = parent[leaf] = node
+        height[node] = leaf / groups
+        current = node
+    return Hierarchy(parent, np.arange(groups), height)
+
+
 def _run(
     spec: SamplingSpec, geometry: CoreSetGeometry, labels: dict[str, int], target: int
 ) -> tuple[list[str], dict[str, list[str]]]:
-    """Fill one budget from empty and return the selection order with its reasons."""
+    """Fill one budget from empty and return the selection order with its reasons.
+
+    The flat clusters double as the tree's assignment units, so the one strategy that reads a tree
+    is held to every rule the others are held to on the same fixture.
+    """
     selected: list[str] = []
     reasons: dict[str, list[str]] = defaultdict(list)
     fill_budget(
@@ -61,6 +86,8 @@ def _run(
         selected_ids=selected,
         reasons=reasons,
         target=target,
+        hierarchy=_cascade(len(set(labels.values()))),
+        units=labels,
     )
     return selected, reasons
 
@@ -154,6 +181,8 @@ def test_every_strategy_leaves_an_already_full_selection_alone(spec: SamplingSpe
         selected_ids=selected,
         reasons=reasons,
         target=3,
+        hierarchy=_cascade(2),
+        units=labels,
     )
 
     assert selected == list(geometry.ids[:3])
@@ -312,3 +341,188 @@ def test_representative_fill_starts_from_each_cluster_centre() -> None:
     assert sorted(selected) == sorted(
         geometry.medoid(members) for members in members_by_group(labels).values()
     )
+
+
+def _siblings() -> tuple[CoreSetGeometry, dict[str, int], Hierarchy]:
+    """Build one heavy archetype beside twenty light siblings under a single parent.
+
+    Ten cases of mass ten carry a hundred units of workload between them and share one leaf.
+    Twenty cases of mass one each hold a leaf of their own, and all twenty of those leaves are
+    siblings under one node, so the tree says they are one broad kind of work. Flat apportionment
+    cannot see that: it compares each light leaf's mass of one against the heavy leaf's hundred,
+    while the descent compares the family's pooled twenty against it.
+    """
+    masses = {f"trace-{index:02d}": (10 if index < 10 else 1) for index in range(30)}
+    geometry = _ring(30, masses=masses)
+    units = {
+        identity: (0 if index < 10 else index - 9) for index, identity in enumerate(geometry.ids)
+    }
+    parent = np.full(23, -1)
+    height = np.zeros(23)
+    for leaf in range(1, 21):
+        parent[leaf] = 21
+    parent[0] = parent[21] = 22
+    height[21], height[22] = 0.4, 0.9
+    return geometry, units, Hierarchy(parent, np.arange(21), height)
+
+
+def _fill(
+    spec: SamplingSpec,
+    geometry: CoreSetGeometry,
+    units: dict[str, int],
+    hierarchy: Hierarchy,
+    target: int,
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Fill one budget over a hand-built tree whose leaves are also the flat clusters."""
+    selected: list[str] = []
+    reasons: dict[str, list[str]] = defaultdict(list)
+    fill_budget(
+        spec,
+        geometry=geometry,
+        labels=units,
+        selected_ids=selected,
+        reasons=reasons,
+        target=target,
+        hierarchy=hierarchy,
+        units=units,
+    )
+    return selected, reasons
+
+
+def test_hierarchical_fill_refuses_a_partition_with_no_tree() -> None:
+    """Filling the budget from flat clusters instead would report coverage it did not have."""
+    geometry = _ring(8)
+    labels = _labels(geometry, 2)
+
+    for hierarchy, units in ((None, labels), (_cascade(2), None), (None, None)):
+        with pytest.raises(ValueError, match="pattern_hierarchy or atoms_hierarchy"):
+            fill_budget(
+                HierarchicalSamplingSpec(),
+                geometry=geometry,
+                labels=labels,
+                selected_ids=[],
+                reasons=defaultdict(list),
+                target=4,
+                hierarchy=hierarchy,
+                units=units,
+            )
+
+
+def test_hierarchical_fill_refuses_units_that_name_no_leaf_of_the_tree() -> None:
+    """A tree and the units indexing it come from one assignment and cannot be mixed."""
+    geometry = _ring(4)
+    labels = _labels(geometry, 2)
+
+    with pytest.raises(ValueError, match="not one of the 2 units"):
+        fill_budget(
+            HierarchicalSamplingSpec(),
+            geometry=geometry,
+            labels=labels,
+            selected_ids=[],
+            reasons=defaultdict(list),
+            target=2,
+            hierarchy=_cascade(2),
+            units={identity: 7 for identity in geometry.ids},
+        )
+
+
+def test_hierarchical_fill_does_not_starve_a_group_of_small_siblings() -> None:
+    """This is the claim the strategy makes, so it is measured against flat apportionment.
+
+    Flat mass-proportional apportionment hands the heavy archetype nine of ten slots, because each
+    light case's own share rounds to nothing and only one of them wins a remainder. Pooling the
+    twenty light siblings under their parent earns the family two whole slots instead of one, and
+    the two come from two different light cases rather than one case twice.
+    """
+    geometry, units, hierarchy = _siblings()
+
+    descended, reasons = _fill(HierarchicalSamplingSpec(), geometry, units, hierarchy, 10)
+    flat, _ = _fill(RepresentativeSamplingSpec(), geometry, units, hierarchy, 10)
+
+    def light(selected: list[str]) -> int:
+        """Count the picks that came from the group of small siblings."""
+        return sum(1 for identity in selected if units[identity] > 0)
+
+    assert len(descended) == len(flat) == 10
+    assert light(flat) == 1
+    assert light(descended) == 2
+    assert len({units[identity] for identity in descended if units[identity] > 0}) == 2
+    assert all(
+        reason == "hierarchy-representative"
+        for identity in descended
+        for reason in reasons[identity]
+    )
+
+
+def test_hierarchical_fill_records_one_reason_a_reader_can_resolve() -> None:
+    """The audit reason says the tree bought the slot and deliberately not which node did.
+
+    A node index is a pattern or atom index below the leaf count, a merge index above it, and
+    possibly a synthetic root. Nothing persists the tree beside the coverage report, so no reader
+    of the artifact could ever map one back to anything, which is why the reason carries no
+    identity at all rather than one that only this process understood.
+    """
+    geometry, units, hierarchy = _siblings()
+
+    selected, reasons = _fill(HierarchicalSamplingSpec(), geometry, units, hierarchy, 4)
+
+    assert selected
+    assert all(reasons[identity] == ["hierarchy-representative"] for identity in selected)
+
+
+def test_hierarchical_fill_spends_the_whole_budget_and_never_more() -> None:
+    """Underfilling loses coverage and overfilling breaks the task-count contract."""
+    geometry, units, hierarchy = _siblings()
+
+    for target in (1, 2, 3, 9, 17, 29, 30):
+        selected, _ = _fill(HierarchicalSamplingSpec(), geometry, units, hierarchy, target)
+        assert len(selected) == target
+        assert len(set(selected)) == target
+
+
+def test_hierarchical_fill_reaches_every_candidate_when_the_budget_allows() -> None:
+    """A subtree the descent could not reach would hold cases selection can never choose."""
+    geometry, units, hierarchy = _siblings()
+
+    selected, _ = _fill(HierarchicalSamplingSpec(), geometry, units, hierarchy, 30)
+
+    assert sorted(selected) == sorted(geometry.ids)
+
+
+def test_hierarchical_fill_returns_when_a_pass_can_apportion_nothing() -> None:
+    """A pass that selects nothing has to end the descent rather than repeat itself.
+
+    Mass is what the descent apportions, so a partition carrying none leaves every child with a
+    share of zero and the descent with nothing to spend. The guarantee is that it returns instead
+    of looping, and the budget then falls through to the farthest-first tail that every strategy
+    ends in.
+    """
+    geometry, units, hierarchy = _siblings()
+    massless = CoreSetGeometry.of(geometry.vectors, dict.fromkeys(geometry.ids, 0))
+
+    selected, reasons = _fill(HierarchicalSamplingSpec(), massless, units, hierarchy, 6)
+
+    assert len(selected) == 6
+    assert all(reasons[identity] == ["farthest-first"] for identity in selected)
+
+
+def test_hierarchical_fill_ignores_the_order_the_units_arrived_in() -> None:
+    """Every tie in the descent is broken by node id or by identity, for exactly this reason."""
+    geometry, units, hierarchy = _siblings()
+    reversed_units = dict(reversed(list(units.items())))
+
+    forward, _ = _fill(HierarchicalSamplingSpec(), geometry, units, hierarchy, 9)
+    backward, _ = _fill(HierarchicalSamplingSpec(), geometry, reversed_units, hierarchy, 9)
+
+    assert forward == backward
+
+
+def test_hierarchical_fill_repeats_itself_exactly() -> None:
+    """There is no seed on this spec because there is no random source, which is checked here."""
+    geometry, units, hierarchy = _siblings()
+
+    answers = {
+        tuple(_fill(HierarchicalSamplingSpec(), geometry, units, hierarchy, 7)[0]) for _ in range(5)
+    }
+
+    assert len(answers) == 1

@@ -34,6 +34,7 @@ from exp.simulation.mining.clustering import (
     ClusterSpec,
     DescriptorClusterSpec,
     PatternHierarchyClusterSpec,
+    publishes_tree,
 )
 from exp.simulation.mining.coverage import (
     DEFAULT_COVERAGE_SIMILARITY_THRESHOLD,
@@ -50,6 +51,7 @@ from exp.simulation.mining.deduplicate import (
 )
 from exp.simulation.mining.descriptors import (
     DescriptorEmbedder,
+    HashingDescriptorEmbedder,
     coverage_descriptor,
     normalized_vectors,
     routing_descriptor,
@@ -68,7 +70,11 @@ from exp.simulation.mining.lineage import (
     assign_source_lineages,
 )
 from exp.simulation.mining.questions import resolve_question_bank
-from exp.simulation.mining.sampling import MedoidSamplingSpec, SamplingSpec
+from exp.simulation.mining.sampling import (
+    HierarchicalSamplingSpec,
+    MedoidSamplingSpec,
+    SamplingSpec,
+)
 from exp.simulation.mining.select import PartitionSelection, select_partition_representatives
 from exp.simulation.mining.tagging import TraceTagger
 from exp.simulation.mining.views import build_units
@@ -95,7 +101,8 @@ class MiningSpec(ContractModel):
             about what each case turned out to contain.
         cluster: Which clustering backend groups the candidates.
         sampling: How representative budget left over after the reserved slots and lineage anchors
-            is spent.
+            is spent. A strategy that reads the clustering's tree, which is the hierarchical one,
+            is usable only with a backend that publishes one.
     """
 
     fit_task_budget: int = Field(default=50, ge=0)
@@ -117,18 +124,22 @@ class MiningSpec(ContractModel):
 
     @model_validator(mode="after")
     def _compatible_geometry(self) -> MiningSpec:
-        """Reject a geometry and backend that cannot describe the same evidence.
+        """Reject a geometry, backend and strategy that cannot describe the same evidence.
 
-        Both refusals are about a combination that would still run and still return tasks while
-        measuring something nobody asked for, which is the one failure mode a mining run cannot
-        detect from its own output.
+        Every refusal here is about a combination that would still run and still return tasks
+        while measuring something nobody asked for, which is the one failure mode a mining run
+        cannot detect from its own output. Each one is caught twice on purpose: here, when the
+        spec is written, and again at dispatch, where the phase that needs the missing evidence
+        refuses it by name. This layer is the cheap one, because it fires before a corpus has been
+        tagged.
 
         Returns:
             The validated spec.
 
         Raises:
             ValueError: The Bernoulli mixture or the pattern hierarchy has no probabilities to
-                read, or a selection geometry would hand the core-set metric vectors it cannot use.
+                read, the hierarchical sampler has no tree to descend, or a selection geometry
+                would hand the core-set metric vectors it cannot use.
         """
         tagged = isinstance(self.selection, DecisionTagSelectionSpec)
         if isinstance(self.cluster, BernoulliMixtureClusterSpec) and not tagged:
@@ -144,12 +155,19 @@ class MiningSpec(ContractModel):
                 "produces them; select with decision_tag, or cluster with descriptor, kmeans or "
                 "atoms_hierarchy"
             )
+        if isinstance(self.sampling, HierarchicalSamplingSpec) and not publishes_tree(self.cluster):
+            raise ValueError(
+                "the hierarchical strategy spends the leftover budget by descending a clustering "
+                f"tree, and the {self.cluster.kind} backend publishes none; cluster with "
+                "pattern_hierarchy or atoms_hierarchy, or spend the budget with medoid, "
+                "proportional, diversity, stratified, representative or balanced"
+            )
         if tagged and self.selection.transform == "none":
             raise ValueError(
                 "core-set selection measures distance as a dot product of unit vectors, and raw "
-                "probability rows saturate it so every pair looks identical; choose the "
-                "indicator, l2, hellinger or logit transform for the selection geometry (a "
-                "clusterer that needs untransformed answers reads them directly)"
+                "probability rows saturate it so every pair looks identical; choose the l2, "
+                "hellinger or logit transform for the selection geometry (a clusterer that needs "
+                "untransformed answers reads them directly)"
             )
         return self
 
@@ -173,6 +191,69 @@ class TaskMiningResult:
     lineage_assignments: tuple[LineageAssignment, ...]
     partition: FrozenTaskPartition
     cleanup_results: tuple[tuple[str, InstructionCleanupResult], ...]
+
+
+@dataclass(frozen=True)
+class SelectionCandidates:
+    """The free part of mining: every distinct case a run would measure, and its lineages.
+
+    This is the prefix of :func:`mine_tasks` that costs nothing. It is a named result rather than
+    an internal step because a caller that has to say what mining will cost needs exactly these
+    numbers before any provider call, and deriving them a second time elsewhere would let the
+    quote drift from the run it describes.
+
+    Attributes:
+        analysis: Duplicate evidence whose candidates are the distinct cases to be measured.
+        lineage_assignments: The lineage each trace was assigned, which fixes the frozen partition.
+    """
+
+    analysis: DuplicateAnalysis
+    lineage_assignments: tuple[LineageAssignment, ...]
+
+
+def selection_candidates(
+    traces: Sequence[Trace],
+    mining_spec: MiningSpec | None = None,
+    *,
+    embedder: DescriptorEmbedder | None = None,
+) -> SelectionCandidates:
+    """Collapse duplicates into the distinct cases a mining run would measure.
+
+    Nothing here reaches a provider. Duplicate collapse always reads the request-visible
+    descriptor vector, so this answer is the same whichever selection geometry the spec names,
+    which is what lets a cost quote be computed before the geometry's first call.
+
+    Args:
+        traces: Valid canonical traces.
+        mining_spec: Mining controls whose duplicate and lineage thresholds decide the collapse.
+        embedder: Explicit request-descriptor embedder. Defaults to the deterministic local
+            hashing embedder, which is the one a project build accepts.
+
+    Returns:
+        The duplicate evidence and the lineage assignments behind it.
+
+    Raises:
+        ValueError: The traces are empty or inconsistent with duplicate analysis.
+    """
+    spec = mining_spec or MiningSpec()
+    assignments = assign_source_lineages(
+        traces,
+        time_bucket_seconds=spec.lineage_time_bucket_seconds,
+    )
+    routing_descriptors = tuple(routing_descriptor(trace) for trace in traces)
+    coverage_descriptors = tuple(coverage_descriptor(trace) for trace in traces)
+    vectors = normalized_vectors(embedder or HashingDescriptorEmbedder(), routing_descriptors)
+    return SelectionCandidates(
+        analysis=analyze_duplicates(
+            traces,
+            assignments,
+            routing_descriptors,
+            coverage_descriptors,
+            vectors,
+            semantic_duplicate_threshold=spec.semantic_duplicate_threshold,
+        ),
+        lineage_assignments=assignments,
+    )
 
 
 def mine_tasks(
@@ -230,21 +311,9 @@ def mine_tasks(
         raise ValueError("input trace count cannot be smaller than valid plus invalid trace counts")
     spec = mining_spec or MiningSpec()
     _require_matching_tagger(spec.selection, tagger)
-    assignments = assign_source_lineages(
-        traces,
-        time_bucket_seconds=spec.lineage_time_bucket_seconds,
-    )
-    routing_descriptors = tuple(routing_descriptor(trace) for trace in traces)
-    coverage_descriptors = tuple(coverage_descriptor(trace) for trace in traces)
-    vectors = normalized_vectors(embedder, routing_descriptors)
-    analysis = analyze_duplicates(
-        traces,
-        assignments,
-        routing_descriptors,
-        coverage_descriptors,
-        vectors,
-        semantic_duplicate_threshold=spec.semantic_duplicate_threshold,
-    )
+    collapsed = selection_candidates(traces, spec, embedder=embedder)
+    assignments = collapsed.lineage_assignments
+    analysis = collapsed.analysis
     probabilities: dict[str, tuple[float, ...]] | None = None
     if isinstance(spec.selection, DecisionTagSelectionSpec):
         assert tagger is not None  # _require_matching_tagger has already established this.

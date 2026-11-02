@@ -1,5 +1,6 @@
 """Clustering backends for representative-task selection, chosen by an explicit spec."""
 
+from exp.simulation.mining.clustering.hierarchy import Hierarchy
 from exp.simulation.mining.clustering.specs import (
     AtomsHierarchyClusterSpec,
     BernoulliMixtureClusterSpec,
@@ -10,6 +11,7 @@ from exp.simulation.mining.clustering.specs import (
     KMeansClusterSpec,
     PatternHierarchyClusterSpec,
     cluster_candidates,
+    publishes_tree,
 )
 
 __all__ = [
@@ -19,7 +21,9 @@ __all__ = [
     "ClusterSpec",
     "ClusteringError",
     "DescriptorClusterSpec",
+    "Hierarchy",
     "KMeansClusterSpec",
     "PatternHierarchyClusterSpec",
     "cluster_candidates",
+    "publishes_tree",
 ]

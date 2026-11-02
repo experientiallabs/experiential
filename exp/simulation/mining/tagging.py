@@ -91,8 +91,8 @@ Two pressures set this. The rendered view is repeated in every call, and a view 
 thousands of tokens while a question runs to tens, so input cost falls as batches grow: splitting
 one bank across two calls nearly doubles what a unit costs. Against that, the answer is a
 positional list, and a long list is likelier to drift out of alignment with the questions, which
-costs the whole batch. 48 holds the packaged 28-question bank plus room for another family in one
-call, while bounding what a single misalignment wastes. It is a property of this answer format,
+costs the whole batch. 48 keeps a small bank in one call while bounding what a single
+misalignment wastes. It is a property of this answer format,
 not of any provider limit.
 """
 

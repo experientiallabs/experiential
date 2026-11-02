@@ -75,6 +75,13 @@ on the exact release checkout.
 - Public Python exposes provider-free build, explicit router composition, frozen selection-only
   router load through the normal gateway application, structural text-versus-sandbox comparison,
   and managed SFT composition. No separate router HTTP or SSE implementation is shipped.
+  The provider-free build is the Python default: `build_task_set` and `build_project` mine with the
+  hashing selection geometry unless a caller passes a decision-tag spec, and
+  `ProjectTracePreparationSettings` defaults to that same geometry, so a stored project record
+  carrying no mining fields prepares with no provider call. The CLI default differs on purpose:
+  `exp build` mines with `--mine-with decision-tag`, which buys one decision per distinct case
+  from `--tagger`, quotes that spend credential-free before mining starts, and takes spend consent
+  for it. `--mine-with hashing` is the one flag back to a build that calls nothing while mining.
 - W16 router evidence uses 100 normalized traces, 50 fit tasks, 20 held-out tasks, 140 planned
   cells, 130 deterministic text simulations, and 140 deterministic judgments under one finite
   simulation and judgment budget. Observed hosted-service spend is exactly $0.00.
