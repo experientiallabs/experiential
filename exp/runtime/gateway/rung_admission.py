@@ -42,6 +42,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
+from exp.runtime.gateway.fleet_lanes import FleetLane, FleetLaneGate, FleetLaneShed, FleetLeases
+
 # Physical lane identity: the deployment and its credentialed connection.
 # Deliberately NOT revision-scoped (unlike health keys): a catalog write does
 # not change the box's capacity, so counters must survive alias revisions.
@@ -147,12 +149,20 @@ class RungShed:
             default keeps one lane from holding every admission permit); a
             priority caller overflows it only to its capped ceiling. An
             authored bound keeps its authored ``saturation``.
+        fleet: Whether the host's fleet-wide lane gate shed it
+            (``fleet_lanes``), default ``False``: the lane is at its fleet
+            pace (``rate_limit``) or fleet concurrency (``queue_bound``).
+            Always a hit overflow ceiling: the fleet rate is a hard limit.
+        fleet_refuse: The fleet-shed lane authors ``saturation="refuse"``:
+            the caller is answered ``lane_saturated`` without trying siblings.
     """
 
     reason: RungShedReason
     learned_requests_per_minute: float | None = None
     overflow_ceiling: bool = False
     default_bound: bool = False
+    fleet: bool = False
+    fleet_refuse: bool = False
 
 
 @dataclass
@@ -249,7 +259,43 @@ class RungLoadRegistry:
         self._fast_tickets: set[str] = set()
         self._failover_tickets: set[str] = set()
         self._attempts: dict[str, str] = {}
+        # Each admitted ticket's window entry, so a fleet shed can retract it.
+        self._ticket_windows: dict[str, tuple[float, int]] = {}
         self._lock = threading.Lock()
+        self.fleet: FleetLeases | None = None
+
+    def attach_fleet_gate(self, gate: FleetLaneGate) -> None:
+        """Bind the host's fleet-wide lane gate (``fleet_lanes``); call before serving."""
+        self.fleet = FleetLeases(gate, clock=self._clock)
+
+    def fleet_acquire(
+        self, ticket: str, lane: FleetLane, *, reserved_tokens: int = 0
+    ) -> FleetLaneShed | None:
+        """Ask the fleet gate for ``ticket``'s dispatch; on a shed retract the ticket.
+
+        Without an attached gate the fleet rate is not enforced (admitted).
+        A shed takes the ticket back as if it was never reserved, its
+        dispatch-window entry included, so the worker's own rate window
+        counts only dispatches that really went out.
+        """
+        if self.fleet is None:
+            return None
+        shed = self.fleet.acquire(ticket, lane, reserved_tokens=reserved_tokens)
+        if shed is not None:
+            with self._lock:
+                entry = self._ticket_windows.pop(ticket, None)
+                key = self._tickets.get(ticket, (None, ""))[0]
+                rung = None if key is None else self._rungs.get(key)
+                if entry is not None and rung is not None:
+                    try:
+                        rung.window.remove(entry)
+                    except ValueError:
+                        pass
+                    else:
+                        rung.window_requests -= 1
+                        rung.window_tokens -= entry[1]
+                self._release_locked(ticket)
+        return shed
 
     def reserve(
         self,
@@ -420,6 +466,7 @@ class RungLoadRegistry:
             rung.window_requests += 1
             rung.window_tokens += reserved_tokens
             ticket = f"rung-{uuid.uuid4().hex}"
+            self._ticket_windows[ticket] = (now, reserved_tokens)
             self._tickets[ticket] = (key, organization_id)
             if class_cap is not None:
                 rung.classes[class_cap[0]] = rung.classes.get(class_cap[0], 0) + 1
@@ -756,6 +803,8 @@ class RungLoadRegistry:
         with self._lock:
             if ticket in self._tickets:
                 self._attempts[attempt_id] = ticket
+        if self.fleet is not None:
+            self.fleet.bind(ticket, attempt_id)
 
     def release_ticket(self, ticket: str) -> None:
         """Release one reservation that never dispatched; idempotent.
@@ -765,17 +814,25 @@ class RungLoadRegistry:
         """
         with self._lock:
             self._release_locked(ticket)
+        if self.fleet is not None:
+            self.fleet.release_ticket(ticket)
 
-    def release_attempt(self, attempt_id: str) -> None:
+    def release_attempt(
+        self, attempt_id: str, *, throttled: bool = False, used_tokens: int | None = None
+    ) -> None:
         """Release the reservation held by one settled attempt; idempotent.
 
         Args:
             attempt_id: The settled or abandoned attempt.
+            throttled: The provider throttled it (passed to the fleet gate).
+            used_tokens: Its settled input plus output tokens, when reported.
         """
         with self._lock:
             ticket = self._attempts.pop(attempt_id, None)
             if ticket is not None:
                 self._release_locked(ticket)
+        if self.fleet is not None:
+            self.fleet.release_attempt(attempt_id, throttled=throttled, used_tokens=used_tokens)
 
     def inflight(self, key: RungLoadKey, organization_id: str | None = None) -> int:
         """Return one rung's total or per-organization in-flight count.
@@ -808,6 +865,7 @@ class RungLoadRegistry:
     def _release_locked(self, ticket: str) -> None:
         """Return one reserved slot to its rung under the registry lock."""
         entry = self._tickets.pop(ticket, None)
+        self._ticket_windows.pop(ticket, None)
         if entry is None:
             return
         key, organization_id = entry

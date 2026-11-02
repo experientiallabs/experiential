@@ -92,6 +92,68 @@ class GatewayThrottleRedialPolicy(ContractModel):
         return self
 
 
+FleetSaturationPolicy = Literal["spill", "queue", "refuse"]
+
+
+class GatewayFleetLanePolicy(ContractModel):
+    """Authored fleet-wide limits for one lane: the operator's own hard ceiling.
+
+    These are limits WE impose, never a provider hint, so they hold even when
+    the provider accepts everything. The host paces dispatches onto the lane
+    (one every ``60 / requests_per_minute`` seconds on average, with
+    ``burst_requests`` extra allowed back to back), weighs a token budget the
+    same way, and caps the lane's fleet-wide in-flight count. What the host
+    does at a limit is ``saturation``. Every field is optional and the whole
+    policy is opt-in: an unauthored rung contributes zero identity bytes.
+    """
+
+    requests_per_minute: int | None = Field(default=None, ge=1, le=1_000_000)
+    """Fleet-wide dispatches per minute; ``None`` = no request pace."""
+    tokens_per_minute: int | None = Field(default=None, ge=1, le=10_000_000_000)
+    """Fleet-wide input plus output tokens per minute; ``None`` = no token pace.
+
+    A dispatch is counted at its worst-case reservation at admission and
+    credited back to its real usage when it settles."""
+    burst_requests: int | None = Field(default=None, ge=0, le=1_000)
+    """Dispatches allowed back to back above the steady pace (host default 2)."""
+    max_inflight: int | None = Field(default=None, ge=1, le=1_000_000)
+    """Fixed cap on the lane's fleet-wide in-flight dispatches; ``None`` = none."""
+    inflight_headroom: float | None = Field(default=None, ge=0, le=10, allow_inf_nan=False)
+    """Automatic in-flight cap by Little's law: ``ceil(rate * avg_duration * (1 + headroom))``.
+
+    Needs ``requests_per_minute`` (the rate). With ``max_inflight`` too, the
+    lower of the two binds."""
+    throttle_backoff_factor: float | None = Field(default=None, gt=0, le=64, allow_inf_nan=False)
+    """Optional extra slowdown on a provider throttle; ``None`` = off (the default).
+
+    Each throttle pushes the lane's next dispatch time later by ``factor``
+    steady intervals (doubling on consecutive throttles). It can only slow
+    the lane: it never lets it exceed the authored limits."""
+    saturation: FleetSaturationPolicy = "spill"
+    """At a limit: ``spill`` to the next sibling rung (the default), ``queue``
+    (wait up to ``queue_milliseconds`` for the next slot, then spill), or
+    ``refuse`` (answer the caller ``lane_saturated`` without trying siblings)."""
+    queue_milliseconds: int | None = Field(default=None, ge=1, le=10_000)
+    """Longest a ``queue`` dispatch waits for its slot; required by ``queue`` only."""
+
+    @model_validator(mode="after")
+    def _require_coherent_limits(self) -> GatewayFleetLanePolicy:
+        """Reject a policy that limits nothing or names a knob its mode ignores."""
+        if (
+            self.requests_per_minute is None
+            and self.tokens_per_minute is None
+            and self.max_inflight is None
+        ):
+            raise ValueError(
+                "a fleet policy needs requests_per_minute, tokens_per_minute or max_inflight"
+            )
+        if self.inflight_headroom is not None and self.requests_per_minute is None:
+            raise ValueError("inflight_headroom needs requests_per_minute (the rate it scales)")
+        if (self.saturation == "queue") != (self.queue_milliseconds is not None):
+            raise ValueError("queue_milliseconds is required by saturation=queue and only by it")
+        return self
+
+
 class GatewayRungDispatchPolicy(ContractModel):
     """Authored per-rung dispatch controls: admission bounds, rates, and affinity.
 
@@ -187,6 +249,15 @@ class GatewayRungDispatchPolicy(ContractModel):
     throttles and re-discovers headroom by letting a little more through over
     time, so the authored value is a cap, never a promise the provider honors
     it.
+    """
+    fleet: GatewayFleetLanePolicy | None = None
+    """Rate, token and in-flight limits for this rung across the WHOLE gateway fleet.
+
+    One budget for every worker together, unlike the per-worker
+    ``requests_per_minute`` / ``tokens_per_minute`` / ``concurrency_bound``:
+    the host's fleet lane gate (``exp.runtime.gateway.fleet_lanes``) enforces
+    it from a store every worker shares. Both kinds may be authored; the
+    stricter binds. Inert on a host that attaches no fleet gate.
     """
     tokens_per_minute: int | None = Field(default=None, ge=1)
     """Sliding-window token rate cap for this rung, per gateway worker process.

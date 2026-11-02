@@ -36,6 +36,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.fleet_lanes import FleetLane
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import failover_overflow_cap, priority_overflow_ceiling
 from exp.runtime.gateway.native_execution import (
@@ -97,6 +98,7 @@ def reserve_rung_slot(
         policy.concurrency_bound is not None
         or policy.requests_per_minute is not None
         or policy.tokens_per_minute is not None
+        or policy.fleet is not None
     )
     # A host class cap on a self-hosted rung (class_throttles); None elsewhere.
     class_cap = class_concurrency_cap(entry.authorization, deployment)
@@ -195,6 +197,20 @@ def reserve_rung_slot(
         fast_reserve_hard=refusing,
         failover_cap=failover_overflow_cap(bound) if failover_pass else None,
     )
+    if isinstance(result, str) and policy is not None and policy.fleet is not None:
+        # The fleet-wide limits (fleet_lanes), asked only once this worker's
+        # own policy admitted, so a local shed never spends fleet budget. Hard:
+        # a hit overflow ceiling, so no forced pass lands back on the lane.
+        lane = FleetLane(deployment.deployment_id, rung_load_key(deployment)[1], policy.fleet)
+        fleet_shed = loads.fleet_acquire(result, lane, reserved_tokens=reserved_tokens)
+        if fleet_shed is not None:
+            refuse = policy.fleet.saturation == "refuse"
+            # A refusal is disclosed as a capacity shed: a rate shed on a
+            # post-backoff redial would otherwise be redialed in place.
+            reason: RungShedReason = (
+                "rate_limit" if fleet_shed.reason == "rate" and not refuse else "queue_bound"
+            )
+            result = RungShed(reason, overflow_ceiling=True, fleet=True, fleet_refuse=refuse)
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
         result = dataclasses.replace(result, default_bound=True)
     if isinstance(result, RungShed) and result.reason == "rate_limit":
@@ -584,7 +600,11 @@ def record_attempt_health(
         settlement: The settlement payload carrying the harvested rate-limit headers.
     """
     # Slot and health releases are idempotent across settlement, abandon, and sweep.
-    loads.release_attempt(attempt_id)
+    loads.release_attempt(
+        attempt_id,
+        throttled=failure is not None and failure.failure_class == GatewayFailureClass.THROTTLED,
+        used_tokens=settled_tokens(settlement),
+    )
     depth = entry.attempt_depths.get(attempt_id)
     if depth is None:
         return
@@ -617,6 +637,20 @@ def record_attempt_health(
     exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
     if exhausted is not None:
         health.exhausted(key, exhausted)
+
+
+def settled_tokens(settlement: JsonObject | None) -> int | None:
+    """Return a settlement's reported input plus output tokens, else ``None``."""
+    usage = None if settlement is None else settlement.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    for key in ("input_tokens", "output_tokens"):
+        value = usage.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        total += value
+    return total
 
 
 LANE_EJECTED = "lane_ejected"
