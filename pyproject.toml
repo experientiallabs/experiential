@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.225"
+version = "0.7.227"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -23,10 +23,10 @@ dependencies = [
     "httpx2==2.13.1",  # at or above 2.12, the OpenAI SDK's response-decompression security floor
     # The capture engine needs Python 3.13+ because mitmproxy on 3.12 conflicts with
     # Pydantic's typing-extensions floor. Other commands remain available on 3.12.
-    "exp-mitmproxy==12.2.3.post2; python_version >= '3.13'",
+    "exp-mitmproxy==12.2.3.post3; python_version >= '3.13'",
     "exp-mitmproxy-rs==0.12.11.post1; python_version >= '3.13'",
     "cryptography==50.0.1; python_version >= '3.13'",
-    "brotli==1.2.0; python_version >= '3.13'",
+    "brotli==1.2.1; python_version >= '3.13'",
     "zstandard==0.25.0; python_version >= '3.13'",
     "truststore==0.10.4",  # verified provider TLS through native system certificate stores
     # At or above HTTPX's async-transport security floor, 4.14.2 (CVE-2026-63374).
@@ -141,18 +141,11 @@ python-version = "3.12"
 exclude-newer = "7 days"
 exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-mitmproxy = false, exp-mitmproxy-rs = false, certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z", pyasn1 = "2026-10-28T00:00:00Z" }
 
-# Keep the transitive native fork on the same immutable source as the direct pin.
-override-dependencies = [
-    "exp-mitmproxy-rs==0.12.11.post1; python_version >= '3.13'",
-    # Preserve the security-patched version despite the proxy's stale 1.2.2 ceiling.
-    "msgpack==1.2.3",
-]
-
 [tool.uv.sources]
 # The one permitted path source (AGENTS.md "One package"): repo checkouts rebuild the
 # extension from source; published metadata keeps the normal PyPI requirement (--no-sources).
 exp-gateway-native = { path = "exp/runtime/gateway/native" }
 
 # Immutable development pins for Capture's reviewed forks; release metadata uses PyPI names.
-exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy.git", rev = "95b902a8ffb0b02da8a8888d6cb86f0fa9255e5b" }
+exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy.git", rev = "a401f5af274a534c7c44be5ea3e542651970cfbc" }
 exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs.git", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }

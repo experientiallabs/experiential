@@ -3483,11 +3483,6 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     # Exercise the exact prerelease forks in the isolated installation. The publishing
     # workflow separately requires their normal PyPI requirements to resolve on 3.13.
     project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
-    overrides = execution / "overrides.txt"
-    overrides.write_text(
-        "\n".join(project["tool"]["uv"].get("override-dependencies", [])) + "\n",
-        encoding="utf-8",
-    )
     capture_sources: list[str] = []
     if sys.version_info >= (3, 13):
         for name in ("exp-mitmproxy", "exp-mitmproxy-rs"):
@@ -3507,8 +3502,6 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
             *capture_sources,
             # Explicit fork URLs above are authoritative over nested source tables.
             "--no-sources",
-            "--overrides",
-            str(overrides),
             "openai==3.0.0",
         ],
         cwd=execution,
