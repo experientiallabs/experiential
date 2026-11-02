@@ -83,7 +83,11 @@ class FleetLaneGate(Protocol):
 
     Both calls run synchronously on the dispatch path, so an implementation
     must answer in bounded time (a short store timeout) and may raise: the
-    engine treats any exception as admission without a lease.
+    engine treats an ``acquire`` exception as admission without a lease.
+    Every lease MUST also expire on its own after a host-chosen lifetime longer
+    than any request: ``release`` is best-effort (a raising release is logged
+    and not retried, and a crashed worker never releases at all), so an
+    implementation whose leases never expire would leak capacity.
     """
 
     def acquire(
@@ -136,16 +140,33 @@ class FleetLaneGate(Protocol):
 
 @dataclass(frozen=True)
 class FleetUsage:
-    """What one settled dispatch reports back to the gate (all ``None`` when unknown)."""
+    """What one settled dispatch reports back to the gate (all ``None`` when unknown).
+
+    Attributes:
+        used_tokens: Settled input plus output tokens; ``None`` when the
+            settlement carried no credible usage.
+        output_tokens: Settled output tokens (the lane's decode-rate sample);
+            ``None`` without credible usage.
+        first_token_at: Wall-clock (epoch seconds) time of the first token, when
+            the data plane reported one.
+    """
 
     used_tokens: int | None = None
     output_tokens: int | None = None
     first_token_at: float | None = None
-    """Wall-clock (epoch seconds) time of the first token."""
 
 
 @dataclass
 class _Held:
+    """One lease this worker holds for a rung reservation.
+
+    Attributes:
+        lane: The lane the lease was acquired on.
+        lease: The gate's opaque lease id.
+        acquired_at: Monotonic acquisition time (the dispatch's duration base).
+        acquired_wall: Wall-clock acquisition time (the first-token base).
+    """
+
     lane: FleetLane
     lease: str
     acquired_at: float

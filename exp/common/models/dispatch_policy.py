@@ -247,6 +247,16 @@ class GatewayRungDispatchPolicy(ContractModel):
             of the self-hosted levers (``upstream_priority``). Explicit
             evidence still wins (a reported standard tier settles standard).
             Default ``False`` keeps the evidence rule.
+        fleet: Rate, token and in-flight limits for this rung across the WHOLE
+            gateway fleet (``GatewayFleetLanePolicy``), unlike the per-worker
+            ``requests_per_minute`` / ``tokens_per_minute`` /
+            ``concurrency_bound``: the host's fleet lane gate
+            (``exp.runtime.gateway.fleet_lanes``, attached through
+            ``NativeControlPlane(fleet_lane_gate=)``) enforces it from a store
+            every worker shares, at the waterfall's per-attempt reservation.
+            Both kinds may be authored; the stricter binds. Video jobs
+            (``/v1/videos``) do not pass the waterfall reservation and are not
+            gated. Inert on a host that attaches no fleet gate.
     """
 
     concurrency_bound: int | None = Field(default=None, ge=1)
@@ -298,14 +308,6 @@ class GatewayRungDispatchPolicy(ContractModel):
     it.
     """
     fleet: GatewayFleetLanePolicy | None = None
-    """Rate, token and in-flight limits for this rung across the WHOLE gateway fleet.
-
-    One budget for every worker together, unlike the per-worker
-    ``requests_per_minute`` / ``tokens_per_minute`` / ``concurrency_bound``:
-    the host's fleet lane gate (``exp.runtime.gateway.fleet_lanes``) enforces
-    it from a store every worker shares. Both kinds may be authored; the
-    stricter binds. Inert on a host that attaches no fleet gate.
-    """
     tokens_per_minute: int | None = Field(default=None, ge=1)
     """Sliding-window token rate cap for this rung, per gateway worker process.
 

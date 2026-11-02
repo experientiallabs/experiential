@@ -672,7 +672,8 @@ def settled_usage(settlement: JsonObject | None) -> FleetUsage:
     total = None if input_tokens is None or output_tokens is None else input_tokens + output_tokens
     return FleetUsage(
         used_tokens=total if total else None,
-        output_tokens=output_tokens,
+        # An all-zero report is not a decode-rate sample either.
+        output_tokens=output_tokens if total else None,
         first_token_at=first_token_at,
     )
 

@@ -320,8 +320,8 @@ def test_settled_usage_reaches_the_gate_for_token_reconciliation() -> None:
         (None, (None, None)),
         ({"input_tokens": 3, "output_tokens": 4}, (7, 4)),
         ({"input_tokens": 3}, (None, None)),
-        ({"input_tokens": True, "output_tokens": 4}, (None, 4)),
-        ({"input_tokens": -1, "output_tokens": 4}, (None, 4)),
+        ({"input_tokens": True, "output_tokens": 4}, (None, None)),
+        ({"input_tokens": -1, "output_tokens": 4}, (None, None)),
     ],
 )
 def test_settled_usage_reads_only_well_formed_counts(
@@ -376,7 +376,7 @@ def test_an_all_zero_usage_report_never_credits_the_reservation() -> None:
     """A settled dispatch processed tokens: zeros are the provider failing to count."""
     read = settled_usage({"usage": {"input_tokens": 0, "output_tokens": 0}})
     assert read.used_tokens is None
-    assert read.output_tokens == 0
+    assert read.output_tokens is None
 
 
 def test_a_queued_admission_restamps_the_local_window() -> None:
