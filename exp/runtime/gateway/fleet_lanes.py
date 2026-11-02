@@ -86,12 +86,16 @@ class FleetLaneGate(Protocol):
     engine treats any exception as admission without a lease.
     """
 
-    def acquire(self, lane: FleetLane, *, reserved_tokens: int) -> str | FleetLaneShed:
+    def acquire(
+        self, lane: FleetLane, *, reserved_tokens: int, deadline_seconds: float
+    ) -> str | FleetLaneShed:
         """Admit one dispatch onto ``lane`` fleet-wide.
 
         Args:
             lane: The lane and its authored fleet policy.
             reserved_tokens: The dispatch's worst-case input plus output tokens.
+            deadline_seconds: What the request's deadline leaves: a ``queue``
+                lane must never hold a dispatch past it.
 
         Returns:
             An opaque lease id on admission, else the shed.
@@ -172,7 +176,12 @@ class FleetLeases:
         self.sheds = 0
 
     def acquire(
-        self, ticket: str, lane: FleetLane, *, reserved_tokens: int
+        self,
+        ticket: str,
+        lane: FleetLane,
+        *,
+        reserved_tokens: int,
+        deadline_seconds: float = float("inf"),
     ) -> FleetLaneShed | None:
         """Ask the gate for one dispatch on ``lane`` held by ``ticket``.
 
@@ -180,12 +189,15 @@ class FleetLeases:
             ticket: The rung reservation this dispatch already holds.
             lane: The lane and its fleet policy.
             reserved_tokens: The dispatch's worst-case input plus output tokens.
+            deadline_seconds: What the request's deadline leaves.
 
         Returns:
             The shed, or ``None`` when admitted (with or without a lease).
         """
         try:
-            verdict = self._gate.acquire(lane, reserved_tokens=reserved_tokens)
+            verdict = self._gate.acquire(
+                lane, reserved_tokens=reserved_tokens, deadline_seconds=deadline_seconds
+            )
         except Exception:  # noqa: BLE001 - a store outage must never stop the lane.
             with self._lock:
                 self.gate_errors += 1

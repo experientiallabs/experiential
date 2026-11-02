@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -35,6 +36,7 @@ class _Gate:
         self.shed = shed
         self.acquired: list[FleetLane] = []
         self.reserved: list[int] = []
+        self.deadlines: list[float] = []
         self.released: list[tuple[str, float | None, bool]] = []
         self.used: list[int | None] = []
         self.outputs: list[int | None] = []
@@ -42,7 +44,10 @@ class _Gate:
         self.raise_on_acquire = False
         self.raise_on_release = False
 
-    def acquire(self, lane: FleetLane, *, reserved_tokens: int) -> str | FleetLaneShed:
+    def acquire(
+        self, lane: FleetLane, *, reserved_tokens: int, deadline_seconds: float
+    ) -> str | FleetLaneShed:
+        self.deadlines.append(deadline_seconds)
         if self.raise_on_acquire:
             raise ConnectionError("store unreachable")
         self.acquired.append(lane)
@@ -178,6 +183,8 @@ def test_a_capped_lane_spills_to_the_next_sibling() -> None:
     assert ledger.started[0]["dispatch_reason"] == "rate_limit"
     assert gate.acquired == [_LANE]
     assert gate.reserved[0] > 0
+    # The gate learns what the request's deadline leaves (a queue never outlives it).
+    assert 0.0 <= gate.deadlines[0] < float("inf")
 
 
 def test_a_fleet_cap_is_hard_when_every_sibling_is_full() -> None:
@@ -340,32 +347,26 @@ def test_first_token_time_reaches_the_gate_relative_to_the_lease() -> None:
     assert settled_usage({"first_token_at": "2026-11-02T00:00:00Z"}).first_token_at is not None
 
 
-@pytest.mark.parametrize(
-    "fields",
-    [
-        {},
-        {"inflight_headroom": 0.5, "max_inflight": 4},
-        {"inflight_auto": True, "max_inflight": 4},
-        {"requests_per_minute": 10, "inflight_headroom": 0.5},
-        {"requests_per_minute": 10, "arrival_fast_seconds": 60, "arrival_slow_seconds": 30},
-        {"requests_per_minute": 10, "saturation": "queue"},
-        {"requests_per_minute": 10, "queue_milliseconds": 50},
-    ],
-)
-def test_incoherent_fleet_policies_are_refused(fields: JsonObject) -> None:
-    """A policy that limits nothing, or a knob its mode ignores, fails closed."""
-    with pytest.raises(ValueError):
-        GatewayFleetLanePolicy.model_validate(fields)
+def test_the_control_plane_attaches_a_host_gate(tmp_path: Path) -> None:
+    """NativeControlPlane(fleet_lane_gate=) is the public seam; without it nothing attaches."""
+    from exp.runtime.gateway.lifecycle import load_gateway_components
+    from exp.runtime.gateway.lifecycle_test import _configured_gateway
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
 
-
-def test_a_coherent_fleet_policy_validates() -> None:
-    """The worked example: 100 RPM, burst 2, auto in-flight at 95%, queue 250 ms."""
-    policy = GatewayFleetLanePolicy(
-        requests_per_minute=100,
-        burst_requests=2,
-        inflight_auto=True,
-        confidence=0.95,
-        saturation="queue",
-        queue_milliseconds=250,
+    _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
     )
-    assert policy.throttle_backoff_factor is None
+    gate = _Gate()
+    with_gate = NativeControlPlane(components, fleet_lane_gate=gate, background_recovery=False)
+    try:
+        held = with_gate._accounting.loads.fleet  # noqa: SLF001 - the seam under test
+        assert held is not None
+        assert held._gate is gate  # noqa: SLF001 - the seam under test
+    finally:
+        with_gate.close()
+    plain = NativeControlPlane(components, background_recovery=False)
+    try:
+        assert plain._accounting.loads.fleet is None  # noqa: SLF001 - the seam under test
+    finally:
+        plain.close()

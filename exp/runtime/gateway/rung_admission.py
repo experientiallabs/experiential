@@ -275,7 +275,12 @@ class RungLoadRegistry:
         self.fleet = FleetLeases(gate, clock=self._clock)
 
     def fleet_acquire(
-        self, ticket: str, lane: FleetLane, *, reserved_tokens: int = 0
+        self,
+        ticket: str,
+        lane: FleetLane,
+        *,
+        reserved_tokens: int = 0,
+        deadline_seconds: float = float("inf"),
     ) -> FleetLaneShed | None:
         """Ask the fleet gate for ``ticket``'s dispatch; on a shed retract the ticket.
 
@@ -286,7 +291,9 @@ class RungLoadRegistry:
         """
         if self.fleet is None:
             return None
-        shed = self.fleet.acquire(ticket, lane, reserved_tokens=reserved_tokens)
+        shed = self.fleet.acquire(
+            ticket, lane, reserved_tokens=reserved_tokens, deadline_seconds=deadline_seconds
+        )
         if shed is not None:
             with self._lock:
                 entry = self._ticket_windows.pop(ticket, None)

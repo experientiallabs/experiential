@@ -396,6 +396,7 @@ uv run pytest -q
     | Gateway accounting recovery rotation | `exp/runtime/gateway/native_accounting_recovery.py` | `RecoveryRotation` rotates stable work identities within one control plane; admission never runs recovery I/O |
     | Tag-rules routing | `exp/runtime/gateway/tag_router.py` | `TagRulesRouterPolicy` and `tag_rules_policy_id` for the policy, `TagRulesSelector` for selection; `routing.project_selector` binds an activation to its selector |
     | Candidate capability fit | `exp/common/models/capability_fit.py` | `capabilities_support`, shared by learned and tag-rules routing |
+    | Fleet-wide lane admission | `exp/runtime/gateway/fleet_lanes.py` | `FleetLaneGate` (host-injected through `NativeControlPlane(fleet_lane_gate=)`) decides `GatewayRungDispatchPolicy.fleet` after the worker's own rung admission; `FleetLeases` releases each lease once |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

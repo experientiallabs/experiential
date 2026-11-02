@@ -93,6 +93,9 @@ class GatewayThrottleRedialPolicy(ContractModel):
 
 
 FleetSaturationPolicy = Literal["spill", "queue", "refuse"]
+# The host defaults of the two arrival windows; validation compares effective values.
+FLEET_ARRIVAL_FAST_DEFAULT_SECONDS = 30
+FLEET_ARRIVAL_SLOW_DEFAULT_SECONDS = 300
 
 
 class GatewayFleetLanePolicy(ContractModel):
@@ -106,54 +109,66 @@ class GatewayFleetLanePolicy(ContractModel):
     ``max_inflight`` or automatically from live estimates of the lane's
     arrival rate and request durations (``inflight_auto``). Hard caps always
     win over estimates. What the host does at a limit is ``saturation``. The
-    estimator knobs (``confidence``, ``horizon_seconds``, the two arrival
-    windows) are host defaults when unset. Every field is optional and the
-    whole policy is opt-in: an unauthored rung contributes zero identity bytes.
+    estimator knobs are host defaults when unset. Every field is optional and
+    the whole policy is opt-in: an unauthored rung contributes zero identity
+    bytes.
+
+    Attributes:
+        requests_per_minute: Fleet-wide dispatches per minute; ``None`` = no
+            request pace.
+        tokens_per_minute: Fleet-wide input plus output tokens per minute;
+            ``None`` = no token pace. A dispatch is counted at its worst-case
+            reservation at admission and credited back to its real usage when
+            it settles.
+        burst_requests: Dispatches allowed back to back above the steady pace
+            (host default 2). Needs ``requests_per_minute``.
+        max_inflight: Fixed cap on the lane's fleet-wide in-flight dispatches;
+            ``None`` = none.
+        inflight_auto: Cap in-flight automatically at the ``confidence``
+            quantile of the count a lane running at its pace holds (Little's
+            law: mean ``rate * avg_duration``, Poisson-distributed). Needs
+            ``requests_per_minute``. With ``max_inflight`` too, the lower binds.
+        inflight_headroom: Extra fraction on the automatic cap (host default
+            0). Needs ``inflight_auto``.
+        confidence: Probability the estimate-based checks hold with (host
+            default 0.95).
+        horizon_seconds: How far ahead the host's in-flight prediction looks
+            (host default 5 s).
+        arrival_fast_seconds: Window of the fast arrival-rate estimate (host
+            default 30 s); shorter than the effective slow window.
+        arrival_slow_seconds: Window of the slow arrival-rate estimate (host
+            default 300 s).
+        throttle_backoff_factor: Optional extra slowdown on a provider
+            throttle; ``None`` = off (the default). Each throttle pushes the
+            lane's next dispatch later by ``factor`` steady intervals
+            (doubling on consecutive throttles). It only ever slows the lane,
+            never lets it exceed the authored limits. Needs
+            ``requests_per_minute`` (the interval it scales).
+        saturation: At a limit: ``spill`` to the next sibling rung (the
+            default), ``queue`` (wait up to ``queue_milliseconds`` for the next
+            slot, never past the request's deadline, then spill), or ``refuse``
+            (answer the caller ``lane_saturated`` without trying siblings).
+        queue_milliseconds: Longest a ``queue`` dispatch waits for its slot;
+            required by ``queue`` and only by it.
     """
 
     requests_per_minute: int | None = Field(default=None, ge=1, le=1_000_000)
-    """Fleet-wide dispatches per minute; ``None`` = no request pace."""
     tokens_per_minute: int | None = Field(default=None, ge=1, le=10_000_000_000)
-    """Fleet-wide input plus output tokens per minute; ``None`` = no token pace.
-
-    A dispatch is counted at its worst-case reservation at admission and
-    credited back to its real usage when it settles."""
     burst_requests: int | None = Field(default=None, ge=0, le=1_000)
-    """Dispatches allowed back to back above the steady pace (host default 2)."""
     max_inflight: int | None = Field(default=None, ge=1, le=1_000_000)
-    """Fixed cap on the lane's fleet-wide in-flight dispatches; ``None`` = none."""
     inflight_auto: bool = False
-    """Cap in-flight automatically at the ``confidence`` quantile of the count a
-    lane running at its pace holds (Little's law: mean ``rate * avg_duration``,
-    Poisson-distributed), and admit only while the predicted in-flight over the
-    next ``horizon_seconds`` stays under the cap at that confidence. Needs
-    ``requests_per_minute``. With ``max_inflight`` too, the lower binds."""
     inflight_headroom: float | None = Field(default=None, ge=0, le=10, allow_inf_nan=False)
-    """Extra fraction on the automatic cap (host default 0). Needs ``inflight_auto``."""
     confidence: float | None = Field(default=None, ge=0.5, le=0.999, allow_inf_nan=False)
-    """Probability the estimate-based checks must hold with (host default 0.95)."""
     horizon_seconds: float | None = Field(default=None, gt=0, le=600, allow_inf_nan=False)
-    """How far ahead the in-flight prediction looks (host default 5 s)."""
     arrival_fast_seconds: int | None = Field(default=None, ge=1, le=3_600)
-    """Window of the fast arrival-rate estimate (host default 30 s)."""
     arrival_slow_seconds: int | None = Field(default=None, ge=1, le=86_400)
-    """Window of the slow arrival-rate estimate (host default 300 s)."""
     throttle_backoff_factor: float | None = Field(default=None, gt=0, le=64, allow_inf_nan=False)
-    """Optional extra slowdown on a provider throttle; ``None`` = off (the default).
-
-    Each throttle pushes the lane's next dispatch time later by ``factor``
-    steady intervals (doubling on consecutive throttles). It can only slow
-    the lane: it never lets it exceed the authored limits."""
     saturation: FleetSaturationPolicy = "spill"
-    """At a limit: ``spill`` to the next sibling rung (the default), ``queue``
-    (wait up to ``queue_milliseconds`` for the next slot, then spill), or
-    ``refuse`` (answer the caller ``lane_saturated`` without trying siblings)."""
     queue_milliseconds: int | None = Field(default=None, ge=1, le=10_000)
-    """Longest a ``queue`` dispatch waits for its slot; required by ``queue`` only."""
 
     @model_validator(mode="after")
     def _require_coherent_limits(self) -> GatewayFleetLanePolicy:
-        """Reject a policy that limits nothing or names a knob its mode ignores."""
+        """Reject a policy that limits nothing or names a knob without what it scales."""
         if (
             self.requests_per_minute is None
             and self.tokens_per_minute is None
@@ -162,18 +177,21 @@ class GatewayFleetLanePolicy(ContractModel):
             raise ValueError(
                 "a fleet policy needs requests_per_minute, tokens_per_minute or max_inflight"
             )
-        if self.inflight_auto and self.requests_per_minute is None:
-            raise ValueError("inflight_auto needs requests_per_minute (the rate it scales)")
+        if self.requests_per_minute is None:
+            for name in ("inflight_auto", "burst_requests", "throttle_backoff_factor"):
+                if getattr(self, name) not in (None, False):
+                    raise ValueError(f"{name} needs requests_per_minute (the pace it scales)")
         if self.inflight_headroom is not None and not self.inflight_auto:
             raise ValueError("inflight_headroom needs inflight_auto")
-        if (
-            self.arrival_fast_seconds is not None
-            and self.arrival_slow_seconds is not None
-            and self.arrival_fast_seconds >= self.arrival_slow_seconds
-        ):
-            raise ValueError("arrival_fast_seconds must be shorter than arrival_slow_seconds")
         if (self.saturation == "queue") != (self.queue_milliseconds is not None):
             raise ValueError("queue_milliseconds is required by saturation=queue and only by it")
+        fast = self.arrival_fast_seconds or FLEET_ARRIVAL_FAST_DEFAULT_SECONDS
+        slow = self.arrival_slow_seconds or FLEET_ARRIVAL_SLOW_DEFAULT_SECONDS
+        if fast >= slow:
+            raise ValueError(
+                "the fast arrival window must be shorter than the slow one "
+                f"(effective {fast} s vs {slow} s; defaults 30 s / 300 s)"
+            )
         return self
 
 

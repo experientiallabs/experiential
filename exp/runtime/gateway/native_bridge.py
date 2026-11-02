@@ -21,6 +21,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.explicit_cache import AutomaticCacheHost, ExplicitCacheHost
+from exp.runtime.gateway.fleet_lanes import FleetLaneGate
 from exp.runtime.gateway.group_commit import SyncGroupCommitLedger
 from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
@@ -201,6 +202,7 @@ class NativeControlPlane(
         explicit_cache: ExplicitCacheHost | None = None,
         automatic_cache: AutomaticCacheHost | None = None,
         background_recovery: bool = True,
+        fleet_lane_gate: FleetLaneGate | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -230,6 +232,7 @@ class NativeControlPlane(
             background_recovery: Own a periodic recovery thread by default. False
                 lets a host schedule serialized recover_accounting calls, including
                 after native execution stops until accounting_drained is true.
+            fleet_lane_gate: Host fleet-wide lane admission (``fleet_lanes``).
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -273,6 +276,8 @@ class NativeControlPlane(
             default_lane_bound=default_lane_bound,
             background_recovery=background_recovery,
         )
+        if fleet_lane_gate is not None:
+            self._accounting.loads.attach_fleet_gate(fleet_lane_gate)
         try:
             if self._videos is not None:
                 self._videos.start_poller()

@@ -203,7 +203,12 @@ def reserve_rung_slot(
         # own policy admitted, so a local shed never spends fleet budget. Hard:
         # a hit overflow ceiling, so no forced pass lands back on the lane.
         lane = FleetLane(deployment.deployment_id, rung_load_key(deployment)[1], policy.fleet)
-        fleet_shed = loads.fleet_acquire(result, lane, reserved_tokens=reserved_tokens)
+        fleet_shed = loads.fleet_acquire(
+            result,
+            lane,
+            reserved_tokens=reserved_tokens,
+            deadline_seconds=max(0.0, entry.deadline_monotonic - time.monotonic()),
+        )
         if fleet_shed is not None:
             refuse = policy.fleet.saturation == "refuse"
             # A refusal is disclosed as a capacity shed: a rate shed on a
@@ -640,7 +645,7 @@ def record_attempt_health(
         health.exhausted(key, exhausted)
 
 
-def _count(usage: dict[str, object], key: str) -> int | None:
+def _count(usage: JsonObject, key: str) -> int | None:
     value = usage.get(key)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
