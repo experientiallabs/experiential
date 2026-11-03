@@ -295,9 +295,8 @@ class NativeControlPlane(
         """Decode, authorize, inspect, route, and durably accept one request.
 
         Args:
-            argument: JSON object with ``raw_key``, ``body`` (raw request
-                body text), optional ``surface`` (``"chat"`` or
-                ``"responses"``, defaulting to chat), and caller app headers.
+            argument: JSON object with ``raw_key``, ``body`` (raw request body text), optional
+                ``surface`` (``"chat"`` or ``"responses"``, default chat), and caller app headers.
 
         Returns:
             The ordered certified ``route`` with dispatch and retry configuration,
@@ -305,8 +304,7 @@ class NativeControlPlane(
             the native plane cannot serve without writing an attempt row.
 
         Raises:
-            NativeBridgeError: Decoding, authorization, routing, or
-                capability admission failed.
+            NativeBridgeError: Decoding, authorization, routing, or capability admission failed.
         """
         assert_not_internal_classification()
         data = json.loads(argument)
