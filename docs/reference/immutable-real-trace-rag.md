@@ -24,6 +24,35 @@ evaluation receipts remain immutable; corrected extraction applies when new evid
 Trace count is not a validation boundary. A corpus with any positive number of valid traces is
 accepted. The 100 to 1,000 range is only a common happy path for useful coverage.
 
+## Scoped fit-only indexes
+
+A build's fit-only index holds every fit transition, and `persist_fit_only_world_model` requires
+exactly that complete fit subset of the world model's serving index. Studies that keep part of
+the fit evidence unread declare a `CorpusScope` instead: a name, a `lineage` or `trace` kind, the
+sorted allowed identities with their SHA-256, and the identity of the plan that chose them (an
+artifact pointer or a digest).
+
+`persist_trace_rag(..., corpus_scope=scope)` builds a fit-only index holding exactly the fit
+transitions the scope admits. It refuses a scope that names an identity the lineage bindings do
+not carry or that admits a held-out trace, and refuses `held_out` in `included_partitions`. The
+scope is recorded in the index envelope and its content identity; an unscoped index records
+nothing, so its envelope bytes and identity are unchanged. The loader refuses a scoped index
+whose transitions fall outside its scope.
+
+`persist_scoped_world_model(store, world_model, scoped_rag, retrieval_scope=...,
+construction_scope=...)` persists the world model over a scoped index. The index must declare
+exactly `retrieval_scope`, name only the serving index's fit lineages, and hold exactly the
+serving fit transitions the scope admits. When `construction_scope` is given, every trace in the
+world model's recorded construction knowledge must lie inside it and none may be held out. The
+two scopes are independent and may overlap. The unscoped `persist_fit_only_world_model` and
+`bind_fit_grounded_world_model` refuse a scoped index.
+
+For variance studies, `exp.optimize.evaluation.variance.exposure.world_learning_scopes(plan,
+construction=..., retrieval=...)` derives both scopes from an `ExposurePlan`. Each covers every
+`world_learning` trace, or the traces of an optional tag selection checked with
+`plan.restrict(selection, "world_learning")`, so mining-probe and final-evaluation traces can
+never enter either corpus.
+
 ## Query and world-prompt capacity
 
 New evaluations and router optimizations derive an omitted `maximum_retrieval_query_tokens`

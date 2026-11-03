@@ -15,6 +15,12 @@ predicate can never move evidence from one role to another:
 Fit lineages are split between world learning and probes by a seeded hash of the lineage identity,
 so the split is reproducible and cannot be tuned after seeing results.
 
+World learning reads its role through two explicit corpus scopes, one for the corpus the world
+model is constructed from and one for the corpus it retrieves from. :func:`world_learning_scopes`
+derives both from the plan, each optionally narrowed by a tag selection that must stay inside the
+role, and records the plan's digest in each, so a scoped retrieval index or world model names the
+exact plan that allowed its evidence.
+
 Every success estimate also has an exact meaning: the probability that one actor policy, under one
 harness, budget, sampling setting, world version and verifier, succeeds from one checkpoint. An
 :class:`EstimateMeaning` records all of it, so estimates are compared and trained on only within
@@ -35,6 +41,7 @@ from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.simulation.continuations import ContinuationCheckpoint
 from exp.simulation.mining.bindings import TaskTraceLineageBinding
 from exp.simulation.mining.tag_selection import TagSelection
+from exp.simulation.retrieval.scope import CorpusScope
 
 Role = Literal["final_evaluation", "world_learning", "mining_probes"]
 """The stage a lineage's traces are reserved for."""
@@ -123,6 +130,80 @@ class ExposurePlan(ContractModel):
         """
         self.require(selection.trace_ids, role)
         return selection
+
+
+class WorldLearningScopes(ContractModel):
+    """The construction and retrieval corpora one world model may read, both inside world learning.
+
+    Attributes:
+        construction: Traces the world model and its learned rules may be constructed from.
+        retrieval: Traces its retrieval index may hold. May differ from and overlap construction.
+    """
+
+    construction: CorpusScope
+    retrieval: CorpusScope
+
+
+def world_learning_scope(
+    plan: ExposurePlan, *, name: str, selection: TagSelection | None = None
+) -> CorpusScope:
+    """Declare one corpus scope over the plan's world-learning traces.
+
+    Args:
+        plan: The frozen exposure plan.
+        name: Stable purpose of the scope, such as ``world-learning-retrieval``.
+        selection: Optional tag selection narrowing the role; it must stay inside world
+            learning.
+
+    Returns:
+        A trace scope over every world-learning trace, or over the selection's traces, bound to
+        the plan's digest.
+
+    Raises:
+        ValueError: The selection reaches into mining probes or final evaluation, or selects
+            nothing.
+    """
+    if selection is None:
+        traces = tuple(
+            trace
+            for trace, lineage in plan.traces.items()
+            if plan.roles[lineage] == "world_learning"
+        )
+    else:
+        traces = plan.restrict(selection, "world_learning").trace_ids
+    if not traces:
+        raise ValueError(f"scope {name!r} selects no world-learning trace; widen its tag rule")
+    return CorpusScope.declare(name=name, kind="trace", ids=traces, source_plan=sha256_json(plan))
+
+
+def world_learning_scopes(
+    plan: ExposurePlan,
+    *,
+    construction: TagSelection | None = None,
+    retrieval: TagSelection | None = None,
+) -> WorldLearningScopes:
+    """Declare the construction and retrieval scopes of one world-learning world model.
+
+    Pass ``scopes.retrieval`` as ``corpus_scope`` when building the scoped fit-only index, then
+    both scopes to ``persist_scoped_world_model``.
+
+    Args:
+        plan: The frozen exposure plan.
+        construction: Optional tag selection narrowing the construction corpus.
+        retrieval: Optional tag selection narrowing the retrieval corpus.
+
+    Returns:
+        Both scopes, each over all world-learning traces unless its selection narrows it.
+
+    Raises:
+        ValueError: A selection reaches outside world learning or selects nothing.
+    """
+    return WorldLearningScopes(
+        construction=world_learning_scope(
+            plan, name="world-learning-construction", selection=construction
+        ),
+        retrieval=world_learning_scope(plan, name="world-learning-retrieval", selection=retrieval),
+    )
 
 
 def plan_exposure(

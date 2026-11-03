@@ -30,9 +30,16 @@ from exp.common.models import (
     OperationEconomics,
     ToolCall,
 )
-from exp.common.project import ProjectConfig, ProjectStore, artifact_input
+from exp.common.project import (
+    ArtifactStore,
+    ProjectConfig,
+    ProjectPaths,
+    ProjectStore,
+    artifact_input,
+)
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.engines.text.prompt import (
     WORLD_MODEL_TEXT_SYSTEM_PROMPT,
     TextWorldModelProtocolError,
@@ -41,6 +48,7 @@ from exp.simulation.engines.text.prompt import (
 from exp.simulation.engines.text.recording_test import _grounding_example
 from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 from exp.simulation.retrieval import (
+    CorpusScope,
     RAGAction,
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -51,6 +59,7 @@ from exp.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
+from exp.simulation.retrieval.tests.retrieval_test import _persist_traces
 from exp.simulation.world_model import (
     WorldModel,
     WorldModelSessionError,
@@ -71,6 +80,7 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model_artifact,
     persist_fit_only_world_model,
     persist_memory_first_world_model,
+    persist_scoped_world_model,
 )
 
 
@@ -696,3 +706,179 @@ def test_step_rejects_invalid_action_before_any_paid_dispatch(
         )
     assert retriever.queries == []
     assert client.requests == []
+
+
+_SCOPED_AT = datetime(2026, 8, 13, tzinfo=UTC)
+
+
+def _scoped_build(
+    tmp_path: Path, knowledge: SimulationKnowledge | None
+) -> tuple[ArtifactStore, ArtifactInput, ArtifactInput, tuple[str, ...]]:
+    """Persist four traces (three fit lineages, one held out), a serving index and a model.
+
+    Args:
+        tmp_path: Temporary project root.
+        knowledge: Optional construction knowledge of the world model.
+
+    Returns:
+        The store, source dataset pointer, world-model pointer and trace IDs in order.
+    """
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="scoped"))
+    source, traces = _persist_traces(store, count=4)
+    serving = persist_trace_rag(
+        store,
+        (source,),
+        _four_bindings(tuple(t.trace_id for t in traces)),
+        created_at=_SCOPED_AT,
+        code_revision="revision-a",
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    world = persist_grounded_world_model(
+        store,
+        artifact_input(serving.manifest),
+        model_alias="world",
+        model=ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            provider="fixture",
+            model_id="world",
+            capabilities_sha256=ModelCapabilities().identity_sha256(),
+            connection_sha256=sha256_json({"connection": "world"}),
+        ),
+        created_at=_SCOPED_AT,
+        code_revision="revision-a",
+        top_k=5,
+        knowledge=knowledge,
+    )
+    return store, source, artifact_input(world.manifest), tuple(t.trace_id for t in traces)
+
+
+def _four_bindings(trace_ids: tuple[str, ...]) -> tuple[RAGLineageBinding, ...]:
+    """Bind traces 0-2 to fit lineages and trace 3 to a held-out lineage."""
+    return tuple(
+        RAGLineageBinding(
+            trace_id=trace_id,
+            lineage_id=f"lineage-{index}",
+            partition="held_out" if index == 3 else "fit",
+        )
+        for index, trace_id in enumerate(trace_ids)
+    )
+
+
+def _scoped_index(
+    store: ArtifactStore, source: ArtifactInput, traces: tuple[str, ...], scope: CorpusScope | None
+) -> ArtifactInput:
+    """Build a fit-only index over the four fixture traces, optionally scoped."""
+    built = persist_trace_rag(
+        store,
+        (source,),
+        _four_bindings(traces),
+        created_at=_SCOPED_AT,
+        code_revision="revision-a",
+        corpus_scope=scope,
+    )
+    return artifact_input(built.manifest)
+
+
+def _trace_scope(name: str, *ids: str) -> CorpusScope:
+    """Declare a trace scope bound to a fixed plan digest."""
+    return CorpusScope.declare(name=name, kind="trace", ids=ids, source_plan="d" * 64)
+
+
+def test_scoped_world_model_retrieves_exactly_the_in_scope_fit_transitions(
+    tmp_path: Path,
+) -> None:
+    """A declared retrieval scope binds an index narrower than the complete fit subset."""
+    store, source, world, traces = _scoped_build(tmp_path, None)
+    retrieval = _trace_scope("world-learning-retrieval", traces[0], traces[2])
+    scoped = _scoped_index(store, source, traces, retrieval)
+
+    persisted = persist_scoped_world_model(store, world, scoped, retrieval_scope=retrieval)
+    assert persisted == persist_scoped_world_model(store, world, scoped, retrieval_scope=retrieval)
+    artifact = load_grounded_world_model_artifact(store, persisted)
+    assert artifact.serving_rag == scoped
+    index = load_rag_index(store, scoped.artifact_id)
+    assert index.index.corpus_scope == retrieval
+    assert {t.trace_id for t in index.transitions} == {traces[0], traces[2]}
+
+
+def test_scoped_and_unscoped_indexes_never_bind_through_the_other_path(tmp_path: Path) -> None:
+    """The unscoped binding refuses a scoped index and the scoped binding refuses others."""
+    store, source, world, traces = _scoped_build(tmp_path, None)
+    retrieval = _trace_scope("world-learning-retrieval", traces[0])
+    scoped = _scoped_index(store, source, traces, retrieval)
+    unscoped = _scoped_index(store, source, traces, None)
+
+    assert (
+        load_grounded_world_model_artifact(
+            store, persist_fit_only_world_model(store, world, unscoped)
+        ).serving_rag
+        == unscoped
+    )
+    with pytest.raises(ValueError, match="corpus scope differs"):
+        persist_fit_only_world_model(store, world, scoped)
+    with pytest.raises(ValueError, match="corpus scope differs"):
+        persist_scoped_world_model(store, world, unscoped, retrieval_scope=retrieval)
+    with pytest.raises(ValueError, match="corpus scope differs"):
+        persist_scoped_world_model(
+            store, world, scoped, retrieval_scope=_trace_scope("other", traces[0], traces[1])
+        )
+
+
+def test_construction_scope_refuses_held_out_and_out_of_scope_construction(
+    tmp_path: Path,
+) -> None:
+    """The construction corpus must lie inside its scope and never include held-out traces."""
+    construction_traces = ("trace-0", "trace-1")
+    store, source, world, traces = _scoped_build(
+        tmp_path, SimulationKnowledge(source_trace_ids=construction_traces)
+    )
+    retrieval = _trace_scope("world-learning-retrieval", traces[1], traces[2])
+    scoped = _scoped_index(store, source, traces, retrieval)
+    construction = _trace_scope("world-learning-construction", *construction_traces)
+
+    persisted = persist_scoped_world_model(
+        store, world, scoped, retrieval_scope=retrieval, construction_scope=construction
+    )
+    assert load_grounded_world_model_artifact(store, persisted).knowledge == SimulationKnowledge(
+        source_trace_ids=construction_traces
+    )
+    with pytest.raises(ValueError, match="outside corpus scope"):
+        persist_scoped_world_model(
+            store,
+            world,
+            scoped,
+            retrieval_scope=retrieval,
+            construction_scope=_trace_scope("world-learning-construction", "trace-0"),
+        )
+    lineage_scope = CorpusScope.declare(
+        name="world-learning-construction",
+        kind="lineage",
+        ids=("lineage-0", "lineage-1"),
+        source_plan="d" * 64,
+    )
+    persist_scoped_world_model(
+        store, world, scoped, retrieval_scope=retrieval, construction_scope=lineage_scope
+    )
+
+    leaked_store, leaked_source, leaked_world, leaked = _scoped_build(
+        tmp_path / "leaked", SimulationKnowledge(source_trace_ids=("trace-0", "trace-3"))
+    )
+    leaked_scoped = _scoped_index(leaked_store, leaked_source, leaked, retrieval)
+    with pytest.raises(ValueError, match="held-out trace trace-3"):
+        persist_scoped_world_model(
+            leaked_store,
+            leaked_world,
+            leaked_scoped,
+            retrieval_scope=retrieval,
+            construction_scope=_trace_scope("world-learning-construction", "trace-0", "trace-3"),
+        )
+    plain_store, plain_source, plain_world, plain = _scoped_build(tmp_path / "plain", None)
+    plain_scoped = _scoped_index(plain_store, plain_source, plain, retrieval)
+    with pytest.raises(ValueError, match="recorded construction knowledge"):
+        persist_scoped_world_model(
+            plain_store,
+            plain_world,
+            plain_scoped,
+            retrieval_scope=retrieval,
+            construction_scope=construction,
+        )

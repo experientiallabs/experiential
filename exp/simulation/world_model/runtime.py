@@ -41,6 +41,8 @@ from exp.simulation.engines.text.tokens import (
     bound_unpublished_output,
 )
 from exp.simulation.retrieval import (
+    CorpusScope,
+    LoadedRAGIndex,
     RAGIndex,
     RAGMatch,
     RAGQuery,
@@ -663,9 +665,67 @@ def persist_fit_only_world_model(
     if artifact_input(fit.manifest) != fit_rag_input:
         raise ValueError("fit RAG manifest differs from its selected input")
     _require_fit_subset(store, artifact, fit.index)
+    return _persist_over_index(store, artifact, fit_rag_input)
+
+
+def persist_scoped_world_model(
+    store: ArtifactStore,
+    world_model_input: ArtifactInput,
+    scoped_rag_input: ArtifactInput,
+    *,
+    retrieval_scope: CorpusScope,
+    construction_scope: CorpusScope | None = None,
+) -> ArtifactInput:
+    """Persist the same world model over a scoped fit-only index, as its own simulator.
+
+    The scoped index must hold exactly the fit transitions of this world model's serving index
+    that ``retrieval_scope`` admits, and nothing held out or out of scope. When
+    ``construction_scope`` is given, every trace the world model's learned knowledge was
+    constructed from must lie inside it and inside the build's fit evidence. Construction and
+    retrieval scopes are independent and may overlap. The retrieval scope is recorded in the
+    scoped index, which becomes the new world model's index; the result keeps the exact model,
+    prompt, knowledge, reranker and top-k, and its identity is content-derived.
+
+    Args:
+        store: Project-local immutable artifact store.
+        world_model_input: Exact completed grounded world-model manifest pointer.
+        scoped_rag_input: Fit-only index built with ``corpus_scope=retrieval_scope``.
+        retrieval_scope: The scope the caller requires the index to declare.
+        construction_scope: Optional scope the world model's construction corpus must lie in.
+
+    Returns:
+        Manifest pointer of the scoped grounded world model.
+
+    Raises:
+        ValueError: The index declares another scope or differs from the in-scope fit subset,
+            or the construction corpus is missing, held out, or outside its scope.
+    """
+    artifact = _load_verified_artifact(store, world_model_input)
+    scoped = load_rag_index(store, scoped_rag_input.artifact_id)
+    if artifact_input(scoped.manifest) != scoped_rag_input:
+        raise ValueError("scoped RAG manifest differs from its selected input")
+    serving = _require_fit_subset(store, artifact, scoped.index, scope=retrieval_scope)
+    if construction_scope is not None:
+        _require_construction_scope(artifact, serving, construction_scope)
+    return _persist_over_index(store, artifact, scoped_rag_input)
+
+
+def _persist_over_index(
+    store: ArtifactStore, artifact: GroundedWorldModelArtifact, rag_input: ArtifactInput
+) -> ArtifactInput:
+    """Persist a verified world model's exact protocol over another verified index.
+
+    Args:
+        store: Project-local immutable artifact store.
+        artifact: Verified grounded world model whose protocol is kept.
+        rag_input: Index already checked against the world model's serving index.
+
+    Returns:
+        Manifest pointer of the persisted world model.
+    """
     persisted = persist_grounded_world_model(
         store,
-        fit_rag_input,
+        rag_input,
         model_alias=artifact.model_alias,
         model=artifact.model,
         created_at=artifact.created_at,
@@ -679,18 +739,30 @@ def persist_fit_only_world_model(
 
 
 def _require_fit_subset(
-    store: ArtifactStore, artifact: GroundedWorldModelArtifact, fit: RAGIndex
-) -> None:
+    store: ArtifactStore,
+    artifact: GroundedWorldModelArtifact,
+    fit: RAGIndex,
+    *,
+    scope: CorpusScope | None = None,
+) -> LoadedRAGIndex:
     """Require a fit-only index built from the same graph as the artifact's serving index.
+
+    Without a scope the index must be the serving index's complete fit subset. With one, it
+    must declare exactly that scope, name only the serving index's fit lineages, and hold
+    exactly the serving fit transitions the scope admits.
 
     Args:
         store: Project-local immutable artifact store.
         artifact: Verified grounded world model whose serving index covers fit and held out.
         fit: Candidate fit-only index envelope.
+        scope: Corpus scope the index must declare, or None for an unscoped index.
+
+    Returns:
+        The verified serving index.
 
     Raises:
-        ValueError: Partition scope, source, schema, embedder, lineage, top-k, or transition
-            identity differs.
+        ValueError: Partition scope, corpus scope, source, schema, embedder, lineage, top-k, or
+            transition identity differs.
     """
     serving = load_rag_index(store, artifact.serving_rag.artifact_id)
     if artifact_input(serving.manifest) != artifact.serving_rag:
@@ -699,26 +771,96 @@ def _require_fit_subset(
         raise ValueError("grounded world-model serving RAG has an unsupported partition scope")
     if fit.included_partitions != ("fit",):
         raise ValueError("grounded simulation requires a fit-only retrieval index")
+    if fit.corpus_scope != scope:
+        raise ValueError(
+            "fit RAG corpus scope differs from the declared scope; bind a scoped index only "
+            "through persist_scoped_world_model with its exact scope"
+        )
+    serving_fit = set(serving.index.fit_lineage_ids)
+    lineages_match = (
+        serving.index.fit_lineage_ids == fit.fit_lineage_ids
+        if scope is None
+        else set(fit.fit_lineage_ids) <= serving_fit
+    )
     if (
         serving.index.sources != fit.sources
         or serving.index.key_schema_version != fit.key_schema_version
         or serving.index.embedder != fit.embedder
         or serving.index.embedding_dimension != fit.embedding_dimension
         or serving.index.embedding_chunk_bytes != fit.embedding_chunk_bytes
-        or serving.index.fit_lineage_ids != fit.fit_lineage_ids
+        or not lineages_match
         or serving.index.default_top_k != fit.default_top_k
     ):
         raise ValueError("fit RAG identity differs from the grounded world-model build graph")
-    fit_lineages = set(fit.fit_lineage_ids)
-    serving_fit_ids = tuple(
+    if scope is not None and scope.kind == "trace":
+        known = {trace for source in serving.index.sources for trace in source.trace_ids}
+        outside = sorted(set(scope.ids) - known)
+        if outside:
+            raise ValueError(
+                f"corpus scope {scope.name!r} names trace {outside[0]} outside the build's sources"
+            )
+    expected = tuple(
         sorted(
             transition.transition_id
             for transition in serving.transitions
-            if transition.lineage_id in fit_lineages
+            if transition.lineage_id in serving_fit
+            and (
+                scope is None
+                or scope.admits(trace_id=transition.trace_id, lineage_id=transition.lineage_id)
+            )
         )
     )
-    if fit.transition_ids != serving_fit_ids:
-        raise ValueError("fit RAG transitions differ from the serving index fit subset")
+    if fit.transition_ids != expected:
+        raise ValueError(
+            "fit RAG transitions differ from the serving index fit subset"
+            if scope is None
+            else "scoped RAG transitions differ from the serving index's in-scope fit subset"
+        )
+    return serving
+
+
+def _require_construction_scope(
+    artifact: GroundedWorldModelArtifact, serving: LoadedRAGIndex, scope: CorpusScope
+) -> None:
+    """Require a world model's construction corpus to lie inside one scope and fit evidence.
+
+    A trace's lineage is read from its serving transitions, so a lineage scope can be checked
+    only for construction traces that produced at least one transition; declare a trace scope
+    otherwise.
+
+    Args:
+        artifact: Verified grounded world model carrying its construction knowledge.
+        serving: Verified serving index of the same build.
+        scope: Scope the construction corpus must lie in.
+
+    Raises:
+        ValueError: The world model has no recorded construction corpus, or a construction trace
+            is unknown, held out, or outside the scope.
+    """
+    if artifact.knowledge is None:
+        raise ValueError(
+            "a construction scope needs a world model with recorded construction knowledge"
+        )
+    fit_lineages = set(serving.index.fit_lineage_ids)
+    lineage_of = {item.trace_id: item.lineage_id for item in serving.transitions}
+    for trace_id in sorted(artifact.knowledge.source_trace_ids):
+        lineage = lineage_of.get(trace_id)
+        if lineage is not None and lineage not in fit_lineages:
+            raise ValueError(f"world model was constructed from held-out trace {trace_id}")
+        if scope.kind == "trace":
+            admitted = trace_id in scope.ids
+        elif lineage is None:
+            raise ValueError(
+                f"construction trace {trace_id} has no serving transition to resolve its "
+                "lineage; declare a trace construction scope"
+            )
+        else:
+            admitted = scope.admits(trace_id=trace_id, lineage_id=lineage)
+        if not admitted:
+            raise ValueError(
+                f"world model was constructed from trace {trace_id} outside corpus scope "
+                f"{scope.name!r}"
+            )
 
 
 def _load_verified_artifact(

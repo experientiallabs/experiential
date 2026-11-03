@@ -49,6 +49,7 @@ from exp.simulation.retrieval.embedding import (
     default_rag_embedder,
 )
 from exp.simulation.retrieval.retriever import TraceRAGRetriever, load_fit_rag_retriever
+from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
 
 _REFRESH_EXPORT_MODULES = {
@@ -63,6 +64,7 @@ _REFRESH_EXPORT_MODULES = {
 }
 
 __all__ = [
+    "CorpusScope",
     "HashingRAGEmbedder",
     "LoadedRAGIndex",
     "PersistedRAGIndex",

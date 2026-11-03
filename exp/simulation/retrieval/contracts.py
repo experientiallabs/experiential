@@ -18,6 +18,7 @@ from exp.common.core.artifacts import (
     validate_artifact_file_path,
 )
 from exp.common.models import ModelSnapshot
+from exp.simulation.retrieval.scope import CorpusScope
 
 RAG_ARTIFACT_TYPE = "trace-rag-index"
 RAG_KEY_SCHEMA_VERSION = "observed-transition-key-v2"
@@ -136,7 +137,15 @@ class RAGVector(ContractModel):
 
 
 class RAGIndex(ArtifactEnvelope):
-    """Completed immutable observed-transition index and its exact embedding identity."""
+    """Completed immutable observed-transition index and its exact embedding identity.
+
+    Attributes:
+        corpus_scope: Explicit restriction of a fit-only index to the fit evidence inside one
+            :class:`CorpusScope`. A scoped index's ``fit_lineage_ids`` and
+            ``included_lineage_ids`` are the in-scope fit lineages, and every transition lies
+            inside the scope. Omitted from the serialized envelope when absent, so unscoped
+            indexes keep their identity.
+    """
 
     rag_id: ArtifactId
     key_schema_version: Literal["observed-transition-key-v2"] = RAG_KEY_SCHEMA_VERSION
@@ -154,6 +163,7 @@ class RAGIndex(ArtifactEnvelope):
     embedding_chunk_bytes: int = Field(default=2_048, ge=4, le=2_048)
     transition_count: int = Field(gt=0)
     default_top_k: int = Field(default=5, gt=0)
+    corpus_scope: CorpusScope | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("transitions_path", "vectors_path")
     @classmethod
@@ -233,6 +243,14 @@ class RAGIndex(ArtifactEnvelope):
             self.included_lineage_ids
         ):
             raise ValueError("RAG included lineages must contain every frozen fit lineage")
+        scope = self.corpus_scope
+        if scope is not None:
+            if self.included_partitions != ("fit",):
+                raise ValueError("a scoped RAG index must include only the fit partition")
+            if self.included_lineage_ids != self.fit_lineage_ids:
+                raise ValueError("a scoped RAG index must include exactly its in-scope lineages")
+            if scope.kind == "lineage" and self.fit_lineage_ids != scope.ids:
+                raise ValueError("a lineage-scoped RAG index must cover exactly its scope")
         return self
 
 

@@ -108,7 +108,7 @@ def _verify_records(
     transitions: tuple[RAGTransition, ...],
     vectors: tuple[RAGVector, ...],
 ) -> None:
-    """Verify ordering, IDs, key hashes, lineage membership, and vector dimensions.
+    """Verify ordering, IDs, key hashes, lineage and scope membership, and vector dimensions.
 
     Args:
         index: Persisted immutable RAG envelope.
@@ -128,6 +128,10 @@ def _verify_records(
     for transition, vector in zip(transitions, vectors, strict=True):
         if transition.lineage_id not in included_lineages:
             raise ArtifactCorruptionError("RAG transition is outside the frozen included lineages")
+        if index.corpus_scope is not None and not index.corpus_scope.admits(
+            trace_id=transition.trace_id, lineage_id=transition.lineage_id
+        ):
+            raise ArtifactCorruptionError("RAG transition is outside the index's corpus scope")
         key_text = render_rag_key(
             task=transition.task,
             initial_context=transition.initial_context,

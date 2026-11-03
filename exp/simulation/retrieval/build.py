@@ -46,6 +46,7 @@ from exp.simulation.retrieval.embedding import (
 )
 from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
 from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
+from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.transitions import extract_real_transitions
 
 
@@ -72,6 +73,7 @@ def persist_trace_rag(
     included_partitions: frozenset[Literal["fit", "held_out"]] = frozenset({"fit"}),
     progress: ProgressHook | None = None,
     embedding_cache: RAGEmbeddingCache | None = None,
+    corpus_scope: CorpusScope | None = None,
 ) -> PersistedRAGIndex:
     """Build a read-only index from selected partitions of real imported traces.
 
@@ -95,13 +97,19 @@ def persist_trace_rag(
             use ``{"fit"}``; serving indexes use both real-evidence partitions.
         progress: Optional observer of embedding and index-persistence stages.
         embedding_cache: Optional same-invocation cache for reusing exact component vectors.
+        corpus_scope: Optional explicit restriction to the fit evidence inside one scope. A
+            scoped index is fit-only, holds exactly the fit transitions the scope admits, and
+            records the scope in its identity. Every scope identity must name a bound fit trace
+            or lineage; held-out or unknown identities are refused. Omitted, the index and its
+            identity are unscoped.
 
     Returns:
         The immutable envelope, manifest, observed transitions, and persisted vectors.
 
     Raises:
         ValueError: A source is not verified real trace evidence, lineage is incomplete, no real
-            included transition exists, or the embedder violates its contract.
+            included transition exists, the scope names held-out or unknown evidence, or the
+            embedder violates its contract.
     """
     if not source_inputs:
         raise ValueError("RAG construction needs at least one verified real trace source")
@@ -116,6 +124,18 @@ def persist_trace_rag(
         lineage_bindings,
         included_partitions=included_partitions,
     )
+    eligible = tuple(lineage_bindings)
+    if corpus_scope is not None:
+        if included_partitions != frozenset({"fit"}):
+            raise ValueError(
+                "a scoped RAG index is fit-only; build it with included_partitions={'fit'}"
+            )
+        eligible = scoped_bindings(lineage_bindings, corpus_scope)
+        transitions = tuple(
+            item
+            for item in transitions
+            if corpus_scope.admits(trace_id=item.trace_id, lineage_id=item.lineage_id)
+        )
     if not transitions:
         raise ValueError(
             "verified included traces contain no real action-to-subsequent-observation transitions"
@@ -141,20 +161,21 @@ def persist_trace_rag(
     transitions_payload = canonical_jsonl_bytes(transitions)
     vectors_payload = canonical_jsonl_bytes(vectors)
     fit_lineages = tuple(
-        sorted({binding.lineage_id for binding in lineage_bindings if binding.partition == "fit"})
+        sorted({binding.lineage_id for binding in eligible if binding.partition == "fit"})
     )
     included_lineages = tuple(
         sorted(
-            {
-                binding.lineage_id
-                for binding in lineage_bindings
-                if binding.partition in included_partitions
-            }
+            {binding.lineage_id for binding in eligible if binding.partition in included_partitions}
         )
     )
     if not fit_lineages or not included_lineages:
         raise ValueError("RAG construction needs at least one included lineage")
+    # An absent scope adds nothing, so unscoped indexes keep the identity they always had.
+    scope_content = (
+        {} if corpus_scope is None else {"corpus_scope": corpus_scope.model_dump(mode="json")}
+    )
     content = {
+        **scope_content,
         "code_revision": code_revision,
         "default_top_k": default_top_k,
         "embedder": binding.snapshot.model_dump(mode="json"),
@@ -193,6 +214,7 @@ def persist_trace_rag(
         embedding_chunk_bytes=chunk_bytes,
         transition_count=len(transitions),
         default_top_k=default_top_k,
+        corpus_scope=corpus_scope,
     )
     files = {
         RAG_INDEX_PATH: canonical_json_bytes(index),
@@ -208,6 +230,46 @@ def persist_trace_rag(
         files=files,
     )
     return PersistedRAGIndex(existing, manifest, transitions, vectors)
+
+
+def scoped_bindings(
+    lineage_bindings: Sequence[RAGLineageBinding], scope: CorpusScope
+) -> tuple[RAGLineageBinding, ...]:
+    """Return the fit bindings a scope admits, refusing held-out or unknown scope identities.
+
+    Args:
+        lineage_bindings: Complete frozen fit or held-out assignment of every source trace.
+        scope: Explicit corpus restriction.
+
+    Returns:
+        The admitted bindings, every one of them fit.
+
+    Raises:
+        ValueError: The scope names an identity no binding carries, or admits held-out evidence.
+    """
+    known = {
+        binding.trace_id if scope.kind == "trace" else binding.lineage_id
+        for binding in lineage_bindings
+    }
+    unknown = sorted(set(scope.ids) - known)
+    if unknown:
+        raise ValueError(
+            f"corpus scope {scope.name!r} names {len(unknown)} {scope.kind} identities outside "
+            f"the build's lineage bindings, for example {unknown[0]}; declare the scope over "
+            "the same traces the index is built from"
+        )
+    admitted = tuple(
+        binding
+        for binding in lineage_bindings
+        if scope.admits(trace_id=binding.trace_id, lineage_id=binding.lineage_id)
+    )
+    held_out = sorted(binding.trace_id for binding in admitted if binding.partition == "held_out")
+    if held_out:
+        raise ValueError(
+            f"corpus scope {scope.name!r} admits {len(held_out)} held-out traces, for example "
+            f"{held_out[0]}; a scoped index may hold only fit evidence"
+        )
+    return admitted
 
 
 def _load_real_sources(
