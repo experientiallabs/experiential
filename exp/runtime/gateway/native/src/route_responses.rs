@@ -951,8 +951,7 @@ async fn stream_responses(
             )
             .await
             .is_ok();
-        // Price every terminal once, including a failed continuation write;
-        // a failed quote settles here, before any terminal frame.
+        // Price each terminal once (even a failed continuation write); failed quotes settle here.
         let settled = match terminal.as_ref() {
             Some(event) => price_stream_end(&mut guard, event, usage.as_ref(), &tool_names).await,
             None => true,
@@ -976,8 +975,7 @@ async fn stream_responses(
             terminal_frames.into_iter().map(Bytes::from).collect(),
         )
         .await;
-        // Close the body before the durable write: the caller holds its
-        // terminal frames while settlement lands.
+        // Close the body before the durable write; the caller holds its terminal frames till then.
         drop(delivery);
         drop(sender);
         guard.settle_priced().await;

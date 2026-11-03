@@ -740,8 +740,7 @@ class NativeAttemptAccounting:
             An empty JSON object; repeated settlement is a no-op.
 
         Raises:
-            NativeBridgeError: The terminal write failed; the retained entry lets either
-                the data plane or the deadline sweep retry the original settlement.
+            NativeBridgeError: The write failed; the data plane or deadline sweep retries it.
         """
         with self._lock:
             self._active_settlements += 1
@@ -751,9 +750,8 @@ class NativeAttemptAccounting:
             with self._lock:
                 self._active_settlements -= 1
 
-    def price(self, argument: str) -> str:
-        """Let the host price one decided settlement (``quote_settlement``); nothing is written."""
-        return quote_settlement(self, argument)
+    price = quote_settlement
+    """Let the host price one decided settlement before its terminal frame; nothing is written."""
 
     def _settle(self, argument: str) -> str:
         """Commit one observed outcome while the caller retains shutdown ownership."""
