@@ -200,6 +200,8 @@ class _RecordingLedger:
         self.request_search_meters: list[int] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
         self.fail_finishes = 0
+        self.priced: list[dict[str, object]] = []
+        self.fail_prices = 0
         self.fail_request_finishes = 0
         self.typed_rejection: GatewayFailure | None = None
         self._counter = 0
@@ -251,6 +253,13 @@ class _RecordingLedger:
             }
         )
         return attempt_id
+
+    def price_attempt(self, **settlement: object) -> None:
+        """Record one priced settlement's keywords, honoring scripted quote failures."""
+        if self.fail_prices > 0:
+            self.fail_prices -= 1
+            raise RuntimeError("scripted quote failure")
+        self.priced.append(dict(settlement))
 
     def finish_attempt(
         self,
@@ -5203,3 +5212,58 @@ def test_meter_arriving_during_abandonment_stays_owned_until_exact_ack(
     assert exact is not None and exact.kind is GatewayEventKind.COMPLETED
     assert exact.usage is not None
     assert (exact.usage.input_tokens, exact.usage.output_tokens) == (123, 12)
+
+
+def test_a_quote_prices_exactly_what_the_later_settlement_writes() -> None:
+    """The host prices the normalized terminal the settlement then writes; nothing is retained."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": {"input_tokens": 7, "output_tokens": 3},
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "finalize": True,
+        "opened": True,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+    }
+    encoded = json.dumps(payload)
+    assert registry.price(encoded) == "{}"
+    assert ledger.finished == []
+    assert entry.pending_settlement is None
+    assert registry.entry(entry.authorization.request_id) is entry
+    registry.settle(encoded)
+    assert len(ledger.priced) == 1
+    priced = ledger.priced[0]
+    assert priced["attempt_id"] == started["attempt_id"]
+    assert priced["terminal_event"] == ledger.terminal_events[-1]
+    assert priced["finalize_request"] is True
+    assert ledger.finished[-1]["finalize"] is True
+    assert registry.entry(entry.authorization.request_id) is None
+
+
+def test_a_failed_quote_retains_nothing_and_the_settlement_still_lands() -> None:
+    """A quote failure is the data plane's cue to settle first; it leaves no recovery state."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    encoded = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 11, "output_tokens": 2},
+            "tool_names": [],
+            "failure": None,
+            "finalize": True,
+            "opened": True,
+        }
+    )
+    ledger.fail_prices = 1
+    with pytest.raises(NativeBridgeError):
+        registry.price(encoded)
+    assert entry.pending_settlement is None
+    assert registry.accounting_healthy
+    registry.settle(encoded)
+    assert len(ledger.finished) == 1

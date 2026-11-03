@@ -262,6 +262,9 @@ pub struct AttemptGuard {
     /// task cancelled mid-write can neither downgrade the ledger outcome nor
     /// diverge from the recorded metric.
     decided_settlement: Option<String>,
+    /// The host priced `decided_settlement` and its terminal bytes may flush
+    /// before the durable write; [`AttemptGuard::settle_priced`] owes it.
+    priced: bool,
     pub started: Instant,
     /// Wall-clock time the winning attempt streamed its first output token,
     /// reported in the finalizing settlement so the control plane can derive
@@ -336,6 +339,7 @@ impl AttemptGuard {
             opened: false,
             dispatched: false,
             decided_settlement: None,
+            priced: false,
             started,
             first_token_at: None,
             rate_limit_headers: None,
@@ -475,8 +479,74 @@ impl AttemptGuard {
         failure: Option<&Failure>,
         finalize: bool,
     ) -> bool {
-        if !self.armed {
+        if self.priced {
+            // A priced terminal settles exactly what the host priced.
+            return self.settle_priced().await;
+        }
+        match self
+            .decide(outcome, usage, tool_names, failure, finalize)
+            .await
+        {
+            Some((argument, finalize)) => self.deliver_decided(argument, finalize).await,
+            None => true,
+        }
+    }
+
+    /// Ask the host to price the active attempt's finalizing settlement
+    /// before its terminal bytes flush, without writing it.
+    ///
+    /// The settlement is decided here exactly once and kept verbatim: a
+    /// successful quote is followed by [`AttemptGuard::settle_priced`] (or,
+    /// if the task is cut short, by the drop backstop re-delivering the same
+    /// argument), so the durable write carries exactly the inputs the host
+    /// priced. A failed quote settles immediately instead, keeping the
+    /// settle-before-terminal order. Returns whether terminal bytes may flush:
+    /// true after a quote or a landed settlement, false when neither landed.
+    pub async fn price_or_settle(
+        &mut self,
+        outcome: &str,
+        usage: Option<&Usage>,
+        tool_names: &[String],
+        failure: Option<&Failure>,
+    ) -> bool {
+        let Some((argument, finalize)) =
+            self.decide(outcome, usage, tool_names, failure, true).await
+        else {
             return true;
+        };
+        if self.bridge.call("price", argument.clone()).await.is_ok() {
+            self.priced = true;
+            return true;
+        }
+        self.deliver_decided(argument, finalize).await
+    }
+
+    /// Durably deliver the settlement a successful quote priced, after its
+    /// terminal bytes flushed, through the same retried delivery as
+    /// [`AttemptGuard::settle`]. A no-op when nothing was priced.
+    pub async fn settle_priced(&mut self) -> bool {
+        if !self.priced || !self.armed {
+            return true;
+        }
+        self.priced = false;
+        let Some(argument) = self.decided_settlement.clone() else {
+            return true;
+        };
+        self.deliver_decided(argument, true).await
+    }
+
+    /// Decide the active attempt's settlement argument and record its
+    /// terminal outcome; `None` when nothing durable remains to close.
+    async fn decide(
+        &mut self,
+        outcome: &str,
+        usage: Option<&Usage>,
+        tool_names: &[String],
+        failure: Option<&Failure>,
+        finalize: bool,
+    ) -> Option<(String, bool)> {
+        if !self.armed {
+            return None;
         }
         let input_failure = match self.input_gate.clone() {
             Some(gate) => gate
@@ -497,7 +567,7 @@ impl AttemptGuard {
         let Some(attempt_id) = self.attempt_id.clone() else {
             // No active attempt: nothing durable to close here. The abandon
             // path owns request-only terminalization.
-            return true;
+            return None;
         };
         let observed = self.observation.snapshot();
         let usage = observed.usage.as_ref().or(usage);
@@ -565,6 +635,11 @@ impl AttemptGuard {
             self.record_terminal(outcome, cancelled);
         }
         self.decided_settlement = Some(argument.clone());
+        Some((argument, finalize))
+    }
+
+    /// Deliver one decided settlement and update the guard's ownership.
+    async fn deliver_decided(&mut self, argument: String, finalize: bool) -> bool {
         let delivered = deliver(&self.bridge, "settle", argument).await;
         if finalize {
             // The control plane retained a failed terminal write verbatim,
@@ -597,6 +672,11 @@ impl AttemptGuard {
     pub async fn settle_cancelled(&mut self, usage: Option<&Usage>, tool_names: &[String]) -> bool {
         if !self.armed {
             return true;
+        }
+        if self.priced {
+            // The provider terminal was already decided and priced; a later
+            // disconnect never downgrades it to a cancellation.
+            return self.settle_priced().await;
         }
         if self.attempt_id.is_some() {
             let observed = self.observation.snapshot();
