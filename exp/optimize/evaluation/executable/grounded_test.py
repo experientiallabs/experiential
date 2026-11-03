@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.models import (
     ReasoningEffort,
     ToolCall,
@@ -15,6 +15,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
+from exp.common.project.manifests import artifact_input
 from exp.common.tasks.facts import ConditioningFacts, InstanceFacts
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable.grounded import (
@@ -31,6 +32,8 @@ from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJso
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
+from exp.simulation.rules.model import Predicate, Rule, RuleBook
+from exp.simulation.rules.rulebook import RULES_JSON, rulebook_json
 from exp.simulation.world_model.prediction_reading import PredictionReading
 
 
@@ -309,10 +312,10 @@ def test_build_learned_memory_uses_admitted_native_decisions_in_executable_world
     assert ledger.used() == len(requests)
 
 
-def _prediction(call_id: str) -> JsonHttpResponse:
+def _prediction(call_id: str, reply: str = "pending") -> JsonHttpResponse:
     """Return one scripted provider reply proposing an unchanged-state text observation."""
     proposal = {
-        "observations": [{"call_id": call_id, "reply": "pending", "encoding": "text"}],
+        "observations": [{"call_id": call_id, "reply": reply, "encoding": "text"}],
         "effect": {"kind": "edits", "edits": []},
     }
     return JsonHttpResponse(
@@ -599,3 +602,90 @@ def test_unsupported_predictor_reasoning_is_refused_before_runtime_or_provider_c
     with pytest.raises(ValueError, match="reasoning effort"):
         continuation_runtime(project, bad.model_dump(mode="json"))
     assert project.artifacts.list_ids() == before
+
+
+def pending_rules() -> RuleBook:
+    """One supported observation rule: inspecting a record shows it pending."""
+    return RuleBook(
+        contracts={},
+        rules=(
+            Rule(
+                rule_id="inspect.pending",
+                tool="inspect",
+                kind="observation",
+                statement="Inspecting the record shows pending.",
+                predicate=Predicate.model_validate(
+                    {
+                        "op": "eq",
+                        "left": {"scope": "observation", "path": ""},
+                        "right": {"value": "pending"},
+                    }
+                ),
+                status="supported",
+                support=2,
+                contradiction=0,
+            ),
+        ),
+    )
+
+
+def save_rules(project: ProjectStore, book: RuleBook) -> ArtifactInput:
+    """Save a rule book as ``rules.json`` in one immutable artifact and return its reference."""
+    manifest = project.artifacts.write(
+        artifact_id="rules-fixture",
+        artifact_type="rule-book",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="fixture"
+        ),
+        files={RULES_JSON: rulebook_json(book).encode()},
+    )
+    return artifact_input(manifest)
+
+
+def test_definition_without_rule_book_keeps_its_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absent rule book leaves the configuration, and so every derived identity, unchanged."""
+    project, fidelity = source_project(tmp_path)
+    spec = _record_spec(project, fidelity)
+    plain = spec.model_dump(mode="json")
+    assert "rule_book" not in plain
+    assert GroundedRuntimeDefinition.model_validate(plain) == spec
+    reference = save_rules(project, pending_rules())
+    checked = spec.model_copy(update={"rule_book": reference}).model_dump(mode="json")
+    assert checked == {**plain, "rule_book": reference.model_dump(mode="json")}
+    preflight_grounded_runtime(project, GroundedRuntimeDefinition.model_validate(checked))
+    stale = reference.model_copy(update={"sha256": "0" * 64})
+    with pytest.raises(ValueError, match="manifest digest changed"):
+        preflight_grounded_runtime(project, spec.model_copy(update={"rule_book": stale}))
+
+
+def test_bound_rule_book_refuses_a_rule_breaking_proposal_and_reasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runtime loads the pinned rules, re-asks a breaking proposal, and records the verdict."""
+    project, fidelity = source_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    reference = save_rules(project, pending_rules())
+    spec = _record_spec(project, fidelity).model_copy(
+        update={"rule_book": reference, "maximum_reasks": 1}
+    )
+    transport = ScriptedJsonTransport((_prediction("read", "done"), _prediction("read")))
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    runtime = continuation_runtime(project, spec.model_dump(mode="json"))
+    with runtime.world.open(spec.task) as world:
+        result = world.execute(ToolCall(name="inspect", call_id="read", arguments={}))
+    assert result.content == "pending" and result.metadata["refused_proposals"] == 1
+    assert len(transport.requests) == 2
+    assert "inspect.pending" in json.dumps(transport.requests[1].payload)
+    events = {
+        artifact_id: json.loads(project.artifacts.read_bytes(artifact_id, "event.json"))
+        for artifact_id in project.artifacts.list_ids(artifact_type="grounded-world-prediction")
+    }
+    stages = sorted(event["stage"] for event in events.values())
+    assert stages == ["intent", "intent", "rejection", "response", "response", "verdict"]
+    (verdict,) = (event for event in events.values() if event["stage"] == "verdict")
+    assert verdict["payload"]["verdict"]["allowed"] is True
+    for artifact_id in events:
+        inputs = project.artifacts.read(artifact_id).manifest.inputs
+        assert reference in inputs

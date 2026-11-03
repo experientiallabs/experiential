@@ -33,6 +33,7 @@ from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.evidence_reading import EvidenceReader, ReadingPolicy
+from exp.simulation.rules.model import Predicate, Rule, RuleBook
 from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
 from exp.simulation.world_model.prediction_reading import PredictionResolver
@@ -50,6 +51,7 @@ def world_fixture(
     maximum_reasks: int = 0,
     facts: InstanceFacts | None = None,
     facts_version: int = 0,
+    rule_book: RuleBook | None = None,
 ) -> tuple[ExecutableWorldRuntime, list[PredictorEvent], list[JsonObject]]:
     """Use the real grounded prompt/parser with scripted provider responses, never native truth."""
     predictor, _, _ = _runtime("", capabilities=ModelCapabilities(supports_tools=True))
@@ -120,8 +122,104 @@ def world_fixture(
         complete=complete,
         record=events.append,
         maximum_reasks=maximum_reasks,
+        rule_book=rule_book,
     )
     return ExecutableWorldRuntime(manifest, factory, owner="simulated"), events, requests
+
+
+def escalation_rules() -> RuleBook:
+    """One supported effect rule: escalating leaves the ticket status escalated."""
+    return RuleBook(
+        contracts={},
+        rules=(
+            Rule(
+                rule_id="escalate.status",
+                tool="escalate",
+                kind="effect",
+                statement="Escalating a ticket sets its status to escalated.",
+                predicate=Predicate.model_validate(
+                    {
+                        "op": "eq",
+                        "left": {"scope": "after", "path": "/tickets/status"},
+                        "right": {"value": "escalated"},
+                    }
+                ),
+                status="supported",
+                support=3,
+                contradiction=0,
+            ),
+        ),
+    )
+
+
+def status_edit(value: str) -> list[JsonObject]:
+    """One proposed edit setting the ticket status."""
+    return [{"op": "set", "path": ["domains", "tickets", "status"], "value": value}]
+
+
+def test_rule_breaking_proposal_is_not_committed_and_is_reasked_with_the_broken_rule() -> None:
+    """The rules refuse a wrong effect, the re-ask carries the rule, and the verdict is kept."""
+    runtime, events, requests = world_fixture(
+        [status_edit("closed"), status_edit("escalated")],
+        maximum_reasks=1,
+        rule_book=escalation_rules(),
+    )
+    with runtime.open(_task("escalate")) as world:
+        observation = world.execute(ToolCall(name="escalate", call_id="call", arguments={}))
+        saved = world.checkpoint()
+    assert observation.metadata["refused_proposals"] == 1
+    assert json.loads(saved.image.parts["predictor.json"])["state"]["tickets"] == {
+        "status": "escalated"
+    }
+    assert [event.stage for event in events] == [
+        "intent",
+        "response",
+        "rejection",
+        "intent",
+        "response",
+        "verdict",
+    ]
+    rejection = events[2].payload["reason"]
+    assert isinstance(rejection, str)
+    assert "breaks environment rules" in rejection and "escalate.status" in rejection
+    assert "escalate.status" in json.dumps(requests[1])
+    verdict = events[-1].payload["verdict"]
+    assert isinstance(verdict, dict) and verdict["allowed"] is True
+
+
+def test_exhausted_rule_reasks_fail_without_committing() -> None:
+    """A proposal that keeps breaking a rule fails the step like any unusable proposal."""
+    runtime, events, requests = world_fixture(
+        [status_edit("closed"), status_edit("closed")],
+        maximum_reasks=1,
+        rule_book=escalation_rules(),
+    )
+    with runtime.open(_task("escalate")) as world:
+        initial = world.checkpoint()
+        with pytest.raises(ValueError, match="breaks environment rules"):
+            world.execute(ToolCall(name="escalate", call_id="call", arguments={}))
+        assert world.checkpoint() == initial
+    assert len(requests) == 2
+    assert [e.stage for e in events].count("rejection") == 2
+    assert "verdict" not in [e.stage for e in events]
+
+
+def test_rule_book_binds_the_definition_only_when_present() -> None:
+    """Without rules the definition, checkpoint and evidence are those of an unchecked world."""
+    plain, plain_events, _ = world_fixture([status_edit("closed")])
+    checked, _, _ = world_fixture([status_edit("escalated")], rule_book=escalation_rules())
+    assert isinstance(plain.factory, GroundedWorldFactory)
+    assert isinstance(checked.factory, GroundedWorldFactory)
+    assert "rule_book_sha256" not in plain.factory.definition
+    assert checked.factory.definition == {
+        **plain.factory.definition,
+        "rule_book_sha256": sha256_json(escalation_rules()),
+    }
+    with plain.open(_task("escalate")) as world:
+        world.execute(ToolCall(name="escalate", call_id="call", arguments={}))
+        image = world.checkpoint().image
+    assert json.loads(image.parts["predictor.json"])["state"]["tickets"] == {"status": "closed"}
+    assert [event.stage for event in plain_events] == ["intent", "response"]
 
 
 def test_refused_proposal_can_be_reasked_with_frozen_limit_and_no_state_change() -> None:

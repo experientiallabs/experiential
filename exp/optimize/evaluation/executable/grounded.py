@@ -7,6 +7,10 @@ native files. Private probes here describe simulated state, never native truth.
 Instance facts are declared explicitly in the definition, with the fidelity-owned
 ``ReplayFacts`` model and its validation and reservation rules. They condition every
 prediction exactly as in fidelity replay and are never derived from native state.
+
+A rule book is bound the same way: the definition pins one immutable artifact holding the
+book as ``rules.json``, and the runtime verifies that exact artifact before every proposal is
+judged against it.
 """
 
 import json
@@ -25,7 +29,8 @@ from exp.common.core.artifacts import (
     sha256_json,
 )
 from exp.common.models import ModelCatalog, ModelRequest, ReasoningEffort, load_model_catalog
-from exp.common.project import ProjectStore
+from exp.common.project import ArtifactStore, ProjectStore
+from exp.common.project.manifests import artifact_input
 from exp.common.release_revision import installed_execution_revision
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
@@ -52,6 +57,8 @@ from exp.simulation.development_scope import require_development_task
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
+from exp.simulation.rules.model import RuleBook
+from exp.simulation.rules.rulebook import RULES_JSON
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
 from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
@@ -87,6 +94,10 @@ class GroundedRuntimeDefinition(ContractModel):
             same physical budget. Never retries unknown outcomes or a valid scored result.
         maximum_physical_attempts: Cumulative durable ceiling, including query/recall retries.
         deadline: Shared deadline for every provider call made by this definition.
+        rule_book: Optional immutable artifact holding a learned rule book as ``rules.json``.
+            Every proposal must satisfy its supported rules before it commits; a rejected
+            proposal is re-asked with the broken rules within ``maximum_reasks``. Absent, the
+            definition and every derived identity are unchanged.
     """
 
     task: TaskCase
@@ -109,6 +120,7 @@ class GroundedRuntimeDefinition(ContractModel):
     maximum_reasks: int = Field(default=0, ge=0, le=3, strict=True)
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
+    rule_book: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _starting_facts_only(self) -> Self:
@@ -179,6 +191,29 @@ def trial_runtime(
     return _runtime(project, spec, provider_grant)
 
 
+def load_rule_book(store: ArtifactStore, reference: ArtifactInput) -> RuleBook:
+    """Read the rule book of one exact immutable artifact.
+
+    Args:
+        store: Project artifact store.
+        reference: The artifact and its manifest digest; the manifest digests ``rules.json``.
+
+    Returns:
+        The parsed rule book.
+
+    Raises:
+        ValueError: The artifact's manifest digest differs from the reference, or it holds no
+            valid ``rules.json``.
+    """
+    stored = store.read(reference.artifact_id)
+    if artifact_input(stored.manifest) != reference:
+        raise ValueError(f"rule book artifact {reference.artifact_id} manifest digest changed")
+    payload = stored.payloads.get(RULES_JSON)
+    if payload is None:
+        raise ValueError(f"rule book artifact {reference.artifact_id} holds no {RULES_JSON}")
+    return RuleBook.model_validate_json(payload)
+
+
 def preflight_grounded_runtime(project: ProjectStore, spec: GroundedRuntimeDefinition) -> None:
     """Check a definition against the project without credentials, runtime state or calls.
 
@@ -188,15 +223,16 @@ def preflight_grounded_runtime(project: ProjectStore, spec: GroundedRuntimeDefin
 
     Raises:
         ValueError: The task is not development data, the state or probe disagrees with the
-            manifest, the catalog changed, or a provider wire is not admitted.
+            manifest, the catalog changed, a provider wire is not admitted, or the rule book
+            artifact differs from its reference.
     """
     _checked(project, spec)
 
 
 def _checked(
     project: ProjectStore, spec: GroundedRuntimeDefinition
-) -> tuple[ModelCatalog, GroundedWorldModelArtifact, str | None]:
-    """Run every credential-free check and return the catalog, simulator and embedder alias."""
+) -> tuple[ModelCatalog, GroundedWorldModelArtifact, str | None, RuleBook | None]:
+    """Run every credential-free check and return the catalog, simulator, embedder and rules."""
     require_development_task(project.artifacts, spec.task)
     if spec.task.reference_answer is not None:
         raise ValueError("grounded executable tasks must not contain private expected answers")
@@ -230,7 +266,10 @@ def _checked(
             raise ValueError("prediction reader requires the admitted native decision wire")
         if spec.prediction_reading.policy.rounds > 2:
             raise ValueError("prediction reading permits at most two rounds")
-    return catalog, artifact, embedder_alias
+    rule_book = (
+        None if spec.rule_book is None else load_rule_book(project.artifacts, spec.rule_book)
+    )
+    return catalog, artifact, embedder_alias, rule_book
 
 
 def _runtime(
@@ -239,7 +278,7 @@ def _runtime(
     provider_grant: ProviderGrant | None = None,
 ) -> ContinuationRuntime:
     """Compose identical state/predictor definitions under one explicitly selected call ledger."""
-    catalog, artifact, embedder_alias = _checked(project, spec)
+    catalog, artifact, embedder_alias, rule_book = _checked(project, spec)
     revision = installed_execution_revision()
     identity_fields: JsonObject = {"definition": spec.model_dump(mode="json"), "code": revision}
     if provider_grant is not None:
@@ -373,7 +412,8 @@ def _runtime(
                 inputs=tuple(
                     sorted(
                         (spec.world_model,)
-                        + (() if provider_grant is None else (provider_grant.registration,)),
+                        + (() if provider_grant is None else (provider_grant.registration,))
+                        + (() if spec.rule_book is None else (spec.rule_book,)),
                         key=lambda reference: reference.artifact_id,
                     )
                 ),
@@ -398,6 +438,7 @@ def _runtime(
         record=record,
         memory=memory,
         maximum_reasks=spec.maximum_reasks,
+        rule_book=rule_book,
     )
 
     def probe(checkpoint: WorldCheckpoint) -> JsonObject:

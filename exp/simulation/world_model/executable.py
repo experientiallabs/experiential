@@ -8,6 +8,11 @@ Instance facts are bound by the engine, not stored as state: every prediction re
 engine's conditioning facts for its state version in the separate ``instance_facts`` channel,
 exactly as fidelity replay delivers them. They are never a writable domain, never part of a
 checkpoint image, and they change the frozen definition only when present.
+
+An optional rule book judges every proposal before it commits, with ``check_proposed_transition``
+over the simulated domains before and after, the action and its proposed reply. A proposal the
+rules reject is refused like any unusable proposal and re-asked with the broken rules as feedback.
+The rule book changes the frozen definition only when present.
 """
 
 import json
@@ -38,7 +43,9 @@ from exp.runtime.environments.worlds import WorldContext
 from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.state_policy import StateEditPolicy
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
-from exp.simulation.engines.transition import Completion
+from exp.simulation.engines.transition import Completion, ProposedObservation
+from exp.simulation.rules.checker import TransitionVerdict, check_proposed_transition
+from exp.simulation.rules.model import RuleBook, Transition
 from exp.simulation.world_model.frozen_memory import TaskView
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
 
@@ -48,12 +55,13 @@ class PredictorEvent(ContractModel):
 
     Attributes:
         operation_id: Unique draw, with intent durably retained before provider dispatch.
-        stage: Intended request, returned raw response or explicit contract refusal.
+        stage: Intended request, returned raw response, explicit contract refusal, or the
+            allowing rule verdict of a proposal about to commit in a rule-checked world.
         payload: Original bounded request/evidence or response before parsing.
     """
 
     operation_id: str
-    stage: Literal["intent", "response", "rejection"]
+    stage: Literal["intent", "response", "rejection", "verdict"]
     payload: JsonObject
 
 
@@ -70,6 +78,9 @@ class GroundedWorldFactory:
         memory: Optional already eligible, pinned memory view; never changed by this runtime.
         maximum_reasks: Finite extra proposals after known contract refusal. All attempts
             consume the existing physical budget and remain in private evidence.
+        rule_book: Optional learned rules every proposal must satisfy before it commits. A
+            proposal they reject is refused and re-asked with the verdict's reasons; the
+            allowing verdict of a committed proposal is recorded as a ``verdict`` event.
     """
 
     def __init__(
@@ -82,6 +93,7 @@ class GroundedWorldFactory:
         record: Callable[[PredictorEvent], None],
         memory: TaskView | None = None,
         maximum_reasks: int = 0,
+        rule_book: RuleBook | None = None,
     ) -> None:
         """Bind one task without retrieving, loading credentials or calling a provider."""
         if engine.output_protocol != "json-tool":
@@ -92,6 +104,8 @@ class GroundedWorldFactory:
         if type(maximum_reasks) is not int or not 0 <= maximum_reasks <= 3:
             raise ValueError("maximum_reasks must be an integer between zero and three")
         self.maximum_reasks = maximum_reasks
+        self.rule_book = None if rule_book is None else rule_book.model_copy(deep=True)
+        self._rule_book_identity = None if rule_book is None else sha256_json(rule_book)
         self._identity = engine.identity
         self._memory_identity = None if memory is None else memory.identity
         self._facts_bound = engine.facts is not None
@@ -116,6 +130,12 @@ class GroundedWorldFactory:
                 if self._facts_bound
                 else {}
             ),
+            # Bound only when rules judge proposals, so unchecked definitions are unchanged.
+            **(
+                {"rule_book_sha256": self._rule_book_identity}
+                if self._rule_book_identity is not None
+                else {}
+            ),
         }
 
     def _check_state(self, state: JsonObject) -> None:
@@ -137,6 +157,10 @@ class GroundedWorldFactory:
             sha256_json(self.definition) != self._definition_identity
             or self.engine.identity != self._identity
             or (self.memory is not None and self.memory.identity != self._memory_identity)
+            or (
+                self.rule_book is not None
+                and sha256_json(self.rule_book) != self._rule_book_identity
+            )
         ):
             raise ValueError("grounded executable predictor or memory changed after freezing")
 
@@ -302,7 +326,9 @@ class _GroundedWorldBackend:
             self.factory.record(PredictorEvent(operation_id=logical, stage="response", payload=raw))
             self.factory._require_frozen()
             try:
-                domains, observation = self._validate_proposal(raw, action, state, state_policy)
+                domains, observation, verdict = self._validate_proposal(
+                    raw, action, state, state_policy
+                )
             except ValueError as error:
                 reason = type(error).__name__ + ": " + redact_secret_text(str(error))[0][:2000]
                 self.factory.record(
@@ -320,6 +346,18 @@ class _GroundedWorldBackend:
                     raise
                 body = reask_proposal(body, raw, reason)
                 continue
+            if verdict is not None:
+                self.factory.record(
+                    PredictorEvent(
+                        operation_id=logical,
+                        stage="verdict",
+                        payload={
+                            "operation": operation,
+                            "attempt": attempt,
+                            "verdict": verdict.model_dump(mode="json"),
+                        },
+                    )
+                )
             observation = observation.model_copy(
                 update={
                     "metadata": {
@@ -366,8 +404,23 @@ class _GroundedWorldBackend:
         action: ToolCall,
         state: JsonObject,
         state_policy: StateEditPolicy,
-    ) -> tuple[JsonObject, Observation]:
-        """Check a saved proposal completely before changing state or conversation history."""
+    ) -> tuple[JsonObject, Observation, TransitionVerdict | None]:
+        """Check a saved proposal completely before changing state or conversation history.
+
+        Args:
+            raw: The provider's raw response.
+            action: The one action being simulated.
+            state: Visible domains and the environment clock delivered to the predictor.
+            state_policy: Writable and readable roots of this action.
+
+        Returns:
+            The complete next domains, the observation, and the allowing rule verdict, which
+            is None when no rule book is bound.
+
+        Raises:
+            ValueError: The proposal breaks the output contract, a schema, a reply binding, or
+                a supported rule. The message is the feedback of a re-ask.
+        """
         policy = self.factory.manifest.tool(action.name)
         proposal = self.factory.engine.parse(raw, (action,), current_state=state)
         if proposal.terminal or len(proposal.observations) != 1:
@@ -409,8 +462,52 @@ class _GroundedWorldBackend:
             action=action,
             domains=policy.domains(),
         )
-        return domains, observation
+        verdict = None
+        if self.factory.rule_book is not None:
+            verdict = _checked(self.factory.rule_book, action, self.state, domains, predicted)
+        return domains, observation, verdict
 
     def close(self) -> None:
         """Invalidate only this state owner, retaining durable evidence in the supplied sink."""
         self._closed = True
+
+
+def _checked(
+    book: RuleBook,
+    action: ToolCall,
+    before: JsonObject,
+    after: JsonObject,
+    observation: ProposedObservation,
+) -> TransitionVerdict:
+    """Judge one proposal by the rule book, refusing it when the verdict does not allow it.
+
+    Args:
+        book: Learned rules the proposal must satisfy.
+        action: The action of the step.
+        before: Every simulated domain before the action.
+        after: Every simulated domain the proposal would commit.
+        observation: The proposal's one observation; an error reply refuses the action.
+
+    Returns:
+        The allowing verdict, for the private evidence of the committed proposal.
+
+    Raises:
+        ValueError: The verdict does not allow the proposal. The message carries the verdict's
+            reasons for the re-ask.
+    """
+    verdict = check_proposed_transition(
+        book,
+        Transition(
+            before=deepcopy(before),
+            after=deepcopy(after),
+            action={"name": action.name, "arguments": deepcopy(action.arguments)},
+            observation=deepcopy(observation.reply),
+        ),
+        refused=observation.is_error,
+    )
+    if not verdict.allowed:
+        reasons = verdict.reasons or tuple(
+            f"rule {rule} is violated" for rule in verdict.violations
+        )
+        raise ValueError("proposed transition breaks environment rules: " + " ".join(reasons))
+    return verdict

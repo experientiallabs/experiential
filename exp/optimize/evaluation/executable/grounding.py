@@ -16,7 +16,13 @@ from typing import Literal, Self
 
 from pydantic import AwareDatetime, Field, model_validator
 
-from exp.common.core.artifacts import ContractModel, JsonObject, sha256_bytes, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactInput,
+    ContractModel,
+    JsonObject,
+    sha256_bytes,
+    sha256_json,
+)
 from exp.common.models import ReasoningEffort, load_model_catalog
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks import TaskCase, ToolSchema
@@ -54,6 +60,8 @@ class GroundedRuntimeRequest(ContractModel):
         reasoning_effort: Frozen predictor-only override; None keeps the catalog default.
         maximum_physical_attempts: The simulator's cumulative provider-attempt ceiling.
         deadline: Shared deadline for every simulator provider call.
+        rule_book: Optional immutable artifact holding a learned rule book as ``rules.json``;
+            the simulator then commits only proposals its supported rules allow.
     """
 
     task_id: str = Field(min_length=1)
@@ -70,6 +78,7 @@ class GroundedRuntimeRequest(ContractModel):
     )
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
+    rule_book: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _one_fact_source(self) -> Self:
@@ -130,8 +139,11 @@ def grounded_capture(project: ProjectStore, request: GroundedRuntimeRequest) -> 
         probe_paths=request.probe_paths,
         maximum_physical_attempts=request.maximum_physical_attempts,
         deadline=request.deadline,
+        rule_book=request.rule_book,
     )
     preflight_grounded_runtime(project, definition)
+    if request.rule_book is not None:
+        sources = (*sources, request.rule_book)
     runtime_file = Path(grounded.__file__)
     capture = CaptureDefinition(
         task=task,

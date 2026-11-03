@@ -161,3 +161,24 @@ def test_grounding_preserves_default_identity_and_pins_explicit_predictor_reason
     assert project.model_catalog_path.read_bytes() == unchanged_catalog
     with pytest.raises(ValueError, match="reasoning effort"):
         grounded_capture(project, request(task, memory="none", reasoning_effort="high"))
+
+
+def test_grounding_pins_an_explicit_rule_book_into_definition_and_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requested rule book joins the frozen definition and the capture sources, nothing else."""
+    from exp.optimize.evaluation.executable.grounded_test import pending_rules, save_rules
+
+    project = built(tmp_path, monkeypatch, learn=False)
+    task = development_tasks(project)[0]
+    ordinary = grounded_capture(project, request(task, memory="none"))
+    assert "rule_book" not in ordinary.configuration
+    reference = save_rules(project, pending_rules())
+    checked = grounded_capture(
+        project, request(task, memory="none", rule_book=reference.model_dump(mode="json"))
+    )
+    assert checked.configuration == {
+        **ordinary.configuration,
+        "rule_book": reference.model_dump(mode="json"),
+    }
+    assert checked.sources == (*ordinary.sources, reference)
