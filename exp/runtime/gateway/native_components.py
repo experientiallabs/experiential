@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
@@ -109,6 +109,46 @@ class SyncWriteLedger(Protocol):
         Certification defaults false and requires trusted admission without paid prework.
         Return true only after commit. Any prior attempt or uncertified terminal failure
         returns false; persistence failures raise instead of certifying.
+        """
+        ...
+
+
+@runtime_checkable
+class SettlementPricer(Protocol):
+    """Optional ledger capability: price a decided settlement before terminal bytes flush.
+
+    A write ledger that also implements this lets a live stream flush its
+    terminal frames once the settlement is priced, before it is durable; the
+    settlement then lands through ``finish_attempt`` with its usual retries,
+    recovery sweep and shutdown drain. A ledger without it (the local engine)
+    keeps every terminal frame behind a durable settlement.
+    """
+
+    def price_attempt(
+        self,
+        *,
+        attempt_id: AttemptId,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool = True,
+        first_token_at: datetime | None = None,
+        retry_after_seconds: int | None = None,
+        ratelimit_limit_requests: int | None = None,
+        ratelimit_remaining_requests: int | None = None,
+        ratelimit_limit_tokens: int | None = None,
+        ratelimit_remaining_tokens: int | None = None,
+        upstream_provider: str | None = None,
+        web_search_requests: int = 0,
+        tool_search_requests: int = 0,
+        service_tier: GatewayServiceTierSettlement | None = None,
+    ) -> None:
+        """Price one decided settlement, writing nothing.
+
+        Takes exactly the keywords the following ``finish_attempt`` receives,
+        so a host can describe the charge that write will record (for example
+        on the response) without waiting on its durable settlement. It must
+        neither write nor wait on settlement contention. Raising is safe: the
+        data plane then settles before any terminal byte.
         """
         ...
 

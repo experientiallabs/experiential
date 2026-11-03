@@ -32,8 +32,8 @@ use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
     emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
-    json_response, latin1_header, outward_event, read_body, settle_stream_end, sse_body_response,
-    stream_delivery::Delivery, with_app_identity,
+    json_response, latin1_header, outward_event, price_stream_end, read_body, settle_stream_end,
+    sse_body_response, stream_delivery::Delivery, with_app_identity,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -951,16 +951,14 @@ async fn stream_responses(
             )
             .await
             .is_ok();
-        // Settle every terminal once, including a failed continuation write.
-        let settled = settle_stream_end(
-            &mut guard,
-            terminal.as_ref(),
-            usage.as_ref(),
-            &tool_names,
-            false,
-        )
-        .await;
+        // Price every terminal once, including a failed continuation write;
+        // a failed quote settles here, before any terminal frame.
+        let settled = match terminal.as_ref() {
+            Some(event) => price_stream_end(&mut guard, event, usage.as_ref(), &tool_names).await,
+            None => true,
+        };
         if !retained || !settled {
+            guard.settle_priced().await;
             return;
         }
         if matches!(terminal, Some(Event::Failed(_))) {
@@ -978,6 +976,11 @@ async fn stream_responses(
             terminal_frames.into_iter().map(Bytes::from).collect(),
         )
         .await;
+        // Close the body before the durable write: the caller holds its
+        // terminal frames while settlement lands.
+        drop(delivery);
+        drop(sender);
+        guard.settle_priced().await;
     });
 
     let body = Body::from_stream(ReceiverStream::new(receiver));
