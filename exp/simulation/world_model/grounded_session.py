@@ -44,6 +44,8 @@ from exp.simulation.retrieval import load_rag_index
 from exp.simulation.retrieval.contracts import RAGTransition
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
 from exp.simulation.retrieval.selection import EvidencePolicy
+from exp.simulation.rules.checker import TransitionVerdict
+from exp.simulation.rules.model import Transition
 from exp.simulation.world_model.checkpoints import WorldCheckpoint, load_world_checkpoint
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
 from exp.simulation.world_model.experience_memory import retrieved_source
@@ -501,6 +503,7 @@ def open_grounded_session(
     facts: InstanceFacts | None = None,
     facts_version: int = 0,
     prediction_reader: PredictionPreparation | None = None,
+    transition_checker: Callable[[Transition, bool], TransitionVerdict] | None = None,
 ) -> DurableWorldModelSession:
     """Open one candidate world using public context and the existing guarded store.
 
@@ -537,6 +540,8 @@ def open_grounded_session(
         facts_version: State version of the session's first action.
         prediction_reader: Optional durable step that rewrites each framed prediction request,
             such as session-scoped guidance.
+        transition_checker: Optional learned-rule check of each proposed transition before it
+            commits; a rejected proposal is re-asked or refused. None leaves commits unchecked.
 
     Returns:
         Durable session; no reference state or tool outcomes are used to initialize it.
@@ -653,6 +658,7 @@ def open_grounded_session(
         clock=clock,
         resumption=resumption,
         preparation_dispatches=preparation_dispatches,
+        transition_checker=transition_checker,
         evaluation_context={
             "task_context": task.initial_context,
             "sources": {

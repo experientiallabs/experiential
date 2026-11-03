@@ -88,7 +88,7 @@ PROTOCOLS = (
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "fe55f4aca8ba262638d1c8f3d5c3e56a85529185877fb21483ae095655efc94e",
+        "185fec9723a9df3dc5e482ddbc598418b5112559a1262383d39e430fd35e3749",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",
@@ -284,6 +284,16 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.contracts",
         ),
         "ae695c1584c24f769cb7edc6a04e4c2b630912860fda92a1cd23034ccfd31164",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
+        "rule-extraction-v1",
+        (
+            "exp.optimize.evaluation.rules.extraction",
+            "exp.simulation.rules.contracts:trajectory_view",
+            "exp.simulation.rules.model",
+        ),
+        "e31cd3f6e6a2b24550d7bd7f5bc442d2edeec394379ae007972cedd87b81c477",
     ),
 )
 
