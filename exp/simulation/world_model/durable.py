@@ -39,13 +39,20 @@ from exp.runtime.sessions.records import SessionBinding, SessionRecord, StepStat
 from exp.runtime.sessions.store import SessionStore
 from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.reconstructed import InformationChannels, ReconstructedTextEngine
-from exp.simulation.engines.transition import Completion, PreparedPrediction, TransitionEngine
+from exp.simulation.engines.transition import (
+    Completion,
+    PreparedPrediction,
+    ProposedObservation,
+    TransitionEngine,
+)
 from exp.simulation.reconstruction.models import (
     InitializationArtifact,
     ReconstructionBundle,
     validate_state,
 )
 from exp.simulation.retrieval.selection import EvidencePolicy
+from exp.simulation.rules.checker import TransitionVerdict
+from exp.simulation.rules.model import Transition
 from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.session_research import SessionResearch
 
@@ -108,6 +115,7 @@ class DurableWorldModelSession:
         research: SessionResearch | None = None,
         resumption: Resumption | None = None,
         preparation_dispatches: bool = True,
+        transition_checker: Callable[[Transition, bool], TransitionVerdict] | None = None,
     ) -> None:
         """Create or reopen the exact same world; no reference state is accepted.
 
@@ -115,6 +123,16 @@ class DurableWorldModelSession:
         open; without it such a step blocks the session. ``preparation_dispatches`` says
         whether preparing a step can send requests (query embeddings or memory-recall
         decisions), so re-preparing an interrupted step is recorded as a retrieval retry.
+
+        ``transition_checker`` is an optional deterministic judge of each proposal, such as
+        ``check_proposed_transition`` bound to a rule book. It receives the state before, the
+        proposed state after, the action and its proposed reply, plus whether the proposal
+        refused the action (an error reply). A proposal it does not allow is refused like any
+        invalid proposal: it is never committed, it is asked again with the verdict's reasons
+        while ``maximum_reasks`` allows, and the step fails after that. The committed
+        transition's evidence records the accepted verdict. A checked session executes one
+        action per step. The checker is not part of the session binding, so a caller that
+        resumes a session supplies the same checker.
         """
         if binding.deadline != policy.deadline:
             raise ValueError("session binding and policy deadline differ")
@@ -122,6 +140,7 @@ class DurableWorldModelSession:
         self._research = research
         self._resumption = resumption
         self._preparation_dispatches = preparation_dispatches
+        self._transition_checker = transition_checker
         self._evaluation_context = copy.deepcopy(evaluation_context or {})
         self._engine_identity = engine.identity
         self._binding, self._policy, self._complete = binding, policy, complete
@@ -244,6 +263,8 @@ class DurableWorldModelSession:
         """
         if not actions or len({action.call_id for action in actions}) != len(actions):
             raise ValueError("ordered actions require distinct nonempty tool call IDs")
+        if self._transition_checker is not None and len(actions) != 1:
+            raise ValueError("a rule-checked session executes exactly one action per step")
         if self._engine.identity != self._engine_identity:
             raise ValueError("frozen engine or evidence policy changed")
         fingerprint = sha256_json(
@@ -320,6 +341,7 @@ class DurableWorldModelSession:
                 else self._resumption.recorder("prediction", operation_id)
             )
             body, logical, refusals = prepared.body, scope, []
+            verdict: TransitionVerdict | None = None
             while True:
                 saved = None if left is None else self._saved(logical + "-proposal")
                 if saved is not None:
@@ -359,6 +381,14 @@ class DurableWorldModelSession:
                                 metadata={"call_id": row.call_id},
                             )
                         )
+                    if self._transition_checker is not None:
+                        verdict = _checked(
+                            self._transition_checker,
+                            actions[0],
+                            state,
+                            next_state,
+                            proposal.observations,
+                        )
                     if self._engine.identity != self._engine_identity:
                         raise ValueError("engine identity changed during prediction")
                     break
@@ -380,6 +410,13 @@ class DurableWorldModelSession:
             response: JsonObject = {
                 "observations": [row.model_dump(mode="json") for row in observations]
             }
+            evidence: JsonObject = (
+                {**prepared.evidence, "refused_proposals": refusals}
+                if refusals
+                else prepared.evidence
+            )
+            if verdict is not None:
+                evidence = {**evidence, "transition_verdict": verdict.model_dump(mode="json")}
             transition: JsonObject = {
                 "operation_id": operation_id,
                 "actions": [a.model_dump(mode="json") for a in actions],
@@ -387,9 +424,7 @@ class DurableWorldModelSession:
                 "before": None,
                 "after": None,
                 "observations": response["observations"],
-                "evidence": {**prepared.evidence, "refused_proposals": refusals}
-                if refusals
-                else prepared.evidence,
+                "evidence": evidence,
                 "proposal": proposal_input.model_dump(mode="json"),
             }
             self._store.complete_step(
@@ -470,6 +505,49 @@ def _commit_edits(
             value={"actions": transition["actions"], "observations": transition["observations"]},
         ),
     )
+
+
+def _checked(
+    checker: Callable[[Transition, bool], TransitionVerdict],
+    action: ToolCall,
+    before: JsonObject,
+    after: JsonObject,
+    observations: Sequence[ProposedObservation],
+) -> TransitionVerdict:
+    """Judge one single-action proposal, refusing it when the verdict does not allow it.
+
+    Args:
+        checker: Deterministic judge over the transition and whether the proposal refused.
+        action: The one action of the step.
+        before: Business state before the action.
+        after: Proposed business state after it.
+        observations: The proposal's observations; exactly one is accepted.
+
+    Returns:
+        The allowing verdict, for the committed transition's evidence.
+
+    Raises:
+        ValueError: The proposal has another observation count, or the verdict does not allow
+            it. The message carries the verdict's reasons for the re-ask.
+    """
+    if len(observations) != 1:
+        raise ValueError("a rule-checked proposal requires exactly one observation")
+    observation = observations[0]
+    verdict = checker(
+        Transition(
+            before=copy.deepcopy(before),
+            after=copy.deepcopy(after),
+            action={"name": action.name, "arguments": copy.deepcopy(action.arguments)},
+            observation=copy.deepcopy(observation.reply),
+        ),
+        observation.is_error,
+    )
+    if not verdict.allowed:
+        reasons = verdict.reasons or tuple(
+            f"rule {rule} is violated" for rule in verdict.violations
+        )
+        raise ValueError("proposed transition breaks environment rules: " + " ".join(reasons))
+    return verdict
 
 
 def _business_state(store: SessionStore, ref: StateRef) -> JsonObject:
