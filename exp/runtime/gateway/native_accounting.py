@@ -51,6 +51,7 @@ from exp.runtime.gateway.native_accounting_recovery import (
     recover_until_stopped,
     recovery_drained,
 )
+from exp.runtime.gateway.native_admission_metrics import AdmissionMetrics
 from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
@@ -119,7 +120,7 @@ TOOL_SEARCH_ROUND: Final = "tool_search_round"
 """Dispatch reason of a same-rung re-dial after a gateway tool-search round."""
 
 
-class NativeAttemptAccounting:
+class NativeAttemptAccounting(AdmissionMetrics):
     """Registry of admitted requests and their durable attempt settlements.
 
     A lock protects Rust callbacks; a background sweep owns abandoned reservations.
@@ -328,37 +329,6 @@ class NativeAttemptAccounting:
                 self._sweep_abandoned_cancelled,
                 len(self._inflight),
             )
-
-    def record_admission_coercions(self, count: int) -> None:
-        """Count disclosed request coercions applied at admission.
-
-        Args:
-            count: Number of disclosed substitutions on one admission.
-        """
-        with self._lock:
-            self._admission_parameter_coercions += count
-
-    def admission_parameter_coercions(self) -> int:
-        """Return the total disclosed request coercions for metrics."""
-        with self._lock:
-            return self._admission_parameter_coercions
-
-    def record_admission_rung_skips(self, dead_count: int, *, lead_skipped: bool) -> None:
-        """Count admission-time dead-rung skips for the metrics snapshot.
-
-        Args:
-            dead_count: Number of certified rungs skipped as dead at admission.
-            lead_skipped: Whether the skipped set included the lead rung.
-        """
-        with self._lock:
-            self._admission_dead_rungs_skipped += dead_count
-            if lead_skipped:
-                self._admission_lead_rungs_skipped += 1
-
-    def admission_rung_skips(self) -> tuple[int, int]:
-        """Return ``(lead_rungs_skipped, dead_rungs_skipped)`` for metrics."""
-        with self._lock:
-            return (self._admission_lead_rungs_skipped, self._admission_dead_rungs_skipped)
 
     def register(self, entry: InflightRequest) -> None:
         """Track one accepted request until its terminal settlement."""
