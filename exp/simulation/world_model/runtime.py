@@ -595,6 +595,7 @@ def persist_memory_first_world_model(
         top_k=artifact.top_k,
         knowledge=artifact.knowledge,
         original_evidence="none",
+        construction_scope=artifact.construction_scope,
     )
     return artifact_input(persisted.manifest)
 
@@ -665,7 +666,7 @@ def persist_fit_only_world_model(
     if artifact_input(fit.manifest) != fit_rag_input:
         raise ValueError("fit RAG manifest differs from its selected input")
     _require_fit_subset(store, artifact, fit.index)
-    return _persist_over_index(store, artifact, fit_rag_input)
+    return _persist_over_index(store, artifact, fit_rag_input, artifact.construction_scope)
 
 
 def persist_scoped_world_model(
@@ -683,35 +684,50 @@ def persist_scoped_world_model(
     ``construction_scope`` is given, every trace the world model's learned knowledge was
     constructed from must lie inside it and inside the build's fit evidence. Construction and
     retrieval scopes are independent and may overlap. The retrieval scope is recorded in the
-    scoped index, which becomes the new world model's index; the result keeps the exact model,
-    prompt, knowledge, reranker and top-k, and its identity is content-derived.
+    scoped index, which becomes the new world model's index. The construction scope, given or
+    already recorded on the world model, is verified against the serving index and recorded on
+    the result; a world model that already records one accepts only that same scope. The result
+    keeps the exact model, prompt, knowledge, reranker and top-k, and its identity is
+    content-derived.
 
     Args:
         store: Project-local immutable artifact store.
         world_model_input: Exact completed grounded world-model manifest pointer.
         scoped_rag_input: Fit-only index built with ``corpus_scope=retrieval_scope``.
         retrieval_scope: The scope the caller requires the index to declare.
-        construction_scope: Optional scope the world model's construction corpus must lie in.
+        construction_scope: Optional scope the world model's construction corpus must lie in;
+            omitted, the world model's recorded construction scope, if any, is used.
 
     Returns:
         Manifest pointer of the scoped grounded world model.
 
     Raises:
         ValueError: The index declares another scope or differs from the in-scope fit subset,
-            or the construction corpus is missing, held out, or outside its scope.
+            the construction scope differs from the recorded one, or the construction corpus
+            is missing, held out, or outside its scope.
     """
     artifact = _load_verified_artifact(store, world_model_input)
     scoped = load_rag_index(store, scoped_rag_input.artifact_id)
     if artifact_input(scoped.manifest) != scoped_rag_input:
         raise ValueError("scoped RAG manifest differs from its selected input")
+    recorded = artifact.construction_scope
+    if recorded is not None and construction_scope not in (None, recorded):
+        raise ValueError(
+            f"world model records construction scope {recorded.name!r}; pass that exact scope "
+            "or omit construction_scope"
+        )
     serving = _require_fit_subset(store, artifact, scoped.index, scope=retrieval_scope)
-    if construction_scope is not None:
-        _require_construction_scope(artifact, serving, construction_scope)
-    return _persist_over_index(store, artifact, scoped_rag_input)
+    construction = recorded if construction_scope is None else construction_scope
+    if construction is not None:
+        _require_construction_scope(artifact, serving, construction)
+    return _persist_over_index(store, artifact, scoped_rag_input, construction)
 
 
 def _persist_over_index(
-    store: ArtifactStore, artifact: GroundedWorldModelArtifact, rag_input: ArtifactInput
+    store: ArtifactStore,
+    artifact: GroundedWorldModelArtifact,
+    rag_input: ArtifactInput,
+    construction_scope: CorpusScope | None,
 ) -> ArtifactInput:
     """Persist a verified world model's exact protocol over another verified index.
 
@@ -719,6 +735,7 @@ def _persist_over_index(
         store: Project-local immutable artifact store.
         artifact: Verified grounded world model whose protocol is kept.
         rag_input: Index already checked against the world model's serving index.
+        construction_scope: Verified construction scope to record, or None for none.
 
     Returns:
         Manifest pointer of the persisted world model.
@@ -734,6 +751,7 @@ def _persist_over_index(
         knowledge=artifact.knowledge,
         selection_policy_sha256=artifact.selection_policy_sha256,
         original_evidence=artifact.original_evidence,
+        construction_scope=construction_scope,
     )
     return artifact_input(persisted.manifest)
 
@@ -903,6 +921,7 @@ def _load_verified_artifact(
         knowledge=artifact.knowledge,
         selection_policy_sha256=artifact.selection_policy_sha256,
         original_evidence=artifact.original_evidence,
+        construction_scope=artifact.construction_scope,
     )
     if stable_id("grounded-world-model", content) != artifact_id:
         raise ValueError("grounded world-model artifact ID differs from its complete content")

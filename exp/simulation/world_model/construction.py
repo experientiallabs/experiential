@@ -22,7 +22,7 @@ from exp.simulation.reconstruction.library import (
 from exp.simulation.reconstruction.models import ReconstructionBundle
 from exp.simulation.reconstruction.revision import ResearchNote
 from exp.simulation.reconstruction.sources import from_canonical_traces
-from exp.simulation.retrieval import load_rag_index
+from exp.simulation.retrieval import CorpusScope, RAGLineageBinding, load_rag_index
 from exp.simulation.retrieval.store import LoadedRAGIndex
 from exp.simulation.world_model.artifact import (
     PersistedGroundedWorldModel,
@@ -93,6 +93,8 @@ def construct_world_model(
     library: LibrarySnapshot | None = None,
     select_library: Callable[[JsonObject, tuple[LibraryEntry, ...]], tuple[str, ...]] | None = None,
     library_top_k: int = 5,
+    construction_scope: CorpusScope | None = None,
+    lineage_bindings: Sequence[RAGLineageBinding] | None = None,
 ) -> ConstructedWorldModel:
     """Infer behavior from canonical source episodes and bind it to normal simulation.
 
@@ -119,11 +121,28 @@ def construct_world_model(
         library: Prior shared base, queried using the new target traces only.
         select_library: Explicit selection policy when a prior library is provided.
         library_top_k: Maximum prior entries delivered to construction.
+        construction_scope: Optional declared construction corpus. Given, ``traces`` must be
+            exactly the in-scope fit traces of the index's sources, never a held-out one, and
+            the scope is recorded on the simulator; ``serving_rag`` may then expose a
+            different, possibly overlapping, set of episodes. Omitted, construction and
+            retrieval must expose the same complete source episode set.
+        lineage_bindings: The build's complete trace lineage assignment, used with
+            ``construction_scope`` to resolve traces the index holds no transition for.
 
     Returns:
         Generated reconstruction and executable simulator artifact.
+
+    Raises:
+        ValueError: Traces differ from the frozen corpus or from the in-scope fit traces, the
+            scope names unknown or held-out evidence, or construction fails.
     """
-    _verified_trace_index(store, serving_rag, traces)
+    _verified_trace_index(
+        store,
+        serving_rag,
+        traces,
+        construction_scope=construction_scope,
+        lineage_bindings=lineage_bindings,
+    )
     ids = tuple(trace.trace_id for trace in traces)
     if any(
         not note.source_trace_ids or not set(note.source_trace_ids) <= set(ids)
@@ -177,6 +196,7 @@ def construct_world_model(
         top_k=top_k,
         knowledge=knowledge,
         selection_policy_sha256=selection_policy_sha256,
+        construction_scope=construction_scope,
     )
     remembered = remember_reconstruction(
         store,
@@ -217,6 +237,8 @@ def ground_world_model_from_traces(
     code_revision: str,
     top_k: int,
     selection_policy_sha256: str | None = None,
+    construction_scope: CorpusScope | None = None,
+    lineage_bindings: Sequence[RAGLineageBinding] | None = None,
 ) -> TraceGroundedWorldModel:
     """Prepare direct simulation without a model-generated construction gate.
 
@@ -230,6 +252,12 @@ def ground_world_model_from_traces(
         code_revision: Exact implementation identity.
         top_k: Maximum observed examples selected per action before context packing.
         selection_policy_sha256: Optional explicit evidence-selection policy identity.
+        construction_scope: Optional declared construction corpus. Given, ``traces`` must be
+            exactly the in-scope fit traces, the observed tool inventory comes only from their
+            transitions, and the scope is recorded on the simulator. Omitted, the index must
+            hold exactly these episodes.
+        lineage_bindings: The build's complete trace lineage assignment, used with
+            ``construction_scope`` to resolve traces the index holds no transition for.
 
     Returns:
         Normal simulator artifact and permissive observed tool inventory. No constructor
@@ -237,8 +265,18 @@ def ground_world_model_from_traces(
         manufactured. Task binding discards externally supplied native tool descriptions.
         Current-instance initialization remains the caller's explicit information treatment.
     """
-    rag = _verified_trace_index(store, serving_rag, traces)
-    tools = observed_tool_schemas(observed_calls(rag.transitions))
+    rag = _verified_trace_index(
+        store,
+        serving_rag,
+        traces,
+        construction_scope=construction_scope,
+        lineage_bindings=lineage_bindings,
+    )
+    transitions = rag.transitions
+    if construction_scope is not None:
+        read = {trace.trace_id for trace in traces}
+        transitions = tuple(item for item in transitions if item.trace_id in read)
+    tools = observed_tool_schemas(observed_calls(transitions))
     if not tools:
         raise ValueError("No observed tool calls; provide source episodes with tool results")
     knowledge = SimulationKnowledge(
@@ -260,17 +298,43 @@ def ground_world_model_from_traces(
         top_k=top_k,
         knowledge=knowledge,
         selection_policy_sha256=selection_policy_sha256,
+        construction_scope=construction_scope,
     )
     return TraceGroundedWorldModel(tools=tools, simulator=simulator)
 
 
 def _verified_trace_index(
-    store: ArtifactStore, serving_rag: ArtifactInput, traces: Sequence[Trace]
+    store: ArtifactStore,
+    serving_rag: ArtifactInput,
+    traces: Sequence[Trace],
+    *,
+    construction_scope: CorpusScope | None = None,
+    lineage_bindings: Sequence[RAGLineageBinding] | None = None,
 ) -> LoadedRAGIndex:
-    """Require exact episode bytes and source/transition closure before preparing a simulator."""
+    """Require exact episode bytes and source/transition closure before preparing a simulator.
+
+    Without a scope the traces must be the index's complete source corpus and exactly the
+    episodes its transitions come from. With one they must be exactly the in-scope fit traces
+    of that corpus, while the index may expose any set of episodes.
+
+    Args:
+        store: Shared immutable artifact owner.
+        serving_rag: Index whose sources are the frozen original corpus.
+        traces: Construction episodes.
+        construction_scope: Optional declared construction corpus.
+        lineage_bindings: Optional complete lineage assignment; only valid with a scope.
+
+    Returns:
+        The verified index.
+
+    Raises:
+        ValueError: Traces repeat or differ from the frozen corpus, or the scope check fails.
+    """
     ids = tuple(trace.trace_id for trace in traces)
     if not ids or len(set(ids)) != len(ids):
         raise ValueError("source grounding requires distinct whole source traces")
+    if construction_scope is None and lineage_bindings is not None:
+        raise ValueError("lineage bindings resolve only a declared construction scope")
     rag = load_rag_index(store, serving_rag.artifact_id)
     if artifact_input(rag.manifest) != serving_rag:
         raise ValueError("serving RAG manifest differs from the selected input")
@@ -282,8 +346,101 @@ def _verified_trace_index(
             if trace.trace_id in originals:
                 raise ValueError("source datasets repeat an episode")
             originals[trace.trace_id] = trace
+    if construction_scope is not None:
+        admitted = _in_scope_fit_traces(rag, set(originals), construction_scope, lineage_bindings)
+        if set(ids) != admitted:
+            extra = sorted(set(ids) - admitted)
+            raise ValueError(
+                f"construction trace {extra[0]} is not an in-scope fit trace of scope "
+                f"{construction_scope.name!r}"
+                if extra
+                else f"construction omits in-scope fit trace {sorted(admitted - set(ids))[0]} "
+                f"of scope {construction_scope.name!r}"
+            )
+        if any(originals[trace.trace_id] != trace for trace in traces):
+            raise ValueError("constructor trace contents differ from the frozen original corpus")
+        return rag
     if originals != {t.trace_id: t for t in traces}:
         raise ValueError("constructor trace contents differ from the frozen original corpus")
     if {t.trace_id for t in rag.transitions} != set(ids):
         raise ValueError("retrieval and construction must expose the same source episode set")
     return rag
+
+
+def _in_scope_fit_traces(
+    rag: LoadedRAGIndex,
+    source_ids: set[str],
+    scope: CorpusScope,
+    lineage_bindings: Sequence[RAGLineageBinding] | None,
+) -> set[str]:
+    """Return every source trace a construction scope admits, refusing held-out or unknown ones.
+
+    A trace's lineage and partition come from the lineage bindings when given, which must
+    cover exactly the source corpus and agree with every index transition; otherwise from the
+    index transitions, a lineage counting as fit when the index lists it among its fit
+    lineages. A trace with neither cannot be placed, so a scope that depends on it is refused.
+
+    Args:
+        rag: Verified index whose sources are the corpus.
+        source_ids: Every trace identity in the index's sources.
+        scope: Declared construction corpus.
+        lineage_bindings: Optional complete lineage assignment of the corpus.
+
+    Returns:
+        Identities of the in-scope fit traces; never empty.
+
+    Raises:
+        ValueError: The scope names unknown identities or admits held-out or unplaceable
+            traces, or the bindings disagree with the corpus or the index.
+    """
+    fit_lineages = set(rag.index.fit_lineage_ids)
+    placed: dict[str, tuple[str, bool]] = {}
+    for item in rag.transitions:
+        placed[item.trace_id] = (item.lineage_id, item.lineage_id in fit_lineages)
+    if lineage_bindings is not None:
+        bound = {binding.trace_id: binding for binding in lineage_bindings}
+        if len(bound) != len(lineage_bindings) or set(bound) != source_ids:
+            raise ValueError("lineage bindings must assign every source trace exactly once")
+        for trace_id, (lineage, fit) in placed.items():
+            binding = bound[trace_id]
+            if binding.lineage_id != lineage or (binding.partition == "fit") != fit:
+                raise ValueError(f"lineage binding of trace {trace_id} differs from the index")
+        placed = {
+            binding.trace_id: (binding.lineage_id, binding.partition == "fit")
+            for binding in lineage_bindings
+        }
+    if scope.kind == "trace":
+        known = source_ids
+    else:
+        known = {lineage for lineage, _ in placed.values()} | fit_lineages
+        known |= set(rag.index.included_lineage_ids)
+    unknown = sorted(set(scope.ids) - known)
+    if unknown:
+        raise ValueError(
+            f"construction scope {scope.name!r} names {scope.kind} {unknown[0]} outside the "
+            "frozen original corpus"
+        )
+    unplaced = sorted(
+        trace_id
+        for trace_id in source_ids - set(placed)
+        if scope.kind == "lineage" or trace_id in scope.ids
+    )
+    if unplaced:
+        raise ValueError(
+            f"construction trace {unplaced[0]} has no index transition to place its lineage; "
+            "pass the build's lineage bindings"
+        )
+    admitted = {
+        trace_id
+        for trace_id, (lineage, _) in placed.items()
+        if scope.admits(trace_id=trace_id, lineage_id=lineage)
+    }
+    held_out = sorted(trace_id for trace_id in admitted if not placed[trace_id][1])
+    if held_out:
+        raise ValueError(
+            f"construction scope {scope.name!r} admits held-out trace {held_out[0]}; "
+            "construction may read only fit evidence"
+        )
+    if not admitted:
+        raise ValueError(f"construction scope {scope.name!r} admits no source trace")
+    return admitted

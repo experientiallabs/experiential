@@ -882,3 +882,50 @@ def test_construction_scope_refuses_held_out_and_out_of_scope_construction(
             retrieval_scope=retrieval,
             construction_scope=construction,
         )
+
+
+def test_rebinding_carries_a_recorded_construction_scope(tmp_path: Path) -> None:
+    """Fit-only, memory-first and scoped rebinding keep the recorded construction scope."""
+    knowledge = SimulationKnowledge(source_trace_ids=("trace-0", "trace-1"))
+    store, source, world, traces = _scoped_build(tmp_path, knowledge)
+    construction = _trace_scope("world-learning-construction", "trace-0", "trace-1")
+    built = load_grounded_world_model_artifact(store, world)
+    recorded = artifact_input(
+        persist_grounded_world_model(
+            store,
+            built.serving_rag,
+            model_alias=built.model_alias,
+            model=built.model,
+            created_at=built.created_at,
+            code_revision=built.code_revision,
+            top_k=built.top_k,
+            knowledge=knowledge,
+            construction_scope=construction,
+        ).manifest
+    )
+    assert recorded != world
+    unscoped = _scoped_index(store, source, traces, None)
+    for rebound in (
+        persist_fit_only_world_model(store, recorded, unscoped),
+        persist_memory_first_world_model(store, recorded),
+    ):
+        assert load_grounded_world_model_artifact(store, rebound).construction_scope == (
+            construction
+        )
+    assert (
+        load_grounded_world_model_artifact(
+            store, persist_fit_only_world_model(store, world, unscoped)
+        ).construction_scope
+        is None
+    )
+    retrieval = _trace_scope("world-learning-retrieval", traces[2])
+    scoped = _scoped_index(store, source, traces, retrieval)
+    plain = persist_scoped_world_model(store, world, scoped, retrieval_scope=retrieval)
+    assert load_grounded_world_model_artifact(store, plain).construction_scope is None
+    declared = persist_scoped_world_model(
+        store, world, scoped, retrieval_scope=retrieval, construction_scope=construction
+    )
+    assert declared != plain
+    assert declared == persist_scoped_world_model(
+        store, recorded, scoped, retrieval_scope=retrieval
+    )

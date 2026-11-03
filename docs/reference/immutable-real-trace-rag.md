@@ -47,6 +47,32 @@ world model's recorded construction knowledge must lie inside it and none may be
 two scopes are independent and may overlap. The unscoped `persist_fit_only_world_model` and
 `bind_fit_grounded_world_model` refuse a scoped index.
 
+The world-model artifact records its construction scope as `construction_scope`. A world model
+without one serializes no such field, so its envelope bytes and content identity are exactly
+those it had before scopes existed. A recorded scope joins the identity, is re-derived on every
+load, and requires construction knowledge; a recorded trace scope must contain every
+construction trace. `persist_scoped_world_model` records the construction scope it verified, and
+reuses an already recorded one when none is passed; a world model that records a scope accepts
+only that exact scope. `persist_fit_only_world_model` and `persist_memory_first_world_model`
+carry a recorded scope unchanged.
+
+## Constructing from a declared scope
+
+`construct_world_model(..., construction_scope=scope)` and
+`ground_world_model_from_traces(..., construction_scope=scope)` construct from a declared corpus
+instead of the index's whole corpus. The supplied traces must be exactly the in-scope fit traces
+of the index's source datasets, with their exact recorded contents. Scope identities the corpus
+does not carry, and scopes admitting a held-out trace, are refused. A trace's lineage and
+partition come from the index transitions, a lineage being fit when the index lists it among its
+fit lineages, or from `lineage_bindings`, the build's complete assignment, which must cover the
+corpus exactly and agree with every index transition. A scope that depends on a trace neither
+places is refused, so a retrieval-scoped index needs the bindings for traces outside it. The
+index itself may expose any episodes, so construction and retrieval corpora may differ and
+overlap; the direct-grounding tool inventory comes only from in-scope transitions. The scope is
+recorded on the persisted world model. Without a scope, construction still requires the traces
+to equal the index's complete corpus and its transition episodes, and `lineage_bindings` is
+refused.
+
 For variance studies, `exp.optimize.evaluation.variance.exposure.world_learning_scopes(plan,
 construction=..., retrieval=...)` derives both scopes from an `ExposurePlan`. Each covers every
 `world_learning` trace, or the traces of an optional tag selection checked with

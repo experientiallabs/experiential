@@ -34,6 +34,7 @@ from exp.simulation.engines.text.prompt import (
 )
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
+from exp.simulation.retrieval.scope import CorpusScope
 
 GROUNDED_WORLD_MODEL_ARTIFACT_TYPE = "grounded-world-model"
 WORLD_MODEL_ARTIFACT_PATH = "world-model.json"
@@ -81,6 +82,7 @@ def grounded_world_model_content(
     knowledge: SimulationKnowledge | None = None,
     selection_policy_sha256: str | None = None,
     original_evidence: OriginalEvidence = "retrieved",
+    construction_scope: CorpusScope | None = None,
 ) -> dict[str, object]:
     """Return the complete content-addressed identity of a grounded world model.
 
@@ -96,6 +98,7 @@ def grounded_world_model_content(
         selection_policy_sha256: Optional explicit reranker identity.
         original_evidence: ``retrieved`` grounds each prediction in nearest recorded
             transitions; ``none`` predicts from task, history and learned memory only.
+        construction_scope: Optional declared scope every construction trace lies inside.
 
     Returns:
         Canonical content mapping used to derive the artifact identity.
@@ -110,6 +113,11 @@ def grounded_world_model_content(
             else {"selection_policy_sha256": selection_policy_sha256}
         ),
         **({} if knowledge is None else {"knowledge": knowledge.model_dump(mode="json")}),
+        **(
+            {}
+            if construction_scope is None
+            else {"construction_scope": construction_scope.model_dump(mode="json")}
+        ),
     }
     return {
         **extra,
@@ -134,6 +142,11 @@ class GroundedWorldModelArtifact(ArtifactEnvelope):
             transitions for every prediction. ``none`` (memory-first profile) never retrieves
             them; the serving index is kept only as the identity of the stored evidence corpus,
             and predictions read the task, visible history and learned memory.
+        construction_scope: Declared :class:`CorpusScope` the construction corpus was read
+            under. Every trace in ``knowledge.source_trace_ids`` lies inside it and in fit
+            evidence; ``construct_world_model`` under a scope also reads every in-scope fit
+            trace. Omitted from the serialized envelope and the identity when absent, so
+            unscoped world models keep their bytes and identity.
     """
 
     world_model_id: ArtifactId
@@ -148,6 +161,9 @@ class GroundedWorldModelArtifact(ArtifactEnvelope):
     original_evidence: OriginalEvidence = Field(
         default="retrieved", exclude_if=lambda value: value == "retrieved"
     )
+    construction_scope: CorpusScope | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _require_single_rag_input(self) -> GroundedWorldModelArtifact:
@@ -161,6 +177,34 @@ class GroundedWorldModelArtifact(ArtifactEnvelope):
         """
         if self.inputs != (self.serving_rag,):
             raise ValueError("grounded world model input must be its exact serving RAG artifact")
+        return self
+
+    @model_validator(mode="after")
+    def _require_construction_inside_scope(self) -> GroundedWorldModelArtifact:
+        """Require recorded construction knowledge consistent with a recorded scope.
+
+        A trace scope is checked here against the construction trace identities. A lineage
+        scope needs the traces' lineages, which the binding paths check against the index.
+
+        Returns:
+            The validated grounded world-model artifact.
+
+        Raises:
+            ValueError: A scope is recorded without construction knowledge, or a construction
+                trace lies outside a recorded trace scope.
+        """
+        scope = self.construction_scope
+        if scope is None:
+            return self
+        if self.knowledge is None or not self.knowledge.source_trace_ids:
+            raise ValueError("a construction scope needs recorded construction source traces")
+        if scope.kind == "trace":
+            outside = sorted(set(self.knowledge.source_trace_ids) - set(scope.ids))
+            if outside:
+                raise ValueError(
+                    f"construction trace {outside[0]} lies outside construction scope "
+                    f"{scope.name!r}"
+                )
         return self
 
 
@@ -184,6 +228,7 @@ def persist_grounded_world_model(
     knowledge: SimulationKnowledge | None = None,
     selection_policy_sha256: str | None = None,
     original_evidence: OriginalEvidence = "retrieved",
+    construction_scope: CorpusScope | None = None,
 ) -> PersistedGroundedWorldModel:
     """Persist a reusable world model over one verified immutable serving index.
 
@@ -198,12 +243,16 @@ def persist_grounded_world_model(
         knowledge: Optional frozen reconstructed knowledge and research history.
         selection_policy_sha256: Frozen reranker identity, required when using JEV.
         original_evidence: Retrieve recorded transitions, or predict from memory only.
+        construction_scope: Optional declared scope the construction corpus was read under.
+            Callers verify it against the build's fit evidence first; omitted, the artifact,
+            its bytes and its identity are unscoped.
 
     Returns:
         Completed artifact and exact verified manifest.
 
     Raises:
-        ValueError: The RAG input is stale or malformed.
+        ValueError: The RAG input is stale or malformed, or a recorded scope contradicts the
+            construction knowledge.
     """
     loaded = load_rag_index(store, serving_rag.artifact_id)
     if artifact_input(loaded.manifest) != serving_rag:
@@ -223,6 +272,7 @@ def persist_grounded_world_model(
         knowledge=knowledge,
         selection_policy_sha256=selection_policy_sha256,
         original_evidence=original_evidence,
+        construction_scope=construction_scope,
     )
     if original_evidence == "none" and selection_policy_sha256 is not None:
         raise ValueError("a memory-first simulator retrieves no originals to rerank")
@@ -246,6 +296,7 @@ def persist_grounded_world_model(
         knowledge=knowledge,
         selection_policy_sha256=selection_policy_sha256,
         original_evidence=original_evidence,
+        construction_scope=construction_scope,
     )
     try:
         stored, manifest = store.write_or_replay(
