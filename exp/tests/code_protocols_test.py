@@ -276,6 +276,15 @@ PROTOCOLS = (
         ),
         "9b738d7a815e3b23db372a80bb2c8f848a14c2d7d768b88e3b7d2bc4cca70f4e",
     ),
+    Protocol(
+        "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
+        "variance-roles-v1",
+        (
+            "exp.optimize.evaluation.variance.roles",
+            "exp.optimize.evaluation.variance.contracts",
+        ),
+        "76f1648f90bf8621447b8d1ea0f9b3ee2dcbf0b1cded25f5fdc537917f7c579e",
+    ),
 )
 
 
