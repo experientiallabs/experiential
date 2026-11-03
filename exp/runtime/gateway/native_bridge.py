@@ -280,9 +280,9 @@ class NativeControlPlane(
         )
         if fleet_lane_gate is not None:
             self._accounting.loads.attach_fleet_gate(fleet_lane_gate)
-        if self._videos is not None:
+        if (videos := self._videos) is not None:
             # No request can yet enter, so a failed start leaves no retained writes.
-            self._start_after_accounting(self._videos.start_poller)
+            self._start_after_accounting(videos.start_poller)
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:

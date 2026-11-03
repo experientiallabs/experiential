@@ -85,28 +85,15 @@ class LocalGatewayLifecycle:
 
 
 class NativeControlLifecycle:
-    """Stop control-plane-owned pollers without closing caller-owned components."""
+    """Close accounting when a control-plane startup step fails after accounting exists."""
 
     _videos: VideoEngine | None
     _accounting: NativeAttemptAccounting
 
-    def _start_after_accounting(self, start: Callable[[], None]) -> None:
+    def _start_after_accounting(self, start: Callable[[], object]) -> None:
         """Run one startup step once accounting exists, closing accounting if the step fails."""
         try:
             start()
         except BaseException:
             self._accounting.close()
             raise
-
-    def close(self, *, timeout_seconds: float = 30.0) -> None:
-        """Bound poller drain and refuse to report shutdown while a provider poll still runs."""
-        if timeout_seconds < 0:
-            raise ValueError("gateway shutdown timeout cannot be negative")
-        deadline = time.monotonic() + timeout_seconds
-        try:
-            if self._videos is not None and not self._videos.stop_poller(
-                timeout_seconds=timeout_seconds
-            ):
-                raise TimeoutError("native video poller did not stop within its shutdown budget")
-        finally:
-            self._accounting.close(timeout_seconds=max(0.0, deadline - time.monotonic()))

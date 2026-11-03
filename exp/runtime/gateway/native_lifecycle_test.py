@@ -131,8 +131,7 @@ def test_control_shutdown_does_not_claim_a_running_video_poller_has_exited(
     control = NativeControlPlane(components)
     try:
         assert entered.wait(2)
-        with pytest.raises(TimeoutError, match="shutdown budget"):
-            control.close(timeout_seconds=0.02)
+        assert control.close(timeout_seconds=0.02) is False
     finally:
         release.set()
         control.close(timeout_seconds=2)
