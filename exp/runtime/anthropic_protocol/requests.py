@@ -219,6 +219,31 @@ class _Message(AnthropicWireModel):
 _MESSAGE_KEYS = frozenset(_Message.model_fields)
 """Keys an Anthropic turn object may carry."""
 
+EMPTY_FINAL_ASSISTANT_DROPPED = "messages.assistant->dropped(empty_final_prefill)"
+"""Disclosure for a trailing assistant turn with no content.
+
+Anthropic rejects empty content on every turn "except for the optional final
+assistant message": an empty final assistant turn is an empty prefill, which
+the provider treats as no prefill at all. The decoder drops that turn so the
+request is served exactly as Anthropic serves it."""
+
+
+def _is_empty_prefill(message: _Message) -> bool:
+    """Whether ``message`` is an assistant turn carrying no content at all.
+
+    An empty string, or only text blocks whose text is empty (a cache marker
+    on such a block bounds nothing: the prefix it would mark ends at the
+    previous turn). An empty block list is not a prefill and stays refused.
+    """
+    if message.role != "assistant":
+        return False
+    if isinstance(message.content, str):
+        return not message.content
+    return bool(message.content) and all(
+        isinstance(block, _TextBlock) and not block.text and not block.citations
+        for block in message.content
+    )
+
 
 class _ToolChoice(AnthropicWireModel):
     """Anthropic tool-choice selector."""
@@ -403,7 +428,14 @@ def _decode(
                 provider_text_blocks=_marked_text_blocks(request.system),
             )
         )
+    prefill_disclosures: tuple[str, ...] = ()
+    last_index = len(request.messages) - 1
     for index, message in enumerate(request.messages):
+        if index == last_index and index > 0 and _is_empty_prefill(message):
+            # Anthropic accepts an empty final assistant turn as no prefill;
+            # an empty turn anywhere else still fails in _gateway_messages.
+            prefill_disclosures = (EMPTY_FINAL_ASSISTANT_DROPPED,)
+            continue
         try:
             messages.extend(_gateway_messages(message, index))
         except ValidationError as exc:
@@ -479,6 +511,7 @@ def _decode(
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(
                 *unknown_disclosures,
+                *prefill_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,
