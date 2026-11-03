@@ -33,6 +33,39 @@ def test_critic_reward_is_negative_brier_over_graded_points_only() -> None:
     assert score.errors == {"a": 0.0, "b": 0.25}
     assert score.reward == pytest.approx(-0.125)
     assert score.unscored == ("c",)
+    assert score.status == "scored"
+
+
+def test_a_critic_with_nothing_graded_has_no_reward() -> None:
+    """An unscored critic must not receive the best possible reward."""
+    score = critic_score({"a": 0.3}, (_point("a", 1, 0, 0, unknown=8),))
+
+    assert score.status == "unscored" and score.reward is None
+
+
+def test_judge_spread_is_screening_and_noisy_under_the_null() -> None:
+    """Two equal points still separate about a fifth of the time with eight continuations each."""
+    from math import comb
+
+    n = 8
+    mass = [comb(n, k) / 2**n for k in range(n + 1)]
+    positive = sum(
+        mass[a] * mass[b]
+        for a in range(n + 1)
+        for b in range(n + 1)
+        if judge_score((_point("a", 0, a, n - a), _point("b", 1, b, n - b))).reward > 0
+    )
+    assert 0.15 < positive < 0.3
+    assert judge_score((_point("a", 0, 8, 0), _point("b", 1, 0, 8))).purpose == "screening"
+
+
+def test_point_intervals_show_how_little_eight_continuations_say() -> None:
+    """Four of eight is compatible with almost any underlying rate."""
+    interval = _point("a", 1, 4, 4).interval()
+    assert interval is not None
+    assert interval[0] == pytest.approx(0.215, abs=0.01)
+    assert interval[1] == pytest.approx(0.785, abs=0.01)
+    assert _point("b", 1, 0, 0, unknown=3).interval() is None
 
 
 def test_critic_estimates_must_match_the_measured_points() -> None:

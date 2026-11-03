@@ -6,11 +6,15 @@ arithmetic over those measurements, so a reward can be recomputed exactly from s
 
 - **Critic** reward is the negative Brier score of its estimates against the measured rates. It is
   computed only over points that have at least one graded continuation; an unknown outcome is
-  neither a success nor a failure and is left out of the rate.
-- **Judge** reward is the spread of the measured rates across its points, minus the spread that
-  binomial sampling alone would produce. Points whose success probability genuinely differs
-  separate good decisions from bad ones; points that differ only because few continuations ran do
-  not, and are not rewarded.
+  neither a success nor a failure and is left out of the rate. A critic with no scored point is
+  ``unscored`` and has no reward, so it can never look perfect and must be left out of training.
+- **Judge** screening score is the spread of the measured rates across its points, minus the
+  spread binomial sampling alone would produce. It is a candidate-selection heuristic, not a
+  training reward: rates also differ across points because of ordinary progress, newly revealed
+  information, spent budget or an already irreversible mistake, none of which is a decision, and
+  with two equal points and eight continuations each it is still positive about a fifth of the
+  time. Whether a point is a decision is established only by running competing actions from the
+  same checkpoint.
 - **Continuation groups** are normalized within each point, so continuations from one point form
   their own group and are never compared with continuations from another starting state.
 """
@@ -19,10 +23,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
+from exp.common.evaluations.uncertainty import wilson_interval
 
 
 class PointOutcome(ContractModel):
@@ -52,25 +58,37 @@ class PointOutcome(ContractModel):
         """Measured probability of success, or None when nothing was graded."""
         return None if self.graded == 0 else self.successes / self.graded
 
+    def interval(self) -> tuple[float, float] | None:
+        """Two-sided 95 percent Wilson interval of the rate, or None when nothing was graded.
+
+        Four passes in eight graded continuations gives roughly 0.22 to 0.78: screening evidence,
+        not a precise value.
+        """
+        rate = self.rate
+        return None if rate is None else wilson_interval(rate, self.graded)
+
 
 class CriticScore(ContractModel):
     """One critic attempt scored against measured outcomes.
 
     Attributes:
-        reward: Negative mean Brier score over scored points, in [-1, 0].
+        status: ``scored`` when at least one point had a graded continuation, else ``unscored``.
+        reward: Negative mean Brier score over scored points, in [-1, 0]; None when unscored.
         errors: Squared error per scored point identity.
         unscored: Point identities with no graded continuation.
     """
 
-    reward: float
+    status: Literal["scored", "unscored"]
+    reward: float | None
     errors: dict[str, float]
     unscored: tuple[str, ...]
 
 
 class JudgeScore(ContractModel):
-    """One judge attempt's choice of points scored by how much their outcomes separate.
+    """One judge attempt's screening score: how much its points' outcomes separate.
 
     Attributes:
+        purpose: Always ``screening``; this score never enters a training record.
         reward: Rate variance across scored points minus the expected sampling variance,
             floored at zero.
         observed_variance: Variance of measured rates across scored points.
@@ -78,6 +96,7 @@ class JudgeScore(ContractModel):
         scored_points: Points that contributed a measured rate.
     """
 
+    purpose: Literal["screening"] = "screening"
     reward: float
     observed_variance: float
     noise_variance: float
@@ -130,8 +149,10 @@ def critic_score(estimates: Mapping[str, float], outcomes: Sequence[PointOutcome
             unscored.append(point_id)
             continue
         errors[point_id] = (estimate - rate) ** 2
-    reward = -sum(errors.values()) / len(errors) if errors else 0.0
-    return CriticScore(reward=reward, errors=errors, unscored=tuple(unscored))
+    if not errors:
+        return CriticScore(status="unscored", reward=None, errors={}, unscored=tuple(unscored))
+    reward = -sum(errors.values()) / len(errors)
+    return CriticScore(status="scored", reward=reward, errors=errors, unscored=tuple(unscored))
 
 
 def judge_score(outcomes: Sequence[PointOutcome]) -> JudgeScore:

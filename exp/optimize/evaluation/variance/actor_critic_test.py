@@ -172,6 +172,9 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
     assert report.critics[0].assessment is not None and report.critics[0].score is not None
     assert report.audit[0]["category"] == "guess_required"
     assert sorted(report.ranking) == [0, 1]
+    assert not report.training_eligible
+    assert "competing actions" in report.ineligible_reasons[0]
+    assert any("disposition" in reason for reason in report.ineligible_reasons)
     for row in report.points:
         assert len(row.group.advantages) == 2
 

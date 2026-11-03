@@ -278,12 +278,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v1",
+        "variance-roles-v2",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts",
         ),
-        "76f1648f90bf8621447b8d1ea0f9b3ee2dcbf0b1cded25f5fdc537917f7c579e",
+        "ae695c1584c24f769cb7edc6a04e4c2b630912860fda92a1cd23034ccfd31164",
     ),
 )
 

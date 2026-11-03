@@ -5,15 +5,25 @@ data: steps, probabilities, JSON-pointer state paths and propositions. Every ref
 makes is checked against what the role was actually shown, and every authored scenario is checked
 mechanically before it can become an environment:
 
-- edits touch only the declared variation axes and never an invariant;
-- the facts that decide a scenario exist in its edited state, so solving it never requires a
-  guess (a task that can only be solved by guessing teaches the model to hallucinate);
-- across one scenario set at least two different choices are correct, so the environment rewards
-  making the decision rather than repeating one memorized action.
+- edits replace only declared variation axes, with only their permitted values;
+- invariants hold the same value before and after the edits, compared as values, so replacing a
+  parent object cannot slip a changed invariant through;
+- every variant's world state differs from every other variant's (the unedited world may be one);
+- the instruction is frozen unless the decision state declares instruction variation;
+- correct choices are option identities from a declared set, so "refund" and "issue refund"
+  cannot pass as different decisions;
+- every deciding fact is revealed by a witness of permitted tool calls that fits in the actor's
+  remaining budget, so a scenario cannot require guessing a hidden value.
+
+These checks are structural. Whether the witness calls really reveal the evidence, whether the
+edited state is coherent with the retained conversation and instance facts, and whether the
+correct option really leads to better outcomes than the others are established by executed
+witnesses and competing-action continuations from the same checkpoint, never by these gates.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -123,14 +133,26 @@ class VariationAxis(ContractModel):
     """One place in the world state where changing the value changes the right decision.
 
     Attributes:
-        path: JSON pointer into the world state.
-        values: At least two values the path may take across scenarios.
+        path: JSON pointer into the world state; scenarios replace exactly this path.
+        values: Two or more values the path may take; scenarios may use no others.
         effect: How the right choice changes with the value.
     """
 
     path: str = Field(pattern=r"^(/[^/]*)+$")
     values: tuple[JsonValue, ...] = Field(min_length=2, max_length=8)
     effect: str = Field(min_length=1, max_length=800)
+
+
+class DecisionOption(ContractModel):
+    """One action the actor could take at the decision.
+
+    Attributes:
+        option_id: Stable identity; scenarios name their correct choice by it.
+        action: The action, stated concretely enough to execute as a competing branch.
+    """
+
+    option_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    action: str = Field(min_length=1, max_length=600)
 
 
 class Criterion(ContractModel):
@@ -151,9 +173,12 @@ class DecisionState(ContractModel):
     Attributes:
         step: Trajectory step whose before-state this describes.
         decision: The decision the state sets up.
+        options: The competing actions; two or more, compared by identity, never by prose.
         relevant_paths: State paths the decision depends on.
-        axes: Where the state may vary and why each change matters.
-        invariants: State paths no scenario may change.
+        axes: Where the state may vary, with the permitted values.
+        invariants: State paths whose values no scenario may change.
+        vary_instruction: Whether scenarios may replace the task instruction. Off by default:
+            a causal variant changes the world, not what the actor is told.
         criteria: Rubric propositions for grading an episode started here.
         audit: Eval-design problems this state would carry into an environment.
         evidence_refs: Supplied locators backing the representation.
@@ -161,32 +186,37 @@ class DecisionState(ContractModel):
 
     step: int = Field(ge=0)
     decision: str = Field(min_length=1, max_length=600)
+    options: tuple[DecisionOption, ...] = Field(min_length=2, max_length=6)
     relevant_paths: tuple[str, ...] = Field(min_length=1, max_length=24)
     axes: tuple[VariationAxis, ...] = Field(min_length=1, max_length=8)
     invariants: tuple[str, ...] = ()
+    vary_instruction: bool = False
     criteria: tuple[Criterion, ...] = Field(min_length=1, max_length=32)
     audit: tuple[AuditFlag, ...] = ()
     evidence_refs: tuple[str, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _coherent(self) -> DecisionState:
-        """Keep axes, invariants and criteria distinct and non-overlapping."""
+        """Keep options, axes, invariants and criteria distinct and non-overlapping."""
         paths = [axis.path for axis in self.axes]
         if len(set(paths)) != len(paths):
             raise ValueError("each variation axis must name a distinct path")
-        if set(paths) & set(self.invariants):
-            raise ValueError("a variation axis cannot also be an invariant")
-        identities = [criterion.criterion_id for criterion in self.criteria]
-        if len(set(identities)) != len(identities):
-            raise ValueError("criterion identities must be distinct")
+        if any(_overlaps(path, invariant) for path in paths for invariant in self.invariants):
+            raise ValueError("a variation axis cannot contain or sit inside an invariant")
+        for name, identities in (
+            ("option", [option.option_id for option in self.options]),
+            ("criterion", [criterion.criterion_id for criterion in self.criteria]),
+        ):
+            if len(set(identities)) != len(identities):
+                raise ValueError(f"{name} identities must be distinct")
         return self
 
 
 class StateEdit(ContractModel):
-    """Set one world-state path to a value.
+    """Set one declared variation axis to one of its permitted values.
 
     Attributes:
-        path: JSON pointer of an existing or new leaf.
+        path: JSON pointer of the axis.
         value: Value to place there.
     """
 
@@ -194,24 +224,41 @@ class StateEdit(ContractModel):
     value: JsonValue
 
 
+class WitnessStep(ContractModel):
+    """One permitted tool call by which the actor can observe deciding evidence.
+
+    Attributes:
+        tool: Name of a tool the actor may call.
+        arguments: Arguments of the call.
+        reveals: Deciding state paths whose values the call's observation shows.
+    """
+
+    tool: str = Field(min_length=1)
+    arguments: JsonObject
+    reveals: tuple[str, ...] = Field(min_length=1)
+
+
 class Scenario(ContractModel):
-    """One variant of the world before the decision, with the choice it makes correct.
+    """One variant of the world before the decision, with the option it makes correct.
 
     Attributes:
         scenario_id: Stable identity within one scenario set.
-        edits: State edits applied to the decision state's before-state.
-        instruction: Replacement task instruction, or None to keep the original.
-        correct_choice: The decision that is correct in this variant.
-        deciding_paths: Edited-state paths whose values make that choice correct.
-        rationale: Why those values make the choice correct.
+        edits: Axis replacements applied to the decision state's before-state.
+        instruction: Replacement task instruction; allowed only when the decision state
+            declares instruction variation.
+        correct_option: Identity of the option that is correct in this variant.
+        deciding_paths: Edited-state paths whose values make that option correct.
+        witness: Permitted tool calls, before the decision, that reveal every deciding path.
+        rationale: Why those values make the option correct.
         criteria: Criterion identities that apply to this variant.
     """
 
     scenario_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     edits: tuple[StateEdit, ...] = Field(min_length=1, max_length=16)
     instruction: str | None = Field(default=None, max_length=4000)
-    correct_choice: str = Field(min_length=1, max_length=600)
+    correct_option: str = Field(min_length=1, max_length=64)
     deciding_paths: tuple[str, ...] = Field(min_length=1, max_length=12)
+    witness: tuple[WitnessStep, ...] = Field(min_length=1, max_length=16)
     rationale: str = Field(min_length=1, max_length=1200)
     criteria: tuple[str, ...] = Field(min_length=1)
 
@@ -229,7 +276,7 @@ class ScenarioSet(ContractModel):
 
 
 class ScenarioProblem(ContractModel):
-    """One mechanical reason a scenario or scenario set cannot become an environment.
+    """One structural reason a scenario or scenario set cannot become an environment.
 
     Attributes:
         scenario_id: The scenario at fault, or None for a set-level problem.
@@ -238,6 +285,18 @@ class ScenarioProblem(ContractModel):
 
     scenario_id: str | None
     reason: str
+
+
+class ScenarioLimits(ContractModel):
+    """What the actor can do before the decision, against which witnesses are checked.
+
+    Attributes:
+        tools: Tools the actor may call.
+        remaining_calls: Tool calls left to the actor at the decision point.
+    """
+
+    tools: frozenset[str] = Field(min_length=1)
+    remaining_calls: int = Field(ge=0)
 
 
 JudgeSelection.model_rebuild()
@@ -295,85 +354,141 @@ def apply_edits(state: JsonObject, edits: tuple[StateEdit, ...]) -> JsonObject:
 
 
 def check_scenarios(
-    before: JsonObject, decision: DecisionState, scenarios: ScenarioSet
+    before: JsonObject,
+    decision: DecisionState,
+    scenarios: ScenarioSet,
+    limits: ScenarioLimits,
 ) -> tuple[ScenarioProblem, ...]:
-    """Mechanically check a scenario set against the decision state it varies.
+    """Structurally check a scenario set against the decision state it varies.
+
+    These checks are necessary, not sufficient: passing them does not show that the world model
+    behaves correctly in the edited state, that the witness calls really reveal the evidence, or
+    that the chosen option leads to better outcomes. Those need executed witnesses, competing
+    actions from the same checkpoint and independent specifications.
 
     Args:
         before: World state just before the decision's step.
         decision: The authored decision state.
         scenarios: The authored variants.
+        limits: Tools and remaining calls available to the actor at the decision.
 
     Returns:
-        Every problem found; empty when the set may become environments.
+        Every problem found; empty when the set may proceed to executed checks.
     """
     problems: list[ScenarioProblem] = []
-    axes = {axis.path for axis in decision.axes}
-    criteria = {criterion.criterion_id for criterion in decision.criteria}
     identities = [scenario.scenario_id for scenario in scenarios.scenarios]
     if len(set(identities)) != len(identities):
         problems.append(ScenarioProblem(scenario_id=None, reason="scenario ids repeat"))
-    choices = {" ".join(s.correct_choice.lower().split()) for s in scenarios.scenarios}
-    if len(choices) < 2:
+    if len({scenario.correct_option for scenario in scenarios.scenarios}) < 2:
         problems.append(
             ScenarioProblem(
                 scenario_id=None,
-                reason="every scenario makes the same choice correct; the set has no decision "
+                reason="every scenario makes the same option correct; the set has no decision "
                 "variance",
             )
         )
+    states: dict[str, JsonObject] = {}
     for scenario in scenarios.scenarios:
-        problems.extend(_scenario_problems(before, scenario, axes, set(decision.invariants)))
-        unknown = sorted(set(scenario.criteria) - criteria)
-        if unknown:
+        found = _scenario_problems(before, decision, scenario, limits)
+        problems.extend(found)
+        if not found:
+            states[scenario.scenario_id] = apply_edits(before, scenario.edits)
+    seen: dict[str, str] = {}
+    for scenario_id, state in states.items():
+        key = json.dumps(state, sort_keys=True)
+        if key in seen:
             problems.append(
                 ScenarioProblem(
-                    scenario_id=scenario.scenario_id, reason=f"unknown criteria {unknown}"
+                    scenario_id=scenario_id,
+                    reason=f"its world state is identical to scenario {seen[key]}",
                 )
             )
+        seen.setdefault(key, scenario_id)
     return tuple(problems)
 
 
 def _scenario_problems(
-    before: JsonObject, scenario: Scenario, axes: set[str], invariants: set[str]
+    before: JsonObject, decision: DecisionState, scenario: Scenario, limits: ScenarioLimits
 ) -> list[ScenarioProblem]:
-    """Check one scenario's edits and that its deciding facts are present.
+    """Check one scenario's option, edits, invariants, criteria and observation witness.
 
     Args:
         before: World state just before the decision's step.
+        decision: The decision state the scenario varies.
         scenario: The variant to check.
-        axes: Paths the decision state allows to vary.
-        invariants: Paths no scenario may change.
+        limits: Tools and remaining calls available to the actor.
 
     Returns:
         Problems with this scenario.
     """
     found: list[ScenarioProblem] = []
+    axes = {axis.path: axis for axis in decision.axes}
+    if scenario.correct_option not in {option.option_id for option in decision.options}:
+        found.append(_problem(scenario, f"unknown option {scenario.correct_option!r}"))
+    if scenario.instruction is not None and not decision.vary_instruction:
+        found.append(_problem(scenario, "replaces the instruction, which is frozen"))
+    unknown = sorted(set(scenario.criteria) - {c.criterion_id for c in decision.criteria})
+    if unknown:
+        found.append(_problem(scenario, f"unknown criteria {unknown}"))
+    edited_paths = [edit.path for edit in scenario.edits]
+    if len(set(edited_paths)) != len(edited_paths):
+        found.append(_problem(scenario, "edits the same axis twice"))
     for edit in scenario.edits:
-        if not any(edit.path == axis or edit.path.startswith(axis + "/") for axis in axes):
-            found.append(_problem(scenario, f"edit {edit.path} is outside every variation axis"))
-        if any(edit.path == path or edit.path.startswith(path + "/") for path in invariants):
-            found.append(_problem(scenario, f"edit {edit.path} changes an invariant"))
+        axis = axes.get(edit.path)
+        if axis is None:
+            found.append(_problem(scenario, f"edit {edit.path} is not a declared variation axis"))
+        elif not any(_same(edit.value, value) for value in axis.values):
+            found.append(
+                _problem(scenario, f"edit {edit.path} uses a value the axis does not permit")
+            )
     try:
         edited = apply_edits(before, scenario.edits)
     except ValueError as error:
         return [*found, _problem(scenario, str(error))]
+    for invariant in decision.invariants:
+        if resolve_pointer(before, invariant) != resolve_pointer(edited, invariant):
+            found.append(_problem(scenario, f"invariant {invariant} changed"))
     for path in scenario.deciding_paths:
         exists, _ = resolve_pointer(edited, path)
         if not exists:
-            found.append(
-                _problem(
-                    scenario,
-                    f"deciding fact {path} is absent from the scenario state, so the right choice "
-                    "could only be guessed",
-                )
+            found.append(_problem(scenario, f"deciding fact {path} is absent from the state"))
+    revealed = {path for step in scenario.witness for path in step.reveals}
+    hidden = sorted(set(scenario.deciding_paths) - revealed)
+    if hidden:
+        found.append(
+            _problem(
+                scenario,
+                f"no witness call reveals deciding facts {hidden}, so the choice could only be "
+                "guessed",
             )
+        )
+    forbidden = sorted({step.tool for step in scenario.witness} - limits.tools)
+    if forbidden:
+        found.append(_problem(scenario, f"witness uses tools the actor cannot call: {forbidden}"))
+    if len(scenario.witness) > limits.remaining_calls:
+        found.append(
+            _problem(
+                scenario,
+                f"witness needs {len(scenario.witness)} calls but only "
+                f"{limits.remaining_calls} remain",
+            )
+        )
     return found
 
 
 def _problem(scenario: Scenario, reason: str) -> ScenarioProblem:
     """Build a problem tied to one scenario."""
     return ScenarioProblem(scenario_id=scenario.scenario_id, reason=reason)
+
+
+def _same(left: JsonValue, right: JsonValue) -> bool:
+    """Compare two JSON values exactly, distinguishing booleans from numbers."""
+    return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+
+
+def _overlaps(path: str, other: str) -> bool:
+    """Return whether one pointer equals, contains or sits inside the other."""
+    return path == other or path.startswith(other + "/") or other.startswith(path + "/")
 
 
 def _copy(value: JsonValue) -> JsonValue:

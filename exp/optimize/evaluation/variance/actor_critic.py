@@ -169,7 +169,9 @@ class ActorCriticReport(ContractModel):
         points: Continuation results per chosen point, in point order.
         drops: Rate drop from each scored point to the next.
         audit: Every audit flag any role raised, with its role and draw.
-        ranking: Point numbers ordered from most to least informative.
+        ranking: Point numbers ordered as candidates for competing-action contrast.
+        training_eligible: Whether any record of this run may be trained on.
+        ineligible_reasons: Why it may not, when it may not.
     """
 
     spec: ActorCriticSpec
@@ -181,6 +183,8 @@ class ActorCriticReport(ContractModel):
     drops: dict[str, float]
     audit: tuple[JsonObject, ...]
     ranking: tuple[int, ...]
+    training_eligible: bool
+    ineligible_reasons: tuple[str, ...]
 
 
 def run_actor_critic(
@@ -231,6 +235,7 @@ def run_actor_critic(
         judges = tuple(_reward_judge(draw, outcomes) for draw in judges)
         critics = tuple(_reward_critic(draw, outcomes) for draw in critic_answers)
         drops = decision_drops(outcomes)
+        audit = _audit(judges, critics)
         report = ActorCriticReport(
             spec=spec,
             group=source,
@@ -239,8 +244,10 @@ def run_actor_critic(
             critics=critics,
             points=points,
             drops=drops,
-            audit=_audit(judges, critics),
+            audit=audit,
             ranking=_rank(outcomes, drops),
+            training_eligible=False,
+            ineligible_reasons=_ineligible(audit, critics),
         )
         dependencies = {source, *(d.response for d in (*judges, *critics) if d.response)}
         dependencies |= {r.study for r in points if r.study} | {r.checkpoint for r in points}
@@ -493,6 +500,30 @@ def _audit(
                 for flag in draw.assessment.audit
             )
     return tuple(flags)
+
+
+def _ineligible(audit: tuple[JsonObject, ...], critics: tuple[CriticDraw, ...]) -> tuple[str, ...]:
+    """Explain why a run's records may not be trained on yet.
+
+    A screening run never qualifies on its own: no point has been shown to be a decision until
+    competing actions from the same checkpoint have been run under a frozen policy and budget.
+
+    Args:
+        audit: Every audit flag the run raised.
+        critics: Every critic draw.
+
+    Returns:
+        The reasons, most fundamental first.
+    """
+    reasons = [
+        "no chosen point has been tested with competing actions from the same checkpoint",
+    ]
+    if audit:
+        reasons.append(f"{len(audit)} audit findings have no recorded disposition")
+    unscored = [draw.draw for draw in critics if draw.score is None or draw.score.reward is None]
+    if unscored:
+        reasons.append(f"critic draws {unscored} have no scored estimate")
+    return tuple(reasons)
 
 
 def _rank(outcomes: tuple[PointOutcome, ...], drops: dict[str, float]) -> tuple[int, ...]:
