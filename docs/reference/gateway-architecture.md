@@ -601,12 +601,9 @@ opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: i
 before manifest validation and decodes exactly as the documented field. When both spellings
 arrive, `prompt_cache_key` wins and the dropped alias is disclosed through `ignored_parameters`.
 It is the only camelCase spelling admitted; every other unknown top-level field stays a named 400.
-An explicit JSON `null` on a top-level field OpenAI documents as nullable (`stream`,
-`stream_options`, `temperature`, `max_tokens`, `stop`, `metadata`, `seed`, and the rest of the
-official SDK's `Optional` request fields, pinned in `exp/runtime/openai_protocol/nullable_params.py`
-and locked to the installed SDK by test) is removed before decoding, so the field takes its default
-exactly as if omitted, with no disclosure. A null on a field OpenAI refuses as null (`model`,
-`messages`, `input`, `tools`, `tool_choice`, `response_format`, `text`, `user`) stays a named 400.
+An explicit JSON `null` on a top-level field OpenAI documents as nullable (`stream`, `stream_options`, `temperature`,
+`max_tokens`, `stop`, `metadata`, `seed`, and the rest of the official SDK's `Optional` request fields, pinned in `exp/runtime/openai_protocol/nullable_params.py` and locked to the installed SDK by test)
+is removed before decoding, so the field takes its default exactly as if omitted, with no disclosure. A null on a field OpenAI refuses as null (`model`, `messages`, `input`, `tools`, `tool_choice`, `response_format`, `text`, `user`) stays a named 400.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.
