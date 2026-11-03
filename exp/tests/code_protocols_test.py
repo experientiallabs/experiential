@@ -295,6 +295,21 @@ PROTOCOLS = (
         ),
         "e31cd3f6e6a2b24550d7bd7f5bc442d2edeec394379ae007972cedd87b81c477",
     ),
+    Protocol(
+        "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
+        "variance-authors-v1",
+        (
+            "exp.optimize.evaluation.variance.authors",
+            "exp.optimize.evaluation.variance.contracts",
+        ),
+        "5f86a894779aad29f005bdb075b6dd92c566ee6bfefb2ab273bc76e18a3c2c80",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.grader:GRADER_PROTOCOL",
+        "variance-grader-v1",
+        ("exp.optimize.evaluation.variance.grader",),
+        "5581d2240bfa5181f7eb71729c0de7e2d3e5deed6f816b29f01bc9ffe070058e",
+    ),
 )
 
 
