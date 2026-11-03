@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.dispatch_policy import (
+    GatewayFleetLanePolicy,
     GatewayRungDispatchPolicy,
     GatewayThrottleRedialPolicy,
 )
@@ -140,3 +142,39 @@ def test_priority_tier_attested_is_off_by_default_and_independent_of_upstream_pr
     policy = GatewayRungDispatchPolicy(priority_tier_attested=True)
     assert policy.priority_tier_attested is True
     assert policy.upstream_priority is False
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"inflight_headroom": 0.5, "max_inflight": 4},
+        {"inflight_auto": True, "max_inflight": 4},
+        {"max_inflight": 4, "burst_requests": 3},
+        {"max_inflight": 4, "burst_requests": 0},
+        {"max_inflight": 4, "throttle_backoff_factor": 2.0},
+        {"requests_per_minute": 10, "arrival_fast_seconds": 600},
+        {"requests_per_minute": 10, "arrival_slow_seconds": 20},
+        {"requests_per_minute": 10, "inflight_headroom": 0.5},
+        {"requests_per_minute": 10, "arrival_fast_seconds": 60, "arrival_slow_seconds": 30},
+        {"requests_per_minute": 10, "saturation": "queue"},
+        {"requests_per_minute": 10, "queue_milliseconds": 50},
+    ],
+)
+def test_incoherent_fleet_policies_are_refused(fields: JsonObject) -> None:
+    """A policy that limits nothing, or a knob its mode ignores, fails closed."""
+    with pytest.raises(ValueError):
+        GatewayFleetLanePolicy.model_validate(fields)
+
+
+def test_a_coherent_fleet_policy_validates() -> None:
+    """The worked example: 100 RPM, burst 2, auto in-flight at 95%, queue 250 ms."""
+    policy = GatewayFleetLanePolicy(
+        requests_per_minute=100,
+        burst_requests=2,
+        inflight_auto=True,
+        confidence=0.95,
+        saturation="queue",
+        queue_milliseconds=250,
+    )
+    assert policy.throttle_backoff_factor is None

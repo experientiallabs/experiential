@@ -558,8 +558,16 @@ class NativeAttemptAccounting:
                 policy_sheds.append((candidate, ticket.reason))
                 shed_records[candidate] = ticket
                 self._health.release_probe(keys[candidate])
-                forced_overflow = not selected_first and shed_keeps_rung(
-                    route, candidate, redial_depth, last_failure, ticket.reason
+                # A fleet shed is a hard cap (fleet_lanes): never kept on the
+                # rung, except a refusing one, which keeps it to refuse below.
+                forced_overflow = not selected_first and (
+                    ticket.fleet_refuse
+                    or (
+                        not ticket.fleet
+                        and shed_keeps_rung(
+                            route, candidate, redial_depth, last_failure, ticket.reason
+                        )
+                    )
                 )
                 if (
                     forced_overflow
