@@ -33,7 +33,7 @@ def test_built_project_prepares_automatic_council_without_credentials_or_calls(
     record = catalog.models["world"]
     catalog.models["model"] = record.model_copy(update={"model": "actor-one"})
     catalog.models["other"] = record.model_copy(update={"model": "actor-two"})
-    default_actors = ("actor-qwen27", "actor-glmflash", "actor-glmfull", "actor-mimo", "actor-kimi")
+    default_actors = ("actor-gemma4", "actor-glmflash", "actor-glmfull", "actor-mimo", "actor-kimi")
     for alias in default_actors:
         catalog.models[alias] = record.model_copy(update={"model": alias})
     write_model_catalog(project.model_catalog_path, catalog)

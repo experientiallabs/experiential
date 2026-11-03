@@ -38,7 +38,7 @@ from exp.simulation.world_model.artifact import persist_grounded_world_model
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 DEFAULT_ACTOR_MODELS = (
-    "actor-qwen27",
+    "actor-gemma4",
     "actor-glmflash",
     "actor-glmfull",
     "actor-mimo",
