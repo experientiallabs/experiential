@@ -58,6 +58,11 @@ from exp.optimize.evaluation.variance.evidence import (
     candidate_branches,
     evidence_packet,
 )
+from exp.optimize.evaluation.variance.exposure import (
+    EstimateMeaning,
+    ExposurePlan,
+    estimate_meaning,
+)
 from exp.optimize.evaluation.variance.rewards import (
     CriticScore,
     GroupAdvantage,
@@ -143,6 +148,7 @@ class PointResult(ContractModel):
     Attributes:
         point: Point number within the picked attempt.
         checkpoint: The paired actor/world checkpoint continuations started from.
+        meaning: What the measured rate is conditional on.
         study: Saved continuation study, or None when it could not run.
         outcome: Graded outcome counts.
         group: Group-relative advantages of the point's continuations.
@@ -151,6 +157,7 @@ class PointResult(ContractModel):
 
     point: int
     checkpoint: ArtifactInput
+    meaning: EstimateMeaning
     study: ArtifactInput | None
     outcome: PointOutcome
     group: GroupAdvantage
@@ -188,24 +195,32 @@ class ActorCriticReport(ContractModel):
 
 
 def run_actor_critic(
-    project: ProjectStore, spec: ActorCriticSpec, *, code_revision: str
+    project: ProjectStore,
+    spec: ActorCriticSpec,
+    *,
+    exposure: ExposurePlan,
+    code_revision: str,
 ) -> ActorCriticReport:
-    """Run, or replay, one actor-critic registration.
+    """Run, or replay, one actor-critic registration over a mining-probe task.
 
     Args:
         project: Project holding every saved step.
         spec: The registration.
+        exposure: The frozen data roles; the task must come from a mining-probe lineage, never
+            from world learning or the final evaluation.
         code_revision: Producing source identity.
 
     Returns:
         The report, also saved as an ``actor-critic-report`` artifact.
 
     Raises:
-        ValueError: The group has no attempt with enough continuable points, or no judge produced
-            a usable selection.
+        ValueError: The task is not a mining probe, the group has no attempt with enough
+            continuable points, or no judge produced a usable selection.
     """
     spec = ActorCriticSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
+    start = load_continuation_checkpoint(store, spec.initial.study.checkpoint)
+    exposure.require_lineage(start.task.lineage_group_id, "mining_probes")
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
         if store.exists(result_id):
@@ -230,7 +245,9 @@ def run_actor_critic(
             _critic(project, spec, packet, chosen, c, identity, sources, code_revision)
             for c in range(len(spec.critics))
         )
-        points = tuple(_continue(project, spec, packet, point, code_revision) for point in chosen)
+        points = tuple(
+            _continue(project, spec, packet, point, loader, code_revision) for point in chosen
+        )
         outcomes = tuple(result.outcome for result in points)
         judges = tuple(_reward_judge(draw, outcomes) for draw in judges)
         critics = tuple(_reward_critic(draw, outcomes) for draw in critic_answers)
@@ -421,11 +438,13 @@ def _continue(
     spec: ActorCriticSpec,
     packet: EvidencePacket,
     point: int,
+    loader: Callable[[ArtifactInput], ContinuationCheckpoint],
     code_revision: str,
 ) -> PointResult:
     """Run or replay one point's continuations and grade them."""
     checkpoint = packet.pool.points[point]
     job = _point_job(spec, checkpoint)
+    meaning = estimate_meaning(job, loader(checkpoint))
     point_id = f"point-{point}"
     try:
         study = saved_continuation_job(project, job, code_revision=code_revision)
@@ -437,6 +456,7 @@ def _continue(
         return PointResult(
             point=point,
             checkpoint=checkpoint,
+            meaning=meaning,
             study=None,
             outcome=empty,
             group=group_advantages(point_id, ()),
@@ -452,6 +472,7 @@ def _continue(
     return PointResult(
         point=point,
         checkpoint=checkpoint,
+        meaning=meaning,
         study=reference,
         outcome=PointOutcome(
             point_id=point_id,

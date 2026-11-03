@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.job import ContinuationJob
@@ -15,9 +15,11 @@ from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates_test import _reply
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec, run_actor_critic
+from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.continuations import load_continuation_checkpoint
 
 
 def _edit(row: int) -> JsonHttpResponse:
@@ -81,6 +83,18 @@ def _spec(project: ProjectStore, job: ContinuationJob, *, judges: int = 1) -> Ac
     )
     return ActorCriticSpec(
         initial=group, judges=(settings,) * judges, critics=(settings,), points=2, continuations=2
+    )
+
+
+def _exposure(project: ProjectStore, job: ContinuationJob, role: Role) -> ExposurePlan:
+    """Reserve the fixture task's lineage for one role."""
+    lineage = load_continuation_checkpoint(project.artifacts, job.study.checkpoint).task
+    return ExposurePlan(
+        bindings=ArtifactInput(artifact_id="bindings", sha256="0" * 64),
+        seed=0,
+        probe_fraction=0.5,
+        roles={lineage.lineage_group_id: role, "other-lineage": "world_learning"},
+        traces={},
     )
 
 
@@ -159,10 +173,16 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
     ]
     actor_transport, role_transport = _wire(monkeypatch, group + continuations, roles)
 
-    report = run_actor_critic(project, spec, code_revision="test")
+    report = run_actor_critic(
+        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    )
 
     assert len(role_transport.requests) == 2
     assert len(actor_transport.requests) == len(group) + len(continuations)
+    assert {row.meaning.actor_model for row in report.points} == {spec.initial.study.actor_model}
+    assert [row.meaning.checkpoint for row in report.points] == [
+        r.checkpoint for r in report.points
+    ]
     assert [row.point for row in report.points] == [0, 1]
     assert all(
         row.failure is None and row.outcome.graded + row.outcome.unknown == 2
@@ -178,7 +198,9 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
     for row in report.points:
         assert len(row.group.advantages) == 2
 
-    replay = run_actor_critic(project, spec, code_revision="test")
+    replay = run_actor_critic(
+        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    )
 
     assert replay == report
     assert len(role_transport.requests) == 2
@@ -196,4 +218,23 @@ def test_a_judge_citing_an_unsupplied_locator_is_kept_as_a_failed_draw(
     _wire(monkeypatch, group, roles)
 
     with pytest.raises(ValueError, match="no judge produced a usable selection"):
-        run_actor_critic(project, spec, code_revision="test")
+        run_actor_critic(
+            project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+        )
+
+
+def test_a_task_outside_the_mining_probes_is_refused_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """World-learning and final-evaluation lineages never feed point selection."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    spec = _spec(project, job)
+    actor_transport, role_transport = _wire(monkeypatch, [], [])
+
+    for role in ("world_learning", "final_evaluation"):
+        with pytest.raises(ValueError, match="not mining_probes"):
+            run_actor_critic(
+                project, spec, exposure=_exposure(project, job, role), code_revision="test"
+            )
+
+    assert actor_transport.requests == [] and role_transport.requests == []
