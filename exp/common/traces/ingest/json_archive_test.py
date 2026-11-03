@@ -1,5 +1,6 @@
 """Incremental JSON parsing preserves exact record shapes and excludes malformed lines."""
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -53,3 +54,42 @@ def test_utf8_failure_is_not_silently_replaced(tmp_path: Path) -> None:
         pytest.raises(VendorTraceFormatError, match="UTF-8"),
     ):
         JsonArchive(path, directory, connection, "chat-json")
+
+
+def test_bom_prefixed_json_is_parsed_and_original_bytes_are_hashed(
+    tmp_path: Path,
+) -> None:
+    """A UTF-8 BOM is ignored for parsing but retained in the source digest."""
+    original = b'\xef\xbb\xbf{"good":1}'
+    path = tmp_path / "input.json"
+    path.write_bytes(original)
+    directory = tmp_path / "scratch"
+    directory.mkdir()
+
+    with sqlite3.connect(directory / "archive.db") as connection:
+        archive = JsonArchive(path, directory, connection, "chat-json")
+
+        assert [node.value() for node in archive.documents()] == [{"good": 1}]
+        assert not archive.issues
+        assert archive.source.sha256 == hashlib.sha256(original).hexdigest()
+
+
+def test_bom_prefixed_jsonl_preserves_first_record_and_original_hash(
+    tmp_path: Path,
+) -> None:
+    """A BOM on the first JSONL line does not drop its record."""
+    original = b'\xef\xbb\xbf{"good":1}\n{"good":2}\n'
+    path = tmp_path / "input.jsonl"
+    path.write_bytes(original)
+    directory = tmp_path / "scratch"
+    directory.mkdir()
+
+    with sqlite3.connect(directory / "archive.db") as connection:
+        archive = JsonArchive(path, directory, connection, "chat-json")
+
+        assert [node.value() for node in archive.documents()] == [
+            {"good": 1},
+            {"good": 2},
+        ]
+        assert not archive.issues
+        assert archive.source.sha256 == hashlib.sha256(original).hexdigest()
