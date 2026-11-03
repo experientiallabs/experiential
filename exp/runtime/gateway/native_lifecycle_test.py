@@ -193,20 +193,20 @@ def test_closing_one_control_preserves_borrowed_components_and_guardrails(
 def test_failed_control_setup_stops_its_already_constructed_accounting_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An exception binding video services cannot leak the earlier settlement sweeper."""
+    """An exception starting video polling cannot leak the earlier settlement sweeper."""
     _configured_gateway(tmp_path)
     components = lifecycle.load_gateway_components(
         tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-value"}
     )
     baseline_threads = threading.active_count()
 
-    def fail(_self: NativeControlPlane) -> None:
+    def fail(_self: VideoEngine, *, interval_seconds: float = 5.0) -> threading.Thread:
         """Fail after accounting has started but before a complete plane can be returned."""
-        raise RuntimeError("injected video binding failure")
+        raise RuntimeError("injected video poller failure")
 
-    monkeypatch.setattr(NativeControlPlane, "_bind_videos", fail)
+    monkeypatch.setattr(VideoEngine, "start_poller", fail)
     try:
-        with pytest.raises(RuntimeError, match="injected video binding failure"):
+        with pytest.raises(RuntimeError, match="injected video poller failure"):
             NativeControlPlane(components)
         assert threading.active_count() == baseline_threads
         assert components.accounting_healthy
