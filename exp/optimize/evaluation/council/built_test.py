@@ -10,6 +10,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.evaluations.actor_rubric import ACTOR_JUDGE_PROMPT, actor_judge
 from exp.common.models import load_model_catalog, write_model_catalog
+from exp.common.project import artifact_input
 from exp.optimize.evaluation.audit.panel import source_rag_inputs
 from exp.optimize.evaluation.audit.panel_test import (
     USERS,
@@ -25,6 +26,11 @@ from exp.optimize.evaluation.council.built import DEFAULT_ACTOR_MODELS, prepare_
 from exp.optimize.evaluation.fidelity import runner as fidelity
 from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
+from exp.simulation.retrieval.scope import CorpusScope
+from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.world_model.artifact import persist_grounded_world_model
+from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 
 def test_fresh_build_prepares_disjoint_calibration_and_actor_tasks(
@@ -102,6 +108,42 @@ def test_execution_uses_existing_calibration_then_council_owners(
     result = built_council.execute_built_council(project, prepared)
     assert stages == ["calibration", "prepare-council", "execute-council"]
     assert result == {"result": "saved"}
+
+
+def test_jev_rebind_keeps_the_source_world_models_construction_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rebinding the simulator to the JEV reranker carries its recorded scope unchanged."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, project, _ = build_project(tmp_path, monkeypatch, provider)
+    world_model, cases = source_rag_inputs(project, USERS)
+    base = load_grounded_world_model_artifact(project.artifacts, world_model)
+    fit = load_rag_index(project.artifacts, base.serving_rag.artifact_id)
+    traces = (min(row.trace_id for row in fit.transitions),)
+    scope = CorpusScope.declare(name="construction", kind="trace", ids=traces, source_plan="0" * 64)
+    scoped = persist_grounded_world_model(
+        project.artifacts,
+        base.serving_rag,
+        model_alias=base.model_alias,
+        model=base.model,
+        created_at=base.created_at,
+        code_revision=base.code_revision,
+        top_k=base.top_k,
+        knowledge=SimulationKnowledge(source_trace_ids=traces),
+        construction_scope=scope,
+    )
+    monkeypatch.setattr(
+        built_council,
+        "source_rag_inputs",
+        lambda _project, _count: (artifact_input(scoped.manifest), cases),
+    )
+    prepared = prepare_built_council(project, ("world", "judge"), code_revision="fixture")
+    rebound = load_grounded_world_model_artifact(
+        project.artifacts, prepared.calibration.spec.world_model
+    )
+    assert rebound.world_model_id != scoped.artifact.world_model_id
+    assert rebound.selection_policy_sha256 is not None
+    assert rebound.construction_scope == scope
 
 
 def test_one_heldout_lineage_is_refused_without_inference(

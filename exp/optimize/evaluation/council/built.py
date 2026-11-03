@@ -161,6 +161,7 @@ def prepare_built_council(
             top_k=artifact.top_k,
             knowledge=artifact.knowledge,
             selection_policy_sha256=policy.identity,
+            construction_scope=artifact.construction_scope,
         )
         world_model = artifact_input(rebound.manifest)
     now = (clock or (lambda: datetime.now(UTC)))()

@@ -147,7 +147,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.learning.lesson_evolution:_attempt",
             "exp.optimize.evaluation.learning.lesson_evolution:evolve_lessons",
         ),
-        "89ba387276193e7a3435a0e5617821c0b37db5ad2654aff1509f2a00051f0a74",
+        "864ccb657a7e51ff10ce6e9f961aa2059ab2e377dc5de41234408cbe95d2dfdc",
     ),
     Protocol(
         "exp.optimize.evaluation.hillclimb.design:HILL_CLIMB_PROTOCOL",

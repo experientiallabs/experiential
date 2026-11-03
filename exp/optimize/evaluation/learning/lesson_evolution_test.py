@@ -13,11 +13,19 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ArtifactStore
+from exp.optimize.evaluation.audit.panel import source_rag_inputs
+from exp.optimize.evaluation.audit.panel_test import (
+    USERS,
+    SimulatedProvider,
+    build_project,
+    episode,
+)
 from exp.optimize.evaluation.learning import lesson_evolution
 from exp.optimize.evaluation.learning.lesson_evolution import (
     RESULT_TYPE,
     EvolutionResult,
     preflight_evolution,
+    variant_construction_scope,
 )
 from exp.optimize.evaluation.learning.lessons import (
     LessonEvolutionRequest,
@@ -26,8 +34,16 @@ from exp.optimize.evaluation.learning.lessons import (
 )
 from exp.optimize.evaluation.learning.lessons_test import continuation, screened_project
 from exp.optimize.evaluation.learning.traces import fit_cases
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibraryEntry
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
+from exp.simulation.retrieval.scope import CorpusScope, ScopeKind
+from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.world_model.artifact import (
+    GroundedWorldModelArtifact,
+    persist_grounded_world_model,
+)
+from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 
 def evolve(
@@ -202,3 +218,109 @@ def test_a_completed_run_id_refuses_a_different_request(
     )
     with pytest.raises(ValueError, match="without its request binding"):
         preflight_evolution(store, legacy)
+
+
+def _scoped_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: ScopeKind
+) -> tuple[ArtifactStore, GroundedWorldModelArtifact, dict[str, str]]:
+    """A built fit-only simulator re-persisted with a construction scope over one trace.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+        kind: Whether the scope lists the trace or its lineage.
+
+    Returns:
+        The store, the scoped base, and every serving trace's lineage.
+    """
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, project, _ = build_project(tmp_path, monkeypatch, provider)
+    world_model, _ = source_rag_inputs(project, USERS)
+    store = project.artifacts
+    unscoped = load_grounded_world_model_artifact(store, world_model)
+    serving = load_rag_index(store, unscoped.serving_rag.artifact_id)
+    lineages = {row.trace_id: row.lineage_id for row in serving.transitions}
+    first = min(lineages)
+    scope = CorpusScope.declare(
+        name="construction",
+        kind=kind,
+        ids=(first if kind == "trace" else lineages[first],),
+        source_plan="0" * 64,
+    )
+    scoped = persist_grounded_world_model(
+        store,
+        unscoped.serving_rag,
+        model_alias=unscoped.model_alias,
+        model=unscoped.model,
+        created_at=unscoped.created_at,
+        code_revision=unscoped.code_revision,
+        top_k=unscoped.top_k,
+        knowledge=SimulationKnowledge(source_trace_ids=(first,)),
+        construction_scope=scope,
+    )
+    return store, scoped.artifact, lineages
+
+
+def test_an_unscoped_simulator_yields_unscoped_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a recorded scope, variants stay unscoped whatever the new knowledge cites."""
+    store, scoped, lineages = _scoped_base(tmp_path, monkeypatch, "trace")
+    base = scoped.model_copy(update={"construction_scope": None})
+    for knowledge in (
+        SimulationKnowledge(),
+        SimulationKnowledge(source_trace_ids=tuple(sorted(lineages))),
+    ):
+        assert variant_construction_scope(store, base, knowledge) is None
+
+
+def test_a_trace_scope_is_kept_inside_and_refused_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In-scope knowledge keeps the exact scope; other or missing traces are refused."""
+    store, base, lineages = _scoped_base(tmp_path, monkeypatch, "trace")
+    assert base.construction_scope is not None
+    inside = SimulationKnowledge(source_trace_ids=base.construction_scope.ids, rules="edited")
+    kept = variant_construction_scope(store, base, inside)
+    assert kept == base.construction_scope
+    variant = persist_grounded_world_model(
+        store,
+        base.serving_rag,
+        model_alias=base.model_alias,
+        model=base.model,
+        created_at=base.created_at,
+        code_revision=base.code_revision,
+        top_k=base.top_k,
+        knowledge=inside,
+        construction_scope=kept,
+    )
+    assert variant.artifact.construction_scope == base.construction_scope
+    other = max(lineages)
+    assert other not in base.construction_scope.ids
+    with pytest.raises(ValueError, match=f"trace {other} outside"):
+        variant_construction_scope(
+            store, base, SimulationKnowledge(source_trace_ids=(*base.construction_scope.ids, other))
+        )
+    with pytest.raises(ValueError, match="records no source traces"):
+        variant_construction_scope(store, base, SimulationKnowledge(rules="edited"))
+
+
+def test_a_lineage_scope_resolves_traces_through_the_serving_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Traces of a scoped lineage keep it; another lineage or an unresolved trace is refused."""
+    store, base, lineages = _scoped_base(tmp_path, monkeypatch, "lineage")
+    assert base.construction_scope is not None
+    allowed = base.construction_scope.ids
+    inside = tuple(sorted(trace for trace, lineage in lineages.items() if lineage in allowed))
+    assert (
+        variant_construction_scope(store, base, SimulationKnowledge(source_trace_ids=inside))
+        == base.construction_scope
+    )
+    other = next(trace for trace, lineage in sorted(lineages.items()) if lineage not in allowed)
+    with pytest.raises(ValueError, match=f"trace {other} outside"):
+        variant_construction_scope(store, base, SimulationKnowledge(source_trace_ids=(other,)))
+    with pytest.raises(ValueError, match="no serving transition"):
+        variant_construction_scope(
+            store, base, SimulationKnowledge(source_trace_ids=("unknown-trace",))
+        )

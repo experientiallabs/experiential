@@ -33,7 +33,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.models import load_model_catalog
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.fidelity.replay import (
     DEADLINE,
     INVESTIGATION_TOKENS,
@@ -71,7 +71,12 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibrarySnapshot, resolve_library_entry
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
-from exp.simulation.world_model.artifact import persist_grounded_world_model
+from exp.simulation.retrieval.scope import CorpusScope
+from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.world_model.artifact import (
+    GroundedWorldModelArtifact,
+    persist_grounded_world_model,
+)
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 LABEL = "lesson-edit"
@@ -157,6 +162,55 @@ class _Attempt:
     held_out: tuple[LibraryCase, ...]
     protected: tuple[LibraryCase, ...]
     replays: dict[str, ReplayCase]
+
+
+def variant_construction_scope(
+    store: ArtifactStore, base: GroundedWorldModelArtifact, knowledge: SimulationKnowledge
+) -> CorpusScope | None:
+    """The construction scope a knowledge variant of ``base`` may record, or a refusal.
+
+    A variant replaces the base world model's knowledge, so a construction scope recorded on
+    the base would otherwise be dropped or claimed for traces it never covered. The scope is
+    kept only when every trace the new knowledge records in ``source_trace_ids`` lies inside
+    it. A lineage scope resolves each trace's lineage from the base's serving transitions.
+    Without a recorded scope the variant is unscoped, as before.
+
+    Args:
+        store: Project-local immutable artifact store holding the base's serving index.
+        base: Verified grounded world model the variant is rebound from.
+        knowledge: Knowledge the variant pins in place of the base's.
+
+    Returns:
+        The base's recorded construction scope, unchanged, or None when it records none.
+
+    Raises:
+        ValueError: The base records a scope and the new knowledge records no source traces,
+            a source trace whose lineage cannot be resolved, or a trace outside the scope.
+    """
+    scope = base.construction_scope
+    if scope is None:
+        return None
+    if not knowledge.source_trace_ids:
+        raise ValueError(
+            f"world model records construction scope {scope.name!r}, but the new knowledge "
+            "records no source traces to check against it"
+        )
+    lineage_of: dict[str, str] = {}
+    if scope.kind == "lineage":
+        serving = load_rag_index(store, base.serving_rag.artifact_id)
+        lineage_of = {row.trace_id: row.lineage_id for row in serving.transitions}
+    for trace_id in sorted(knowledge.source_trace_ids):
+        if scope.kind == "lineage" and trace_id not in lineage_of:
+            raise ValueError(
+                f"new knowledge cites trace {trace_id} with no serving transition to resolve "
+                f"its lineage against construction scope {scope.name!r}"
+            )
+        if not scope.admits(trace_id=trace_id, lineage_id=lineage_of.get(trace_id, "")):
+            raise ValueError(
+                f"new knowledge was derived from trace {trace_id} outside the world model's "
+                f"construction scope {scope.name!r}; the scope is neither dropped nor widened"
+            )
+    return scope
 
 
 def _result_id(spec: LessonEvolutionRequest) -> str:
@@ -381,6 +435,7 @@ def evolve_lessons(
             knowledge=knowledge,
             selection_policy_sha256=base.selection_policy_sha256,
             original_evidence=base.original_evidence,
+            construction_scope=variant_construction_scope(store, base, knowledge),
         )
         replay = attempt.replays[case.case_id]
         replayed = replay_spec(
