@@ -45,7 +45,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -54,6 +54,7 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelFinishReason, ModelMessage, ModelRequest, ModelSnapshot
 from exp.common.models.client import ModelClient
 from exp.common.project.paths import ProjectPaths
@@ -642,7 +643,7 @@ class DecisionCache:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         if directory.is_symlink() or not directory.is_dir():
             raise TraceTaggingError("the decision cache coordination directory is unsafe")
-        lock = FileLock(self.lock_path, timeout=_LOCK_TIMEOUT_SECONDS, mode=0o600)
+        lock = CoordinationLock(self.lock_path, timeout=_LOCK_TIMEOUT_SECONDS, mode=0o600)
         try:
             lock.acquire()
         except Timeout:
