@@ -753,12 +753,7 @@ class NativeAttemptAccounting:
 
     def price(self, argument: str) -> str:
         """Let the host price one decided settlement (``quote_settlement``); nothing is written."""
-        data = json.loads(argument)
-        with self._lock:
-            entry = self._inflight.get(str(data["request_id"]))
-        if entry is None or entry.pending_settlement is not None:
-            raise NativeBridgeError(accounting_recovering_error())
-        return quote_settlement(data, entry, loads=self._loads, ledger=self._write_ledger)
+        return quote_settlement(self, argument)
 
     def _settle(self, argument: str) -> str:
         """Commit one observed outcome while the caller retains shutdown ownership."""

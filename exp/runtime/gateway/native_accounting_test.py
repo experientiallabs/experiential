@@ -5232,7 +5232,9 @@ def test_a_quote_prices_exactly_what_the_later_settlement_writes() -> None:
     encoded = json.dumps(payload)
     assert registry.price(encoded) == "{}"
     assert ledger.finished == []
-    assert entry.pending_settlement is None
+    # Priced means owned by recovery: the sweep replays it, never abandons it.
+    assert entry.pending_settlement == payload
+    assert registry.accounting_healthy
     assert registry.entry(entry.authorization.request_id) is entry
     registry.settle(encoded)
     assert len(ledger.priced) == 1
@@ -5266,4 +5268,31 @@ def test_a_failed_quote_retains_nothing_and_the_settlement_still_lands() -> None
     assert entry.pending_settlement is None
     assert registry.accounting_healthy
     registry.settle(encoded)
+    assert len(ledger.finished) == 1
+
+
+def test_an_expired_priced_settlement_is_replayed_not_abandoned() -> None:
+    """A stream still flushing its priced terminal past its deadline settles as priced."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "completed",
+        "usage": {"input_tokens": 9, "output_tokens": 4},
+        "tool_names": [],
+        "failure": None,
+        "finalize": True,
+        "opened": True,
+    }
+    registry.price(json.dumps(payload))
+    entry.deadline_monotonic = time.monotonic() - 60
+    registry.sweep_expired()
+    assert registry.entry(entry.authorization.request_id) is None
+    assert ledger.finished == [
+        {"attempt_id": started["attempt_id"], "failure_class": None, "finalize": True}
+    ]
+    assert ledger.priced[0]["terminal_event"] == ledger.terminal_events[-1]
+    # The data plane's own delivery afterwards is a no-op, not a second write.
+    assert registry.settle(json.dumps(payload)) == "{}"
     assert len(ledger.finished) == 1
