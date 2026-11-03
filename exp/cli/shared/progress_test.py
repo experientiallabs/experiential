@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 
 import pytest
 from rich.console import Console
@@ -14,9 +15,8 @@ from exp.cli.shared.progress import (
     ProgressDisplay,
     progress_display,
     progress_phases,
-    qualified,
 )
-from exp.common.progress import ProgressEvent
+from exp.common.progress import ProgressEvent, qualified
 from exp.simulation.retrieval.contracts import RAGAction
 from exp.simulation.retrieval.embedding import (
     RAGEmbeddingCache,
@@ -36,6 +36,7 @@ def _plain_console(*, interactive: bool) -> tuple[Console, io.StringIO]:
         width=100,
         color_system=None,
         legacy_windows=False,
+        _environ={**os.environ, "TERM": "xterm-256color"} if interactive else None,
     )
     return console, buffer
 

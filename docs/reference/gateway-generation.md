@@ -148,6 +148,14 @@ the order the model produced.
   their typed refusal for a bad value, unknown keys inside a tool call's `function`
   object, inside a Messages content block, or on other Responses item types stay
   refused, and an unknown top-level parameter is still `unsupported_parameter`.
+- An unknown key anywhere else in a Chat or Responses body (a function tool definition
+  included) stays refused as `invalid_parameter`, and the message names the key as unknown
+  and says to remove it: `Unknown parameter 'tools.0.function.requires_confirmation': this
+  field is not supported. Remove it and resend.` A function tool accepts `name`,
+  `description`, `parameters` and `strict` (plus `defer_loading`); Agno's client-side
+  approval flags (`requires_confirmation`, `external_execution`, `approval_type`) are not
+  part of OpenAI's function tool schema. A key that some branch of a union defines keeps
+  its value message, so a value fault is never reported as a stray key.
 - OpenAI's deprecated (not removed) function-calling shapes on Chat
   ([API reference](https://platform.openai.com/docs/api-reference/chat/create)) are rewritten
   to their `tools` spelling before dispatch: an assistant `function_call: {"name",
@@ -166,6 +174,21 @@ the order the model produced.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.
+- A lone UTF-16 surrogate escape (`\ud83d` without its pair, what JavaScript's well-formed
+  `JSON.stringify` writes for a string cut inside an emoji) is valid JSON with no UTF-8 form.
+  On Chat, Responses and Messages (and a Messages count) every such escape in content
+  (message text and parts, tool results, tool-call `arguments`, system prompts and
+  instructions, tool descriptions and schemas, metadata) becomes U+FFFD before any decoder
+  reads the body, disclosed once per field path as `<path>->replaced(lone_surrogate)` with
+  list positions omitted (`messages.content`, `messages.tool_calls.function.arguments`,
+  `system.text`). A path stops at a caller-keyed object (`parameters`, `input_schema`,
+  `schema`, `metadata`, `properties`, a tool call's `input`), so no caller key is echoed.
+  A field that names something is a 400 `invalid_parameter` naming that field instead:
+  `model`, tool and function `name`s, `id`, `call_id`, `tool_call_id`, `tool_use_id`,
+  `previous_response_id`, `type`, `role`, and opaque provider tokens (`signature`,
+  `thought_signature`, `encrypted_content`, `data`), as is an object key holding one.
+  Embeddings, images and audio have no disclosure channel, so a lone surrogate there is the
+  same field-named 400. A body whose bytes are not UTF-8 stays `invalid_json`.
 - A Chat system, developer, user or tool message whose `content` is null or omitted (Go clients
   drop an empty tool result under `omitempty`) is refused with `400 invalid_parameter` naming
   `messages.<n>.content`; an empty string is content and is accepted.

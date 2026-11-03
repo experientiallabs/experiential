@@ -12,6 +12,7 @@ from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.attempt_tokens import worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
@@ -202,6 +203,13 @@ class NativeAttemptAccounting:
                 daemon=True,
             )
             self._sweeper.start()
+
+    @property
+    def running(self) -> bool:
+        """Report whether recovery is still owned here (host-scheduled hosts own no thread)."""
+        return not self._stop_sweeper.is_set() and (
+            self._sweeper is None or self._sweeper.is_alive()
+        )
 
     @property
     def accounting_healthy(self) -> bool:
@@ -709,13 +717,13 @@ class NativeAttemptAccounting:
             )
         exhaustion = last_failure
         if exhaustion is None:
-            # An empty forced claim means every deployment is provider-throttled.
-            # Otherwise report unavailable without a free-capacity certificate.
+            # Throttled, else the account failure holding every claimable circuit open (a
+            # selected dial never forces one), else unavailable; no free-capacity certificate.
             throttled_remaining = self._health.throttled_remaining_seconds(keys)
             exhaustion = (
                 all_routes_throttled_failure(throttled_remaining)
                 if throttled_remaining is not None
-                else all_routes_unavailable_failure()
+                else self._health.circuit_failure(keys, ladder) or all_routes_unavailable_failure()
             )
         certified = active and self.finish_request_quietly(
             entry.authorization,
@@ -956,8 +964,11 @@ class NativeAttemptAccounting:
         )
 
     def _sweep_loop(self) -> None:
-        """Periodically reconcile retained or expired attempts for the process lifetime."""
-        recover_until_stopped(self, _SWEEP_INTERVAL_SECONDS)
+        """Reconcile retained or expired attempts until close, then release thread handles."""
+        try:
+            recover_until_stopped(self, _SWEEP_INTERVAL_SECONDS)
+        finally:
+            close_idle_connections()
 
     def close(self, timeout_seconds: float = 10.0) -> bool:
         """Stop owned recovery before a host closes its durable transport.

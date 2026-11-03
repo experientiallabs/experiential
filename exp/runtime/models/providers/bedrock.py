@@ -38,6 +38,7 @@ from exp.runtime.models.providers.reasoning_compat import bedrock_adaptive_think
 from exp.runtime.models.providers.transport import (
     ProviderTransportError,
     RetryPolicy,
+    classify_unrepeatable_retry,
     run_with_retry,
 )
 
@@ -694,7 +695,7 @@ class BedrockClient:
         *,
         retry_policy: RetryPolicy | None = None,
     ) -> Mapping[str, object]:
-        """Retry one Bedrock call on the same region and model without botocore multiplication."""
+        """Retry one Bedrock call in its region and model; an unknown outcome is never resent."""
 
         def send() -> Mapping[str, object]:
             """Run one attempt and translate provider failures into transport errors."""
@@ -709,7 +710,9 @@ class BedrockClient:
             except Exception as exc:
                 raise _as_transport_error(exc) from exc
 
-        return run_with_retry(send, policy=retry_policy or self._retry_policy)
+        return run_with_retry(
+            send, policy=retry_policy or self._retry_policy, classify=classify_unrepeatable_retry
+        )
 
 
 class BoundedBedrockClient(BoundedSyncModelClientAdapter):

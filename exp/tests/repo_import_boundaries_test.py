@@ -18,6 +18,9 @@ FORBIDDEN_IMPORTS = {
     "optimize": frozenset({"cli"}),
 }
 PACKAGE_ORDER = {"common": 0, "runtime": 1, "simulation": 2, "optimize": 3, "cli": 4}
+# Command presentation packages: ``exp build`` composes evaluation presentation (learning, the
+# miss retest), never the reverse, so the two commands cannot form an ownership cycle.
+FORBIDDEN_CLI_IMPORTS = {"evaluation": frozenset({"build"})}
 
 
 def _module_name(path: Path) -> str:
@@ -170,6 +173,36 @@ def test_production_package_graph_is_acyclic() -> None:
         edge for edge in _production_edges() if PACKAGE_ORDER[edge[1]] >= PACKAGE_ORDER[edge[0]]
     }
     assert not outward, f"outward or cyclic production imports: {sorted(outward)}"
+
+
+def _cli_violations(path: Path, source: str) -> frozenset[tuple[str, str]]:
+    """Return forbidden command-package edges, deferred imports included, in one CLI source."""
+    parts = _module_name(path).split(".")
+    owner = parts[2] if len(parts) > 2 and parts[:2] == ["exp", "cli"] else ""
+    forbidden = FORBIDDEN_CLI_IMPORTS.get(owner, frozenset())
+    tree = ast.parse(source, filename=str(path))
+    return frozenset(
+        (path.relative_to(REPO_ROOT).as_posix(), target)
+        for target in _import_targets(tree, _module_package(path))
+        if target.split(".")[:2] == ["exp", "cli"]
+        and len(target.split(".")) > 2
+        and target.split(".")[2] in forbidden
+    )
+
+
+def test_evaluation_presentation_never_imports_the_build_command() -> None:
+    """Shared learning and replay presentation lives below ``exp build``, not inside it."""
+    violations: set[tuple[str, str]] = set()
+    for path in (EXP_DIR / "cli").rglob("*.py"):
+        if path.name.endswith("_test.py") or path.name == "conftest.py":
+            continue
+        violations.update(_cli_violations(path, path.read_text(encoding="utf-8")))
+    assert not violations, (
+        f"evaluation presentation imports the build command: {sorted(violations)}"
+    )
+    deferred = "def run():\n    from exp.cli.build.learning import run_learning\n"
+    probe = EXP_DIR / "cli" / "evaluation" / "probe.py"
+    assert _cli_violations(probe, deferred), "a deferred import is still an edge"
 
 
 def test_every_forbidden_direction_is_detected() -> None:

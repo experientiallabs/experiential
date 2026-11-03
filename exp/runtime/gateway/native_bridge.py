@@ -100,6 +100,7 @@ from exp.runtime.gateway.native_explicit_cache import (
     validate_cache_hosts,
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
+from exp.runtime.gateway.native_lifecycle import NativeControlLifecycle
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_openai_decisions import NativeDecisionSurfacesMixin
 from exp.runtime.gateway.native_reasoning import (
@@ -161,6 +162,7 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
+    NativeControlLifecycle,
     NativeAuthenticationMixin,
     NativeGuardrailsMixin,
     NativeDecodeMixin,
@@ -278,13 +280,9 @@ class NativeControlPlane(
         )
         if fleet_lane_gate is not None:
             self._accounting.loads.attach_fleet_gate(fleet_lane_gate)
-        try:
-            if self._videos is not None:
-                self._videos.start_poller()
-        except BaseException:
-            # No request can yet enter, so this registry has no retained writes.
-            self._accounting.close()
-            raise
+        if self._videos is not None:
+            # No request can yet enter, so a failed start leaves no retained writes.
+            self._start_after_accounting(self._videos.start_poller)
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:

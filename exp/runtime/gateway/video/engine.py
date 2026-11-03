@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -902,32 +903,28 @@ class VideoEngine:
     # -- background poller ------------------------------------------------------
 
     def start_poller(self, *, interval_seconds: float = POLL_INTERVAL_SECONDS) -> threading.Thread:
-        """Start the daemon thread that drives every open job to settlement.
-
-        Args:
-            interval_seconds: Sleep between passes.
-
-        Returns:
-            The started thread.
-        """
+        """Start (once) the daemon thread that drives every open job to settlement."""
         if not 0 < interval_seconds <= 300:
             raise ValueError("video poll interval must be positive and at most 300 seconds")
 
         def loop() -> None:
-            """Stop new polls at shutdown but retain ownership of known terminal writes."""
-            while True:
-                closing = self._poll_stop.wait(interval_seconds)
-                try:
+            """Stop new polls at shutdown, retain known terminal writes, release handles."""
+            try:
+                while True:
+                    closing = self._poll_stop.wait(interval_seconds)
+                    try:
+                        if closing:
+                            self._retry_settlements()
+                            if self._recovery_drained():
+                                return
+                        else:
+                            self.poll_open()
+                    except Exception:  # noqa: BLE001 - the poller must outlive store hiccups.
+                        _LOGGER.exception("video poller pass failed")
                     if closing:
-                        self._retry_settlements()
-                        if self._recovery_drained():
-                            return
-                    else:
-                        self.poll_open()
-                except Exception:  # noqa: BLE001 - the poller must outlive store hiccups.
-                    _LOGGER.exception("video poller pass failed")
-                if closing:
-                    time.sleep(min(interval_seconds, 0.1))
+                        time.sleep(min(interval_seconds, 0.1))
+            finally:
+                close_idle_connections()
 
         with self._poller_lock:
             if self._poller is None:

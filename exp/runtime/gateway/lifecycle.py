@@ -5,14 +5,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import cast
-
-from filelock import FileLock, Timeout
 
 from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
@@ -26,6 +24,7 @@ from exp.common.models import (
     read_model_catalog_document,
     read_normalized_snapshot_document,
 )
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -36,6 +35,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
+from exp.runtime.gateway.instance_lock import gateway_instance_lock as gateway_instance_lock
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle_fields import (
@@ -52,6 +52,7 @@ from exp.runtime.gateway.model_chain_authority import (
     ModelChainAuthorityError,
     refuse_unenforced_model_chains,
 )
+from exp.runtime.gateway.native_lifecycle import LocalGatewayLifecycle
 from exp.runtime.gateway.project_activation import (
     ProjectActivationError,
     ProjectActivationRepository,
@@ -398,37 +399,8 @@ class _ReadyControlStore:
         raise GatewayRoutingError("authorized alias revision is unavailable in this process")
 
 
-@contextmanager
-def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
-    """Hold the single live gateway owner lock for one EXP root.
-
-    Args:
-        root: EXP root whose gateway database and snapshots are served.
-        port: Requested loopback port, included only in actionable diagnostics.
-
-    Yields:
-        None while this process exclusively owns the local gateway.
-
-    Raises:
-        GatewayLifecycleError: Another process currently owns the root.
-    """
-    state_dir = root / "gateway"
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = FileLock(state_dir / "run.lock", timeout=0, mode=0o600)
-    try:
-        lock.acquire()
-    except Timeout:
-        raise GatewayLifecycleError(
-            f"another gateway process already owns {root} (requested port {port})"
-        ) from None
-    try:
-        yield
-    finally:
-        lock.release()
-
-
 @dataclass(frozen=True)
-class LocalGatewayComponents:
+class LocalGatewayComponents(LocalGatewayLifecycle):
     """Loaded authority, accounting, and routing for the native gateway engine.
 
     The native engine's control-plane bridge uses these directly for
@@ -487,17 +459,9 @@ def load_gateway_components(
     decision_sink: DecisionSink | None = None,
     only_aliases: frozenset[str] | None = None,
 ) -> LocalGatewayComponents:
-    """Load granted active aliases into engine-neutral gateway components.
-
-    Args:
-        root: Initialized EXP root. Defaults to the local ``.exp`` root.
-        environment: Optional provider credential mapping used by tests.
-        project_repository: Repository for verified immutable project activations.
-        decision_sink: Optional aggregate-safe recorder for served project selections.
-        only_aliases: Optional exact public aliases to expose.
-
-    Returns:
-        Hot-reloadable authority, ledger, routes, and startup proof.
+    """Load granted active aliases; close the returned composition after serving.
+    A failed startup drains every worker already created. Optional injected credentials,
+    activation repository, decision sink and alias filtering retain their existing authority.
 
     Raises:
         GatewayLifecycleError: No granted alias can form a complete local route.
@@ -510,46 +474,52 @@ def load_gateway_components(
         serving_snapshot_max_bytes=manager.serving_snapshot_max_bytes,
         classification_memo=manager.classification_memo,
     )
-    write_ledger = GroupCommitAttemptLedger(ledger)
-    expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
+    with ExitStack() as startup:
+        startup.callback(close_idle_connections)
+        write_ledger = GroupCommitAttemptLedger(ledger)
+        startup.callback(write_ledger.close)
+        expired, unknown = ledger.reconcile_crashed_requests(cleanup_grace=timedelta(seconds=5))
 
-    def loader() -> _AliasAuthorityState:
-        """Build one complete validated generation from current granted authority."""
-        return _load_alias_state(
-            manager,
-            environment=environment,
-            project_repository=project_repository,
-            decision_sink=decision_sink,
-            only_aliases=only_aliases,
+        def loader() -> _AliasAuthorityState:
+            """Build one complete validated generation from current granted authority."""
+            return _load_alias_state(
+                manager,
+                environment=environment,
+                project_repository=project_repository,
+                decision_sink=decision_sink,
+                only_aliases=only_aliases,
+            )
+
+        state = loader()
+        selection_workers = SelectionWorkerPool()
+        startup.callback(selection_workers.shutdown)
+        routes = CatalogRouteResolver(
+            state.normalized_catalogs,
+            project_resolver=_project_resolver(
+                state.activations, state.exact_models, selection_workers=selection_workers
+            ),
+            listing_pools=state.listing_pools,
         )
-
-    state = loader()
-    selection_workers = SelectionWorkerPool()
-    routes = CatalogRouteResolver(
-        state.normalized_catalogs,
-        project_resolver=_project_resolver(
-            state.activations, state.exact_models, selection_workers=selection_workers
-        ),
-        listing_pools=state.listing_pools,
-    )
-    reloader = _AliasAuthorityReloader(
-        loader=loader,
-        state=state,
-        routes=routes,
-        selection_workers=selection_workers,
-    )
-    return LocalGatewayComponents(
-        manager=manager,
-        store=_ReadyControlStore(store=store, reloader=reloader),
-        ledger=ledger,
-        write_ledger=write_ledger,
-        routes=routes,
-        reloader=reloader,
-        selection_workers=selection_workers,
-        reconciled_expired_requests=expired,
-        reconciled_unknown_attempts=unknown,
-        video_jobs=SQLiteVideoJobStore(manager.database_path),
-    )
+        reloader = _AliasAuthorityReloader(
+            loader=loader,
+            state=state,
+            routes=routes,
+            selection_workers=selection_workers,
+        )
+        result = LocalGatewayComponents(
+            manager=manager,
+            store=_ReadyControlStore(store=store, reloader=reloader),
+            ledger=ledger,
+            write_ledger=write_ledger,
+            routes=routes,
+            reloader=reloader,
+            selection_workers=selection_workers,
+            reconciled_expired_requests=expired,
+            reconciled_unknown_attempts=unknown,
+            video_jobs=SQLiteVideoJobStore(manager.database_path),
+        )
+        startup.pop_all()
+        return result
 
 
 def _project_resolver(

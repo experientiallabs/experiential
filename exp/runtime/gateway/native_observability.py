@@ -235,10 +235,13 @@ class NativeObservabilityMixin:
     def readiness(self, argument: str) -> str:
         """Return whether bridge settlement and composition accounting stay healthy.
 
-        This instance's retained writes and infrastructure failures fail closed.
+        This instance's retained writes and infrastructure failures fail closed, and so
+        does an instance whose owned recovery has been stopped by close.
         A host composing several instances owns process readiness separately.
         """
         del argument
+        if not self._accounting.running:
+            return "false"
         try:
             if not self._components.accounting_healthy or not self._accounting.accounting_healthy:
                 return "false"

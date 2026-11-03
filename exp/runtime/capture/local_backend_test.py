@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import os
 import plistlib
-import select
+import selectors
 import stat
 import subprocess
 import sys
@@ -534,7 +534,9 @@ def test_foreground_lock_releases_after_process_crash(capture_home: Path) -> Non
     )
     try:
         assert child.stdout is not None
-        assert select.select([child.stdout], [], [], 10)[0], "lock child did not become ready"
+        with selectors.DefaultSelector() as reader:
+            reader.register(child.stdout, selectors.EVENT_READ)
+            assert reader.select(10), "lock child did not become ready"
         assert child.stdout.readline() == "locked\n"
         with pytest.raises(RuntimeError, match="Capture is already running"):
             with local_backend.capture_instance():
@@ -627,9 +629,10 @@ def test_foreground_lock_normalizes_only_capture_directory(capture_home: Path) -
     """Legacy readable directories become private without chmodding the user's Library."""
     directory = capture_home / "Library/Application Support/exp/capture"
     directory.mkdir(parents=True)
-    directory.chmod(0o755)
     library = capture_home / "Library"
-    library.chmod(0o755)
+    parents = (library, library / "Application Support", directory.parent)
+    for path in (*parents, directory):
+        path.chmod(0o755)
     with local_backend.capture_instance():
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-        assert stat.S_IMODE(library.stat().st_mode) == 0o755
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o755 for path in parents)

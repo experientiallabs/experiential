@@ -51,6 +51,8 @@ dependencies = [
 [project.optional-dependencies]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
 sft = ["tinker==0.23.4", "tinker-cookbook==0.4.3"]
+# Native artifact materialization: typed workbook edits on immutable input bytes.
+artifact-edits = ["openpyxl==3.1.5", "et-xmlfile==2.0.0"]
 dev = [
     "pytest==9.1.1",
     "pytest-xdist==3.8.0",
@@ -62,6 +64,7 @@ dev = [
     "packaging==26.2",  # Compare Cargo SemVer and Python prerelease versions in release guards.
     "ty==0.0.56",
     "experiential[sft]",
+    "experiential[artifact-edits]",
     # Builds the optional Rust gateway data-plane extension (exp_gateway_native).
     "maturin==1.14.1",
     # WebSocket client for the Responses-over-WebSocket gateway e2e tests.

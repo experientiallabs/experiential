@@ -7,9 +7,23 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import FailureCode, SourceIdentity, StructuredFailure
+from exp.common.core.artifacts import (
+    FailureCode,
+    JsonObject,
+    SourceIdentity,
+    StructuredFailure,
+    canonical_json_bytes,
+)
 from exp.common.models import BillingSource, ModelSnapshot
-from exp.common.traces import Trace, TraceDataset, TraceOutcome, TraceSource, TraceSpan
+from exp.common.traces import (
+    INPUT_HISTORY_PREFIX_KEY,
+    INPUT_MESSAGES_KEY,
+    Trace,
+    TraceDataset,
+    TraceOutcome,
+    TraceSource,
+    TraceSpan,
+)
 
 _DIGEST = "a" * 64
 
@@ -94,3 +108,63 @@ def test_trace_requires_ordered_unique_spans_and_structured_failure() -> None:
             invalid_trace_count=1,
             trace_ids=(trace.trace_id,),
         )
+
+
+_HISTORY: tuple[JsonObject, ...] = (
+    {"role": "user", "content": "Refund order 7."},
+    {"role": "assistant", "content": "Checking."},
+    {"role": "user", "content": "Thanks."},
+)
+
+
+def _with_input(attributes: JsonObject, history: tuple[JsonObject, ...] = _HISTORY) -> JsonObject:
+    """Return the fixture trace as JSON with one span's input attributes and a history.
+
+    Args:
+        attributes: Input attributes for the single span.
+        history: Shared message history stored on the trace.
+
+    Returns:
+        A trace payload ready for validation.
+    """
+    trace = _trace()
+    span = trace.spans[0].model_copy(update={"attributes": attributes})
+    return {**trace.model_dump(), "spans": [span.model_dump()], "message_history": list(history)}
+
+
+def test_input_messages_resolves_a_history_prefix_or_the_inline_value() -> None:
+    """A history reference reads its prefix; an inline value is returned as declared."""
+    shared = Trace.model_validate(_with_input({INPUT_HISTORY_PREFIX_KEY: 3}))
+    assert shared.input_messages(shared.spans[0]) == list(_HISTORY)
+    inline = Trace.model_validate(_with_input({INPUT_MESSAGES_KEY: '[{"role":"user"}]'}, ()))
+    assert inline.input_messages(inline.spans[0]) == '[{"role":"user"}]'
+    assert _trace().input_messages(_trace().spans[0]) is None
+
+
+def test_trace_without_history_keeps_its_canonical_bytes() -> None:
+    """An empty history is omitted, so traces of every other source keep their identity."""
+    trace = _trace()
+    assert "message_history" not in trace.model_dump(mode="json")
+    assert canonical_json_bytes(Trace.model_validate(trace.model_dump())) == canonical_json_bytes(
+        trace
+    )
+
+
+@pytest.mark.parametrize(
+    ("attributes", "history", "message"),
+    [
+        ({INPUT_HISTORY_PREFIX_KEY: 4}, _HISTORY, "references 4 history messages"),
+        ({INPUT_HISTORY_PREFIX_KEY: -1}, _HISTORY, "must be a count"),
+        ({INPUT_HISTORY_PREFIX_KEY: True}, _HISTORY, "must be a count"),
+        ({INPUT_HISTORY_PREFIX_KEY: "3"}, _HISTORY, "must be a count"),
+        ({INPUT_HISTORY_PREFIX_KEY: 2}, _HISTORY, "reference only 2"),
+        ({}, _HISTORY, "reference only 0"),
+        ({INPUT_HISTORY_PREFIX_KEY: 3, INPUT_MESSAGES_KEY: []}, _HISTORY, "both inline"),
+    ],
+)
+def test_trace_rejects_unresolvable_or_unreferenced_history(
+    attributes: JsonObject, history: tuple[JsonObject, ...], message: str
+) -> None:
+    """A dangling, malformed, doubled or partly unreferenced history never validates."""
+    with pytest.raises(ValidationError, match=message):
+        Trace.model_validate(_with_input(attributes, history))

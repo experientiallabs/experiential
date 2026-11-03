@@ -433,7 +433,7 @@ reports contain measurements only, never an approval or denial. See the
 ### Learning from traces
 
 `exp build PROJECT -t PATH` learns the simulator from the traces as part of every build. After
-the index and simulator are built, it replays every trace once, in export order, on a hybrid
+the index and simulator are built, it replays every trace once, in canonical dataset order (start time, then trace ID), on a hybrid
 simulator: learned memory supplies behavioral rules, and the build's index supplies recorded facts
 (a trace never retrieves its own lineage). Every step in a trace is predicted before its recorded
 replies are disclosed and mismatches are investigated. Only investigations the investigator marks
@@ -478,9 +478,20 @@ toward that limit too. Later misses are recorded as raw feedback without one, an
 still learned. Concurrent investigations share one session lease, preventing another feedback
 batch or prediction from changing the session while their receipts settle.
 
-A memory version always shows the predictor the same overview: the first read of a version
-records which compressed summaries existed, and every later read of that version uses exactly
-those, even after more compression completes.
+Each investigation sees the causal history of its trace: every step up to and including the
+investigated one, with the public action, the simulator's predicted reply and committed state
+edits, and the recorded reply disclosed for that step. Recorded replies are labelled native
+observations and predictions are labelled the simulator's own belief, so a readback miss can be
+attributed to the earlier write that explains it. Later steps and other traces never enter the
+history. When a long trace exceeds the history budget, the oldest whole steps are dropped and the
+request states how many were omitted; no step is cut partway.
+
+A memory version pins its overview on first read; later compression cannot change it. Long rules keep both cue and claim as labelled previews, linked to their full records.
+Learning banks bind the simulator's knowledge, the learning protocol and the scope. Changing a
+serving setting (the simulator model, retrieval top-k) keeps compatible memory under a new
+execution plan; changing knowledge or the learning protocol starts a fresh bank. A learning pass
+never re-predicts a consumed trace on later memory. Fit-only banks remain separate. Earlier bank
+contracts require a fresh project; they are not automatically migrated.
 
 The build ends by retesting every learned trace that had at least one inexact reply, against
 the final memory checkpoint, and compares each turn before and after learning: fixed, still
@@ -506,7 +517,139 @@ never learned, and the fit-only index is used for recorded facts. Saved results 
 calls. It then replays N held-out traces, selected deterministically, against that memory's
 final checkpoint. It prints one aggregate line (replies exact, reply fields matching, judge
 mean), how often the judge's per-turn verdict agrees with exact reproduction (a check on the
-judge, not a score), and the learning curve.
+judge, not a score), and the learning curve. The report
+names the audited checkpoint (memory lineage, version and `fit` scope). The build's all-traces
+memory is a different checkpoint, which this audit does not evaluate independently.
+
+Screened lessons. Learning records a miss on every inexact step; most describe one instance's
+data, not how the environment behaves. To compare memory profiles on any project:
+
+1. `exp eval PROJECT --audit N --audit-memory learned` learns the fit-only memory and audits it.
+2. Screen its misses with `--continuations` and `{"action": "repair-learning", "learning_repair":
+   {"resolution": "screen-lessons"}}` (`--dry-run` first: misses, new decisions, estimate). One
+   native decision per miss (recall alias) gives three probabilities: reusable behaviour, already
+   covered, supported by the recorded reply. The threshold is fitted on the fit split from saved
+   same-tool deliveries and saved; unknown decisions are never redrawn. Screened-in misses become
+   `unresolved` rule entries `derived_from` their trajectory; the rest stay source evidence.
+3. `--audit N --include-inspected --audit-memory none`, then the same with `lessons` (only
+   screened-in records and their overview lines, no raw observations): the same cases and specs
+   except memory, reported as development re-audits of step 1's lineages.
+4. Optionally `"resolution": "evolve-lessons"`, `lessons` set to the printed `lesson_set` and a
+   fresh `run_id`: one proposed rule edit, replayed on held-out and protected fit lineages without
+   memory, `accepted` only on a strict exact-reply gain without regressions; every attempt stays
+   `research`. Pass the returned `library` to build on an accepted edit.
+
+A held-out lineage stays independent only while nobody has read its per-trace results, or the
+results of anything grouped with it. That fact is kept in one exposure ledger at the `.exp` root
+(`<root>/exposure-ledger/ledger.sqlite`), shared by every project on the machine, so it survives
+reimports, rebuilds and regrouping:
+
+- Nodes are traces fingerprinted under a scheme, each pointing at its immutable verified source
+  record (project, trace dataset, trace ID and the record's SHA-256) and keeping the source
+  trace ID and any declared task identity (`task_lineage`). Project-local lineage IDs are not
+  used, because they change on reimport and regrouping.
+- Edges are grouping relationships that every `exp build` records, exposed or not: traces that
+  declare the same task identity within one source and customer (the scope the build's own
+  partition gives declarations), and the build's own exact or semantic near-duplicate unions
+  with their similarity. Each names the project and build that produced it. Declaring traces
+  also link to the scoped task identity itself, so a task stays joined across builds even when
+  a later import carries only new content of it. Nothing weaker (a shared customer,
+  conversation or time bucket, or a declared name reused by another source or customer) is an
+  edge.
+- Equivalence links join one source's nodes under every scheme that fingerprinted it, for
+  unexposed traces too.
+- Exposures mark content a person saw, with the panel, receipt and report that showed it.
+  `--verbose` shows per-trace detail, so it exposes every member trace of the audited lineages.
+- Reservations claim a panel's content for one audit receipt before any of its runs exists.
+
+The fingerprint (`trace-content` v1) hashes only the task instruction and the multiset of paired
+exchanges (tool name, canonical arguments, paired recorded reply) over the whole recorded trace,
+public prefix included, with duplicates counted. Calls and results are paired by
+`gen_ai.tool.call.id`, never by position; a missing, repeated or colliding call ID leaves the
+trace unresolved (no fingerprint), though grouping edges still reach it. IDs, timestamps, import
+and exporter metadata, request-context keys (including `replay_from`) and call order never change
+it, and content is kept verbatim. Ignoring order makes it conservative exposure matching: two
+different execution sequences of the same exchanges match, which errs in the safe direction. A
+scheme's identity is its name, version and the digest of its written specification; any change
+to that specification needs a new version even if its golden vectors still pass. Golden vectors
+must reproduce before a scheme computes or matches. Candidates are matched under every
+computable scheme. A ledger recording the same name and version with a different definition is
+refused, and so is such a scheme on `merge()`, whose nodes then stay as unknown-scheme nodes.
+
+A held-out lineage is not independent when any member trace shares a connected component with
+exposed content, shares one with content another receipt holds, or cannot be fingerprinted (the
+whole group is ineligible, even if its selected trace is fingerprintable). Exposure is transitive
+and ignores order: if exposed A was grouped with B and a later build groups C only with B, C is
+exposed even after A disappears from imports, and edges recorded before an exposure still carry
+it. Nodes under a scheme this machine cannot compute block every independent audit until an
+equivalence resolves them (re-fingerprinting their source record when it is still available
+and unchanged); the refusal reports their count and scheme, and development re-audits proceed.
+Every table is append-only. Independence is only relative to the ledger a decision used;
+`ExposureLedger.export()` and `merge()` share one between machines. A build made before the
+ledger existed is refused until `exp build` is rerun on the same import to record its grouping.
+The fit and held-out split is a rank among the lineages one build sees, so a rebuild can move a
+lineage across it. A lineage whose content the ledger links to exposed or reserved content is
+always held out, wherever it ranks, so a rebuild never hands audited content to fitting; every
+other lineage keeps the partition its rank gives it.
+
+Grouping links recorded after a reservation are reassessed whenever its receipt is resumed or
+reports. If they reveal exposure that predates the receipt, an undispatched reservation is
+released and the audit refuses to run independently; once execution began, an invalidation
+notice is appended instead and the headline becomes "independent, invalidated: predating
+exposure". The receipt and its snapshot are never rewritten, and exposure that
+happens only after the receipt was minted never invalidates it. "Before" and "after" are
+causal, never exposure times: the receipt lists every exposure in the snapshot it was minted
+against, and later exposure counts as after only when this root's ledger recorded both it,
+from a report run here, and the receipt's reservation (the ledger notes the rows it wrote
+itself; a merge never imports that note, so a moved project's receipt orders nothing here).
+Exposure merged from another ledger cannot be ordered against the receipt, so it counts as
+predating, whatever its recorded time, even when its receipt was copied into this root.
+
+An audit runs in a fixed order: reserve, register, claim a dispatch slot, call. Selection reads
+the ledger, then the panel's exclusive lease (an OS file lock, `panel in use` for any second
+process) is taken and, in one ledger transaction, the graph is read again and the reservation
+committed; content another audit took meanwhile is never reserved. The lease is held through
+execution, every slot claim first checks it, and locks are always taken in one order: panel
+lease, ledger transaction, a run's execution lock, its dispatch ledger. Atomicity holds only for
+runs sharing one ledger file on one host; SQLite and file locks over network filesystems are
+unreliable.
+
+Every audit has one immutable receipt (`held-out-audit-receipt`): the panel identity (a hash over
+the sorted selected case IDs and each case's first-generation content-addressed run ID, which
+covers the simulator, memory checkpoint and recall policy, every prompt sent and the judge
+configuration), the code revision (not part of run IDs), the cases, the memory checkpoint (lineage,
+version, scope, fit traces learned and simulator artifact), every fingerprint scheme's full
+identity (name, version, definition and vector digests), the ledger snapshot it reserved against, and for each exposed or reserved
+lineage its component size and edge path, so an over-long chain is visible. Its basis is
+`independent` when no audited lineage was exposed or reserved by another receipt and no run had
+a saved result, otherwise `development-re-audit`. Everything later is appended beside it: a
+report per invocation (prepared, stopped, evaluation, or replay of fully saved results, which
+keeps the receipt's headline) and a child per replaced registration. The same command resumes
+its receipt when the cases, panel identity and code revision all match.
+
+A run that claimed even one slot makes the reservation permanent, since its output may have
+reached logs or screens; after a crash the receipt reports "dispatched, outcome unknown", and
+only that receipt can complete it with `--retry-incomplete`, which resumes the same run in
+place (below). A run that sent a lost request again becomes an in-place `re-attempt` child that
+names each re-dispatched step by stage, and the headline becomes "independent, qualified: trace
+re-attempts": the primary score keeps every trace, the report counts the re-dispatches by stage
+(prediction, judge, investigation) and the affected traces, and it adds the score over
+unaffected traces only and over re-attempted traces only, each with its own denominator. A registration retired before any dispatch (for example
+after a catalog change) is a `re-registration` child and does not qualify the headline. When the
+frozen configuration changes, an unused reservation is released by its owner under the lease
+(after recounting every claimed slot) and a new receipt is minted; after any dispatch the old
+reservation stays and the new receipt over those cases is a development re-audit.
+
+By default an audit selects only unexposed, unreserved, resolved held-out lineages and says how
+many it skipped and why. `--include-inspected` re-runs them too; the report then labels the panel
+"Re-audit on inspected cases (development)" and never independent. When none remain, the
+command refuses before any provider call: an independent audit needs fresh traces, a new import
+with new content. The check runs when the command starts; if another audit reserves the last
+eligible lineages while this one learns its fit-only memory, the refusal comes only after that
+learning, which is saved and replays without calls on the next run. Every report states the ledger's limits: an
+unmerged ledger on another machine cannot show its exposure, paraphrased or regenerated variants
+that near-duplicate grouping misses are not caught, knowledge a person carries over by hand is
+not tracked, atomicity is same-host only, and matching ignores call order.
 
 The audit stays independent only while nobody tunes the simulator on its cases. Held-out traces
 are selected deterministically, so a second audit replays the same ones. Once anyone inspects a
@@ -519,16 +662,35 @@ inspected, which in practice means new traces from a new import.
 In every replay, turns the simulator never answered count as not reproduced, and `--verbose`
 adds every trace and turn. Run IDs are derived from the run's inputs, including the prompts the
 simulator sends, so a changed input starts a new run and an unchanged one replays without provider
-calls. A run that stopped after buying calls is never bought again silently: rerun with
-`--retry-incomplete` (on `exp build` or `exp eval --audit`) to replace it. A learning trace that stops before completing is
-retried up to three times in the same pass; any trace still not learned is reported separately.
+calls. A run interrupted before it saved a result (a killed process, a lost connection) is never
+bought again silently: the plain command stops on it, and `--retry-incomplete` (on
+`exp build` or `exp eval --audit`) resumes it in place. The same run continues from its first uncommitted step, with the same run ID and the
+memory it pinned when it started, in a fresh three-hour window. Committed steps, saved
+investigations, a saved judge response and finished panel traces replay without provider calls;
+if only the judge is missing, only the judge runs. A request that left the process without a
+saved response has an unknown outcome: it may have been answered, billed and seen (in a gateway
+log or a terminal). It is sent again and reported as `step k re-dispatched after an unknown
+outcome` (k counts turns from 1) with its attempt count, so the retry is transparent but not
+provably uninfluenced. A step whose interrupted preparation (query embeddings, memory-recall
+decisions) must be prepared again is reported the same way, at stage `retrieval`. Such a trace is
+a trace re-attempt: any learning, retest or audit report that includes one says
+`qualified: trace re-attempts` in its headline, keeps every trace in the primary score, counts
+the re-dispatches by stage and the affected traces, and adds the score over unaffected traces
+only and over re-attempted traces only, each with its denominator; nothing is dropped by
+default. A learning trace that saves a result but is
+not learned (for example after a failed investigation) is retried up to three times in the same
+pass; any trace still not learned is reported separately. A trace whose identical request the
+gateway refuses deterministically (`invalid_provider_stream`) is retired after three refusals
+under `--retry-incomplete`, and an operator can retire a stuck trace by name with the
+`repair-learning` `retire-trace` resolution; a retired trace is counted as not learned, never
+scored, and memory is unchanged ([reference](reference/learning-retirement.md)).
 Every trace is predicted whole before any of its replies is disclosed;
 investigations of its misses then run together, so a failed investigation never prevents a
 prediction. A trace's first saved measurement fixes its score, including unanswered turns as
 misses. Later learning retries cannot replace that measurement, and the curve reports traces not
 learned separately. The retest covers learned traces only and preserves their first measurement
 as its baseline. A cancelled learning preflight records nothing; later commands read the memory
-that learned most recently. When every trace is already learned, learning replays its saved
+of the scope they name. When every trace is already learned, learning replays its saved
 results without asking for spend consent.
 
 Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)
@@ -543,6 +705,28 @@ their replies are given to the simulator as initial observations, and measuremen
 next call. Without it, every recorded call is measured. Traces that declare no tool list
 (`exp.request.tools`) get tool signatures observed in learned traces: names and argument names
 only.
+
+A trace may also supply its instance facts, the starting world memory cannot know (workbook
+cells, orders, tickets), under `instance_facts` in the same request context:
+`{"facts": [{"key": "input.xlsx/Sheet1/A2", "value": "PQTW1", "visibility": "conditioning",
+"provenance": {"adapter": "...", "source": "...", "validation": {"status": "validated",
+"method": "..."}, "state_version": 0}}]}`. `exp build` (learning and its retest) and
+`exp eval --audit` then deliver that trace's facts to its own predictions in a
+separate `instance_facts` request channel, apart from memory and research history, and the
+facts are part of the content-addressed run ID. The conditioning facts a learning pass delivers
+also key its memory lineage, so adding, changing or removing them learns a fresh memory. Facts are moved out of the request context on
+import, so they never reach retrieval grounding, mined tasks, recorded fingerprints or the
+memory other traces read. `state_version` counts applied actions (0 is the starting state): a
+prediction for the action at index i receives only facts of version i or earlier, so a fact read
+after an action never conditions it. `verifier_private` facts reach no simulator or actor
+request. A fact that is malformed or not `validated` stops the command with an error naming it.
+A fact may list `derived_from_traces`; one derived from another held-out trace is refused, since
+held-out-derived facts condition only that trace's own replay. Domain decoding (for example
+reading a workbook) belongs in an environment adapter outside the core; in Python, an adapter
+implementing `InstanceFactsProvider.initial_facts(task)` can also pass facts to
+`replay_case(..., facts=adapter)`. For workbooks, `exp eval PROJECT --continuations SPEC.json` with `action:
+"derive-facts"` derives validated facts from each task's declared input file and writes them into
+a copy of a chat JSON trace package ([instance facts](reference/instance-facts.md)).
 
 ### Simulated tool observations
 
@@ -564,6 +748,37 @@ by `world.step(session.id, assistant_message)`. Each result exposes `messages`, 
 of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
 consume them before producing its final answer. World-model artifacts pin the current prompt; rebuild
 projects created with a different prompt before running them.
+
+### Materialize declared native outputs
+
+`exp eval PROJECT --materialize SPEC.json --root .exp` materializes an explicit native edit plan
+from an audited simulator checkpoint. Install the `artifact-edits` extra for the XLSX adapter.
+The specification is a `NativeMaterializationSpec`: an exact `checkpoint` artifact reference,
+a `NativeArtifactBinding`, and an optional new `destination` directory. `--dry-run` validates
+frozen bindings without executing the adapter. It does not validate or execute individual edits.
+
+Freeze `native_artifact_binding` in the task's initial context before simulation. The binding
+names the immutable initial files, adapter definition digest, declared output paths and state key.
+Supply the adapter's operation schema and initial native facts as public task context. The model
+predicts the original environment's responses and separately records cumulative typed native
+edits at the binding's state key. Capture the committed session with `capture_world_checkpoint`
+or `capture_stored_world_checkpoint`, then pass its exact artifact reference to materialization.
+A binding cannot be attached retroactively to an existing prediction.
+
+The current CLI adapter applies ordered row deletions to initial XLSX bytes. It preserves native
+cell values, types and number formats, and refuses formulas and other unsupported row dependencies.
+It does not execute predicted Bash or Python commands. A native plan contains `input_sha256`,
+`operations` and `expected_projection`; its operations start from the registered initial files.
+The selected adapter executes these declarations and compares its actual projection with the
+prediction. A mismatch persists a diagnostic receipt and refuses output delivery. It never repairs
+the simulator state. Saved receipts reuse the same bytes without model calls or edit reexecution.
+
+Harbor tasks with this binding expose `outputs --directory NEW_DIRECTORY` after submission and
+declare those files for Harbor artifact collection. Such packages remain **diagnostic only**:
+a matching prediction is not an independent task verifier, a solvability demonstration, or actor
+tier calibration. Native verifier calibration is required before qualification. The XLSX adapter
+is a bounded artifact transformer; general executable applications still need their own selected
+`EnvironmentRuntime` and sandbox.
 
 ### Build scenarios from traces
 
@@ -676,3 +891,80 @@ Request-receipt replay returns the saved result or pricing error without another
 after the operator adds a lower cap. Online routed accounting retains an unknown total when
 the final reply cannot account for earlier potentially paid attempts, preserving the original
 response beside that total. Unpriceable assistant usage cannot create a known report cost.
+
+## Objective-driven investigation reading
+
+`exp build PROJECT --traces PATH --source SOURCE --root ROOT --evidence-reading` enables bounded
+evidence reading during learning investigations; see `reference/evidence-reading.md`.
+
+## Native and mixed-world continuations in Python
+
+Pair chat context and remaining calls with a native/mixed checkpoint using
+`ChatAgentRuntime.run(..., on_checkpoint=...)`, `ContinuationCheckpoint` and
+`persist_continuation_checkpoint`. Capsules bind immutable sources, public tasks and binary files.
+
+`exp.optimize.evaluation.continuations.study.run_continuation_study` consumes that capsule
+through a `ContinuationStudySpec`, an exact matching actor/world runtime, a caller-admitted
+model client, and a private state probe. The spec pins actor model, sampling, repeats, verifier and probe identity. Optional predicted success and selection
+rationale are registered before outcomes. The caller must provide bounded provider admission;
+this Python API does not authorize spend itself. The CLI below owns admission.
+
+Every branch restores the same world and actor prefix without executing completed calls.
+Goal and policy grades stay separate. Saved results replay; interrupted outcomes stay unknown. Only unstarted branches execute on another invocation. Reports retain all planned branches and disclose the assessable denominator for success rates and Brier scores.
+
+Only fit tasks with checked trace provenance are accepted. Training needs independent, preregistered
+acceptance evidence. Pi/process continuation and trained selectors/critics are absent. Native edits
+refuse unsupported features or changed retained cell types/formats. Write replies acknowledge files;
+`describe_workbook` pages exact sheet names/dimensions, and `inspect_workbook` reads typed cells.
+
+### Dream consolidation and frozen execution
+
+Add `--dream-every N` to a learning build for bounded consolidation after every N traces and the
+last trace. Prediction and feedback precede consolidation and one memory-version publication.
+Original observations get the first record slot; one prior wiki claim gets the next for revision, then remaining originals precede research context. Citations name only originals; page labels are optional. Checks include uncited counterexamples; hypotheses cannot support or veto claims.
+When individual citations are inconclusive, one bounded joint read may check a multi-record claim.
+Any local contradiction, malformed judgment or oversized reader request vetoes publication. Complete evidence is never truncated; support must cover every factual clause.
+Plans pin the dream protocol; missing pins or changed prompts/schema/limits require a new project.
+Accepted claims retain scope, uncertainty and provenance. Explicit transferability is required for overview rules; historical-only claims remain records and cannot supersede reusable rules. Rejects and retirements remain recorded.
+Reader agreement is not native verification or demonstrated benefit. Lost outcomes never silently retry.
+`RUN-memory-outcomes` joins full-claim delivery to later reply scores and pinned memory; summary-only
+exposure is excluded. This observational ledger never promotes rules or enters learning; retention is labeled.
+
+`exp.simulation.world_model.executable.GroundedWorldFactory` adapts the existing grounded
+transition engine to the executable state machine. It retains predictor history with state,
+uses compact edits (including authority-bounded `copy`), and cannot alter the kernel's clock or undeclared domains. Restoring a
+checkpoint restores context and state exactly; subsequent model responses are still new draws.
+Compose it with `MixedRealityEnvironmentRuntime` for native and simulated domains. Ownership is
+explicit: a simulated edit cannot update a native workbook. Manifest `native_reads` bridges
+map simulated arguments to private zero-duration native read tools. Reads run on isolated forks;
+state, scheduler or RNG changes refuse. Bounded checkpoint/time-bound receipts condition only the
+current prediction through `InstanceFacts`, never learned rules. Required probes are checked before due events and again before tool execution. Schema-invalid arguments and proven pre-dispatch access refusals return recoverable errors without advancing the world.
+This grounds reads without synchronizing state. The predictor receives per-tool `reply_schema`;
+shape violations leave state/history unchanged. Explicit `maximum_reasks` (0 to 3, default 0) permits bounded corrections of known refused proposals within the same physical budget; every response and refusal is retained, and successful observations report the refusal count. Lost responses and valid-but-wrong results are never retried by this mechanism. Domain `state_schema` applies at initialization, restore and commit. `reply_bindings` select current state using exact arguments, unique-member matches, exact ranges or explicitly clamped pagination. `workbook_contracts.simulated_workbook_manifest` binds these to full typed workbook projections. These checks establish internal consistency, not native fidelity.
+The built-in `exp/optimize/evaluation/executable/grounded.py` factory's `GroundedRuntimeDefinition` pins the world-model reference, catalog,
+optional exact `EvaluationMemory`, task, manifest, initial domain state, private projection,
+deadline and cumulative physical-attempt ceiling. Its predictor, query embeddings and memory
+readers share admission. Provider SDKs bypassing that transport are refused. Projections from
+this factory have simulated authority; they do not establish native truth. Missing memory means
+no learned memory is delivered. Optional `facts` (`ReplayFacts`: the same validated, provenance-bearing
+`InstanceFacts` and held-out reservation rules as fidelity replay, with `first_version` the start's state
+version) condition every simulated prediction in the separate `instance_facts` channel with the same
+guidance, beside native read receipts. Facts are not state: they are never a writable domain or part of
+a checkpoint image, and nothing is derived from native state. Only starting-state facts are accepted, and
+the `native-read/` key prefix is reserved. Facts re-key the definition, ledger and backend digest, so a
+checkpoint restores only under the same facts; definitions without facts keep their identities. Declare
+them under `simulated` in the mixed definition, or in any continuation or `compare-environments` job. `workbook_runtime.py` binds immutable XLSX inputs and private worksheet
+digest views. `mixed_runtime.py` combines a native factory with this simulator and real/simulated routes under one
+manifest; private projections stay under separate `native` and `simulated` keys. Execution receipts
+bind release plus installed EXP source/resource digest; code changes require fresh qualification. Third-party dependencies remain host-owned. Owned executable-world shadow routes refuse at setup until an independent mirror contract exists; cross-owner writes remain unsupported.
+
+### Continuation, Harbor and training CLI
+
+`exp eval PROJECT --continuations SPEC.json` runs one action from a JSON spec: continuation
+studies and campaigns, witnessed SFT export, trajectory trace export, learning repair (lesson
+screening and library evolution), saved-evidence analysis, environment comparison, task-factory
+authoring and executable Harbor tasks. Every action, its payload and the Harbor reward contract
+are documented in [docs/reference/continuations-and-harbor.md](reference/continuations-and-harbor.md).
+Trajectory-count selection (`sample-count`), summary forgetting (`forget-summary`), judge
+challenge studies (`challenge-judges`), checkpoint retirement (`retire-checkpoint`) and
+session-state collection (`collect-garbage`) are in [evaluation-procedures.md](reference/evaluation-procedures.md).

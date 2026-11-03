@@ -6,6 +6,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -20,6 +21,7 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.common.routing.policy import RoutingDecision
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -691,7 +693,7 @@ class SelectionWorkerPool:
         submitted.add_done_callback(self._forget)
         return submitted
 
-    def shutdown(self, *, drain_timeout_seconds: float = _SELECTION_DRAIN_SECONDS) -> None:
+    def shutdown(self, *, drain_timeout_seconds: float = _SELECTION_DRAIN_SECONDS) -> bool:
         """Stop accepting selections, drop queued work, and drain running work.
 
         A selection already inside a synchronous provider embedding call cannot
@@ -701,7 +703,13 @@ class SelectionWorkerPool:
 
         Args:
             drain_timeout_seconds: Bound on waiting for running selections.
+
+        Returns:
+            True only when every actual selection worker has exited.
         """
+        if drain_timeout_seconds < 0:
+            raise ValueError("selection shutdown timeout cannot be negative")
+        deadline = time.monotonic() + drain_timeout_seconds
         abandoned: list[_QueuedSelection] = []
         with self._lock:
             self._closed = True
@@ -717,31 +725,37 @@ class SelectionWorkerPool:
             outstanding = frozenset(self._outstanding)
         for item in abandoned:
             item.future.cancel()
-        _, running = wait(outstanding, timeout=drain_timeout_seconds)
+        _, running = wait(outstanding, timeout=max(0.0, deadline - time.monotonic()))
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if running:
             _logger.warning(
                 "gateway shutdown left %d router selection call(s) running", len(running)
             )
+        return all(not thread.is_alive() for thread in self._threads)
 
     def _work(self) -> None:
         """Run queued selections on one daemon worker until the stop sentinel."""
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            if not item.future.set_running_or_notify_cancel():
-                continue
-            try:
-                prepared = _select_within_deadline(
-                    item.runtime,
-                    item.model_request,
-                    episode_id=item.episode_id,
-                    deadline=item.deadline,
-                )
-            except BaseException as failure:  # noqa: BLE001 - relayed to the waiting caller.
-                item.future.set_exception(failure)
-            else:
-                item.future.set_result(prepared)
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                if not item.future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    prepared = _select_within_deadline(
+                        item.runtime,
+                        item.model_request,
+                        episode_id=item.episode_id,
+                        deadline=item.deadline,
+                    )
+                except BaseException as failure:  # noqa: BLE001 - relayed to the waiting caller.
+                    item.future.set_exception(failure)
+                else:
+                    item.future.set_result(prepared)
+        finally:
+            close_idle_connections()
 
     def _forget(self, completed: Future[PreparedSelection]) -> None:
         """Drop one settled selection from the outstanding drain set."""

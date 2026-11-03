@@ -416,7 +416,8 @@ as an object; its internal shape is the provider's). `function_call_output.outpu
 SDK list form: text and image parts map onto the canonical tool message and re-emit typed, an
 all-text list keeps the plain-string wire shape, and any other part kind is a named 400. A
 reasoning input item without `encrypted_content` (a `store: true` replay by item id) carries
-verbatim to homogeneous native Responses routes and the provider judges resolvability. Off the
+verbatim to homogeneous native Responses routes and the provider judges resolvability. Agent,
+compaction, configuration, and reference items: [Responses input items](gateway-responses-input-items.md). Off the
 native Responses wire, tool-call and tool-result attribution (`namespace`/`caller`/output
 `name`) drops with per-field disclosure — the call itself always survives — and a
 Messages-surface effort the route cannot serve rejects as `output_config.effort` with
@@ -600,6 +601,12 @@ opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: i
 before manifest validation and decodes exactly as the documented field. When both spellings
 arrive, `prompt_cache_key` wins and the dropped alias is disclosed through `ignored_parameters`.
 It is the only camelCase spelling admitted; every other unknown top-level field stays a named 400.
+An explicit JSON `null` on a top-level field OpenAI documents as nullable (`stream`,
+`stream_options`, `temperature`, `max_tokens`, `stop`, `metadata`, `seed`, and the rest of the
+official SDK's `Optional` request fields, pinned in `exp/runtime/openai_protocol/nullable_params.py`
+and locked to the installed SDK by test) is removed before decoding, so the field takes its default
+exactly as if omitted, with no disclosure. A null on a field OpenAI refuses as null (`model`,
+`messages`, `input`, `tools`, `tool_choice`, `response_format`, `text`, `user`) stays a named 400.
 Chat streaming emits valid completion chunks and one `[DONE]`. Responses streaming emits the
 created, in-progress, output, and exactly one terminal lifecycle. Provider tool-argument fragments
 are accumulated in original order and validated only at the complete-call boundary.

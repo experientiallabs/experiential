@@ -30,6 +30,7 @@ from exp.optimize.model.sft.run_manifest import (
     validate_run_inputs,
     verified_training_inputs,
 )
+from exp.optimize.model.sft.tail_sft import LossScorer, load_initial_losses, select_tail
 from exp.optimize.model.sft.training_contracts import (
     TINKER_SFT_EVENT_ADAPTER,
     TinkerSFTAmbiguousStepError,
@@ -130,6 +131,7 @@ def train_tinker_sft(
     manifest_path = sft_run_lock_path(store, output_dir)
     with file_write_lock(manifest_path, what="the Tinker SFT run"):
         return _train_locked(
+            store=store,
             dataset=dataset,
             dataset_input=dataset_input,
             spec=spec,
@@ -142,6 +144,7 @@ def train_tinker_sft(
 
 def _train_locked(
     *,
+    store: ProjectStore,
     dataset: SFTDatasetArtifact,
     dataset_input: ArtifactInput,
     spec: TinkerSFTSpec,
@@ -164,7 +167,22 @@ def _train_locked(
     _assert_no_uncheckpointed_completed_steps(events)
     train_examples = tuple(row.example for row in dataset.rows if row.partition == "train")
     expected_schedule = _expected_schedule(train_examples, spec)
-    _validate_event_schedule(events, expected_schedule)
+    initial = None
+    if spec.tail_sft is not None:
+        initial = load_initial_losses(store.artifacts, spec.tail_sft.reference)
+        if (
+            initial.dataset != dataset_input
+            or initial.model_configuration != spec.initialization_identity()
+            or {row.example_id for row in initial.losses}
+            != {row.example_id for row in train_examples}
+        ):
+            raise TinkerSFTError("TailSFT reference differs from training data or initialization")
+        if any(
+            round(len(batch.example_ids) * spec.tail_sft.drop_fraction) >= len(batch.example_ids)
+            for batch in expected_schedule
+        ):
+            raise TinkerSFTError("TailSFT would remove the whole batch; reduce drop_fraction")
+    _validate_event_schedule(events, expected_schedule, spec=spec, initial=initial)
     completed = _load_completed_result(
         state,
         manifest,
@@ -231,6 +249,19 @@ def _train_locked(
         events = (*events, _read_last_event(state))
     datums = session.render_examples(train_examples)
     _validate_rendered_datums(datums, train_examples)
+    if spec.tail_sft is not None:
+        if not isinstance(session, LossScorer):
+            raise TinkerSFTError("TailSFT requires an explicit read-only scoring backend")
+        assert initial is not None
+        for datum in datums:
+            first = next(row for row in initial.losses if row.example_id == datum.example_id)
+            if (
+                first.datum_sha256 != session.datum_identity(datum)
+                or first.target_tokens != datum.supervised_token_count
+            ):
+                raise TinkerSFTError(
+                    "TailSFT tokenizer or target mask changed; create a fresh reference"
+                )
     schedule = _build_schedule(datums, spec)
     current_cost = durable_cost
     for step, batch in enumerate(schedule[start_step:], start=start_step + 1):
@@ -254,7 +285,26 @@ def _train_locked(
             ),
             "Tinker SFT optimizer-step intent",
         )
-        batch_result = session.train_batch(batch.datums, learning_rate=spec.learning_rate)
+        selection = None
+        selected = batch.datums
+        if spec.tail_sft is not None:
+            assert isinstance(session, LossScorer) and initial is not None
+            current = session.score_batch(batch.datums)
+            if tuple(row.example_id for row in current) != tuple(
+                row.example_id for row in batch.datums
+            ):
+                raise TinkerSFTError("TailSFT current scorer changed the scheduled batch")
+            selection = select_tail(initial.losses, current, spec.tail_sft.drop_fraction)
+            selected = tuple(row for row in batch.datums if row.example_id in selection.retained)
+            _write_new_json(
+                state, f"tail-selection-{attempt_id}-{step}", selection, "TailSFT selection"
+            )
+        batch_result = session.train_batch(selected, learning_rate=spec.learning_rate)
+        reported_cost = batch_result.cost_usd
+        if spec.tail_sft is not None:
+            # Reserve both forward scoring and the full update, regardless of actual retention.
+            # This is explicitly an estimated ceiling, not provider-observed billing.
+            batch_result = batch_result.model_copy(update={"cost_usd": upper_bound})
         current_cost = _add_cost(current_cost, batch_result.cost_usd, has_prior_metrics=step > 1)
         metric = TinkerSFTMetric(
             run_id=manifest.run_id,
@@ -264,7 +314,8 @@ def _train_locked(
             batch_index=batch.batch_index,
             batch_example_count=len(batch.datums),
             example_ids=tuple(datum.example_id for datum in batch.datums),
-            supervised_token_count=sum(datum.supervised_token_count for datum in batch.datums),
+            supervised_token_count=sum(datum.supervised_token_count for datum in selected),
+            tail_selection=selection,
             loss=batch_result.loss,
             gradient_norm=batch_result.gradient_norm,
             usage=batch_result.usage,
@@ -273,8 +324,8 @@ def _train_locked(
         )
         _append_event(state, metric)
         events = (*events, metric)
-        if upper_bound is not None and batch_result.cost_usd is not None:
-            if batch_result.cost_usd.value > upper_bound.value:
+        if upper_bound is not None and reported_cost is not None:
+            if reported_cost.value > upper_bound.value:
                 raise TinkerSFTBudgetExceeded(
                     "backend-reported step cost exceeded its conservative pre-dispatch bound; "
                     "the completed step is not replayable and requires manual review"
@@ -532,7 +583,8 @@ def _save_or_load_terminal_model(
     model = TinkerSFTModelArtifact(
         schema_version=1,
         created_at=manifest.created_at,
-        inputs=(dataset_input,),
+        inputs=manifest.inputs,
+        initial_losses=manifest.spec.tail_sft.reference if manifest.spec.tail_sft else None,
         code_revision=manifest.code_revision,
         model_id=model_id,
         run_id=manifest.run_id,
@@ -682,6 +734,9 @@ def _load_model(
     if state.read(path) is None:
         return None
     model = _read_model(state, path, TinkerSFTModelArtifact, "Tinker SFT model artifact")
+    expected_losses = manifest.spec.tail_sft.reference if manifest.spec.tail_sft else None
+    if model.initial_losses != expected_losses:
+        raise TinkerSFTResumeError("Tinker SFT model names different initial losses")
     if model.run_id != manifest.run_id:
         raise TinkerSFTResumeError("Tinker SFT model artifact names a different run")
     if model.dataset_id != manifest.dataset_id:

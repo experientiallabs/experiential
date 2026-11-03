@@ -15,15 +15,15 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.memory import (
+    saved_memory_receipt,
+)
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
-)
-from exp.optimize.evaluation.fidelity_memory import (
-    saved_memory_receipt,
 )
 from exp.optimize.evaluation.tests.fidelity_lifecycle_test import learn_alpha
 from exp.optimize.evaluation.tests.fidelity_memory_test import (

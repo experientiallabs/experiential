@@ -614,6 +614,7 @@ def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(
     assert public["answers"] == _answers()
     assert public["usage"] == {"input_tokens": 451, "output_tokens": 68}
     assert "provider_private" not in public
+    assert "x-experiential-ignored-parameters" not in public
     assert response.headers["x-gateway-alias"] == "decision"
     assert response.headers["x-gateway-provider"] == "typesafe"
     assert response.headers["x-gateway-route-depth"] == "0"
@@ -650,6 +651,66 @@ def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(
     assert attempt["budget_reserved_nano_usd"] > _COST_NANO_USD
     assert attempt["content_retained"] == 0
     _assert_budget_accounted(engine)
+
+
+def test_lone_surrogate_escapes_are_replaced_disclosed_and_settled(
+    engine: _ServingEngine,
+) -> None:
+    """A Node body sliced inside an emoji is served with U+FFFD, not refused.
+
+    Node's well-formed ``JSON.stringify`` writes the orphaned half of a surrogate
+    pair as a ``\\udXXX`` escape. The body is sent as those exact bytes.
+    """
+    before = _request_ids(engine)
+    raw = (
+        json.dumps(_body(), ensure_ascii=True)
+        .replace("Refund the duplicate invoice", "Refund \\ud83d \\ud83d\\ude00 \\ude00")
+        .replace("Was payment received?", "Was payment received? \\ud83d")
+    )
+    response = httpx.post(
+        f"{engine.base}/v1/systemone",
+        headers={"authorization": f"Bearer {engine.raw_key}", "content-type": "application/json"},
+        content=raw.encode("ascii"),
+        timeout=_TIMEOUT_SECONDS + 3.0,
+    )
+    assert response.status_code == 200, response.text
+    public = response.json()
+    assert public["answers"] == _answers()
+    assert public["x-experiential-ignored-parameters"] == [
+        "state->replaced(lone_surrogate)",
+        "questions.instructions->replaced(lone_surrogate)",
+    ]
+    with _DecisionsUpstream.payloads_lock:
+        sent = _DecisionsUpstream.payloads[-1]
+    state = cast(JsonObject, sent["state"])
+    assert state["message"] == "Refund \ufffd \U0001f600 \ufffd"
+    paid = cast(JsonObject, cast(JsonObject, sent["questions"])["paid"])
+    assert paid["instructions"] == "Was payment received? \ufffd"
+    [(request, [attempt])] = _settled(engine, before)
+    assert request["request_id"] == response.headers["x-request-id"]
+    assert request["terminal_state"] == "completed"
+    assert attempt["state"] == "completed"
+    _assert_budget_accounted(engine)
+
+
+def test_lone_surrogate_identifiers_are_refused_before_acceptance(engine: _ServingEngine) -> None:
+    """A question ID the answer is keyed by is never rewritten; nothing is accepted."""
+    before = _request_ids(engine)
+    calls = _provider_calls()
+    raw = json.dumps(_body(), ensure_ascii=True).replace('"paid"', '"paid\\ud83d"')
+    response = httpx.post(
+        f"{engine.base}/v1/systemone",
+        headers={"authorization": f"Bearer {engine.raw_key}", "content-type": "application/json"},
+        content=raw.encode("ascii"),
+        timeout=_TIMEOUT_SECONDS + 3.0,
+    )
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == "invalid_parameter"
+    assert error["param"] == "questions"
+    assert "lone UTF-16 surrogates" in error["message"]
+    assert _request_ids(engine) == before
+    assert _provider_calls() == calls
 
 
 @pytest.mark.parametrize("selector", ["rounded-low", "rounded-high"])

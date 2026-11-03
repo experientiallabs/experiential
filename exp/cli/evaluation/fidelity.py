@@ -16,18 +16,18 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.evaluations.reconstruction import DualReport, JudgeConfig
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity.memory import (
+    fidelity_decision_trace,
+    fidelity_memory_plan,
+    saved_maintenance_receipt,
+    saved_memory_receipt,
+)
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
     saved_fidelity_report,
-)
-from exp.optimize.evaluation.fidelity_memory import (
-    fidelity_decision_trace,
-    fidelity_memory_plan,
-    saved_maintenance_receipt,
-    saved_memory_receipt,
 )
 
 
@@ -206,10 +206,32 @@ def render_summary(
     console.print()
     _summary_row(console, "Replies exact", replies)
     _summary_row(console, "Judge", Text(_judge_line(result)))
+    _summary_row(console, "Facts", Text(supplied_facts_line(spec)))
     memory = _memory_line(store, prepared, spec)
     if memory is not None:
         _summary_row(console, "Memory", Text(memory))
     _summary_row(console, "Report", Text(f"{prepared.id}-report · --verbose shows every turn"))
+
+
+def supplied_facts_line(spec: FidelitySpec) -> str:
+    """Whether the run's predictions were conditioned on supplied starting-world facts.
+
+    An exact reply measured with supplied instance facts is fidelity given those facts, not
+    fidelity from the task and history alone, so every summary names which one it is.
+
+    Args:
+        spec: Registered workload.
+
+    Returns:
+        One plain line naming the supplied fact count, or that none were supplied.
+    """
+    if spec.facts is None:
+        return "none supplied; predictions read only the task and its history"
+    count = len(spec.facts.facts.facts)
+    return (
+        f"{count} supplied instance {'fact' if count == 1 else 'facts'}; exactness is "
+        "measured given those facts"
+    )
 
 
 def _summary_row(console: Console, label: str, value: Text) -> None:
@@ -283,7 +305,7 @@ def render_fidelity(console: Console, result: DualReport, judge: JudgeConfig) ->
     )
     console.print(
         Text(
-            "Whole trajectory exact: "
+            "Whole trajectory replies exact: "
             + ("yes" if exact == result.planned_steps and result.planned_steps else "no")
         )
     )

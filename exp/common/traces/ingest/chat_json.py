@@ -13,6 +13,10 @@ Message mapping follows the roles the conversation already declares:
 - a ``tool`` message becomes the tool result paired with the earlier call,
 - ``system`` and ``developer`` messages are retained as initial instructions.
 
+A model call's input is every message before it. The conversation's messages are declared once,
+on the first observation, and stored once on the trace; each model span names how many of them
+form its input. Import size and time therefore grow linearly with transcript length.
+
 Chat JSON carries no source timing. When a message declares no timestamp, EXP assigns ordinal
 timestamps that preserve message order only, and every resulting span records
 ``exp.source.time.synthetic`` so downstream consumers can never mistake assigned order for measured
@@ -22,7 +26,9 @@ latency. Provider and model identity is retained only when the conversation decl
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from pydantic import JsonValue
@@ -142,7 +148,6 @@ def _conversation_observations(
     if request_text is None:
         raise VendorTraceFormatError("chat JSON conversation has no user message")
     observations: list[VendorObservation] = []
-    input_messages: list[JsonValue] = []
     for index, message in enumerate(messages):
         role = message_role(message)
         timestamp, synthetic = _message_timestamp(message, index)
@@ -155,15 +160,13 @@ def _conversation_observations(
             synthetic=synthetic,
             source_trace_id=source_trace_id,
             request_text=request_text if not observations else None,
-            input_messages=tuple(input_messages),
             model=model,
             extensions=extensions,
         )
         observations.extend(emitted)
-        input_messages.append(message)
     if not observations:
         raise VendorTraceFormatError("chat JSON conversation has no assistant or tool message")
-    return tuple(observations)
+    return (replace(observations[0], message_history=tuple(messages)), *observations[1:])
 
 
 def _message_observations(
@@ -176,7 +179,6 @@ def _message_observations(
     synthetic: bool,
     source_trace_id: str,
     request_text: str | None,
-    input_messages: tuple[JsonValue, ...],
     model: VendorModelIdentity | None,
     extensions: JsonObject,
 ) -> tuple[VendorObservation, ...]:
@@ -191,7 +193,6 @@ def _message_observations(
         synthetic: Whether the timestamp is EXP-assigned.
         source_trace_id: Vendor conversation key.
         request_text: Trace request text, supplied only on the first emitted observation.
-        input_messages: Messages preceding this one, retained as canonical input evidence.
         model: Declared conversation model identity.
         extensions: Approved EXP extension attributes for the conversation.
 
@@ -237,7 +238,7 @@ def _message_observations(
             ended_at=timestamp,
             kind="model",
             request_text=request_text,
-            input_messages=list(input_messages),
+            input_history_prefix=index,
             completion_text=completion or None,
             tool_calls=declared_tool_calls(message),
             model=model,
@@ -345,6 +346,79 @@ def _model_identity(conversation: JsonObject) -> VendorModelIdentity | None:
         model_id=model_id,
         revision=first_text(conversation, ("model_revision", "revision")),
     )
+
+
+def attach_request_context(
+    payload: bytes, key: str, entries: Mapping[str, JsonValue]
+) -> tuple[bytes, frozenset[str]]:
+    """A copy of a chat JSON export with one request-context entry added per conversation.
+
+    Conversations are matched by their declared key (``trace_id``, ``conversation_id``,
+    ``session_id``, ``thread_id`` or ``id``, the first one present), the same key import uses
+    to group a conversation into one trace. Every other byte of meaning is kept: the export
+    keeps its shape (one document, or JSONL with one record per line, malformed lines
+    verbatim), and only the matched conversations' ``exp.request.context`` gains the entry.
+
+    Args:
+        payload: The chat JSON or JSONL export.
+        key: Request-context entry to add, such as ``instance_facts``.
+        entries: Declared conversation key mapped to the entry's value.
+
+    Returns:
+        The re-serialized export and the conversation keys it matched.
+
+    Raises:
+        VendorTraceFormatError: The export is not UTF-8 chat JSON, a conversation key is
+            declared twice, a matched request context is not an object, or it already has
+            the entry.
+    """
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise VendorTraceFormatError("chat JSON export is not UTF-8") from exc
+    matched: set[str] = set()
+
+    def annotate(document: JsonValue) -> None:
+        """Add the entry to every matched conversation of one decoded document."""
+        for conversation in _conversations(document):
+            declared = first_text(conversation, _TRACE_ID_KEYS)
+            if declared is None or declared not in entries:
+                continue
+            if declared in matched:
+                raise VendorTraceFormatError(
+                    f"chat JSON conversation key {declared!r} is declared twice"
+                )
+            context = conversation.get("exp.request.context", {})
+            if not isinstance(context, dict):
+                raise VendorTraceFormatError(
+                    f"chat JSON conversation {declared!r} has a request context that is not "
+                    "an object"
+                )
+            if key in context:
+                raise VendorTraceFormatError(
+                    f"chat JSON conversation {declared!r} already declares {key!r}; remove it "
+                    "or leave this conversation out"
+                )
+            conversation["exp.request.context"] = {**context, key: entries[declared]}
+            matched.add(declared)
+
+    try:
+        document: JsonValue = json.loads(text)
+    except json.JSONDecodeError:
+        lines: list[str] = []
+        for line in text.split("\n"):
+            try:
+                record: JsonValue = json.loads(line) if line.strip() else None
+            except json.JSONDecodeError:
+                record = None
+            if record is None:
+                lines.append(line)
+                continue
+            annotate(record)
+            lines.append(json.dumps(record, ensure_ascii=False))
+        return "\n".join(lines).encode("utf-8"), frozenset(matched)
+    annotate(document)
+    return json.dumps(document, ensure_ascii=False).encode("utf-8"), frozenset(matched)
 
 
 CHAT_JSON_SOURCE: VendorSource[JsonObject] = VendorSource(

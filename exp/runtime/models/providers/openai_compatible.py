@@ -21,6 +21,7 @@ from exp.common.models import (
     ModelSnapshot,
     RawEmbedding,
     RawEmbeddingBatch,
+    ReasoningEffort,
     ToolCall,
     Usage,
 )
@@ -30,9 +31,7 @@ from exp.common.models.usage_observability import (
 )
 from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.gateway.images_contracts import ImagesRequest
-from exp.runtime.models.providers.async_transport import (
-    AsyncJsonHttpTransport,
-)
+from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
@@ -227,13 +226,39 @@ def openai_embedding_request(
     return request
 
 
+_BASE64_ONLY_IMAGE_MODEL_PREFIXES = ("gpt-image", "chatgpt-image")
+"""Wire-id prefixes of OpenAI's GPT image models (``gpt-image-1``, ``gpt-image-1.5``,
+``gpt-image-2``, ``chatgpt-image-latest``, ...)."""
+
+
+def returns_base64_images_only(model_id: str) -> bool:
+    """Whether one served image model always answers base64 and refuses ``response_format``.
+
+    OpenAI's Images API defines ``response_format`` for ``dall-e-2`` and
+    ``dall-e-3`` only: "This parameter isn't supported for the GPT image
+    models, which always return base64-encoded images" (the official
+    ``ImageGenerateParams`` reference), and the provider answers a GPT image
+    model that receives it with ``400 Unknown parameter: 'response_format'``.
+
+    Args:
+        model_id: Served image model id, optionally vendor-prefixed.
+
+    Returns:
+        True for a GPT image model.
+    """
+    return model_id.rsplit("/", 1)[-1].lower().startswith(_BASE64_ONLY_IMAGE_MODEL_PREFIXES)
+
+
 def openai_images_request(
     model_id: str, request: ImagesRequest, *, inline_images: bool = False
 ) -> JsonObject:
     """Convert one canonical image-generation request into the OpenAI wire body.
 
     Every optional control is omitted when absent so the provider default
-    applies; ``user`` is never forwarded (metadata-only in the manifest).
+    applies; ``user`` is never forwarded (metadata-only in the manifest). A
+    GPT image model never receives ``response_format``: ``b64_json`` is what it
+    returns anyway, and admission excludes such a rung from a ``url`` request
+    (:func:`returns_base64_images_only`).
 
     Args:
         model_id: Served image model id.
@@ -245,6 +270,10 @@ def openai_images_request(
 
     Returns:
         The OpenAI-compatible ``/images/generations`` request body.
+
+    Raises:
+        ValueError: A ``url`` request reached a GPT image model, which cannot
+            honor it.
     """
     body: JsonObject = {"model": model_id, "prompt": request.prompt, "n": request.n}
     for field in (
@@ -260,7 +289,11 @@ def openai_images_request(
         value = getattr(request, field)
         if value is not None:
             body[field] = value
-    if inline_images:
+    if returns_base64_images_only(model_id):
+        if request.response_format == "url":
+            raise ValueError(f"{model_id!r} returns base64 images only and cannot serve 'url'")
+        body.pop("response_format", None)
+    elif inline_images:
         body["response_format"] = "b64_json"
     return body
 
@@ -344,7 +377,8 @@ def openai_compatible_response(
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
         raise ProviderRetryableResponseError(
-            "OpenAI-compatible response has neither text nor a complete tool call"
+            "OpenAI-compatible response has neither text nor a complete tool call",
+            hit_length_limit=choice.get("finish_reason") == "length",
         ) from exc
     return ModelResponse.completed(
         output=output,
@@ -452,6 +486,8 @@ def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
 
+    supports_idempotency_key: ClassVar[bool] = True
+
     def _embedding_model_id(self) -> str:
         """Return the model id placed on the embeddings wire.
 
@@ -541,7 +577,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
         reasoning_output_exposed: bool = False,
@@ -573,6 +609,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
@@ -581,7 +618,6 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
         self._reasoning_output_exposed = reasoning_output_exposed

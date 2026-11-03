@@ -27,7 +27,13 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
     stable_id,
 )
-from exp.common.core.locks import DEFAULT_LOCK_TIMEOUT_S, FileLockTimeout, file_write_lock
+from exp.common.core.host_scope import current_host, require_same_host
+from exp.common.core.locks import (
+    DEFAULT_LOCK_TIMEOUT_S,
+    CoordinationLock,
+    FileLockTimeout,
+    file_write_lock,
+)
 from exp.common.project.database import project_connection
 from exp.common.project.records import ProjectRecordError, ProjectRecords
 
@@ -75,6 +81,10 @@ class TextCellLease(ContractModel):
         reserved_cost_usd: Concrete reservation retained until spend is reconciled.
         owner_id: Ownership protocol and unique nonce identifying the live kernel lock.
         owner_pid: Diagnostic process number, never the default liveness authority.
+        owner_machine: Hashed identity of the machine whose process holds the claim. Only that
+            machine can prove the holder gone, so no other machine ever takes the claim over.
+        owner_boot: Hashed boot of that machine, when the platform has one; a different boot
+            on the same machine proves the holder gone.
         claimed_at: Time the exclusive claim was created.
         expires_at: Recorded deadline used by explicit process-liveness test overrides.
         status: Active ownership or an abandoned-attempt tombstone.
@@ -91,6 +101,8 @@ class TextCellLease(ContractModel):
     reserved_cost_usd: float | None = Field(default=None, gt=0)
     owner_id: str = Field(min_length=1, max_length=128)
     owner_pid: int = Field(gt=0)
+    owner_machine: str = Field(min_length=1, max_length=64)
+    owner_boot: str | None = Field(default=None, min_length=1, max_length=64)
     claimed_at: AwareDatetime
     expires_at: AwareDatetime
     status: TextCellLeaseStatus = TextCellLeaseStatus.ACTIVE
@@ -460,6 +472,7 @@ class TextCellLeaseStore:
                     return None
                 if maximum_cost_usd is not None and reservation is None:
                     return TextCellLeaseClaim(TextCellLeaseState.BUDGET_BLOCKED, None, spend)
+                host = current_host()
                 lease = TextCellLease(
                     lease_id=lease_id,
                     resolution_id=resolution_id,
@@ -470,6 +483,8 @@ class TextCellLeaseStore:
                     reserved_cost_usd=reservation,
                     owner_id=f"{_OWNER_PROTOCOL}{uuid4().hex}",
                     owner_pid=os.getpid(),
+                    owner_machine=host.machine,
+                    owner_boot=host.boot,
                     claimed_at=now,
                     expires_at=now + self._stale_after,
                 )
@@ -619,7 +634,16 @@ class TextCellLeaseStore:
         return tuple(leases)
 
     def _is_stale(self, lease: TextCellLease, now: datetime) -> bool:
-        """Recognize a stopped owner without trusting a reused or foreign process number."""
+        """Recognize a stopped owner without trusting a reused or foreign process number.
+
+        Only the owner's machine can prove it stopped: a claim recorded on another machine is
+        refused rather than judged. A different boot of this machine proves the owner gone;
+        otherwise the owner's kernel lock is probed.
+        """
+        require_same_host(lease.owner_machine, what=f"text-cell lease {lease.lease_id!r}")
+        boot = current_host().boot
+        if lease.owner_boot is not None and boot is not None and lease.owner_boot != boot:
+            return True
         if self._owner_alive is not None:
             return now >= lease.expires_at and not self._owner_alive(lease.owner_pid)
         if not lease.owner_id.startswith(_OWNER_PROTOCOL):
@@ -646,7 +670,7 @@ class TextCellLeaseStore:
         path = self._directory / f"{lock_id}.lock"
         if path.is_symlink():
             raise TextCellLeaseError("text-cell owner lock must not be a symlink")
-        return FileLock(path, timeout=0, mode=0o600, thread_local=False)
+        return CoordinationLock(path, timeout=0, mode=0o600, thread_local=False)
 
     def _hold_ownership(self, lease: TextCellLease) -> None:
         """Acquire ownership before publishing a claim and retain it throughout execution."""

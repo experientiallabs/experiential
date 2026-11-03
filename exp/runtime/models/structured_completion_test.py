@@ -1,11 +1,12 @@
 """Request replay, raw-output retention and shared actor accounting at the model seam."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -16,8 +17,13 @@ from exp.common.models import (
     ModelSnapshot,
     ToolCall,
 )
-from exp.common.project import ProjectConfig, ProjectStore
+from exp.common.project import ArtifactStore, ProjectConfig, ProjectStore, artifact_input
 from exp.runtime.models.budget import RequestBudget
+from exp.runtime.models.call_evidence import canonical_call
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.openai_compatible_test import _snapshot
+from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.spend_ceiling_test import _ceiling, _transport
 from exp.runtime.models.structured_completion import (
     CompletionPlan,
     ReturnedOutputRejected,
@@ -182,6 +188,44 @@ def test_named_tool_output_uses_actual_schema_and_validates_response(tmp_path: P
     assert isinstance(refused.value.__cause__, ValidationError)
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        AssistantAction(content='{"value": "current"}'),
+        AssistantAction(
+            tool_calls=(
+                ToolCall(call_id="one", name="submit_proposal", arguments={"value": "a"}),
+                ToolCall(call_id="two", name="submit_proposal", arguments={"value": "b"}),
+            )
+        ),
+    ],
+)
+def test_named_tool_output_refuses_what_an_automatic_choice_can_return(
+    tmp_path: Path, output: AssistantAction
+) -> None:
+    """A model steered to the tool by ``auto`` must still return exactly one call.
+
+    Text alone or a second call is retained, refused, and never bought again on replay.
+    """
+    complete, client, budget = setup(tmp_path, output)
+    caps = complete.plan.capabilities.model_copy(
+        update={"supports_tools": True, "supports_forced_tool_choice": False}
+    )
+    model = complete.plan.model.model_copy(update={"capabilities_sha256": caps.identity_sha256()})
+    client.model = model
+    complete.plan = complete.plan.model_copy(
+        update={"capabilities": caps, "model": model, "output_protocol": "tool"}
+    )
+    body: JsonObject = {
+        "messages": [{"role": "user", "content": "Submit JSON."}],
+        "response_schema": {"type": "object"},
+    }
+    for _ in range(2):
+        with pytest.raises(ReturnedOutputRejected, match="exactly one named"):
+            complete(body, "steered-answer")
+    assert len(client.requests) == 1 and budget.accounted_usd == 1
+
+
 def test_response_under_the_catalog_served_model_id_is_admitted(tmp_path: Path) -> None:
     """A provider may answer under its pinned served model ID, and under no other ID."""
     complete, client, _ = setup(tmp_path, AssistantAction(content="{}"))
@@ -194,3 +238,138 @@ def test_response_under_the_catalog_served_model_id_is_admitted(tmp_path: Path) 
     complete.plan = complete.plan.model_copy(update={"served_model_id": "another-model"})
     with pytest.raises(ValueError, match="model identity differs"):
         complete(body, "other-pin")
+
+
+def test_completion_profile_pins_inference_settings_not_scheduling(tmp_path: Path) -> None:
+    """A rubric cannot reuse qualification across different output protocols or allowances."""
+    complete, _, _ = setup(tmp_path, AssistantAction(content="{}"))
+    original = complete.completion_profile_sha256
+    complete.plan = complete.plan.model_copy(
+        update={"deadline": complete.plan.deadline + timedelta(hours=1), "maximum_cost_per_call": 2}
+    )
+    assert complete.completion_profile_sha256 == original
+    for update in (
+        {"output_tokens": 500},
+        {"output_protocol": "tool"},
+        {"json_object_output": True},
+    ):
+        plan = complete.plan
+        complete.plan = plan.model_copy(update=update)
+        assert complete.completion_profile_sha256 != original
+        complete.plan = plan
+
+
+def test_a_resumption_window_admits_past_the_plan_deadline_and_still_replays(
+    tmp_path: Path,
+) -> None:
+    """The window extends admission; the plan, so the replay fingerprint, is unchanged."""
+    complete, client, budget = setup(tmp_path, AssistantAction(content='{"a": 1}'))
+    body: JsonObject = {"messages": [{"role": "user", "content": "return JSON"}]}
+    assert complete(body, "answered") == {"a": 1}
+    later = complete.plan.deadline + timedelta(hours=4)
+    with pytest.raises(TimeoutError):
+        StructuredCompletion(
+            client=client,
+            plan=complete.plan,
+            budget=budget,
+            artifacts=budget_artifacts(tmp_path),
+            clock=lambda: later,
+        )(body, "answered")
+    resumed = StructuredCompletion(
+        client=client,
+        plan=complete.plan,
+        budget=budget,
+        artifacts=budget_artifacts(tmp_path),
+        clock=lambda: later,
+        window=later + timedelta(hours=3),
+    )
+    assert resumed(body, "answered") == {"a": 1}
+    assert len(client.requests) == 1, "the saved answer replays without a provider call"
+    assert resumed(body, "new") == {"a": 1}
+    assert len(client.requests) == 2
+
+
+def budget_artifacts(root: Path) -> ArtifactStore:
+    """The fixture project's artifact store."""
+    return ProjectStore(root, "completion").artifacts
+
+
+@pytest.mark.parametrize("with_caller", [False, True])
+def test_physical_structured_intent_preserves_caller_and_protected_source_ancestry(
+    tmp_path: Path, with_caller: bool
+) -> None:
+    """Physical ownership stays structured; its outer source remains an immutable ancestor."""
+    response = JsonHttpResponse(
+        200,
+        {
+            "choices": [{"message": {"content": '{"ok":true}'}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+        },
+    )
+    inner = ScriptedJsonTransport([response])
+    admitted, project, physical = _transport(tmp_path, inner, _ceiling(tmp_path, 1))
+    caps = ModelCapabilities(context_window_tokens=100000, maximum_output_tokens=1024)
+    model = _snapshot().model_copy(update={"capabilities_sha256": caps.identity_sha256()})
+    client = OpenAICompatibleClient(
+        model=model, api_key="fixture", base_url="https://fixture.invalid/v1", transport=admitted
+    )
+    complete = StructuredCompletion(
+        client=client,
+        plan=CompletionPlan(
+            model=model,
+            capabilities=caps,
+            deadline=datetime.now(UTC) + timedelta(minutes=1),
+            output_tokens=1024,
+            maximum_cost_per_call=1,
+            code_revision="fixture",
+        ),
+        budget=RequestBudget(project, identity="ancestry"),
+        artifacts=project.artifacts,
+    )
+
+    def source(identity: str, inputs: tuple[ArtifactInput, ...] = ()) -> ArtifactInput:
+        return artifact_input(
+            project.artifacts.write_json(
+                artifact_id=identity,
+                artifact_type="test-source",
+                envelope=ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=datetime.now(UTC),
+                    code_revision="fixture",
+                    inputs=inputs,
+                ),
+                files={"source.json": {"classification": "protected"}},
+            )
+        )
+
+    protected = source("protected-source")
+    caller = source("caller-intent", (protected,))
+    body: JsonObject = {"messages": [{"role": "user", "content": "Assess the task."}]}
+    if with_caller:
+        with canonical_call(caller):
+            assert complete(body, "one-cell") == {"ok": True}
+            assert complete(body, "one-cell") == {"ok": True}
+    else:
+        assert complete(body, "one-cell") == {"ok": True}
+        assert complete(body, "one-cell") == {"ok": True}
+    assert len(inner.requests) == physical.used() == 1
+    [intent_id] = [
+        i
+        for i in project.artifacts.list_ids(artifact_type="provider-physical-attempt")
+        if i.endswith("-intent")
+    ]
+    receipt = json.loads(project.artifacts.read_bytes(intent_id, "receipt.json"))
+    structured = project.artifacts.read(receipt["canonical_request"]["artifact_id"]).manifest
+    assert structured.artifact_type == "structured-call-intent"
+    assert project.artifacts.read(intent_id).manifest.inputs == (artifact_input(structured),)
+    assert structured.inputs == ((caller,) if with_caller else ())
+    if with_caller:
+        assert project.artifacts.read(caller.artifact_id).manifest.inputs == (protected,)
+        replacement = source("different-caller")
+        with canonical_call(replacement), pytest.raises(ValueError):
+            complete(body, "one-cell")
+        assert len(inner.requests) == 1
+        altered = caller.model_copy(update={"sha256": "0" * 64})
+        with canonical_call(altered), pytest.raises(ValueError, match="exact artifact"):
+            complete(body, "one-cell")
+        assert len(inner.requests) == 1

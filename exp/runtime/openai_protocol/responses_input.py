@@ -14,7 +14,75 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     SealedReasoningContentBlock,
 )
+from exp.runtime.openai_protocol.custom_tool_wire import (
+    CustomToolCallItem,
+    CustomToolCallOutputItem,
+)
 from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.responses_input_items import (
+    AgentMessageItem,
+    CompactionTriggerItem,
+    ConfigurationUpdateItem,
+    ContextCompactionItem,
+    ItemReferenceItem,
+)
+from exp.runtime.openai_protocol.wire_models import (
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
+    _AdditionalToolsItem,
+    _HostedToolItemEcho,
+)
+
+NativeInputRole = Literal["developer", "user", "assistant", "tool"]
+"""The canonical role a verbatim-carried input item holds its place under."""
+
+NATIVE_INPUT_ITEMS = (
+    _AdditionalToolsItem,
+    CustomToolCallItem,
+    CustomToolCallOutputItem,
+    _HostedToolItemEcho,
+    AgentMessageItem,
+    CompactionTriggerItem,
+    ContextCompactionItem,
+    ConfigurationUpdateItem,
+    ItemReferenceItem,
+)
+"""Input item models the decoder carries byte-for-byte as ``ReplayedNativeItem``.
+
+None of them has a canonical message form: a native Responses rung receives
+the raw caller item, and a foreign wire translates or drops it with
+disclosure (``codex_tools.convert_native_history``)."""
+
+
+def native_input_role(
+    item: _AdditionalToolsItem
+    | CustomToolCallItem
+    | CustomToolCallOutputItem
+    | _HostedToolItemEcho
+    | AgentMessageItem
+    | CompactionTriggerItem
+    | ContextCompactionItem
+    | ConfigurationUpdateItem
+    | ItemReferenceItem,
+) -> NativeInputRole:
+    """Return the role one verbatim-carried item holds its place under.
+
+    Provider-authored output (calls, compacted history, stored references)
+    is assistant history; results answering a call are tool history; an
+    agent message and a compaction request are input the model answers, so a
+    foreign wire never reads them as assistant prefill; tool definitions and
+    the positional configuration update are harness instructions.
+    """
+    match item:
+        case _HostedToolItemEcho():
+            return "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
+        case CustomToolCallItem() | ContextCompactionItem() | ItemReferenceItem():
+            return "assistant"
+        case CustomToolCallOutputItem():
+            return "tool"
+        case AgentMessageItem() | CompactionTriggerItem():
+            return "user"
+        case _AdditionalToolsItem() | ConfigurationUpdateItem():
+            return "developer"
 
 
 @dataclass(frozen=True)
@@ -52,11 +120,10 @@ class ReplayedFunctionCall:
 
 @dataclass(frozen=True)
 class ReplayedNativeItem:
-    """One Codex-native input item carried byte-for-byte (tool namespaces,
-    freeform tool calls and their outputs)."""
+    """One input item carried byte-for-byte (see ``NATIVE_INPUT_ITEMS``)."""
 
     index: int
-    role: Literal["developer", "assistant", "tool"]
+    role: NativeInputRole
     item: JsonObject
 
 
