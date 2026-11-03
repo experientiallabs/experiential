@@ -1,0 +1,26 @@
+# The only packaged bank. It exists so tests and documentation can load a bank with no setup, and
+# its propositions are deliberately generic: a real bank is local configuration, read from
+# .exp/question_banks, because the wording of a proposition is what decides whether the geometry
+# can tell two kinds of work apart. Never tag a real corpus with this.
+bank_id = "example-v1"
+version = 1
+
+[[questions]]
+question_id = "example.single_step"
+family = "example"
+text = "Was the task completed in a single step, with no intermediate lookups?"
+
+[[questions]]
+question_id = "example.used_tools"
+family = "example"
+text = "Did the agent call any tool or external service while working the task?"
+
+[[questions]]
+question_id = "example.changed_state"
+family = "example"
+text = "Did the agent change state in an external system rather than only reading from it?"
+
+[[questions]]
+question_id = "example.asked_person"
+family = "example"
+text = "Did the agent ask the person a question before finishing?"
