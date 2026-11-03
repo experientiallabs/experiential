@@ -868,3 +868,109 @@ fn settle_argument_carries_the_twelve_hour_write_subset_only_when_observed() {
         .get("cache_creation_12h_input_tokens")
         .is_none());
 }
+
+/// A Python control plane that records every `price` and `settle` call in order.
+fn ordering_plane(price_fails: bool) -> Py<PyAny> {
+    Python::initialize();
+    let code = format!(
+        "import json\nclass Plane:\n def __init__(self): self.calls = []\n def price(self, argument):\n  self.calls.append(['price', json.loads(argument)])\n  if {price_fails}: raise RuntimeError('quote unavailable')\n  return '{{}}'\n def settle(self, argument):\n  self.calls.append(['settle', json.loads(argument)])\n  return '{{}}'\n def close_thread_resources(self, argument): return '{{}}'\n",
+        price_fails = if price_fails { "True" } else { "False" },
+    );
+    let code = std::ffi::CString::new(code).unwrap();
+    Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py, &code, c"ordering_plane.py", c"ordering_plane")
+            .unwrap()
+            .getattr("Plane")
+            .unwrap()
+            .call0()
+            .unwrap()
+            .unbind()
+    })
+}
+
+/// Return the recorded `[method, argument]` calls of an ordering plane.
+fn recorded_calls(plane: &Py<PyAny>) -> Vec<(String, Value)> {
+    let calls: String = Python::attach(|py| {
+        py.import("json")
+            .unwrap()
+            .call_method1("dumps", (plane.bind(py).getattr("calls").unwrap(),))
+            .unwrap()
+            .extract()
+            .unwrap()
+    });
+    serde_json::from_str::<Vec<(String, Value)>>(&calls).unwrap()
+}
+
+/// A guard bound to one dispatched attempt that observed final usage.
+fn priced_guard(plane: &Py<PyAny>) -> AttemptGuard {
+    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 4).unwrap());
+    let mut guard = AttemptGuard::new(
+        bridge,
+        Arc::new(AtomicUsize::new(0)),
+        "request".into(),
+        Instant::now(),
+    );
+    guard.rebind("attempt".into());
+    guard.mark_opened();
+    guard.begin_dial_observation().record(&Event::Usage(Usage {
+        input_tokens: Some(21),
+        output_tokens: Some(5),
+        ..Usage::default()
+    }));
+    guard
+}
+
+#[tokio::test]
+async fn a_priced_terminal_settles_the_exact_priced_argument_afterwards() {
+    let plane = ordering_plane(false);
+    let mut guard = priced_guard(&plane);
+    assert!(guard.price_or_settle("completed", None, &[], None).await);
+    let calls = recorded_calls(&plane);
+    assert_eq!(calls.len(), 1, "a successful quote writes nothing yet");
+    assert_eq!(calls[0].0, "price");
+    // A disconnect after the quote never downgrades the priced outcome.
+    assert!(guard.settle_cancelled(None, &[]).await);
+    assert!(!guard.armed);
+    let calls = recorded_calls(&plane);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "settle");
+    assert_eq!(calls[1].1, calls[0].1);
+    assert_eq!(calls[1].1["outcome"], "completed");
+    assert_eq!(calls[1].1["usage"]["input_tokens"], 21);
+    assert!(guard.settle_priced().await);
+    assert_eq!(recorded_calls(&plane).len(), 2, "settled exactly once");
+}
+
+#[tokio::test]
+async fn a_failed_quote_settles_before_any_terminal_byte() {
+    let plane = ordering_plane(true);
+    let mut guard = priced_guard(&plane);
+    assert!(guard.price_or_settle("incomplete", None, &[], None).await);
+    let calls = recorded_calls(&plane);
+    let methods: Vec<&str> = calls.iter().map(|(method, _)| method.as_str()).collect();
+    assert_eq!(methods, ["price", "settle"]);
+    assert_eq!(calls[1].1, calls[0].1);
+    assert!(!guard.armed);
+    assert!(guard.settle_priced().await);
+    assert_eq!(recorded_calls(&plane).len(), 2);
+}
+
+#[tokio::test]
+async fn a_priced_terminal_dropped_unsettled_is_delivered_by_the_backstop() {
+    let plane = ordering_plane(false);
+    let pending = Arc::new(AtomicUsize::new(0));
+    let mut guard = priced_guard(&plane);
+    guard.pending = pending.clone();
+    assert!(guard.price_or_settle("completed", None, &[], None).await);
+    drop(guard);
+    for _ in 0..200 {
+        if recorded_calls(&plane).len() == 2 && pending.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let calls = recorded_calls(&plane);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].0, "settle");
+    assert_eq!(calls[1].1, calls[0].1);
+}

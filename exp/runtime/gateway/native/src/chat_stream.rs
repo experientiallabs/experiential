@@ -19,7 +19,7 @@ use crate::relay::track_event;
 use crate::replay::OwnerLease;
 use crate::respond::{
     capture_frame, failure_frames, finish_stream_terminal, log_stream_exit, outward_event,
-    settle_stream_end, stream_delivery::Delivery,
+    price_stream_end, settle_stream_end, stream_delivery::Delivery,
 };
 use crate::settlement::AttemptGuard;
 use crate::tool_search::configure_chat_encoder;
@@ -212,9 +212,7 @@ pub(super) async fn stream_response(
                     }
                 }
                 terminal = Some(event.clone());
-                if !settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
-                    .await
-                {
+                if !price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await {
                     log_stream_exit(&request_id, "settlement_unavailable");
                     return;
                 }
@@ -224,8 +222,9 @@ pub(super) async fn stream_response(
                     Ok(encoded) => encoded,
                     Err(_) => {
                         if terminal.is_some() {
-                            // The attempt already settled by its provider
-                            // terminal; the stream simply ends short.
+                            // The provider terminal is already settled, or
+                            // priced and settled by the drop backstop; the
+                            // stream simply ends short.
                             log_stream_exit(&request_id, "terminal_encoding_failed");
                             return;
                         }
@@ -248,6 +247,11 @@ pub(super) async fn stream_response(
                         encoded.into_iter().map(Bytes::from).collect(),
                     )
                     .await;
+                    // Close the body before the durable write: the caller
+                    // holds its terminal frames while settlement lands.
+                    drop(delivery);
+                    drop(sender);
+                    guard.settle_priced().await;
                     return;
                 }
                 for data in encoded {

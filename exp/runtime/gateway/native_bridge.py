@@ -861,6 +861,10 @@ class NativeControlPlane(
         """
         return self._accounting.settle(argument)
 
+    def price(self, argument: str) -> str:
+        """Price one decided settlement before terminal bytes flush; nothing is written."""
+        return self._accounting.price(argument)
+
     def abandon(self, argument: str) -> str:
         """Terminalize one accepted request through the accounting registry.
 

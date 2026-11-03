@@ -920,7 +920,7 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.174"
+version = "0.3.175"
 source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]
@@ -972,7 +972,7 @@ dependencies = [
 
 [[package]]
 name = "experiential"
-version = "0.7.228"
+version = "0.7.229"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },

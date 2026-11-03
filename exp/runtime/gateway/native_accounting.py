@@ -97,6 +97,7 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
+from exp.runtime.gateway.native_settlement_quote import quote_settlement
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -749,6 +750,10 @@ class NativeAttemptAccounting:
         finally:
             with self._lock:
                 self._active_settlements -= 1
+
+    def price(self, argument: str) -> str:
+        """Let the host price one decided settlement (``quote_settlement``); nothing is written."""
+        return quote_settlement(self, argument)
 
     def _settle(self, argument: str) -> str:
         """Commit one observed outcome while the caller retains shutdown ownership."""
