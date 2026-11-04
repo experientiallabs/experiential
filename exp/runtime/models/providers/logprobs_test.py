@@ -240,3 +240,27 @@ def test_capture_eligibility_honors_the_callers_explicit_false() -> None:
     caller = rung_request.model_copy(update={"logprobs": False})
     assert capture_logprobs_eligible(_profile(), rung_request)
     assert not capture_logprobs_eligible(_profile(), rung_request, caller=caller)
+
+
+def test_an_unqualified_effort_names_the_efforts_that_serve_probabilities() -> None:
+    """A caller learns which reasoning_effort to send instead of a generic refusal."""
+    request = _chat_request().model_copy(update={"logprobs": True, "top_logprobs": 5})
+    profile = replace(
+        _profile(),
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="max",
+        supported_reasoning_efforts=("low", "high", "max"),
+        logprobs_reasoning_efforts=("low", "high", "max"),
+    )
+    require_chat_logprobs((profile,), request)
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((profile,), request.model_copy(update={"reasoning_effort": "medium"}))
+    assert caught.value.param == "reasoning_effort"
+    assert "'medium'" in str(caught.value)
+    assert "low, high, max" in str(caught.value)
+    # No qualified effort at all keeps the route refusal on the probability field.
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((replace(profile, logprobs_reasoning_efforts=()),), request)
+    assert caught.value.param == "top_logprobs"
+    assert "cannot preserve" in str(caught.value)
