@@ -47,6 +47,16 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
+        "exp.optimize.evaluation.variance.behavior_differences:BEHAVIOR_DIFFERENCES_PROTOCOL",
+        "behavior-differences-v1",
+        (
+            "exp.optimize.evaluation.variance.behavior_differences",
+            "exp.optimize.evaluation.variance.behavior_pairs",
+            "exp.optimize.evaluation.variance.pipeline_behaviors",
+        ),
+        "971c8c7f06aae12a4107cab71d6d161989051a96fad3390cc8c3d4f189b4f120",
+    ),
+    Protocol(
         "exp.simulation.mining.descriptors:DESCRIPTOR_EMBEDDING",
         "hashing-descriptor-v3",
         (
@@ -278,7 +288,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v5",
+        "variance-roles-v6",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -290,7 +300,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "6a6ceb49cde775e5ea4083015f97fea81ab1d2e3e64e5b65500711b01da9c3aa",
+        "ea22000df8aa2d32e7c53ebc7c903e2a10a235989050bb983e223bbf4bc5c420",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -341,13 +351,13 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v6",
+        "variance-authors-v7",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "f44886a6c2f74d0592dac07aa7dbf640736a08a3a49aa66c31aaf43898248a44",
+        "6910fc1b9046dfea05b195e235fb0ecbe008fce4b69c317d0c13597af6cc3c64",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.briefing_review:BRIEFING_REVIEW_PROTOCOL",
@@ -387,12 +397,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authoring_packet:AUTHORING_PACKET_PROTOCOL",
-        "authoring-packet-v3",
+        "authoring-packet-v4",
         (
             "exp.optimize.evaluation.variance.authoring_packet",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "7724b2776207f710b3160a4644d07051d3a100b73fbb9b805685bf2f9269d7ee",
+        "76aaeda7f516212796cd99d447864cbd0e3d64c4eef92b4ce14e054690c165de",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_author:WORLD_AUTHOR_PROTOCOL",

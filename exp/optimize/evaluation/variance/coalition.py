@@ -34,6 +34,7 @@ from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
+from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceEvidence
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judged import (
     JudgedCell,
@@ -254,6 +255,7 @@ class CoalitionEvidence(ContractModel):
     critics: tuple[CriticComparison, ...] = ()
     contrasts: tuple[ContrastOutcome, ...] = ()
     step_labels: tuple[StepLabel, ...] = ()
+    behavior_differences: tuple[BehaviorDifferenceEvidence, ...] = ()
     references: tuple[ArtifactInput, ...] = ()
     unavailable: tuple[str, ...] = ()
 
@@ -272,6 +274,12 @@ class CoalitionEvidence(ContractModel):
         known = set(attempts)
         named = {a for row in self.patterns for a in row.attempts}
         named |= {row.attempt_id for row in self.step_labels if row.attempt_id is not None}
+        named |= {
+            a
+            for group in self.behavior_differences
+            for pair in group.pairs
+            for a in (pair.good_attempt, pair.poor_attempt)
+        }
         if named - known:
             raise ValueError(f"coalition rows name unknown attempts {sorted(named - known)}")
         sampled = {row.tier for row in (*self.attempts, *self.selections, *self.critics)}
@@ -292,6 +300,10 @@ class CoalitionEvidence(ContractModel):
                 *(f"critic:{row.tier}.{row.draw}.{row.step}" for row in self.critics),
                 *(f"contrast:{row.contrast_id}.{row.arm}" for row in self.contrasts),
                 *(f"steplabel:{index}" for index in range(len(self.step_labels))),
+                *(
+                    f"behavior-diff:{row.source.artifact_id}/{row.group_id}"
+                    for row in self.behavior_differences
+                ),
             }
         )
 
@@ -362,6 +374,7 @@ def mining_coalition(
     patterns: Sequence[BehaviorPattern] = (),
     contrasts: Sequence[ContrastOutcome] = (),
     step_labels: ArtifactInput | None = None,
+    behavior_differences: Sequence[BehaviorDifferenceEvidence] = (),
 ) -> CoalitionEvidence:
     """Gather the coalition from one error-mining report per tier.
 
@@ -477,8 +490,10 @@ def mining_coalition(
         unavailable.append("no judged action-contrast outcomes were supplied")
     if not patterns:
         unavailable.append("no mistake, recovery or alternative patterns were supplied")
+    references.update(group.source for group in behavior_differences)
     return CoalitionEvidence(
         attempts=tuple(attempts),
+        behavior_differences=tuple(behavior_differences),
         patterns=tuple(patterns),
         tiers=tuple(_tier(name, model, attempts, patterns) for name, model in tiers),
         selections=tuple(selections),

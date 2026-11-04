@@ -69,7 +69,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.induction.contracts import InductionEpisode
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook, ToolContract
 
-AUTHORING_PACKET_PROTOCOL = "authoring-packet-v3"
+AUTHORING_PACKET_PROTOCOL = "authoring-packet-v4"
 """Version of the packet contract; change it whenever what authors are shown changes."""
 
 PACKET_TYPE = "authoring-packet"

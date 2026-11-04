@@ -74,7 +74,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
 
-AUTHORS_PROTOCOL = "variance-authors-v6"
+AUTHORS_PROTOCOL = "variance-authors-v7"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"
@@ -95,6 +95,11 @@ estimate beside the judged rate, and judged outcomes per competing option. Each 
 keeps its evidence status: historical labels came from an earlier judge, and patterns, selector
 rationales, critic estimates and step labels are hypotheses, not established facts. The agent
 under test never sees any of this.
+
+When reviewed behavior-difference groups are supplied, use their exact Added/Removed tags,
+paired step evidence and pre-decision checkpoints to propose variants that test the mechanism.
+These differences are hypotheses, not blanket rules: legitimate test corrections, recoveries
+and alternative valid solutions remain valid.
 
 Use the coalition to find a decision on which actors genuinely diverge and to keep every valid
 alternative solution and recovery valid; one failed attempt or one success never defines the

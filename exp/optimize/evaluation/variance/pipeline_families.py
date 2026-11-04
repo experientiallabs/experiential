@@ -68,6 +68,10 @@ from exp.optimize.evaluation.variance.family import (
 from exp.optimize.evaluation.variance.judge import EVIDENCE_TYPE, load_assessment
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedStudy
+from exp.optimize.evaluation.variance.pipeline_behaviors import (
+    behavior_authoring_coalition,
+    coalition_differences,
+)
 from exp.optimize.evaluation.variance.pipeline_errors import coalition_patterns, tier_error_bank
 from exp.optimize.evaluation.variance.pipeline_inputs import (
     library_draws,
@@ -411,6 +415,10 @@ class _Point:
             judge=self.tier.judge.identity,
             patterns=patterns,
             step_labels=labels.get(self.tier.tier),
+            behavior_differences=coalition_differences(
+                project,
+                MiningOutputs.model_validate(context.upstream["error-mining"].outputs).tiers,
+            ),
         )
         return build_authoring_packet(
             family_id=local_id(f"{self.tier.tier}-{self.point}"),
@@ -627,6 +635,7 @@ def _family(point: _Point) -> FamilyOutcome:
         measure_decisions=authoring.decision_variance,
         search=authoring.search_spec(),
         ladder=authoring.ladder_spec(),
+        coalition=behavior_authoring_coalition(context),
     )
     point.draws = family_spec.draws_identity(point.report, point.point, revision)
     family = run_decision_family(

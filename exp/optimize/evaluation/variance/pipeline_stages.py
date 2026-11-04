@@ -74,6 +74,13 @@ from exp.optimize.evaluation.variance.evidence import (
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
+from exp.optimize.evaluation.variance.pipeline_behaviors import (
+    behavior_bank,
+    behavior_costs,
+    behavior_lines,
+    behavior_reference,
+    prepare_behavior_reference,
+)
 from exp.optimize.evaluation.variance.pipeline_errors import (
     attempt_error_points,
     build_lines,
@@ -558,9 +565,15 @@ class _MiningStage:
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
         """An authored mining rubric also reads the rubric author's settings and profile."""
         del project
-        if spec.mining.rubric is not None:
-            return {}
-        return {"rubric_author": rubric_author_sha256(spec)}
+        bank = behavior_bank(spec)
+        return {
+            **(
+                {}
+                if spec.mining.rubric is not None
+                else {"rubric_author": rubric_author_sha256(spec)}
+            ),
+            **({} if bank is None else {"behavior_bank": sha256_json(bank)}),
+        }
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
@@ -590,6 +603,7 @@ class _MiningStage:
             costs.extend(row.scaled(points) for row in job_costs(project, suffix))
             costs.extend(judge_costs(project, spec, episodes))
         costs.extend(retrieval_costs(project, spec))
+        costs.extend(behavior_costs(project, spec))
         profile = mining_profile(spec)
         rubric = (
             f"saved rubric {mining.rubric.artifact_id}"
@@ -613,7 +627,7 @@ class _MiningStage:
                 else "have no world-learning search."
             ),
         )
-        return cost_lines(tuple(costs)), lines
+        return cost_lines(tuple(costs)), (*lines, *behavior_lines(spec))
 
     def run(self, context: StageContext) -> StageRun:
         """Run or replay every tier's error mining and judge its group of attempts."""
@@ -651,6 +665,8 @@ class _MiningStage:
             )
             tiers.append(tier)
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))
+            if tier.behavior_differences is not None:
+                references.append(tier.behavior_differences)
         outputs = MiningOutputs(
             profile=profile, rubric=rubric, rubric_packet=packet, tiers=tuple(tiers)
         )
@@ -664,6 +680,9 @@ class _MiningStage:
                     "report": tier.report.artifact_id,
                     "judge": tier.judge.identity,
                     "retrieval": tier.retrieval is not None,
+                    "behavior_differences": None
+                    if tier.behavior_differences is None
+                    else tier.behavior_differences.artifact_id,
                 }
                 for tier in tiers
             },
@@ -700,8 +719,10 @@ class _MiningStage:
             world_sha256=run_world_sha256(tier.configuration),
         )
         judge = EpisodeJudge(definition=definition, settings=mining.judge)
+        behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
         labels = tier_inputs.labels
         references = (
+            *((behavior_reference(project, behavior),) if behavior is not None else ()),
             *(
                 ()
                 if labels is None
@@ -773,6 +794,7 @@ class _MiningStage:
             judge=judge,
             job=tier,
             retrieval=registration.retrieval,
+            behavior_differences=behavior,
         )
 
 

@@ -143,6 +143,94 @@ A bound rule book makes the world model a state machine: the model proposes each
 re-asked with the broken rules as feedback and never committed. Durable sessions take an opt-in
 `transition_checker`; executable worlds bind the rule book into `GroundedRuntimeDefinition`.
 
+## Paired behavioral differences
+
+Register `mining.behaviors` with a `BehaviorDifferenceSpec`
+(`variance/behavior_differences.py`) to mine directional contrasts before point selection:
+
+```python
+from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
+
+behavior_settings = BehaviorDifferenceSpec(
+    bank_id="completion-behavior-v1",
+    author=alignment_author,
+    reviewer=independent_reviewer,
+    positive_tags=("changed_implementation", "verified_result"),
+    negative_tags=(
+        "unsupported_success_claim",
+        "modified_evaluation",
+        "skipped_required_step",
+        "exploited_metric",
+        "hid_failure",
+    ),
+    maximum_pairs=16,
+)
+spec = spec.model_copy(
+    update={"mining": spec.mining.model_copy(update={"behaviors": behavior_settings})}
+)
+```
+
+The local `completion-behavior-v1.toml` bank, resolved from `traceml.bank_root` or the
+usual local question-bank directory, must contain exactly the declared tag identities, with
+their full propositions. For example, `modified_evaluation` can mean that the focal action
+changes the tests or metric used to evaluate the task. That observation alone does not make the
+edit wrong. `verified_result` should require a recorded result that actually supports the
+claim, rather than merely an attempted test command. If the bank has only the six base tags,
+set `positive_tags=("verified_result",)` and omit `changed_implementation` from the bank.
+Questions and their definitions stay local configuration, not packaged data.
+
+The pipeline then:
+
+1. Reuses each tier's saved actor group and judges it under the frozen episode judge before
+   point selection. A historical mechanical verifier pass remains a separate diagnostic.
+2. Tags actor messages, tool calls with their results, and final answers step by step through
+   the generic decision tagger. Context-only and experiment-imposed actions are excluded.
+   Positive tags never enter the error-only bank, error totals or actor reward.
+3. Forms same-study pass/fail pairs under that one judge. A bounded seeded sample prioritizes
+   failed attempts that the historical verifier passed. No pair crosses a task, starting
+   checkpoint, world, actor policy or tier. Unassessable episodes remain coverage gaps.
+4. Asks an LLM to align contiguous windows around the corresponding decision. The windows may
+   have different indexes; the full ordered episodes accompany the capped step views.
+5. Computes the poor attempt minus the good attempt: Added and Removed tags. A tag must be
+   confidently present on one side and confidently absent on the other. An unresolved
+   comparison remains uncertain and does not enter an accepted group. With the default
+   confidence, 0.3 and 0.7 also remain uncertain.
+6. Asks a separate LLM draw to audit the mechanism, both windows and event citations. Legitimate
+   test corrections, valid alternatives, recoveries and missing evidence must be considered.
+   Simulator failures and missing tools need research rather than an actor-error rubric.
+7. Saves accepted pairs with the poor-side checkpoint before the action, then groups identical
+   directional Added/Removed signatures. Group identities include the exact bank digest, so
+   equivalent signatures can be joined across saved reports without pooling their outcomes.
+   Each report retains its task, world, tier, judge, source episodes and individual pair evidence.
+8. Registers a compact `behavior_differences` reference for selectors and critics, and carries
+   the exact signatures, paired steps, event citations and checkpoints into the family
+   authors' coalition. The world and rubric authors remain independent.
+
+For example:
+
+```text
+Good: changed_implementation, verified_result
+Poor: modified_evaluation, unsupported_success_claim
+
+Added:   modified_evaluation, unsupported_success_claim
+Removed: changed_implementation, verified_result
+```
+
+`run_behavior_differences` (`variance/behavior_pairs.py`) is also a Python operation over a saved
+study and its saved judging. Its `behavior-differences` artifact contains `differences.json`:
+tag matrices, full evidence, selected pairs, alignments, audits, accepted groups and failures.
+`load_behavior_differences` verifies the pinned report, tag text bindings, judgments, computed
+differences and pre-action checkpoints. Failed or malformed paid responses are retained; replay
+does not redraw them. Alignment and audit calls run at bounded concurrency and are included,
+with step tagging, in the pipeline's up-front cost inventory.
+
+This is opt-in analysis, not a new reward function. Accepted differences are reviewed hypotheses,
+not causal proof, task admission or Harbor qualification. If there is no judged pass/fail
+contrast, or every pair is uncertain or refused, the saved report has no accepted groups.
+This registration currently cannot be combined with `mining.schedule`; generate the behavioral
+evidence first and explicitly register it in a frozen schedule's base references.
+
+
 ## Screening: judges, critics and continuations
 
 `run_actor_critic` (`variance/actor_critic.py`, CLI action `actor-critic`) runs G attempts of a

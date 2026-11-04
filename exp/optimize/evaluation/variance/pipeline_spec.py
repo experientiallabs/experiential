@@ -47,6 +47,7 @@ from exp.optimize.evaluation.rules.memory_stage import MemorySetSettings
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, VariantJudging
 from exp.optimize.evaluation.variance.behavior_curation import CuratorVariant
+from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
 from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec
@@ -276,10 +277,17 @@ class MiningSettings(ContractModel):
     schedule: TrainingScheduleSpec | None = None
     retrieval: bool = True
     retrieval_top_k: int = Field(default=5, ge=1, le=20, strict=True)
+    behaviors: BehaviorDifferenceSpec | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _tiers(self) -> Self:
         """Require distinct actor aliases that are valid tier labels."""
+        if self.behaviors is not None and self.schedule is not None:
+            raise ValueError(
+                "mine behavior differences before registering a frozen training schedule"
+            )
         if len(set(self.actors)) != len(self.actors):
             raise ValueError("mining actors must be distinct; each actor is its own tier")
         bad = [alias for alias in self.actors if not _is_tier(alias)]
@@ -687,6 +695,7 @@ class TierMining(ContractModel):
     judge: EpisodeJudge
     job: ContinuationJob
     retrieval: TraceSearchSpec | None = None
+    behavior_differences: ArtifactInput | None = None
 
 
 class MiningOutputs(ContractModel):

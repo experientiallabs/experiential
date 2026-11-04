@@ -77,6 +77,7 @@ ReferenceKind = Literal[
     "grader_rubric",
     "traceml_labels",
     "error_points",
+    "behavior_differences",
 ]
 """Reference or specification material a run may register beside the verifier."""
 
@@ -88,6 +89,7 @@ REFERENCE_KINDS: tuple[ReferenceKind, ...] = (
     "grader_rubric",
     "traceml_labels",
     "error_points",
+    "behavior_differences",
 )
 """Every reference kind, in the order unavailable kinds are named."""
 
@@ -97,7 +99,11 @@ TRACEML_LABELS_TYPE = "traceml-labels"
 ERROR_POINTS_TYPE = "error-points"
 """Artifact type an ``error_points`` reference must have; its producer is not imported here."""
 
-_TYPED = {"traceml_labels": TRACEML_LABELS_TYPE, "error_points": ERROR_POINTS_TYPE}
+_TYPED = {
+    "traceml_labels": TRACEML_LABELS_TYPE,
+    "error_points": ERROR_POINTS_TYPE,
+    "behavior_differences": "behavior-differences",
+}
 """Reference kinds that must come from one artifact type."""
 
 ALWAYS_UNAVAILABLE: tuple[JsonObject, ...] = (
@@ -325,7 +331,12 @@ def evidence_packet(
     }
     verifier = study.spec.verifier.model_dump(mode="json")
     documents: dict[str, JsonValue] = {"group": group, "verifier": verifier}
-    unavailable: list[JsonValue] = [dict(row) for row in ALWAYS_UNAVAILABLE]
+    has_differences = any(ref.source.kind == "behavior_differences" for ref in references)
+    unavailable: list[JsonValue] = [
+        dict(row)
+        for row in ALWAYS_UNAVAILABLE
+        if not (has_differences and row["material"] == "independent_correctness_labels")
+    ]
     attempts: list[JsonValue] = []
     summaries: list[JsonValue] = []
     for row in study.branches:

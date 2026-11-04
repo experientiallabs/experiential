@@ -97,6 +97,7 @@ from exp.optimize.evaluation.variance.authors import (
     relevant_questions,
     relevant_rules,
 )
+from exp.optimize.evaluation.variance.coalition import CoalitionEvidence
 from exp.optimize.evaluation.variance.contracts import (
     ActorView,
     DecisionState,
@@ -210,6 +211,7 @@ class DecisionFamilySpec(ContractModel):
             and keeps the identity families had before the measure existed.
         search: Variant search settings: the scenarios come from measured search rounds instead
             of one draw, and only an admitted set goes on. Needs the measure; unkeyed while None.
+        coalition: Optional frozen behavioral evidence for the early decision-state author.
         ladder: Nudge ladder settings: an admitted family builds a ladder over its hardest
             state and records every curriculum rung as its own task. Needs the measure; unkeyed
             while None.
@@ -236,6 +238,9 @@ class DecisionFamilySpec(ContractModel):
     measure_decisions: bool = True
     search: VariantSearchSpec | None = None
     ladder: NudgeLadderSpec | None = None
+    coalition: CoalitionEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _measured(self) -> DecisionFamilySpec:
@@ -432,6 +437,8 @@ def run_decision_family(
         result_id = identity + "-result"
         if store.exists(result_id):
             return FamilyReport.model_validate_json(store.read_bytes(result_id, "report.json"))
+        if spec.coalition is not None:
+            spec.coalition.check_exposure(exposure)
         book = load_rulebook(project, stage.rulebook)
         tools = frozenset(tool.name for tool in checkpoint.task.tools)
         context = DecisionContext(
@@ -443,9 +450,15 @@ def run_decision_family(
             questions=relevant_questions(book, tools),
             tools=checkpoint.task.tools,
             instruction_variation=spec.instruction_variation,
+            task_instruction=None if spec.coalition is None else checkpoint.task.instruction,
+            coalition=spec.coalition or CoalitionEvidence(),
         )
         context_ref = save_context(
-            project, draws, context, (stage.rulebook, spec.rules_stage), code_revision
+            project,
+            draws,
+            context,
+            (stage.rulebook, spec.rules_stage, *context.coalition.references),
+            code_revision,
         )
         sources = (context_ref, spec.rules_stage, stage.rulebook, report.group)
         decision = author_decision_state(
