@@ -17,20 +17,22 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.ledger_errors import (
     AccountingRecoveryUnresolvedTerminalError,
+    AccountingRefusedError,
+    AttemptRejectedError,
     GatewayLedgerError,
 )
-from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_accounting_test import (
-    _admit,
-    _deployment,
     _RecordingLedger,
     _registry,
     _retryable_failure,
     _settle,
     _start,
 )
-from exp.runtime.gateway.native_request_settlement import RequestSettlements
+from exp.runtime.gateway.native_request_settlement import (
+    RequestSettlements,
+    permanently_refused,
+)
 
 
 def test_pre_dispatch_search_meter_is_retried_by_the_accounting_sweep() -> None:
@@ -48,15 +50,15 @@ def test_pre_dispatch_search_meter_is_retried_by_the_accounting_sweep() -> None:
         web_search_requests=1,
     )
     assert not accounting.accounting_healthy
+    organization_id = entry.authorization.organization_id
+    assert accounting.request_settlements.fenced_organizations() == {organization_id}
     with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.request_settlements.require_clear(entry.authorization.organization_id)
-    with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear(organization_id)
     accounting.sweep_expired()
     assert not accounting.accounting_healthy
     accounting.sweep_expired()
     assert accounting.accounting_healthy
-    accounting.request_settlements.require_clear(entry.authorization.organization_id)
+    accounting.require_clear(organization_id)
     accounting.sweep_expired()
     assert ledger.finished_requests == [failure]
     assert ledger.request_search_meters == [1]
@@ -112,7 +114,7 @@ def test_normal_in_progress_terminal_write_does_not_block_unrelated_admission() 
         try:
             assert entered.wait(3)
             assert accounting.accounting_healthy
-            accounting.request_settlements.require_clear(entry.authorization.organization_id)
+            assert not accounting.request_settlements.fenced_organizations()
             accounting.request_settlements.retry(16)
             assert calls == [1]
         finally:
@@ -233,7 +235,7 @@ def test_failed_abandonment_retains_search_meter_and_original_failure() -> None:
         )
     assert not accounting.accounting_healthy
     with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.request_settlements.require_clear(entry.authorization.organization_id)
+        accounting.require_clear(entry.authorization.organization_id)
     accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
     accounting.sweep_expired()
     assert accounting.accounting_healthy
@@ -275,66 +277,20 @@ def test_active_abandonment_owns_search_only_on_final_settlement(previous_attemp
 _BLOCKED = GatewayFailure(failure_class=GatewayFailureClass.GUARDRAIL, safe_message="blocked")
 
 
-def test_one_organizations_retained_write_never_fences_another_organization() -> None:
-    """The admission fence is per organization: a neighbor keeps serving.
-
-    One organization's write that keeps failing used to refuse every
-    organization on the worker with ``accounting_unavailable`` until it landed.
-    """
-    accounting, ledger, entry = _registry()
-    other = entry.authorization.model_copy(
-        update={"organization_id": "organization-two", "request_id": "request-two"}
-    )
-    ledger.fail_request_finishes = 1
-    assert not accounting.finish_request_quietly(entry.authorization, _BLOCKED)
-    with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.require_clear(entry.authorization.organization_id)
-    accounting.require_clear(other.organization_id)
-    accounting.request_settlements.require_clear(other.organization_id)
-    accounting.sweep_expired()
-    accounting.require_clear(entry.authorization.organization_id)
-
-
-def test_a_failed_attempt_settlement_fences_only_its_organization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A retained attempt meter refuses its own organization and no other."""
-    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
-    ledger = _RecordingLedger()
-    accounting = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
-    deployments = (_deployment("lead", connection_sha256="b" * 64),)
-    _admit(accounting, deployments, request_id="wedged", organization_id="wedged-org")
-    _admit(accounting, deployments, request_id="neighbor", organization_id="neighbor-org")
-    attempt = _start(accounting, ordinal=0, request_id="wedged")
-    ledger.fail_finishes = 1
-    with pytest.raises(NativeBridgeError):
-        _settle(
-            accounting,
-            attempt_id=str(attempt["attempt_id"]),
-            outcome="completed",
-            finalize=True,
-            request_id="wedged",
-        )
-    with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.require_clear("wedged-org")
-    accounting.require_clear("neighbor-org")
-    accounting.sweep_expired()
-    accounting.require_clear("wedged-org")
-
-
 def test_a_replay_the_ledger_permanently_refuses_is_dropped_and_clears_the_fence(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A retained write whose replay fails a ledger contract is finalized, not replayed forever.
 
     The first write fails transiently; the replay meets a deterministic refusal
-    (here: another ledger now owns the organization's money). Retrying cannot
-    succeed, so the write is dropped with a warning and the fence lifts.
+    (the request is already terminal with another outcome). No retry can commit
+    it, so it is dropped with a warning, the fence lifts and later sweeps never
+    call the ledger again.
     """
     accounting, ledger, entry = _registry()
     replies: list[Exception] = [
         RuntimeError("canceling statement due to lock timeout"),
-        GatewayLedgerError("organization admission is owned by another ledger"),
+        GatewayLedgerError("request is already settled with another terminal state"),
     ]
     calls = 0
 
@@ -351,6 +307,7 @@ def test_a_replay_the_ledger_permanently_refuses_is_dropped_and_clears_the_fence
         assert calls == 2
         assert accounting.accounting_healthy
         assert not accounting.request_settlements.outstanding
+        assert accounting.fenced_organizations() == frozenset()
         accounting.require_clear(entry.authorization.organization_id)
         accounting.sweep_expired()
         assert calls == 2
@@ -362,24 +319,50 @@ def test_a_first_write_the_ledger_permanently_refuses_is_never_retained() -> Non
     accounting, ledger, entry = _registry()
 
     def refuse(**_fields: object) -> bool:
-        raise GatewayLedgerError("request is already terminal with another outcome")
+        raise GatewayLedgerError("request was not durably accepted")
 
     with patch.object(ledger, "finish_request", refuse):
         assert not accounting.request_settlements.finish(entry.authorization, _BLOCKED)
     assert accounting.accounting_healthy
+    assert not accounting.request_settlements.outstanding
     accounting.require_clear(entry.authorization.organization_id)
 
 
-def test_a_recovery_owner_refusal_stays_retained() -> None:
-    """An unresolved-liability outcome keeps its owner; only plain contract refusals drop."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        AccountingRecoveryUnresolvedTerminalError("liability remains unresolved"),
+        AttemptRejectedError(
+            "another ledger owns the organization",
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL, safe_message="owned elsewhere"
+            ),
+        ),
+        RuntimeError("connection lost"),
+    ],
+    ids=["recovery_owner", "attempt_rejected", "transport"],
+)
+def test_replayable_failures_stay_retained_and_fence(error: Exception) -> None:
+    """Only a plain contract refusal is dropped; every replayable outcome keeps its owner."""
+    assert not permanently_refused(error)
     accounting, ledger, entry = _registry()
 
-    def unresolved(**_fields: object) -> bool:
-        raise AccountingRecoveryUnresolvedTerminalError("liability remains unresolved")
+    def fail(**_fields: object) -> bool:
+        raise error
 
-    with patch.object(ledger, "finish_request", unresolved):
-        with pytest.raises(AccountingRecoveryUnresolvedTerminalError):
+    with patch.object(ledger, "finish_request", fail):
+        with pytest.raises(type(error)):
             accounting.request_settlements.finish(entry.authorization, _BLOCKED)
         assert not accounting.accounting_healthy
         with pytest.raises(NativeBridgeError, match="accounting is recovering"):
             accounting.require_clear(entry.authorization.organization_id)
+    accounting.sweep_expired()
+    assert accounting.accounting_healthy
+    assert accounting.fenced_organizations() == frozenset()
+
+
+def test_a_deliberate_refusal_is_never_classified_permanent() -> None:
+    """``AccountingRefusedError`` (another ledger owns the money for now) is replayed."""
+    assert not permanently_refused(AccountingRefusedError("owned elsewhere"))
+    assert permanently_refused(GatewayLedgerError("request authority differs"))
+    assert not permanently_refused(ValueError("not a ledger error"))

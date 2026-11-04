@@ -979,6 +979,15 @@ not partition logical request counts. Estimated cost is attribution, not a provi
 The process owns readiness from preflight through bounded drain and rejects new work once drain starts.
 It owns and bounds admitted tasks, upstream streams, disconnect cleanup, replay, continuation state,
 and final ledger settlement. Stuck cancellation cannot stop content-free terminal flusher attempts.
+A failed terminal write stays owned by the recovery sweep and fences only the admitting organization
+(503 `accounting_unavailable`, counted by `accounting_fenced_organizations`) until it lands; other
+organizations keep serving, and readiness fails only while the durable writer cannot commit. A
+deliberate `AccountingRefusedError` answers a retryable 503 `accounting_refused` and fences no one.
+A request-only terminal write the ledger refuses with a plain `GatewayLedgerError` (unknown request,
+another organization's request, or already terminal with another outcome) can never commit, so it is
+finalized uncommitted with a warning instead of being replayed on every sweep. The admission check
+is constant time per organization, and an organization's fence entry is released with its last
+retained write.
 
 ## Certification boundary
 

@@ -48,6 +48,7 @@ from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
 )
+from exp.runtime.gateway.native_accounting_recovery import settle_swept
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     InflightRequest,
@@ -1086,7 +1087,7 @@ def test_poison_recovery_item_retains_its_meter_without_stopping_later_recovery(
     assert first.pending_settlement == retained
     assert accounting.entry("healthy") is None
     with pytest.raises(NativeBridgeError):
-        accounting.require_clear(first.authorization.organization_id)
+        accounting.require_clear("first")
     accounting.sweep_expired()
     assert accounting.entry("poison") is None
     assert len(ledger.finished) == 2
@@ -1108,7 +1109,7 @@ def test_host_scheduled_recovery_keeps_failed_close_owned_until_acknowledged() -
     assert not accounting.close(timeout_seconds=0)
     assert accounting.entry(entry.authorization.request_id) is entry
     with pytest.raises(NativeBridgeError):
-        accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear("organization-one")
     accounting.sweep_expired()
     assert accounting.close(timeout_seconds=0)
     assert accounting.entry(entry.authorization.request_id) is None
@@ -4606,7 +4607,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         accounting.abandon(json.dumps({"request_id": "late-reservation"}))
         # Cancellation intent while reserve still owns the request lock is not
         # a failed ledger write and must not fence sibling admissions.
-        accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear("organization-one")
         assert not accounting.accounting_healthy
         assert accounting.entry("late-reservation") is entry
         assert not ledger.finished_requests and not ledger.finished
@@ -4621,7 +4622,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         assert not results and accounting.entry("late-reservation") is entry
         assert entry.active_attempt_id is not None and not ledger.finished
         with pytest.raises(NativeBridgeError):
-            accounting.require_clear(entry.authorization.organization_id)
+            accounting.require_clear("organization-one")
         accounting.sweep_expired()
     else:
         assert not errors and results and results[0].get("exhausted") is True
@@ -4780,7 +4781,7 @@ def test_delayed_sweep_cannot_clear_a_newer_attempts_observed_meter(
     ledger.fail_finishes = 1
     with pytest.raises(NativeBridgeError):
         accounting.settle(json.dumps(newer))
-    assert not accounting._settle_swept("request-one", entry, selected)
+    assert not settle_swept(accounting, "request-one", entry, selected)
     assert entry.pending_settlement == newer
     accounting.sweep_expired()
     assert entry.pending_settlement is None
@@ -4963,7 +4964,7 @@ def test_observed_meter_owns_abandonment_before_waiting_for_execution_gate(
         """Run competing cleanup exactly before the observed callback takes its gate."""
 
         def __enter__(self) -> None:
-            accounting.require_clear(entry.authorization.organization_id)
+            accounting.require_clear("organization-one")
             assert accounting.accounting_healthy
             cleanups.append(
                 json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
@@ -5079,7 +5080,7 @@ def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
     try:
         assert entered.wait(5)
         assert accounting.accounting_healthy
-        accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear("organization-one")
         if not request_only:
             entry.deadline_monotonic = time.monotonic() - 10
             assert json.loads(

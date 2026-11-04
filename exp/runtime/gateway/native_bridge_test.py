@@ -2376,7 +2376,7 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
 
 
 def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
-    """A lost terminal write latches readiness but stays settleable on retry."""
+    """A lost terminal write fences its organization, not readiness, and stays settleable."""
     control, raw_key = _control_plane(tmp_path)
     admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
@@ -2397,9 +2397,17 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     ):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
-        assert control.readiness("{}") == "false"
+        # One organization's retained write never takes the worker out of rotation.
+        assert control.readiness("{}") == "true"
+        with pytest.raises(NativeBridgeError) as fenced:
+            _admit(control, raw_key, _chat_body())
+        assert json.loads(fenced.value.public_error_json)["code"] == "accounting_unavailable"
     assert control.settle(settlement) == "{}"
     assert control.readiness("{}") == "true"
+    assert (
+        json.loads(control.metrics_json("{}"))["control_plane"]["accounting_fenced_organizations"]
+        == 0
+    )
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
 

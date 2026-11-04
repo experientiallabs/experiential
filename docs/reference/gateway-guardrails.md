@@ -148,7 +148,10 @@ Persist that meter atomically with the request failure, with zero customer charg
 it is provider expense evidence, not a model dispatch. Never certify such work as
 having no paid effects. The local ledger stores the meter on `gateway_requests`.
 Accounting retains failed terminal writes for its existing retry sweep and refuses
-new paid admission work on every native endpoint until the retained request writes commit.
+new paid admission work for the owning organization, on every native endpoint, until
+that organization's retained writes commit; other organizations keep serving. A
+ledger's deliberate refusal (`AccountingRefusedError`) is a retryable per-request
+error that is retained for replay but never refuses admission.
 Hosted ledgers must
 adopt this contract before enabling the coordinated release.
 
