@@ -33,7 +33,8 @@ saved actor-critic run over a mining-probe task:
    samples: the job's selector names the confirmation seed and the selection contrasts are cited as
    evidence, so every confirmation draw has a new identity and none of its samples took part in
    selection. Qualification stands only when every qualifying variant's confirmation reproduces
-   its separated, matching winner.
+   its separated, matching winner. With ``decision_variance`` registered, confirmation runs only
+   after :func:`~exp.optimize.evaluation.variance.decision_measure.measure_family` admits it.
 9. **Coverage.** The judge's coverage of each confirmed variant is recorded. When a criterion
    grader is supplied, its probabilistic grades are calibration evidence only.
 10. **Eligibility.** Every condition in :mod:`~exp.optimize.evaluation.variance.records`, including
@@ -107,6 +108,7 @@ from exp.optimize.evaluation.variance.contracts import (
 )
 from exp.optimize.evaluation.variance.contrast import FlipVerdict, family_flip
 from exp.optimize.evaluation.variance.coverage import uncovered_tools
+from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec, measure_family
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning, ExposurePlan
 from exp.optimize.evaluation.variance.family_stages import (
     FamilyVariant,
@@ -170,6 +172,8 @@ class DecisionFamilySpec(ContractModel):
         grading: Calibration criterion-grading controls; never an eligibility input.
         tiers: Tier label per actor model identity, when tiers are recorded.
         dispositions: Recorded dispositions of audit findings. They never re-key a draw.
+        decision_variance: Joint decision-variance admission (choice shift, consequence,
+            clarity); when set, a family that fails it is not confirmed. Unkeyed while None.
     """
 
     decision_author: AuthorSettings
@@ -189,6 +193,7 @@ class DecisionFamilySpec(ContractModel):
     grading: GraderSettings = GraderSettings()
     tiers: dict[str, str] = Field(default_factory=dict)
     dispositions: tuple[AuditDisposition, ...] = ()
+    decision_variance: DecisionMeasureSpec | None = None
 
     def _unkeyed(self) -> set[str]:
         """Fields left out of the draws identity: dispositions, and new fields at their defaults.
@@ -197,6 +202,7 @@ class DecisionFamilySpec(ContractModel):
         before they existed replaying under its identity.
         """
         unset = {"fresh_briefing"} if not self.fresh_briefing else set()
+        unset |= {"decision_variance"} if self.decision_variance is None else set()
         return {"dispositions", *unset, *(() if self.required_state else ("required_state",))}
 
     def draws_identity(self, report: ActorCriticReport, point: int, code_revision: str) -> str:
@@ -268,6 +274,7 @@ class FamilyReport(ContractModel):
         eligibility: Every computed eligibility condition.
         records: Training records, only when every condition holds.
         failure: Why the family stopped early, when it did.
+        decision_variance: The saved joint decision-variance measure, or why it could not run.
     """
 
     spec: DecisionFamilySpec
@@ -291,6 +298,7 @@ class FamilyReport(ContractModel):
     eligibility: TrainingEligibility
     records: TrainingRecords | None = None
     failure: str | None = None
+    decision_variance: ArtifactInput | str | None = None
 
 
 def run_decision_family(
@@ -723,7 +731,22 @@ def _continue(
     selection = family_flip(measured, scenarios.scenarios.scenarios)
     winners = {v.scenario_id for v in selection.variants if v.status == "separated_matches"}
     confirmation: FlipVerdict | None = None
-    if selection.qualifies:
+    admitted = spec.decision_variance is None
+    if spec.decision_variance is not None and selection.qualifies:
+        frozen_judges = {sid: binding.judge for sid, binding in judging.items()}
+        measured_ref, measure, why = measure_family(
+            project,
+            spec.decision_variance,
+            decision=state,
+            scenarios=scenarios.scenarios.scenarios,
+            variants=variants,
+            jobs=jobs,
+            judges=frozen_judges,
+            code_revision=code_revision,
+        )
+        admitted = measure is not None and measure.verdict.admitted
+        base = base.model_copy(update={"decision_variance": measured_ref or why})
+    if selection.qualifies and admitted:
         variants = [
             confirm_variant(
                 project,

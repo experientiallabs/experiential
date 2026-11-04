@@ -7,14 +7,28 @@ import math
 import pytest
 
 from exp.optimize.evaluation.variance.rewards import (
+    DEFAULT_SELECTOR_OBJECTIVE,
+    SELECTOR_OBJECTIVE_V2,
+    DecisionVarianceObjective,
+    OptionCounts,
+    PointDecision,
     PointOutcome,
     SelectorObjective,
+    SelectorObjectiveV2,
+    choice_shift,
     critic_score,
     decision_drops,
     decision_variance,
+    explained_variance,
     group_advantages,
+    jensen_shannon,
     judge_score,
+    normalized_entropy,
+    score_selector,
     selector_score,
+    selector_score_v2,
+    state_consequence,
+    success_difference,
 )
 
 
@@ -162,3 +176,138 @@ def test_selector_draws_of_one_run_form_one_group() -> None:
     graded = [value for value in advantages if value is not None]
     assert sum(graded) == pytest.approx(0.0)
     assert graded[0] > graded[2] > graded[1] > graded[3]
+
+
+# Decision variance: choice shift, consequence and the version 2 selector objective
+
+
+def _counts(option: str, successes: int, planned: int = 20, unknown: int = 0) -> OptionCounts:
+    """Build one forced option's judged counts."""
+    return OptionCounts(option_id=option, successes=successes, planned=planned, unknown=unknown)
+
+
+def test_jensen_shannon_and_entropy_are_bounded_and_exact_at_the_extremes() -> None:
+    """Identical distributions diverge by 0, disjoint ones by 1; entropy is normalized."""
+    assert jensen_shannon([0.5, 0.5, 0.0], [0.5, 0.5, 0.0]) == 0.0
+    assert jensen_shannon([1.0, 0.0], [0.0, 1.0]) == pytest.approx(1.0)
+    assert 0.0 < jensen_shannon([0.75, 0.25], [0.25, 0.75]) < 1.0
+    assert normalized_entropy(["a", "b"], ("a", "b", "other")) == pytest.approx(1.0)
+    assert normalized_entropy(["a", "b", "other"], ("a", "b", "other")) == 1.0
+    assert normalized_entropy(["a", "a"], ("a", "b", "other")) == 0.0
+    assert normalized_entropy([], ("a", "b")) is None
+
+
+def test_a_choice_shift_needs_a_significant_bounded_divergence_and_recomputes_exactly() -> None:
+    """Opposite choices shift; samples from one mixture do not, despite a positive plug-in value."""
+    objective = DecisionVarianceObjective(resamples=500)
+    categories = ("refund", "decline", "other")
+    shifted = choice_shift(
+        ("s1", "s2"),
+        ["refund"] * 7 + ["decline"],
+        ["decline"] * 7 + ["refund"],
+        categories,
+        objective,
+    )
+    same = choice_shift(
+        ("s1", "s2"),
+        ["refund", "decline"] * 4,
+        ["decline", "refund", "refund", "decline", "decline", "refund", "refund", "decline"],
+        categories,
+        objective,
+    )
+
+    assert shifted.holds and shifted.p_value <= 0.05 and shifted.interval[0] >= 0.1
+    assert not same.holds and same.divergence == 0.0
+    assert shifted == choice_shift(
+        ("s1", "s2"),
+        ["refund"] * 7 + ["decline"],
+        ["decline"] * 7 + ["refund"],
+        categories,
+        objective,
+    )
+    with pytest.raises(ValueError, match="both states"):
+        choice_shift(("s1", "s2"), [], ["refund"], categories, objective)
+
+
+def test_consequence_uses_conservative_bounds_and_names_a_separated_best() -> None:
+    """A clear gap holds with a separated best; unknowns shrink it; equal options never hold."""
+    objective = DecisionVarianceObjective()
+    clear = state_consequence((_counts("refund", 18), _counts("decline", 2)), objective)
+    murky = state_consequence((_counts("refund", 10), _counts("decline", 10)), objective)
+    unknowns = state_consequence(
+        (_counts("refund", 12, unknown=6), _counts("decline", 2, unknown=6)), objective
+    )
+
+    assert clear.holds and clear.better == "refund" and clear.separated_best == "refund"
+    assert clear.effect_bounds[0] > 0.4 and clear.effect == pytest.approx(0.8)
+    assert not murky.holds and murky.separated_best is None
+    assert unknowns.effect == pytest.approx(0.2) and not unknowns.holds
+    assert success_difference(_counts("a", 20), _counts("b", 0))[1] > 0.6
+    with pytest.raises(ValueError, match="two forced options"):
+        state_consequence((_counts("refund", 18),), objective)
+    with pytest.raises(ValueError, match="exceed"):
+        _counts("refund", 18, unknown=5)
+
+
+def _decision(point: str, choices: str, rewards: str) -> PointDecision:
+    """Build a point's classified choices ('r', 'd', 'u') and judged labels ('1', '0', '-')."""
+    names = {"r": "refund", "d": "decline", "u": "unclear"}
+    labels = {"1": 1.0, "0": 0.0, "-": None}
+    return PointDecision(
+        point_id=point,
+        choices=tuple(names[c] for c in choices),
+        rewards=tuple(labels[r] for r in rewards),
+    )
+
+
+def test_selector_v2_rewards_choices_that_change_success_not_coin_flips() -> None:
+    """A coin flip scores 1 under version 1 but 0 under version 2 unless the choice explains it."""
+    objective = SelectorObjectiveV2(minimum_scored=4)
+    decisive = _decision("decisive", "rrrrdddd", "11110000")
+    coin_flip = _decision("coin_flip", "rrrrdddd", "10101010")
+    split_no_effect = _decision("split_no_effect", "rrrrdddd", "11111111")
+    agreeing = _decision("agreeing", "rrrrrrrr", "10101010")
+
+    assert explained_variance(decisive, objective) == pytest.approx(1.0 - 4 * 0.25 / 8)
+    assert explained_variance(coin_flip, objective) == 0.0
+    assert explained_variance(split_no_effect, objective) == 0.0
+    assert explained_variance(agreeing, objective) == 0.0
+    assert explained_variance(_decision("thin", "rrdd", "1--0"), objective) is None
+    assert explained_variance(_decision("unclear", "rruuuudd", "11000000"), objective) is None
+    assert decision_variance(_point("coin_flip", 0, 4, 4), 4) == 1.0
+
+    outcomes = {
+        name: _point(name, i, 4, 4)
+        for i, name in enumerate(("decisive", "coin_flip", "family", "silent"))
+    }
+    decisions = {
+        "decisive": decisive,
+        "coin_flip": coin_flip,
+        "family": _decision("family", "", "").model_copy(update={"joint_score": 0.6}),
+    }
+    score = selector_score_v2(
+        ["decisive", "coin_flip", "family", "silent", "gone", "decisive"],
+        outcomes,
+        decisions,
+        objective,
+    )
+    assert score.objective == SELECTOR_OBJECTIVE_V2 and score.unscored == ("silent",)
+    assert score.variances["coin_flip"] == 0.0 and score.variances["family"] == 0.6
+    assert score.unusable == ("gone",) and score.duplicates == 1
+    assert score.reward == pytest.approx((0.875 + 0.0 + 0.6) / 3 - 0.5 / 6)
+    assert DEFAULT_SELECTOR_OBJECTIVE.version == SELECTOR_OBJECTIVE_V2
+
+
+def test_both_objective_versions_stay_scorable_by_version() -> None:
+    """Version 1 keeps scoring outcome variance; version 2 reads classified choices."""
+    outcomes = {"p": _point("p", 0, 4, 4)}
+    decisions = {"p": _decision("p", "rrrrdddd", "10101010")}
+
+    old = score_selector(["p"], outcomes, SelectorObjective())
+    new = score_selector(["p"], outcomes, SelectorObjectiveV2(), decisions)
+
+    assert old.objective == "selector-decision-variance-v1" and old.reward == 1.0
+    assert new.objective == SELECTOR_OBJECTIVE_V2 and new.reward == 0.0
+    assert score_selector(["p"], outcomes, SelectorObjectiveV2()).status == "unscored"
+    with pytest.raises(ValueError, match="align"):
+        PointDecision(point_id="p", choices=("refund",), rewards=())
