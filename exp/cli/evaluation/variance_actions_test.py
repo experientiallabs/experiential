@@ -48,6 +48,7 @@ from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
 from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as VARIANCE_REPORT_TYPE
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
+from exp.optimize.evaluation.variance.decision_measure_test import FORCED
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceBudget, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import (
@@ -56,13 +57,17 @@ from exp.optimize.evaluation.variance.judge_prompt import (
     judge_profile,
 )
 from exp.optimize.evaluation.variance.point_options import PointOptionsSpec
+from exp.optimize.evaluation.variance.point_options_test import _proposal
+from exp.optimize.evaluation.variance.rewards import SelectorObjectiveV2
 from exp.optimize.evaluation.variance.schedule import (
     RevisionRegistration,
     TrainingScheduleSpec,
     TransitionRule,
+    next_rollout_plan,
     schedule_state,
 )
-from exp.runtime.models.spend_ceiling import operation_spend_scope
+from exp.runtime.models.providers.transport import ScriptedJsonTransport
+from exp.runtime.models.spend_ceiling import current_spend_ceiling, operation_spend_scope
 
 _TRACES = ("alpha", "beta")
 
@@ -595,3 +600,59 @@ def test_variance_schedule_executes_role_and_actor_rollouts_and_registers_revisi
     assert schedule_state(project, spec).epoch == 0
     handle_variance_schedule(context, register)
     assert schedule_state(project, spec).epoch == 1
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_saved_schedule_report_requires_consent_for_pending_point_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved: bool
+) -> None:
+    """Resuming after role evidence saved still governs unsaved option completion calls."""
+    project, base = schedule_fixture._schedule(tmp_path, monkeypatch)
+    spec = base.model_copy(
+        update={
+            "objective": SelectorObjectiveV2(),
+            "point_options": PointOptionsSpec(
+                proposer=base.base.judges[0],
+                classifier=base.base.critics[0],
+                profile=FORCED,
+                stances=("action_clustering",),
+            ),
+        }
+    )
+    pending = next_rollout_plan(project, spec, code_revision="test")
+    schedule_fixture._run_roles(project, monkeypatch, pending)
+    path = _write(tmp_path / "schedule.json", spec)
+    exposure = _write(
+        tmp_path / "exposure.json",
+        critic_fixture._exposure(project, pending.actor_job, "mining_probes"),
+    )
+    wire = ScriptedJsonTransport(
+        tuple(_proposal({"decision": "Choose a row", "options": []}) for _ in range(4))
+    )
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: wire
+    )
+    consent: list[bool] = []
+
+    def confirm(*args: object, **kwargs: object) -> bool:
+        """Return the explicit invocation decision and count consent requests."""
+        consent.append(approved)
+        return approved
+
+    monkeypatch.setattr("exp.cli.evaluation.continuation_context.require_spend_consent", confirm)
+    context, _ = _schedule_context(tmp_path, yes=False)
+    with operation_spend_scope():
+        assert current_spend_ceiling() is None
+        handle_variance_schedule(
+            context,
+            VarianceScheduleAction(
+                operation="plan",
+                spec=path,
+                execute=True,
+                exposure=exposure,
+            ),
+        )
+        assert consent == [approved]
+        assert (current_spend_ceiling() is not None) == approved
+    assert bool(wire.requests) == approved
+    assert len(schedule_state(project, spec).completed) == int(approved)

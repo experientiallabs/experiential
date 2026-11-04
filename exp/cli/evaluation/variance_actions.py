@@ -356,20 +356,24 @@ def handle_variance_schedule(context: ContinuationContext, action: VarianceSched
     exposure.require_lineage(start.task.lineage_group_id, "mining_probes")
     if plan.spec is not None:
         saved = store.artifacts.exists(plan.spec.identity(revision) + "-result")
+        completion_costs = point_option_costs(store, spec, plan.spec)
         components = (
-            *actor_critic_costs(store, plan.spec),
-            *point_option_costs(store, spec, plan.spec),
+            *(() if saved else actor_critic_costs(store, plan.spec)),
+            *completion_costs,
         )
+        needs_consent = not saved or bool(completion_costs)
     else:
         saved = saved_actor_rollout(store, plan, code_revision=revision) is not None
         components = actor_rollout_costs(store, plan)
+        needs_consent = not saved
     if not saved:
         preflight_continuation_job(store, plan.actor_job)
+    if needs_consent:
         review_components(console, components)
     if context.dry_run:
         console.print("Dry run: plan, exposure and group job validated; no provider calls.")
         return
-    if not saved and not _consent(context, "variance-schedule", plan, components):
+    if needs_consent and not _consent(context, "variance-schedule", plan, components):
         return
     if plan.spec is not None:
         run_actor_critic(store, plan.spec, exposure=exposure, code_revision=revision)
