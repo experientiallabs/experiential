@@ -1151,8 +1151,8 @@ def test_empty_final_assistant_prefill_is_dropped_with_disclosure(
     """An empty final assistant turn is Anthropic's no-prefill, not a 400.
 
     Anthropic refuses empty content on every turn "except for the optional
-    final assistant message"; the Anthropic Python SDK 2.4.0 sends exactly
-    that turn (production, 2026-11-03). Both decoders drop it and disclose.
+    final assistant message", and Anthropic SDK clients send exactly that
+    turn. Both decoders drop it and disclose.
     """
     decoded = decode(
         _body(

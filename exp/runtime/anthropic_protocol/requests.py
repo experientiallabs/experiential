@@ -37,16 +37,13 @@ from exp.common.models.content import (
     TextContentPart,
 )
 from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol import passthrough_fields
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
     gateway_reasoning_block,
     merge_exposed_reasoning,
 )
-from exp.runtime.anthropic_protocol.manifest import (
-    MESSAGES_BETA_TOKENS_FIELD_BOUND,
-    MESSAGES_BETA_TOKENS_FORWARDED,
-    MESSAGES_MANIFEST,
-)
+from exp.runtime.anthropic_protocol.manifest import MESSAGES_MANIFEST
 from exp.runtime.anthropic_protocol.media_blocks import (
     AnthropicWireModel,
     CacheControl,
@@ -417,7 +414,7 @@ def _decode(
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
-    forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
+    forwarded_betas, dropped_beta_disclosures = passthrough_fields.beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
     if system_text:
@@ -496,9 +493,9 @@ def _decode(
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
             provider_thinking_config=channels.thinking_config,
-            context_management=_context_management(payload),
-            diagnostics=_diagnostics(payload),
-            safeguards=_safeguards(payload),
+            context_management=passthrough_fields.context_management(payload),
+            diagnostics=passthrough_fields.diagnostics(payload),
+            safeguards=passthrough_fields.safeguards(payload),
             speed=request.speed,
             # Raw payload value, mirroring thinking: the provider receives the
             # caller's cache marker byte-for-byte on Anthropic rungs.
@@ -528,101 +525,6 @@ def _decode(
     except ValidationError as exc:
         raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _context_management(payload: JsonObject) -> JsonObject | None:
-    """Validate the caller's context-editing config as an object, verbatim.
-
-    The nested shape is an evolving Anthropic beta the gateway forwards
-    byte-for-byte (with the required beta header), so validation is
-    deliberately shallow: a closed model here would recreate the
-    reject-what-real-clients-send incident class.
-
-    Raises:
-        OpenAIProtocolError: The field is present but not a JSON object.
-    """
-    value = payload.get("context_management")
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise invalid_field("context_management", "context_management must be a JSON object.")
-    return cast(JsonObject, value)
-
-
-def _diagnostics(payload: JsonObject) -> JsonObject | None:
-    """Validate the caller's diagnostics correlation as an object, verbatim.
-
-    Like ``context_management``, the nested shape is an evolving Anthropic
-    beta the gateway forwards byte-for-byte (with the required beta
-    header), so validation is deliberately shallow.
-
-    Raises:
-        OpenAIProtocolError: The field is present but not a JSON object.
-    """
-    value = payload.get("diagnostics")
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise invalid_field("diagnostics", "diagnostics must be a JSON object.")
-    return cast(JsonObject, value)
-
-
-def _safeguards(payload: JsonObject) -> tuple[JsonObject, ...] | None:
-    """Validate Claude Code's auto-mode safeguards as an array of objects.
-
-    Each entry is an evolving provider object forwarded byte-for-byte on
-    Anthropic rungs, so validation stays shallow.
-
-    Raises:
-        OpenAIProtocolError: The field is present but not an array of objects.
-    """
-    value = payload.get("safeguards")
-    if value is None:
-        return None
-    if not isinstance(value, list) or not all(isinstance(entry, dict) for entry in value):
-        raise invalid_field("safeguards", "safeguards must be an array of JSON objects.")
-    return tuple(cast(JsonObject, entry) for entry in value)
-
-
-def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Partition a caller ``anthropic-beta`` header into forward and drop sets.
-
-    Forwarding is an exact allowlist (:data:`MESSAGES_BETA_TOKENS_FORWARDED`):
-    a caller header is operator-trust surface and is never blind-forwarded.
-    Dropped tokens are disclosed per token, never rejected, because the
-    provider itself tolerates unknown beta tokens. Field-bound tokens
-    (:data:`MESSAGES_BETA_TOKENS_FIELD_BOUND`) land in neither set: the
-    gateway injects them itself beside their field.
-
-    Args:
-        header: Raw comma-separated header value, or ``None``.
-
-    Returns:
-        ``(forwarded_tokens, dropped_disclosures)`` in caller order, deduped.
-
-    Raises:
-        OpenAIProtocolError: The header carries a non-display-safe value.
-    """
-    if header is None:
-        return (), ()
-    if len(header) > 4_096 or any(ord(char) < 32 for char in header):
-        raise invalid_field("anthropic-beta", "anthropic-beta must be a display-safe header value.")
-    forwarded: list[str] = []
-    dropped: list[str] = []
-    for raw_token in header.split(","):
-        token = raw_token.strip()
-        if not token:
-            continue
-        if token in MESSAGES_BETA_TOKENS_FIELD_BOUND:
-            continue
-        if token in MESSAGES_BETA_TOKENS_FORWARDED:
-            if token not in forwarded:
-                forwarded.append(token)
-        else:
-            disclosure = f"anthropic-beta.{token}"
-            if disclosure not in dropped:
-                dropped.append(disclosure)
-    return tuple(forwarded), tuple(dropped)
 
 
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:
