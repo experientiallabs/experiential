@@ -356,10 +356,19 @@ def _reserved_candidate(
             return None
         if not eligible:
             return None
+        by_id = {candidate.representative_trace_id: candidate for candidate in candidates}
+        members: dict[int, list[str]] = defaultdict(list)
+        for candidate in candidates:
+            members[clusters[candidate.representative_trace_id]].append(
+                candidate.representative_trace_id
+            )
+        medoids = tuple(
+            by_id[_medoid(members[cluster_id], by_id)] for cluster_id in set(clusters.values())
+        )
         return min(
             eligible,
             key=lambda candidate: (
-                _boundary_gap(candidate, candidates, clusters),
+                _boundary_gap(candidate, medoids),
                 candidate.representative_trace_id,
             ),
         ).representative_trace_id
@@ -388,24 +397,11 @@ def _long_span_threshold(candidates: Sequence[DeduplicatedTrace]) -> int | None:
 
 def _boundary_gap(
     candidate: DeduplicatedTrace,
-    candidates: Sequence[DeduplicatedTrace],
-    clusters: dict[str, int],
+    medoids: Sequence[DeduplicatedTrace],
 ) -> float:
-    """Measure closeness to the two nearest cluster medoids as a boundary proxy."""
-    by_id = {item.representative_trace_id: item for item in candidates}
-    medoids = {
-        cluster_id: _medoid(
-            [
-                item.representative_trace_id
-                for item in candidates
-                if clusters[item.representative_trace_id] == cluster_id
-            ],
-            by_id,
-        )
-        for cluster_id in set(clusters.values())
-    }
+    """Measure closeness to the two nearest precomputed cluster medoids."""
     similarities = sorted(
-        (_cosine(candidate.vector, by_id[medoid_id].vector) for medoid_id in medoids.values()),
+        (_cosine(candidate.vector, medoid.vector) for medoid in medoids),
         reverse=True,
     )
     return similarities[0] - similarities[1]
