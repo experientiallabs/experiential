@@ -302,12 +302,13 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v2",
+        "variance-authors-v3",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
+            "exp.optimize.evaluation.variance.coalition",
         ),
-        "985bab5784972ad4c56b4ec1ca9374f894e6b6475febc53156f4e10f63e937c3",
+        "b670e4a7e6d0e007b8880d6dbdb005389be904e98d8f3b109d213db442d79a27",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.grader:GRADER_PROTOCOL",
@@ -341,9 +342,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authoring_packet:AUTHORING_PACKET_PROTOCOL",
-        "authoring-packet-v1",
-        ("exp.optimize.evaluation.variance.authoring_packet",),
-        "b06ff0a6864fa60bbc6d73ac509494b71ce535948406d9610e09dc483ade6ba2",
+        "authoring-packet-v2",
+        (
+            "exp.optimize.evaluation.variance.authoring_packet",
+            "exp.optimize.evaluation.variance.coalition",
+        ),
+        "eae16e2f9432498ef0a56a0ff232a440041fc2ab4ddd3fb151d1b85a095f22f2",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_author:WORLD_AUTHOR_PROTOCOL",
@@ -353,9 +357,21 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rubric_author:RUBRIC_AUTHOR_PROTOCOL",
-        "rubric-author-v1",
+        "rubric-author-v2",
         ("exp.optimize.evaluation.variance.rubric_author",),
-        "2b196177c3d9d5e998a23358792d04b8906a7b8c6f6e90aa33ba01936f107735",
+        "a592633d1f43cbd379499fdb8641d65851bbcb8798a88316094a847d7f727489",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.rubric_agent:RUBRIC_AGENT_PROTOCOL",
+        "rubric-agent-v1",
+        ("exp.optimize.evaluation.variance.rubric_agent",),
+        "74f46a10ba019058436882c1cfb2c32c134347581f1973866d640484d82f304c",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.rubric_revision:RUBRIC_REVISION_PROTOCOL",
+        "rubric-revision-v1",
+        ("exp.optimize.evaluation.variance.rubric_revision",),
+        "9c20d1f6f128859f14593d9d40888a989cc8ea0566cfc8f9b4bb72fd83723945",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_freeze:WORLD_FREEZE_PROTOCOL",
@@ -374,24 +390,6 @@ PROTOCOLS = (
         "crosstalk-probe-v1",
         ("exp.optimize.evaluation.variance.crosstalk",),
         "a1ec0982a884e5651380fd2007490706b2893db884da8bdfe4df3f0aca243503",
-    ),
-    Protocol(
-        "exp.optimize.evaluation.variance.rewards:SELECTOR_OBJECTIVE",
-        "selector-decision-variance-v1",
-        (
-            "exp.optimize.evaluation.variance.rewards:SelectorObjective",
-            "exp.optimize.evaluation.variance.rewards:SelectorScore",
-            "exp.optimize.evaluation.variance.rewards:decision_variance",
-            "exp.optimize.evaluation.variance.rewards:selector_score",
-            "exp.optimize.evaluation.variance.records:selector_records",
-        ),
-        "24d4ef40e1f85b274af268a0816d3e249be7bc7e1a34fea40b4c01f7f8063903",
-    ),
-    Protocol(
-        "exp.optimize.evaluation.variance.schedule:SCHEDULE_PROTOCOL",
-        "variance-schedule-v1",
-        ("exp.optimize.evaluation.variance.schedule",),
-        "0fc1f8f881d0af8ce0d5986c5f5714a85c880a01b740516d959f5066ac7b5533",
     ),
 )
 

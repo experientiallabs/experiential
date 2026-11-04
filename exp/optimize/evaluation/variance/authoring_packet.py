@@ -14,6 +14,11 @@ An :class:`AuthoringPacket` binds, for one decision family:
 - the **decision brief**, marked as a proposal: the alternatives, axes and correct options the
   decision and scenario authors proposed. It is never authority; every claim derived from it is
   a ``hypothesis`` and keeps that status;
+- the **behavioral coalition** (:class:`~exp.optimize.evaluation.variance.coalition.
+  CoalitionEvidence`): every grouped attempt of every tier with its judged label, distinct
+  mistakes, recoveries and valid alternatives, selector rationales, critic estimates beside
+  judged rates, judged contrast outcomes per option and optional TraceML step labels, each row
+  with its source locator and evidence status and none from final evaluation;
 - the **evidence contract** of the episode judge: which events the harness and the world must
   record so a rubric criterion can be observed.
 
@@ -45,6 +50,7 @@ from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolCho
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
+from exp.optimize.evaluation.variance.coalition import CoalitionEvidence
 from exp.optimize.evaluation.variance.contracts import (
     DecisionOption,
     DecisionState,
@@ -63,7 +69,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.induction.contracts import InductionEpisode
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook, ToolContract
 
-AUTHORING_PACKET_PROTOCOL = "authoring-packet-v1"
+AUTHORING_PACKET_PROTOCOL = "authoring-packet-v2"
 """Version of the packet contract; change it whenever what authors are shown changes."""
 
 PACKET_TYPE = "authoring-packet"
@@ -270,6 +276,7 @@ class AuthoringPacket(ContractModel):
         observed_episodes: Source-derived replay episodes induced programs are validated on.
         variants: The exact task variants.
         brief: The decision brief, a proposal.
+        coalition: Every attempt, tier, pattern, selector, critic and contrast behind the family.
         evidence: The judge's evidence contract.
     """
 
@@ -289,6 +296,7 @@ class AuthoringPacket(ContractModel):
     observed_episodes: tuple[InductionEpisode, ...] = ()
     variants: tuple[PacketVariant, ...] = Field(min_length=1)
     brief: DecisionBrief
+    coalition: CoalitionEvidence = Field(default_factory=CoalitionEvidence)
     evidence: EvidenceContract = Field(default_factory=EvidenceContract)
 
     @model_validator(mode="after")
@@ -326,6 +334,7 @@ class AuthoringPacket(ContractModel):
                 *(f"claim:{claim.claim_id}" for claim in self.claims),
                 *(f"variant:{variant.variant_id}" for variant in self.variants),
                 *(f"tool:{tool.name}" for tool in self.task.tools),
+                *self.coalition.locators(),
             }
         )
 
@@ -428,8 +437,9 @@ def build_authoring_packet(
     observed_episodes: tuple[InductionEpisode, ...] = (),
     extra_claims: tuple[PacketClaim, ...] = (),
     unresolved: tuple[str, ...] = (),
+    coalition: CoalitionEvidence | None = None,
 ) -> AuthoringPacket:
-    """Assemble the packet from original sources, the rule book and the proposed brief.
+    """Assemble the packet from original sources, the coalition, the rule book and the brief.
 
     Args:
         family_id: Stable family identity.
@@ -447,14 +457,15 @@ def build_authoring_packet(
         observed_episodes: Source-derived replay episodes for program validation.
         extra_claims: Further source claims, with their own evidence status.
         unresolved: Interpretations the brief left open.
+        coalition: The behavioral coalition from error mining and contrasts.
 
     Returns:
         The packet. A baseline variant is added when no scenario keeps the checkpoint state and
         instruction, so the unedited task stays comparable.
 
     Raises:
-        ValueError: A trace belongs to final evaluation, a scenario edits an absent path, or two
-            variants have the same complete task identity.
+        ValueError: A source trace or coalition row belongs to final evaluation, a scenario
+            edits an absent path, or two variants have the same complete task identity.
     """
     final = sorted(
         source.trace_id
@@ -466,6 +477,8 @@ def build_authoring_packet(
             f"{len(final)} sources are reserved for final evaluation, for example {final[0]}; "
             "authors may read only world-learning and mining sources"
         )
+    coalition = coalition or CoalitionEvidence()
+    coalition.check_exposure(exposure)
     names = {tool.name for tool in task.tools}
     rules = tuple(rule for rule in book.rules if rule.tool is None or rule.tool in names)
     questions = tuple(item for item in book.questions if item.tool is None or item.tool in names)
@@ -520,6 +533,7 @@ def build_authoring_packet(
             rationales={s.scenario_id: s.rationale for s in scenarios},
             unresolved=unresolved,
         ),
+        coalition=coalition,
     )
 
 
@@ -545,6 +559,7 @@ def save_packet(
         return reference
     inputs = {packet.checkpoint, packet.rule_book}
     inputs |= {source.artifact for source in packet.sources if source.artifact is not None}
+    inputs |= set(packet.coalition.references)
     manifest = store.write_json(
         artifact_id=artifact_id,
         artifact_type=PACKET_TYPE,

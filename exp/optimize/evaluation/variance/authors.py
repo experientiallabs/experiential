@@ -12,8 +12,8 @@ why.
   axis, which permitted tools reveal it and which rules or observed values ground its permitted
   values. The answer is refused when it cites a locator it was not given, points at state that is
   absent, varies a path outside the decision-relevant paths, leaves an axis ungrounded or
-  undiscoverable, declares an instruction axis without permission, or declares one whose
-  original value is not the task's instruction.
+  undiscoverable, declares an instruction axis without permission, declares one whose original
+  value is not the task's instruction, or names a tier or actor model in a criterion.
 - The **scenario author** reads that decision state, the same before-state and the actor's
   :class:`~exp.optimize.evaluation.variance.contracts.ScenarioLimits`, and returns a
   :class:`~exp.optimize.evaluation.variance.contracts.ScenarioSet`, choosing per scenario a
@@ -46,6 +46,7 @@ from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolCho
 from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
+from exp.optimize.evaluation.variance.coalition import CoalitionEvidence
 from exp.optimize.evaluation.variance.contracts import (
     ActorView,
     DecisionState,
@@ -61,7 +62,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
 
-AUTHORS_PROTOCOL = "variance-authors-v2"
+AUTHORS_PROTOCOL = "variance-authors-v3"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"
@@ -75,7 +76,17 @@ DECISION_STATE_PROMPT = (
 one estimation point a judge chose in an actor's attempt (the decision made there, alternatives,
 and the state the judge thinks decides it), the public conversation the actor had seen by then,
 the world state just before that step, the learned environment rules and open questions that
-bear on it, and the tools the actor may call. The agent under test never sees any of this.
+bear on it, the tools the actor may call, and the behavioral coalition: every grouped attempt of
+every tier with its operational outcome and judged label, distinct mistake patterns, recoveries
+and valid alternative solutions, every selector's chosen points and rationale, every critic
+estimate beside the judged rate, and judged outcomes per competing option. Each coalition row
+keeps its evidence status: historical labels came from an earlier judge, and patterns, selector
+rationales, critic estimates and step labels are hypotheses, not established facts. The agent
+under test never sees any of this.
+
+Use the coalition to find a decision on which actors genuinely diverge and to keep every valid
+alternative solution and recovery valid; one failed attempt or one success never defines the
+right option. Tier labels and model names say who behaved how; never put them in a criterion.
 
 Return a decision state that a scenario author will vary. Requirements, all of them mandatory:
 - Options are concrete executable actions that can be run as competing branches from the same
@@ -197,6 +208,7 @@ class DecisionContext(ContractModel):
         instruction_variation: Whether scenarios may replace the task instruction.
         task_instruction: The public task instruction, which an instruction axis's original
             value must repeat exactly; None when it is not supplied.
+        coalition: The behavioral coalition from error mining and contrasts.
     """
 
     point: EstimationPoint
@@ -208,6 +220,7 @@ class DecisionContext(ContractModel):
     tools: tuple[ToolSchema, ...] = Field(min_length=1)
     instruction_variation: bool = False
     task_instruction: str | None = None
+    coalition: CoalitionEvidence = Field(default_factory=CoalitionEvidence)
 
     def refs(self) -> frozenset[str]:
         """Return every fixed locator an answer may cite, excluding ``state:`` pointers."""
@@ -218,6 +231,7 @@ class DecisionContext(ContractModel):
                 *(f"rule:{rule.rule_id}" for rule in self.rules),
                 *(f"question:{index}" for index in range(len(self.questions))),
                 *(f"tool:{tool.name}" for tool in self.tools),
+                *self.coalition.locators(),
             }
         )
 
@@ -347,6 +361,7 @@ def decision_state_request(context: DecisionContext, *, output_tokens: int) -> M
         "tools": [tool.model_dump(mode="json") for tool in context.tools],
         "instruction_variation_allowed": context.instruction_variation,
         "task_instruction": context.task_instruction,
+        "coalition": context.coalition.model_dump(mode="json"),
         "citable_locators": sorted(context.refs()),
     }
     return _request(
@@ -372,7 +387,8 @@ def validate_decision_state(arguments: object, context: DecisionContext) -> Deci
         ValueError: The answer is malformed, describes another step, cites an unsupplied locator
             or absent state, varies a path outside the relevant paths, leaves an axis ungrounded
             or undiscoverable, excludes the observed value of an axis, declares an instruction axis
-            without permission, or declares one whose original is not the task's instruction.
+            without permission, declares one whose original is not the task's instruction, or
+            names a tier or actor model in a criterion.
     """
     answer = DecisionStateAnswer.model_validate(arguments)
     state, before = answer.state, context.before
@@ -391,6 +407,9 @@ def validate_decision_state(arguments: object, context: DecisionContext) -> Deci
         *(ref for grounding in answer.grounding for ref in grounding.refs),
     )
     _check_refs(cited, context)
+    named = context.coalition.mentions([row.text for row in state.criteria])
+    if named:
+        raise ValueError(f"criteria name tiers or actor models {named}; judge behavior, not actors")
     absent = sorted(
         path for path in (*state.relevant_paths, *state.invariants) if not _exists(before, path)
     )

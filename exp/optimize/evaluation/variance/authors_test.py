@@ -21,6 +21,7 @@ from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates_test import _reply
+from exp.optimize.evaluation.variance.authoring_packet_test import ticket_coalition
 from exp.optimize.evaluation.variance.authors import (
     DECISION_STATE_TOOL,
     SCENARIO_TOOL,
@@ -397,3 +398,25 @@ def test_a_scenario_without_a_witness_is_a_failed_draw(
 
     assert not draft.accepted and draft.scenarios is None
     assert draft.failure is not None and "witness" in draft.failure
+
+
+def test_the_decision_state_author_reads_the_coalition_and_never_names_actors() -> None:
+    """Coalition rows are shown and citable; a criterion naming a tier or model is refused."""
+    coalition = ticket_coalition()
+    context = _context(ArtifactInput(artifact_id="c", sha256="0" * 64)).model_copy(
+        update={"coalition": coalition}
+    )
+    request = decision_state_request(context, output_tokens=512)
+    system, user = str(request.messages[0].content), json.loads(str(request.messages[1].content))
+
+    assert user["coalition"]["patterns"][1]["kind"] == "valid_alternative"
+    assert "attempt:kimi.g0" in user["citable_locators"]
+    assert "pattern:close-high" in context.refs()
+    assert "never put them in a criterion" in system and "historical labels" in system
+    cited = _state(evidence_refs=["point", "pattern:close-high", "attempt:glm-flash.g0"])
+    assert validate_decision_state(_answer(cited), context).state.evidence_refs[1] == (
+        "pattern:close-high"
+    )
+    named = _state(criteria=[{"criterion_id": "decision.correct", "text": "Did kimi refund?"}])
+    with pytest.raises(ValueError, match=r"tiers or actor models \('kimi',\)"):
+        validate_decision_state(_answer(named), context)

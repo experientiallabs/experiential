@@ -26,10 +26,21 @@ from exp.optimize.evaluation.rules.stage import RULE_BOOK_TYPE, rulebook_files
 from exp.optimize.evaluation.variance.authoring_packet import (
     AuthoringPacket,
     SourceRef,
+    author_request,
     build_authoring_packet,
     load_packet,
     save_packet,
     variant_task_sha256,
+)
+from exp.optimize.evaluation.variance.coalition import (
+    BehaviorPattern,
+    CoalitionAttempt,
+    CoalitionEvidence,
+    ContrastOutcome,
+    CriticComparison,
+    SelectorChoice,
+    StepLabel,
+    TierBehavior,
 )
 from exp.optimize.evaluation.variance.contracts import (
     FreshBriefing,
@@ -96,13 +107,15 @@ def plan() -> ExposurePlan:
 
 
 def save_book(project: ProjectStore) -> tuple[ArtifactInput, RuleBook]:
-    """Save the ticket rule book and return its reference and content."""
+    """Save the ticket rule book, or adopt the saved one, and return its reference and content."""
     book = RuleBook(
         contracts={tool.name: ToolContract(name=tool.name) for tool in TOOLS},
         rules=(RULE, LOCK_RULE),
         questions=(QUESTION,),
         sources=("trace-1",),
     )
+    if project.artifacts.exists("ticket-authoring-rule-book"):
+        return artifact_input(project.artifacts.read("ticket-authoring-rule-book").manifest), book
     manifest = project.artifacts.write(
         artifact_id="ticket-authoring-rule-book",
         artifact_type=RULE_BOOK_TYPE,
@@ -138,14 +151,111 @@ def observed_episode() -> InductionEpisode:
     )
 
 
+def ticket_coalition(*, lineage: str = "tickets", trace: str | None = None) -> CoalitionEvidence:
+    """Two council tiers' attempts at the ticket task, with patterns, roles and contrasts.
+
+    Args:
+        lineage: Lineage of every attempt.
+        trace: Trace a step label names, when one should.
+    """
+    judge = "4" * 64
+
+    def attempt(attempt_id: str, label: str) -> CoalitionAttempt:
+        tier = attempt_id.split(".", 1)[0]
+        return CoalitionAttempt.model_validate(
+            {
+                "attempt_id": attempt_id,
+                "tier": tier,
+                "lineage": lineage,
+                "outcome": "completed",
+                "label": label,
+                "label_status": "judged",
+                "judge": judge,
+                "steps": 3,
+                "source": f"group-{tier}#branch-{attempt_id[-1]}",
+            }
+        )
+
+    return CoalitionEvidence(
+        attempts=(
+            attempt("glm-flash.g0", "fail"),
+            attempt("glm-flash.g1", "pass"),
+            attempt("kimi.g0", "pass"),
+        ),
+        patterns=(
+            BehaviorPattern(
+                pattern_id="close-high",
+                kind="mistake",
+                description="Closed a high tier ticket without reading its tier.",
+                attempts=("glm-flash.g0",),
+            ),
+            BehaviorPattern(
+                pattern_id="read-then-escalate",
+                kind="valid_alternative",
+                description="Read the ticket, then escalated it.",
+                attempts=("glm-flash.g1", "kimi.g0"),
+            ),
+        ),
+        tiers=(
+            TierBehavior(
+                tier="glm-flash",
+                model="exp/glm-5.3-flash",
+                attempts=2,
+                passed=1,
+                failed=1,
+                unscored=0,
+            ),
+            TierBehavior(
+                tier="kimi", model="exp/kimi-k3", attempts=1, passed=1, failed=0, unscored=0
+            ),
+        ),
+        selections=(
+            SelectorChoice(
+                tier="glm-flash", draw=0, step=0, decision="Close", rationale="Attempts diverge."
+            ),
+        ),
+        critics=(
+            CriticComparison(
+                tier="glm-flash",
+                draw=0,
+                step=0,
+                estimate=0.4,
+                successes=1,
+                failures=1,
+                unknown=0,
+                judge=judge,
+            ),
+        ),
+        contrasts=(
+            ContrastOutcome(
+                contrast_id="contrast-1",
+                arm="alternative",
+                option="escalate",
+                passed=2,
+                failed=0,
+                unscored=0,
+                judge=judge,
+            ),
+        ),
+        step_labels=(
+            StepLabel(attempt_id="glm-flash.g0", step=1, label="pivot"),
+            *(() if trace is None else (StepLabel(trace_id=trace, step=0, label="read"),)),
+        ),
+    )
+
+
 def ticket_packet(
-    fixture: GroundedFixture, *, scenarios: tuple[Scenario, ...] | None = None
+    fixture: GroundedFixture,
+    *,
+    scenarios: tuple[Scenario, ...] | None = None,
+    coalition: CoalitionEvidence | None = None,
 ) -> tuple[AuthoringPacket, ArtifactInput]:
     """Build and save the ticket family's packet over the grounded fixture's start checkpoint.
 
     Args:
         fixture: The grounded ticket fixture.
         scenarios: Scenarios to use instead of the urgent and routine tiers.
+        coalition: The behavioral coalition to carry, if any.
 
     Returns:
         The packet and its saved reference.
@@ -175,6 +285,7 @@ def ticket_packet(
         decision=tier_decision(0),
         scenarios=scenarios or (tier_scenario("urgent", "high"), tier_scenario("routine", "low")),
         observed_episodes=(observed_episode(),),
+        coalition=coalition,
     )
     return packet, save_packet(project, packet, code_revision="test")
 
@@ -343,4 +454,54 @@ def test_an_instruction_only_variant_is_a_distinct_task_with_the_same_state(
             book=book,
             decision=tier_decision(0),
             scenarios=(explain,),
+        )
+
+
+def test_the_packet_carries_the_coalition_and_refuses_held_out_behavior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every attempt, tier and finding reaches the authors with its status; none held out."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    packet, reference = ticket_packet(fixture, coalition=ticket_coalition(trace="trace-1"))
+
+    assert load_packet(fixture.project, reference) == packet
+    assert {row.attempt_id: row.label for row in packet.coalition.attempts} == {
+        "glm-flash.g0": "fail",
+        "glm-flash.g1": "pass",
+        "kimi.g0": "pass",
+    }
+    assert {
+        "attempt:kimi.g0",
+        "pattern:close-high",
+        "tier:kimi",
+        "selection:glm-flash.0.0",
+        "critic:glm-flash.0.0",
+        "contrast:contrast-1.alternative",
+        "steplabel:1",
+    } <= packet.locators()
+    assert {row.status for row in packet.coalition.patterns} == {"hypothesis"}
+    assert packet.coalition.critics[0].judged_rate == 0.5
+    assert packet.coalition.mentions(["The kimi-k3 actor closed it.", "glm-flash did."]) == (
+        "glm-flash",
+        "kimi-k3",
+    )
+    assert packet.coalition.mentions(["Read the ticket first."]) == ()
+    sent = json.loads(
+        str(author_request("x", packet, tool="t", schema={}, output_tokens=8).messages[1].content)
+    )
+    assert sent["authoring_packet"]["coalition"]["patterns"][0]["pattern_id"] == "close-high"
+    assert "attempt:glm-flash.g0" in sent["citable_locators"]
+
+    for coalition, message in (
+        (ticket_coalition(lineage="held"), "come from final evaluation"),
+        (ticket_coalition(trace="trace-final"), "come from final evaluation"),
+        (ticket_coalition(lineage="unknown"), "outside the exposure plan"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ticket_packet(fixture, coalition=coalition)
+    with pytest.raises(ValueError, match="unknown attempts"):
+        CoalitionEvidence(
+            patterns=(
+                BehaviorPattern(pattern_id="p", kind="recovery", description="d", attempts=("x",)),
+            )
         )

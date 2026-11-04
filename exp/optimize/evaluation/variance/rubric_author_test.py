@@ -9,12 +9,21 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ModelMessage
-from exp.optimize.evaluation.variance.authoring_packet_test import ticket_packet, tool_reply, wire
+from exp.optimize.evaluation.variance.authoring_packet_test import (
+    ticket_coalition,
+    ticket_packet,
+    tool_reply,
+    wire,
+)
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.rubric_author import (
+    DESIGN_CHECKS,
     RUBRIC_AUTHOR_PROMPT,
     RUBRIC_TOOL,
+    RubricBody,
+    RubricDraft,
     author_rubric,
+    design_findings,
     judge_definition,
     load_rubric,
     rubric_protocol_sha256,
@@ -242,3 +251,64 @@ def test_the_rubric_author_never_sees_the_world_authors_output(
         "citable_locators",
     }
     assert CLOSE not in str(user.content)
+
+
+def covering_answer(*extra: JsonObject) -> JsonObject:
+    """A ready answer whose criteria cover every design check the host decides."""
+    handled = criterion(
+        "handled",
+        met_when="A successful escalate on a high tier, or close on a low tier, after the tier "
+        "was read.",
+        accepted_alternatives=["Escalating when the tier cannot be read."],
+        evidence_needed=[
+            {"kind": "tool_call", "detail": "escalate or close with arguments"},
+            {"kind": "tool_error", "detail": "a refused handling call and any retry"},
+        ],
+    )
+    reported = criterion(
+        "reported",
+        question="Did what the agent told the user match the recorded handling?",
+        evidence_needed=[
+            {"kind": "assistant_message", "detail": "what the user was told"},
+            {"kind": "tool_result", "detail": "the handling result"},
+        ],
+    )
+    return rubric_answer(handled, reported, *extra)
+
+
+def test_design_violations_are_refused_and_uncovered_checks_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Efficiency or reference-path grading and actor names are refused; gaps are recorded."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    packet, reference = ticket_packet(fixture, coalition=ticket_coalition())
+    efficiency = criterion("fast", question="Did the agent use the fewest tool calls?")
+    oracle = criterion("oracle", not_met_when="The calls differ from the reference trace.")
+    named = criterion("named", failure_patterns=["Like glm-flash, closing a high ticket."])
+    wire(
+        monkeypatch,
+        tool_reply(RUBRIC_TOOL, rubric_answer(criterion("handled"))),
+        tool_reply(RUBRIC_TOOL, covering_answer()),
+        *(tool_reply(RUBRIC_TOOL, covering_answer(row)) for row in (efficiency, oracle, named)),
+    )
+
+    def draw(name: str) -> RubricDraft:
+        return author_rubric(
+            fixture.project, fixture.settings, reference, identity=name, code_revision="t"
+        )
+
+    gaps = draw("rubric-gaps")
+    assert gaps.status == "ready", gaps.failure
+    assert {row.check for row in gaps.design} == {10, 11, 12}
+    assert {row.severity for row in gaps.design} == {"uncovered"}
+    covered = draw("rubric-covered")
+    assert covered.status == "ready" and covered.design == (), covered.design
+    for name, check in (("fast", "19"), ("oracle", "32"), ("named", "36")):
+        refused = draw(f"rubric-{name}")
+        assert refused.status == "refused" and refused.rubric is None
+        assert (
+            refused.failure is not None and f"design check violations: {check}" in refused.failure
+        )
+    body = RubricBody.model_validate(covering_answer(efficiency)["rubric"])
+    assert [(row.check, row.subjects) for row in design_findings(body, packet)] == [(19, ("fast",))]
+    assert len(DESIGN_CHECKS) == 40 and DESIGN_CHECKS[18][0] == 19
