@@ -296,6 +296,7 @@ def _execute(
             code_revision=code_revision,
             upstream=dict(records),
             dependencies=dependencies,
+            plan=row,
         )
         result = executor.run(context)
         usage = _usage(before, _measure(project))

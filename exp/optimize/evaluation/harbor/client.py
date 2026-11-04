@@ -8,6 +8,9 @@ log directory. The verifier therefore writes ``reward.json`` for every verdict t
 returns: a scored verdict carries ``{"reward": 0 or 1, "scored": 1}``, while a diagnostic,
 unsubmitted, failed or unknown-outcome verdict carries only ``{"scored": 0}``, never a reward
 value the backend did not grant. The complete verdict is retained in ``experiential.json``.
+When the backend judged a dense error-mode reward, its versioned export (every finding, scored or
+not, with actor spans) is written to ``dense.json``; it is a separate training signal and never
+changes ``reward.json``. The verifier runs in its own environment, so the actor never sees it.
 Only a grading failure, where no verdict exists, leaves no reward file, so Harbor records that
 trial as an infrastructure exception instead of an actor outcome.
 """
@@ -30,7 +33,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERIFIER_FILES = ("reward.json", "reward.txt", "experiential.json")
+VERIFIER_FILES = ("reward.json", "reward.txt", "experiential.json", "dense.json")
 
 
 def main() -> int:
@@ -177,6 +180,9 @@ def verify(request: Request, directory: Path) -> int:
     scored = result.get("status") == "completed" and type(reward) is int and reward in (0, 1)
     rewards = {"reward": reward, "scored": 1} if scored else {"scored": 0}
     (directory / "reward.json").write_text(json.dumps(rewards) + "\n")
+    dense = result.get("dense")
+    if isinstance(dense, dict):
+        (directory / "dense.json").write_text(json.dumps(dense, indent=2) + "\n")
     if not scored:
         sys.stderr.write(
             "Experiential verdict is unscored ("

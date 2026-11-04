@@ -20,6 +20,9 @@ from exp.optimize.evaluation.executable.trial import (
     open_executable_harbor_trial,
 )
 from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
+from exp.optimize.evaluation.variance.dense_judge_test import dense_judge, unanimous
+from exp.optimize.evaluation.variance.dense_judge_test import finding as dense_finding
+from exp.optimize.evaluation.variance.dense_reward import DenseRewardExport
 from exp.optimize.evaluation.variance.judged_test import (
     episode_judge,
     judge_settings,
@@ -363,3 +366,43 @@ def test_a_judged_task_is_rewarded_only_by_its_frozen_judge_over_the_ledger(
     assert isinstance(events, list)
     kinds = [e["kind"] for e in events if isinstance(e, dict) and e["scope"] == "scored"]
     assert kinds[:2] == ["assistant_message", "tool_call"] and "final_answer" in kinds
+
+
+def test_a_dense_reward_is_judged_after_the_episode_beside_the_unchanged_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger is judged for dense findings; the outcome reward is unchanged and separate."""
+    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
+    loaded = load_executable_task(project, task)
+    run = run_digests(project, loaded.job.study.checkpoint, loaded.job.configuration)
+    judge = episode_judge(project, judge_settings(project), **run)
+    dense = dense_judge(project, **run)
+    bound = loaded.model_copy(update={"judge": judge, "dense": dense})
+    reference = persist_executable_task(
+        project, bound, created_at=datetime.now(UTC), code_revision="test"
+    )
+    qualification = qualify_executable_task(
+        project,
+        spec.model_copy(update={"task": reference}),
+        created_at=datetime.now(UTC),
+        code_revision="test",
+    )
+    credit = dense_finding("verified_result", "established", observed_refs=["ledger.2"])
+    route_judge(monkeypatch, roles=unanimous(credit), verdict=lambda evidence: "pass")
+    with open_executable_harbor_trial(
+        project, reference, trial_id="dense", code_revision="test", qualification=qualification
+    ) as trial:
+        trial.message("Deleting the row now.")
+        trial.call(workbook_case().first)
+        trial.submit({"answer": "done"})
+        result = trial.result()
+    assert (result["status"], result["reward"]) == ("completed", 1)
+    export = DenseRewardExport.model_validate(result["dense"])
+    assert export.trainable and export.outcome is not None and export.outcome.reward == 1.0
+    assert export.definition_sha256 == dense.identity
+    (row,) = [f for f in export.findings if f.tag_id == "verified_result"]
+    assert row.reward == pytest.approx(0.05)
+    assert [(s.turn_index, s.part, s.granularity) for s in row.spans] == [
+        (1, "tool_call", "action")
+    ]
+    assert {f.tag_id for f in export.findings if f.reward is None} == {"redundant_check"}

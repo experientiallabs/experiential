@@ -75,6 +75,7 @@ from exp.optimize.evaluation.variance.rubric_critic import DesignCriticProfile
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
 from exp.optimize.evaluation.variance.variant_search import VariantSearchSpec
 from exp.optimize.evaluation.variance.world_agent import DEFAULT_PROMPT_SETS
+from exp.simulation.mining.environment_review import CompatibilityReviewer
 from exp.simulation.mining.error_tags import TaskErrorRank
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
 from exp.simulation.mining.traceml_moves import (
@@ -121,9 +122,11 @@ class BuildSettings(ContractModel):
         naming_alias: Catalog alias of the admitted model that names the tag clusters; required
             when ``spec.cluster_naming`` is set.
         naming_deadline_hours: Hours the naming calls may run, from the stage start.
+        reviewer: Frozen admitted compatibility-review settings when families are enabled.
     """
 
     spec: VarianceBuildSpec
+    reviewer: AuthorSettings | None = None
     naming_alias: str | None = Field(default=None, min_length=1)
     naming_deadline_hours: int = Field(default=6, ge=1, le=72, strict=True)
 
@@ -133,6 +136,12 @@ class BuildSettings(ContractModel):
         named = self.spec.cluster_naming is not None and self.spec.clustering is not None
         if named and self.naming_alias is None:
             raise ValueError("cluster naming needs build.naming_alias, an admitted naming model")
+        families = self.spec.environment_families
+        if families is not None:
+            if self.reviewer is None:
+                raise ValueError("environment families need build.reviewer settings")
+            if self.reviewer.output_tokens != families.review.maximum_output_tokens:
+                raise ValueError("build.reviewer output allowance must match the family review")
         return self
 
 
@@ -575,6 +584,7 @@ class StageDependencies:
         build_tagger: Tagger for the variance build, or None for its admitted default.
         build_constructor: Admitted world-model constructor, when the build reconstructs.
         build_namer: Cluster naming model, or None for the admitted ``build.naming_alias``.
+        build_reviewer: Compatibility reviewer, or None for the admitted build.reviewer.
         traceml_tagger: Tagger for TraceML labels, or None for the admitted decision tagger.
         rules_decisions: System One decisions client of the rules memory, or None for the
             admitted ``rules.jev_alias`` tagger.
@@ -584,6 +594,7 @@ class StageDependencies:
 
     build_tagger: DecisionsTraceTagger | None = None
     build_namer: ClusterNamer | None = None
+    build_reviewer: CompatibilityReviewer | None = None
     build_constructor: Constructor | None = None
     traceml_tagger: TraceTagger | None = None
     rules_decisions: DecisionsTraceTagger | None = None
@@ -601,6 +612,7 @@ class StageContext:
         code_revision: Producing source identity.
         upstream: Records of every earlier stage, by stage.
         dependencies: Injected collaborators.
+        plan: The approved stage plan, including any scheduled rollout binding.
     """
 
     project: ProjectStore
@@ -609,6 +621,7 @@ class StageContext:
     code_revision: str
     upstream: Mapping[StageName, StageRecord] = field(default_factory=dict)
     dependencies: StageDependencies = StageDependencies()
+    plan: StagePlan | None = None
 
 
 class BuildOutputs(ContractModel):

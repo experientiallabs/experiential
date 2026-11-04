@@ -589,7 +589,7 @@ PROTOCOLS = (
         "exp.simulation.mining.tag_clusters:TAG_CLUSTERS_PROTOCOL",
         "tag-clusters-v1",
         ("exp.simulation.mining.tag_clusters", "exp.simulation.mining.tag_cluster_names"),
-        "66f5d43c569f052817ac2fab344cb98396623a2998508b869234f648858153d3",
+        "dd52f6a6299fd91d7a1ce62b1b76daa6f869404149ceb21625a16d722831ac90",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.crosstalk:CROSSTALK_PROTOCOL",

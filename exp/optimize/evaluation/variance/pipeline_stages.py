@@ -1,27 +1,11 @@
-"""Owner-bound executors of the variance-build, rules, TraceML, error-mining and records stages.
+"""Owner-bound executors for build, rules, TraceML and error mining.
 
-Each executor prices its stage as a credential-free upper bound and runs it through the stage's
-own owner, which saves and replays its work:
+The build fixes exposure before tagging and scopes learned worlds. Rules are learned over the
+world-learning traces, challenged, then frozen into the mining runtime. TraceML labels grouped
+attempts through the decision tagger. Error mining runs each actor tier with bounded selectors,
+critics and one frozen episode judge. Every owner persists its work for exact replay.
 
-- ``variance-build``: :func:`~exp.optimize.evaluation.variance.build.run_variance_build`.
-- ``rules``: :func:`~exp.optimize.evaluation.rules.stage.run_rules_stage` over the build's
-  world-learning traces, with boundary workloads executed in the bound world through
-  :class:`~exp.optimize.evaluation.rules.challenges.RuntimeChallenges`; the frozen rule book is
-  then bound, with the build's scoped world model and tag binding, into the mining job's
-  grounded runtime, and a new start is captured there before any probe.
-- ``traceml``: every tier's group of attempts (run or replayed by its continuation owner) is
-  labelled by :func:`~exp.simulation.mining.traceml.label_traces`, its pivots and returns judged
-  by the move judge under every move variant (each draw saved and replayed by the author-response
-  owner), and saved per tier.
-- ``error-mining``: the mining-probe task's rubric (the spec's, or authored by the agentic
-  rubric author over a whole-task packet), then one
-  :func:`~exp.optimize.evaluation.variance.actor_critic.run_actor_critic` per tier, its episode
-  judge bound to the tier's run digests, its selectors and critics given tag-aware search over
-  the build's scoped world-learning index, and its group of attempts judged by the same judge
-  for the coalition.
-
-The families stage lives in :mod:`~exp.optimize.evaluation.variance.pipeline_families` and the
-records stage in :mod:`~exp.optimize.evaluation.variance.pipeline_records`.
+Family authoring and record export live in ``pipeline_families`` and ``pipeline_records``.
 """
 
 from __future__ import annotations
@@ -56,6 +40,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticSpec,
     run_actor_critic,
 )
+from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
 from exp.optimize.evaluation.variance.build import (
     plan_variance_build,
     run_variance_build,
@@ -103,6 +88,12 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     rules_costs,
     trace_search,
     world_learning_traces,
+)
+from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
+from exp.optimize.evaluation.variance.pipeline_schedule import (
+    require_scheduled_plan,
+    scheduled_line,
+    scheduled_preview,
 )
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
@@ -231,7 +222,9 @@ class _BuildStage:
         if plan.saved:
             return (), (*lines, "The variance build report is saved; it replays.")
         costs = variance_build_costs(project, plan, spec.build.spec.decision_alias)
-        return cost_lines((*costs, *naming_costs(project, spec, plan))), lines
+        return cost_lines(
+            (*costs, *naming_costs(project, spec, plan), *review_costs(project, spec.build, plan))
+        ), lines
 
     def run(self, context: StageContext) -> StageRun:
         """Run or replay the variance build."""
@@ -240,6 +233,10 @@ class _BuildStage:
         if namer is None and spec.cluster_naming is not None:
             plan = plan_variance_build(project, spec, code_revision=context.code_revision)
             namer = None if plan.saved else cluster_namer(context, plan)
+        reviewer = context.dependencies.build_reviewer
+        if reviewer is None and spec.environment_families is not None:
+            plan = plan_variance_build(project, spec, code_revision=context.code_revision)
+            reviewer = None if plan.saved else family_reviewer(context)
         report = run_variance_build(
             project,
             spec,
@@ -247,6 +244,7 @@ class _BuildStage:
             tagger=context.dependencies.build_tagger,
             constructor=context.dependencies.build_constructor,
             namer=namer,
+            reviewer=reviewer,
         )
         saved = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
         outputs = BuildOutputs(
@@ -372,22 +370,10 @@ def bound_job(
     definition: GroundedRuntimeDefinition,
     code_revision: str,
 ) -> ContinuationJob:
-    """Rebind a job to a runtime definition and capture its start there.
-
-    The registered start must be the task's initial actor context, so the new start differs only
-    in the world it is served by.
-
-    Args:
-        project: Project receiving the new start.
-        job: The registered job.
-        definition: The bound runtime definition.
-        code_revision: Producing source identity.
-
-    Returns:
-        The job over the bound runtime, starting at its new checkpoint.
+    """Capture the registered initial actor context in the rule-bound runtime.
 
     Raises:
-        ValueError: The registered start is not an initial context.
+        ValueError: The registered start is not the task's initial actor context.
     """
     start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
     actor = ChatAgentRuntime(
@@ -581,6 +567,7 @@ class _MiningStage:
         """Price the mining rubric and every tier's draws, suffixes and judgments as bounds."""
         del code_revision
         mining = spec.mining
+        planned = scheduled_preview(project, spec)
         costs: list[CostComponent] = []
         if mining.rubric is None:
             draws = rubric_draws(spec.authoring.rubric_profile)
@@ -589,6 +576,16 @@ class _MiningStage:
         points = mining.selector_draws * mining.points
         episodes = mining.attempts + points * mining.continuations
         for alias in mining.actors:
+            if planned is not None and planned.actor_job.actor_alias == alias:
+                assert planned.spec is not None
+                costs.extend(actor_critic_costs(project, planned.spec))
+                if mining.behaviors is not None:
+                    if not spec.traceml.enabled:
+                        costs.extend(
+                            job_costs(project, group_job(project, spec, mining.job, alias))
+                        )
+                    costs.extend(judge_costs(project, spec, mining.attempts))
+                continue
             if not spec.traceml.enabled:
                 costs.extend(job_costs(project, group_job(project, spec, mining.job, alias)))
             suffix = tier_job(project, mining.job, alias, mining.continuations).model_copy(
@@ -627,11 +624,15 @@ class _MiningStage:
                 else "have no world-learning search."
             ),
         )
-        return cost_lines(tuple(costs)), (*lines, *behavior_lines(spec))
+        scheduled = () if planned is None else (scheduled_line(planned),)
+        return cost_lines(tuple(costs)), (*lines, *scheduled, *behavior_lines(spec))
 
     def run(self, context: StageContext) -> StageRun:
         """Run or replay every tier's error mining and judge its group of attempts."""
         project, spec = context.project, context.spec
+        planned = scheduled_preview(project, spec)
+        if planned is not None:
+            require_scheduled_plan(context, planned)
         build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
         exposure = load_exposure_plan(project, build.exposure)
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
@@ -709,6 +710,13 @@ class _MiningStage:
         """
         project, spec, revision = context.project, context.spec, context.code_revision
         mining, alias = spec.mining, tier_inputs.alias
+        schedule = mining.schedule
+        scheduled = schedule is not None and schedule.base.initial.actor_alias == alias
+        plan = None
+        if scheduled:
+            assert schedule is not None
+            plan = next_rollout_plan(project, schedule, code_revision=revision)
+            require_scheduled_plan(context, plan)
         tier = group_job(project, spec, tier_inputs.job, alias)
         start = load_continuation_checkpoint(project.artifacts, tier.study.checkpoint)
         definition = judge_definition(
@@ -760,16 +768,8 @@ class _MiningStage:
             references=references,
             actor_tier=alias,
         ).model_copy(update={"retrieval": retrieval})
-        schedule = mining.schedule
-        scheduled = schedule is not None and schedule.base.initial.actor_alias == alias
         if scheduled:
-            assert schedule is not None
-            plan = next_rollout_plan(project, schedule, code_revision=revision)
-            if plan.spec is None:
-                raise ValueError(
-                    f"the schedule's next rollout for {alias} is actor-only; run it with the "
-                    "variance-schedule action first"
-                )
+            assert plan is not None and plan.spec is not None
             registration = plan.spec
             judge = registration.episode_judge
             tier = registration.initial

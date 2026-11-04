@@ -56,3 +56,24 @@ def test_instruction_routes_customer_messages_only_when_backend_records_them(
     assert ("python /app/tools.py say 'TEXT'" in instruction) is dialogue
     assert "python /app/tools.py submit" in instruction
     assert verify_harbor_export(package)["backend"] == "test"
+
+
+def test_a_dense_reward_definition_is_part_of_the_package_identity(tmp_path: Path) -> None:
+    """The definition digest is bound and declared; its tags never enter the actor files."""
+    package = write_harbor_package(
+        tmp_path / "package",
+        name="test/dense",
+        instruction="Fix the parser.",
+        public_context={},
+        binding={"backend": "test"},
+        qualified=False,
+        notice="Fixture backend.",
+        dense_reward="f" * 64,
+    )
+    binding = verify_harbor_export(package)
+    assert binding["dense_reward"] == {
+        "schema_version": "dense-reward-v1",
+        "definition_sha256": "f" * 64,
+    }
+    assert 'dense_reward = "dense-reward-v1"' in (package / "task.toml").read_text()
+    assert "modified_evaluation" not in (package / "environment/actor-context.json").read_text()

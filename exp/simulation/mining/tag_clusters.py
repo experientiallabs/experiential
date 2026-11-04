@@ -523,6 +523,58 @@ def _clusters(
     return tuple(clusters), assignments, confidence
 
 
+def assign_clusters(
+    clustering: TagClustering, matrices: Sequence[TagMatrix], trace_ids: Collection[str]
+) -> dict[str, tuple[str, float]]:
+    """Place traces outside the fit (such as mining probes) under the fitted mixture.
+
+    Each trace's posterior over the clusters is computed from the columns its matrices answer;
+    a column no given matrix answers for it is marginalized out, which the independent
+    Bernoulli components allow exactly. Nothing is refitted and no trace joins a cluster.
+
+    Args:
+        clustering: The fitted clustering.
+        matrices: Matrices holding the traces' rows, by view as in :func:`tag_space`.
+        trace_ids: Traces to place.
+
+    Returns:
+        Each placeable trace's most probable cluster and its posterior probability; a trace no
+        matrix answers any clustered column for is left out.
+    """
+    index = {column: position for position, column in enumerate(clustering.columns)}
+    theta = np.clip(
+        np.array(
+            [[c.propositions[col] for col in clustering.columns] for c in clustering.clusters]
+        ),
+        1e-6,
+        1.0 - 1e-6,
+    )
+    weights = np.array([max(c.weight, 1e-12) for c in clustering.clusters])
+    prior = np.log(weights / weights.sum())
+    placed: dict[str, tuple[str, float]] = {}
+    for trace in sorted(set(trace_ids)):
+        columns: list[int] = []
+        values: list[float] = []
+        for matrix in matrices:
+            row = next((r for r in matrix.rows if r.trace_id == trace), None)
+            if row is None:
+                continue
+            for question, value in zip(matrix.question_ids, row.values, strict=True):
+                position = index.get(f"{matrix.view}:{question}")
+                if position is not None:
+                    columns.append(position)
+                    values.append(float(value))
+        if not columns:
+            continue
+        x, t = np.array(values), theta[:, columns]
+        joint = prior + (np.log(t) * x + np.log1p(-t) * (1.0 - x)).sum(axis=1)
+        posterior = np.exp(joint - joint.max())
+        posterior /= posterior.sum()
+        best = int(posterior.argmax())
+        placed[trace] = (clustering.clusters[best].cluster_id, round(float(posterior[best]), 6))
+    return placed
+
+
 class ClusterAdmissionSpec(ContractModel):
     """Which clusters, and how many traces of each, enter a corpus.
 

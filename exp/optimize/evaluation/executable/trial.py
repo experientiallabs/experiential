@@ -10,6 +10,11 @@ once the trial closes, its ledger becomes the episode evidence, the judge assess
 the reward is the verdict's encoding (pass 1, fail 0). An unscored verdict writes no reward, which
 is distinct from a reward of 0, and no mechanical grade is computed for such a task. A task
 without a judge is the observable-mechanical task type, rewarded by its verifier grade.
+
+A judged task that also binds a dense error-mode reward (``ExecutableTask.dense``) has the same
+ledger evidence judged for dense findings after the episode. The result carries the versioned
+export under ``dense`` (unscored findings included), which the verifier writes to ``dense.json``
+next to ``reward.json``; it never changes the reward and never reaches the actor.
 """
 
 import base64
@@ -40,6 +45,10 @@ from exp.optimize.evaluation.executable.loader import ContinuationRuntime, load_
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant, ProviderLimits
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
+from exp.optimize.evaluation.variance.dense_candidates import definition_candidates
+from exp.optimize.evaluation.variance.dense_judge import judge_dense
+from exp.optimize.evaluation.variance.dense_reward import OutcomeReference
+from exp.optimize.evaluation.variance.dense_spans import trajectory_from_ledger
 from exp.optimize.evaluation.variance.episode_evidence import ledger_evidence
 from exp.optimize.evaluation.variance.episodes import episode_reward
 from exp.optimize.evaluation.variance.judge import judge_episode
@@ -444,6 +453,25 @@ class ExecutableHarborTrial:
         result["status"] = "completed" if rewarded else "incomplete"
         result["reward"] = int(reward) if rewarded and reward is not None else None
         inputs = (reference, *(() if self.qualification is None else (self.qualification,)))
+        if self.task.dense is not None:
+            outcome = OutcomeReference(
+                judge=judge.identity,
+                assessment=reference,
+                verdict=assessment.verdict,
+                reward=reward,
+            )
+            dense_ref, export = judge_dense(
+                self.project,
+                self.task.dense,
+                evidence,
+                definition_candidates(self.task.dense.definition),
+                trajectory_from_ledger(self._ledger),
+                code_revision=self.code_revision,
+                outcome=outcome,
+            )
+            export = export.model_copy(update={"trainable": rewarded})
+            result["dense"] = export.model_dump(mode="json")
+            inputs = (*inputs, dense_ref)
         self._save("result", result, inputs)
         return result
 

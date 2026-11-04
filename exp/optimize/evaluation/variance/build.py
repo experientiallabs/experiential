@@ -39,7 +39,7 @@ the exact question banks, and a repeated run returns the saved report without an
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -51,7 +51,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.models import Embedding, ModelSnapshot, load_model_catalog
+from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import (
     ArtifactStore,
     ProjectBuildArtifacts,
@@ -89,6 +89,8 @@ from exp.optimize.evaluation.variance.exposure import (
     Role,
     plan_exposure,
 )
+from exp.optimize.evaluation.variance.family_scopes import require_family_review, scope_families
+from exp.optimize.evaluation.variance.saved_vectors import saved_vector_embedder
 from exp.optimize.evaluation.variance.tag_retrieval import index_tag_view, query_task_tags
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import (
@@ -100,6 +102,7 @@ from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
+from exp.simulation.mining.environment_review import CompatibilityReviewer
 from exp.simulation.mining.error_tags import (
     ErrorTags,
     bank_for_view,
@@ -129,9 +132,7 @@ from exp.simulation.retrieval.build import persist_trace_rag
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.retrieval.contracts import RAGIndex
 from exp.simulation.retrieval.embedding import (
-    RAGEmbedderBinding,
     RAGEmbeddingCache,
-    default_rag_embedder,
 )
 from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
 from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
@@ -232,6 +233,7 @@ def run_variance_build(
     tagger: DecisionsTraceTagger | None = None,
     constructor: Constructor | None = None,
     namer: ClusterNamer | None = None,
+    reviewer: CompatibilityReviewer | None = None,
 ) -> VarianceBuildReport:
     """Run, or replay, the variance build over the project's completed build.
 
@@ -244,6 +246,8 @@ def run_variance_build(
         constructor: Admitted world-model constructor, required when the spec requests
             construction and unused otherwise.
         namer: Admitted cluster-naming model, required when the spec requests naming.
+        reviewer: Admitted compatibility reviewer, required when the spec requests environment
+            families; each family is then scoped by ``scope_families``.
 
     Returns:
         The report, also saved as a ``variance-build-report`` artifact.
@@ -276,6 +280,7 @@ def run_variance_build(
             return VarianceBuildReport.model_validate_json(
                 store.read_bytes(result_id, "report.json")
             )
+        require_family_review(spec, reviewer)
         build = prepared.build
         exposure = save_artifact(
             store, EXPOSURE_TYPE, {"exposure.json": prepared.plan}, (build.task_set,), code_revision
@@ -309,6 +314,15 @@ def run_variance_build(
                 "selected_probes": selected,
             }
         )
+        report = scope_families(
+            project,
+            report,
+            traces=prepared.traces,
+            tasks=prepared.tasks,
+            reviewer=reviewer,
+            code_revision=code_revision,
+        )
+        families = report.environment_families
         dependencies = {
             exposure,
             report.index,
@@ -317,6 +331,7 @@ def run_variance_build(
             report.control_retrieval,
             *(row.matrix for row in tagging),
             *(ref for ref in (report.errors, report.clustering, report.cluster_names) if ref),
+            *(() if families is None else families.references()),
         }
         store.write_json(
             artifact_id=result_id,
@@ -421,11 +436,12 @@ def _prepare(
             "error_bank": None if errors is None else sha256_json(errors[0]),
         },
     )
+    summary_roles = role_counts(plan, tasks)
     summary = VarianceBuildPlan(
         identity=identity,
         saved=store.exists(identity + "-result"),
         decision_model=model,
-        roles=role_counts(plan, tasks),
+        roles=summary_roles,
         views=views,
         decision_calls=calls,
         decision_attempts=calls * RetryPolicy().maximum_attempts,
@@ -437,6 +453,9 @@ def _prepare(
         naming_calls=0
         if spec.cluster_naming is None or spec.clustering is None
         else spec.cluster_naming.calls(spec.clustering.max_clusters),
+        review_calls=0
+        if spec.environment_families is None
+        else spec.environment_families.calls(summary_roles["world_learning"].traces),
     )
     return _Prepared(build, plan, traces, tasks, banks, units, summary, errors)
 
@@ -681,7 +700,7 @@ def _bind(
     index_tags = RAGIndexTags(views=tuple(views))
     fit = load_rag_index(store, build.fit_rag.artifact_id)
     serving = load_rag_index(store, build.serving_rag.artifact_id).index
-    embedder = _saved_vector_embedder(serving)
+    embedder = saved_vector_embedder(serving)
     persisted = persist_trace_rag(
         store,
         (build.trace_dataset,),
@@ -864,50 +883,6 @@ def _select(
     inside = matrix.model_copy(update={"rows": rows})
     selection = select_traces(inside, rule.rule, bank=prepared.banks[rule.view])
     return plan.restrict(selection, "world_learning")
-
-
-def _saved_vector_embedder(serving: RAGIndex) -> RAGEmbedderBinding:
-    """Bind the build's embedder identity so the scoped index reuses its saved vectors.
-
-    The local hashing embedder is free and deterministic, so it is bound as itself. A semantic
-    embedder is bound to a client that refuses every call: the scoped index holds a subset of
-    the build's fit transitions, whose vectors the build saved in the project's embedding
-    checkpoint under the same identity and chunking.
-
-    Args:
-        serving: The build's serving index envelope.
-
-    Returns:
-        The binding.
-    """
-    hashing = default_rag_embedder(serving.embedding_dimension)
-    if hashing.snapshot == serving.embedder:
-        return hashing
-    return RAGEmbedderBinding(
-        client=_SavedVectorsOnly(serving.embedder.model_id),
-        snapshot=serving.embedder,
-        maximum_input_tokens=serving.embedding_chunk_bytes,
-    )
-
-
-class _SavedVectorsOnly:
-    """An embedding client for vectors the build already saved; any call is refused."""
-
-    def __init__(self, model_id: str) -> None:
-        """Name the embedder whose vectors must already be saved."""
-        self._model_id = model_id
-
-    def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
-        """Refuse: the build's embedding checkpoint must already hold every input.
-
-        Raises:
-            ValueError: Always, naming how many inputs were missing.
-        """
-        raise ValueError(
-            f"{len(texts)} embedding inputs for {self._model_id} are not in the build's "
-            "embedding checkpoint; rerun `exp build` for this project so the scoped index can "
-            "reuse its vectors"
-        )
 
 
 def _construct(

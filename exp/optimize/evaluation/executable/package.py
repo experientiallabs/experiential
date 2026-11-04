@@ -83,6 +83,7 @@ def export_executable_harbor(
         output_paths=task.output_paths,
         transport=task.harbor_transport,
         notice="Tools run in the declared executable or mixed world from a frozen checkpoint.",
+        dense_reward=None if task.dense is None else task.dense.identity,
     )
 
 

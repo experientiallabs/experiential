@@ -35,6 +35,7 @@ from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role, world_learning_scope
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.simulation.mining.dispatch import DEFAULT_TAGGING_CONCURRENCY
+from exp.simulation.mining.environment_families import EnvironmentFamilySpec, FamilyStatus
 from exp.simulation.mining.error_tags import (
     ERROR_BANK_ID,
     ErrorTags,
@@ -124,6 +125,9 @@ class VarianceBuildSpec(ContractModel):
             construction and retrieval corpora unless an explicit rule overrides that corpus.
         cluster_naming: How an injected naming model names the clusters, or None to leave them
             unnamed; naming needs a namer passed to the run.
+        environment_families: How an injected reviewer turns the clusters into environment
+            families, each given its own scoped index, world model and rule-memory inputs; None
+            keeps one simulator for the whole build. Needs clustering and a reviewer.
         probe_limit: Most mining-probe tasks selected for error mining, most error-laden first;
             None selects every probe task, still ranked.
         construction_rule: Optional explicit tag rule for the construction corpus; it overrides
@@ -155,6 +159,9 @@ class VarianceBuildSpec(ContractModel):
     clustering: ClusteringSpec | None = Field(default_factory=ClusteringSpec)
     cluster_admission: ClusterAdmissionSpec = Field(default_factory=ClusterAdmissionSpec)
     cluster_naming: ClusterNamingSpec | None = None
+    environment_families: EnvironmentFamilySpec | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     probe_limit: int | None = Field(default=None, ge=1)
     construction_rule: ScopeRule | None = None
     retrieval_rule: ScopeRule | None = None
@@ -247,6 +254,7 @@ class VarianceBuildPlan(ContractModel):
         errors: Decisions the error tags may buy, when an error bank is named; included in
             ``decision_calls``.
         naming_calls: Upper bound on cluster-naming calls, at the largest cluster count.
+        review_calls: Upper bound on environment-family review calls over world learning.
     """
 
     identity: str
@@ -262,6 +270,7 @@ class VarianceBuildPlan(ContractModel):
     construction: bool
     errors: ViewPlan | None = None
     naming_calls: int = Field(default=0, ge=0)
+    review_calls: int = Field(default=0, ge=0)
 
 
 class TagMatrixRecord(ContractModel):
@@ -353,6 +362,99 @@ class TraceAdmission(ContractModel):
     reason: str
 
 
+class ProbePlacement(ContractModel):
+    """Where one mining-probe task was placed among the environment families.
+
+    Attributes:
+        task_id: The probe task.
+        trace_id: Its source trace placed under the clustering, when one was tagged.
+        cluster_id: The cluster the mixture placed it in.
+        posterior: That cluster's posterior probability.
+        family_id: The family it joined, or None when it stays unplaced.
+        reason: Why it was placed there, or why not.
+    """
+
+    task_id: str
+    trace_id: str | None = None
+    cluster_id: str | None = None
+    posterior: float | None = None
+    family_id: str | None = None
+    reason: str
+
+
+class FamilyScope(ContractModel):
+    """One environment family's own simulator inputs, keyed by its identity.
+
+    Attributes:
+        family_id: The family.
+        status: ``compatible``, or ``admitted_uncertain`` when explicitly admitted.
+        cluster_id: The cluster it came from.
+        path: Its position in the review tree.
+        members: Member world-learning traces.
+        retrieval_scope: The members the family's index holds (tagged, in the build's scope).
+        index: The family's scoped, tagged fit-only index.
+        world_model: The family's world model over that index.
+        tag_retrieval: Treatment binding over the family's probe tasks, when it has any.
+        rules_traces: World-learning traces its one rule memory is learned from.
+        tools: Tools of its reconciled contracts.
+        tasks: World-learning tasks and placed probe tasks, every one sharing this simulator.
+    """
+
+    family_id: str
+    status: FamilyStatus
+    cluster_id: str
+    path: str
+    members: tuple[str, ...]
+    retrieval_scope: CorpusScope
+    index: ArtifactInput
+    world_model: ArtifactInput
+    tag_retrieval: ArtifactInput | None = None
+    rules_traces: tuple[str, ...]
+    tools: tuple[str, ...] = ()
+    tasks: tuple[str, ...] = ()
+
+
+class FamilyScoping(ContractModel):
+    """Per-family scoping of a variance build.
+
+    Attributes:
+        families: The saved ``environment-families`` record.
+        scopes: One scope per admitted family, in review order.
+        uncertain: Uncertain groups reported and left out of training.
+        admitted_uncertain: Uncertain groups the spec explicitly admitted.
+        left_out: Admitted families without a scope, with why.
+        placements: Every mining-probe task's placement.
+    """
+
+    families: ArtifactInput
+    scopes: tuple[FamilyScope, ...] = ()
+    uncertain: tuple[str, ...] = ()
+    admitted_uncertain: tuple[str, ...] = ()
+    left_out: dict[str, str] = Field(default_factory=dict)
+    placements: tuple[ProbePlacement, ...] = ()
+
+    def scope(self, family_id: str) -> FamilyScope:
+        """Return one family's scope.
+
+        Raises:
+            KeyError: No scope has that family identity.
+        """
+        for row in self.scopes:
+            if row.family_id == family_id:
+                return row
+        raise KeyError(f"no scope for environment family {family_id}")
+
+    def references(self) -> tuple[ArtifactInput, ...]:
+        """Return every artifact the scoping saved or read, for the report's inputs."""
+        rows = (
+            ref
+            for scope in self.scopes
+            for ref in (scope.index, scope.world_model, scope.tag_retrieval)
+            if ref is not None
+        )
+        return (self.families, *rows)
+
+
 class VarianceBuildReport(ContractModel):
     """The complete record of one variance build.
 
@@ -385,6 +487,7 @@ class VarianceBuildReport(ContractModel):
         admissions: Why every world-learning trace in either corpus is there.
         probe_ranking: Every mining-probe task ranked by its source traces' error tags.
         selected_probes: Probe tasks selected for error mining, most error-laden first.
+        environment_families: Per-family scopes, when environment families were requested.
     """
 
     spec: VarianceBuildSpec
@@ -414,6 +517,9 @@ class VarianceBuildReport(ContractModel):
     admissions: tuple[TraceAdmission, ...] = ()
     probe_ranking: tuple[TaskErrorRank, ...] = ()
     selected_probes: tuple[str, ...] = ()
+    environment_families: FamilyScoping | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def view_plan(

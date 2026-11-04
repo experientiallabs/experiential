@@ -11,6 +11,7 @@ from typing import Literal
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
+from exp.optimize.evaluation.variance.dense_reward import DENSE_REWARD_SCHEMA
 from exp.runtime.environments.artifact_edits import NativeArtifactBinding
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.tasks import load_evaluation_task
@@ -121,6 +122,7 @@ def write_harbor_package(
     output_paths: tuple[str, ...] = (),
     transport: Literal["http", "unix-no-network"] = "http",
     dialogue: bool = True,
+    dense_reward: str | None = None,
 ) -> Path:
     """Write the shared Harbor client and isolated verifier package for one frozen backend.
 
@@ -137,6 +139,9 @@ def write_harbor_package(
         dialogue: Whether the backend records customer-facing messages sent with ``say``. The
             instruction then routes every customer-facing message through it. A backend without
             a message ledger passes False, and the instruction does not mention ``say``.
+        dense_reward: Identity of the frozen dense reward definition the backend judges each
+            trial with, or None. It is recorded in the binding and task metadata; its tag
+            definitions and grading instructions stay with the trusted backend.
 
     Returns:
         Published package with the complete digest-bound file inventory.
@@ -205,7 +210,9 @@ def write_harbor_package(
             'keywords = ["experiential", "simulation", "tool-use"]\n\n'
             "[metadata]\n"
             f"diagnostic_only = {str(not qualified).lower()}\n"
-            f'harbor_version = "{HARBOR_VERSION}"\n\n'
+            f'harbor_version = "{HARBOR_VERSION}"\n'
+            + ("" if dense_reward is None else f'dense_reward = "{DENSE_REWARD_SCHEMA}"\n')
+            + "\n"
             "[agent]\ntimeout_sec = 600\n\n"
             "[environment]\ncpus = 1\nmemory_mb = 512\n"
             "[environment.env]\n"
@@ -280,6 +287,11 @@ def write_harbor_package(
             for directory in (environment, tests):
                 (directory / "docker-compose.yaml").write_text(json.dumps(compose, indent=2) + "\n")
         (staging / "task.toml").write_text(configuration)
+        if dense_reward is not None:
+            binding["dense_reward"] = {
+                "schema_version": DENSE_REWARD_SCHEMA,
+                "definition_sha256": dense_reward,
+            }
         binding["files"] = {
             str(path.relative_to(staging)): sha256(path.read_bytes()).hexdigest()
             for path in sorted(staging.rglob("*"))

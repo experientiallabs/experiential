@@ -77,6 +77,7 @@ from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, co
 from exp.optimize.evaluation.variance.authors import DecisionStateAnswer
 from exp.optimize.evaluation.variance.contracts import JudgeSelection
 from exp.optimize.evaluation.variance.contrast import FlipVerdict, OptionContrast
+from exp.optimize.evaluation.variance.dense_reward import DenseEpisode
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning
 from exp.optimize.evaluation.variance.grader import EpisodeView
 from exp.optimize.evaluation.variance.judged import (
@@ -599,6 +600,8 @@ class ContinuationGroup(ContractModel):
             where unscored.
         imposed_action_trainable: Always False: the forced first action was imposed by the
             experiment and is not actor-sampled; only the actor's suffix may carry advantages.
+        dense: Dense findings and actor spans per episode (``attach_dense``), separate from
+            the outcome advantages; empty until attached, None where an episode has none.
     """
 
     scenario_id: str
@@ -609,6 +612,7 @@ class ContinuationGroup(ContractModel):
     episodes: tuple[JudgedSlot, ...]
     advantages: tuple[float | None, ...]
     imposed_action_trainable: Literal[False] = False
+    dense: tuple[DenseEpisode | None, ...] = ()
 
 
 class SelectorPoint(ContractModel):

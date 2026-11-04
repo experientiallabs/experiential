@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.variance.dense_judge import DenseRewardJudge
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
@@ -38,6 +39,9 @@ class ExecutableTask(ContractModel):
             only reward of a decision-variance task. Without it the task is the explicitly
             different observable-mechanical task type, rewarded by its verifier grade. The
             binding holds only digests and references; the rubric stays on the host.
+        dense: The frozen dense error-mode reward judged over the same ledger after the episode,
+            a training signal separate from the judge's outcome reward. Its tag definitions and
+            grading instructions are part of the task identity and never reach the actor.
     """
 
     intent: str = Field(min_length=1)
@@ -49,6 +53,7 @@ class ExecutableTask(ContractModel):
         default="http", exclude_if=lambda value: value == "http"
     )
     judge: EpisodeJudge | None = Field(default=None, exclude_if=lambda value: value is None)
+    dense: DenseRewardJudge | None = Field(default=None, exclude_if=lambda value: value is None)
     known_limits: tuple[str, ...] = (
         "Observable predicates do not certify unobserved effects or host containment.",
         "Authored or simulated behavior does not establish fidelity to a native production system.",
@@ -63,6 +68,13 @@ class ExecutableTask(ContractModel):
         for path in paths:
             validate_artifact_file_path(path)
         return paths
+
+    @model_validator(mode="after")
+    def dense_needs_judge(self) -> "ExecutableTask":
+        """Bind a dense reward only beside the episode judge's outcome reward."""
+        if self.dense is not None and self.judge is None:
+            raise ValueError("a dense reward accompanies an episode judge; bind judge as well")
+        return self
 
     def profile(self) -> str:
         """Bind the world, probe, verifier, actor context and execution allowance."""

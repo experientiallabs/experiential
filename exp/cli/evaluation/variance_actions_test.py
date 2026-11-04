@@ -22,7 +22,6 @@ from exp.cli.evaluation.variance_actions import (
     RulesStageAction,
     VarianceBuildAction,
     VarianceScheduleAction,
-    actor_critic_costs,
     actor_critic_lines,
     handle_variance_schedule,
     rules_stage_identity,
@@ -45,6 +44,7 @@ from exp.optimize.evaluation.variance import actor_critic_test as critic_fixture
 from exp.optimize.evaluation.variance import build_test as build_fixture
 from exp.optimize.evaluation.variance import schedule_test as schedule_fixture
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
 from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as VARIANCE_REPORT_TYPE
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceBudget, EvidenceToolProfile

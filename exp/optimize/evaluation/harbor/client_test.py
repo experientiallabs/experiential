@@ -163,3 +163,26 @@ def test_explicit_unix_failure_never_falls_back_to_http(
     assert harbor_client.main() == 2
     assert not (tmp_path / "grade/reward.json").exists()
     assert json.loads((tmp_path / "grade/experiential.json").read_text())["error"] == "URLError"
+
+
+def test_a_dense_export_is_written_beside_the_unchanged_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dense.json holds the backend's dense export; reward.json keeps the outcome reward only."""
+    dense: JsonObject = {"schema_version": "dense-reward-v1", "findings": [{"reward": None}]}
+
+    def response(request: Request, *, timeout: int) -> io.BytesIO:
+        """Return a completed grade carrying a dense export."""
+        return io.BytesIO(json.dumps({"status": "completed", "reward": 1, "dense": dense}).encode())
+
+    (tmp_path / "dense.json").write_text("stale")
+    assert _verify(tmp_path, monkeypatch, response) == 0
+    assert json.loads((tmp_path / "reward.json").read_text()) == {"reward": 1, "scored": 1}
+    assert json.loads((tmp_path / "dense.json").read_text()) == dense
+
+    def plain(request: Request, *, timeout: int) -> io.BytesIO:
+        """Return a grade without a dense export."""
+        return io.BytesIO(json.dumps({"status": "completed", "reward": 0}).encode())
+
+    assert _verify(tmp_path, monkeypatch, plain) == 0
+    assert not (tmp_path / "dense.json").exists()
