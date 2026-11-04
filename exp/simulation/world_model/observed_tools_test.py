@@ -3,7 +3,11 @@
 import pytest
 
 from exp.common.tasks import TaskCase, ToolSchema
-from exp.simulation.world_model.observed_tools import observed_tool_schemas, public_task_tools
+from exp.simulation.world_model.observed_tools import (
+    observed_tool_schemas,
+    public_task_tools,
+    signature_calls,
+)
 
 
 def task(tools: tuple[ToolSchema, ...] = ()) -> TaskCase:
@@ -51,3 +55,27 @@ def test_published_contract_wins_and_observation_fills_its_absence() -> None:
     calls = [("get_order", {"order_id": "1"})]
     assert public_task_tools(task(declared), calls) == declared
     assert [tool.name for tool in public_task_tools(task(), calls)] == ["get_order"]
+
+
+def test_signature_calls_keep_the_same_observed_schemas() -> None:
+    """Collapsing calls to one per tool keeps every name and argument name, so schemas match."""
+    calls = [
+        ("read", {"path": "a"}),
+        ("write", {"path": "b", "text": "x"}),
+        ("read", {"path": "c", "lines": 3}),
+        ("run", {}),
+    ]
+
+    collapsed = signature_calls(calls)
+
+    assert collapsed == [
+        ("read", {"lines": None, "path": None}),
+        ("run", {}),
+        ("write", {"path": None, "text": None}),
+    ]
+    assert observed_tool_schemas(collapsed) == observed_tool_schemas(calls)
+    assert observed_tool_schemas([*collapsed, ("read", {"mode": "r"})]) == observed_tool_schemas(
+        [*calls, ("read", {"mode": "r"})]
+    )
+    with pytest.raises(ValueError, match="JSON objects"):
+        signature_calls([("run", "ls")])

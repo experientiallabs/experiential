@@ -105,6 +105,7 @@ from exp.simulation.world_model.experience_memory import (
 from exp.simulation.world_model.experience_sources import (
     consumed_trajectory_digest,
 )
+from exp.simulation.world_model.observed_tools import signature_calls
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 
 LABEL = "learn"
@@ -524,11 +525,15 @@ def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...
         for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces
         if scope == "all" or bindings[trace.trace_id].partition == "fit"
     ]
-    calls = [
-        (row.name, row.arguments)
+    exchanges = {
+        trace.trace_id: recorded_exchanges(trace, bindings[trace.trace_id].lineage_id)
         for trace in traces
-        for row in recorded_exchanges(trace, bindings[trace.trace_id].lineage_id)
-    ]
+    }
+    # One call per tool name with every observed argument name: the same observed signatures
+    # as the full inventory, without re-scanning every recorded call for every trace.
+    calls = signature_calls(
+        (row.name, row.arguments) for rows in exchanges.values() for row in rows
+    )
     cases = []
     for trace in traces:
         # Every learned trace is fit data, whatever split the build assigned it.
@@ -542,7 +547,7 @@ def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...
             workload_weight=1,
             source_trace_ids=(trace.trace_id,),
         )
-        case = replay_case(task, trace, calls)
+        case = replay_case(task, trace, calls, exchanges=exchanges[trace.trace_id])
         if case is not None:
             cases.append(case)
     return tuple(cases)

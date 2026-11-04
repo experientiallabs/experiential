@@ -339,6 +339,7 @@ def replay_case(
     visible_calls: Sequence[tuple[str, JsonValue]],
     *,
     facts: InstanceFactsProvider | None = None,
+    exchanges: tuple[RecordedExchange, ...] | None = None,
 ) -> ReplayCase | None:
     """Make one trace's public replay case, or None when nothing follows its prefix.
 
@@ -351,6 +352,8 @@ def replay_case(
             visible from the first turn.
         facts: Environment adapter supplying the instance's facts; by default, the facts the
             trace package supplies with the trace.
+        exchanges: The trace's recorded exchanges when the caller already extracted them with
+            :func:`recorded_exchanges` for this trace and lineage; extracted here otherwise.
 
     Returns:
         The case, or None when the public prefix covers every recorded exchange.
@@ -359,7 +362,8 @@ def replay_case(
         ValueError: The trace calls a tool its published tool list does not declare.
         InstanceFactsError: The supplied facts are malformed or not validated.
     """
-    exchanges = recorded_exchanges(trace, task.lineage_group_id)
+    if exchanges is None:
+        exchanges = recorded_exchanges(trace, task.lineage_group_id)
     start = replay_boundary(trace, len(exchanges))
     if start == len(exchanges):
         return None
