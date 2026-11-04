@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.traces.ingest.agent_session_formats import (
+    FREE_FORM_ARGUMENT,
     content_text,
     detect_session_format,
     export_session,
     is_injected_text,
+    object_arguments,
     read_sessions,
 )
 from exp.common.traces.ingest.vendor_records import VendorTraceFormatError
@@ -86,7 +89,7 @@ def test_pi_requires_a_session_header() -> None:
 
 
 def test_export_tool_call_arguments_fall_back_to_text() -> None:
-    """Non-JSON tool-call content is kept as text arguments."""
+    """Non-JSON tool-call content is kept exactly, under the free-form key."""
     session = export_session(
         {
             "id": "e",
@@ -98,7 +101,7 @@ def test_export_tool_call_arguments_fall_back_to_text() -> None:
     )
 
     (event,) = session.events
-    assert event.tool_calls[0].arguments == "not json"
+    assert event.tool_calls[0].arguments == {FREE_FORM_ARGUMENT: "not json"}
     assert session.synthetic_time is True
 
 
@@ -129,3 +132,10 @@ def test_export_drops_repeated_calls_and_results() -> None:
     assert [event.kind for event in session.events] == ["assistant", "tool_result"]
     assert session.events[1].tool_name == "run"
     assert session.metadata["skipped_records"] == {"duplicate-record": 2}
+
+
+@pytest.mark.parametrize("recorded", ["ls -la", ["ls", "-la"], 3, None])
+def test_non_object_arguments_are_held_under_the_free_form_key(recorded: JsonValue) -> None:
+    """Replay needs object arguments, so any other recorded value is wrapped, never dropped."""
+    assert object_arguments(recorded) == {FREE_FORM_ARGUMENT: recorded}
+    assert object_arguments({"path": "a"}) == {"path": "a"}
