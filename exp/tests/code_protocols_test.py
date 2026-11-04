@@ -363,6 +363,18 @@ PROTOCOLS = (
         ("exp.optimize.evaluation.variance.world_freeze",),
         "a0c92da5a0e548c2bfe4e307269578800c63c8437c8fba019dd85ee679ffc59f",
     ),
+    Protocol(
+        "exp.simulation.mining.traceml:TRACEML_PROTOCOL",
+        "traceml-v1",
+        ("exp.simulation.mining.traceml",),
+        "ad808578b0ec14ece06aac20a290d08152f880bdeec32ab2fd291b19fb58f239",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.crosstalk:CROSSTALK_PROTOCOL",
+        "crosstalk-probe-v1",
+        ("exp.optimize.evaluation.variance.crosstalk",),
+        "a1ec0982a884e5651380fd2007490706b2893db884da8bdfe4df3f0aca243503",
+    ),
 )
 
 
