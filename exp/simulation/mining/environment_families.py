@@ -176,6 +176,7 @@ class UncertainGroup(ContractModel):
         reason: Why it is uncertain.
         open_questions: Questions that would settle it.
         evidence: Compatibility evidence.
+        tasks: Tasks placed in it, kept for when it is explicitly admitted.
     """
 
     group_id: str
@@ -185,6 +186,7 @@ class UncertainGroup(ContractModel):
     reason: str
     open_questions: tuple[OpenQuestion, ...] = ()
     evidence: CompatibilityEvidence
+    tasks: tuple[FamilyTask, ...] = ()
 
 
 class EnvironmentFamilies(ContractModel):
@@ -366,6 +368,55 @@ def environment_families(
     )
 
 
+def persist_environment_families(
+    store: ArtifactStore,
+    record: EnvironmentFamilies,
+    *,
+    code_revision: str,
+    inputs: Sequence[ArtifactInput] = (),
+) -> ArtifactInput:
+    """Save a record under its content identity (for example with placed tasks), or adopt it.
+
+    Raises:
+        ValueError: A saved artifact under that identity holds a different record.
+    """
+    identity = record.identity()
+    if store.exists(identity):
+        reference = artifact_input(store.read(identity).manifest)
+        if load_environment_families(store, reference) != record:
+            raise ValueError(f"saved environment families {identity} hold a different record")
+        return reference
+    return write_record(
+        store, identity, FAMILIES_TYPE, "families.json", record, code_revision, inputs
+    )
+
+
+def with_placed(
+    record: EnvironmentFamilies, placed: Mapping[str, Sequence[FamilyTask]]
+) -> EnvironmentFamilies:
+    """Return the record with tasks placed in its families and uncertain groups, by identity.
+
+    Raises:
+        ValueError: A placement names no family or group, or repeats a task.
+    """
+    known = {f.family_id for f in record.families} | {g.group_id for g in record.uncertain}
+    unknown = sorted(set(placed) - known)
+    if unknown:
+        raise ValueError(f"tasks placed in unknown families or groups {unknown}")
+    families = tuple(with_tasks(f, placed.get(f.family_id, ())) for f in record.families)
+    groups = tuple(
+        g.model_copy(
+            update={
+                "tasks": tuple(
+                    sorted((*g.tasks, *placed.get(g.group_id, ())), key=lambda t: t.task_id)
+                )
+            }
+        )
+        for g in record.uncertain
+    )
+    return record.model_copy(update={"families": families, "uncertain": groups})
+
+
 def load_environment_families(
     store: ArtifactStore, reference: ArtifactInput
 ) -> EnvironmentFamilies:
@@ -402,6 +453,7 @@ def admitted_families(
             tool_contracts={}
             if traces is None
             else group_contracts([traces[t] for t in group.members if t in traces]),
+            tasks=group.tasks,
             evidence=group.evidence,
         )
         for group_id, group in groups.items()

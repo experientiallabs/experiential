@@ -122,22 +122,32 @@ class _RecordsStage:
         costs: list[CostComponent] = []
         options = spec.point_options()
         if options is not None:
-            points = spec.mining.selector_draws * spec.mining.points
-            per_point = options.profile.budget.model_calls * options.draws_per_point(
-                spec.mining.continuations
-            )
-            for _ in spec.mining.actors:
+            populations = []
+            for alias in spec.mining.actors:
+                points = spec.mining.selector_draws * spec.mining.points
+                continuations = spec.mining.continuations
+                schedule = spec.mining.schedule
+                if schedule is not None and schedule.base.initial.actor_alias == alias:
+                    points = (
+                        max(len(schedule.base.judges), schedule.steady_draws) * schedule.base.points
+                    )
+                    continuations = schedule.base.continuations
+                per_point = options.profile.budget.model_calls * options.draws_per_point(
+                    continuations
+                )
                 for settings in (options.proposer, options.classifier):
                     costs.extend(
                         row.scaled(points * per_point)
                         for row in evaluation_costs(project, settings)
                     )
+                populations.append(
+                    f"{alias}: up to {points} points x {continuations} continuations"
+                )
             lines.append(
-                f"Point decisions: every continued point (up to {points} per tier) gets options "
-                f"from {len(options.stances)} proposer stances and a reconcile on "
-                f"{options.proposer.model_alias}, and each of its {spec.mining.continuations} "
-                f"judged continuations is classified on {options.classifier.model_alias}, so the "
-                "version 2 selector records score every draw."
+                "Point decisions: " + "; ".join(populations) + ". Each point gets options from "
+                f"{len(options.stances)} proposer stances and a reconcile on "
+                f"{options.proposer.model_alias}; judged continuations are classified on "
+                f"{options.classifier.model_alias} for version 2 selector records."
             )
         if qualify:
             variants = spec.authoring.families_per_tier * (spec.authoring.maximum_variants + 1)

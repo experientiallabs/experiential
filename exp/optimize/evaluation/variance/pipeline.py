@@ -55,6 +55,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.variance.pipeline_build import BUILD_STAGE
 from exp.optimize.evaluation.variance.pipeline_families import FAMILIES_STAGE
 from exp.optimize.evaluation.variance.pipeline_records import RECORDS_STAGE
 from exp.optimize.evaluation.variance.pipeline_spec import (
@@ -78,7 +79,6 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     stage_identity,
 )
 from exp.optimize.evaluation.variance.pipeline_stages import (
-    BUILD_STAGE,
     MINING_STAGE,
     RULES_STAGE,
     TRACEML_STAGE,

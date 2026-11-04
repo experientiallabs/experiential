@@ -363,7 +363,16 @@ def _searches(spec: DecisionVarianceSpec) -> int:
     mining = spec.mining
     per_tier = mining.selector_draws * mining.selector_profile.budget.tool_calls
     per_tier += mining.critic_draws * mining.critic_profile.budget.tool_calls
-    return max(1, per_tier * len(mining.actors))
+    total = per_tier * len(mining.actors)
+    schedule = mining.schedule
+    if schedule is not None and schedule.base.initial.actor_alias in mining.actors:
+        base = schedule.base
+        selectors = max(len(base.judges), schedule.steady_draws)
+        critics = max(len(base.critics), schedule.steady_draws)
+        scheduled = selectors * base.selector_profile.budget.tool_calls
+        scheduled += critics * base.critic_profile.budget.tool_calls
+        total += max(0, scheduled - per_tier)
+    return max(1, total)
 
 
 def admitted_transport(

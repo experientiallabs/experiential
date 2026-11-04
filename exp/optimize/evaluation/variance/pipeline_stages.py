@@ -41,11 +41,6 @@ from exp.optimize.evaluation.variance.actor_critic import (
     run_actor_critic,
 )
 from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
-from exp.optimize.evaluation.variance.build import (
-    plan_variance_build,
-    run_variance_build,
-    variance_build_costs,
-)
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
@@ -68,11 +63,8 @@ from exp.optimize.evaluation.variance.pipeline_behaviors import (
 )
 from exp.optimize.evaluation.variance.pipeline_errors import (
     attempt_error_points,
-    build_lines,
-    cluster_namer,
     error_point_reference,
     error_tag_costs,
-    naming_costs,
     probe_line,
     save_error_points,
     tag_tier_errors,
@@ -89,7 +81,6 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     trace_search,
     world_learning_traces,
 )
-from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_schedule import (
     require_scheduled_plan,
     scheduled_line,
@@ -130,7 +121,7 @@ from exp.simulation.mining.traceml_moves import MoveJudge, MoveJudgeError
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.rules.recall import RecallPolicy
 
-__all__ = ["BUILD_STAGE", "MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
+__all__ = ["MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
 
 
 def tier_job(
@@ -198,79 +189,6 @@ def run_group(
     if study is None:
         study = execute_continuation_job(project, job, code_revision=code_revision)
     return continuation_result_reference(project, job, code_revision=code_revision), study
-
-
-class _BuildStage:
-    """The ``variance-build`` stage."""
-
-    def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """The build reads only its spec and the project's completed build."""
-        del project, spec
-        return {}
-
-    def plan(
-        self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
-    ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
-        """Price every decision call of the variance build from its own plan."""
-        plan = plan_variance_build(project, spec.build.spec, code_revision=code_revision)
-        roles = ", ".join(f"{role} {count.traces}" for role, count in sorted(plan.roles.items()))
-        lines = (
-            f"Variance build: traces by role {roles}; exposure fixed before tagging; "
-            f"{plan.decision_calls} decision calls; final_evaluation is never tagged.",
-            *build_lines(project, spec, plan),
-        )
-        if plan.saved:
-            return (), (*lines, "The variance build report is saved; it replays.")
-        costs = variance_build_costs(project, plan, spec.build.spec.decision_alias)
-        return cost_lines(
-            (*costs, *naming_costs(project, spec, plan), *review_costs(project, spec.build, plan))
-        ), lines
-
-    def run(self, context: StageContext) -> StageRun:
-        """Run or replay the variance build."""
-        project, spec = context.project, context.spec.build.spec
-        namer = context.dependencies.build_namer
-        if namer is None and spec.cluster_naming is not None:
-            plan = plan_variance_build(project, spec, code_revision=context.code_revision)
-            namer = None if plan.saved else cluster_namer(context, plan)
-        reviewer = context.dependencies.build_reviewer
-        if reviewer is None and spec.environment_families is not None:
-            plan = plan_variance_build(project, spec, code_revision=context.code_revision)
-            reviewer = None if plan.saved else family_reviewer(context)
-        report = run_variance_build(
-            project,
-            spec,
-            code_revision=context.code_revision,
-            tagger=context.dependencies.build_tagger,
-            constructor=context.dependencies.build_constructor,
-            namer=namer,
-            reviewer=reviewer,
-        )
-        saved = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
-        outputs = BuildOutputs(
-            report=saved,
-            exposure=report.exposure,
-            world_model=report.world_model,
-            tag_retrieval=report.tag_retrieval,
-            trace_dataset=report.build.trace_dataset,
-            rules_traces=report.rules_stage_traces,
-            index=report.index,
-            retrieval_scope=report.retrieval_scope,
-            selected_probes=report.selected_probes,
-            probe_ranking=report.probe_ranking,
-        )
-        summary: JsonObject = {
-            "exposure": report.exposure.artifact_id,
-            "world_model": report.world_model.artifact_id,
-            "rules_traces": len(report.rules_stage_traces),
-            "probes": len(report.probes),
-            "selected_probes": list(report.selected_probes),
-            "cluster_admitted": None
-            if report.admission is None
-            else len(report.admission.admitted),
-        }
-        refs = (saved, report.exposure, report.world_model, report.tag_retrieval, report.index)
-        return StageRun(outputs, refs, summary)
 
 
 class _RulesStage:
@@ -974,9 +892,6 @@ def _rules_summary(report: RulesStageReport) -> JsonObject:
         "families_must_stay_diagnostic": list(report.families_must_stay_diagnostic),
     }
 
-
-BUILD_STAGE = _BuildStage()
-"""The owner-bound ``variance-build`` executor."""
 
 RULES_STAGE = _RulesStage()
 """The owner-bound ``rules`` executor."""

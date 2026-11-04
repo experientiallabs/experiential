@@ -49,6 +49,7 @@ from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
     RuleMemoryBinding,
 )
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
 from exp.optimize.evaluation.variance.build_records import FamilyScope
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.mining.environment_families import (
@@ -143,10 +144,16 @@ def family_simulator(
     """Assemble a family's unlearned simulator from its review and its build scope.
 
     Raises:
-        ValueError: The scope belongs to another family.
+        ValueError: The scope belongs to another family or lists other tasks, such as a family
+            read from a record saved before probes were placed.
     """
     if scope.family_id != family.family_id:
         raise ValueError(f"scope {scope.family_id} is not family {family.family_id}'s scope")
+    if set(scope.tasks) != set(family.task_ids()):
+        raise ValueError(
+            f"family {family.family_id} lists other tasks than its scope; load the family from "
+            "the scoping's saved environment-families record"
+        )
     return FamilySimulator(
         family_id=family.family_id,
         status=family.status,
@@ -260,11 +267,13 @@ def bind_runtime(
     """Freeze the family's runtime template over its own world model and learned rules.
 
     The template's manifest, catalog, allowance and probe paths are kept; its world model, rule
-    book, rule memory and tag binding are replaced by the family's.
+    book, rule memory and tag binding are replaced by the family's. Its instance facts describe
+    the template task's starting world, not the environment, so they are dropped.
     """
     frozen = GroundedRuntimeDefinition.model_validate(
         template.model_dump()
         | {
+            "facts": None,
             "world_model": simulator.world_model,
             "rule_book": simulator.rule_book,
             "rule_memory": simulator.rule_memory,
@@ -275,11 +284,16 @@ def bind_runtime(
 
 
 def definition_for(
-    simulator: FamilySimulator, task: TaskCase, initial_state: JsonObject
+    simulator: FamilySimulator,
+    task: TaskCase,
+    initial_state: JsonObject,
+    *,
+    facts: ReplayFacts | None = None,
 ) -> GroundedRuntimeDefinition:
     """Derive one task's runtime definition from the family's frozen template.
 
-    Only the task and its initial state differ between the family's tasks.
+    The task, its initial state and its own instance facts (none unless given) differ between
+    the family's tasks; nothing task-specific is carried over from the template's task.
 
     Raises:
         KeyError: The task is not in the family.
@@ -289,7 +303,8 @@ def definition_for(
     if simulator.runtime is None:
         raise ValueError(f"family {simulator.family_id} has no bound runtime template")
     return GroundedRuntimeDefinition.model_validate(
-        simulator.runtime.model_dump() | {"task": task, "initial_state": initial_state}
+        simulator.runtime.model_dump()
+        | {"task": task, "initial_state": initial_state, "facts": facts}
     )
 
 

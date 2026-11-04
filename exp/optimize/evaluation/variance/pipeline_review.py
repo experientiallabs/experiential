@@ -6,7 +6,7 @@ from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.variance.build_records import VarianceBuildPlan
-from exp.optimize.evaluation.variance.pipeline_spec import BuildSettings, StageContext
+from exp.optimize.evaluation.variance.pipeline_spec import BuildSettings
 from exp.simulation.mining.environment_review import CompatibilityReviewer
 
 
@@ -23,21 +23,23 @@ def review_costs(
     )
 
 
-def family_reviewer(context: StageContext) -> CompatibilityReviewer:
+def family_reviewer(
+    project: ProjectStore, build: BuildSettings, *, code_revision: str
+) -> CompatibilityReviewer:
     """Bind one reviewer whose calls use exact saved author-response replay and admission."""
-    settings = context.spec.build.reviewer
+    settings = build.reviewer
     if settings is None:
         raise ValueError("environment families need build.reviewer settings before execution")
 
     def draw(request: ModelRequest, *, identity: str) -> ModelResponse:
         """Buy or replay one exact compatibility request under the enclosing build lock."""
         _, response = author_response(
-            context.project,
+            project,
             settings,
             request,
             identity=identity,
             sources=(),
-            code_revision=context.code_revision,
+            code_revision=code_revision,
         )
         return response
 

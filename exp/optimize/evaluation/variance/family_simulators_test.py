@@ -231,3 +231,24 @@ def test_attempts_against_another_simulator_or_start_are_refused() -> None:
         run_isolated_attempts(world, task("t1"), start, (*slots, other), lambda s, slot: 0)
     with pytest.raises(ValueError, match="this task"):
         run_isolated_attempts(world, task("t2"), start, slots, lambda s, slot: 0)
+
+
+def test_a_derived_task_never_carries_the_template_tasks_instance_facts() -> None:
+    """Task B's definition has no fact of template task A, only the facts given for B."""
+    from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
+    from exp.simulation.world_model.executable_test import record_facts
+
+    with_a = GroundedRuntimeDefinition.model_validate(
+        template().model_dump() | {"facts": ReplayFacts(facts=record_facts("high"))}
+    )
+    shared = bind_runtime(simulator("t1", "t2"), with_a)
+    assert shared.runtime is not None and shared.runtime.facts is None
+
+    plain = definition_for(shared, task("t2"), {"items": []})
+    assert plain.facts is None
+    own = definition_for(
+        shared, task("t2"), {"items": []}, facts=ReplayFacts(facts=record_facts("low"))
+    )
+    assert own.facts is not None
+    priorities = [f.value for f in own.facts.facts.facts if f.key.endswith("/priority")]
+    assert priorities == ["low"]

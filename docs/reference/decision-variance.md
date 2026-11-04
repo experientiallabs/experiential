@@ -80,16 +80,21 @@ questions), and a failed draft is repaired within `repairs`.
   out of training unless `admit_uncertain` names it (status `admitted_uncertain`).
 
 `scope_families` (`variance/family_scopes.py`) then builds, per admitted family and keyed by its
-identity, a scoped tagged fit-only index over its members, the world model rebound to it, the
-world-learning traces its one rule memory is learned from, its tasks (mining-probe tasks placed by
-the fitted mixture's posterior over their source trace, `assign_clusters`) and a tag binding over
-those tasks, all recorded as `VarianceBuildReport.environment_families`. The record replays without
-a review call; the plan's `review_calls` is an upper bound.
+identity, a scoped tagged fit-only index over its members, the world model rebound to it
+(reconstructed from the family's members alone when the build constructs its world, so no other
+group's knowledge survives), the world-learning traces its one rule memory is learned from, its
+tasks (mining-probe tasks placed by the fitted mixture's posterior over their source trace,
+`assign_clusters`, only into a family whose contracts cover the task's tools) and a tag binding
+over those tasks, all recorded as `VarianceBuildReport.environment_families`. Placed tasks are
+saved in the scoping's `environment-families` record. The reviewer's model identity is part of the
+build identity, so a changed reviewer re-reviews and a family-enabled build never replays without
+one; the plan's `review_calls` is an upper bound.
 
 `FamilySimulator` (`variance/family_simulators.py`) is the one simulator definition per family:
 `learn_family_rules` learns its rules once per family and learner and replays them, `bind_runtime`
-freezes the runtime template over the family's world model and rules, and `definition_for` derives
-each task's definition by replacing only the task and its initial state. `plan_attempts` and
+freezes the runtime template over the family's world model and rules (dropping the template task's
+instance facts), and `definition_for` derives each task's definition from its own task, initial
+state and instance facts. `plan_attempts` and
 `run_isolated_attempts` make five actors times sixteen attempts eighty independent runs: each
 restores the same saved start into a fresh, isolated world through `restore_continuation_world`,
 and the start is verified unchanged.

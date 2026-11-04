@@ -188,6 +188,7 @@ def plan_variance_build(
     *,
     code_revision: str,
     decision_model: ModelSnapshot | None = None,
+    reviewer_model: ModelSnapshot | None = None,
 ) -> VarianceBuildPlan:
     """Summarize a variance build without credentials, provider calls or publication.
 
@@ -196,6 +197,8 @@ def plan_variance_build(
         spec: The registration.
         code_revision: Producing source identity.
         decision_model: Identity of an injected tagger; the catalog alias's when omitted.
+        reviewer_model: Identity of the compatibility reviewer, part of the run identity when
+            the spec requests environment families.
 
     Returns:
         Traces per role, decisions per view, embedding reuse and the run identity.
@@ -204,7 +207,7 @@ def plan_variance_build(
         ValueError: There is no completed build, a bank or alias is missing, or a rule names a
             view that is not tagged.
     """
-    return _prepare(project, spec, code_revision, decision_model).summary
+    return _prepare(project, spec, code_revision, decision_model, reviewer_model).summary
 
 
 def variance_build_costs(
@@ -272,7 +275,8 @@ def run_variance_build(
     if tagger is not None and tagger.cache is None:
         raise ValueError("a variance build tagger needs a project decision cache to replay")
     model = None if tagger is None else ModelSnapshot.model_validate(tagger.model_identity)
-    prepared = _prepare(project, spec, code_revision, model)
+    reviewed = None if reviewer is None else reviewer.model
+    prepared = _prepare(project, spec, code_revision, model, reviewed)
     identity, store = prepared.summary.identity, project.artifacts
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
@@ -321,6 +325,7 @@ def run_variance_build(
             tasks=prepared.tasks,
             reviewer=reviewer,
             code_revision=code_revision,
+            constructor=constructor,
         )
         families = report.environment_families
         dependencies = {
@@ -352,6 +357,7 @@ def _prepare(
     spec: VarianceBuildSpec,
     code_revision: str,
     model: ModelSnapshot | None,
+    reviewer: ModelSnapshot | None = None,
 ) -> _Prepared:
     """Load the build, freeze exposure, render units and compute the summary.
 
@@ -360,6 +366,7 @@ def _prepare(
         spec: The registration.
         code_revision: Producing source identity.
         model: Identity of an injected tagger, or None for the catalog alias's.
+        reviewer: Identity of the compatibility reviewer, keyed when families are requested.
 
     Returns:
         The prepared run.
@@ -432,6 +439,11 @@ def _prepare(
             "spec": spec.identity(code_revision),
             "build": build.model_dump(mode="json"),
             "decision_model": model.model_dump(mode="json"),
+            **(
+                {}
+                if spec.environment_families is None or reviewer is None
+                else {"reviewer": reviewer.model_dump(mode="json")}
+            ),
             "banks": {view: sha256_json(bank) for view, bank in sorted(banks.items())},
             "error_bank": None if errors is None else sha256_json(errors[0]),
         },

@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.tasks import load_task_set
+from exp.common.tasks import TaskCase, load_task_set
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import (
+    ConstructionSettings,
     VarianceBuildSpec,
     load_exposure_plan,
     load_tag_retrieval_binding,
@@ -21,14 +22,26 @@ from exp.optimize.evaluation.variance.build_test import (
     _tagger,
     variance_project,
 )
+from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.family_scopes import _place
 from exp.optimize.evaluation.variance.family_simulators import family_simulator
+from exp.optimize.evaluation.variance.family_simulators_test import ref
 from exp.simulation.mining.environment_families import (
     EnvironmentFamilySpec,
     load_environment_families,
+    review_environment_families,
 )
-from exp.simulation.mining.environment_families_test import answer, reviewer, split
-from exp.simulation.mining.environment_review import CompatibilitySpec
+from exp.simulation.mining.environment_families_test import (
+    answer,
+    clustering,
+    file_trace,
+    order_trace,
+    reviewer,
+    split,
+)
+from exp.simulation.mining.environment_review import CompatibilityReviewer, CompatibilitySpec
 from exp.simulation.mining.tag_clusters import ClusteringSpec
+from exp.simulation.mining.tagging import TagMatrix, TagRow
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -129,6 +142,8 @@ def test_each_family_gets_its_own_index_world_and_rule_inputs_and_uncertainty_st
     assert set(load_tag_retrieval_binding(project, scope.tag_retrieval).tasks) == placed
     shared = family_simulator(record.families[0], scope, scoping.families)
     assert shared.family_id == scope.family_id and shared.index == scope.index
+    assert {t.task_id for t in shared.tasks} == set(scope.tasks)
+    assert all(shared.task(task_id).role == "mining_probes" for task_id in placed)
 
     _, refusing = reviewer(first_half_compatible, refuse=True)
     replay = run_variance_build(
@@ -139,10 +154,24 @@ def test_each_family_gets_its_own_index_world_and_rule_inputs_and_uncertainty_st
         reviewer=refusing,
     )
     assert replay == report
-    saved_replay = run_variance_build(
-        project, registered, code_revision="test", tagger=_tagger(project, FakeDecisions())
+    with pytest.raises(ValueError, match="admitted reviewer"):
+        run_variance_build(
+            project, registered, code_revision="test", tagger=_tagger(project, FakeDecisions())
+        )
+    other_script, other = reviewer(lambda members, variant: answer("uncertain", members))
+    other = CompatibilityReviewer(
+        draw=other.draw, model=other.model.model_copy(update={"model_id": "other-reviewer"})
     )
-    assert saved_replay == report
+    changed = run_variance_build(
+        project,
+        registered,
+        code_revision="test",
+        tagger=_tagger(project, FakeDecisions()),
+        reviewer=other,
+    )
+    assert other_script.requests and changed.identity != report.identity
+    assert changed.environment_families is not None
+    assert not changed.environment_families.scopes
 
     admitted = run_variance_build(
         project,
@@ -154,3 +183,109 @@ def test_each_family_gets_its_own_index_world_and_rule_inputs_and_uncertainty_st
     assert admitted is not None and not admitted.uncertain
     assert [s.status for s in admitted.scopes] == ["compatible", "admitted_uncertain"]
     assert admitted.scopes[1].family_id == uncertain
+
+
+def construct(body: JsonObject, operation: str) -> JsonObject:
+    """Return fixed construction knowledge without contacting a model."""
+    del body, operation
+    return {
+        "interface": {
+            "tools": [{"name": "reply", "description": "Observed", "parameters": {}}],
+            "state_schema": {"type": "object"},
+        },
+        "claims": [
+            {
+                "statement": "Unobserved behavior is unknown",
+                "status": "unknown",
+                "origin": "model_prior",
+                "scope": "unseen calls",
+            }
+        ],
+        "text_rules": "Retain uncertainty.",
+    }
+
+
+def test_a_family_world_is_constructed_from_its_own_members_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With construction, the family's knowledge never cites the excluded uncertain group."""
+    project = variance_project(tmp_path, monkeypatch)
+    plain = run_variance_build(
+        project,
+        VarianceBuildSpec(
+            task_bank=TASK_BANK, observations_bank=OBSERVATIONS_BANK, clustering=CLUSTERING
+        ),
+        code_revision="test",
+        tagger=_tagger(project, FakeDecisions()),
+    )
+    learning = sorted(plain.retrieval_scope.ids)
+    FIRST[:] = learning[: len(learning) // 2]
+    registered = spec().model_copy(update={"construction": ConstructionSettings()})
+    _, bound = reviewer(first_half_compatible)
+
+    report = run_variance_build(
+        project,
+        registered,
+        code_revision="test",
+        tagger=_tagger(project, FakeDecisions()),
+        reviewer=bound,
+        constructor=construct,
+    )
+
+    assert report.constructed is not None
+    pooled = load_grounded_world_model_artifact(project.artifacts, report.constructed)
+    assert pooled.knowledge is not None and set(pooled.knowledge.source_trace_ids) == set(learning)
+    scoping = report.environment_families
+    assert scoping is not None
+    (scope,) = scoping.scopes
+    world = load_grounded_world_model_artifact(project.artifacts, scope.world_model)
+    assert world.knowledge is not None
+    assert set(world.knowledge.source_trace_ids) == set(FIRST) == set(scope.members)
+    assert world.construction_scope is not None
+    assert set(world.construction_scope.ids) == set(FIRST)
+
+
+def test_a_probe_is_never_placed_in_a_family_whose_contracts_lack_its_tools() -> None:
+    """After a split, a filesystem probe stays out of the only admitted (order) child."""
+    traces = {"o1": order_trace("o1"), "f1": file_trace("f1")}
+    fitted = clustering({"c00": ("o1", "f1")})
+
+    def decide(members: frozenset[str], variant: str) -> JsonObject:
+        """Split by environment; the filesystem child stays uncertain."""
+        del variant
+        if len(members) > 1:
+            return answer("split", members, subgroups=split(("o1",), ("f1",)))
+        return answer("compatible" if "o1" in members else "uncertain", members)
+
+    _, bound = reviewer(decide)
+    record = review_environment_families(fitted, bound, traces=traces, eligible=traces, held_out=())
+    probe = file_trace("probe-files")
+    task = TaskCase(
+        task_id="file-probe",
+        lineage_group_id="probe-lineage",
+        partition="fit",
+        instruction=probe.task,
+        tools=probe.tools,
+        source_trace_ids=("probe-files",),
+        workload_weight=1,
+        origin="mined",
+    )
+    plan = ExposurePlan(
+        bindings=ref("bindings"),
+        seed=0,
+        probe_fraction=0.2,
+        roles={"probe-lineage": "mining_probes"},
+        traces={"probe-files": "probe-lineage"},
+    )
+    matrix = TagMatrix(
+        view="task",
+        bank_id="fixture",
+        bank_version=1,
+        question_ids=("q0",),
+        rows=(TagRow(trace_id="probe-files", unit_hash="fixture", values=(1.0,)),),
+    )
+
+    placements, placed = _place(plan, (task,), fitted, (matrix,), record.families)
+
+    assert placements[0].family_id is None and not placed
+    assert placements[0].cluster_id == "c00" and "covering" in placements[0].reason

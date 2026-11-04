@@ -35,7 +35,7 @@ def scheduled_line(plan: RolloutPlan) -> str:
 
 def require_scheduled_plan(context: StageContext, plan: RolloutPlan) -> None:
     """Refuse schedule drift from the approved preview before any mining provider call."""
-    if context.plan is None or scheduled_line(plan) not in context.plan.lines:
+    if plan.spec is None or context.plan is None or scheduled_line(plan) not in context.plan.lines:
         raise ValueError(
             "the scheduled rollout changed since spend planning; review and approve a fresh plan"
         )

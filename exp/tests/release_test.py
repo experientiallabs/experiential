@@ -695,6 +695,10 @@ def _installed_release_driver() -> None:
     assert "site-packages" in package_path.parts, package_path
     assert not any(part == "experiential" for part in package_path.parts)
 
+    # Host admission accounting and local preferences belong to this isolated evidence run.
+    os.environ["XDG_DATA_HOME"] = str(execution_root / "xdg-data")
+    os.environ["XDG_CONFIG_HOME"] = str(execution_root / "xdg-config")
+
     class ProviderState:
         """Thread-safe deterministic request log for the loopback fake provider."""
 

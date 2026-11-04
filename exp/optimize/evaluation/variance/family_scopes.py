@@ -8,12 +8,16 @@ identity:
 
 - a scoped, tagged fit-only index over its members that are in the build's tagged retrieval
   scope, reusing the build's saved vectors exactly as the build-wide index does;
-- the build's world model (or its constructed one) rebound to that index;
+- the build's world model rebound to that index; when the build constructed its world (or the
+  build's world carries knowledge), the family's world is reconstructed from its own members
+  only, so no knowledge from another family or an excluded group survives;
 - the world-learning traces its one rule memory is learned from (the rules stage runs once per
   family over exactly these);
 - its tasks: world-learning tasks whose source traces are members, and mining-probe tasks placed
-  by the fitted mixture's posterior over their source trace's tags (a split cluster's probe goes
-  to the one sub-family whose reconciled contracts cover the task's tools, or stays unplaced);
+  by the fitted mixture's posterior over their source trace's tags, into the one admitted family
+  of that cluster whose reconciled contracts cover the task's tools (otherwise unplaced). Placed
+  tasks are saved into the scoping's ``environment-families`` record, so a family loaded from
+  it lists exactly its scope's tasks;
 - a tag retrieval binding over its placed probe tasks, under the build's treatment policy.
 
 Uncertain groups that are not admitted are reported and left out of training. Held-out traces
@@ -22,14 +26,16 @@ never enter: the clustering is over world learning, and a final-evaluation trace
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace
 from exp.optimize.evaluation.variance.build_records import (
     BINDING_TYPE,
+    ConstructionSettings,
     FamilyScope,
     FamilyScoping,
     ProbePlacement,
@@ -49,7 +55,8 @@ from exp.simulation.mining.environment_families import (
     admitted_families,
     environment_families,
     family_task,
-    with_tasks,
+    persist_environment_families,
+    with_placed,
 )
 from exp.simulation.mining.environment_review import CompatibilityReviewer
 from exp.simulation.mining.error_tags import load_error_tags
@@ -61,7 +68,14 @@ from exp.simulation.retrieval.embedding import RAGEmbeddingCache
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.retrieval.tags import TagRetrievalBinding, TaskQueryTags
-from exp.simulation.world_model.runtime import persist_scoped_world_model
+from exp.simulation.world_model.construction import construct_world_model
+from exp.simulation.world_model.runtime import (
+    load_grounded_world_model_artifact,
+    persist_scoped_world_model,
+)
+
+Constructor = Callable[[JsonObject, str], JsonObject]
+"""Admitted world-model constructor, as :func:`construct_world_model` takes it."""
 
 
 def require_family_review(spec: VarianceBuildSpec, reviewer: CompatibilityReviewer | None) -> None:
@@ -85,6 +99,7 @@ def scope_families(
     tasks: Sequence[TaskCase],
     reviewer: CompatibilityReviewer | None,
     code_revision: str,
+    constructor: Constructor | None = None,
 ) -> VarianceBuildReport:
     """Review the build's clusters into families and give each its own simulator inputs.
 
@@ -95,13 +110,18 @@ def scope_families(
         tasks: Build tasks; held-out ones are never attached.
         reviewer: Admitted compatibility reviewer.
         code_revision: Producing source identity.
+        constructor: Admitted world-model constructor. When the build constructed its world,
+            or the build's world carries knowledge from traces outside a family, each family's
+            world is reconstructed from its own members only; without a constructor that is
+            refused.
 
     Returns:
         The report with ``environment_families`` set, or unchanged when none were requested.
 
     Raises:
-        ValueError: Families are requested without a clustering or a reviewer, or a family's
-            index needs a vector the build's checkpoint lacks.
+        ValueError: Families are requested without a clustering or a reviewer, a family's
+            index needs a vector the build's checkpoint lacks, or a family's world would keep
+            knowledge from outside the family and no constructor is given.
     """
     spec = report.spec.environment_families
     if spec is None:
@@ -114,7 +134,7 @@ def scope_families(
     clustering = load_tag_clustering(store, report.clustering)
     learning = {t for t in plan.traces if plan.role_of(t) == "world_learning"}
     held_out = {t for t in plan.traces if plan.role_of(t) == "final_evaluation"}
-    record, saved = environment_families(
+    record, reviewed = environment_families(
         store,
         clustering,
         reviewer,
@@ -132,7 +152,11 @@ def scope_families(
         errors = load_error_tags(store, report.errors).matrix
         matrices.append(errors.model_copy(update={"view": "errors"}))
     placements, placed = _place(plan, tasks, clustering, matrices, admitted)
-    admitted = tuple(with_tasks(f, placed.get(f.family_id, ())) for f in admitted)
+    record = with_placed(record, placed)
+    saved = persist_environment_families(
+        store, record, code_revision=code_revision, inputs=(reviewed,)
+    )
+    admitted = admitted_families(record, spec.admit_uncertain, traces=traces)
     task_matrix = next(m for m in matrices if m.view == "task")
     policy = load_tag_retrieval_binding(project, report.tag_retrieval).policy
     serving = load_rag_index(store, build.serving_rag.artifact_id).index
@@ -140,7 +164,8 @@ def scope_families(
     tags = load_rag_index(store, report.index.artifact_id).index.trace_tags
     embedder = saved_vector_embedder(serving)
     lineage = load_completed_build_rag_lineage_bindings(store, build)
-    source_world = report.constructed or build.world_model
+    base = load_grounded_world_model_artifact(store, build.world_model)
+    rebuild = report.constructed is not None or base.knowledge is not None
     in_scope = set(report.retrieval_scope.ids)
     scopes: list[FamilyScope] = []
     left_out: dict[str, str] = {}
@@ -171,7 +196,20 @@ def scope_families(
             trace_tags=tags,
         )
         index = artifact_input(persisted.manifest)
-        world = persist_scoped_world_model(store, source_world, index, retrieval_scope=scope)
+        source_world, construction = build.world_model, None
+        if rebuild:
+            construction = CorpusScope.declare(
+                name="family-construction-" + family.family_id[-20:],
+                kind="trace",
+                ids=family.members,
+                source_plan=sha256_json(plan),
+            )
+            source_world = _construct(
+                project, report, construction, traces, constructor, family.family_id, code_revision
+            )
+        world = persist_scoped_world_model(
+            store, source_world, index, retrieval_scope=scope, construction_scope=construction
+        )
         queries: dict[str, TaskQueryTags] = {}
         recorded = persisted.index.trace_tags
         for task in family.tasks:
@@ -236,10 +274,10 @@ def _place(
             rows.append(ProbePlacement(task_id=task.task_id, reason="no tagged source trace"))
             continue
         cluster, posterior = where[trace]
-        candidates = [f for f in families if f.cluster_id == cluster]
         tools = {tool.name for tool in task.tools}
-        if len(candidates) > 1:
-            candidates = [f for f in candidates if tools <= set(f.tool_contracts)]
+        candidates = [
+            f for f in families if f.cluster_id == cluster and tools <= set(f.tool_contracts)
+        ]
         found = ProbePlacement(
             task_id=task.task_id, trace_id=trace, cluster_id=cluster, posterior=posterior, reason=""
         )
@@ -247,7 +285,8 @@ def _place(
             why = (
                 f"cluster {cluster} has no admitted family"
                 if not any(f.cluster_id == cluster for f in families)
-                else f"{len(candidates)} families of cluster {cluster} cover the task's tools"
+                else f"{len(candidates)} admitted families of cluster {cluster} have contracts "
+                f"covering the task's tools {sorted(tools)}"
             )
             rows.append(found.model_copy(update={"reason": why}))
             continue
@@ -256,3 +295,46 @@ def _place(
         why = f"posterior {posterior:.3f} in cluster {cluster}; family {family.path}"
         rows.append(found.model_copy(update={"family_id": family.family_id, "reason": why}))
     return tuple(rows), placed
+
+
+def _construct(
+    project: ProjectStore,
+    report: VarianceBuildReport,
+    scope: CorpusScope,
+    traces: Mapping[str, Trace],
+    constructor: Constructor | None,
+    family_id: str,
+    code_revision: str,
+) -> ArtifactInput:
+    """Reconstruct the world model from exactly one family's members.
+
+    Raises:
+        ValueError: No constructor is given.
+    """
+    if constructor is None:
+        raise ValueError(
+            f"family {family_id} would keep world knowledge constructed from traces outside "
+            "it; pass an admitted constructor so each family's world is built from its own "
+            "members"
+        )
+    store, build = project.artifacts, report.build
+    settings = report.spec.construction or ConstructionSettings()
+    world = load_grounded_world_model_artifact(store, build.world_model)
+    built = construct_world_model(
+        tuple(traces[trace] for trace in scope.ids),
+        store=store,
+        serving_rag=build.serving_rag,
+        complete=constructor,
+        model_alias=world.model_alias,
+        model=world.model,
+        run_id=f"{report.identity}-construction-{family_id}",
+        clock=lambda: datetime.now(UTC),
+        deadline=datetime.now(UTC) + timedelta(minutes=settings.deadline_minutes),
+        code_revision=code_revision,
+        top_k=world.top_k,
+        construction_guidance=settings.construction_guidance,
+        prediction_guidance=settings.prediction_guidance,
+        construction_scope=scope,
+        lineage_bindings=load_completed_build_rag_lineage_bindings(store, build),
+    )
+    return artifact_input(built.simulator.manifest)
