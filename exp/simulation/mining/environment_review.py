@@ -46,7 +46,7 @@ from exp.common.traces import Trace
 from exp.simulation.rules.contracts import parse_tool_contracts, trace_locator, trajectory_view
 from exp.simulation.rules.model import ToolContract
 
-ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v1"
+ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v2"
 """Version of the review prompts, variants, tools, packet and checks; bump when any changes."""
 
 REVIEW_TOOL = "submit_review"
@@ -451,6 +451,7 @@ def _loop(
             "environment-review",
             {
                 "protocol": ENVIRONMENT_REVIEW_PROTOCOL,
+                "model": reviewer.model.model_dump(mode="json"),
                 "scope": scope,
                 "variant": variant,
                 "turn": turns,
