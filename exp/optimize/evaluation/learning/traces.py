@@ -519,19 +519,10 @@ def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...
         Replay cases in learning order.
     """
     build = _build(project)
-    # Cases are a pure function of the immutable build graph and scope; one build's learning
-    # pass asks for them several times, and each derivation re-extracts every trace.
+    # A pure function of the immutable build graph and scope, asked for several times per pass.
     key = (str(project.paths.root), build.model_dump_json(), scope)
-    if key not in _LEARNING_CASES:
-        _LEARNING_CASES.clear()
-        _LEARNING_CASES[key] = _derive_learning_cases(project, build, scope)
-    return _LEARNING_CASES[key]
-
-
-def _derive_learning_cases(
-    project: ProjectStore, build: ProjectBuildArtifacts, scope: Scope
-) -> tuple[ReplayCase, ...]:
-    """Derive every replayable case in scope from one completed build (see learning_cases)."""
+    if key in _LEARNING_CASES:
+        return _LEARNING_CASES[key]
     bindings = {
         row.trace_id: row
         for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
@@ -566,7 +557,9 @@ def _derive_learning_cases(
         case = replay_case(task, trace, calls, exchanges=exchanges[trace.trace_id])
         if case is not None:
             cases.append(case)
-    return tuple(cases)
+    _LEARNING_CASES.clear()
+    _LEARNING_CASES[key] = tuple(cases)
+    return _LEARNING_CASES[key]
 
 
 def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
