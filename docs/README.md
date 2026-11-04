@@ -13,6 +13,7 @@ results, and plans do not live here.
 | `reference/task-hardening.md` | Task-validity checks (leakage, closed-book, controls) and bounded hardening of saturated factory worlds: specs, rules, bands and limits. |
 | `reference/instance-facts.md` | Backend-derived instance facts from task input files: the `derive-facts` action, the typed lossless workbook encoding, validation, refusals, bounds and views. |
 | `reference/decision-cascade.md` | Cheap next-action decisions with the main model as fallback: labels on reached states, threshold fit by a registered objective, held-out closed-loop confirmation and the versioned runtime policy. |
+| `reference/decision-variance.md` | Decision-variance environments: data roles before tagging, the rules stage kept apart from state, judge and critic screening, coherent variants, executed witnesses, competing actions from one checkpoint, fresh confirmation, computed training eligibility and the milestone comparison. |
 | `reference/admission-policy.md` | Per-dimension trajectory admission policies: applicability, predeclared margins, family-clustered calibration and the export consumers. |
 | `reference/trajectory-derived-equivalence.md` | Judge rubrics derived from admitted development trajectories: derive, review and freeze, family exclusion, behavior-assessable pairs and per-criterion reporting. |
 | `reference/evidence-reading.md` | Bounded objective-driven evidence reading during learning investigations: budgets, pinned policy, replay and limits. |
