@@ -12,6 +12,25 @@ from exp.runtime.models.providers.thinking_budget import (
 )
 
 
+def _effort_refusal(effort: str | None, qualified: Sequence[str]) -> str:
+    """Name the effort that blocked probabilities and the efforts that would serve them.
+
+    The gateway never changes effort to admit probabilities, so without this a
+    caller sending e.g. ``medium`` (which a plain request would coerce) sees only
+    a generic route refusal and cannot tell what to change.
+    """
+    if not qualified:
+        return "This model route cannot preserve the requested token probabilities."
+    choices = ", ".join(qualified)
+    requested = (
+        "the model's default reasoning effort" if effort is None else f"reasoning_effort {effort!r}"
+    )
+    return (
+        f"Token probabilities are not available with {requested} on this model. "
+        f"Use reasoning_effort one of: {choices}, or disable logprobs."
+    )
+
+
 def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: GatewayRequest) -> None:
     """Reject probability controls that any remaining deployment cannot preserve.
 
@@ -44,23 +63,26 @@ def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: Gatew
             code="unsupported_parameter",
         )
     for profile in profiles:
-        compatible = profile.dialect == "openai_compatible" and profile.supports_logprobs is True
-        if profile.supports_reasoning:
-            compatible = (
-                compatible
-                and (
-                    request.reasoning_effort
-                    if request.reasoning_effort is not None
-                    else profile.reasoning_effort
-                )
-                in profile.logprobs_reasoning_efforts
-            )
-        if not compatible:
+        if not (profile.dialect == "openai_compatible" and profile.supports_logprobs is True):
             raise ProviderParameterError(
                 message="This model route cannot preserve the requested token probabilities.",
                 param=parameter,
                 code="unsupported_parameter",
             )
+        if profile.supports_reasoning:
+            effort = (
+                request.reasoning_effort
+                if request.reasoning_effort is not None
+                else profile.reasoning_effort
+            )
+            if effort not in profile.logprobs_reasoning_efforts:
+                raise ProviderParameterError(
+                    message=_effort_refusal(effort, profile.logprobs_reasoning_efforts),
+                    param=(
+                        "reasoning_effort" if request.reasoning_effort is not None else parameter
+                    ),
+                    code="unsupported_parameter",
+                )
         if emulated_stop_sequences(profile.dialect, request):
             raise ProviderParameterError(
                 message="Chat logprobs cannot be combined with gateway-emulated stop sequences.",
