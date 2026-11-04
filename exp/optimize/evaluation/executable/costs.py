@@ -151,6 +151,12 @@ def _grounded_costs(
                 project, spec.prediction_reading.reader_alias, spec.maximum_physical_attempts
             )
         )
+    if spec.rule_memory is not None:
+        components.append(
+            decision_cost(
+                project, spec.rule_memory.recall.jev_alias, spec.maximum_physical_attempts
+            )
+        )
     # All roles share one ledger. Summing each role at that ceiling overestimates the mixture,
     # but cannot omit an expensive role or assume a favorable allocation of requests.
     return tuple(components)

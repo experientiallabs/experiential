@@ -22,10 +22,17 @@ in a :class:`~exp.simulation.induction.sandbox.ProgramSandbox` inside their vali
 every other call, and every call outside a program's domain, is predicted by the grounded model
 under the bound rule book. The coverage is part of the definition, so every identity derived from
 it, including the world digest a judge binds, covers the programs.
+
+A rule memory set is bound likewise: the definition pins one saved ``rule-memory-set`` artifact
+and a recall policy. The runtime verifies every file against its digest, and before each
+prediction a native Jev recall selects only the rule files that govern the current call, within
+a byte budget. Recall decisions go through the project decision cache, so a replayed step makes
+no call, and every step's receipt (scores, selection, cost) is retained. The binding is part of
+the definition, so the runtime identity and the world digest cover the exact memory set.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Self
 
@@ -59,6 +66,7 @@ from exp.runtime.environments.world_contracts import (
     WorldManifest,
 )
 from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldBackendFactory
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
 from exp.runtime.models.providers.admitted_transport import (
@@ -75,11 +83,14 @@ from exp.simulation.development_scope import require_development_task
 from exp.simulation.induction.backend import InducedWorldFactory
 from exp.simulation.induction.contracts import InducedCoverage
 from exp.simulation.induction.sandbox import ProgramSandbox
+from exp.simulation.mining.tagging import DecisionCache
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
 from exp.simulation.retrieval.tags import TagRetrievalBinding
+from exp.simulation.rules.memory_set import MemorySet, load_memory_set
 from exp.simulation.rules.model import RuleBook
+from exp.simulation.rules.recall import RECALL_PROTOCOL, RecallPolicy, RuleRecall
 from exp.simulation.rules.rulebook import RULES_JSON
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
 from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
@@ -91,6 +102,18 @@ from exp.simulation.world_model.runtime import (
 )
 
 _PREDICTOR_PART = "predictor.json"
+
+
+class RuleMemoryBinding(ContractModel):
+    """A pinned rule memory set and the per-step recall policy over it.
+
+    Attributes:
+        memory_set: Saved ``rule-memory-set`` artifact; its manifest digests every file.
+        recall: Frozen recall policy, naming the admitted native decision alias.
+    """
+
+    memory_set: ArtifactInput
+    recall: RecallPolicy
 
 
 class GroundedRuntimeDefinition(ContractModel):
@@ -130,6 +153,9 @@ class GroundedRuntimeDefinition(ContractModel):
             manifest. Covered tools run as exact sandboxed code inside their validated domain;
             everything else goes to the grounded model and its rule-book check. Absent, the
             definition and every derived identity are unchanged.
+        rule_memory: Optional pinned rule memory set with its recall policy. Each prediction
+            receives only the rule files recalled for its call, alongside the task memory.
+            Absent, the definition and every derived identity are unchanged.
     """
 
     task: TaskCase
@@ -157,6 +183,9 @@ class GroundedRuntimeDefinition(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     programs: InducedCoverage | None = Field(default=None, exclude_if=lambda value: value is None)
+    rule_memory: RuleMemoryBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _starting_facts_only(self) -> Self:
@@ -351,8 +380,9 @@ def preflight_grounded_runtime(project: ProjectStore, spec: GroundedRuntimeDefin
     Raises:
         ValueError: The task is not development data, the state or probe disagrees with the
             manifest, the catalog changed, a provider wire is not admitted, the rule book or
-            tag retrieval binding artifact differs from its reference, or a memory-first
-            simulator is given a tag binding.
+            tag retrieval binding artifact differs from its reference, a memory-first
+            simulator is given a tag binding, or the rule memory set or its recall alias is not
+            the pinned, admitted one.
     """
     _checked(project, spec)
 
@@ -365,8 +395,9 @@ def _checked(
     str | None,
     RuleBook | None,
     TagRetrievalBinding | None,
+    MemorySet | None,
 ]:
-    """Run every credential-free check; return catalog, simulator, embedder, rules and tags."""
+    """Run every credential-free check; return catalog, simulator, embedder, rules, tags, memory."""
     require_development_task(project.artifacts, spec.task)
     if spec.task.reference_answer is not None:
         raise ValueError("grounded executable tasks must not contain private expected answers")
@@ -408,7 +439,44 @@ def _checked(
         tag_retrieval = load_tag_retrieval_binding(project, spec.tag_retrieval)
         if artifact.original_evidence == "none":
             raise ValueError("a memory-first simulator retrieves nothing to rank by tags")
-    return catalog, artifact, embedder_alias, rule_book, tag_retrieval
+    rule_memory = None
+    if spec.rule_memory is not None:
+        alias = catalog.models.get(spec.rule_memory.recall.jev_alias)
+        if alias is None or catalog.connections[alias.connection].provider != "typesafe":
+            raise ValueError("rule memory recall requires the admitted native decision wire")
+        rule_memory = load_memory_set(project.artifacts, spec.rule_memory.memory_set)
+    return catalog, artifact, embedder_alias, rule_book, tag_retrieval, rule_memory
+
+
+def recall_decider(
+    project: ProjectStore,
+    decide: Callable[[DecisionRequest], JsonObject],
+    model: JsonObject,
+) -> Callable[[DecisionRequest], JsonObject]:
+    """Buy each recall decision once through the project decision cache, replaying repeats.
+
+    Args:
+        project: Project owning the cache.
+        decide: Admitted native decision call.
+        model: Decision model identity, part of every cache key.
+
+    Returns:
+        A decision call that replays a saved answer without dispatching.
+    """
+    cache = DecisionCache(project.paths)
+
+    def cached(request: DecisionRequest) -> JsonObject:
+        """Replay or buy one recall decision."""
+        key = sha256_json(
+            {
+                "protocol": RECALL_PROTOCOL,
+                "request": sha256_json(request.model_dump(mode="json")),
+                "model": model,
+            }
+        )
+        return cache.purchase(key, request, lambda: decide(request))
+
+    return cached
 
 
 def _runtime(
@@ -417,7 +485,9 @@ def _runtime(
     provider_grant: ProviderGrant | None = None,
 ) -> ContinuationRuntime:
     """Compose identical state/predictor definitions under one explicitly selected call ledger."""
-    catalog, artifact, embedder_alias, rule_book, tag_retrieval = _checked(project, spec)
+    catalog, artifact, embedder_alias, rule_book, tag_retrieval, memory_set = _checked(
+        project, spec
+    )
     revision = installed_execution_revision()
     identity_fields: JsonObject = {"definition": spec.model_dump(mode="json"), "code": revision}
     if provider_grant is not None:
@@ -554,12 +624,27 @@ def _runtime(
                         (spec.world_model,)
                         + (() if provider_grant is None else (provider_grant.registration,))
                         + (() if spec.rule_book is None else (spec.rule_book,))
-                        + (() if spec.tag_retrieval is None else (spec.tag_retrieval,)),
+                        + (() if spec.tag_retrieval is None else (spec.tag_retrieval,))
+                        + (() if spec.rule_memory is None else (spec.rule_memory.memory_set,)),
                         key=lambda reference: reference.artifact_id,
                     )
                 ),
             ),
             files={"event.json": event},
+        )
+
+    recall = None
+    if spec.rule_memory is not None and memory_set is not None:
+        native_recall = registry.resolve(spec.rule_memory.recall.jev_alias)
+        recall = RuleRecall(
+            memory_set,
+            spec.rule_memory.recall,
+            decide=recall_decider(
+                project,
+                decision_caller(native_recall, transport, deadline, lambda: datetime.now(UTC)),
+                native_recall.snapshot.model_dump(mode="json"),
+            ),
+            record=receipt_recorder(project, identity, revision, lambda: datetime.now(UTC)),
         )
 
     grounded_factory = GroundedWorldFactory(
@@ -580,6 +665,7 @@ def _runtime(
         memory=memory,
         maximum_reasks=spec.maximum_reasks,
         rule_book=rule_book,
+        rule_memory=recall,
     )
     factory: WorldBackendFactory = grounded_factory
     sandbox = None

@@ -63,6 +63,13 @@ from exp.simulation.world_model.session_research import (
     SessionResearch,
 )
 
+LEARNED_RULES_GUIDANCE = (
+    "\nLearned environment rules recalled for this call from world-learning research. Each "
+    "has a truism, why it holds, and a weighed status; a contradicted or unknown rule is not "
+    "settled behavior, and none of them is this instance's state: "
+)
+"""Framing of the per-step recalled rule files attached to the called tool's description."""
+
 
 class _GroundedJsonProposal(ProposedTransition):
     """Typed observations plus compact edits to the candidate state.
@@ -228,11 +235,14 @@ class GroundedTransitionEngine:
         reply_bindings: Mapping[str, tuple[ReplyStateBinding, ...]] | None = None,
         state_schemas: Mapping[str, JsonObject] | None = None,
         operation_id: str | None = None,
+        learned_rules: Sequence[JsonObject] = (),
     ) -> PreparedPrediction:
         """Render the typed context once, pack it, and frame the output protocol.
 
         Memory enters as typed channels before rendering, so packing and capacity admission
-        see the complete request and no caller edits serialized prompt text.
+        see the complete request and no caller edits serialized prompt text. Rule files recalled
+        for this call (``learned_rules``) are attached to the called tool's description, with
+        their status, so only the rules relevant to this step reach the predictor.
         """
         if state_policy is not None and self.output_protocol != "json-tool":
             raise ValueError("bounded executable prediction requires the json-tool protocol")
@@ -341,6 +351,23 @@ class GroundedTransitionEngine:
                             }
                         )
                         if reply_bindings.get(tool.name)
+                        else tool
+                        for tool in task.tools
+                    )
+                }
+            )
+        if learned_rules:
+            task = task.model_copy(
+                update={
+                    "tools": tuple(
+                        tool.model_copy(
+                            update={
+                                "description": tool.description
+                                + LEARNED_RULES_GUIDANCE
+                                + json.dumps(list(learned_rules), sort_keys=True)
+                            }
+                        )
+                        if tool.name in {action.name for action in actions}
                         else tool
                         for tool in task.tools
                     )

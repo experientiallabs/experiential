@@ -1018,3 +1018,152 @@ def test_bound_programs_serve_covered_tools_and_the_model_answers_the_rest(
                 "programs": coverage.model_dump(mode="json"),
             }
         )
+
+
+class _RecallWire:
+    """One shared physical wire: native recall decisions and scripted predictions."""
+
+    def __init__(self) -> None:
+        """Start with no recorded requests."""
+        self.decisions: list[JsonObject] = []
+        self.predictions: list[JsonObject] = []
+
+    def post(
+        self, url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Score the inspect rule as governing, everything else as irrelevant."""
+        del headers, timeout_seconds
+        if url.endswith("/systemone"):
+            self.decisions.append(payload)
+            state = payload["state"]
+            assert isinstance(state, dict) and isinstance(state["index"], list)
+            answers: JsonObject = {}
+            for i, row in enumerate(state["index"]):
+                assert isinstance(row, dict)
+                relevant = row["tool"] == "inspect"
+                answers[f"governs_{i}"] = {"type": "score", "score": 2.0 if relevant else 0.0}
+                answers[f"applies_{i}"] = {"type": "noul", "noul": 0.9 if relevant else 0.1}
+            return JsonHttpResponse(
+                status_code=200, body={"answers": answers, "usage": {"cost": 0.0001}}
+            )
+        self.predictions.append(payload)
+        return _prediction("read")
+
+
+def _rule_memory(project: ProjectStore, truism: str) -> ArtifactInput:
+    """Save a two-tool memory set whose inspect rule has ``truism``."""
+    from exp.simulation.rules.memory_set import MemorySet, RuleFile, save_memory_set
+
+    def rule(rule_id: str, tool: str, text: str) -> RuleFile:
+        return RuleFile(
+            rule_id=rule_id,
+            topic=tool,
+            tool=tool,
+            kind="observation",
+            truism=text,
+            reasoning=f"Recorded replies of {tool} always showed it: {text}",
+            status="supported",
+            status_rationale="Seen in every recorded call.",
+        )
+
+    memory = MemorySet(
+        tools=("archive", "inspect"),
+        rules=(
+            rule("observation.inspect.1", "inspect", truism),
+            rule("observation.archive.1", "archive", "Archiving hides the record."),
+        ),
+    )
+    return save_memory_set(
+        project.artifacts,
+        memory,
+        artifact_id="memory-" + sha256_json(truism)[:12],
+        inputs=(),
+        code_revision="test",
+    )
+
+
+def test_bound_rule_memory_recalls_only_relevant_files_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recall injects only the governing rule, records it per step, replays, and binds identity."""
+    from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
+    from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
+    from exp.simulation.rules.recall import RecallPolicy
+
+    project, fidelity = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    reference = _rule_memory(project, "Inspecting a record shows its pending status.")
+    base = _record_spec(project, fidelity).model_copy(update={"maximum_physical_attempts": 10})
+    spec = base.model_copy(
+        update={
+            "rule_memory": RuleMemoryBinding(
+                memory_set=reference, recall=RecallPolicy(jev_alias="jev")
+            )
+        }
+    )
+    assert "rule_memory" not in base.model_dump(mode="json")
+    wire = _RecallWire()
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: wire)
+
+    def first_step(definition: GroundedRuntimeDefinition) -> WorldCheckpoint:
+        with (
+            continuation_runtime(project, definition.model_dump(mode="json")) as runtime,
+            runtime.world.open(definition.task) as world,
+        ):
+            assert world.execute(ToolCall(name="inspect", call_id="read", arguments={})).content
+            return world.checkpoint()
+
+    saved = first_step(spec)
+    assert len(wire.decisions) == 1
+    prompt = json.dumps(wire.predictions[-1])
+    assert "Inspecting a record shows its pending status." in prompt
+    assert "Archiving hides the record." not in prompt
+    intents = [
+        json.loads(project.artifacts.read_bytes(key, "event.json"))
+        for key in project.artifacts.list_ids(artifact_type="grounded-world-prediction")
+    ]
+    (intent,) = [event for event in intents if event["stage"] == "intent"]
+    recall = intent["payload"]["rule_recall"]
+    assert recall["selected"] == ["observation.inspect.1"] and recall["usd"] == 0.0001
+    assert project.artifacts.list_ids(artifact_type="jev-receipt")
+
+    first_step(spec)
+    assert len(wire.decisions) == 1, "a replayed step recalls from the cache without a call"
+
+    other = spec.model_copy(
+        update={
+            "rule_memory": RuleMemoryBinding(
+                memory_set=_rule_memory(project, "Inspecting a record shows it is done."),
+                recall=RecallPolicy(jev_alias="jev"),
+            )
+        }
+    )
+    assert isinstance(saved, ExecutableCheckpoint)
+    changed = first_step(other)
+    assert isinstance(changed, ExecutableCheckpoint)
+    assert changed.backend_sha256 != saved.backend_sha256
+    assert sha256_json(other) != sha256_json(spec) != sha256_json(base)
+
+    stale = reference.model_copy(update={"sha256": "0" * 64})
+    with pytest.raises(ValueError, match="manifest digest changed"):
+        preflight_grounded_runtime(
+            project,
+            spec.model_copy(
+                update={
+                    "rule_memory": RuleMemoryBinding(
+                        memory_set=stale, recall=RecallPolicy(jev_alias="jev")
+                    )
+                }
+            ),
+        )
+    with pytest.raises(ValueError, match="native decision wire"):
+        preflight_grounded_runtime(
+            project,
+            spec.model_copy(
+                update={
+                    "rule_memory": RuleMemoryBinding(
+                        memory_set=reference, recall=RecallPolicy(jev_alias="model")
+                    )
+                }
+            ),
+        )

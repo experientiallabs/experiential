@@ -13,6 +13,12 @@ An optional rule book judges every proposal before it commits, with ``check_prop
 over the simulated domains before and after, the action and its proposed reply. A proposal the
 rules reject is refused like any unusable proposal and re-asked with the broken rules as feedback.
 The rule book changes the frozen definition only when present.
+
+An optional rule memory recall selects, before each prediction, the few rule files of a pinned
+memory set that govern the current call (typed Jev decisions over the set's index), and attaches
+only those to the called tool. Its identity, which covers the memory set digest and the recall
+policy, joins the frozen definition only when present, and every step's recall receipt is part
+of that step's recorded intent.
 """
 
 import json
@@ -46,6 +52,7 @@ from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.engines.transition import Completion, ProposedObservation
 from exp.simulation.rules.checker import TransitionVerdict, check_proposed_transition
 from exp.simulation.rules.model import RuleBook, Transition
+from exp.simulation.rules.recall import RuleRecall
 from exp.simulation.world_model.frozen_memory import TaskView
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
 
@@ -81,6 +88,8 @@ class GroundedWorldFactory:
         rule_book: Optional learned rules every proposal must satisfy before it commits. A
             proposal they reject is refused and re-asked with the verdict's reasons; the
             allowing verdict of a committed proposal is recorded as a ``verdict`` event.
+        rule_memory: Optional per-step recall over a pinned rule memory set; only the recalled
+            rule files reach each prediction.
     """
 
     def __init__(
@@ -94,6 +103,7 @@ class GroundedWorldFactory:
         memory: TaskView | None = None,
         maximum_reasks: int = 0,
         rule_book: RuleBook | None = None,
+        rule_memory: RuleRecall | None = None,
     ) -> None:
         """Bind one task without retrieving, loading credentials or calling a provider."""
         if engine.output_protocol != "json-tool":
@@ -106,6 +116,8 @@ class GroundedWorldFactory:
         self.maximum_reasks = maximum_reasks
         self.rule_book = None if rule_book is None else rule_book.model_copy(deep=True)
         self._rule_book_identity = None if rule_book is None else sha256_json(rule_book)
+        self.rule_memory = rule_memory
+        self._rule_memory_identity = None if rule_memory is None else rule_memory.identity
         self._identity = engine.identity
         self._memory_identity = None if memory is None else memory.identity
         self._facts_bound = engine.facts is not None
@@ -136,6 +148,12 @@ class GroundedWorldFactory:
                 if self._rule_book_identity is not None
                 else {}
             ),
+            # Bound only when rule files are recalled, so definitions without them are unchanged.
+            **(
+                {"rule_memory_sha256": self._rule_memory_identity}
+                if self._rule_memory_identity is not None
+                else {}
+            ),
         }
 
     def _check_state(self, state: JsonObject) -> None:
@@ -160,6 +178,10 @@ class GroundedWorldFactory:
             or (
                 self.rule_book is not None
                 and sha256_json(self.rule_book) != self._rule_book_identity
+            )
+            or (
+                self.rule_memory is not None
+                and self.rule_memory.identity != self._rule_memory_identity
             )
         ):
             raise ValueError("grounded executable predictor or memory changed after freezing")
@@ -287,6 +309,18 @@ class _GroundedWorldBackend:
             read_roots=tuple(("domains", name) for name in sorted(policy.domains())),
         )
         operation = "grounded-world-" + uuid4().hex
+        learned: tuple[JsonObject, ...] = ()
+        recall: JsonObject | None = None
+        if self.factory.rule_memory is not None:
+            learned, receipt = self.factory.rule_memory.recall(
+                {"name": action.name, "arguments": action.arguments},
+                state,
+                [
+                    {"actions": t["actions"], "observations": t["observations"]}
+                    for t in self.history
+                ],
+            )
+            recall = receipt.model_dump(mode="json")
         prepared = self.factory.engine.prepare(
             state,
             self.history,
@@ -294,6 +328,7 @@ class _GroundedWorldBackend:
             memory=memory,
             current_facts=current_facts,
             operation_id=operation,
+            learned_rules=learned,
             state_policy=state_policy,
             state_schemas={
                 row.name: row.state_schema
@@ -317,6 +352,7 @@ class _GroundedWorldBackend:
                         "evidence": prepared.evidence,
                         "operation": operation,
                         "refused_proposals": attempt,
+                        **({} if recall is None else {"rule_recall": recall}),
                     },
                 )
             )

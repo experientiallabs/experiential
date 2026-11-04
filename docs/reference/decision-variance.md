@@ -93,6 +93,51 @@ the environment behaves from world-learning traces only, keeping rules apart fro
    membership boundaries; a contradicted rule with no independent witness keeps every family that
    relies on it diagnostic.
 
+### The `jev_memory` profile
+
+Registering `memory` settings (`MemorySetSettings`, with the System One `decision_alias`) makes
+`jev_memory` the default profile; `agentic_research` and `single_draw` stay available by name.
+`run_rules_stage` then takes the System One decisions client (`decisions`, a
+`DecisionsTraceTagger` or `DecisionBoundary`) and replaces steps 2 to 4
+(`rules/memory_stage.py`):
+
+- **Research as System Two plus System One.** Per topic (each tool, plus the environment), a
+  System Two draw (`rules/system_two.py`, the shared agentic loop, stances `preconditions_first`,
+  `state_effects_first`, `failures_first`) sets explicit evidence objectives with
+  `ask_system_one`. System One (`rules/system_one.py`) cuts the world-learning traces into one
+  region per step and answers each objective with parallel typed Jev judgments per region: Noul
+  `shows`, Score `relevance`, Choice `reading` (stop, read the surrounding steps, inspect more)
+  and Noul plus Choice for a lead of another kind. Reading adapts round by round until enough
+  passages are found or the bounds stop it, and returns the original passages with locator,
+  trace and step plus discovered leads, which a second round follows. Decisions are bought once
+  through the project decision cache at bounded concurrency; every objective's judgments and
+  passages are saved as `jev-objective-findings`, every draw as `topic-research`, and the run
+  reports a research coverage manifest.
+- **A memory set of small files.** Researched rules merge as one `add` proposal each into a
+  `rule-memory-set` (`exp/simulation/rules/memory_set.py`): `rules/<topic>/<rule-id>.md` per rule
+  (truism, why it holds, quoted passages with locators, status with the weighing rationale,
+  applicability, open questions), `index.md`, `tools/<tool>.md`, `contradictions.md`,
+  `unknowns.md`, `memory-set.json` and `files.json` with every file's digest and the set digest.
+  The existing weigher sets each rule's status as a `patch` proposal.
+- **Inspector governance.** Single-responsibility inspectors (`rules/inspectors.py`:
+  `evidence_auditor`, `contradiction_auditor`, `coverage_auditor`, `fidelity_auditor`,
+  `reasoning_auditor`, `redundancy_auditor`), each with its own prompt variants, findings and
+  edit permissions, run for `governance.cycles` cycles (default 3, `rules/governance.py`). They
+  propose small patches to individual files against each file's digest, with a rationale and
+  citations; the merge applies each proposal atomically and records it, rejecting a stale patch
+  as a conflict. Coverage objectives go back to System Two; the fidelity auditor reads held-in
+  replay misses (by default the call-free `PredicateReplay`). Each cycle saves a version, and a
+  cycle with no proposal ends governance early.
+
+The governed set becomes the rule book, so the checker and challenges are unchanged.
+`memory_stage_costs` prices System Two draws, System One decisions, inspector draws and the
+per-rule weighing. At runtime `GroundedRuntimeDefinition.rule_memory` pins the set and a
+`RecallPolicy`: before each prediction `RuleRecall` (`exp/simulation/rules/recall.py`) scores
+only the index rows of the called tool and the environment (Score: governs this call; Noul:
+applicability met) and attaches the passing rules' truism, reasoning, status and rationale to the
+called tool within a byte budget. Recall decisions replay through the decision cache, every
+step's receipt is recorded in its prediction intent, and the definition digest covers the set.
+
 A bound rule book makes the world model a state machine: the model proposes each transition and
 `check_proposed_transition` (`exp/simulation/rules/checker.py`) decides. A rule-breaking proposal is
 re-asked with the broken rules as feedback and never committed. Durable sessions take an opt-in

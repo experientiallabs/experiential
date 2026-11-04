@@ -20,7 +20,13 @@ One run follows a fixed sequence over saved, replayable owners:
 7. **Rule book.** The rendered Markdown files and ``rules.json`` are saved as one
    ``rule-book`` artifact whose inputs are the responses or transcripts it was learned from and
    weighed by.
-8. **Memory.** Under ``agentic_research`` an agentic condenser turns the rule book and every
+8. **Memory.** Under ``jev_memory`` (the default whenever ``memory`` settings register a System One
+   decision alias) steps 3 to 5 are replaced: System Two plans objectives per topic, System One
+   answers them with parallel Jev judgments returning original passages, the weigher sets each
+   rule's status, and single-responsibility inspectors govern the result in cycles
+   (:mod:`~exp.optimize.evaluation.rules.memory_stage`); the governed ``rule-memory-set`` of small
+   Markdown files is what the simulator recalls from at runtime. Under ``agentic_research`` an
+   agentic condenser turns the rule book and every
    research history into the ``world-model-memory`` artifact (Markdown plus JSON) the
    environment simulator reads at runtime (:mod:`~exp.optimize.evaluation.rules.condense`),
    keeping every contradiction and unknown.
@@ -53,7 +59,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -83,6 +89,12 @@ from exp.optimize.evaluation.rules.extraction import (
     extract_rules_in_parallel,
     extraction_protocol_sha256,
 )
+from exp.optimize.evaluation.rules.inspectors import FidelityReplay
+from exp.optimize.evaluation.rules.memory_stage import (
+    MemorySetSettings,
+    MemoryStageResult,
+    build_memory_set,
+)
 from exp.optimize.evaluation.rules.research import (
     RESEARCH_VARIANTS,
     ResearchDraw,
@@ -91,6 +103,7 @@ from exp.optimize.evaluation.rules.research import (
     research_in_parallel,
     research_protocol_sha256,
 )
+from exp.optimize.evaluation.rules.system_one import DecisionBoundary
 from exp.optimize.evaluation.rules.weighing import (
     WeighingDraw,
     weigh_rules_in_parallel,
@@ -98,6 +111,7 @@ from exp.optimize.evaluation.rules.weighing import (
 )
 from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.rules.contracts import parse_tool_contracts
 from exp.simulation.rules.merge import (
     apply_weighings,
@@ -141,8 +155,9 @@ SESSION_EVIDENCE = "evidence.json"
 
 _STATUSES: tuple[RuleStatus, ...] = ("supported", "contradicted", "unknown")
 
-RulesProfile = Literal["agentic_research", "single_draw"]
-"""How rules are learned: agentic per-trace research (default) or one forced draw per trace."""
+RulesProfile = Literal["jev_memory", "agentic_research", "single_draw"]
+"""How rules are learned: System Two plus System One into a governed memory set, agentic per-trace
+research, or one forced draw per trace."""
 
 
 class RulesStageSpec(ContractModel):
@@ -153,7 +168,8 @@ class RulesStageSpec(ContractModel):
             weighing and condensation call.
         concurrency: Most research, extraction or weighing draws in flight at once. It does not
             affect what is bought, so it is left out of every identity.
-        profile: ``agentic_research`` (default) or the explicit earlier ``single_draw`` path.
+        profile: ``jev_memory`` (the default when ``memory`` is registered), or the explicit
+            earlier ``agentic_research`` (the default otherwise) and ``single_draw`` paths.
         research: Budgets of each research draw.
         variants: Research prompt variants assigned to traces.
         draws_per_trace: Research variants run per trace.
@@ -169,6 +185,7 @@ class RulesStageSpec(ContractModel):
             ``action:<pointer>``, used for ``in`` non-members.
         epsilon: Relative step for float thresholds.
         refusal: How a refused action is recognized in sessions and observed workloads.
+        memory: The ``jev_memory`` registration: decision alias, reading, planner and governance.
     """
 
     author: AuthorSettings
@@ -187,6 +204,22 @@ class RulesStageSpec(ContractModel):
     observed_values: dict[str, tuple[JsonValue, ...]] = Field(default_factory=dict)
     epsilon: float = Field(default=1e-6, gt=0.0, lt=1.0)
     refusal: RefusalCriteria = DEFAULT_REFUSAL
+    memory: MemorySetSettings | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_profile(cls, data: object) -> object:
+        """Default to ``jev_memory`` exactly when its decision model is registered."""
+        if isinstance(data, dict) and "profile" not in data:
+            return {**data, "profile": "jev_memory" if data.get("memory") else "agentic_research"}
+        return data
+
+    @model_validator(mode="after")
+    def _memory_registered(self) -> RulesStageSpec:
+        """Require memory settings for the ``jev_memory`` profile."""
+        if self.profile == "jev_memory" and self.memory is None:
+            raise ValueError("the jev_memory profile needs memory settings with a decision_alias")
+        return self
 
     def identity(self, code_revision: str) -> str:
         """Bind the registration, the extraction protocol and the producing code.
@@ -207,6 +240,7 @@ class RulesStageSpec(ContractModel):
                 "condensation": condensation_protocol_sha256(),
                 "loop": AGENT_LOOP_PROTOCOL,
                 "code": code_revision,
+                **({} if self.memory is None else {"memory": self.memory.protocol()}),
             },
         )
 
@@ -229,6 +263,16 @@ class RulesStageSpec(ContractModel):
         }
         if self.profile == "single_draw":
             return stable_id("rules-extraction", fields)
+        if self.profile == "jev_memory" and self.memory is not None:
+            return stable_id(
+                "rules-jev",
+                {
+                    **fields,
+                    "memory": self.memory.protocol(),
+                    "settings": sha256_json(self.memory.model_dump(mode="json")),
+                    "weighing": sha256_json(self.weighing),
+                },
+            )
         return stable_id(
             "rules-research",
             {
@@ -273,6 +317,8 @@ class RulesStageReport(ContractModel):
         research_failures: Research draws that produced no usable answer; never redrawn.
         weighings: Every rule's evidence weighing, in merged-book order.
         memory: The saved ``world-model-memory``, under ``agentic_research``.
+        memory_set: The governed ``rule-memory-set``, under ``jev_memory``.
+        memory_stage: Research, weighing, governance and coverage, under ``jev_memory``.
     """
 
     spec: RulesStageSpec
@@ -300,6 +346,10 @@ class RulesStageReport(ContractModel):
     )
     weighings: tuple[WeighingDraw, ...] = Field(default=(), exclude_if=lambda value: not value)
     memory: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    memory_set: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    memory_stage: MemoryStageResult | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def run_rules_stage(
@@ -314,6 +364,8 @@ def run_rules_stage(
     observed: Mapping[str, Transition] | None = None,
     challenge: ChallengeExecutor | None = None,
     search: TraceSearch | None = None,
+    decisions: DecisionsTraceTagger | DecisionBoundary | None = None,
+    fidelity: FidelityReplay | None = None,
 ) -> RulesStageReport:
     """Run, or replay, the learned-rules stage over world-learning traces.
 
@@ -332,6 +384,9 @@ def run_rules_stage(
             supplying observed transitions; its identity joins the run identity.
         search: Registered world-learning retrieval research draws may query; its index joins
             the run identity.
+        decisions: The System One decisions client (``jev_memory``); its model joins the identity.
+        fidelity: Held-in replay for the fidelity auditor (``jev_memory``); the call-free
+            predicate replay when None. Its identity joins the run identity.
 
     Returns:
         The report, also saved as a ``rules-stage-report`` artifact.
@@ -367,6 +422,17 @@ def run_rules_stage(
     fields: JsonObject = {} if challenge is None else {"challenge": challenge.identity}
     if search is not None:
         fields["search"] = search.inventory()
+    boundary = (
+        DecisionBoundary.from_tagger(decisions)
+        if isinstance(decisions, DecisionsTraceTagger)
+        else decisions
+    )
+    if spec.profile == "jev_memory":
+        if boundary is None:
+            raise ValueError("the jev_memory profile needs a System One decisions client")
+        fields["decisions"] = boundary.identity
+        if fidelity is not None:
+            fields["fidelity"] = fidelity.identity
     identity = stable_id(
         "rules-stage",
         {
@@ -399,7 +465,27 @@ def run_rules_stage(
         )
         draws: tuple[ExtractionDraw, ...] = ()
         research: tuple[TraceResearch, ...] = ()
-        if spec.profile == "single_draw":
+        staged: MemoryStageResult | None = None
+        if spec.profile == "jev_memory":
+            assert spec.memory is not None and boundary is not None
+            staged, _, book = build_memory_set(
+                project,
+                spec.author,
+                spec.weighing,
+                spec.memory,
+                traces,
+                contracts,
+                boundary=boundary,
+                identity=extraction_identity,
+                excluded=excluded,
+                concurrency=spec.concurrency,
+                code_revision=code_revision,
+                sources=spec.sources,
+                fidelity=fidelity,
+            )
+            weighings = staged.weighings
+            responses = staged.transcripts()
+        elif spec.profile == "single_draw":
             draws = extract_rules_in_parallel(
                 project,
                 spec.author,
@@ -423,37 +509,40 @@ def run_rules_stage(
                 for draw in item.draws
                 if draw.answer is not None and draw.transcript is not None
             )
-        merged = merge_rules(contracts, analyses, excluded=excluded)
-        weighings = weigh_rules_in_parallel(
-            project,
-            spec.author,
-            spec.weighing,
-            merged,
-            ResearchMaterial(traces, contracts, maximum_bytes=spec.weighing.maximum_result_bytes),
-            {item.trace_id: item for item in research},
-            identity=stable_id(
-                "rules-weighing",
-                {
-                    "extraction": extraction_identity,
-                    "book": sha256_json(merged),
-                    "author": sha256_json(spec.author),
-                    "profile": sha256_json(spec.weighing),
-                    "weighing": weighing_protocol_sha256(),
-                    "loop": AGENT_LOOP_PROTOCOL,
-                    "excluded": sorted(excluded),
-                },
-            ),
-            excluded=excluded,
-            code_revision=code_revision,
-            concurrency=spec.concurrency,
-            sources=spec.sources,
-        )
-        book = apply_weighings(
-            merged, [w.weighing for w in weighings if w.weighing is not None], excluded=excluded
-        )
+        if staged is None:
+            merged = merge_rules(contracts, analyses, excluded=excluded)
+            weighings = weigh_rules_in_parallel(
+                project,
+                spec.author,
+                spec.weighing,
+                merged,
+                ResearchMaterial(
+                    traces, contracts, maximum_bytes=spec.weighing.maximum_result_bytes
+                ),
+                {item.trace_id: item for item in research},
+                identity=stable_id(
+                    "rules-weighing",
+                    {
+                        "extraction": extraction_identity,
+                        "book": sha256_json(merged),
+                        "author": sha256_json(spec.author),
+                        "profile": sha256_json(spec.weighing),
+                        "weighing": weighing_protocol_sha256(),
+                        "loop": AGENT_LOOP_PROTOCOL,
+                        "excluded": sorted(excluded),
+                    },
+                ),
+                excluded=excluded,
+                code_revision=code_revision,
+                concurrency=spec.concurrency,
+                sources=spec.sources,
+            )
+            book = apply_weighings(
+                merged, [w.weighing for w in weighings if w.weighing is not None], excluded=excluded
+            )
+            responses = learned + tuple(w.transcript for w in weighings if w.transcript is not None)
         if combined:
             book = attach_witnesses(book, combined)
-        responses = learned + tuple(w.transcript for w in weighings if w.transcript is not None)
         rulebook = _save_rulebook(project, book, responses, extraction_identity, code_revision)
         memory: ArtifactInput | None = None
         if spec.profile == "agentic_research":
@@ -523,12 +612,16 @@ def run_rules_stage(
                 ),
                 "weighings": weighings,
                 "memory": memory,
+                "memory_set": None if staged is None else staged.memory_set,
+                "memory_stage": staged,
             }
         )
         dependencies = {rulebook, *responses, *spec.sources}
         dependencies |= {item.history for item in research if item.history is not None}
         if memory is not None:
             dependencies.add(memory)
+        if staged is not None:
+            dependencies.add(staged.memory_set)
         if executed is not None:
             dependencies.add(artifact_input(store.read(executed.identity + "-result").manifest))
         dependencies |= {reference for reference, _ in loaded if reference is not None}

@@ -580,6 +580,56 @@ PROTOCOLS = (
         ),
         "e44b4d9bfd3adbaeb7387cd875ae65483f7bf4779c8e62303b07e196a3caf8fa",
     ),
+    Protocol(
+        "exp.optimize.evaluation.rules.system_one:SYSTEM_ONE_PROTOCOL",
+        "jev-system-one-v1",
+        (
+            "exp.optimize.evaluation.rules.system_one",
+            "exp.simulation.rules.memory_set:Passage",
+        ),
+        "be0bfcb9d90af6b4f9e9db253ca9967d7c78d0d3dba815504dff16c9b8f972dd",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.system_two:SYSTEM_TWO_PROTOCOL",
+        "jev-system-two-v1",
+        (
+            "exp.optimize.evaluation.rules.system_two",
+            "exp.optimize.evaluation.rules.agent_loop",
+            "exp.optimize.evaluation.rules.memory_edits:RuleDraft",
+        ),
+        "c53f9bec904e1c77b378ff9023dcb58a5afb245c54dfc78d82c7c781a2d178a3",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.inspectors:INSPECTOR_PROTOCOL",
+        "rule-memory-inspectors-v1",
+        (
+            "exp.optimize.evaluation.rules.inspectors",
+            "exp.optimize.evaluation.rules.memory_edits",
+            "exp.optimize.evaluation.rules.agent_loop",
+        ),
+        "11442db6d9a0321fe7a6f4c0506ad014956aabab9d61b7c44552bad0a48e5de4",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.memory_stage:MEMORY_STAGE_PROTOCOL",
+        "jev-memory-stage-v1",
+        (
+            "exp.optimize.evaluation.rules.memory_stage",
+            "exp.optimize.evaluation.rules.governance",
+        ),
+        "306a615b7efbb70873e5c5e7a546d470ccff9776eaca78d52ff9b55769b4740e",
+    ),
+    Protocol(
+        "exp.simulation.rules.recall:RECALL_PROTOCOL",
+        "rule-memory-recall-v1",
+        ("exp.simulation.rules.recall",),
+        "6d0a690a53015d7c7edd1bf498f70a623344fcc214881ac9051329c463d74ef7",
+    ),
+    Protocol(
+        "exp.simulation.rules.memory_set:MEMORY_SET_FORMAT",
+        "rule-memory-set-v1",
+        ("exp.simulation.rules.memory_set",),
+        "60a13ef8b4d2e6724e4cbb8a679fcc93025d08bf0009192bf6fe812b6ae857fd",
+    ),
 )
 
 
