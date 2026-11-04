@@ -291,3 +291,21 @@ def test_an_unchanged_history_is_returned_without_copies() -> None:
     payload = _chat_body(_chat_tool_history(_chat_image(_PNG_URL)))
     degraded, disclosures = degrade_chat_media(payload)
     assert degraded is payload and disclosures == ()
+
+
+@pytest.mark.parametrize(
+    "item_type", ["compaction", "program", "program_output", "tool_search_output"]
+)
+def test_every_provider_authored_item_ends_the_latest_turn(item_type: str) -> None:
+    """A hosted output item is the model speaking, so earlier user media is history."""
+    payload: JsonObject = {
+        "model": "coding",
+        "input": [
+            {"role": "user", "content": [{"type": "input_image", "image_url": _OVERSIZED_URL}]},
+            {"type": item_type, "id": "item_1"},
+            {"role": "user", "content": [{"type": "input_text", "text": "next"}]},
+        ],
+    }
+    degraded, disclosures = degrade_responses_media(payload)
+    assert disclosures == ("input.content.image->placeholder(oversized)",)
+    assert degraded is not payload

@@ -145,10 +145,15 @@ def _ends_in_empty_prefill(messages: list[JsonValue]) -> bool:
     """Whether the last turn is an empty assistant prefill the decoder drops.
 
     Such a turn is not the model speaking, so the user turn before it is
-    still the latest turn and stays strict.
+    still the latest turn and stays strict. The rule mirrors the decoder's
+    own: an empty string, or only empty text blocks with no cache marker and
+    no citations, after at least one non-system turn. A turn the decoder
+    keeps (and refuses) still counts as the model's.
     """
     last = messages[-1] if messages else None
     if not isinstance(last, dict) or last.get("role") != "assistant":
+        return False
+    if not any(isinstance(turn, dict) and turn.get("role") != "system" for turn in messages[:-1]):
         return False
     content = last.get("content")
     if isinstance(content, str):
@@ -157,7 +162,11 @@ def _ends_in_empty_prefill(messages: list[JsonValue]) -> bool:
         isinstance(content, list)
         and bool(content)
         and all(
-            isinstance(block, dict) and block.get("type") == "text" and not block.get("text")
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and not block.get("text")
+            and block.get("cache_control") is None
+            and not block.get("citations")
             for block in content
         )
     )

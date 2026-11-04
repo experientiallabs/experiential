@@ -215,3 +215,19 @@ def test_an_empty_final_prefill_does_not_turn_the_latest_user_turn_into_history(
     with pytest.raises(OpenAIProtocolError) as info:
         degrade_history_media(payload)
     assert info.value.detail.param == "messages.0.content.0.source.data"
+
+
+def test_a_marked_empty_final_turn_still_counts_as_the_models_turn() -> None:
+    """The decoder keeps (and refuses) a marked empty turn, so earlier media is history."""
+    payload = _body(
+        [
+            {"role": "user", "content": [_image(_OVERSIZED_IMAGE)]},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}],
+            },
+        ]
+    )
+    degraded, disclosures = degrade_history_media(payload)
+    assert degraded is not payload
+    assert disclosures == ("messages.content.image->placeholder(oversized)",)

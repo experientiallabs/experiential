@@ -40,6 +40,7 @@ from exp.common.models.content import (
     MAXIMUM_IMAGE_BYTES,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
+from exp.runtime.openai_protocol.wire_models import HOSTED_TOOL_ITEM_TYPES_ASSISTANT
 
 MediaKind = Literal["image", "document"]
 """Media kinds whose inline bytes this pass inspects."""
@@ -331,18 +332,23 @@ def _degrade_parts(
     return rebuilt
 
 
+_MODEL_ITEM_TYPES: Final = frozenset(
+    {"reasoning", "function_call", "custom_tool_call", *HOSTED_TOOL_ITEM_TYPES_ASSISTANT}
+)
+"""Responses item types the model authored, beside assistant-role messages."""
+
+
 def _model_turn(item: JsonObject) -> bool:
     """Whether one history entry is model output: an assistant message or a model item."""
-    item_type = item.get("type")
-    return (
-        item.get("role") == "assistant"
-        or item_type == "reasoning"
-        or (isinstance(item_type, str) and item_type.endswith("_call"))
-    )
+    return item.get("role") == "assistant" or item.get("type") in _MODEL_ITEM_TYPES
 
 
 def latest_turn(items: list[JsonValue]) -> frozenset[int]:
     """Return the indexes of the user entries after the last model-output entry.
+
+    Model output is an assistant message, a reasoning or function/custom tool
+    call item, or any provider-authored hosted item (compaction and program
+    items included).
 
     The latest turn is everything the caller added since the model last
     spoke, so consecutive user messages (an image, then its question) all
