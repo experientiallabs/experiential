@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+import numpy as np
+import numpy.typing as npt
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonValue, envelope_matches_manifest, stable_id
@@ -27,14 +29,41 @@ from exp.simulation.retrieval.tags import verify_index_tags
 from exp.simulation.retrieval.transitions import render_rag_key
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class LoadedRAGIndex:
-    """Verified immutable RAG envelope, manifest, transitions, and vectors."""
+    """Verified immutable RAG envelope, manifest, transitions, and vector matrix.
+
+    Vectors are held as one read-only float64 matrix with a row per transition, in transition
+    order. Float64 keeps every persisted JSON value bit-exact, so retrieval can reproduce the
+    exact persisted cosine scores and :attr:`vectors` can rebuild the persisted records. Equality
+    is identity: two loads are compared through their envelopes, not their matrices.
+
+    Attributes:
+        index: Verified immutable envelope.
+        manifest: Manifest the envelope was verified against.
+        transitions: Ordered observed-transition records.
+        matrix: Read-only ``(transition_count, embedding_dimension)`` float64 unit vectors.
+    """
 
     index: RAGIndex
     manifest: ArtifactManifest
     transitions: tuple[RAGTransition, ...]
-    vectors: tuple[RAGVector, ...]
+    matrix: npt.NDArray[np.float64]
+
+    @property
+    def vectors(self) -> tuple[RAGVector, ...]:
+        """Rebuild the exact persisted vector records from the matrix.
+
+        This materializes every vector as Python floats. Retrieval never calls it; it serves
+        verification paths that compare complete records.
+
+        Returns:
+            One record per transition, equal to the persisted JSONL records.
+        """
+        return tuple(
+            RAGVector(transition_id=transition.transition_id, values=tuple(row.tolist()))
+            for transition, row in zip(self.transitions, self.matrix, strict=True)
+        )
 
 
 def load_rag_index(store: ArtifactStore, rag_id: str) -> LoadedRAGIndex:
@@ -74,10 +103,10 @@ def load_rag_index(store: ArtifactStore, rag_id: str) -> LoadedRAGIndex:
     if hashlib.sha256(vectors_payload).hexdigest() != index.vectors_sha256:
         raise ArtifactCorruptionError(f"RAG index {rag_id} vector digest does not match")
     transitions = _parse_transitions(rag_id, transitions_payload)
-    vectors = _parse_vectors(rag_id, vectors_payload)
-    _verify_records(index, transitions, vectors)
+    vector_ids, matrix = _parse_vectors(rag_id, vectors_payload, index.embedding_dimension)
+    _verify_records(index, transitions, vector_ids)
     _verify_sources(store, index, transitions)
-    return LoadedRAGIndex(index, stored.manifest, transitions, vectors)
+    return LoadedRAGIndex(index, stored.manifest, transitions, matrix)
 
 
 def _parse_transitions(rag_id: str, payload: bytes) -> tuple[RAGTransition, ...]:
@@ -92,41 +121,68 @@ def _parse_transitions(rag_id: str, payload: bytes) -> tuple[RAGTransition, ...]
         raise ArtifactCorruptionError(f"RAG index {rag_id} has invalid transitions") from exc
 
 
-def _parse_vectors(rag_id: str, payload: bytes) -> tuple[RAGVector, ...]:
-    """Parse all vector JSONL records and reject NaN, infinity, and non-unit values."""
+def _parse_vectors(
+    rag_id: str, payload: bytes, dimension: int
+) -> tuple[tuple[str, ...], npt.NDArray[np.float64]]:
+    """Parse vector JSONL into ordered IDs and one read-only float64 matrix.
+
+    Each record is validated by the strict :class:`RAGVector` contract (finite unit values),
+    copied into its matrix row, and discarded, so peak memory is the matrix plus one record.
+
+    Args:
+        rag_id: Index identity used in error messages.
+        payload: Digest-verified vector JSONL bytes.
+        dimension: Envelope embedding dimension every record must have.
+
+    Returns:
+        Transition IDs in record order and the matching ``(records, dimension)`` matrix.
+
+    Raises:
+        ArtifactCorruptionError: A record is invalid or its dimension differs from the envelope.
+    """
     try:
-        return tuple(
-            RAGVector.model_validate_json(line)
-            for line in payload.decode("utf-8").split("\n")
-            if line
-        )
-    except (UnicodeDecodeError, ValidationError, ValueError) as exc:
+        lines = [line for line in payload.decode("utf-8").split("\n") if line]
+    except UnicodeDecodeError as exc:
         raise ArtifactCorruptionError(f"RAG index {rag_id} has invalid vectors") from exc
+    matrix = np.empty((len(lines), dimension), dtype=np.float64)
+    ids: list[str] = []
+    for row, line in enumerate(lines):
+        try:
+            record = RAGVector.model_validate_json(line)
+        except (ValidationError, ValueError) as exc:
+            raise ArtifactCorruptionError(f"RAG index {rag_id} has invalid vectors") from exc
+        if len(record.values) != dimension:
+            raise ArtifactCorruptionError("RAG vector dimension does not match the envelope")
+        matrix[row] = record.values
+        ids.append(record.transition_id)
+    matrix.flags.writeable = False
+    return tuple(ids), matrix
 
 
 def _verify_records(
     index: RAGIndex,
     transitions: tuple[RAGTransition, ...],
-    vectors: tuple[RAGVector, ...],
+    vector_ids: tuple[str, ...],
 ) -> None:
-    """Verify ordering, IDs, key hashes, lineage, scope and tag coverage, and vector dimensions.
+    """Verify ordering, IDs, key hashes, lineage, scope and tag coverage.
+
+    Vector dimensions are verified while the vectors are parsed.
 
     Args:
         index: Persisted immutable RAG envelope.
         transitions: Parsed ordered transition records.
-        vectors: Parsed ordered embedding vectors.
+        vector_ids: Transition IDs of the parsed vectors, in record order.
 
     Raises:
         ArtifactCorruptionError: Any record contradicts the frozen index identity.
     """
     transition_ids = tuple(item.transition_id for item in transitions)
-    vector_ids = tuple(item.transition_id for item in vectors)
     if transition_ids != index.transition_ids or vector_ids != index.transition_ids:
         raise ArtifactCorruptionError("RAG records do not match ordered transition IDs")
-    if len(transitions) != index.transition_count or len(vectors) != index.transition_count:
+    if len(transitions) != index.transition_count or len(vector_ids) != index.transition_count:
         raise ArtifactCorruptionError("RAG record counts do not match the envelope")
     included_lineages = set(index.included_lineage_ids or index.fit_lineage_ids)
-    for transition, vector in zip(transitions, vectors, strict=True):
+    for transition in transitions:
         if transition.lineage_id not in included_lineages:
             raise ArtifactCorruptionError("RAG transition is outside the frozen included lineages")
         if index.corpus_scope is not None and not index.corpus_scope.admits(
@@ -153,8 +209,6 @@ def _verify_records(
         }
         if stable_id("rag-transition", material) != transition.transition_id:
             raise ArtifactCorruptionError("RAG transition ID does not match its observed evidence")
-        if len(vector.values) != index.embedding_dimension:
-            raise ArtifactCorruptionError("RAG vector dimension does not match the envelope")
     if index.trace_tags is not None:
         try:
             verify_index_tags(index.trace_tags, (item.trace_id for item in transitions))

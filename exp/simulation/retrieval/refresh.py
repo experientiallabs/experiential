@@ -14,8 +14,10 @@ from exp.common.core.artifacts import (
     ArtifactId,
     ArtifactInput,
     JsonObject,
+    Sha256,
     canonical_json_bytes,
     envelope_matches_manifest,
+    sha256_json,
     stable_id,
 )
 from exp.common.core.locks import file_write_lock
@@ -33,9 +35,9 @@ from exp.runtime.router import (
     load_runtime_trace_snapshot,
     seal_runtime_trace_snapshot,
 )
-from exp.simulation.retrieval.build import PersistedRAGIndex, persist_trace_rag
-from exp.simulation.retrieval.contracts import RAGLineageBinding
-from exp.simulation.retrieval.embedding import RAGEmbedderBinding
+from exp.simulation.retrieval.build import PersistedRAGIndex, persist_trace_rag, scoped_bindings
+from exp.simulation.retrieval.contracts import RAGLineageBinding, RAGTransition
+from exp.simulation.retrieval.embedding import RAGEmbedderBinding, RAGEmbeddingCache
 from exp.simulation.retrieval.embedding_inputs import (
     embedding_chunk_bytes,
     plan_rag_embedding_inputs,
@@ -45,7 +47,9 @@ from exp.simulation.retrieval.refresh_dataset import (
     persist_runtime_rag_dataset,
 )
 from exp.simulation.retrieval.runtime_stitching import stitch_runtime_observations
+from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.retrieval.tags import RAGIndexTags
 from exp.simulation.retrieval.transitions import extract_fit_transitions
 
 _REFRESH_ARTIFACT_TYPE = "runtime-rag-refresh"
@@ -57,7 +61,15 @@ class RuntimeRAGRefreshError(ValueError):
 
 
 class RuntimeRAGRefresh(ArtifactEnvelope):
-    """Completion receipt for one immutable runtime trace and retrieval refresh."""
+    """Completion receipt for one immutable runtime trace and retrieval refresh.
+
+    Attributes:
+        corpus_scope: Scope the refreshed index was restricted to. Omitted from the serialized
+            receipt and its identity when absent, so unscoped refreshes keep their identity.
+        trace_tags_sha256: Digest of the tag record stored on the refreshed index. Omitted from
+            the serialized receipt and its identity when absent, so untagged refreshes keep
+            their identity.
+    """
 
     refresh_id: ArtifactId
     project_id: ArtifactId
@@ -72,6 +84,8 @@ class RuntimeRAGRefresh(ArtifactEnvelope):
     reserved_embedding_cost_usd: float = Field(ge=0)
     last_ordinal: int = Field(gt=0)
     default_top_k: int = Field(gt=0)
+    corpus_scope: CorpusScope | None = Field(default=None, exclude_if=lambda value: value is None)
+    trace_tags_sha256: Sha256 | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("imported_trace_datasets")
     @classmethod
@@ -154,6 +168,8 @@ class RuntimeRAGRefresh(ArtifactEnvelope):
             maximum_embedding_cost_usd=self.maximum_embedding_cost_usd,
             code_revision=self.code_revision,
             default_top_k=self.default_top_k,
+            corpus_scope=self.corpus_scope,
+            trace_tags_sha256=self.trace_tags_sha256,
         )
         if self.refresh_id != expected_id:
             raise ValueError("runtime RAG refresh ID differs from its immutable request")
@@ -203,6 +219,9 @@ def refresh_runtime_trace_rag(
     code_revision: str,
     last_ordinal: int | None = None,
     default_top_k: int = 5,
+    corpus_scope: CorpusScope | None = None,
+    trace_tags: RAGIndexTags | None = None,
+    embedding_cache: RAGEmbeddingCache | None = None,
 ) -> PersistedRuntimeRAGRefresh:
     """Seal current runtime evidence and refresh one immutable observed-transition index.
 
@@ -222,13 +241,24 @@ def refresh_runtime_trace_rag(
         code_revision: Exact EXP revision producing the artifacts.
         last_ordinal: Optional inclusive journal prefix boundary.
         default_top_k: Positive retrieval limit persisted in the new index.
+        corpus_scope: Optional scope the refreshed index is restricted to, exactly as
+            :func:`persist_trace_rag` applies it. Runtime traces are bound as fit evidence under
+            their conversation lineage, so a scoped refresh is refused when any runtime trace
+            that contributes a transition lies outside the scope; widen the scope explicitly
+            to admit new conversations. Recorded in the refresh identity and receipt.
+        trace_tags: Optional tag record for the refreshed index. It must carry a row for every
+            indexed trace in every view, including each new runtime trace; a missing row is
+            refused before dispatch. Its stored digest is recorded in the refresh identity and
+            receipt. Omitted, the refreshed index is untagged.
+        embedding_cache: Optional same-invocation vector cache passed to the index build. It
+            reuses exact vectors only and has no effect on identity.
 
     Returns:
         Verified immutable refresh artifacts and their sealed runtime source.
 
     Raises:
-        RuntimeRAGRefreshError: Source coverage, replay, reservation, spend, or referenced artifacts
-            cannot be proven before or after dispatch.
+        RuntimeRAGRefreshError: Source coverage, scope, tag coverage, replay, reservation, spend,
+            or referenced artifacts cannot be proven before or after dispatch.
         RuntimeTraceSnapshotError: The selected journal prefix cannot be sealed.
     """
     maximum_embedding_cost_usd = _normalize_finite_nonnegative_cost(maximum_embedding_cost_usd)
@@ -264,11 +294,17 @@ def refresh_runtime_trace_rag(
         imported_lineage_bindings,
         runtime_traces=stitched,
     )
-    transitions = extract_fit_transitions(dataset.traces, bindings)
+    transitions = _scoped_transitions(
+        extract_fit_transitions(dataset.traces, bindings),
+        bindings,
+        corpus_scope,
+        runtime_trace_ids=frozenset(trace.trace_id for trace in stitched),
+    )
     if not transitions:
         raise RuntimeRAGRefreshError(
             "runtime RAG refresh has no real observed fit transition after terminal exclusion"
         )
+    trace_tags_sha256 = _index_tags_sha256(trace_tags, transitions)
     reserved_cost = _reserved_embedding_cost(
         tuple(item.key_text for item in transitions),
         embedder=embedder,
@@ -286,6 +322,8 @@ def refresh_runtime_trace_rag(
         maximum_embedding_cost_usd=maximum_embedding_cost_usd,
         code_revision=code_revision,
         default_top_k=default_top_k,
+        corpus_scope=corpus_scope,
+        trace_tags_sha256=trace_tags_sha256,
     )
     lock_target = store.project_directory / "runtime" / f"{refresh_id}.receipt"
     with file_write_lock(lock_target, what="the runtime RAG refresh"):
@@ -307,6 +345,9 @@ def refresh_runtime_trace_rag(
             code_revision=code_revision,
             embedder=embedder,
             default_top_k=default_top_k,
+            embedding_cache=embedding_cache,
+            corpus_scope=corpus_scope,
+            trace_tags=trace_tags,
         )
         refresh = _refresh_envelope(
             refresh_id=refresh_id,
@@ -324,6 +365,8 @@ def refresh_runtime_trace_rag(
             created_at=created_at,
             code_revision=code_revision,
             default_top_k=default_top_k,
+            corpus_scope=corpus_scope,
+            trace_tags_sha256=trace_tags_sha256,
         )
         try:
             manifest = store.write(
@@ -438,11 +481,23 @@ def load_runtime_rag_refresh(
         raise RuntimeRAGRefreshError(
             "refreshed trace dataset inputs differ from runtime and imported sources"
         )
+    if loaded_rag.index.corpus_scope != refresh.corpus_scope:
+        raise RuntimeRAGRefreshError("runtime RAG index scope differs from its refresh receipt")
+    stored_tags = loaded_rag.index.trace_tags
+    if (None if stored_tags is None else sha256_json(stored_tags)) != refresh.trace_tags_sha256:
+        raise RuntimeRAGRefreshError("runtime RAG index tags differ from its refresh receipt")
     try:
         expected_transitions = extract_fit_transitions(
             loaded_dataset.traces,
             refresh.lineage_bindings,
         )
+        if refresh.corpus_scope is not None:
+            scope = refresh.corpus_scope
+            expected_transitions = tuple(
+                item
+                for item in expected_transitions
+                if scope.admits(trace_id=item.trace_id, lineage_id=item.lineage_id)
+            )
     except ValueError as exc:
         raise RuntimeRAGRefreshError(
             "runtime RAG lineage bindings do not cover the refreshed trace dataset"
@@ -539,6 +594,82 @@ def _combined_lineage_bindings(
     return tuple(by_trace[trace_id] for trace_id in sorted(by_trace))
 
 
+def _scoped_transitions(
+    transitions: tuple[RAGTransition, ...],
+    bindings: tuple[RAGLineageBinding, ...],
+    scope: CorpusScope | None,
+    *,
+    runtime_trace_ids: frozenset[str],
+) -> tuple[RAGTransition, ...]:
+    """Restrict fit transitions to a scope, refusing new runtime evidence outside it.
+
+    Args:
+        transitions: Every fit transition of the combined dataset.
+        bindings: Complete lineage assignment of the combined dataset.
+        scope: Optional corpus scope; None returns ``transitions`` unchanged.
+        runtime_trace_ids: Traces sealed from the runtime journal in this refresh.
+
+    Returns:
+        The transitions the scope admits.
+
+    Raises:
+        RuntimeRAGRefreshError: A runtime trace with a transition lies outside the scope, or
+            the scope names unknown or held-out evidence.
+    """
+    if scope is None:
+        return transitions
+    try:
+        scoped_bindings(bindings, scope)
+    except ValueError as exc:
+        raise RuntimeRAGRefreshError(f"runtime RAG refresh scope is invalid: {exc}") from exc
+    outside = sorted(
+        {
+            item.trace_id
+            for item in transitions
+            if item.trace_id in runtime_trace_ids
+            and not scope.admits(trace_id=item.trace_id, lineage_id=item.lineage_id)
+        }
+    )
+    if outside:
+        raise RuntimeRAGRefreshError(
+            f"runtime RAG refresh would add {len(outside)} runtime traces outside corpus scope "
+            f"{scope.name!r}, for example {outside[0]}; declare a scope that admits them or "
+            "refresh without one"
+        )
+    return tuple(
+        item
+        for item in transitions
+        if scope.admits(trace_id=item.trace_id, lineage_id=item.lineage_id)
+    )
+
+
+def _index_tags_sha256(
+    trace_tags: RAGIndexTags | None, transitions: tuple[RAGTransition, ...]
+) -> str | None:
+    """Return the digest of the tag record the refreshed index will store.
+
+    Args:
+        trace_tags: Optional caller-supplied tag record.
+        transitions: Transitions the refreshed index will hold.
+
+    Returns:
+        SHA-256 of the record restricted to the indexed traces, or None without tags.
+
+    Raises:
+        RuntimeRAGRefreshError: A view lacks a row for an indexed trace.
+    """
+    if trace_tags is None:
+        return None
+    try:
+        restricted = trace_tags.restricted_to(item.trace_id for item in transitions)
+    except ValueError as exc:
+        raise RuntimeRAGRefreshError(
+            f"runtime RAG refresh tags must cover every indexed trace, including new runtime "
+            f"traces: {exc}"
+        ) from exc
+    return sha256_json(restricted)
+
+
 def _reserved_embedding_cost(
     texts: Sequence[str],
     *,
@@ -603,6 +734,8 @@ def _refresh_id(
     maximum_embedding_cost_usd: float,
     code_revision: str,
     default_top_k: int,
+    corpus_scope: CorpusScope | None = None,
+    trace_tags_sha256: str | None = None,
 ) -> str:
     """Derive the replay lookup identity before any embedding dispatch.
 
@@ -617,6 +750,8 @@ def _refresh_id(
         maximum_embedding_cost_usd: Finite refresh cost ceiling.
         code_revision: Exact EXP revision defining the refresh semantics.
         default_top_k: Retrieval limit persisted in the requested index.
+        corpus_scope: Optional scope of the requested index; absent adds nothing.
+        trace_tags_sha256: Optional digest of the requested index's tags; absent adds nothing.
 
     Returns:
         Stable operation identity that can locate a completed exact replay.
@@ -636,6 +771,11 @@ def _refresh_id(
         "code_revision": code_revision,
         "default_top_k": default_top_k,
     }
+    # Absent scope and tags add nothing, so unscoped untagged refreshes keep their identity.
+    if corpus_scope is not None:
+        material["corpus_scope"] = corpus_scope.model_dump(mode="json")
+    if trace_tags_sha256 is not None:
+        material["trace_tags_sha256"] = trace_tags_sha256
     return stable_id("runtime-rag-refresh", material)
 
 
@@ -656,6 +796,8 @@ def _refresh_envelope(
     created_at: datetime,
     code_revision: str,
     default_top_k: int,
+    corpus_scope: CorpusScope | None,
+    trace_tags_sha256: str | None,
 ) -> RuntimeRAGRefresh:
     """Construct one validated completion receipt over exact inputs and outputs.
 
@@ -675,6 +817,8 @@ def _refresh_envelope(
         created_at: Receipt materialization time.
         code_revision: Exact EXP revision.
         default_top_k: Retrieval limit persisted in the completed index.
+        corpus_scope: Optional scope of the completed index.
+        trace_tags_sha256: Optional digest of the completed index's tags.
 
     Returns:
         Validated immutable completion receipt.
@@ -708,6 +852,8 @@ def _refresh_envelope(
         reserved_embedding_cost_usd=reserved_embedding_cost_usd,
         last_ordinal=last_ordinal,
         default_top_k=default_top_k,
+        corpus_scope=corpus_scope,
+        trace_tags_sha256=trace_tags_sha256,
     )
 
 

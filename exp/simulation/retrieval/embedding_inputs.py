@@ -17,7 +17,8 @@ from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 MAXIMUM_CHUNK_BYTES = 2_048
 # UTF-8 bytes conservatively bound text tokens. These batches remain below OpenAI's 300,000
 # total-token and 2,048-input limits and Gemini's 100-input batch bound, without guessing
-# a tokenizer for other providers.
+# a tokenizer for other providers. They are defaults; an embedder binding may lower them for a
+# slow local server or raise them for a provider with larger limits.
 MAXIMUM_BATCH_BYTES = 262_144
 MAXIMUM_BATCH_INPUTS = 100
 
@@ -75,15 +76,58 @@ def plan_rag_embedding_inputs(
     return RAGEmbeddingInputPlan(texts=tuple(unique), keys=tuple(assignments))
 
 
-def embedding_batches(texts: Sequence[str]) -> Iterator[tuple[str, ...]]:
-    """Batch bounded chunks by both total UTF-8 bytes and number of inputs."""
+def validate_batch_bounds(*, maximum_inputs: int, maximum_bytes: int) -> None:
+    """Refuse provider batch bounds that cannot carry every admitted chunk.
+
+    Args:
+        maximum_inputs: Largest number of inputs in one provider request.
+        maximum_bytes: Largest total UTF-8 size of one provider request.
+
+    Raises:
+        ValueError: A bound is not a positive integer, or the byte bound is below one chunk.
+    """
+    if isinstance(maximum_inputs, bool) or not isinstance(maximum_inputs, int):
+        raise ValueError("RAG embedding batch inputs must be an integer")
+    if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int):
+        raise ValueError("RAG embedding batch bytes must be an integer")
+    if maximum_inputs < 1:
+        raise ValueError("RAG embedding batches need at least one input")
+    if maximum_bytes < MAXIMUM_CHUNK_BYTES:
+        raise ValueError(
+            f"RAG embedding batch bytes must be at least one {MAXIMUM_CHUNK_BYTES}-byte chunk"
+        )
+
+
+def embedding_batches(
+    texts: Sequence[str],
+    *,
+    maximum_inputs: int = MAXIMUM_BATCH_INPUTS,
+    maximum_bytes: int = MAXIMUM_BATCH_BYTES,
+) -> Iterator[tuple[str, ...]]:
+    """Batch bounded chunks by both total UTF-8 bytes and number of inputs.
+
+    Batching is transport only: every input is embedded independently, so the bounds never
+    change a vector, a checkpoint namespace, or an index identity.
+
+    Args:
+        texts: Unique nonempty chunks of at most ``MAXIMUM_CHUNK_BYTES`` bytes, in order.
+        maximum_inputs: Largest number of inputs in one batch.
+        maximum_bytes: Largest total UTF-8 size of one batch.
+
+    Yields:
+        Consecutive batches covering ``texts`` in order.
+
+    Raises:
+        ValueError: A chunk is empty or oversized, or a bound is invalid.
+    """
+    validate_batch_bounds(maximum_inputs=maximum_inputs, maximum_bytes=maximum_bytes)
     batch: list[str] = []
     size = 0
     for text in texts:
         length = len(text.encode("utf-8"))
         if not text or length > MAXIMUM_CHUNK_BYTES:
             raise ValueError("RAG embedding batches require nonempty bounded text chunks")
-        if batch and (len(batch) == MAXIMUM_BATCH_INPUTS or size + length > MAXIMUM_BATCH_BYTES):
+        if batch and (len(batch) == maximum_inputs or size + length > maximum_bytes):
             yield tuple(batch)
             batch = []
             size = 0

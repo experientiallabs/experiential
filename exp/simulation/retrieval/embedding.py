@@ -18,9 +18,12 @@ from exp.common.models import (
 from exp.common.progress import ProgressHook, report
 from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
 from exp.simulation.retrieval.embedding_inputs import (
+    MAXIMUM_BATCH_BYTES,
+    MAXIMUM_BATCH_INPUTS,
     embedding_batches,
     embedding_chunk_bytes,
     plan_rag_embedding_inputs,
+    validate_batch_bounds,
 )
 
 DEFAULT_HASHING_DIMENSIONS = 256
@@ -58,6 +61,15 @@ class RAGEmbedderBinding:
         maximum_attempts: Maximum provider attempts made by one ``embed`` call.
         input_usd_per_million_tokens: Active catalog input price used for query reservations.
         maximum_input_tokens: Configured per-input context window, when known.
+        maximum_batch_inputs: Largest number of inputs sent in one provider request. Lower it
+            for a slow local server so each request finishes within the client timeout.
+        maximum_batch_bytes: Largest total UTF-8 size of one provider request; at least one
+            full 2,048-byte chunk.
+
+    Batch bounds are transport settings, not representation identity. Each input is embedded
+    independently, so the bounds are excluded from the model snapshot, the durable checkpoint
+    namespace, and the index identity: changing them reuses every saved vector and rebuilds the
+    same index. Batch composition already varies between a fresh build and a resumed one.
     """
 
     client: EmbeddingClient
@@ -65,12 +77,15 @@ class RAGEmbedderBinding:
     maximum_attempts: int = 1
     input_usd_per_million_tokens: float = 0.0
     maximum_input_tokens: int | None = None
+    maximum_batch_inputs: int = MAXIMUM_BATCH_INPUTS
+    maximum_batch_bytes: int = MAXIMUM_BATCH_BYTES
 
     def __post_init__(self) -> None:
-        """Validate retry and price bounds before the binding can dispatch.
+        """Validate retry, price, and batch bounds before the binding can dispatch.
 
         Raises:
-            ValueError: The retry ceiling is nonpositive or the input price is invalid.
+            ValueError: The retry ceiling is nonpositive, the input price is invalid, or a
+                batch bound cannot carry one chunk.
         """
         if self.maximum_attempts <= 0:
             raise ValueError("RAG embedder maximum_attempts must be positive")
@@ -80,6 +95,9 @@ class RAGEmbedderBinding:
         ):
             raise ValueError("RAG embedder input price must be finite and nonnegative")
         embedding_chunk_bytes(self.maximum_input_tokens)
+        validate_batch_bounds(
+            maximum_inputs=self.maximum_batch_inputs, maximum_bytes=self.maximum_batch_bytes
+        )
 
 
 class RAGEmbeddingCache:
@@ -174,7 +192,11 @@ def embed_rag_texts(
     missing = tuple(text for text in plan.texts if text not in active.vectors)
     completed = len(plan.texts) - len(missing)
     report(progress, "embeddings", completed=completed, total=len(plan.texts))
-    for batch in embedding_batches(missing):
+    for batch in embedding_batches(
+        missing,
+        maximum_inputs=binding.maximum_batch_inputs,
+        maximum_bytes=binding.maximum_batch_bytes,
+    ):
         vectors = (
             _embed_batch(binding, batch)
             if checkpoint is None

@@ -121,3 +121,27 @@ def test_provider_dimension_drift_between_batches_is_rejected_before_cache_write
     assert client.calls == 2
     assert len(cache.vectors) == 100
     assert all(len(vector) == 2 for vector in cache.vectors.values())
+
+
+def test_batch_bounds_change_requests_but_not_vectors_or_identity() -> None:
+    """Smaller provider batches send smaller requests and return the identical vectors."""
+    keys = tuple(_key(index) for index in range(40))
+    default_client = RecordingEmbedder()
+    default_binding = replace(default_rag_embedder(), client=default_client)
+    small_client = RecordingEmbedder()
+    small_binding = replace(default_rag_embedder(), client=small_client, maximum_batch_inputs=8)
+
+    assert embed_rag_texts(small_binding, keys) == embed_rag_texts(default_binding, keys)
+    assert max(len(batch) for batch in small_client.batches) == 8
+    assert len(small_client.batches) > len(default_client.batches)
+    assert small_binding.snapshot == default_binding.snapshot
+    cache = RAGEmbeddingCache(default_binding, maximum_chunk_bytes=2_048)
+    embed_rag_texts(small_binding, keys[:1], cache=cache)
+
+
+def test_binding_refuses_batch_bounds_below_one_chunk() -> None:
+    """A binding cannot be created with batch bounds that would strand a chunk."""
+    with pytest.raises(ValueError, match="at least one input"):
+        replace(default_rag_embedder(), maximum_batch_inputs=0)
+    with pytest.raises(ValueError, match="batch bytes"):
+        replace(default_rag_embedder(), maximum_batch_bytes=1_024)

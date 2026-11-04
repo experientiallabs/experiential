@@ -18,6 +18,7 @@ from exp.common.core.artifacts import (
     SourceIdentity,
     StructuredFailure,
     canonical_json_bytes,
+    sha256_json,
     stable_id,
 )
 from exp.common.models import (
@@ -75,6 +76,8 @@ from exp.simulation.retrieval import (
     load_runtime_rag_refresh,
     refresh_runtime_trace_rag,
 )
+from exp.simulation.retrieval.scope import CorpusScope
+from exp.simulation.retrieval.tags import RAGIndexTags, RAGTagView
 
 _DIGEST = "a" * 64
 _TIME = datetime(2026, 8, 14, tzinfo=UTC)
@@ -1346,3 +1349,151 @@ def _imported_trace(
         outcome=TraceOutcome(status="success"),
         source=source,
     )
+
+
+def _scoped_refresh(
+    tmp_path: Path,
+    *,
+    scope_lineages: Sequence[str] | None = None,
+    tagged_traces: Sequence[str] | None = None,
+) -> tuple[PersistedRuntimeRAGRefresh, ArtifactStore, CountingEmbedder, str, str]:
+    """Refresh one imported and one runtime trace with an optional scope and tag record.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+        scope_lineages: Lineages admitted by a lineage scope; None refreshes unscoped. The
+            literal ``"runtime"`` stands for the runtime conversation lineage.
+        tagged_traces: Traces with a task-view tag row; None refreshes untagged. The literal
+            ``"runtime"`` stands for the runtime trace.
+
+    Returns:
+        Refresh result, store, counting client, runtime trace ID, and runtime lineage ID.
+    """
+    journal, store, first = _two_turn_journal(tmp_path)
+    imported = _persist_imported_trace(store, source_kind="otlp")
+    imported_binding = RAGLineageBinding(
+        trace_id=imported.traces[0].trace_id, lineage_id="imported-lineage", partition="fit"
+    )
+    runtime_trace, runtime_lineage = first.interaction_id, first.identity.lineage_id
+
+    def resolve(values: Sequence[str], runtime: str) -> tuple[str, ...]:
+        """Replace the runtime placeholder.
+
+        Args:
+            values: Identities, possibly containing ``"runtime"``.
+            runtime: Identity substituted for the placeholder.
+
+        Returns:
+            Resolved identities.
+        """
+        return tuple(runtime if value == "runtime" else value for value in values)
+
+    scope = (
+        None
+        if scope_lineages is None
+        else CorpusScope.declare(
+            name="refresh-scope",
+            kind="lineage",
+            ids=resolve(scope_lineages, runtime_lineage),
+            source_plan="a" * 64,
+        )
+    )
+    tags = (
+        None
+        if tagged_traces is None
+        else RAGIndexTags(
+            views=(
+                RAGTagView.model_validate(
+                    {
+                        "bank_id": "bank",
+                        "bank_version": 1,
+                        "view": "task",
+                        "threshold": 0.5,
+                        "questions": [{"question_id": "q.one", "family": "requirement"}],
+                        "matrix_sha256": "e" * 64,
+                        "traces": [
+                            {"trace_id": trace_id, "fired": ["q.one"]}
+                            for trace_id in sorted(resolve(tagged_traces, runtime_trace))
+                        ],
+                    }
+                ),
+            )
+        )
+    )
+    client = CountingEmbedder()
+    binding = _binding(client)
+    result = refresh_runtime_trace_rag(
+        journal,
+        store,
+        (artifact_input(imported.manifest),),
+        (imported_binding,),
+        embedder=binding,
+        embedding_reservation=_reservation(binding),
+        maximum_embedding_cost_usd=1.0,
+        created_at=_TIME + timedelta(hours=1),
+        code_revision="test-revision",
+        corpus_scope=scope,
+        trace_tags=tags,
+    )
+    return result, store, client, runtime_trace, runtime_lineage
+
+
+def test_scoped_refresh_records_scope_in_index_receipt_and_identity(tmp_path: Path) -> None:
+    """A scope admitting the runtime lineage restricts the index and is recorded everywhere.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    unscoped, _, _, _, _ = _scoped_refresh(tmp_path / "unscoped")
+    scoped, store, _, runtime_trace, _ = _scoped_refresh(
+        tmp_path / "scoped", scope_lineages=("runtime",)
+    )
+
+    assert unscoped.refresh.corpus_scope is None
+    assert "corpus_scope" not in canonical_json_bytes(unscoped.refresh).decode()
+    assert scoped.refresh.corpus_scope is not None
+    assert scoped.retrieval.index.corpus_scope == scoped.refresh.corpus_scope
+    assert {item.trace_id for item in scoped.retrieval.transitions} == {runtime_trace}
+    assert scoped.refresh.refresh_id != unscoped.refresh.refresh_id
+    reloaded = load_runtime_rag_refresh(store, scoped.refresh.refresh_id)
+    assert reloaded[0] == scoped.refresh
+
+
+def test_scoped_refresh_refuses_runtime_traces_outside_the_scope(tmp_path: Path) -> None:
+    """New runtime evidence is never silently dropped from or added to a scoped index.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    with pytest.raises(RuntimeRAGRefreshError, match="outside corpus scope"):
+        _scoped_refresh(tmp_path, scope_lineages=("imported-lineage",))
+
+
+def test_tagged_refresh_requires_rows_for_new_runtime_traces(tmp_path: Path) -> None:
+    """A tag record without the runtime trace is refused before any embedding dispatch.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    with pytest.raises(RuntimeRAGRefreshError, match="new runtime traces"):
+        _scoped_refresh(tmp_path, tagged_traces=("otlp-trace",))
+
+
+def test_tagged_refresh_records_index_tags_and_their_digest(tmp_path: Path) -> None:
+    """Complete tag rows are stored on the index and bound into the receipt identity.
+
+    Args:
+        tmp_path: Pytest-owned project directory.
+    """
+    untagged, _, _, _, _ = _scoped_refresh(tmp_path / "untagged")
+    tagged, store, _, runtime_trace, _ = _scoped_refresh(
+        tmp_path / "tagged", tagged_traces=("otlp-trace", "runtime", "unindexed-trace")
+    )
+
+    assert untagged.refresh.trace_tags_sha256 is None
+    index_tags = tagged.retrieval.index.trace_tags
+    assert index_tags is not None
+    assert index_tags.traced() == {"otlp-trace", runtime_trace}
+    assert tagged.refresh.trace_tags_sha256 == sha256_json(index_tags)
+    assert tagged.refresh.refresh_id != untagged.refresh.refresh_id
+    assert load_runtime_rag_refresh(store, tagged.refresh.refresh_id)[0] == tagged.refresh

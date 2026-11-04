@@ -85,3 +85,30 @@ def test_invalid_context_is_rejected_before_embedding(limit: int) -> None:
     """An invalid limit cannot silently become an unlimited provider input."""
     with pytest.raises(ValueError, match="at least four"):
         embedding_chunk_bytes(limit)
+
+
+def test_configured_batch_bounds_split_without_omitting_inputs() -> None:
+    """Smaller configured bounds give smaller ordered batches covering every input once."""
+    texts = tuple(f"{index:04d}" + "x" * 1_000 for index in range(50))
+    batches = tuple(embedding_batches(texts, maximum_inputs=8, maximum_bytes=4_096))
+
+    assert tuple(text for batch in batches for text in batch) == texts
+    assert all(len(batch) <= 8 for batch in batches)
+    assert all(sum(len(text.encode("utf-8")) for text in batch) <= 4_096 for batch in batches)
+    assert max(len(batch) for batch in batches) == 4
+
+
+@pytest.mark.parametrize(
+    ("inputs", "size", "message"),
+    [(0, MAXIMUM_BATCH_BYTES, "at least one input"), (8, 2_047, "at least one 2048-byte")],
+)
+def test_invalid_batch_bounds_are_refused(inputs: int, size: int, message: str) -> None:
+    """A batch bound that cannot carry one chunk fails before any batch is produced.
+
+    Args:
+        inputs: Configured input bound.
+        size: Configured byte bound.
+        message: Expected refusal text.
+    """
+    with pytest.raises(ValueError, match=message):
+        tuple(embedding_batches(("text",), maximum_inputs=inputs, maximum_bytes=size))

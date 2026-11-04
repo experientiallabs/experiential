@@ -22,6 +22,7 @@ import pytest
 from filelock import FileLock
 
 from exp.common.core.artifacts import SourceIdentity, canonical_json_bytes, sha256_json
+from exp.common.models import Embedding
 from exp.common.progress import ProgressEvent
 from exp.common.project import ArtifactStore, ProjectPaths, artifact_input
 from exp.common.project.database import content_database_path
@@ -417,3 +418,32 @@ def test_two_build_processes_share_completed_batches_without_duplicate_calls(
     assert all(output.read_text() == "completed" for output in outputs)
     successful = [text for batch in state.successful for text in batch]
     assert len(successful) == len(set(successful)) == 240
+
+
+def test_changed_batch_bounds_reuse_the_same_checkpoint_namespace(tmp_path: Path) -> None:
+    """Vectors saved under default batching resume without dispatch under smaller batches."""
+
+    class Refusing:
+        """Fail if any input reaches the provider."""
+
+        def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
+            """Refuse every request.
+
+            Args:
+                texts: Provider inputs.
+
+            Raises:
+                AssertionError: Always.
+            """
+            raise AssertionError(f"unexpected embedding of {len(texts)} saved inputs")
+
+    keys = tuple(
+        render_rag_key(
+            task="task", initial_context={}, action=RAGAction(kind="message", content=f"act {i}")
+        )
+        for i in range(30)
+    )
+    binding = default_rag_embedder()
+    saved = embed_rag_texts(binding, keys, checkpoint=_checkpoint(tmp_path))
+    smaller = replace(binding, client=Refusing(), maximum_batch_inputs=4)
+    assert embed_rag_texts(smaller, keys, checkpoint=_checkpoint(tmp_path)) == saved

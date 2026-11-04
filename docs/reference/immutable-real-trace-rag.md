@@ -181,6 +181,46 @@ must match the model identity frozen into the build artifact before either servi
 execution can proceed. A matching explicit `ModelCapabilities()` remains valid for a model with
 unknown capacities; omitting known metadata cannot disable capacity admission.
 
+## Large indexes and local embedders
+
+`load_rag_index` validates every persisted vector record and copies it into one read-only
+float64 matrix (`LoadedRAGIndex.matrix`), one row per transition, instead of keeping a Python
+tuple per vector. Float64 keeps each persisted JSON value bit-exact, so `LoadedRAGIndex.vectors`
+still rebuilds the exact persisted records for verification paths. At 100,000 transitions of
+768 dimensions the matrix is about 615 MB.
+
+Retrieval scores every eligible transition with one matrix-vector product plus the tag term,
+then rescores only a shortlist with the exact Python sum the earlier full scan used. The
+shortlist keeps every row whose approximate total is within twice a proven float64 error bound
+of the `k`-th approximate total, so it always contains the exact top `k` and every row tied with
+one. Returned matches, scores, tag overlaps and transition-ID tie breaks are identical to a full
+pure-Python scan. Lineage exclusion and the tag filter apply before scoring, as before.
+
+Provider batches default to 100 inputs and 256 KiB. `RAGEmbedderBinding(maximum_batch_inputs=...,
+maximum_batch_bytes=...)` changes them, for example to send small batches to a slow local CPU
+server; the byte bound must hold at least one 2,048-byte chunk. Batching is transport only. Each
+input is embedded independently, so the bounds are not part of the model snapshot, the durable
+checkpoint namespace or the index identity: changing them reuses every saved vector and rebuilds
+the same index. The HTTP request timeout of an embedding client is set through
+`RuntimeModelCatalog(http_timeout_seconds=...)`, which defaults to 60 seconds and also governs
+embedding clients.
+
+`TraceRAGRetriever(loaded, embedder=..., query_cache=checkpoint)` and
+`load_fit_rag_retriever(..., query_cache=checkpoint)` accept an optional
+`RAGEmbeddingCheckpoint` for query embeddings. Query chunks are then looked up by text digest
+in the namespace of the index's model snapshot and chunk size before any provider call, and new
+chunks are committed, so a repeated identical query does not embed again. The checkpoint must
+share the index's model and chunk size. Without it, every query embeds through the provider.
+Query-cost estimates still reserve the full uncached cost.
+
+`refresh_runtime_trace_rag(..., corpus_scope=..., trace_tags=..., embedding_cache=...)` passes
+scope, tags and the invocation cache to the index build. Runtime traces are bound as fit
+evidence under their conversation lineage. A scoped refresh is refused when any runtime trace
+that contributes a transition lies outside the scope, and a tagged refresh is refused before
+dispatch unless the tag record has a row in every view for every indexed trace, including each
+new runtime trace. The receipt records the scope and the digest of the stored tag record, and
+both join the refresh identity. Unscoped, untagged refreshes keep their previous identity.
+
 ## Historical provenance
 
 This design restores useful behavior from the last coherent pre-refactor implementation:
