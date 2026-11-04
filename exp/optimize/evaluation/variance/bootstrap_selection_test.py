@@ -1,5 +1,6 @@
 """Selected build tasks retain exact family worlds and frozen knowledge during preparation."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -161,7 +162,7 @@ def preparation_fixture(
             maximum_tasks=2, maximum_families=2, maximum_family_traces=20, maximum_family_tools=10
         ),
     )
-    return project, spec, bound
+    return project, spec, replace(bound, configuration_sha256=sha256_json(spec.build.reviewer))
 
 
 def saved_build(

@@ -32,7 +32,7 @@ from typing import Literal, Protocol, Self
 
 from pydantic import Field, JsonValue, model_validator
 
-from exp.common.core.artifacts import ContractModel, JsonObject, sha256_json, stable_id
+from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json, stable_id
 from exp.common.models import (
     ModelMessage,
     ModelRequest,
@@ -126,10 +126,13 @@ class CompatibilityReviewer:
     Attributes:
         draw: Buys or replays one draw by identity.
         model: Identity of the model it serves; part of every review identity.
+        configuration_sha256: Frozen caller settings, when the draw has configuration beyond
+            the model and request. Stateless injected reviewers may leave it unset.
     """
 
     draw: ReviewDraw
     model: ModelSnapshot
+    configuration_sha256: Sha256 | None = None
 
 
 class CompatibilitySpec(ContractModel):
@@ -452,6 +455,7 @@ def _loop(
             {
                 "protocol": ENVIRONMENT_REVIEW_PROTOCOL,
                 "model": reviewer.model.model_dump(mode="json"),
+                "configuration": reviewer.configuration_sha256,
                 "scope": scope,
                 "variant": variant,
                 "turn": turns,

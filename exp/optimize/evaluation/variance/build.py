@@ -47,6 +47,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     JsonObject,
+    Sha256,
     sha256_json,
     stable_id,
 )
@@ -189,6 +190,7 @@ def plan_variance_build(
     code_revision: str,
     decision_model: ModelSnapshot | None = None,
     reviewer_model: ModelSnapshot | None = None,
+    reviewer_configuration_sha256: Sha256 | None = None,
 ) -> VarianceBuildPlan:
     """Summarize a variance build without credentials, provider calls or publication.
 
@@ -199,6 +201,7 @@ def plan_variance_build(
         decision_model: Identity of an injected tagger; the catalog alias's when omitted.
         reviewer_model: Identity of the compatibility reviewer, part of the run identity when
             the spec requests environment families.
+        reviewer_configuration_sha256: Frozen caller settings beyond the reviewer model.
 
     Returns:
         Traces per role, decisions per view, embedding reuse and the run identity.
@@ -207,7 +210,9 @@ def plan_variance_build(
         ValueError: There is no completed build, a bank or alias is missing, or a rule names a
             view that is not tagged.
     """
-    return _prepare(project, spec, code_revision, decision_model, reviewer_model).summary
+    return _prepare(
+        project, spec, code_revision, decision_model, reviewer_model, reviewer_configuration_sha256
+    ).summary
 
 
 def variance_build_costs(
@@ -276,7 +281,14 @@ def run_variance_build(
         raise ValueError("a variance build tagger needs a project decision cache to replay")
     model = None if tagger is None else ModelSnapshot.model_validate(tagger.model_identity)
     reviewed = None if reviewer is None else reviewer.model
-    prepared = _prepare(project, spec, code_revision, model, reviewed)
+    prepared = _prepare(
+        project,
+        spec,
+        code_revision,
+        model,
+        reviewed,
+        None if reviewer is None else reviewer.configuration_sha256,
+    )
     identity, store = prepared.summary.identity, project.artifacts
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
@@ -358,6 +370,7 @@ def _prepare(
     code_revision: str,
     model: ModelSnapshot | None,
     reviewer: ModelSnapshot | None = None,
+    reviewer_configuration: Sha256 | None = None,
 ) -> _Prepared:
     """Load the build, freeze exposure, render units and compute the summary.
 
@@ -367,6 +380,7 @@ def _prepare(
         code_revision: Producing source identity.
         model: Identity of an injected tagger, or None for the catalog alias's.
         reviewer: Identity of the compatibility reviewer, keyed when families are requested.
+        reviewer_configuration: Frozen caller settings beyond the reviewer model.
 
     Returns:
         The prepared run.
@@ -442,7 +456,10 @@ def _prepare(
             **(
                 {}
                 if spec.environment_families is None or reviewer is None
-                else {"reviewer": reviewer.model_dump(mode="json")}
+                else {
+                    "reviewer": reviewer.model_dump(mode="json"),
+                    "reviewer_configuration": reviewer_configuration,
+                }
             ),
             "banks": {view: sha256_json(bank) for view, bank in sorted(banks.items())},
             "error_bank": None if errors is None else sha256_json(errors[0]),

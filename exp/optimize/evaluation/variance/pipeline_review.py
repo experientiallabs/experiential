@@ -1,5 +1,6 @@
 """Persisted, admitted family review draws and their credential-free cost inventory."""
 
+from exp.common.core.artifacts import sha256_json
 from exp.common.models import ModelRequest, ModelResponse
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.executable.costs import evaluation_costs
@@ -43,4 +44,6 @@ def family_reviewer(
         )
         return response
 
-    return CompatibilityReviewer(draw=draw, model=settings.model)
+    return CompatibilityReviewer(
+        draw=draw, model=settings.model, configuration_sha256=sha256_json(settings)
+    )

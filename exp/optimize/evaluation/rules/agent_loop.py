@@ -59,7 +59,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v1"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v2"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"

@@ -55,6 +55,7 @@ from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpe
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
+from exp.optimize.evaluation.variance.family_stages import MEASURE_PROFILE
 from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.nudge_ladder import CurriculumStage, NudgeLadderSpec
@@ -125,10 +126,13 @@ class BuildSettings(ContractModel):
             when ``spec.cluster_naming`` is set.
         naming_deadline_hours: Hours the naming calls may run, from the stage start.
         reviewer: Frozen admitted compatibility-review settings when families are enabled.
+        saved_report: Exact completed variance build to reuse, including its frozen reviewer
+            evidence and family scopes. Reuse makes no build calls across producer revisions.
     """
 
     spec: VarianceBuildSpec
     reviewer: AuthorSettings | None = None
+    saved_report: ArtifactInput | None = None
     naming_alias: str | None = Field(default=None, min_length=1)
     naming_deadline_hours: int = Field(default=6, ge=1, le=72, strict=True)
 
@@ -346,6 +350,8 @@ class AuthoringSettings(ContractModel):
         decision_classifier: Open-weight choice classifier; None uses ``scenario_author``.
         decision_reviewer: Open-weight clarity reviewer; None uses ``rubric_author``.
         decision_free_repeats: Free continuations per measured state checkpoint.
+        decision_profile: Evidence-tool limits shared by decision measurement, scenario search
+            and nudge author/reviewer draws. Defaults retain their priced draw budgets.
         variant_search: Search each family's scenario set over measured rounds
             (:func:`~exp.optimize.evaluation.variance.variant_search.search_variants`) in place
             of one scenario draw, accepting only a set the joint measure admits. Needs
@@ -394,6 +400,7 @@ class AuthoringSettings(ContractModel):
     decision_classifier: AuthorSettings | None = None
     decision_reviewer: AuthorSettings | None = None
     decision_free_repeats: int = Field(default=8, ge=2, le=100, strict=True)
+    decision_profile: EvidenceToolProfile = MEASURE_PROFILE
     variant_search: bool = True
     search_author: AuthorSettings | None = None
     search_rounds: int = Field(default=3, ge=1, le=8, strict=True)
@@ -429,6 +436,8 @@ class AuthoringSettings(ContractModel):
             classifier=self.decision_classifier or self.scenario_author,
             reviewer=self.decision_reviewer or self.rubric_author,
             free_repeats=self.decision_free_repeats,
+            classifier_profile=self.decision_profile,
+            reviewer_profile=self.decision_profile,
         )
 
     def search_spec(self) -> VariantSearchSpec | None:
@@ -436,7 +445,9 @@ class AuthoringSettings(ContractModel):
         if not (self.variant_search and self.decision_variance):
             return None
         return VariantSearchSpec(
-            author=self.search_author or self.scenario_author, maximum_rounds=self.search_rounds
+            author=self.search_author or self.scenario_author,
+            maximum_rounds=self.search_rounds,
+            profile=self.decision_profile,
         )
 
     def ladder_spec(self) -> NudgeLadderSpec | None:
@@ -450,6 +461,7 @@ class AuthoringSettings(ContractModel):
             realism_reviewer=reviewer,
             strengths=self.ladder_strengths,
             maximum_rounds=self.ladder_rounds,
+            profile=self.decision_profile,
         )
 
 
@@ -492,6 +504,7 @@ class RecordsSettings(ContractModel):
         dense: Optional frozen training-error vocabulary and bounded dense judge settings.
         option_proposer: Open-weight option proposer; None uses ``authoring.decision_author``.
         option_classifier: Open-weight choice classifier; None uses the family measure's.
+        option_profile: Evidence-tool limits of point-option proposal and classification draws.
         schedule: Emit one training schedule per tier from its error-mining registration and
             the nudge curriculum of its admitted families, saved and written as a spec file the
             ``variance-schedule`` action starts from; it makes no model call.
@@ -509,6 +522,7 @@ class RecordsSettings(ContractModel):
     point_decisions: bool = True
     option_proposer: AuthorSettings | None = None
     option_classifier: AuthorSettings | None = None
+    option_profile: EvidenceToolProfile = MEASURE_PROFILE
     schedule: bool = True
     rollouts_per_tier: int = Field(default=4, ge=1, le=1000, strict=True)
 
@@ -566,6 +580,7 @@ class DecisionVarianceSpec(ContractModel):
             classifier=self.records.option_classifier
             or authoring.decision_classifier
             or authoring.scenario_author,
+            profile=self.records.option_profile,
         )
 
 

@@ -106,6 +106,10 @@ class BootstrapPreparationSpec(ContractModel):
             raise ValueError("bootstrap preparation needs build.spec.environment_families")
         if self.build.spec.construction is not None:
             raise ValueError("bootstrap preparation reuses the completed build; omit construction")
+        if self.build.saved_report is not None:
+            raise ValueError(
+                "build.saved_report is a pipeline reuse input; omit it from bootstrap preparation"
+            )
         if (
             len(set(self.task_ids)) != len(self.task_ids)
             or len(self.task_ids) > self.limits.maximum_tasks
@@ -334,7 +338,11 @@ def plan_bootstrap_preparation(
     reviewer = spec.build.reviewer
     assert reviewer is not None
     build = plan_variance_build(
-        project, spec.build.spec, code_revision=code_revision, reviewer_model=reviewer.model
+        project,
+        spec.build.spec,
+        code_revision=code_revision,
+        reviewer_model=reviewer.model,
+        reviewer_configuration_sha256=sha256_json(reviewer),
     )
     identity = _identity(spec, build.identity, code_revision)
     saved = _saved_build(project, build.identity)
@@ -489,6 +497,9 @@ def run_bootstrap_preparation(
             spec.build.spec,
             code_revision=code_revision,
             reviewer_model=spec.build.reviewer.model if spec.build.reviewer is not None else None,
+            reviewer_configuration_sha256=(
+                None if spec.build.reviewer is None else sha256_json(spec.build.reviewer)
+            ),
         ).decision_model
         if injected != expected:
             raise ValueError("injected decision tagger differs from the approved model snapshot")
@@ -496,7 +507,9 @@ def run_bootstrap_preparation(
         project, spec.build, code_revision=code_revision
     )
     assert spec.build.reviewer is not None
-    if reviewer.model != spec.build.reviewer.model:
+    if reviewer.model != spec.build.reviewer.model or reviewer.configuration_sha256 != sha256_json(
+        spec.build.reviewer
+    ):
         raise ValueError("injected family reviewer differs from the approved model snapshot")
     if spec.build.spec.cluster_naming is not None and dependencies.namer is None:
         raise ValueError("the registered cluster naming needs an admitted namer before execution")

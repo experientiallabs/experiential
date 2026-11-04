@@ -288,7 +288,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v6",
+        "variance-roles-v7",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -300,7 +300,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "ea22000df8aa2d32e7c53ebc7c903e2a10a235989050bb983e223bbf4bc5c420",
+        "cd0fddb7297c7cde2a651402b0c7018a727cdc12b85faad7ea5ad76d34950075",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -314,40 +314,40 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.agent_loop:AGENT_LOOP_PROTOCOL",
-        "rules-agent-loop-v1",
+        "rules-agent-loop-v2",
         ("exp.optimize.evaluation.rules.agent_loop",),
-        "0d766e002b19ea7fdbcafc30bad5832726d42bf8802d983fdcbfb527efddb55e",
+        "a08740ad13cbf4105402aa06dd729c8f92801ac9a1711ddb39691cac1a37163e",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.research:RESEARCH_PROTOCOL",
-        "rule-research-v1",
+        "rule-research-v2",
         (
             "exp.optimize.evaluation.rules.research",
             "exp.optimize.evaluation.rules.agent_loop",
             "exp.simulation.rules.contracts:trajectory_view",
             "exp.simulation.rules.model",
         ),
-        "8f0078fd210a4a35962dce4bec8d676f042c0cfb30a20001ee3fc49dd27136f4",
+        "3e2c9b551bf7c5d95dcda3be16ef6334b08925f0c86eaf90ae82c6429268a9c8",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.weighing:WEIGHING_PROTOCOL",
-        "rule-weighing-v1",
+        "rule-weighing-v2",
         (
             "exp.optimize.evaluation.rules.weighing",
             "exp.optimize.evaluation.rules.agent_loop",
             "exp.simulation.rules.merge:check_weighing",
             "exp.simulation.rules.model",
         ),
-        "88dd8af8c2970ff6e3457622c70e0fd5f9353c04ce3605465701683371f9700c",
+        "9cae095c6bad0a4cb5f0698baaf97547bc62900738862e0222e206effcf53f3e",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.condense:CONDENSATION_PROTOCOL",
-        "rule-condensation-v1",
+        "rule-condensation-v2",
         (
             "exp.optimize.evaluation.rules.condense",
             "exp.optimize.evaluation.rules.agent_loop",
         ),
-        "c5d8ca53783448abc2ec6e031ea7c83b00bc2819cae6f61bcaa4641cbf5d5bd4",
+        "b93a2595d625a3684b90af702865b4954696bc8dc8a8e6c1d873652353f4f020",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
@@ -622,23 +622,23 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.system_two:SYSTEM_TWO_PROTOCOL",
-        "jev-system-two-v1",
+        "jev-system-two-v2",
         (
             "exp.optimize.evaluation.rules.system_two",
             "exp.optimize.evaluation.rules.agent_loop",
             "exp.optimize.evaluation.rules.memory_edits:RuleDraft",
         ),
-        "bda8eb9fca30c926f34fa664611bb14b249f217f86a90296ee69419593f375dc",
+        "ec14e5771bd4d6209959542a417c1a4dae16eb8f695814f776ca1370253a16dc",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.inspectors:INSPECTOR_PROTOCOL",
-        "rule-memory-inspectors-v1",
+        "rule-memory-inspectors-v2",
         (
             "exp.optimize.evaluation.rules.inspectors",
             "exp.optimize.evaluation.rules.memory_edits",
             "exp.optimize.evaluation.rules.agent_loop",
         ),
-        "11442db6d9a0321fe7a6f4c0506ad014956aabab9d61b7c44552bad0a48e5de4",
+        "c085c711fb83220740e304f97403102ee04bbf5b6229bf311f6a1f76cc80d773",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.memory_stage:MEMORY_STAGE_PROTOCOL",

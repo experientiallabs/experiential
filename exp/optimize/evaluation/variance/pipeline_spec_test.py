@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.optimize.evaluation.variance.family_stages import MEASURE_PROFILE
 from exp.optimize.evaluation.variance.pipeline import plan_decision_variance
 from exp.optimize.evaluation.variance.pipeline_spec import (
     COUNCIL_ACTORS,
@@ -20,6 +21,45 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     stage_identity,
 )
 from exp.optimize.evaluation.variance.pipeline_test import make_spec, wired
+
+
+def test_explicit_request_capped_profile_reaches_every_derived_evidence_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validated pipeline retains opt-in budgets without changing ordinary role defaults."""
+    run = wired(tmp_path, monkeypatch)
+    base = make_spec(run.fixture, run.rubric, run.bank)
+    profile = MEASURE_PROFILE.model_copy(
+        update={"budget": MEASURE_PROFILE.budget.model_copy(update={"maximum_usd": None})}
+    )
+    data = base.model_dump(mode="json")
+    data["authoring"].update(
+        decision_variance=True, decision_profile=profile.model_dump(mode="json")
+    )
+    data["records"]["option_profile"] = profile.model_dump(mode="json")
+    spec = DecisionVarianceSpec.model_validate(data)
+    measure, search, ladder = (
+        spec.authoring.decision_measure(),
+        spec.authoring.search_spec(),
+        spec.authoring.ladder_spec(),
+    )
+    options = spec.point_options()
+    assert measure is not None and search is not None and ladder is not None and options is not None
+    assert all(
+        bound == profile
+        for bound in (
+            measure.classifier_profile,
+            measure.reviewer_profile,
+            search.profile,
+            ladder.profile,
+            options.profile,
+        )
+    )
+    assert base.authoring.decision_profile.budget.maximum_usd is not None
+    assert base.records.option_profile.budget.maximum_usd is not None
+    assert spec.authoring.decision_profile.budget.model_calls == MEASURE_PROFILE.budget.model_calls
+    assert spec.slice("families") != base.slice("families")
+    assert spec.slice("records") != base.slice("records")
 
 
 def test_the_council_is_five_open_weight_tiers_in_stage_order() -> None:

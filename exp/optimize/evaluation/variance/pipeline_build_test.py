@@ -1,10 +1,11 @@
 """The actual pipeline build executor supplies compatibility review and prices its calls."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.optimize.evaluation.variance.bootstrap import resolve_bootstrap
 from exp.optimize.evaluation.variance.bootstrap_plan_test import successful_preparation
 from exp.optimize.evaluation.variance.bootstrap_stage import bootstrapped_registration
@@ -62,6 +63,7 @@ def test_build_stage_delivers_the_injected_family_reviewer(
         update={"reviewer": settings.reviewer.model_copy(update={"model": bound.model})}
     )
     spec = spec.model_copy(update={"build": settings})
+    bound = replace(bound, configuration_sha256=sha256_json(settings.reviewer))
     context = StageContext(
         project=project,
         spec=spec,
@@ -83,7 +85,11 @@ def test_build_stage_delivers_the_injected_family_reviewer(
     replay = BUILD_STAGE.run(context)
     assert replay.outputs == result.outputs and len(script.requests) == calls
     plan = plan_variance_build(
-        project, registered, code_revision="test", reviewer_model=bound.model
+        project,
+        registered,
+        code_revision="test",
+        reviewer_model=bound.model,
+        reviewer_configuration_sha256=bound.configuration_sha256,
     )
     assert plan.saved and review_costs(project, settings, plan) == ()
 
@@ -97,7 +103,7 @@ def test_prepared_start_keeps_family_inputs_and_rules_through_pipeline(
     author = preparation.bootstrap.author
     assert preparation.bootstrap.rules is not None
     spec = DecisionVarianceSpec(
-        build=preparation.build,
+        build=preparation.build.model_copy(update={"saved_report": prepared.build_report}),
         rules=RulesSettings(spec=preparation.bootstrap.rules),
         traceml=TraceMLSettings(enabled=False),
         mining=MiningSettings(
@@ -136,8 +142,9 @@ def test_prepared_start_keeps_family_inputs_and_rules_through_pipeline(
     monkeypatch.setattr("exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", forbidden)
     monkeypatch.setattr("exp.runtime.models.providers.transport.HttpxJsonTransport", forbidden)
     context = StageContext(
-        project=project, spec=resolved, identity="scoped-build", code_revision="test"
+        project=project, spec=resolved, identity="scoped-build", code_revision="consumer-revision"
     )
+    assert BUILD_STAGE.plan(project, resolved, "consumer-revision")[0] == ()
     result = BUILD_STAGE.run(context)
     assert isinstance(result.outputs, BuildOutputs)
     registration = bootstrapped_registration(project, prepared.bindings[0])
@@ -158,4 +165,10 @@ def test_prepared_start_keeps_family_inputs_and_rules_through_pipeline(
     assert rules.outputs.job == registration.job
     assert rules.outputs.rulebook == registration.rulebook
     assert rules.outputs.rule_memory == registration.rule_memory
+    wrong_reference = prepared.build_report.model_copy(update={"sha256": "f" * 64})
+    wrong = resolved.model_copy(
+        update={"build": resolved.build.model_copy(update={"saved_report": wrong_reference})}
+    )
+    with pytest.raises(ValueError, match="immutable variance-build"):
+        BUILD_STAGE.plan(project, wrong, "consumer-revision")
     assert rules.outputs.report == registration.rules_report

@@ -256,6 +256,7 @@ def families_identity(
             "protocol": review_protocol_sha256(),
             "clustering": clustering.identity(),
             "model": reviewer.model.model_dump(mode="json"),
+            "configuration": reviewer.configuration_sha256,
             "spec": sha256_json(spec),
             "evidence": _evidence_digest(traces, tasks),
         },
