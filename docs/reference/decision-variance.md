@@ -624,6 +624,17 @@ What the stages read beyond their own owners lives in `variance/pipeline_inputs.
   (`decision_free_repeats`), with an open-weight classifier (`decision_classifier`, default the
   scenario author) and clarity reviewer (`decision_reviewer`, default the rubric author), and
   admission requires the joint verdict.
+- **Version 2 selector records.** The records stage scores each tier's selector picks by the
+  joint decision-variance score of the family built from that point (`family_decisions`); a
+  point whose family was measured but not admitted scores zero, and a pick with no measured
+  family stays unscored. A family's eligibility names the `decision_variance` condition when the
+  joint measure blocks it.
+- **Nudges, the nudge ladder and variant search** (`variance/nudge_ladder.py`,
+  `variance/variant_search.py`). Their owners measure a set of scenarios, or a ladder of
+  instruction nudges from strongest to none, under one frozen judge and rubric with the same
+  joint measure. The pipeline does not yet run them: the family owner offers no hook for a
+  searched scenario set or a ladder in place of its single scenario draw, so each family still
+  authors one scenario set.
 - **Option actions.** The decision-state author gives each option its executable first call
   (`DecisionOption.call`). When `authoring.actions` is empty the family forces those calls
   (`option_calls`); an option without a call becomes the family's recorded failure. Explicit

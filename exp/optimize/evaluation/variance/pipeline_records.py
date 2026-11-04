@@ -52,6 +52,7 @@ from exp.optimize.evaluation.variance.crosstalk import (
 from exp.optimize.evaluation.variance.family import (
     FamilyReport,
     export_family_harbor,
+    family_decisions,
     family_executable_task,
 )
 from exp.optimize.evaluation.variance.pipeline_spec import (
@@ -149,8 +150,18 @@ class _RecordsStage:
                 training[key] = _save(context, "training", key, report.records, (row.report,))
         selectors: dict[str, ArtifactInput] = {}
         for tier in mining.tiers:
+            # Version 2 selector records score each pick by its family's joint decision measure;
+            # every family of the tier counts, admitted or not, so a refused point scores zero.
+            measured = [
+                _family(project, row)
+                for row in families.families
+                if row.tier == tier.tier and row.report is not None
+            ]
             records = selector_records(
-                project, load_report(project, tier.report), judge=tier.judge.identity
+                project,
+                load_report(project, tier.report),
+                judge=tier.judge.identity,
+                decisions=family_decisions(project, measured),
             )
             selectors[tier.tier] = _save(context, "selectors", tier.tier, records, (tier.report,))
         exports: list[HarborExport] = []
