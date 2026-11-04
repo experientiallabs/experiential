@@ -42,6 +42,7 @@ from exp.runtime.anthropic_protocol.gateway_reasoning import (
     gateway_reasoning_block,
     merge_exposed_reasoning,
 )
+from exp.runtime.anthropic_protocol.history_media import degrade_history_media
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FIELD_BOUND,
     MESSAGES_BETA_TOKENS_FORWARDED,
@@ -389,6 +390,9 @@ def _decode(
     # turn defines is removed with disclosure rather than failing the whole
     # conversation. Content blocks and top-level fields stay strict.
     payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
+    # Media the gateway cannot forward fails every replay of a history that
+    # carries it, so history copies degrade to disclosed placeholders.
+    payload, media_disclosures = degrade_history_media(payload)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
@@ -479,6 +483,7 @@ def _decode(
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(
                 *unknown_disclosures,
+                *media_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,

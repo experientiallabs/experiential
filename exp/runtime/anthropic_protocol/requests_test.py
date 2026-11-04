@@ -3252,3 +3252,45 @@ def test_exposed_messages_tool_loop_replays_unsigned_reasoning_for_each_turn() -
             payload = openai_chat_message(assistant, reasoning_output_exposed=True)
             assert payload["reasoning_content"] == f"check city {index}"
             assert "reasoning_content" not in openai_chat_message(assistant)
+
+
+def test_a_tool_read_pdf_larger_than_bedrocks_document_cap_decodes() -> None:
+    """A 5 MiB PDF a tool returned (about 7 million base64 characters) is admitted.
+
+    The Anthropic Messages API sets no per-document limit below its request
+    size, so a PDF Claude Code's Read baked into history must not 400 at the
+    gateway; a narrower rung reports its own limit.
+    """
+    data = "A" * (7 * 1024 * 1024)
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": data,
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+    tool_message = next(m for m in decoded.request.messages if m.role == "tool")
+    assert tool_message.documents[0].data == data
+    assert decoded.request.ignored_parameters == ()
