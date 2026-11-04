@@ -24,6 +24,13 @@ from exp.common.core.artifacts import ContractModel, JsonObject
 
 ImageMediaType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
 
+ImageDetail = Literal["auto", "low", "high", "original"]
+"""OpenAI's image fidelity hint (``ImageDetail`` in the OpenAI SDK, both surfaces).
+
+``original`` (full resolution, no downscaling) is forwarded only where the
+rung serves it; every other wire carries ``high`` with disclosure
+(``exp.runtime.models.providers.image_detail``)."""
+
 IMAGE_MEDIA_TYPES: dict[str, ImageMediaType] = {
     "image/png": "image/png",
     "image/jpeg": "image/jpeg",
@@ -336,7 +343,7 @@ class ImageContentPart(ContractModel):
     data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
     handle: MediaHandle | None = None
-    detail: Literal["auto", "low", "high"] | None = None
+    detail: ImageDetail | None = None
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Prompt-cache breakpoint the caller placed on this image, re-emitted
     verbatim on wires that cache a marked block natively and dropped
@@ -551,7 +558,7 @@ def audio_part_from_input_audio(data: str, audio_format: str) -> AudioContentPar
 def image_part_from_url(
     url: str,
     *,
-    detail: Literal["auto", "low", "high"] | None = None,
+    detail: ImageDetail | None = None,
 ) -> ImageContentPart:
     """Build one image part from a caller URL, inlining a data URL's bytes.
 

@@ -4923,7 +4923,7 @@ def test_vocabulary_rejections_name_the_members_and_a_bad_tag_names_the_tag() ->
                             {
                                 "type": "input_image",
                                 "image_url": "https://x/y",
-                                "detail": "original",
+                                "detail": "ultra",
                             }
                         ],
                     }
@@ -4933,7 +4933,7 @@ def test_vocabulary_rejections_name_the_members_and_a_bad_tag_names_the_tag() ->
     assert detail.value.detail.param == "input.0.content.0.input_image.detail"
     assert detail.value.detail.message == (
         "Invalid value for 'input.0.content.0.input_image.detail': expected one of 'auto', "
-        "'low' or 'high'."
+        "'low', 'high' or 'original'."
     )
     with pytest.raises(OpenAIProtocolError) as chat_part:
         decode_chat(
@@ -5950,3 +5950,76 @@ def test_a_malformed_thought_signature_is_refused_naming_its_field() -> None:
     assert rejected.value.detail.param == (
         "messages.1.tool_calls.0.extra_content.google.thought_signature"
     )
+
+
+def test_codex_original_detail_in_tool_output_history_decodes() -> None:
+    """``original`` is in OpenAI's ``ImageDetail`` and decodes everywhere it appears.
+
+    Codex Desktop attaches screenshots to tool output with ``detail:
+    "original"``; the item stays in history, so a refusal at
+    ``input.N.output.0.input_image.detail`` failed every later turn. The value
+    decodes at top level and inside a ``function_call_output`` and re-emits
+    verbatim on OpenAI's own Responses wire.
+    """
+    image_url = "data:image/png;base64,aGk="
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": image_url, "detail": "original"}
+                    ],
+                },
+                {"type": "function_call", "call_id": "c", "name": "view_image", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "c",
+                    "output": [
+                        {"type": "input_image", "image_url": image_url, "detail": "original"}
+                    ],
+                },
+            ],
+        }
+    )
+    images = [
+        part
+        for message in decoded.request.messages
+        for part in message.content_parts
+        if isinstance(part, ImageContentPart)
+    ]
+    assert [image.detail for image in images] == ["original", "original"]
+
+    payload = openai_responses_stream_payload(
+        "gpt-fixture", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    output_value = cast(list[JsonObject], payload_input[-1]["output"])
+    assert output_value[0]["detail"] == "original"
+
+
+def test_chat_image_url_accepts_original_detail() -> None:
+    """OpenAI's Chat ``image_url.detail`` documents ``original`` too."""
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,aGk=",
+                                "detail": "original",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    (image,) = decoded.request.messages[0].content_parts
+    assert isinstance(image, ImageContentPart)
+    assert image.detail == "original"
