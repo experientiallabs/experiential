@@ -87,11 +87,15 @@ re-asked with the broken rules as feedback and never committed. Durable sessions
 mining-probe task, picks one trajectory by seed, lets J point selectors (`judges`) choose up to K
 points and C critics estimate the success probability at each, then runs M continuations per
 point. Point selectors, critics and the final episode judge are separate roles even when they
-share a model. Judges and critics read a privileged packet (every attempt, its grade, the group
-rate and the verifier) and both carry the eval-audit checklist. Critics are scored by squared
-error against measured rates; a critic with nothing graded is unscored. The judges' spread score
-is a screening heuristic only and never a training reward. Every measured rate records its
-`EstimateMeaning` (actor, harness, budget, sampling, world, verifier).
+share a model. Point selectors and critics read a privileged packet (every attempt, its historical
+mechanical verifier grade, the group's historical verifier rate and the verifier specification,
+each labelled a historical diagnostic) and both carry the eval-audit checklist. Every
+continuation is judged by the spec's frozen `episode_judge` (`judge_study`), and only those
+verdicts form the measured rates: critics are scored by squared error against the judged rate of
+each point's scored continuations, and a critic with nothing judged pass or fail is unscored. The
+selectors' spread score is a screening heuristic only and never a training reward. Every measured
+rate records its `EstimateMeaning` (actor, harness, budget, sampling, runtime world digest and
+judge definition identity).
 
 Error mining is a versioned experiment (`protocol: "error-mining-v1"`).
 `ActorCriticSpec.error_mining` registers the reference counts G=16, J=8, C=8, K=4, M=8; every
@@ -127,12 +131,19 @@ ceiling and `J * K` suffix jobs of M continuations at the continuation ceiling.
    events, freeze every restorable state part and prove restoration.
 3. Executed witnesses and option contrasts (`variance/contrast.py`): the witness calls must show
    every deciding value without stating the answer; each option is forced from the same checkpoint
-   through the preregistered action-contrast experiments.
+   through the preregistered action-contrast experiments, and every cell is judged once by the
+   variant's frozen judge. When the variant's `VariantJudging` binds a world freeze, the frozen
+   variant is what runs: `frozen_start` (`variance/admission.py`) returns the freeze's saved start
+   checkpoint and the runtime definition whose digest the freeze recorded, the witness and every
+   contrast start from that checkpoint under the family job rebound to that runtime, and the
+   edited decision checkpoint of step 2 is coherence evidence only.
 4. `family_flip`: at least two variants with separated, different winners that match their declared
    correct options; a contradicting winner goes to triage and blocks qualification.
-5. Fresh confirmation on independently seeded samples, then rubric grading
-   (`variance/grader.py`), which separates insufficient evidence, ambiguous criteria, disagreement,
-   pass, fail and plain uncertainty.
+5. Fresh confirmation on independently seeded samples under the same frozen judge, then the
+   judge's coverage of the confirmation episodes (passed, failed, unassessable, malformed,
+   unavailable, without evidence, insufficient evidence, rubric problems). Probabilistic criterion
+   grading (`variance/grader.py`) may still run, as calibration evidence only; an uncertain
+   criterion never decides eligibility.
 
 **Initialization modes.** A scenario starts by `resume` (the coherent actor-visible prefix and its
 remaining calls) or `fresh_briefing` (an authored `FreshBriefing` at the fork, with the same
@@ -152,7 +163,13 @@ changes cite their authorization and bind their own criteria. Any non-original i
 start by `fresh_briefing`, since a resumed prefix already stated the original.
 
 `TrainingEligibility` (`variance/records.py`) is computed, never asserted, and lists every failed
-condition; training records exist only for eligible families. `export_family_harbor` packages a
+condition; training records exist only for eligible families. The family's
+`FamilyAdmissionPolicy` (`variance/admission.py`) adds, per confirmed variant, judge coverage,
+rubric problems, rubric compatibility, world freeze and world provenance. World provenance needs
+more than matching digests: every selection and confirmation contrast must have started from the
+freeze report's saved checkpoint for the variant, under the runtime definition the freeze
+recorded, with a judge bound to that checkpoint's task and that runtime; an unfrozen variant
+records a failed `world_provenance` condition. `export_family_harbor` packages a
 confirmed variant for Harbor, diagnostic unless the family is eligible and an executable
 qualification is supplied.
 
@@ -182,7 +199,10 @@ explicit research requests and no invented artifacts.
 draft's fixtures and the rules stage's boundary workloads, probes every load-bearing precondition
 of a state-writing tool (a silent write under missing or failing authorization rejects the world),
 and records a `VariantFreeze` per variant: `frozen` (may qualify), `diagnostic` (an unsupported
-boundary) or `rejected`, with the start checkpoint proven to restore exactly.
+boundary) or `rejected`, with the start checkpoint proven to restore exactly and the digest of the
+variant's grounded runtime definition (`definition_sha256`). `frozen_run_digests`
+(`variance/admission.py`) returns the task and world digests a run from that frozen start
+produces, which are what the variant's judge definition binds.
 `review_compatibility` records every disagreement between the world and the rubric without
 reconciling them.
 
@@ -195,6 +215,17 @@ and digest, output-schema digest, temperature, output allowance, reasoning effor
 content, refused when it equals the artifact's manifest digest), the event contract
 (`episode-events-v1`), the task digest and the world digest. Any change is a new definition and
 new labels.
+
+Both digests describe a run, not an authoring artifact. `run_task_sha256`
+(`variance/episode_evidence.py`) digests the starting checkpoint's actor task and environment
+task; `run_world_sha256` digests the runtime configuration the episode actually ran under, which
+for a frozen variant is its grounded runtime definition (the freeze's `definition_sha256`; the
+authored world's own digest stays the freeze's `world_sha256`, which the compatibility review
+covers). Every evidence converter derives `task_sha256` and `world_sha256` this way from the
+checkpoint and the job configuration it was given, never from the judge definition.
+`require_run` (`variance/judged.py`) refuses a study or contrast whose digests differ before any
+judge call, and `judge_episode` refuses any evidence that does not match its definition. The
+authoring packet's `variant_task_sha256` identifies a packet variant and is not a judge binding.
 
 `EpisodeEvidence` is ordered and append-only. Each `EpisodeEvent` names its kind, its owner
 (`actor`, `user`, `simulator`, `world`, `harness` or `experiment`) and its scope: `context` events
@@ -232,38 +263,46 @@ exactly by protocol, definition identity, evidence identity and input budget. Th
 schema live in `variance/judge_prompt.py` (`JUDGE_PROMPT_VERSION`); `judge_profile` binds both.
 
 Every place on the execution-to-reward path that derives a success bit, an empirical rate, a
-critic target, an advantage, an eligibility result or a Harbor reward, classified as semantic
-grading (migrates to the judge) or simulator and protocol validity (stays code). Paths are relative
-to `exp/optimize/evaluation/`; function names are authoritative where line numbers move.
+critic target, an advantage, an eligibility result or a Harbor reward, in its migrated state.
+Paths are relative to `exp/optimize/evaluation/`; function names are authoritative.
 
-| Site (file:line) | Current source | Kind | Target |
-|---|---|---|---|
-| `continuations/study.py:687`, `:721` `_run_branch` | `grade(spec.verifier, outcome)` sets `ContinuationBranch.assessment` (`VerifierGrade`) for completed and failed branches | semantic | Build `EpisodeEvidence` from the branch's actor calls, steps, receipts and final state; `judge_episode`; store the `JudgedEpisode` reference. Branch `status` (completed, failed, outcome_unknown) and `actor_stop` stay protocol facts; an outcome-unknown branch is still unscored, an actor budget stop is still judged |
-| `continuations/study.py:191` `known_outcomes` | `VerifierGrade.status == "pass"`, unassessable dropped | semantic aggregation | Labels from `episode_reward(load_assessment(...))`; unscored stays in the planned denominator |
-| `continuations/study.py:259` `ContinuationStudy.metrics` | `resumed_success_rate` and `brier` against `predicted_success` from verifier labels | semantic | Same arithmetic over judged labels, reported with the judge definition identity |
-| `continuations/action_contrast.py:177` `_assessment`, `:187` `grade_intervention_outcome` (`grade` at `:207`) | Re-grades the imposed action plus suffix with the task verifier | semantic | One `EpisodeEvidence` with the imposed action as `owner=experiment`, `scope=scored`, then the suffix, judged once; no separate regrade |
-| `continuations/action_contrast.py:210` `_metrics` | Arm success bounds and pair differences from verifier labels; `goal_failures`/`policy_failures` from `VerifierGrade.goal/policy` | semantic | Bounds from judged labels; goal/policy counts replaced by counts of judged not_met required criteria |
-| `variance/evidence.py:51` `group_rate`, `:125` attempt `grade`, `:147` `success_rate` | Verifier grades and group rate shown to point selectors and critics | semantic (historical) | Discovery packets label these historical; scored variant predictions read judged rates of the frozen variant judge |
-| `variance/evidence.py:64` `candidate_branches`; `variance/actor_critic.py:336` `_pick` | Completed attempts with checkpoints and enough remaining calls | protocol | Unchanged; record the eligible population as selected, not an unconditional draw |
-| `variance/actor_critic.py:465`-`:484` `_point_result` | `known_outcomes` and per-branch 1/0/None from `VerifierGrade` feed `PointOutcome` and `group_advantages` | semantic | `episode_reward` of each continuation's assessment |
-| `variance/actor_critic.py:489` `_reward_judge`, `:498` `_reward_critic`, `:526` `_ineligible`, `:550` `_rank` | Selector spread score, critic negative Brier, ranking over `PointOutcome` rates | consumer of semantic rates | Unchanged arithmetic over judged rates; the spread score stays screening only |
-| `variance/rewards.py:125` `critic_score`, `:158` `judge_score`, `:182` `group_advantages` | Pure arithmetic over supplied rates and rewards | encoding | Unchanged; inputs come only from judged assessments |
-| `variance/exposure.py:286` `estimate_meaning` (`verifier_sha256` at `:308`) | Estimate meaning binds the verifier digest | identity | Bind the `JudgeDefinition.identity` instead, so a new rubric or profile is a new estimate |
-| `variance/contrast.py:742` `option_outcome` | Option counts, Wilson and separation bounds, goal/policy failures from cell `VerifierGrade` | semantic | Judged labels of each forced-action cell |
-| `variance/contrast.py:835` `variant_verdict`, `:877` `family_flip` | Separated leader from option bounds, compared with the declared `correct_option` | consumer of semantic rates; the declared option is an authoring hypothesis | Bounds from judged cells; a mismatch with the declared option stays a triage finding, never a reward |
-| `variance/contrast.py:452` `_verdict` (witness) | Executed witness calls show each deciding fact, no error, no verbatim answer, enough calls | protocol | Unchanged; it proves discoverability, not success |
-| `variance/milestone.py:650`-`:673`, `:780` | Point separation from `run_option_contrast` | consumer of semantic rates | Follows judged contrasts; no separate grading |
-| `variance/family_stages.py:255` `grade_variants` (`variance/grader.py:281` `grade_episodes`) | Probabilistic criterion grading of confirmation episodes; only ambiguity and grading success reach eligibility | semantic diagnostic | Judge every confirmation episode; eligibility counts judged, unscored, insufficient-evidence and rubric-problem outcomes separately; criterion probabilities stay calibration evidence only |
-| `variance/records.py:424`, `:432` `family_flip`, `fresh_confirmation` conditions | From `FlipVerdict` over verifier-labelled contrasts | semantic | From judged contrasts of the frozen variant judge |
-| `variance/records.py:450` `critic_scores` | Critic draws without a scored reward | consumer of semantic rates | Unchanged over judged rates |
-| `variance/records.py:478` `rubric_unambiguous` | `rubric_graded` and ambiguous criteria from `grade_variants` | semantic | Replaced by judged-coverage and rubric-problem conditions; one uncertain criterion is not proof of ambiguity |
-| `variance/records.py:443`, `:457`, `:464`, `:471` (dispositions, tool coverage, rule witnesses, policy consistency) | Audit and world evidence | protocol | Unchanged |
-| `variance/records.py:564` `training_records` (`measured_rate` `:604`, `advantages` `:622`) | Copies critic targets and group advantages from the discovery `ActorCriticReport` | semantic handoff | Build from the family's judged variant studies under the frozen variant judge; discovery scores stay diagnostic |
-| `variance/family.py:598`, `:617`, `:621`, `:682` `_continue`/`_finish` | Selection, confirmation, rubric grading and records wiring | consumer | Freeze the `JudgeDefinition` per variant before scored critic predictions and fresh continuations; pass judged studies to records |
-| `variance/family.py:357` `export_family_harbor` (`:396`) | Qualified only when eligible, confirmed and an executable qualification exists | consumer | Package the exact private judge binding; qualification of the LLM assessment path is separate from observable-contract qualification |
-| `executable/trial.py:231` `result` (`grade` `:245`, `reward` `:258`) | Harbor reward from `grade(task.job.study.verifier, outcome)` when qualified | semantic | `judge_episode` over the trial's harness-recorded evidence, including captured intermediate dialogue; reward `episode_reward` |
-| `harbor/client.py:164`-`:165` | Writes `reward.json` from the backend's `reward` and `status` | encoding | Unchanged; it only serializes the judged reward |
-| `harbor/trial.py:304` `result` (`grade` `:310`, `task_decision` `:365`) | Mechanical grade combined with dual-evaluator axes for `EvaluationTask` Harbor trials | separate evaluation mode | Keeps its explicit contract; never used for decision-variance family exports |
+Semantic labels on this path read a saved `EpisodeAssessment`:
+
+| Site | Reads | Notes |
+|---|---|---|
+| `variance/judged.py` `judge_study`, `judge_cells` | `judge_episode` over evidence from each continuation branch or contrast cell | One `JudgedSlot` per planned episode: an assessment reference or the reason no evidence could be built. `require_run` checks the run's own digests first |
+| `variance/judged.py` `slot_rewards`, `slot_coverage`, `judged_metrics` | `episode_reward(load_assessment(...))` per slot | Pass 1, fail 0, else None; unscored episodes stay in the planned denominator and in `JudgeCoverage`, never 0.5 |
+| `variance/actor_critic.py` `_continue` (`PointOutcome`, `group_advantages`) | `slot_rewards` of the point's judged study | Critic Brier scores, selector spread scores and ranking are unchanged arithmetic over these judged rates |
+| `variance/contrast.py` `run_option_contrast`, `option_outcome` | Judged cells of every action contrast | Each cell is judged once as the imposed action (`owner=experiment`, `scope=scored`) plus its suffix; Wilson and separation bounds come from judged labels |
+| `variance/contrast.py` `variant_verdict`, `family_flip` | Option outcomes above | A mismatch with the declared correct option stays a triage finding, never a reward |
+| `variance/family_stages.py` `grade_variants` | `OptionContrast.coverage` of each confirmation | Judge coverage per confirmed variant; criterion grades from `variance/grader.py` are calibration evidence only |
+| `variance/records.py` `family_flip`, `fresh_confirmation`, `critic_scores` conditions | Judged contrasts and judged rates | Computed over the frozen variant judge's labels |
+| `variance/records.py` `judge_coverage`, `rubric_problems`, `rubric_compatibility`, `world_freeze`, `world_provenance` conditions | `variance/admission.py` `judging_problems` | Replaces the old `rubric_unambiguous` condition; one uncertain criterion is not proof of ambiguity |
+| `variance/records.py` `training_records` | Judged confirmation cells of each confirmed variant | Groups cite every assessment and read advantages back from them; discovery critic records stay diagnostic and untrainable |
+| `variance/exposure.py` `estimate_meaning` | `JudgeDefinition.identity` | Every estimate binds the judge, so a new rubric or profile is a new estimate |
+| `executable/trial.py` `result` (`_judged_result`) for a task with a `judge` | `judge_episode` over `ledger_evidence` of the closed trial ledger (`executable/ledger.py`) | Reward is `episode_reward`, emitted only when the observable contract is qualified; `family_executable_task` always binds the variant's judge |
+| `harbor/client.py` `reward.json` | The backend's judged `reward` and `status` | Encoding only |
+
+Mechanical code that stays as simulator and protocol validity, never actor reward:
+
+| Site | What it decides |
+|---|---|
+| `continuations/study.py` `_run_branch` (`VerifierGrade` on `ContinuationBranch.assessment`), `known_outcomes`, `ContinuationStudy.metrics` | Recorded as simulator and protocol diagnostics of the general continuations owner; nothing on this path reads them for a label |
+| `continuations/action_contrast.py` `_assessment`, `_metrics` | Mechanical arm diagnostics of the general contrast owner; decision-variance labels come from `judge_cells` |
+| `variance/evidence.py` `group_rate`, attempt grades, `success_rate` | Historical verifier diagnostics shown to point selectors and critics, labelled as such in the packet |
+| `variance/evidence.py` `candidate_branches`, `variance/actor_critic.py` `_pick` | The eligible population (completed attempts with checkpoints and enough remaining calls) and the seeded pick over it |
+| `variance/contrast.py` witness `_verdict` | That every deciding fact is discoverable within the remaining calls, without stating the answer |
+| `variance/records.py` dispositions, tool coverage, rule witnesses, policy consistency | Audit and world evidence; policy consistency excludes the runtime world, which `world_provenance` checks per variant |
+| `variance/world_freeze.py` `freeze_world`, `review_compatibility` | Whether the authored world is a valid simulator and how it disagrees with the rubric |
+| Branch `status`, `actor_stop`, cell `failure` | Protocol facts; an outcome-unknown branch is unscored, an actor budget stop is still judged |
+
+Legacy modes that keep their mechanical contract and are never used for decision-variance labels:
+
+| Site | Mode |
+|---|---|
+| `executable/trial.py` `result` for a task without a `judge` | Observable mechanical grade of an executable task outside this path |
+| `harbor/trial.py` `result` | Mechanical grade combined with dual-evaluator axes for `EvaluationTask` Harbor trials |
+| `variance/grader.py` `grade_episodes` | Probabilistic criterion grading kept as calibration evidence |
 
 ## What this does not establish
 

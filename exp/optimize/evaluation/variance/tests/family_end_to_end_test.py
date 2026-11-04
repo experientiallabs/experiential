@@ -40,7 +40,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
     _spec,
     _tool_reply,
 )
-from exp.optimize.evaluation.variance.admission_test import bound_judging
+from exp.optimize.evaluation.variance.admission_test import bound_judging, unfrozen_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import (
@@ -125,11 +125,19 @@ def _scenario(scenario_id: str, severity: str, *, lock: str | None = None) -> Js
 
 
 def _roles(*, held: bool) -> ScriptedJsonTransport:
-    """Judge, critic, decision-state author and scenario author replies, in call order."""
+    """Judge, critic, decision-state author and scenario author replies, in call order.
+
+    The authors answer twice: once for the unfrozen registration that builds each variant's start
+    and once for the registration bound to the world freezes of those starts.
+    """
     estimate = {"probability": 0.6, "rationale": "Base rate.", "evidence_refs": ["group"]}
     scenarios = [_scenario("urgent", "high"), _scenario("routine", "low")]
     if held:
         scenarios.append(_scenario("held", "low", lock="held"))
+    authoring = (
+        _tool_reply(DECISION_STATE_TOOL, _decision_answer(lock_axis=held)),
+        _tool_reply(SCENARIO_TOOL, {"scenarios": scenarios, "limitations": ["Tier variants."]}),
+    )
     return ScriptedJsonTransport(
         (
             _tool_reply(
@@ -153,8 +161,8 @@ def _roles(*, held: bool) -> ScriptedJsonTransport:
                     "limitations": ["Simulated grades only."],
                 },
             ),
-            _tool_reply(DECISION_STATE_TOOL, _decision_answer(lock_axis=held)),
-            _tool_reply(SCENARIO_TOOL, {"scenarios": scenarios, "limitations": ["Tier variants."]}),
+            *authoring,
+            *authoring,
         )
     )
 
@@ -168,13 +176,15 @@ class _Run:
         roles: The role transport.
         report: The actor-critic run.
         exposure: The frozen data roles.
-        spec: The family registration.
+        unfrozen: The family run before any variant was frozen, which built each start.
+        spec: The family registration bound to the world freezes of those starts.
     """
 
     fixture: GroundedFixture
     roles: JudgeRouter
     report: ActorCriticReport
     exposure: ExposurePlan
+    unfrozen: FamilyReport
     spec: DecisionFamilySpec
 
     @property
@@ -227,17 +237,34 @@ def _run(
     exposure = _exposure(project, job, "mining_probes")
     report = run_actor_critic(project, _spec(project, job), exposure=exposure, code_revision="test")
     assert all(row.failure is None for row in report.points)
+    scenarios = ("urgent", "routine", "held")
+    unbound = unfrozen_judging(project, job.study.checkpoint, job.configuration)
     spec = DecisionFamilySpec(
         decision_author=fixture.settings,
         scenario_author=fixture.settings,
         rules_stage=grounded_rules_stage(project, fixture.settings),
         actions=ACTIONS,
-        judging=dict.fromkeys(("urgent", "routine", "held"), bound_judging(project)),
+        judging=dict.fromkeys(scenarios, unbound),
         repeats=4,
         confirmation_repeats=4,
         tiers={job.study.actor_model.model_id: "strong"},
     )
-    return _Run(fixture, roles, report, exposure, spec)
+    unfrozen = run_decision_family(
+        project,
+        spec,
+        exposure=exposure,
+        report=report,
+        point=1,
+        code_revision="test",
+        grader=DecisionsTraceTagger(_Decider(lambda question, text: 0.9), _SNAPSHOT),
+    )
+    starts = {row.scenario_id: row.decision_checkpoint for row in unfrozen.variants}
+    judging = {sid: unbound for sid in scenarios}
+    for sid, start in starts.items():
+        if start is not None:
+            judging[sid] = bound_judging(project, start, job.configuration, variant=sid)
+    frozen = spec.model_copy(update={"judging": judging})
+    return _Run(fixture, roles, report, exposure, unfrozen, frozen)
 
 
 def _qualification(run: _Run, report: FamilyReport, scenario_id: str) -> ArtifactInput:
@@ -355,15 +382,17 @@ def test_a_grounded_family_is_qualified_confirmed_eligible_and_exported(
     assert report.failure is None, report.failure
     assert report.selection is not None and report.selection.qualifies
     assert report.confirmation is not None and report.confirmation.winners == ("close", "escalate")
+    unfrozen = {row.scenario_id: row.decision_checkpoint for row in run.unfrozen.variants}
     for row in report.variants:
         assert row.variant.replay_turns == 0 and row.replay is None and row.stopped is None
+        assert row.frozen is not None and row.frozen == unfrozen[row.scenario_id]
         assert row.witness is not None and row.witness.holds
         assert row.selection is not None and row.confirmation is not None
         assert row.witness_artifact in _cited(run.project, row.selection.contrasts)
         assert set(row.selection.contrasts) <= _cited(run.project, row.confirmation.contrasts)
     assert set(report.grades) == {"urgent", "routine"} and report.ambiguous_criteria == ()
     assert [c.name for c in report.eligibility.conditions if not c.holds] == ["audit_dispositions"]
-    assert report.records is None and len(run.roles.requests) == 4
+    assert report.records is None and len(run.roles.requests) == 6
 
     qualification = _qualification(run, report, "urgent")
     diagnostic = export_family_harbor(
@@ -392,7 +421,7 @@ def test_a_grounded_family_is_qualified_confirmed_eligible_and_exported(
     ]
     assert all(group.episodes and None not in group.advantages for group in groups)
     assert {record.point for record in eligible.records.critics} == {0, 1}
-    assert len(run.roles.requests) == 4
+    assert len(run.roles.requests) == 6
     qualified = export_family_harbor(
         run.project,
         eligible,
@@ -425,11 +454,16 @@ def test_a_grounded_family_is_qualified_confirmed_eligible_and_exported(
 def test_variants_forked_before_the_decision_replay_to_it_or_diverge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``check_sla`` revealed the tier, so variants replay it; a held ticket's replay diverges."""
+    """``check_sla`` revealed the tier, so variants replay it; a held ticket's replay diverges.
+
+    The replayed decisions are then frozen, and the frozen family runs from them without
+    replaying again; the held ticket has no frozen start and diverges again.
+    """
     run = _run(tmp_path, monkeypatch, first="check_sla", held=True)
     ambiguous = run.family(answer=_evidence(0.9, 0.9, draw=0.1))
 
-    rows = {row.scenario_id: row for row in ambiguous.variants}
+    rows = {row.scenario_id: row for row in run.unfrozen.variants}
+    frozen = {row.scenario_id: row for row in ambiguous.variants}
     for scenario_id in ("urgent", "routine"):
         row = rows[scenario_id]
         assert (row.variant.fork_turn, row.variant.replay_turns) == (0, 1)
@@ -437,7 +471,10 @@ def test_variants_forked_before_the_decision_replay_to_it_or_diverge(
         assert row.decision_checkpoint == row.replay.checkpoint != row.variant.reference
         assert row.selection is not None and row.selection.checkpoint == row.decision_checkpoint
         assert row.confirmation is not None
-    held = rows["held"]
+        start = frozen[scenario_id]
+        assert start.frozen == row.replay.checkpoint and start.replay is None
+        assert start.selection is not None and start.selection.checkpoint == start.frozen
+    held = frozen["held"]
     assert held.replay is not None and held.replay.status == "replay_diverged"
     assert held.stopped is not None and held.stopped.startswith("replay_diverged: ")
     assert held.selection is None and held.decision_checkpoint is None
@@ -453,8 +490,8 @@ def test_variants_forked_before_the_decision_replay_to_it_or_diverge(
 
     assert eligible.eligibility.eligible, eligible.eligibility.reasons
     assert isinstance(eligible.records, TrainingRecords)
-    assert [row.replay for row in eligible.variants] == [row.replay for row in ambiguous.variants]
-    assert len(run.roles.requests) == 4
+    assert [row.frozen for row in eligible.variants] == [row.frozen for row in ambiguous.variants]
+    assert len(run.roles.requests) == 6
     replayed = rows["routine"].replay
     assert replayed is not None and replayed.calls[0].observation is not None
     assert json.loads(replayed.calls[0].observation.content) == {"lock": "none", "severity": "low"}

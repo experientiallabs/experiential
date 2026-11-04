@@ -16,10 +16,11 @@ from saved evidence rather than asserted by a caller:
 - **rule_witnesses**: no rule the family relies on was contradicted without a witness, or lacks
   a supporting witness.
 - **policy_consistency**: every estimate the records rest on shares one actor policy, harness,
-  budget, sampling setting and world; only the checkpoint, the calls remaining there and the
-  judge that labels each variant differ.
-- **judge_coverage**, **rubric_problems**, **rubric_compatibility**, **world_freeze**: every
-  confirmed variant meets the family's frozen admission policy
+  budget and sampling setting; only where it started (the checkpoint, the calls remaining there
+  and the runtime world, which differs between frozen authored variants) and the judge that
+  labels each variant differ. Each variant's world is checked by **world_provenance** instead.
+- **judge_coverage**, **rubric_problems**, **rubric_compatibility**, **world_freeze**,
+  **world_provenance**: every confirmed variant meets the family's frozen admission policy
   (:mod:`~exp.optimize.evaluation.variance.admission`); each failing variant is named with what
   was found.
 
@@ -27,9 +28,10 @@ Failed conditions are all listed, never only the first. Records are built only f
 family, from its judged confirmation episodes under each variant's frozen judge: one
 :class:`ContinuationGroup` per confirmed variant and forced option, referencing every saved
 assessment, with group-relative advantages read back from those assessments; the imposed first
-action is experiment-owned and never trainable as actor tokens. Discovery critic records and
-point-selector screening scores are kept, both marked non-trainable: they were scored under the
-discovery judge, not the variant's.
+action is experiment-owned and never trainable as actor tokens. Discovery critic records are kept
+only when the error-mining run's episode judge is every confirmed variant's judge (otherwise
+``critics_refused`` says why), and point-selector screening scores are kept, both marked
+non-trainable: they were scored under the discovery run, not the variant's fresh predictions.
 
 Fresh confirmation draws come from :func:`confirmation_job`, and their episodes are rendered for
 an optional calibration grader by :func:`confirmation_episodes`.
@@ -82,6 +84,7 @@ ConditionName = Literal[
     "rubric_problems",
     "rubric_compatibility",
     "world_freeze",
+    "world_provenance",
 ]
 """Every condition training eligibility checks."""
 
@@ -97,6 +100,7 @@ CONDITIONS: tuple[ConditionName, ...] = (
     "rubric_problems",
     "rubric_compatibility",
     "world_freeze",
+    "world_provenance",
 )
 """The conditions in the order they are reported."""
 
@@ -367,10 +371,12 @@ def policy_key(meaning: EstimateMeaning) -> str:
         meaning: An estimate's frozen meaning.
 
     Returns:
-        SHA-256 over every field except the checkpoint, the calls remaining there and the judge,
-        which labels outcomes and is not part of the actor policy.
+        SHA-256 over every field except the checkpoint, the calls remaining there, the runtime
+        world (frozen authored variants each run their own frozen definition, checked by the
+        ``world_provenance`` condition) and the judge, which labels outcomes and is not part of
+        the actor policy.
     """
-    excluded = {"checkpoint", "remaining_calls", "judge_sha256"}
+    excluded = {"checkpoint", "remaining_calls", "world_sha256", "judge_sha256"}
     return sha256_json(meaning.model_dump(mode="json", exclude=excluded))
 
 
@@ -499,6 +505,7 @@ def training_eligibility(
                     "rubric_problems",
                     "rubric_compatibility",
                     "world_freeze",
+                    "world_provenance",
                 )
             ),
         )
@@ -591,7 +598,9 @@ class TrainingRecords(ContractModel):
 
     Attributes:
         policy: Policy key every record shares (:func:`policy_key`).
-        critics: Discovery critic records, by draw then point; none is trainable.
+        critics: Discovery critic records, by draw then point; none is trainable. Empty when
+            the error-mining run's episode judge is not every confirmed variant's judge.
+        critics_refused: Why discovery critic records were refused, when they were.
         groups: Judged continuation groups per actor tier, each by variant then option.
         judges: Point-selector screening scores; none of them is trainable.
         coverage: The judge coverage of every confirmed variant behind the groups.
@@ -599,6 +608,7 @@ class TrainingRecords(ContractModel):
 
     policy: str
     critics: tuple[CriticRecord, ...]
+    critics_refused: str | None = None
     groups: dict[str, tuple[ContinuationGroup, ...]]
     judges: tuple[JudgeScreening, ...]
     coverage: dict[str, JudgeCoverage] = Field(default_factory=dict)
@@ -650,9 +660,20 @@ def training_records(
                     ).advantages,
                 )
             )
+    mining = report.spec.episode_judge.identity
+    foreign = sorted(
+        scenario for scenario, (contrast, _) in confirmed.items() if contrast.judge != mining
+    )
+    refused = (
+        f"the error-mining judge {mining[:12]} is not the frozen judge of variants {foreign}, "
+        "so its measured rates do not score critics for this family"
+        if foreign
+        else None
+    )
     return TrainingRecords(
         policy=policy,
-        critics=_discovery_critics(report),
+        critics=() if refused else _discovery_critics(report),
+        critics_refused=refused,
         groups={tier: tuple(items) for tier, items in sorted(groups.items())},
         judges=tuple(
             JudgeScreening(draw=draw.draw, score=draw.score)

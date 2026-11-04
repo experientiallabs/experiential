@@ -15,8 +15,13 @@ reason recorded on its :class:`FamilyVariant`:
    evidence.
 
 Every contrast cell is judged by the variant's own frozen episode judge, fixed before the variant's
-first contrast runs. A variant whose selection winner qualifies is contrasted again on fresh
-samples by :func:`confirm_variant`, and :func:`grade_variants` reports the judge's coverage of the
+first contrast runs. When the variant's judge binding names a world freeze, the frozen variant is
+what runs: the witness and every contrast start from the freeze's saved checkpoint under the job
+rebound to the frozen runtime definition, and the edited decision checkpoint is coherence evidence
+only.
+
+A variant whose selection winner qualifies is contrasted again on fresh samples by
+:func:`confirm_variant`, and :func:`grade_variants` reports the judge's coverage of the
 confirmation episodes, with optional probabilistic criterion grades kept as calibration evidence
 only.
 """
@@ -74,6 +79,8 @@ class FamilyVariant(ContractModel):
         selection: The selection option contrast, when one ran.
         confirmation: The fresh confirmation option contrast, when one ran.
         meaning: What the variant's contrast outcomes are conditional on, when contrasted.
+        frozen: The world freeze's saved start the variant's witness and contrasts ran from, when
+            a freeze was bound.
         stopped: Why the variant went no further, when it stopped before confirmation; a replay
             that diverged stops it with a reason starting ``replay_diverged``.
     """
@@ -87,14 +94,17 @@ class FamilyVariant(ContractModel):
     selection: OptionContrast | None = None
     confirmation: OptionContrast | None = None
     meaning: EstimateMeaning | None = None
+    frozen: ArtifactInput | None = None
     stopped: str | None = None
 
     @property
     def decision_checkpoint(self) -> ArtifactInput | None:
-        """The checkpoint at the decision: the replayed one, else the variant itself.
+        """The checkpoint contrasts start from: the frozen start, the replayed one, or the variant.
 
         None when the variant was not persisted or its replay diverged.
         """
+        if self.frozen is not None:
+            return self.frozen
         if self.replay is not None:
             return self.replay.checkpoint
         return self.variant.reference
@@ -114,6 +124,7 @@ def run_variant(
     judge: EpisodeJudge,
     code_revision: str,
     required_state: frozenset[StatePart] = frozenset(),
+    frozen: ArtifactInput | None = None,
 ) -> FamilyVariant:
     """Build, prove, replay, witness and contrast one scenario's variant, stopping at a gap.
 
@@ -131,6 +142,9 @@ def run_variant(
         code_revision: Producing source identity.
         required_state: State parts the variant must hold beyond the baseline, such as
             ``files``.
+        frozen: The world freeze's saved start for this variant; ``job`` must already run its
+            frozen runtime definition. The witness and contrasts then start from it, and the
+            edited decision checkpoint is not replayed.
 
     Returns:
         The variant with every stage it reached.
@@ -156,7 +170,12 @@ def run_variant(
     row = row.model_copy(update={"restored": restored})
     if not restored:
         return row.model_copy(update={"stopped": "variant does not restore to its edited state"})
-    if variant.replay_turns:
+    if frozen is not None:
+        row = row.model_copy(update={"frozen": frozen})
+        reference = frozen
+        if not verify_restoration(project, reference):
+            return row.model_copy(update={"stopped": "the frozen start does not restore"})
+    elif variant.replay_turns:
         try:
             replay = replay_to_decision(
                 project,

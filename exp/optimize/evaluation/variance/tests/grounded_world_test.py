@@ -75,6 +75,7 @@ from exp.optimize.evaluation.variance.contrast import run_observation_witness, r
 from exp.optimize.evaluation.variance.judged_test import (
     episode_judge,
     route_judge,
+    run_digests,
     state_judge,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
@@ -653,7 +654,11 @@ def test_witness_and_option_contrast_run_on_the_grounded_world(
         actions=ACTIONS,
         job=fixture.job,
         repeats=2,
-        judge=episode_judge(fixture.project, fixture.settings),
+        judge=episode_judge(
+            fixture.project,
+            fixture.settings,
+            **run_digests(fixture.project, start, fixture.job.configuration),
+        ),
         code_revision="test",
     )
 

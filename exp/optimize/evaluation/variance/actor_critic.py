@@ -8,7 +8,8 @@ explicit spec field.
 1. **Group.** The registered initial job runs ``G`` attempts of one task from one starting
    checkpoint in the configured world (typically the grounded world model with learned rules),
    saving a paired actor/world checkpoint after every tool turn.
-2. **Pick.** One attempt is chosen with a seed derived from the run identity. This is not an
+2. **Pick.** One attempt is chosen with a seed derived from the registration without its episode
+   judge, so changing only the judge never re-picks the trajectory. This is not an
    unconditional draw over every attempt: it is a seeded uniform choice over the *eligible*
    population (completed, at least one saved tool turn, and at least two boundaries with actor
    calls left). The rule, the seed material, the shuffled order and every attempt's eligibility
@@ -271,7 +272,7 @@ class PickRecord(ContractModel):
 
     Attributes:
         rule: The eligibility rule, verbatim.
-        seed_material_sha256: Digest of the run identity and seed the shuffle used.
+        seed_material_sha256: Digest of the judge-free registration and seed the shuffle used.
         population: Every attempt index in the group.
         order: Shuffled order of the candidate attempts.
         eligible: Attempts the rule admits, in attempt order.
@@ -668,7 +669,7 @@ def _pick(
 
     Args:
         group: The group of attempts.
-        identity: Run identity mixed into the seed.
+        identity: Run identity; it binds the judge, so it is not mixed into the seed.
         spec: The registration.
         loader: Cached checkpoint loader.
         references: Registered references rendered into the packet.
@@ -681,7 +682,9 @@ def _pick(
     """
     candidates = candidate_branches(group)
     order = list(candidates)
-    material = f"{identity}:{spec.seed}"
+    del identity
+    registration = sha256_json(spec.model_dump(mode="json", exclude={"episode_judge"}))
+    material = f"{registration}:{spec.seed}"
     random.Random(material).shuffle(order)
     calls = spec.initial.maximum_model_calls
     ineligible: dict[int, str] = {}
@@ -889,7 +892,11 @@ def _continue(
             tier=tier,
         )
     judged_ref, judged = judge_study(
-        project, reference, spec.episode_judge, code_revision=code_revision
+        project,
+        reference,
+        spec.episode_judge,
+        configuration=job.configuration,
+        code_revision=code_revision,
     )
     rewards = slot_rewards(project, judged.branches, judged.judge)
     labels = [int(reward) for reward in rewards if reward is not None]

@@ -11,7 +11,7 @@ from exp.common.core.artifacts import ArtifactInput
 from exp.common.models import BillingSource, ModelSnapshot, ToolCall
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel_test import write_catalog
-from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
+from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, ActorCriticSpec
 from exp.optimize.evaluation.variance.contrast import (
     FlipVerdict,
     OptionContrast,
@@ -135,10 +135,11 @@ def test_eligibility_reports_every_condition_and_cannot_be_asserted() -> None:
         "rubric_problems",
         "rubric_compatibility",
         "world_freeze",
+        "world_provenance",
     ]
     assert any("rule.a was contradicted" in r and "rule.b has no" in r for r in eligibility.reasons)
     assert eligibility.reasons[-1] == (
-        "world_freeze: no confirmed variant was checked against the policy"
+        "world_provenance: no confirmed variant was checked against the policy"
     )
     with pytest.raises(ValidationError, match="every condition"):
         TrainingEligibility(
@@ -190,7 +191,13 @@ def test_each_failed_admission_check_is_recorded_per_variant() -> None:
             judging=problems,
         )
 
-    names = ("judge_coverage", "rubric_problems", "rubric_compatibility", "world_freeze")
+    names = (
+        "judge_coverage",
+        "rubric_problems",
+        "rubric_compatibility",
+        "world_freeze",
+        "world_provenance",
+    )
     assert eligibility({name: {} for name in names}).eligible
     blocked = eligibility(
         {
@@ -266,10 +273,10 @@ def test_exported_advantages_are_read_from_the_saved_verdicts_and_follow_a_flip(
                 "rubric_problems",
                 "rubric_compatibility",
                 "world_freeze",
+                "world_provenance",
             )
         },
     )
-    discovery = ActorCriticReport.model_construct(points=(), critics=(), judges=())
     exported = []
     for run, flip in enumerate((False, True)):
         root = tmp_path / f"run-{run}"
@@ -298,8 +305,23 @@ def test_exported_advantages_are_read_from_the_saved_verdicts_and_follow_a_flip(
             options=(option, option.model_copy(update={"option_id": "b"})),
             judge=judge.identity,
         )
+        discovery = ActorCriticReport.model_construct(
+            spec=ActorCriticSpec.model_construct(episode_judge=judge),
+            points=(),
+            critics=(),
+            judges=(),
+        )
         records = training_records(project, eligible, discovery, {"x": (contrast, _meaning())})
-        assert isinstance(records, TrainingRecords)
+        assert isinstance(records, TrainingRecords) and records.critics_refused is None
+        other = episode_judge(
+            project, judge_settings(project), task_sha256="d" * 64, world_sha256="d" * 64
+        )
+        foreign = discovery.model_copy(
+            update={"spec": ActorCriticSpec.model_construct(episode_judge=other)}
+        )
+        refused = training_records(project, eligible, foreign, {"x": (contrast, _meaning())})
+        assert isinstance(refused, TrainingRecords) and refused.critics == ()
+        assert refused.critics_refused is not None and "variants ['x']" in refused.critics_refused
         group = records.groups["untiered"][0]
         assert group.episodes == tuple(cell.slot for cell in option.cells)
         assert not group.imposed_action_trainable and group.judge == judge.identity

@@ -28,13 +28,15 @@ from exp.optimize.evaluation.variance.episode_evidence import (
     evidence_from_branch,
     evidence_from_contrast_cell,
     ledger_evidence,
+    run_task_sha256,
+    run_world_sha256,
 )
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 
-TASK, WORLD = sha256_json("task"), sha256_json("world")
+CONFIGURATION: JsonObject = {"runtime": "evidence-fixture"}
 
 
 def _reply(index: int, content: str | None, calls: tuple[ToolCall, ...] = ()) -> JsonHttpResponse:
@@ -98,8 +100,7 @@ def _evidence(
         branch,
         checkpoint,
         episode_id="branch-0",
-        task_sha256=TASK,
-        world_sha256=WORLD,
+        configuration=CONFIGURATION,
         checkpoint_source="checkpoint",
         branch_source="branch",
         exogenous=exogenous,
@@ -114,6 +115,8 @@ def test_branch_keeps_prefix_as_context_and_every_scored_event_in_order(
     assert branch.status == "completed"
     evidence = _evidence(branch, checkpoint)
     assert evidence.complete and evidence.missing == ()
+    assert evidence.task_sha256 == run_task_sha256(checkpoint)
+    assert evidence.world_sha256 == run_world_sha256(CONFIGURATION) == sha256_json(CONFIGURATION)
     prefix = len(checkpoint.actor.messages)
     context = [event for event in evidence.events if event.scope == "context"]
     assert [event.event_id for event in context][:prefix] == [
@@ -214,14 +217,14 @@ def test_contrast_cell_scores_the_imposed_action_as_experiment_owned(
             intervention=intervention,
             suffix=suffix,
             episode_id=f"cell-{index}",
-            task_sha256=TASK,
-            world_sha256=WORLD,
             contrast_source="contrast",
             checkpoint_source="checkpoint",
             intervention_source=cell.intervention.artifact_id,
             suffix_source=cell.study.artifact_id,
         )
         assert evidence.complete
+        assert evidence.task_sha256 == run_task_sha256(checkpoint)
+        assert evidence.world_sha256 == run_world_sha256(spec.base.configuration)
         events = {event.event_id: event for event in evidence.events}
         imposed = events["imposed.call"]
         assert (imposed.kind, imposed.owner, imposed.scope) == ("tool_call", "experiment", "scored")
@@ -243,8 +246,6 @@ def test_contrast_cell_scores_the_imposed_action_as_experiment_owned(
             intervention=None,
             suffix=None,
             episode_id="cell",
-            task_sha256=TASK,
-            world_sha256=WORLD,
             contrast_source="contrast",
             checkpoint_source="checkpoint",
         )
@@ -256,8 +257,6 @@ def test_contrast_cell_scores_the_imposed_action_as_experiment_owned(
         intervention=None,
         suffix=None,
         episode_id="cell",
-        task_sha256=TASK,
-        world_sha256=WORLD,
         contrast_source="contrast",
         checkpoint_source="checkpoint",
     )
@@ -292,8 +291,7 @@ def test_trial_ledger_becomes_evidence_with_dialogue_between_calls(
         entries,
         checkpoint,
         episode_id=identity,
-        task_sha256=TASK,
-        world_sha256=WORLD,
+        configuration=CONFIGURATION,
         ledger_source=identity,
         checkpoint_source="checkpoint",
     )
@@ -320,8 +318,7 @@ def test_trial_ledger_becomes_evidence_with_dialogue_between_calls(
         entries[:3],
         checkpoint,
         episode_id=identity,
-        task_sha256=TASK,
-        world_sha256=WORLD,
+        configuration=CONFIGURATION,
         ledger_source=identity,
         checkpoint_source="checkpoint",
     )
@@ -333,8 +330,7 @@ def test_trial_ledger_becomes_evidence_with_dialogue_between_calls(
             entries[1:],
             checkpoint,
             episode_id=identity,
-            task_sha256=TASK,
-            world_sha256=WORLD,
+            configuration=CONFIGURATION,
             ledger_source=identity,
             checkpoint_source="checkpoint",
         )

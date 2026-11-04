@@ -326,18 +326,18 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judged:JUDGED_LABELS_PROTOCOL",
-        "judged-labels-v1",
+        "judged-labels-v2",
         (
             "exp.optimize.evaluation.variance.judged",
             "exp.optimize.evaluation.variance.episode_evidence",
         ),
-        "0a8daa633cd1f23009bc5fc82b7f1088594ae1f014eab93e850b256c5fcd185d",
+        "2b26ae0c1cda7b2ceaa1ab4cce7d8535cb638d99ff24eee9d41b96dd185b701c",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.admission:FAMILY_ADMISSION_POLICY",
-        "family-admission-v1",
+        "family-admission-v2",
         ("exp.optimize.evaluation.variance.admission",),
-        "10d7315d932a11593975b27b4cbc7be69685ecfb244d598c270cfe2dfb067ea2",
+        "db87ef56d6f53319d2c606685e674d5c58e544da8a3028d4fd9df7aa027e6e94",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authoring_packet:AUTHORING_PACKET_PROTOCOL",

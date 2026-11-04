@@ -13,12 +13,14 @@ from exp.common.models import BillingSource, ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates_test import _reply
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticSpec,
     ActorTier,
     PointResult,
+    _pick,
     policy_groups,
     run_actor_critic,
 )
@@ -35,6 +37,7 @@ from exp.optimize.evaluation.variance.judged_test import (
     Verdict,
     episode_judge,
     route_judge,
+    run_digests,
 )
 from exp.optimize.evaluation.variance.rewards import PointOutcome, group_advantages
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
@@ -104,7 +107,9 @@ def _spec(project: ProjectStore, job: ContinuationJob, *, judges: int = 1) -> Ac
     )
     return ActorCriticSpec(
         initial=group,
-        episode_judge=episode_judge(project, settings),
+        episode_judge=episode_judge(
+            project, settings, **run_digests(project, job.study.checkpoint, job.configuration)
+        ),
         judges=(settings,) * judges,
         critics=(settings,),
         points=2,
@@ -334,7 +339,9 @@ def test_the_error_mining_defaults_run_and_record_populations_and_usage(
     settings = _settings(project, job)
     spec = ActorCriticSpec.error_mining(
         job,
-        episode_judge=episode_judge(project, settings),
+        episode_judge=episode_judge(
+            project, settings, **run_digests(project, job.study.checkpoint, job.configuration)
+        ),
         selector=settings,
         critic=settings,
         group_physical_attempts=40,
@@ -363,6 +370,26 @@ def test_the_error_mining_defaults_run_and_record_populations_and_usage(
     assert report.pick.ineligible == {0: "no saved tool turn"}
     assert report.pick.eligible == tuple(range(1, 16))
     assert report.picked == next(i for i in report.pick.order if i in report.pick.eligible)
+    other = spec.model_copy(
+        update={
+            "episode_judge": episode_judge(
+                project, settings, task_sha256="e" * 64, world_sha256="e" * 64
+            )
+        }
+    )
+    group = load_study(project.artifacts, report.group)
+    repicked, _ = _pick(
+        group,
+        other.identity("test"),
+        other,
+        lambda ref: load_continuation_checkpoint(project.artifacts, ref),
+        (),
+    )
+    assert other.identity("test") != spec.identity("test")
+    assert (repicked.seed_material_sha256, repicked.picked) == (
+        report.pick.seed_material_sha256,
+        report.picked,
+    )
     counts = report.counts
     assert (counts.attempts_planned, counts.attempts_eligible) == (16, 15)
     assert (counts.selector_answers, counts.critic_answers) == (8, 8)

@@ -20,7 +20,12 @@ from exp.optimize.evaluation.executable.trial import (
     open_executable_harbor_trial,
 )
 from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
-from exp.optimize.evaluation.variance.judged_test import episode_judge, judge_settings, route_judge
+from exp.optimize.evaluation.variance.judged_test import (
+    episode_judge,
+    judge_settings,
+    route_judge,
+    run_digests,
+)
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.workbook_edits import read_supported_workbook
@@ -321,8 +326,10 @@ def test_a_judged_task_is_rewarded_only_by_its_frozen_judge_over_the_ledger(
 ) -> None:
     """The same submitted episode under pass, fail and unassessable verdicts: 1, 0 and none."""
     project, task, spec = qualified_fixture(tmp_path, monkeypatch)
-    judge = episode_judge(project, judge_settings(project))
-    judged = load_executable_task(project, task).model_copy(update={"judge": judge})
+    loaded = load_executable_task(project, task)
+    run = run_digests(project, loaded.job.study.checkpoint, loaded.job.configuration)
+    judge = episode_judge(project, judge_settings(project), **run)
+    judged = loaded.model_copy(update={"judge": judge})
     reference = persist_executable_task(
         project, judged, created_at=datetime.now(UTC), code_revision="test"
     )

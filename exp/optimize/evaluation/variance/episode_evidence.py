@@ -12,6 +12,12 @@ Event ids are deterministic locators (``prefix.3``, ``call.2.tool.0.reply``, ``l
 each event's ``source`` names the exact saved record field it came from. ``complete`` and
 ``missing`` are honest: an unrecorded tool reply, actor response or interrupted branch is missing
 evidence. Hidden reasoning is never recorded and is not evidence, so it is never listed as missing.
+
+The evidence's ``task_sha256`` and ``world_sha256`` are derived from the run itself, never copied
+from the judge definition: :func:`run_task_sha256` digests the starting checkpoint's actor and
+environment tasks, and :func:`run_world_sha256` digests the runtime configuration the episode
+actually ran under (a frozen variant's grounded runtime definition when it ran in a frozen world).
+The judge then refuses evidence whose digests differ from the ones its definition binds.
 """
 
 from collections.abc import Sequence
@@ -19,7 +25,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue
+from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, Sha256, sha256_json
 from exp.common.models import ModelFinishReason, ModelMessage, ModelResponse, ToolCall
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrastSpec, ContrastCell
 from exp.optimize.evaluation.continuations.intervention import ActionIntervention
@@ -34,6 +40,38 @@ from exp.optimize.evaluation.variance.episodes import (
 )
 from exp.runtime.environments.interface import Observation
 from exp.simulation.continuations import ContinuationCheckpoint
+
+
+def run_task_sha256(checkpoint: ContinuationCheckpoint) -> Sha256:
+    """Return the digest of the exact task a run started from.
+
+    Args:
+        checkpoint: The run's starting checkpoint.
+
+    Returns:
+        SHA-256 over the actor's public task and the environment task that restored the world.
+    """
+    return sha256_json(
+        {
+            "task": checkpoint.task.model_dump(mode="json"),
+            "environment_task": checkpoint.world_task.model_dump(mode="json"),
+        }
+    )
+
+
+def run_world_sha256(configuration: JsonObject) -> Sha256:
+    """Return the digest of the runtime configuration a run actually used.
+
+    For an episode in a frozen authored world this is the variant's grounded runtime definition,
+    whose digest the world-freeze report records as ``definition_sha256``.
+
+    Args:
+        configuration: The continuation job's runtime configuration.
+
+    Returns:
+        SHA-256 of the configuration.
+    """
+    return sha256_json(configuration)
 
 
 class ExogenousRecord(ContractModel):
@@ -92,12 +130,14 @@ class _Log:
             self.add(event_id, "state_snapshot", "world", scope, state, source)
             self.state = state
 
-    def evidence(self, *, episode_id: str, task_sha256: str, world_sha256: str) -> EpisodeEvidence:
-        """Freeze the log; it is complete exactly when nothing is known to be missing."""
+    def evidence(
+        self, *, episode_id: str, checkpoint: ContinuationCheckpoint, configuration: JsonObject
+    ) -> EpisodeEvidence:
+        """Freeze the log with the run's own digests; complete exactly when nothing is missing."""
         return EpisodeEvidence(
             episode_id=episode_id,
-            task_sha256=task_sha256,
-            world_sha256=world_sha256,
+            task_sha256=run_task_sha256(checkpoint),
+            world_sha256=run_world_sha256(configuration),
             events=tuple(self.events),
             complete=not self.missing,
             missing=tuple(self.missing),
@@ -323,8 +363,7 @@ def evidence_from_branch(
     checkpoint: ContinuationCheckpoint,
     *,
     episode_id: str,
-    task_sha256: str,
-    world_sha256: str,
+    configuration: JsonObject,
     checkpoint_source: str,
     branch_source: str,
     exogenous: Sequence[ExogenousRecord] = (),
@@ -335,8 +374,8 @@ def evidence_from_branch(
         branch: Saved branch of a continuation study started at ``checkpoint``.
         checkpoint: The study's starting checkpoint; its actor messages are the retained prefix.
         episode_id: Stable episode identity, typically the branch record id.
-        task_sha256: Digest of the exact task the judge definition binds.
-        world_sha256: Digest of the exact frozen world the judge definition binds.
+        configuration: Runtime configuration the episode ran under; with the checkpoint it
+            gives the evidence's task and world digests.
         checkpoint_source: Locator of the checkpoint artifact.
         branch_source: Locator of the branch record.
         exogenous: Externally initiated world events, each placed after its step.
@@ -351,7 +390,7 @@ def evidence_from_branch(
     log = _Log()
     _prefix(log, checkpoint, checkpoint_source)
     _branch(log, branch, branch_source, exogenous, initial=True)
-    return log.evidence(episode_id=episode_id, task_sha256=task_sha256, world_sha256=world_sha256)
+    return log.evidence(episode_id=episode_id, checkpoint=checkpoint, configuration=configuration)
 
 
 def evidence_from_contrast_cell(
@@ -362,8 +401,6 @@ def evidence_from_contrast_cell(
     intervention: ActionIntervention | None,
     suffix: ContinuationBranch | None,
     episode_id: str,
-    task_sha256: str,
-    world_sha256: str,
     contrast_source: str,
     checkpoint_source: str,
     intervention_source: str | None = None,
@@ -374,6 +411,7 @@ def evidence_from_contrast_cell(
 
     The imposed action is ``scored`` and owned by ``experiment``, so an unsafe imposed action
     cannot disappear behind a clean suffix and is never mistaken for an actor-sampled decision.
+    The task and world digests come from ``checkpoint`` and the contrast job's configuration.
 
     Args:
         cell: Saved contrast cell.
@@ -382,8 +420,6 @@ def evidence_from_contrast_cell(
         intervention: Saved imposed-action effect, None exactly when the cell has none.
         suffix: The suffix study's single branch, None exactly when the cell has no study.
         episode_id: Stable episode identity, typically the cell record id.
-        task_sha256: Digest of the exact task the judge definition binds.
-        world_sha256: Digest of the exact frozen world the judge definition binds.
         contrast_source: Locator of the contrast registration.
         checkpoint_source: Locator of the original checkpoint artifact.
         intervention_source: Locator of the intervention record, required with one.
@@ -439,7 +475,9 @@ def evidence_from_contrast_cell(
         if intervention is not None and initial is not None and initial != intervention.after:
             raise ValueError("suffix did not resume the imposed action's state")
         _branch(log, suffix, suffix_source, exogenous, initial=False)
-    return log.evidence(episode_id=episode_id, task_sha256=task_sha256, world_sha256=world_sha256)
+    return log.evidence(
+        episode_id=episode_id, checkpoint=checkpoint, configuration=spec.base.configuration
+    )
 
 
 def ledger_evidence(
@@ -447,8 +485,7 @@ def ledger_evidence(
     checkpoint: ContinuationCheckpoint,
     *,
     episode_id: str,
-    task_sha256: str,
-    world_sha256: str,
+    configuration: JsonObject,
     ledger_source: str,
     checkpoint_source: str,
 ) -> EpisodeEvidence:
@@ -462,8 +499,8 @@ def ledger_evidence(
         entries: The trial's ledger (``trial_ledger``), starting with its ``start`` entry.
         checkpoint: The executable task's starting checkpoint; its messages are the prefix.
         episode_id: Stable episode identity, typically the trial identity.
-        task_sha256: Digest of the exact task the judge definition binds.
-        world_sha256: Digest of the exact frozen world the judge definition binds.
+        configuration: Runtime configuration the episode ran under; with the checkpoint it
+            gives the evidence's task and world digests.
         ledger_source: Locator prefix of the ledger records (the trial identity).
         checkpoint_source: Locator of the checkpoint artifact.
 
@@ -516,4 +553,4 @@ def ledger_evidence(
             {"submitted": False, "entries": len(entries)},
             ledger_source,
         )
-    return log.evidence(episode_id=episode_id, task_sha256=task_sha256, world_sha256=world_sha256)
+    return log.evidence(episode_id=episode_id, checkpoint=checkpoint, configuration=configuration)

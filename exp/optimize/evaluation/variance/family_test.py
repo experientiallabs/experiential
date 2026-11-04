@@ -42,7 +42,8 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
     _tool_reply,
     _wire,
 )
-from exp.optimize.evaluation.variance.admission_test import bound_judging
+from exp.optimize.evaluation.variance.admission import VariantJudging
+from exp.optimize.evaluation.variance.admission_test import bound_judging, unfrozen_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
 from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
@@ -506,7 +507,6 @@ def _setup(
     monkeypatch.setattr(stages_module, "run_option_contrast", stages.contrast)
     monkeypatch.setattr(stages_module, "confirmation_episodes", _episodes)
     settings = actor_spec.judges[0]
-    binding = bound_judging(project)
     identities = [str(row["scenario_id"]) for row in scenarios or ()] or ["six", "seven"]
     spec = DecisionFamilySpec(
         decision_author=settings,
@@ -514,11 +514,28 @@ def _setup(
         rules_stage=_rules_stage(project, settings),
         repeats=8,
         confirmation_repeats=8,
-        judging=dict.fromkeys(identities, binding),
+        judging=_frozen(project, stages, job, identities),
         tiers={report.spec.initial.study.actor_model.model_id: "strong"},
     )
     decider = _Decider(lambda question, text: 0.9)
     return _Setup(project, spec, report, exposure, roles, stages, decider, job)
+
+
+def _frozen(
+    project: ProjectStore,
+    stages: _Stages,
+    job: ContinuationJob,
+    identities: list[str],
+    *,
+    trainable: bool = True,
+) -> dict[str, VariantJudging]:
+    """Bind each scenario to a world freeze whose saved start is its stand-in checkpoint."""
+    return {
+        sid: bound_judging(
+            project, stages.checkpoint(sid), job.configuration, variant=sid, trainable=trainable
+        )
+        for sid in identities
+    }
 
 
 def _disposed(setup: _Setup, report: FamilyReport) -> DecisionFamilySpec:
@@ -719,11 +736,8 @@ def test_an_untrainable_world_freeze_and_a_missing_review_are_each_recorded(
 ) -> None:
     """The admission policy names every failed check for each confirmed variant."""
     setup = _setup(tmp_path, monkeypatch)
-    binding = bound_judging(setup.project, trainable=False)
-    judging = {
-        "six": binding,
-        "seven": binding.model_copy(update={"compatibility": None}),
-    }
+    judging = _frozen(setup.project, setup.stages, setup.job, ["six", "seven"], trainable=False)
+    judging["seven"] = judging["seven"].model_copy(update={"compatibility": None})
     setup.spec = setup.spec.model_copy(update={"judging": judging})
     first = setup.run()
     report = setup.run(_disposed(setup, first))
@@ -732,6 +746,35 @@ def test_an_untrainable_world_freeze_and_a_missing_review_are_each_recorded(
     assert failed == ["rubric_compatibility", "world_freeze"]
     assert any("seven: no compatibility review" in reason for reason in report.eligibility.reasons)
     assert any("six: the world freeze is not trainable" in r for r in report.eligibility.reasons)
+    assert report.records is None
+
+
+def test_frozen_variants_are_what_contrasts_run_from_and_unfrozen_ones_fail_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bound freeze's saved start runs every contrast; a variant without one is recorded."""
+    setup = _setup(tmp_path, monkeypatch)
+    assert setup.spec.judging is not None
+    judging = dict(setup.spec.judging)
+    judging["seven"] = unfrozen_judging(
+        setup.project, setup.stages.checkpoint("seven"), setup.job.configuration
+    )
+    setup.spec = setup.spec.model_copy(update={"judging": judging})
+    first = setup.run()
+    report = setup.run(_disposed(setup, first))
+
+    rows = {row.scenario_id: row for row in report.variants}
+    frozen = setup.stages.checkpoint("six")
+    assert rows["six"].frozen == frozen == rows["six"].decision_checkpoint
+    for contrast in (rows["six"].selection, rows["six"].confirmation):
+        assert contrast is not None and contrast.checkpoint == frozen
+    assert rows["seven"].frozen is None and rows["seven"].confirmation is not None
+    failed = [c.name for c in report.eligibility.conditions if not c.holds]
+    assert failed == ["world_freeze", "world_provenance"]
+    assert any(
+        "seven: no world-freeze report binds this variant" in reason
+        for reason in report.eligibility.reasons
+    )
     assert report.records is None
 
 

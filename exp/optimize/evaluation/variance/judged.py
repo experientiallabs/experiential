@@ -19,6 +19,14 @@ every label back from its saved assessment through
   denominator as explicit coverage gaps (:class:`JudgeCoverage`); none is ever 0.5 and none is
   dropped.
 
+Provenance: each evidence record's task and world digests are derived from the run (its starting
+checkpoint and the runtime configuration it actually ran under, see
+:func:`~exp.optimize.evaluation.variance.episode_evidence.run_task_sha256` and
+:func:`~exp.optimize.evaluation.variance.episode_evidence.run_world_sha256`), never copied from
+the judge definition. :func:`require_run` refuses, before any judge call, a run whose digests
+differ from the ones the judge binds, so a judge bound to a frozen variant labels only episodes
+that ran from that variant's start under its frozen runtime definition.
+
 The mechanical verifier grade the continuation owners still compute is simulator and protocol
 diagnostics only; nothing here reads it.
 """
@@ -48,6 +56,8 @@ from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.episode_evidence import (
     evidence_from_branch,
     evidence_from_contrast_cell,
+    run_task_sha256,
+    run_world_sha256,
 )
 from exp.optimize.evaluation.variance.episodes import (
     EpisodeAssessment,
@@ -57,9 +67,9 @@ from exp.optimize.evaluation.variance.episodes import (
     episode_reward,
 )
 from exp.optimize.evaluation.variance.judge import judge_episode, load_assessment
-from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 
-JUDGED_LABELS_PROTOCOL = "judged-labels-v1"
+JUDGED_LABELS_PROTOCOL = "judged-labels-v2"
 """Version of how saved episodes become judged evidence and labels; bump when that changes."""
 
 JUDGED_STUDY_TYPE = "judged-continuation-study"
@@ -198,6 +208,32 @@ class JudgeCoverage(ContractModel):
         return JudgeCoverage(judge=self.judge or other.judge, **counts)
 
 
+def require_run(
+    judge: EpisodeJudge, checkpoint: ContinuationCheckpoint, configuration: JsonObject
+) -> None:
+    """Refuse a run whose own task or world digest differs from the judge's binding.
+
+    Args:
+        judge: The frozen judge.
+        checkpoint: The run's starting checkpoint.
+        configuration: The runtime configuration the run actually used.
+
+    Raises:
+        ValueError: The run started another task or ran under another runtime definition.
+    """
+    task, world = run_task_sha256(checkpoint), run_world_sha256(configuration)
+    definition = judge.definition
+    if task != definition.task_sha256:
+        raise ValueError(
+            f"the run started task {task[:12]}, not the judge's task {definition.task_sha256[:12]}"
+        )
+    if world != definition.world_sha256:
+        raise ValueError(
+            f"the run used runtime {world[:12]}, not the judge's frozen world "
+            f"{definition.world_sha256[:12]}"
+        )
+
+
 def judged_episode(project: ProjectStore, slot: JudgedSlot, judge: str) -> EpisodeAssessment | None:
     """Load one slot's saved assessment, refusing one made by another judge.
 
@@ -318,7 +354,12 @@ def judged_metrics(
 
 
 def judge_study(
-    project: ProjectStore, reference: ArtifactInput, judge: EpisodeJudge, *, code_revision: str
+    project: ProjectStore,
+    reference: ArtifactInput,
+    judge: EpisodeJudge,
+    *,
+    configuration: JsonObject,
+    code_revision: str,
 ) -> tuple[ArtifactInput, JudgedStudy]:
     """Judge every branch of one saved continuation study once, or replay the saved judging.
 
@@ -326,13 +367,15 @@ def judge_study(
         project: Project holding the study, the rubric and the assessments.
         reference: The saved continuation study result.
         judge: The frozen judge and its admitted settings.
+        configuration: The runtime configuration the study ran under (its job's).
         code_revision: Producing source identity.
 
     Returns:
         The saved ``judged-continuation-study`` reference and its record.
 
     Raises:
-        ValueError: The study or judge binding is invalid, or a saved record differs.
+        ValueError: The study or judge binding is invalid, the study started another task or ran
+            under another runtime than the judge binds, or a saved record differs.
     """
     store = project.artifacts
     identity = stable_id(
@@ -343,14 +386,15 @@ def judge_study(
             "study": reference.model_dump(mode="json"),
         },
     )
+    study = load_study(store, reference)
+    checkpoint = load_continuation_checkpoint(store, study.spec.checkpoint)
+    require_run(judge, checkpoint, configuration)
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         if store.exists(identity):
             saved = JudgedStudy.model_validate_json(store.read_bytes(identity, "judged.json"))
             if saved.study != reference or saved.judge != judge.identity:
                 raise ValueError(f"saved judged study {identity} judges something else")
             return artifact_input(store.read(identity).manifest), saved
-        study = load_study(store, reference)
-        checkpoint = load_continuation_checkpoint(store, study.spec.checkpoint)
         prefix = reference.artifact_id.removesuffix("-result")
         slots: list[JudgedSlot] = []
         for branch in study.branches:
@@ -360,8 +404,7 @@ def judge_study(
                     branch,
                     checkpoint,
                     episode_id=source,
-                    task_sha256=judge.definition.task_sha256,
-                    world_sha256=judge.definition.world_sha256,
+                    configuration=configuration,
                     checkpoint_source=study.spec.checkpoint.artifact_id,
                     branch_source=source,
                 )
@@ -392,10 +435,15 @@ def judge_cells(
 
     Returns:
         One judged cell per planned cell, in plan order.
+
+    Raises:
+        ValueError: The contrast started another task or ran under another runtime than the
+            judge binds.
     """
     store = project.artifacts
     spec = contrast.spec
     checkpoint = load_continuation_checkpoint(store, spec.base.study.checkpoint)
+    require_run(judge, checkpoint, spec.base.configuration)
     prefix = reference.artifact_id.removesuffix("-result")
     cells: list[JudgedCell] = []
     for index, cell in enumerate(contrast.cells):
@@ -416,8 +464,6 @@ def judge_cells(
                 intervention=intervention,
                 suffix=suffix,
                 episode_id=episode_id,
-                task_sha256=judge.definition.task_sha256,
-                world_sha256=judge.definition.world_sha256,
                 contrast_source=prefix,
                 checkpoint_source=spec.base.study.checkpoint.artifact_id,
                 intervention_source=None

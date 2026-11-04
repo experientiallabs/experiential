@@ -20,7 +20,9 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
 from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
+from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeDefinition
 from exp.optimize.evaluation.variance.judge_prompt import judge_profile
 from exp.optimize.evaluation.variance.judge_test import _RUBRIC, _answer, _call
@@ -39,11 +41,14 @@ from exp.runtime.models.providers.transport import (
     ScriptedJsonTransport,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.continuations import load_continuation_checkpoint
 
 Verdict = Callable[[JsonObject], str]
 """Maps the rendered episode evidence to pass, fail, unassessable or malformed."""
 
 TASK, WORLD = sha256_json("judged-task"), sha256_json("judged-world")
+CONFIGURATION: JsonObject = {"runtime": "judged-workbook"}
+"""Runtime configuration the fixture study is recorded as having run under."""
 
 
 def always(verdict: str) -> Verdict:
@@ -150,6 +155,17 @@ def route_judge(
     return router
 
 
+def run_digests(
+    project: ProjectStore, checkpoint: ArtifactInput, configuration: JsonObject
+) -> dict[str, str]:
+    """The task and world digests a run from ``checkpoint`` under ``configuration`` produces."""
+    start = load_continuation_checkpoint(project.artifacts, checkpoint)
+    return {
+        "task_sha256": run_task_sha256(start),
+        "world_sha256": run_world_sha256(configuration),
+    }
+
+
 def episode_judge(
     project: ProjectStore,
     settings: AuthorSettings,
@@ -157,7 +173,10 @@ def episode_judge(
     task_sha256: str = TASK,
     world_sha256: str = WORLD,
 ) -> EpisodeJudge:
-    """Save the fixture rubric once and bind a frozen judge to it under the given settings."""
+    """Save the fixture rubric once and bind a frozen judge to it under the given settings.
+
+    Use :func:`run_digests` for the digests of the run the judge must label.
+    """
     store = project.artifacts
     if not store.exists("rubric-refund"):
         store.write_json(
@@ -206,7 +225,9 @@ def _study(
     admission = ContinuationAdmission.model_validate_json(
         project.artifacts.read_bytes(acceptance.artifact_id, "admission.json")
     )
-    return project, episode_judge(project, judge_settings(project)), admission.study
+    start = load_study(project.artifacts, admission.study).spec.checkpoint
+    digests = run_digests(project, start, CONFIGURATION)
+    return project, episode_judge(project, judge_settings(project), **digests), admission.study
 
 
 def test_every_branch_is_judged_once_and_labels_come_from_saved_assessments(
@@ -217,7 +238,9 @@ def test_every_branch_is_judged_once_and_labels_come_from_saved_assessments(
     verdicts = iter(["pass", "fail"])
     router = route_judge(monkeypatch, verdict=lambda evidence: next(verdicts))
 
-    saved, judged = judge_study(project, reference, judge, code_revision="test")
+    saved, judged = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="test"
+    )
     rewards = slot_rewards(project, judged.branches, judge.identity)
 
     planned = len(judged.branches)
@@ -231,7 +254,9 @@ def test_every_branch_is_judged_once_and_labels_come_from_saved_assessments(
         "judged-continuation-study"
     )
 
-    assert judge_study(project, reference, judge, code_revision="test") == (saved, judged)
+    assert judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="test"
+    ) == (saved, judged)
     assert len(router.judged) == planned
 
 
@@ -243,7 +268,9 @@ def test_malformed_and_unassessable_judgments_stay_unscored_coverage_gaps(
     script = iter(["malformed", "unassessable"])
     route_judge(monkeypatch, verdict=lambda evidence: next(script))
 
-    _, judged = judge_study(project, reference, judge, code_revision="test")
+    _, judged = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="test"
+    )
     rewards = slot_rewards(project, judged.branches, judge.identity)
     coverage = slot_coverage(project, judged.branches, judge.identity)
 
@@ -261,9 +288,36 @@ def test_a_slot_judged_by_another_judge_is_refused(
     """Labels are never reused across judge definitions by alias."""
     project, judge, reference = _study(tmp_path, monkeypatch)
     route_judge(monkeypatch)
-    _, judged = judge_study(project, reference, judge, code_revision="test")
+    _, judged = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="test"
+    )
 
     with pytest.raises(ValueError, match="different judge"):
         slot_rewards(project, judged.branches, "0" * 64)
     with pytest.raises(ValueError, match="either an assessment or a gap"):
         JudgedSlot(position=0)
+
+
+def test_a_run_in_another_task_or_world_is_refused_before_any_judge_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence digests come from the run, so a judge bound elsewhere never labels it."""
+    project, judge, reference = _study(tmp_path, monkeypatch)
+    router = route_judge(monkeypatch)
+    other_world: JsonObject = {"runtime": "another-world"}
+
+    with pytest.raises(ValueError, match="not the judge's frozen world"):
+        judge_study(project, reference, judge, configuration=other_world, code_revision="test")
+    foreign = episode_judge(
+        project, judge.settings, task_sha256=TASK, world_sha256=judge.definition.world_sha256
+    )
+    with pytest.raises(ValueError, match="not the judge's task"):
+        judge_study(project, reference, foreign, configuration=CONFIGURATION, code_revision="test")
+    assert router.judged == []
+
+    _, judged = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="test"
+    )
+    assert judged.branches and all(slot.episode for slot in judged.branches)
+    with pytest.raises(ValueError, match="not the judge's frozen world"):
+        judge_study(project, reference, judge, configuration=other_world, code_revision="test")

@@ -422,8 +422,7 @@ class ExecutableHarborTrial:
             self._ledger,
             load_continuation_checkpoint(self.project.artifacts, start),
             episode_id=self.identity,
-            task_sha256=judge.definition.task_sha256,
-            world_sha256=judge.definition.world_sha256,
+            configuration=self.task.job.configuration,
             ledger_source=self.identity,
             checkpoint_source=start.artifact_id,
         )

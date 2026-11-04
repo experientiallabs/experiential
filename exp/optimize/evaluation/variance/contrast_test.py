@@ -37,6 +37,7 @@ from exp.optimize.evaluation.variance.judged_test import (
     episode_judge,
     judge_settings,
     route_judge,
+    run_digests,
 )
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
@@ -313,7 +314,11 @@ def test_forced_options_separate_under_one_frozen_job_and_replay(
     transport = _finish_transport(monkeypatch, 8)
     decision = _row_decision(1, 2)
     router = _one_row_judge(monkeypatch)
-    judge = episode_judge(project, judge_settings(project))
+    judge = episode_judge(
+        project,
+        judge_settings(project),
+        **run_digests(project, job.study.checkpoint, job.configuration),
+    )
 
     def run() -> OptionContrast:
         """Run or replay the one-versus-two row contrast."""
@@ -377,7 +382,11 @@ def test_three_options_pool_the_reference_and_keep_unknowns(
         actions={f"delete-{n}": _deletion(n) for n in (1, 2, 3)},
         job=job,
         repeats=1,
-        judge=episode_judge(project, judge_settings(project)),
+        judge=episode_judge(
+            project,
+            judge_settings(project),
+            **run_digests(project, job.study.checkpoint, job.configuration),
+        ),
         code_revision="test",
     )
     reference, two, three = contrast.options
@@ -408,7 +417,11 @@ def test_option_actions_must_cover_distinct_declared_options(
                 actions=actions,
                 job=job,
                 repeats=1,
-                judge=episode_judge(project, judge_settings(project)),
+                judge=episode_judge(
+                    project,
+                    judge_settings(project),
+                    **run_digests(project, job.study.checkpoint, job.configuration),
+                ),
                 code_revision="test",
             )
     assert not transport.requests

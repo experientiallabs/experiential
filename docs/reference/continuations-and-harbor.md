@@ -113,8 +113,13 @@ customer-facing message and the submission, numbered in one sequence. The actor 
 text with `python /app/tools.py say 'TEXT'` (`POST /message`, actor capability only, at most 256
 messages of 16,000 characters, refused after submission); the exported `instruction.md` says the
 customer sees only those messages. Repeated calls replay without new entries, and a restart appends
-any entry its process stopped before writing, marked `reconciled`. The ledger records evidence only;
-reward is computed as before. `trial_ledger` reads it, and
+any entry its process stopped before writing, marked `reconciled`. For a task bound to a frozen
+episode judge (every decision-variance family export), the reward is that judge's verdict over the
+closed trial's ledger evidence (`episode_reward`: pass 1, fail 0, anything else unscored), emitted
+only when the observable contract is qualified; a task without a judge keeps its mechanical grade.
+The evidence's task and world digests come from the task's starting checkpoint and its job's
+runtime configuration, never from the judge, so a judge bound to another task or frozen world
+refuses the trial. `trial_ledger` reads it, and
 `exp.optimize.evaluation.variance.episode_evidence` converts a ledger (`ledger_evidence`), a
 continuation branch (`evidence_from_branch`) or an action-contrast cell
 (`evidence_from_contrast_cell`) into `EpisodeEvidence`: the checkpoint's actor messages are context,

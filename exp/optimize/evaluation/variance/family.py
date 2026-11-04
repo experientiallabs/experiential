@@ -20,7 +20,11 @@ saved actor-critic run over a mining-probe task:
 6. **Judges.** Each scenario's :class:`~exp.optimize.evaluation.variance.admission.VariantJudging`
    (its frozen episode judge, world freeze and rubric compatibility review) is fixed from the spec
    or a caller function and saved in the report before any of the variant's contrasts run.
-   Every contrast cell is judged by it; those saved verdicts are the only labels.
+   Every contrast cell is judged by it; those saved verdicts are the only labels. When the binding
+   names a world freeze, the frozen variant is what runs: its witness and contrasts start from the
+   freeze's saved checkpoint under the family job rebound to the frozen runtime definition
+   (:func:`~exp.optimize.evaluation.variance.admission.frozen_start`), and admission records
+   ``world_provenance`` for any contrast that did not.
 7. **Selection.** Every option is forced from each variant's decision checkpoint under the frozen
    job, citing the saved witness as evidence, and
    :func:`~exp.optimize.evaluation.variance.contrast.family_flip` decides whether the better option
@@ -79,6 +83,7 @@ from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.admission import (
     FamilyAdmissionPolicy,
     VariantJudging,
+    frozen_start,
     judging_problems,
 )
 from exp.optimize.evaluation.variance.authors import (
@@ -488,9 +493,30 @@ def family_executable_task(
     judging = (family_report.judging or {}).get(scenario_id)
     if judging is None:
         raise ValueError(f"scenario {scenario_id} has no frozen judge binding in this family")
-    return ExecutableTask(
-        intent=intent, job=bound_job(family_report.job, checkpoint), judge=judging.judge
-    )
+    job = family_report.job
+    if row is not None and row.frozen is not None:
+        if judging.runtime is None:
+            raise ValueError(f"frozen scenario {scenario_id} has no frozen runtime definition")
+        job = variant_job(job, (row.frozen, judging.runtime))
+    return ExecutableTask(intent=intent, job=bound_job(job, checkpoint), judge=judging.judge)
+
+
+def variant_job(
+    job: ContinuationJob, start: tuple[ArtifactInput, JsonObject] | None
+) -> ContinuationJob:
+    """Return the job a variant's witness and contrasts run under.
+
+    Args:
+        job: The family's frozen job.
+        start: The variant's frozen start checkpoint and runtime configuration, if frozen.
+
+    Returns:
+        The family job, or for a frozen variant the same job rebound to its frozen runtime
+        definition; the study checkpoint is rebound per contrast.
+    """
+    if start is None:
+        return job
+    return job.model_copy(update={"configuration": start[1]})
 
 
 @dataclass(frozen=True)
@@ -520,6 +546,7 @@ class _Family:
         contrasted: tuple[EstimateMeaning, ...] = (),
         judging: Mapping[str, VariantJudging] | None = None,
         coverage: Mapping[str, JudgeCoverage] | None = None,
+        starts: Mapping[str, tuple[ArtifactInput, ...]] | None = None,
     ) -> TrainingEligibility:
         """Compute eligibility from the family's evidence so far.
 
@@ -531,13 +558,14 @@ class _Family:
             contrasted: Meanings of every variant contrast.
             judging: Frozen judge binding per scenario, once fixed.
             coverage: Judge coverage of each confirmed variant, once confirmed.
+            starts: Starting checkpoint of each variant's selection and confirmation contrasts.
 
         Returns:
             The computed eligibility.
         """
         meanings = tuple(row.meaning for row in self.report.points if row.failure is None)
         problems = (
-            judging_problems(self.project, judging, coverage, self.spec.admission)
+            judging_problems(self.project, judging, coverage, self.spec.admission, starts)
             if judging is not None and coverage
             else {}
         )
@@ -647,13 +675,19 @@ def _continue(
             family, base, findings, relied, failure=f"variant judges: none for {unbound}"
         )
     base = base.model_copy(update={"judging": judging})
+    try:
+        starts = {sid: frozen_start(project, binding) for sid, binding in judging.items()}
+    except ValueError as error:
+        return _finish(family, base, findings, relied, failure=f"frozen start: {error}")
+    jobs = {sid: variant_job(base.job, start) for sid, start in starts.items()}
+    frozen = {sid: start[0] for sid, start in starts.items() if start is not None}
     study = load_study(project.artifacts, report.group)
     picked = next(row for row in study.branches if row.index == report.picked)
     boundaries = (study.spec.checkpoint, *picked.checkpoints)
     variants = [
         run_variant(
             project,
-            job=base.job,
+            job=jobs[scenario.scenario_id],
             base=base.checkpoint,
             boundaries=boundaries,
             decision=state,
@@ -664,6 +698,7 @@ def _continue(
             judge=judging[scenario.scenario_id].judge,
             code_revision=code_revision,
             required_state=frozenset(spec.required_state),
+            frozen=frozen.get(scenario.scenario_id),
         )
         for scenario in scenarios.scenarios.scenarios
     ]
@@ -692,7 +727,7 @@ def _continue(
         variants = [
             confirm_variant(
                 project,
-                job=base.job,
+                job=jobs[row.scenario_id],
                 decision=state,
                 row=row,
                 actions=mapping,
@@ -762,8 +797,16 @@ def _finish(
         The complete report.
     """
     unique = tuple({finding.finding_id: finding for finding in findings}.values())
+    starts = {
+        row.scenario_id: tuple(
+            contrast.checkpoint
+            for contrast in (row.selection, row.confirmation)
+            if contrast is not None
+        )
+        for row in base.variants
+    }
     eligibility = family.eligibility(
-        selection, confirmation, unique, relied, contrasted, base.judging, base.coverage
+        selection, confirmation, unique, relied, contrasted, base.judging, base.coverage, starts
     )
     confirmed = {
         row.scenario_id: (row.confirmation, row.meaning)
@@ -911,6 +954,9 @@ def _dependencies(result: FamilyReport, report: ActorCriticReport) -> tuple[Arti
     """Collect every saved artifact the family report rests on."""
     refs = {result.checkpoint, result.context, report.group, result.spec.rules_stage}
     refs |= {row.judge.definition.rubric for row in (result.judging or {}).values()}
+    refs |= {
+        row.world_freeze for row in (result.judging or {}).values() if row.world_freeze is not None
+    }
     for draft in (result.decision, result.scenarios):
         if draft is not None and draft.response is not None:
             refs.add(draft.response)
