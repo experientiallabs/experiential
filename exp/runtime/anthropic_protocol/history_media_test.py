@@ -202,3 +202,16 @@ def test_a_messages_placeholder_carries_only_the_cache_control_key() -> None:
     placeholder = cast(JsonObject, cast(list[object], result["content"])[1])
     assert placeholder["cache_control"] == {"type": "ephemeral"}
     assert "prompt_cache_breakpoint" not in placeholder
+
+
+def test_an_empty_final_prefill_does_not_turn_the_latest_user_turn_into_history() -> None:
+    """The decoder drops an empty prefill, so the user turn before it stays strict."""
+    payload = _body(
+        [
+            {"role": "user", "content": [_image(_OVERSIZED_IMAGE)]},
+            {"role": "assistant", "content": ""},
+        ]
+    )
+    with pytest.raises(OpenAIProtocolError) as info:
+        degrade_history_media(payload)
+    assert info.value.detail.param == "messages.0.content.0.source.data"

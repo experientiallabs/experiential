@@ -111,7 +111,7 @@ def degrade_history_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, .
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return payload, ()
-    latest = latest_turn(messages)
+    latest = latest_turn(messages[:-1] if _ends_in_empty_prefill(messages) else messages)
     disclosures: dict[str, None] = {}
     rebuilt: list[JsonValue] | None = None
     for message_index, message in enumerate(messages):
@@ -139,6 +139,28 @@ def degrade_history_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, .
     if rebuilt is None:
         return payload, ()
     return {**payload, "messages": rebuilt}, tuple(disclosures)
+
+
+def _ends_in_empty_prefill(messages: list[JsonValue]) -> bool:
+    """Whether the last turn is an empty assistant prefill the decoder drops.
+
+    Such a turn is not the model speaking, so the user turn before it is
+    still the latest turn and stays strict.
+    """
+    last = messages[-1] if messages else None
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return False
+    content = last.get("content")
+    if isinstance(content, str):
+        return not content
+    return (
+        isinstance(content, list)
+        and bool(content)
+        and all(
+            isinstance(block, dict) and block.get("type") == "text" and not block.get("text")
+            for block in content
+        )
+    )
 
 
 def _degrade_block(
