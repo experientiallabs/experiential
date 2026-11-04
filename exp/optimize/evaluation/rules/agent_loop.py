@@ -17,7 +17,8 @@ Before each call the loop checks there is room for it and every later mandatory 
 room a reading turn becomes the phase's own tool, and a phase without room is skipped and
 recorded. A draw that cannot afford its final answer, or whose measured usage exceeds a budget,
 fails explicitly. Unpriceable usage makes the dollar budget unverifiable, so no further optional
-call is made.
+call is made. An explicit ``maximum_usd=None`` requires the active operation's finite
+unpriced-attempt allowance for each new call, while keeping all other draw limits.
 
 The tools only read frozen material the caller supplies; they execute nothing and write no
 environment state. Every model call is saved by the shared author-response owner, every tool
@@ -375,11 +376,15 @@ class _Loop:
     def _call(self, request: ModelRequest, *, phase: Phase, forced: str | None) -> ModelResponse:
         """Buy or replay one model call and measure it."""
         index = len(self.calls)
+        name = f"{self.identity}-call-{index}"
+        if self.profile.budget.maximum_usd is None:
+            name += "-request-capped"
+        self.profile.budget.require_call_authorization(self.project, name)
         reference, response = author_response(
             self.project,
             self.settings,
             request,
-            identity=f"{self.identity}-call-{index}",
+            identity=name,
             sources=self.sources,
             code_revision=self.revision,
         )
@@ -405,6 +410,8 @@ class _Loop:
         pace = elapsed / len(self.calls) if self.calls else 0.0
         if elapsed + count * pace > budget.wall_clock_seconds:
             short.append("wall_clock_seconds")
+        if budget.maximum_usd is None:
+            return tuple(short)
         if usage.unpriced_calls:
             short.append("maximum_usd_unverifiable")
         else:
@@ -424,7 +431,7 @@ class _Loop:
                 ("maximum_usd", usage.priced_usd, budget.maximum_usd),
                 ("wall_clock_seconds", time.monotonic() - self.started, budget.wall_clock_seconds),
             )
-            if spent > limit
+            if limit is not None and spent > limit
         )
 
     def _finish(

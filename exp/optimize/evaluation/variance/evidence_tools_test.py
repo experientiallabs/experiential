@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import socket
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -43,6 +46,13 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 from exp.optimize.evaluation.variance.role_prompts import PromptAssignment, assignment
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.spend_ceiling import (
+    MAXIMUM_UNPRICED_ATTEMPTS,
+    OperationSpendCeiling,
+    UnpricedDispatchRefused,
+    install_spend_ceiling,
+    operation_spend_scope,
+)
 
 _REF = ArtifactInput(artifact_id="checkpoint-a", sha256="a" * 64)
 _DOCUMENTS: JsonObject = {
@@ -340,6 +350,7 @@ def _loop_fixture(
     priced: bool = True,
 ) -> tuple[ProjectStore, AuthorSettings, ScriptedJsonTransport]:
     """Return a project, judge settings and the scripted role transport."""
+    monkeypatch.setattr("socket.socket.connect", _forbid_connect)
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     digest = price_judge(project) if priced else job.catalog_sha256
     catalog = RuntimeModelCatalog(load_model_catalog(project.model_catalog_path), environment={})
@@ -562,3 +573,146 @@ def test_an_agentic_role_that_ignores_a_forced_phase_tool_fails_explicitly(
 
     assert transcript.stop == "protocol_failure" and "record_plan" in str(transcript.failure)
     assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("allowance", [None, 0, MAXIMUM_UNPRICED_ATTEMPTS + 1])
+def test_request_capped_draw_requires_finite_operation_authorization_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowance: int | None
+) -> None:
+    """No operation, zero allowance or summed grants over the cap cannot buy a call."""
+    project, settings, transport = _loop_fixture(tmp_path, monkeypatch, [], priced=False)
+    profile = EvidenceToolProfile(budget=EvidenceBudget(maximum_usd=None))
+    with operation_spend_scope():
+        if allowance is not None:
+            ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={})
+            ceiling.authorize("first", ceiling_usd=1.0, unpriced_attempts=min(allowance, 100_000))
+            if allowance > MAXIMUM_UNPRICED_ATTEMPTS:
+                ceiling.authorize("second", ceiling_usd=1.0, unpriced_attempts=1)
+            install_spend_ceiling(ceiling)
+        with pytest.raises(UnpricedDispatchRefused, match="active finite"):
+            _run(project, settings, profile)
+    assert transport.requests == []
+    assert not project.artifacts.exists("draw-0-request-capped-intent")
+
+
+def test_approved_unpriced_draw_keeps_unknown_usage_and_replays_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded unpriced operation completes two calls and exact replay buys none."""
+    project, settings, transport = _loop_fixture(
+        tmp_path,
+        monkeypatch,
+        [_reply([("read_evidence", {"locator": "group"})]), _reply([("submit", {"value": 2})])],
+        priced=False,
+    )
+    profile = EvidenceToolProfile(
+        mode="read_only_tools", budget=EvidenceBudget(model_calls=2, tool_calls=1, maximum_usd=None)
+    )
+    ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={})
+    ceiling.authorize_policy(ceiling_usd=1.0, unpriced_attempts=2)
+    with operation_spend_scope():
+        install_spend_ceiling(ceiling)
+        reference, transcript = _run(project, settings, profile)
+    assert transcript.stop == "answered" and transcript.answer == {"value": 2}
+    assert transcript.usage.unpriced_calls == 2 and transcript.usage.priced_usd == 0.0
+    assert all(call.usage.unpriced_calls == 1 for call in transcript.calls)
+    assert transcript.profile.budget.maximum_usd is None
+    assert all("request-capped" in call.response.artifact_id for call in transcript.calls)
+    assert ceiling.summary().unpriced_attempts == 2
+    assert _run(project, settings, profile) == (reference, transcript)
+    assert len(transport.requests) == 2
+    assert transport.requests[-1].payload["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit"},
+    }
+    with pytest.raises(ValueError, match="different profile"):
+        _run(project, settings, _TOOLS)
+
+
+@pytest.mark.parametrize("dimension", ["input_tokens", "output_tokens", "wall_clock_seconds"])
+def test_request_capped_draw_still_enforces_token_and_time_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dimension: str
+) -> None:
+    """Removing a draw dollar cap preserves each finite token and elapsed-time bound."""
+    project, settings, transport = _loop_fixture(
+        tmp_path,
+        monkeypatch,
+        [_reply([("read_evidence", {"locator": "group"})], prompt_tokens=60_000)],
+        priced=False,
+    )
+    budget = EvidenceBudget(model_calls=2, tool_calls=1, maximum_usd=None)
+    if dimension == "input_tokens":
+        budget = budget.model_copy(update={"input_tokens": 50_000})
+    elif dimension == "output_tokens":
+        budget = budget.model_copy(update={"output_tokens": 1})
+    else:
+        ticks = iter([0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+        monkeypatch.setattr(
+            "exp.optimize.evaluation.variance.evidence_tools.time",
+            SimpleNamespace(monotonic=lambda: next(ticks, 5.0)),
+        )
+        budget = budget.model_copy(update={"wall_clock_seconds": 0.1})
+    profile = EvidenceToolProfile(mode="read_only_tools", budget=budget)
+    ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={})
+    ceiling.authorize_policy(ceiling_usd=1.0, unpriced_attempts=2)
+    with operation_spend_scope():
+        install_spend_ceiling(ceiling)
+        _, transcript = _run(project, settings, profile)
+    assert transcript.stop == "budget_exhausted" and dimension in transcript.exhausted
+    assert len(transport.requests) <= 1
+
+
+def test_request_capped_draw_cannot_exceed_operation_attempt_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Physical dispatch still refuses the next call once the unpriced grant is spent."""
+    project, settings, transport = _loop_fixture(
+        tmp_path,
+        monkeypatch,
+        [_reply([("read_evidence", {"locator": "group"})])],
+        priced=False,
+    )
+    profile = EvidenceToolProfile(
+        mode="read_only_tools", budget=EvidenceBudget(model_calls=2, tool_calls=1, maximum_usd=None)
+    )
+    ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={})
+    ceiling.authorize_policy(ceiling_usd=1.0, unpriced_attempts=1)
+    with operation_spend_scope():
+        install_spend_ceiling(ceiling)
+        with pytest.raises(UnpricedDispatchRefused):
+            _run(project, settings, profile)
+    assert len(transport.requests) == 1 and ceiling.summary().unpriced_attempts == 1
+    assert not project.artifacts.exists("draw-0-call-1-request-capped-intent")
+
+
+def _forbid_connect(_connection: socket.socket, _address: str | tuple[str, int]) -> None:
+    """Fail the offline role fixture if any real socket is opened."""
+    raise AssertionError("offline role tests must not open provider sockets")
+
+
+def test_interrupted_request_capped_draw_replays_saved_calls_without_spend_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash before transcript publication reuses its saved response without another call."""
+    project, settings, transport = _loop_fixture(
+        tmp_path, monkeypatch, [_reply([("submit", {"value": 2})])], priced=False
+    )
+    profile = EvidenceToolProfile(budget=EvidenceBudget(maximum_usd=None))
+    ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={})
+    ceiling.authorize_policy(ceiling_usd=1.0, unpriced_attempts=1)
+    with operation_spend_scope():
+        install_spend_ceiling(ceiling)
+        with (
+            patch(
+                "exp.optimize.evaluation.variance.evidence_tools._Loop._finish",
+                side_effect=RuntimeError("interrupted before transcript publication"),
+            ),
+            pytest.raises(RuntimeError, match="interrupted"),
+        ):
+            _run(project, settings, profile)
+    assert not project.artifacts.exists("draw-0-transcript")
+    assert project.artifacts.exists("draw-0-request-capped-response")
+    _, transcript = _run(project, settings, profile)
+    assert transcript.stop == "answered" and transcript.answer == {"value": 2}
+    assert transcript.usage.unpriced_calls == 1 and len(transport.requests) == 1
+    assert ceiling.summary().unpriced_attempts == 1

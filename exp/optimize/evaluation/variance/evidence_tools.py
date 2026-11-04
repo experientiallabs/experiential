@@ -20,11 +20,13 @@ is built from them. Unavailable material is refused by name; a result too large 
 refused with its size, never silently truncated.
 
 Every draw has frozen finite budgets: model calls, evidence-tool calls, input and output tokens,
-wall-clock seconds and dollars. Before each call the loop checks there is room for it and for every
-later mandatory phase; without room a reading turn becomes the phase's forced tool, and a phase
-without room for itself is skipped and recorded. A draw that cannot afford its final answer, or
-whose measured usage exceeds a budget, fails explicitly. Dollars are priced from the usage on each
-saved response; unpriceable usage makes the dollar budget unverifiable, so no further call is made.
+wall-clock seconds and, by default, dollars. Before each call the loop checks there is room for
+it and for every later mandatory phase. Without room a reading turn becomes the phase's forced
+tool, and a phase without room is skipped and recorded. A draw that cannot afford its final
+answer, or whose measured usage exceeds a budget, fails explicitly. Dollars are priced from
+usage on each saved response; unpriceable usage makes a dollar budget unverifiable, so no further
+call is made. An explicit ``maximum_usd=None`` instead requires an active operation ceiling with
+a finite unpriced-attempt allowance before every new call; all other draw limits still apply.
 
 Every model call goes through the shared author-response owner, which saves its exact request and
 response; every tool result is saved as an ``evidence-tool-result`` artifact; and the whole
@@ -81,6 +83,11 @@ from exp.optimize.evaluation.variance.role_prompts import (
     phase_prompt,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.spend_ceiling import (
+    MAXIMUM_UNPRICED_ATTEMPTS,
+    UnpricedDispatchRefused,
+    current_spend_ceiling,
+)
 
 EVIDENCE_TOOLS_PROTOCOL = "variance-evidence-tools-v2"
 """Version of the evidence tools, their schemas and the analysis loop's budget rules."""
@@ -101,7 +108,8 @@ class EvidenceBudget(ContractModel):
         input_tokens: Most measured input tokens across the draw.
         output_tokens: Most output tokens; each call reserves its full output allowance.
         wall_clock_seconds: Most elapsed seconds from the draw's first call.
-        maximum_usd: Most priced dollars across the draw.
+        maximum_usd: Most priced dollars across the draw; None explicitly uses the active
+            operation's bounded unpriced-attempt allowance instead of a draw dollar cap.
     """
 
     model_calls: int = Field(default=1, ge=1, le=32, strict=True)
@@ -109,7 +117,33 @@ class EvidenceBudget(ContractModel):
     input_tokens: int = Field(default=400_000, ge=1, le=10_000_000, strict=True)
     output_tokens: int = Field(default=16_384, ge=1, le=1_000_000, strict=True)
     wall_clock_seconds: float = Field(default=900.0, gt=0, le=86_400)
-    maximum_usd: float = Field(default=5.0, gt=0, le=1_000)
+    maximum_usd: float | None = Field(default=5.0, gt=0, le=1_000)
+
+    def require_call_authorization(self, project: ProjectStore, identity: str) -> None:
+        """Require bounded operation consent for a new request-capped, unpriced draw call.
+
+        Saved author outcomes replay offline. New calls still pass through the admitted
+        transport, which atomically reserves each physical attempt against the operation.
+
+        Raises:
+            UnpricedDispatchRefused: No active finite unpriced allowance authorizes a new call.
+        """
+        if self.maximum_usd is not None or any(
+            project.artifacts.exists(identity + suffix) for suffix in ("-response", "-rejection")
+        ):
+            return
+        ceiling = current_spend_ceiling()
+        if ceiling is not None:
+            summary = ceiling.summary()
+            if (
+                math.isfinite(summary.ceiling_usd)
+                and 0 < summary.unpriced_attempt_ceiling <= MAXIMUM_UNPRICED_ATTEMPTS
+                and summary.unpriced_attempts < summary.unpriced_attempt_ceiling
+            ):
+                return
+        raise UnpricedDispatchRefused(
+            None, "a request-capped role requires an active finite unpriced-attempt allowance"
+        )
 
 
 class EvidenceToolProfile(ContractModel):
@@ -541,6 +575,9 @@ class _Loop:
             if self.profile.mode == "forced_response"
             else (f"{self.identity}-call-{index}")
         )
+        if self.profile.budget.maximum_usd is None:
+            name += "-request-capped"
+        self.profile.budget.require_call_authorization(self.project, name)
         reference, response = author_response(
             self.project,
             self.settings,
@@ -578,6 +615,8 @@ class _Loop:
         pace = elapsed / len(self.calls) if self.calls else 0.0
         if elapsed + count * pace > budget.wall_clock_seconds:
             short.append("wall_clock_seconds")
+        if budget.maximum_usd is None:
+            return tuple(short)
         if usage.unpriced_calls:
             short.append("maximum_usd_unverifiable")
         else:
@@ -597,7 +636,7 @@ class _Loop:
                 ("maximum_usd", usage.priced_usd, budget.maximum_usd),
                 ("wall_clock_seconds", time.monotonic() - self.started, budget.wall_clock_seconds),
             )
-            if spent > limit
+            if limit is not None and spent > limit
         ]
         return tuple(over)
 
