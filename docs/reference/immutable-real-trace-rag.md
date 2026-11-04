@@ -79,6 +79,53 @@ construction=..., retrieval=...)` derives both scopes from an `ExposurePlan`. Ea
 `plan.restrict(selection, "world_learning")`, so mining-probe and final-evaluation traces can
 never enter either corpus.
 
+## Tag-aware retrieval
+
+Tags are used twice. A tag selection decides which world-learning traces enter a scoped corpus
+(above). Recorded tags can also shape what one query retrieves from it.
+
+`persist_trace_rag(..., trace_tags=record)` records an optional `RAGIndexTags` on the index. It
+holds at most one `RAGTagView` per view (`task`, `observations`), each with the bank ID and
+revision, every question with its family, the fire threshold, the SHA-256 of the tag matrix and,
+for each indexed trace, the sorted propositions whose probability was strictly above the
+threshold. The build restricts each view to exactly the traces the index's transitions come from
+and refuses a view that misses one; the loader refuses a record that covers any other set. The
+record joins the envelope and content identity. An index built without it serializes no
+`trace_tags` key, so its bytes and identity are unchanged.
+
+A query brings `TaskQueryTags` for the current task, computed with the same bank and threshold,
+and a `TagRetrievalPolicy` (bank ID, revision, threshold, `weight`, `mode` and `families`).
+`TraceRAGRetriever.retrieve(query, tag_policy=..., query_tags=...)` scores each eligible
+candidate as cosine similarity plus `weight` times the Jaccard overlap between the query's fired
+tags and the candidate trace's fired task-view tags (0 when neither fired anything). In
+`require_shared_family` mode, candidates sharing no fired tag from one of `families` with the
+query are dropped first. Equal scores still break by transition ID. Each match records its
+`tag_overlap`. The policy, query and index must agree on bank, revision and threshold, and the
+query and families must name recorded columns; otherwise retrieval refuses.
+
+Only task-view tags may inform a query. `TaskQueryTags` refuses any other view, because the
+observations view describes what the episode revealed and would leak the outcome being
+predicted. Observations-view tags may annotate indexed traces but ranking never reads them, and
+an index with only observations tags cannot serve a tag policy.
+
+Without a policy and query tags, retrieval is cosine ranking exactly as before and matches carry
+no `tag_overlap` field.
+
+A grounded session takes the policy through `GroundedWorldModel(tag_retrieval=...)` or
+`load_grounded_world_model(..., tag_retrieval=...)`: a `TagRetrievalBinding` of the policy and
+query tags keyed by task ID. The binding is checked against the index at construction.
+`prepare_turn` ranks with the current task's tags when the binding lists them and records
+`TagRetrievalEvidence` (the policy, its SHA-256, the query tags and the index matrix digest) on
+the prepared call and in the session's prediction evidence. A task without listed tags retrieves
+by cosine alone. The session representation identity includes the digest of the policy and the
+task's own tags only when a binding is present, so unbound sessions keep their identity.
+
+For variance studies, `exp.optimize.evaluation.variance.tag_retrieval.index_trace_tags(plan,
+bank=..., task=..., observations=...)` builds the record from tag matrices, keeping only
+`world_learning` traces, and `query_task_tags(matrix, trace_id, index_tags=..., plan=...)` reads a
+probe task's query tags with the index's threshold. Both refuse matrices that mix banks,
+revisions, columns or views, and query tags must come from a task-view matrix.
+
 ## Query and world-prompt capacity
 
 New evaluations and router optimizations derive an omitted `maximum_retrieval_query_tokens`

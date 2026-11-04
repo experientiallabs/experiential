@@ -51,6 +51,12 @@ from exp.simulation.retrieval.embedding import (
 from exp.simulation.retrieval.retriever import TraceRAGRetriever, load_fit_rag_retriever
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
+from exp.simulation.retrieval.tags import (
+    RAGIndexTags,
+    TagRetrievalBinding,
+    TagRetrievalPolicy,
+    TaskQueryTags,
+)
 
 _REFRESH_EXPORT_MODULES = {
     "PersistedRuntimeRAGDataset": "exp.simulation.retrieval.refresh_dataset",
@@ -73,6 +79,7 @@ __all__ = [
     "RAGAction",
     "RAGEmbedderBinding",
     "RAGIndex",
+    "RAGIndexTags",
     "RAGLineageBinding",
     "RAGMatch",
     "RAGObservation",
@@ -85,6 +92,9 @@ __all__ = [
     "RuntimeRAGRefresh",
     "RuntimeRAGRefreshError",
     "RuntimeTraceStitchingError",
+    "TagRetrievalBinding",
+    "TagRetrievalPolicy",
+    "TaskQueryTags",
     "TraceRAGRetriever",
     "default_rag_embedder",
     "load_runtime_rag_refresh",

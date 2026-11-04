@@ -1,6 +1,9 @@
 """Read-only cosine retrieval from a loaded immutable observed-transition index.
 
-The corpus and vectors are frozen before load and expose no mutation surface.
+The corpus and vectors are frozen before load and expose no mutation surface. A query may also
+carry the current task's task-view tags and a declared :class:`TagRetrievalPolicy`; ranking then
+adds the policy's weighted tag overlap to cosine similarity (see
+:mod:`exp.simulation.retrieval.tags`). Without tags, ranking is cosine similarity alone.
 """
 
 from __future__ import annotations
@@ -16,6 +19,12 @@ from exp.simulation.retrieval.embedding import (
 )
 from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
 from exp.simulation.retrieval.store import LoadedRAGIndex, load_rag_index
+from exp.simulation.retrieval.tags import (
+    TagRanking,
+    TagRetrievalEvidence,
+    TagRetrievalPolicy,
+    TaskQueryTags,
+)
 from exp.simulation.retrieval.transitions import render_rag_key
 
 
@@ -118,20 +127,35 @@ class TraceRAGRetriever:
         cost = maximum_input_tokens * reservation.input_usd_per_million_tokens / 1_000_000
         return OperationEconomics(cost_usd=NumericMeasurement(value=cost, provenance="estimated"))
 
-    def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
-        """Return top cosine matches after excluding query-related lineages.
+    def retrieve(
+        self,
+        query: RAGQuery,
+        *,
+        tag_policy: TagRetrievalPolicy | None = None,
+        query_tags: TaskQueryTags | None = None,
+    ) -> tuple[RAGMatch, ...]:
+        """Return top matches after excluding query-related lineages.
 
         Args:
             query: Request-visible task, initial context, action, lineage exclusions, and optional
                 limit. An omitted limit uses the immutable index default.
+            tag_policy: Optional declared combination of cosine similarity and task-tag overlap.
+                Requires ``query_tags`` and an index recording task-view tags.
+            query_tags: The current task's task-view tags, computed with the policy's bank and
+                threshold. Requires ``tag_policy``.
 
         Returns:
-            Up to ``top_k`` eligible real transitions. Equal scores use transition ID order.
+            Up to ``top_k`` eligible real transitions. Without tags the score is cosine
+            similarity. With tags it is cosine plus ``weight`` times the Jaccard overlap of fired
+            task tags, and a ``require_shared_family`` policy first drops candidates sharing no
+            filter-family tag with the task. Equal scores use transition ID order.
 
         Raises:
-            ValueError: Query embedding dimensions differ from the frozen index.
+            ValueError: Query embedding dimensions differ from the frozen index, only one of the
+                policy and query tags is given, or they disagree with the index's tag record.
         """
-        if not self._has_eligible_transition(query):
+        ranking = self.tag_ranking(tag_policy, query_tags)
+        if not self._has_eligible_transition(query, ranking):
             return ()
         key_text = render_rag_key(
             task=query.task,
@@ -156,15 +180,81 @@ class TraceRAGRetriever:
             score = sum(
                 left * right for left, right in zip(query_vector, vector.values, strict=True)
             )
-            candidates.append(RAGMatch(transition=transition, score=score))
+            if ranking is None:
+                candidates.append(RAGMatch(transition=transition, score=score))
+                continue
+            if not ranking.admits(transition.trace_id):
+                continue
+            overlap = ranking.overlap(transition.trace_id)
+            candidates.append(
+                RAGMatch(
+                    transition=transition,
+                    score=score + ranking.policy.weight * overlap,
+                    tag_overlap=overlap,
+                )
+            )
         candidates.sort(key=lambda match: (-match.score, match.transition.transition_id))
         limit = self._index.default_top_k if query.top_k is None else query.top_k
         return tuple(candidates[:limit])
 
-    def _has_eligible_transition(self, query: RAGQuery) -> bool:
-        """Check lineage eligibility before estimating or dispatching an embedding."""
+    def tag_ranking(
+        self,
+        tag_policy: TagRetrievalPolicy | None,
+        query_tags: TaskQueryTags | None,
+    ) -> TagRanking | None:
+        """Validate one tag policy and query tags against this index's tag record.
+
+        Args:
+            tag_policy: Optional declared ranking policy.
+            query_tags: Optional current-task task-view tags.
+
+        Returns:
+            The validated ranking, or None when neither is given.
+
+        Raises:
+            ValueError: Only one of the two is given, or they disagree with the index.
+        """
+        if tag_policy is None and query_tags is None:
+            return None
+        if tag_policy is None or query_tags is None:
+            raise ValueError(
+                "tag-aware retrieval needs both a tag policy and the task's query tags"
+            )
+        return TagRanking(tag_policy, query_tags, self._index.trace_tags)
+
+    def tag_evidence(
+        self, tag_policy: TagRetrievalPolicy, query_tags: TaskQueryTags
+    ) -> TagRetrievalEvidence:
+        """Return the evidence record of one validated tag-aware retrieval.
+
+        Args:
+            tag_policy: Declared ranking policy.
+            query_tags: Current-task task-view tags.
+
+        Returns:
+            Policy, its identity, the query tags and the index matrix digest.
+
+        Raises:
+            ValueError: The policy or tags disagree with the index's tag record.
+        """
+        return TagRanking(tag_policy, query_tags, self._index.trace_tags).evidence
+
+    def _has_eligible_transition(self, query: RAGQuery, ranking: TagRanking | None = None) -> bool:
+        """Check lineage and tag-filter eligibility before estimating or embedding.
+
+        Args:
+            query: Query whose lineage exclusions apply.
+            ranking: Optional validated tag ranking whose hard filter also applies.
+
+        Returns:
+            Whether any transition could be returned.
+        """
         excluded = set(query.excluded_lineage_ids)
-        return any(transition.lineage_id not in excluded for transition in self._transitions)
+        return any(
+            transition.lineage_id not in excluded
+            and (ranking is None or ranking.admits(transition.trace_id))
+            for transition in self._transitions
+        )
 
 
 def load_fit_rag_retriever(

@@ -206,6 +206,12 @@ class GroundedTransitionEngine:
                     if self.task.initial_context.get("native_artifact_binding") is not None
                     else {}
                 ),
+                # Recorded only with a tag-ranking binding, so untagged identities stay unchanged.
+                **(
+                    {}
+                    if self.runtime.tag_retrieval is None
+                    else {"tag_retrieval": self.runtime.tag_retrieval_identity(self.task)}
+                ),
             }
         )
 
@@ -417,6 +423,11 @@ class GroundedTransitionEngine:
                 "grounded_transition_ids": [
                     match.transition.transition_id for match in prepared.matches
                 ],
+                **(
+                    {}
+                    if prepared.tag_retrieval is None
+                    else {"tag_retrieval": prepared.tag_retrieval.model_dump(mode="json")}
+                ),
                 # A digest, never keys or values: this evidence reaches investigations, which
                 # must not learn instance facts into memory other traces read.
                 **(

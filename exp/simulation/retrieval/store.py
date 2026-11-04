@@ -23,6 +23,7 @@ from exp.simulation.retrieval.contracts import (
     RAGVector,
     RealTraceSourceIdentity,
 )
+from exp.simulation.retrieval.tags import verify_index_tags
 from exp.simulation.retrieval.transitions import render_rag_key
 
 
@@ -108,7 +109,7 @@ def _verify_records(
     transitions: tuple[RAGTransition, ...],
     vectors: tuple[RAGVector, ...],
 ) -> None:
-    """Verify ordering, IDs, key hashes, lineage and scope membership, and vector dimensions.
+    """Verify ordering, IDs, key hashes, lineage, scope and tag coverage, and vector dimensions.
 
     Args:
         index: Persisted immutable RAG envelope.
@@ -154,6 +155,11 @@ def _verify_records(
             raise ArtifactCorruptionError("RAG transition ID does not match its observed evidence")
         if len(vector.values) != index.embedding_dimension:
             raise ArtifactCorruptionError("RAG vector dimension does not match the envelope")
+    if index.trace_tags is not None:
+        try:
+            verify_index_tags(index.trace_tags, (item.trace_id for item in transitions))
+        except ValueError as exc:
+            raise ArtifactCorruptionError(f"RAG index tag record is inconsistent: {exc}") from exc
 
 
 def _verify_sources(

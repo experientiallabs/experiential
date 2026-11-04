@@ -51,6 +51,7 @@ from exp.simulation.retrieval import (
 )
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.retrieval.jev import JEVSelector
+from exp.simulation.retrieval.tags import TagRetrievalBinding, TagRetrievalEvidence
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
     WORLD_MODEL_ARTIFACT_PATH,
@@ -69,11 +70,13 @@ class PreparedGroundedWorldModelCall:
         request: Fully framed world-model request ready for dispatch.
         matches: Ordered grounding examples selected for the action.
         action: Exact candidate action whose call IDs constrain generated results.
+        tag_retrieval: Policy and task tags that ranked the matches, when tags were applied.
     """
 
     request: ModelRequest
     matches: tuple[RAGMatch, ...]
     action: AssistantAction
+    tag_retrieval: TagRetrievalEvidence | None = None
 
     def fit_context(
         self,
@@ -152,6 +155,8 @@ class GroundedWorldModel:
             Unknown capacity fields remain explicit rather than disabling identity verification.
         token_counter: Complete-request counter used for capacity admission.
         evidence_selector: Optional artifact-bound JEV policy over eligible candidates.
+        tag_retrieval: Optional session tag policy and per-task task-view tags. A task with
+            tags retrieves by the policy's combined score; others retrieve by cosine alone.
     """
 
     artifact_input: ArtifactInput
@@ -161,10 +166,17 @@ class GroundedWorldModel:
     capabilities: ModelCapabilities
     token_counter: TokenCounter = field(default_factory=Utf8UpperBoundTokenCounter)
     evidence_selector: JEVSelector | None = None
+    tag_retrieval: TagRetrievalBinding | None = None
 
     def __post_init__(self) -> None:
-        """Require the current prompt and the immutable build's exact capacity binding."""
+        """Require the current prompt, exact capacity, and a tag binding the index can serve."""
         _require_current_prompt(self.artifact)
+        binding = self.tag_retrieval
+        if binding is not None:
+            if self.artifact.original_evidence == "none":
+                raise ValueError("a memory-first simulator retrieves nothing to rank by tags")
+            for tags in binding.tasks.values():
+                self.retriever.tag_ranking(binding.policy, tags)
         selector_id = (
             None if self.evidence_selector is None else self.evidence_selector.policy.identity
         )
@@ -236,6 +248,9 @@ class GroundedWorldModel:
             return PreparedGroundedWorldModelCall(
                 request=request, matches=(), action=candidate_response
             )
+        binding = self.tag_retrieval
+        tags = None if binding is None else binding.for_task(task.task_id)
+        policy = None if binding is None or tags is None else binding.policy
         queries = tuple(
             RAGQuery(
                 task=task.instruction,
@@ -250,7 +265,12 @@ class GroundedWorldModel:
             )
             for action in candidate_rag_actions(candidate_response)
         )
-        batches = tuple(self.retriever.retrieve(query) for query in queries)
+        batches = tuple(
+            self.retriever.retrieve(query)
+            if policy is None
+            else self.retriever.retrieve(query, tag_policy=policy, query_tags=tags)
+            for query in queries
+        )
         if self.evidence_selector is not None:
             batches = tuple(
                 self.evidence_selector.select(
@@ -284,8 +304,25 @@ class GroundedWorldModel:
         )
         request = request.model_copy(update={"json_object_output": json_object_output})
         return PreparedGroundedWorldModelCall(
-            request=request, matches=matches, action=candidate_response
+            request=request,
+            matches=matches,
+            action=candidate_response,
+            tag_retrieval=None
+            if policy is None or tags is None
+            else self.retriever.tag_evidence(policy, tags),
         )
+
+    def tag_retrieval_identity(self, task: TaskCase) -> str | None:
+        """Return the tag-ranking identity a session for one task binds, or None without tags.
+
+        Args:
+            task: The task a session serves.
+
+        Returns:
+            Digest of the policy and that task's tags, or None when no binding is configured.
+        """
+        binding = self.tag_retrieval
+        return None if binding is None else binding.identity_for(task.task_id)
 
     def preflight_turn(
         self,
@@ -476,6 +513,7 @@ def load_grounded_world_model(
     embedder: RAGEmbedderBinding | None = None,
     token_counter: TokenCounter | None = None,
     evidence_selector: JEVSelector | None = None,
+    tag_retrieval: TagRetrievalBinding | None = None,
 ) -> GroundedWorldModel:
     """Load and verify one executable grounded world-model artifact.
 
@@ -489,6 +527,7 @@ def load_grounded_world_model(
             match the artifact's frozen model snapshot, including unknown capacity fields.
         token_counter: Optional exact counter; otherwise uses a conservative UTF-8 bound.
         evidence_selector: Reranker whose identity must match the persisted policy.
+        tag_retrieval: Optional tag policy and per-task task-view tags for ranking.
 
     Returns:
         Executable grounded world model.
@@ -514,6 +553,7 @@ def load_grounded_world_model(
         capabilities=capabilities,
         token_counter=token_counter or Utf8UpperBoundTokenCounter(),
         evidence_selector=evidence_selector,
+        tag_retrieval=tag_retrieval,
     )
 
 

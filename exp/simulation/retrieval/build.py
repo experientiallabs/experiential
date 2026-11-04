@@ -47,6 +47,7 @@ from exp.simulation.retrieval.embedding import (
 from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
 from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
 from exp.simulation.retrieval.scope import CorpusScope
+from exp.simulation.retrieval.tags import RAGIndexTags
 from exp.simulation.retrieval.transitions import extract_real_transitions
 
 
@@ -74,6 +75,7 @@ def persist_trace_rag(
     progress: ProgressHook | None = None,
     embedding_cache: RAGEmbeddingCache | None = None,
     corpus_scope: CorpusScope | None = None,
+    trace_tags: RAGIndexTags | None = None,
 ) -> PersistedRAGIndex:
     """Build a read-only index from selected partitions of real imported traces.
 
@@ -102,6 +104,10 @@ def persist_trace_rag(
             records the scope in its identity. Every scope identity must name a bound fit trace
             or lineage; held-out or unknown identities are refused. Omitted, the index and its
             identity are unscoped.
+        trace_tags: Optional decision tags to record on the index. Each view is restricted to
+            exactly the traces the index's transitions come from and must cover every one of
+            them. Recorded in the envelope and its content identity; omitted, the index and its
+            identity carry no tags.
 
     Returns:
         The immutable envelope, manifest, observed transitions, and persisted vectors.
@@ -109,7 +115,7 @@ def persist_trace_rag(
     Raises:
         ValueError: A source is not verified real trace evidence, lineage is incomplete, no real
             included transition exists, the scope names held-out or unknown evidence, or the
-            embedder violates its contract.
+            embedder violates its contract, or the tag record misses an indexed trace.
     """
     if not source_inputs:
         raise ValueError("RAG construction needs at least one verified real trace source")
@@ -140,6 +146,8 @@ def persist_trace_rag(
         raise ValueError(
             "verified included traces contain no real action-to-subsequent-observation transitions"
         )
+    if trace_tags is not None:
+        trace_tags = trace_tags.restricted_to(item.trace_id for item in transitions)
     binding = embedder or default_rag_embedder()
     chunk_bytes = embedding_chunk_bytes(binding.maximum_input_tokens)
     embedded = embed_rag_texts(
@@ -174,8 +182,10 @@ def persist_trace_rag(
     scope_content = (
         {} if corpus_scope is None else {"corpus_scope": corpus_scope.model_dump(mode="json")}
     )
+    tag_content = {} if trace_tags is None else {"trace_tags": trace_tags.model_dump(mode="json")}
     content = {
         **scope_content,
+        **tag_content,
         "code_revision": code_revision,
         "default_top_k": default_top_k,
         "embedder": binding.snapshot.model_dump(mode="json"),
@@ -215,6 +225,7 @@ def persist_trace_rag(
         transition_count=len(transitions),
         default_top_k=default_top_k,
         corpus_scope=corpus_scope,
+        trace_tags=trace_tags,
     )
     files = {
         RAG_INDEX_PATH: canonical_json_bytes(index),

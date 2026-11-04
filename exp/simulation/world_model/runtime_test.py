@@ -37,7 +37,7 @@ from exp.common.project import (
     ProjectStore,
     artifact_input,
 )
-from exp.common.tasks import ToolSchema
+from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.engines.text.prompt import (
@@ -59,6 +59,15 @@ from exp.simulation.retrieval import (
     load_rag_index,
     persist_trace_rag,
 )
+from exp.simulation.retrieval.tags import (
+    RAGIndexTags,
+    RAGTagQuestion,
+    RAGTagView,
+    RAGTraceTags,
+    TagRetrievalBinding,
+    TagRetrievalPolicy,
+    TaskQueryTags,
+)
 from exp.simulation.retrieval.tests.retrieval_test import _persist_traces
 from exp.simulation.world_model import (
     WorldModel,
@@ -75,8 +84,10 @@ from exp.simulation.world_model.artifact import (
     GroundedWorldModelArtifact,
     grounded_world_model_prompt_sha256,
 )
+from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
 from exp.simulation.world_model.runtime import (
     GroundedWorldModel,
+    PreparedGroundedWorldModelCall,
     load_grounded_world_model_artifact,
     persist_fit_only_world_model,
     persist_memory_first_world_model,
@@ -929,3 +940,155 @@ def test_rebinding_carries_a_recorded_construction_scope(tmp_path: Path) -> None
     assert declared == persist_scoped_world_model(
         store, recorded, scoped, retrieval_scope=retrieval
     )
+
+
+def _tagged_world(
+    tmp_path: Path,
+) -> tuple[ArtifactStore, str, ModelSnapshot]:
+    """Persist four fit traces, a task-tagged fit index and a world model over it.
+
+    Args:
+        tmp_path: Temporary project root.
+
+    Returns:
+        The store, the world-model artifact ID and the world-model snapshot.
+    """
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="tagged"))
+    source, traces = _persist_traces(store, count=4)
+    fired = {trace.trace_id: () for trace in traces} | {traces[3].trace_id: ("req.export",)}
+    tags = RAGIndexTags(
+        views=(
+            RAGTagView(
+                bank_id="bank",
+                bank_version=1,
+                view="task",
+                threshold=0.5,
+                questions=(RAGTagQuestion(question_id="req.export", family="requirement"),),
+                matrix_sha256="e" * 64,
+                traces=tuple(
+                    RAGTraceTags(trace_id=key, fired=value) for key, value in sorted(fired.items())
+                ),
+            ),
+        )
+    )
+    index = persist_trace_rag(
+        store,
+        (source,),
+        tuple(
+            RAGLineageBinding(trace_id=t.trace_id, lineage_id=f"lineage-{i}", partition="fit")
+            for i, t in enumerate(traces)
+        ),
+        created_at=_SCOPED_AT,
+        code_revision="revision-a",
+        trace_tags=tags,
+    )
+    snapshot = ModelSnapshot(
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        provider="fixture",
+        model_id="world",
+        capabilities_sha256=ModelCapabilities().identity_sha256(),
+        connection_sha256=sha256_json({"connection": "world"}),
+    )
+    world = persist_grounded_world_model(
+        store,
+        artifact_input(index.manifest),
+        model_alias="world",
+        model=snapshot,
+        created_at=_SCOPED_AT,
+        code_revision="revision-a",
+        top_k=4,
+    )
+    return store, world.artifact.world_model_id, snapshot
+
+
+def _tag_task() -> TaskCase:
+    """Return the current task whose task-view tags are supplied to the session."""
+    return TaskCase(
+        task_id="probe-task",
+        lineage_group_id="probe-lineage",
+        partition="held_out",
+        instruction="reset password 1",
+        initial_context={},
+        tools=(),
+        workload_weight=1.0,
+        source_trace_ids=("probe-trace",),
+    )
+
+
+def test_session_tag_binding_ranks_retrieval_and_records_evidence(tmp_path: Path) -> None:
+    """A bound task's tags re-rank grounding, record their policy and bind the session."""
+    store, world_id, snapshot = _tagged_world(tmp_path)
+    policy = TagRetrievalPolicy(bank_id="bank", bank_version=1, threshold=0.5, weight=10.0)
+    tags = TaskQueryTags(
+        bank_id="bank",
+        bank_version=1,
+        view="task",
+        threshold=0.5,
+        matrix_sha256="f" * 64,
+        fired=("req.export",),
+    )
+
+    def load(binding: TagRetrievalBinding | None) -> GroundedWorldModel:
+        """Load the tagged world model with an optional session tag binding."""
+        return load_grounded_world_model(
+            store,
+            world_id,
+            client=_WorldClient(snapshot),
+            capabilities=ModelCapabilities(),
+            tag_retrieval=binding,
+        )
+
+    def prepare(runtime: GroundedWorldModel) -> PreparedGroundedWorldModelCall:
+        """Prepare one turn of the probe task."""
+        return runtime.prepare_turn(
+            task=_tag_task(),
+            visible_messages=(),
+            candidate_response=AssistantAction(content="Which email is on the account?"),
+            excluded_lineage_ids=(),
+            maximum_output_tokens=256,
+        )
+
+    plain = prepare(load(None))
+    bound_runtime = load(TagRetrievalBinding(policy=policy, tasks={"probe-task": tags}))
+    bound = prepare(bound_runtime)
+    unlisted = prepare(load(TagRetrievalBinding(policy=policy, tasks={"other": tags})))
+
+    assert plain.tag_retrieval is None
+    assert all(match.tag_overlap is None for match in plain.matches)
+    assert plain.matches[0].transition.trace_id != "trace-3"
+    assert bound.matches[0].transition.trace_id == "trace-3"
+    assert bound.matches[0].tag_overlap == 1.0
+    assert bound.tag_retrieval is not None
+    assert bound.tag_retrieval.policy_sha256 == policy.identity
+    assert bound.tag_retrieval.query == tags
+    assert unlisted.tag_retrieval is None
+    assert [m.transition.transition_id for m in unlisted.matches] == [
+        m.transition.transition_id for m in plain.matches
+    ]
+    assert plain.request == unlisted.request
+
+    task = _tag_task()
+    plain_identity = GroundedTransitionEngine(load(None), task, maximum_output_tokens=256).identity
+    bound_identity = GroundedTransitionEngine(
+        bound_runtime, task, maximum_output_tokens=256
+    ).identity
+    assert bound_identity != plain_identity
+    assert bound_runtime.tag_retrieval_identity(task) is not None
+    assert load(None).tag_retrieval_identity(task) is None
+
+
+def test_session_tag_binding_must_match_the_index(tmp_path: Path) -> None:
+    """A binding whose bank differs from the index's task tags is refused at load."""
+    store, world_id, snapshot = _tagged_world(tmp_path)
+    policy = TagRetrievalPolicy(bank_id="bank", bank_version=2, threshold=0.5, weight=1.0)
+    tags = TaskQueryTags(
+        bank_id="bank", bank_version=2, view="task", threshold=0.5, matrix_sha256="f" * 64
+    )
+    with pytest.raises(ValueError, match="index task tags answer"):
+        load_grounded_world_model(
+            store,
+            world_id,
+            client=_WorldClient(snapshot),
+            capabilities=ModelCapabilities(),
+            tag_retrieval=TagRetrievalBinding(policy=policy, tasks={"probe-task": tags}),
+        )

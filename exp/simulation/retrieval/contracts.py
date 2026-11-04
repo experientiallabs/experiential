@@ -19,6 +19,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ModelSnapshot
 from exp.simulation.retrieval.scope import CorpusScope
+from exp.simulation.retrieval.tags import RAGIndexTags
 
 RAG_ARTIFACT_TYPE = "trace-rag-index"
 RAG_KEY_SCHEMA_VERSION = "observed-transition-key-v2"
@@ -145,6 +146,10 @@ class RAGIndex(ArtifactEnvelope):
             ``included_lineage_ids`` are the in-scope fit lineages, and every transition lies
             inside the scope. Omitted from the serialized envelope when absent, so unscoped
             indexes keep their identity.
+        trace_tags: Optional decision tags of every indexed trace, at most one record per view.
+            Each view describes exactly the traces the index's transitions come from. Only the
+            ``task`` view may shape query-time ranking. Omitted from the serialized envelope
+            when absent, so untagged indexes keep their bytes and identity.
     """
 
     rag_id: ArtifactId
@@ -164,6 +169,7 @@ class RAGIndex(ArtifactEnvelope):
     transition_count: int = Field(gt=0)
     default_top_k: int = Field(default=5, gt=0)
     corpus_scope: CorpusScope | None = Field(default=None, exclude_if=lambda value: value is None)
+    trace_tags: RAGIndexTags | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @field_validator("transitions_path", "vectors_path")
     @classmethod
@@ -272,14 +278,36 @@ class RAGQuery(ContractModel):
 
 
 class RAGMatch(ContractModel):
-    """One retrieved real transition and its cosine-similarity score."""
+    """One retrieved real transition and its ranking score.
+
+    Attributes:
+        transition: The retrieved observed transition.
+        score: Cosine similarity, plus the policy's weighted tag overlap when tag-aware ranking
+            was applied.
+        tag_overlap: Jaccard overlap of the query task's and this trace's fired task tags, set
+            only when tag-aware ranking was applied. Omitted from serialization when absent.
+    """
 
     transition: RAGTransition
     score: float
+    tag_overlap: float | None = Field(
+        default=None, ge=0.0, le=1.0, exclude_if=lambda value: value is None
+    )
 
     @field_validator("score")
     @classmethod
     def _require_finite_score(cls, value: float) -> float:
+        """Refuse a non-finite score.
+
+        Args:
+            value: Candidate score.
+
+        Returns:
+            The validated score.
+
+        Raises:
+            ValueError: The score is NaN or infinite.
+        """
         if not math.isfinite(value):
             raise ValueError("RAG match scores must be finite")
         return value
