@@ -1,0 +1,262 @@
+"""The ``records`` stage: training records, selector records, Harbor exports and cross-talk.
+
+Only admitted families contribute. Each admitted family's training records (judged continuation
+groups per tier and their critics, read back from saved assessments by the family owner) are
+saved beside the family report, and each tier's point-selector records are saved from its
+error-mining report under its episode judge. Every confirmed variant of an admitted family is
+exported for Harbor at its frozen start; without an executable qualification every export is
+diagnostic and awards no reward. When enabled and two families are admitted, the cross-talk
+probe measures whether exemplars from the first family's best judged attempts move the second
+family's judged scores.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    ContractModel,
+    JsonObject,
+    stable_id,
+)
+from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.executable.costs import job_costs
+from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
+from exp.optimize.evaluation.executable.model_costs import CostComponent
+from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_start
+from exp.optimize.evaluation.variance.crosstalk import (
+    CrosstalkProbeSpec,
+    ProbeTarget,
+    run_crosstalk_probe,
+)
+from exp.optimize.evaluation.variance.family import FamilyReport, export_family_harbor
+from exp.optimize.evaluation.variance.pipeline_spec import (
+    CostLine,
+    DecisionVarianceSpec,
+    FamiliesOutputs,
+    FamilyOutcome,
+    HarborExport,
+    MiningOutputs,
+    RecordsOutputs,
+    StageContext,
+    StageRun,
+    cost_lines,
+    family_key,
+)
+from exp.optimize.evaluation.variance.pipeline_stages import judge_costs, load_report, tier_job
+from exp.optimize.evaluation.variance.records import selector_records
+
+__all__ = ["RECORDS_STAGE"]
+
+RECORDS_TYPE = "decision-variance-records"
+"""Artifact type of one saved set of training or selector records."""
+
+
+class _RecordsStage:
+    """The ``records`` stage."""
+
+    def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
+        """The stage reads only its spec and the earlier stages."""
+        del project, spec
+        return {}
+
+    def plan(
+        self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
+    ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
+        """Records and exports make no call; only the optional cross-talk probe is priced."""
+        del code_revision
+        records = spec.records
+        lines = [
+            "Records: training and selector records of admitted families; Harbor exports of "
+            f"their confirmed variants {'(diagnostic without a qualification)' if records.harbor else 'disabled'}.",  # noqa: E501
+        ]
+        if not records.crosstalk:
+            return (), tuple(lines)
+        alias = spec.mining.actors[0]
+        episode = tier_job(project, spec.mining.job, alias, 1)
+        jobs = 1 + 3 * 1
+        episodes = records.crosstalk_attempts + 3 * records.crosstalk_repeats
+        costs: list[CostComponent] = [row.scaled(jobs) for row in job_costs(project, episode)]
+        costs.extend(judge_costs(project, spec, episodes))
+        lines.append(
+            f"Cross-talk: best-of-{records.crosstalk_attempts} source, top "
+            f"{records.crosstalk_top_k} exemplars, three arms of {records.crosstalk_repeats} "
+            "attempts on one target."
+        )
+        return cost_lines(tuple(costs)), tuple(lines)
+
+    def run(self, context: StageContext) -> StageRun:
+        """Save records, export admitted variants and run the cross-talk probe."""
+        project, spec = context.project, context.spec
+        families = FamiliesOutputs.model_validate(context.upstream["families"].outputs)
+        mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
+        admitted = [row for row in families.families if row.admitted and row.report is not None]
+        reports = {family_key(row.tier, row.point): _family(project, row) for row in admitted}
+        training: dict[str, ArtifactInput] = {}
+        for row in admitted:
+            key = family_key(row.tier, row.point)
+            report = reports[key]
+            assert row.report is not None
+            if report.records is not None:
+                training[key] = _save(context, "training", key, report.records, (row.report,))
+        selectors: dict[str, ArtifactInput] = {}
+        for tier in mining.tiers:
+            records = selector_records(
+                project, load_report(project, tier.report), judge=tier.judge.identity
+            )
+            selectors[tier.tier] = _save(context, "selectors", tier.tier, records, (tier.report,))
+        exports: list[HarborExport] = []
+        if spec.records.harbor:
+            for row in admitted:
+                exports.extend(_export(context, row, reports[family_key(row.tier, row.point)]))
+        crosstalk, skipped = None, None
+        if spec.records.crosstalk:
+            crosstalk, skipped = _crosstalk(context, admitted, reports)
+        outputs = RecordsOutputs(
+            training=training,
+            selectors=selectors,
+            harbor=tuple(exports),
+            crosstalk=crosstalk,
+            crosstalk_skipped=skipped,
+        )
+        summary: JsonObject = {
+            "admitted": len(admitted),
+            "training": sorted(training),
+            "harbor": [row.path for row in exports],
+            "crosstalk": None if crosstalk is None else crosstalk.artifact_id,
+            "crosstalk_skipped": skipped,
+        }
+        refs = (*training.values(), *selectors.values(), crosstalk)
+        return StageRun(outputs, refs, summary)
+
+
+def _family(project: ProjectStore, row: FamilyOutcome) -> FamilyReport:
+    """Read one family's saved report."""
+    assert row.report is not None
+    return FamilyReport.model_validate_json(
+        project.artifacts.read_bytes(row.report.artifact_id, "report.json")
+    )
+
+
+def _save(
+    context: StageContext,
+    kind: str,
+    key: str,
+    records: ContractModel,
+    inputs: tuple[ArtifactInput, ...],
+) -> ArtifactInput:
+    """Save one set of records under this stage, or adopt the identical saved one."""
+    store = context.project.artifacts
+    artifact_id = stable_id("decision-variance-records", {"stage": context.identity, kind: key})
+    if not store.exists(artifact_id):
+        store.write_json(
+            artifact_id=artifact_id,
+            artifact_type=RECORDS_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=context.code_revision,
+                inputs=inputs,
+            ),
+            files={"records.json": records},
+        )
+    return artifact_input(store.read(artifact_id).manifest)
+
+
+def _confirmed(report: FamilyReport) -> tuple[str, ...]:
+    """Variants whose winner was confirmed on fresh samples, in scenario order."""
+    if report.confirmation is None:
+        return ()
+    winners = {
+        verdict.scenario_id
+        for verdict in report.confirmation.variants
+        if verdict.status == "separated_matches"
+    }
+    return tuple(row.scenario_id for row in report.variants if row.scenario_id in winners)
+
+
+def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> list[HarborExport]:
+    """Export every confirmed variant of one admitted family, reusing an earlier export."""
+    root = context.dependencies.harbor_root
+    if root is None:
+        root = context.project.paths.runtime_directory / "decision-variance"
+    exports: list[HarborExport] = []
+    for scenario in _confirmed(report):
+        name = _slug(f"{row.tier}-{row.point}-{scenario}")
+        destination = root / context.identity / name
+        if not destination.exists():
+            export_family_harbor(
+                context.project,
+                report,
+                scenario,
+                Path(destination),
+                name=f"decision-variance/{name}",
+                intent=context.spec.records.intent,
+                code_revision=context.code_revision,
+            )
+        exports.append(
+            HarborExport(
+                tier=row.tier, point=row.point, scenario_id=scenario, path=str(destination)
+            )
+        )
+    return exports
+
+
+def _crosstalk(
+    context: StageContext, admitted: list[FamilyOutcome], reports: dict[str, FamilyReport]
+) -> tuple[ArtifactInput | None, str | None]:
+    """Probe the first admitted family's exemplars against the second's judged scores."""
+    starts = []
+    for row in admitted:
+        report = reports[family_key(row.tier, row.point)]
+        confirmed = _confirmed(report)
+        if confirmed and report.judging:
+            starts.append((report, report.judging[confirmed[0]]))
+    if len(starts) < 2:
+        return None, f"{len(starts)} admitted families with a confirmed variant; two are needed"
+    records = context.spec.records
+    (source, source_binding), (target, target_binding) = starts[0], starts[1]
+    spec = CrosstalkProbeSpec(
+        source=ProbeTarget(
+            job=_frozen(context.project, source.job, source_binding, records.crosstalk_attempts),
+            judge=source_binding.judge,
+        ),
+        targets=(
+            ProbeTarget(
+                job=_frozen(context.project, target.job, target_binding, records.crosstalk_repeats),
+                judge=target_binding.judge,
+            ),
+        ),
+        top_k=records.crosstalk_top_k,
+    )
+    reference, _ = run_crosstalk_probe(context.project, spec, code_revision=context.code_revision)
+    return reference, None
+
+
+def _frozen(
+    project: ProjectStore, job: ContinuationJob, binding: VariantJudging, repeats: int
+) -> ContinuationJob:
+    """The family job started at a variant's frozen start under its frozen runtime."""
+    start = frozen_start(project, binding)
+    if start is None:
+        raise ValueError("cross-talk needs frozen variants; this variant has no frozen start")
+    checkpoint, configuration = start
+    probe = GroundedRuntimeDefinition.model_validate(configuration).probe_sha256
+    study = job.study.model_copy(
+        update={"checkpoint": checkpoint, "probe_sha256": probe, "repeats": repeats}
+    )
+    return job.model_copy(update={"study": study, "configuration": configuration})
+
+
+def _slug(value: str) -> str:
+    """Turn a label into a lowercase directory and package name."""
+    return re.sub(r"[^a-z0-9_.-]", "-", value.lower())[:120]
+
+
+RECORDS_STAGE = _RecordsStage()
+"""The owner-bound ``records`` executor."""

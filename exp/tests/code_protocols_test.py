@@ -423,6 +423,17 @@ PROTOCOLS = (
         ("exp.optimize.evaluation.variance.crosstalk",),
         "a1ec0982a884e5651380fd2007490706b2893db884da8bdfe4df3f0aca243503",
     ),
+    Protocol(
+        "exp.optimize.evaluation.variance.pipeline_spec:PIPELINE_PROTOCOL",
+        "decision-variance-pipeline-v1",
+        (
+            "exp.optimize.evaluation.variance.pipeline_spec:DecisionVarianceSpec.slice",
+            "exp.optimize.evaluation.variance.pipeline_spec:stage_identity",
+            "exp.optimize.evaluation.variance.pipeline:_identities",
+            "exp.optimize.evaluation.variance.pipeline:_register",
+        ),
+        "e44b4d9bfd3adbaeb7387cd875ae65483f7bf4779c8e62303b07e196a3caf8fa",
+    ),
 )
 
 

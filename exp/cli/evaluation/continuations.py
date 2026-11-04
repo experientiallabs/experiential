@@ -43,6 +43,10 @@ from exp.cli.evaluation.continuation_studies import (
     handle_run_continuation_campaign,
     handle_run_selection,
 )
+from exp.cli.evaluation.decision_variance_action import (
+    DecisionVarianceAction,
+    handle_decision_variance,
+)
 from exp.cli.evaluation.development import (
     DevelopmentTaskQuery,
     GroundRuntime,
@@ -254,6 +258,7 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("variance-schedule", "variance_schedule", handle_variance_schedule),
     ContinuationAction("rules-stage", "rules_stage", handle_rules_stage),
     ContinuationAction("actor-critic", "actor_critic", handle_actor_critic),
+    ContinuationAction("decision-variance", "decision_variance", handle_decision_variance),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -335,6 +340,7 @@ class ContinuationCommand(ContractModel):
         variance_schedule: Training-schedule operation (status, plan or register-revision).
         rules_stage: Rules-stage spec and exposure files and the world-learning trace IDs.
         actor_critic: Actor-critic spec and exposure files for one mining-probe task.
+        decision_variance: Decision-variance pipeline spec file, planned or executed.
     """
 
     action: ContinuationActionName
@@ -400,6 +406,7 @@ class ContinuationCommand(ContractModel):
     variance_schedule: VarianceScheduleAction | None = None
     rules_stage: RulesStageAction | None = None
     actor_critic: ActorCriticAction | None = None
+    decision_variance: DecisionVarianceAction | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
