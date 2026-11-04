@@ -97,8 +97,10 @@ from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.evaluation.variance_actions import (
     ActorCriticAction,
     RulesStageAction,
+    VarianceBuildAction,
     handle_actor_critic,
     handle_rules_stage,
+    handle_variance_build,
 )
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -246,6 +248,7 @@ CONTINUATION_ACTIONS = (
     ContinuationAction(
         "validate-transitions", "transition_validation", handle_validate_transitions
     ),
+    ContinuationAction("variance-build", "variance_build", handle_variance_build),
     ContinuationAction("rules-stage", "rules_stage", handle_rules_stage),
     ContinuationAction("actor-critic", "actor_critic", handle_actor_critic),
 )
@@ -325,6 +328,7 @@ class ContinuationCommand(ContractModel):
         references: Saved artifact IDs or types whose exact references to print.
         native_workbook: Starting workbooks, task and answer ranges for a native capture.
         rubric_trajectory: Development chronology to register as a rubric source.
+        variance_build: Variance-build spec file over the completed build.
         rules_stage: Rules-stage spec and exposure files and the world-learning trace IDs.
         actor_critic: Actor-critic spec and exposure files for one mining-probe task.
     """
@@ -388,6 +392,7 @@ class ContinuationCommand(ContractModel):
     references: ArtifactReferenceQuery | None = None
     native_workbook: NativeWorkbookPayload | None = None
     rubric_trajectory: RubricTrajectoryRegistration | None = None
+    variance_build: VarianceBuildAction | None = None
     rules_stage: RulesStageAction | None = None
     actor_critic: ActorCriticAction | None = None
 

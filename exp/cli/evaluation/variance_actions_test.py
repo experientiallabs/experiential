@@ -1,4 +1,4 @@
-"""The ``rules-stage`` and ``actor-critic`` actions end to end through ``exp eval --continuations``.
+"""The variance-build, rules-stage and actor-critic actions end to end through ``exp eval``.
 
 Provider wires are scripted; spec, exposure and trace dataset are real saved inputs, so dry runs,
 spend consent, execution and replay all run through the public command.
@@ -17,6 +17,7 @@ from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.cli.evaluation.variance_actions import (
     ActorCriticAction,
     RulesStageAction,
+    VarianceBuildAction,
     rules_stage_identity,
 )
 from exp.common.project import ProjectStore, artifact_input
@@ -34,7 +35,11 @@ from exp.optimize.evaluation.rules.extraction_test import (
 from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageSpec
 from exp.optimize.evaluation.rules.stage_test import _plan, _spec, _traces
 from exp.optimize.evaluation.variance import actor_critic_test as critic_fixture
+from exp.optimize.evaluation.variance import build_test as build_fixture
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as VARIANCE_REPORT_TYPE
+from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
+from exp.optimize.evaluation.variance.exposure import ExposurePlan
 
 _TRACES = ("alpha", "beta")
 
@@ -258,4 +263,106 @@ def test_actor_critic_runs_then_replays_without_consent(
 
     assert replay.exit_code == 0, replay.output
     assert (len(actor.requests), len(role.requests)) == calls
+    assert replay.output[replay.output.index("{") :] == result.output[result.output.index("{") :]
+
+
+def _variance_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ProjectStore, Path, Path, build_fixture.DecisionWire]:
+    """Complete a build, write a variance-build command and route decisions to a fake wire.
+
+    Args:
+        tmp_path: Directory holding the build root and the command.
+        monkeypatch: Fixture keeping the build local and the decision wire scripted.
+
+    Returns:
+        The project, its root, the command file and the decision wire.
+    """
+    project = build_fixture.variance_project(tmp_path, monkeypatch)
+    wire = build_fixture.DecisionWire()
+    monkeypatch.setattr("exp.optimize.evaluation.variance.build.HttpxJsonTransport", lambda: wire)
+    action = VarianceBuildAction(
+        spec=_write(
+            tmp_path / "variance-spec.json", VarianceBuildSpec(task_bank=build_fixture.TASK_BANK)
+        )
+    )
+    request = _write(
+        tmp_path / "variance.json",
+        ContinuationCommand(action="variance-build", variance_build=action, spend=UNPRICED_SPEND),
+    )
+    return project, tmp_path / ".exp", request, wire
+
+
+def _variance_command(root: Path, request: Path, *extra: str) -> list[str]:
+    """The public ``exp eval`` command for the variance build of the fixture project."""
+    return [
+        "eval",
+        build_fixture.PROJECT,
+        "--root",
+        str(root),
+        "--continuations",
+        str(request),
+        *extra,
+    ]
+
+
+def test_variance_build_dry_run_prints_calls_and_reuse_and_makes_no_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run shows traces per role, decision calls per view and embedding reuse."""
+    project, root, request, wire = _variance_fixture(tmp_path, monkeypatch)
+
+    result = CliRunner().invoke(app, _variance_command(root, request, "--dry-run"))
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(result.output.split())
+    assert "final_evaluation is never tagged" in output
+    assert "x ceil(3/32) =" in output and "decision calls" in output
+    assert "Embedding reuse:" in output and "no embedding call" in output
+    assert not wire.states
+    assert not project.artifacts.list_ids(artifact_type=VARIANCE_REPORT_TYPE)
+
+
+def test_variance_build_refused_consent_stops_before_any_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Declining the estimate runs no stage and sends nothing."""
+    project, root, request, wire = _variance_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "exp.cli.evaluation.continuation_context.require_spend_consent", lambda *a, **k: False
+    )
+    monkeypatch.setattr("exp.cli.evaluation.variance_actions.run_variance_build", _forbid)
+
+    result = CliRunner().invoke(app, _variance_command(root, request, "--non-interactive"))
+
+    assert result.exit_code == 0, result.output
+    assert not wire.states
+    assert not project.artifacts.list_ids(artifact_type=VARIANCE_REPORT_TYPE)
+
+
+def test_variance_build_runs_over_the_catalog_alias_then_replays_without_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A consented run tags through the decision alias, writes the exposure file and replays."""
+    project, root, request, wire = _variance_fixture(tmp_path, monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(app, _variance_command(root, request, "--yes", "--non-interactive"))
+
+    assert result.exit_code == 0, result.output
+    assert wire.states
+    assert '"tag_retrieval"' in result.output and '"world_model"' in result.output
+    (report_id,) = project.artifacts.list_ids(artifact_type=VARIANCE_REPORT_TYPE)
+    identity = report_id.removesuffix("-result")
+    exposure = project.paths.runtime_directory / "variance-build" / identity / "exposure.json"
+    plan = ExposurePlan.model_validate_json(exposure.read_bytes())
+    assert "final_evaluation" in plan.roles.values()
+    calls = len(wire.states)
+
+    monkeypatch.setattr("exp.cli.evaluation.continuation_context.require_spend_consent", _forbid)
+    replay = runner.invoke(app, _variance_command(root, request, "--non-interactive"))
+
+    assert replay.exit_code == 0, replay.output
+    assert len(wire.states) == calls
+    assert project.artifacts.list_ids(artifact_type=VARIANCE_REPORT_TYPE) == (report_id,)
     assert replay.output[replay.output.index("{") :] == result.output[result.output.index("{") :]

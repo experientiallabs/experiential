@@ -4,7 +4,7 @@ This pipeline turns agent traffic into long-horizon environments whose difficult
 decisions that matter. A point in a trajectory counts as a decision only when competing actions
 taken from that exact checkpoint, continued under one frozen policy and budget, lead to measurably
 different outcomes. A family of environments qualifies only when which action is better flips
-across coherent variants of the world. Everything here is a Python API; two stages are also
+across coherent variants of the world. Everything here is a Python API; three stages are also
 `exp eval` continuation actions.
 
 ## Data roles
@@ -22,6 +22,37 @@ Tag selections (`exp/simulation/mining/tag_selection.py`, over the decision-mode
 `exp/simulation/mining/tagging.py`) apply only inside a role. `CorpusScope`
 (`exp/simulation/retrieval/scope.py`) restricts retrieval indexes and world-model construction to
 declared world-learning traces; held-out traces can never enter a scoped index or construction.
+
+## Variance build
+
+`run_variance_build` (`variance/build.py`, CLI action `variance-build`) turns a completed
+`exp build` into this pipeline's simulator as one saved, replayable stage:
+
+1. `plan_exposure` splits the build's lineage bindings before any tag is bought; the plan is saved
+   as a `variance-exposure-plan` artifact and written to `exposure.json` for the actions below.
+2. `DecisionsTraceTagger`, resolved from the catalog decision alias (default `jev`, on a typesafe
+   connection), answers a local question bank (default `capability-shape-task-v1`, read from
+   `EXP_QUESTION_BANK_ROOT` or `.exp/question_banks`) over the task view of world-learning and
+   mining-probe traces. An optional `observations_bank` tags world-learning observations views
+   as annotation. Final-evaluation traces are never rendered or sent. Each matrix is saved as a
+   `variance-tag-matrix` artifact with its bank, revision, view and digest; a trace whose answers
+   cannot be bought or read is recorded as a failure and left out of retrieval, never redrawn.
+3. Optional `construction_rule` and `retrieval_rule` tag rules narrow the two world-learning
+   corpus scopes; by default both hold every world-learning trace.
+4. The scoped, tagged fit-only index reuses the build serving index's embedder identity, chunking
+   and `default_top_k`, so every vector comes from the build's embedding checkpoint. A semantic
+   embedder is bound to a client that refuses calls: a missing vector stops the run.
+5. `persist_scoped_world_model` rebinds the build's world model to that index. Reconstruction
+   over the construction scope is off by default; the Python API runs it with an injected
+   admitted constructor.
+6. Every mining-probe task gets task-view query tags in a `tag-retrieval-binding` (default boost
+   weight 0.25), with a weight-zero control binding for cosine-only baselines.
+
+The dry run prints traces per role, decision calls per view (distinct traces x
+ceil(questions/32)) and how many world-learning embedding inputs the build already saved. Decision
+calls are priced from the catalog when the alias has prices and are otherwise unpriced. The
+`variance-build-report` lists exposure counts, tagging coverage and failures, the index, the world
+model, both bindings and the world-learning traces for the rules stage.
 
 ## Rules stage
 

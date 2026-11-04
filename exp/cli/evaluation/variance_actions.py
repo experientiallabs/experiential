@@ -1,9 +1,11 @@
-"""The ``rules-stage`` and ``actor-critic`` continuation actions over a frozen exposure plan.
+"""The ``variance-build``, ``rules-stage`` and ``actor-critic`` continuation actions.
 
-Both stages belong to their optimize owners (:mod:`exp.optimize.evaluation.rules.stage` and
+Every stage belongs to its optimize owner (:mod:`exp.optimize.evaluation.variance.build`,
+:mod:`exp.optimize.evaluation.rules.stage` and
 :mod:`exp.optimize.evaluation.variance.actor_critic`); these handlers read the registered spec
-and exposure plan files, print a credential-free summary with a conservative cost estimate, ask
-spend consent once and run or replay the stage. A saved report replays without consent or calls.
+(and, for the later two, the exposure plan file the variance build writes), print a
+credential-free summary with a conservative cost estimate, ask spend consent once and run or
+replay the stage. A saved report replays without consent or calls.
 """
 
 import math
@@ -12,8 +14,10 @@ from pathlib import Path
 from pydantic import Field
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
+from exp.cli.evaluation.learning_summary import save_details
 from exp.cli.evaluation.spend import review_components
 from exp.common.core.artifacts import ArtifactInput, ContractModel, sha256_json, stable_id
+from exp.common.core.files import write_text_atomic
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
@@ -26,8 +30,30 @@ from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticSpec,
     run_actor_critic,
 )
+from exp.optimize.evaluation.variance.build import (
+    plan_variance_build,
+    run_variance_build,
+    variance_build_costs,
+)
+from exp.optimize.evaluation.variance.build_records import (
+    VarianceBuildPlan,
+    VarianceBuildReport,
+    VarianceBuildSpec,
+    load_exposure_plan,
+)
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.simulation.continuations import load_continuation_checkpoint
+
+
+class VarianceBuildAction(ContractModel):
+    """One variance build over the project's completed build.
+
+    Attributes:
+        spec: ``VarianceBuildSpec`` JSON file: decision alias, question banks, exposure split,
+            tag rules and tag policy.
+    """
+
+    spec: Path
 
 
 class RulesStageAction(ContractModel):
@@ -60,6 +86,111 @@ class ActorCriticAction(ContractModel):
 
     spec: Path
     exposure: Path
+
+
+def handle_variance_build(context: ContinuationContext, action: VarianceBuildAction) -> None:
+    """Run or replay the variance build and write the exposure plan the later stages read.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        action: The spec file.
+
+    Returns:
+        None. The summary, any consent question and the result are printed to the console.
+
+    Raises:
+        ValueError: The spec requests construction, which needs an admitted constructor that
+            this action does not build.
+    """
+    store, console, revision = context.store, context.console, context.revision
+    spec = VarianceBuildSpec.model_validate_json(action.spec.read_bytes())
+    if spec.construction is not None:
+        raise ValueError(
+            "variance-build binds the build's world model; paid reconstruction runs through "
+            "run_variance_build with an admitted constructor"
+        )
+    plan = plan_variance_build(store, spec, code_revision=revision)
+    for line in variance_build_lines(plan, spec.decision_alias):
+        console.print(line, markup=False)
+    components = variance_build_costs(store, plan, spec.decision_alias)
+    if not plan.saved:
+        review_components(console, components)
+    if context.dry_run:
+        console.print("Dry run: build, exposure, banks and embedding reuse checked; no calls.")
+        return
+    if not plan.saved and not _consent(context, "variance-build", spec, components):
+        return
+    report = run_variance_build(store, spec, code_revision=revision)
+    exposure = store.paths.runtime_directory / "variance-build" / report.identity / "exposure.json"
+    exposure.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(exposure, load_exposure_plan(store, report.exposure).model_dump_json())
+    details = save_details(store, "variance-build", report.identity, report.model_dump_json())
+    console.print_json(data=variance_build_summary(report))
+    console.print(f"Exposure: {exposure}", markup=False)
+    console.print(f"Report: {details}", markup=False)
+
+
+def variance_build_lines(plan: VarianceBuildPlan, alias: str) -> tuple[str, ...]:
+    """Describe a variance build before consent.
+
+    Args:
+        plan: The credential-free summary.
+        alias: The decision alias.
+
+    Returns:
+        Traces per role, decision calls per view and the expected embedding reuse.
+    """
+    roles = ", ".join(f"{role} {count.traces}" for role, count in sorted(plan.roles.items()))
+    lines = [f"Variance build: traces by role: {roles}. final_evaluation is never tagged."]
+    lines.extend(
+        f"Tagging {view.view} view with {view.bank_id} v{view.bank_version} on {alias}: "
+        f"{view.distinct_units} distinct traces x ceil({view.questions}/32) = "
+        f"{view.decision_calls} decision calls ({', '.join(view.roles)})."
+        for view in plan.views
+    )
+    lines.append(
+        f"Decision calls: {plan.decision_calls}, at most {plan.decision_attempts} HTTP "
+        "attempts. Saved decisions replay without a call."
+    )
+    lines.append(
+        f"Embedding reuse: {plan.embedding_inputs_saved} of {plan.embedding_inputs} "
+        f"world-learning inputs saved by the build for {plan.embedder.model_id}; no embedding "
+        "call is made, and a missing vector stops the run."
+    )
+    return tuple(lines)
+
+
+def variance_build_summary(report: VarianceBuildReport) -> dict[str, object]:
+    """Summarize a variance build report for the terminal.
+
+    Args:
+        report: The saved report.
+
+    Returns:
+        Exposure counts, tagging coverage and failures, and every artifact the later stages read.
+    """
+    return {
+        "report": report.identity + "-result",
+        "exposure": report.exposure.artifact_id,
+        "roles": {role: count.traces for role, count in sorted(report.plan.roles.items())},
+        "tagging": [
+            {
+                "view": row.plan.view,
+                "matrix": row.matrix.artifact_id,
+                "tagged": dict(sorted(row.tagged.items())),
+                "failures": [failure.trace_id for failure in row.failures],
+            }
+            for row in report.tagging
+        ],
+        "index": report.index.artifact_id,
+        "index_transitions": report.index_transitions,
+        "world_model": report.world_model.artifact_id,
+        "tag_retrieval": report.tag_retrieval.artifact_id,
+        "control_retrieval": report.control_retrieval.artifact_id,
+        "probe_tasks": len(report.probes),
+        "rules_stage_traces": len(report.rules_stage_traces),
+        "next_steps": list(report.next_steps),
+    }
 
 
 def handle_rules_stage(context: ContinuationContext, action: RulesStageAction) -> None:
@@ -304,7 +435,7 @@ def actor_critic_summary(report: ActorCriticReport) -> dict[str, object]:
 def _consent(
     context: ContinuationContext,
     action: str,
-    spec: RulesStageSpec | ActorCriticSpec,
+    spec: VarianceBuildSpec | RulesStageSpec | ActorCriticSpec,
     components: tuple[CostComponent, ...],
     traces: tuple[Trace, ...] = (),
 ) -> bool:

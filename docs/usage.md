@@ -968,5 +968,6 @@ are documented in [docs/reference/continuations-and-harbor.md](reference/continu
 Trajectory-count selection (`sample-count`), summary forgetting (`forget-summary`), judge
 challenge studies (`challenge-judges`), checkpoint retirement (`retire-checkpoint`) and
 session-state collection (`collect-garbage`) are in [evaluation-procedures.md](reference/evaluation-procedures.md).
+`variance-build` (`variance_build`: `spec` JSON file) turns the completed build into the decision-variance simulator: exposure plan, decision tags, scoped tagged index, scoped world model and probe tag bindings.
 `rules-stage` (`rules_stage`: `spec` and `exposure` JSON files, `traces` IDs, optional `dataset`) learns a saved rule book from world-learning traces.
 `actor-critic` (`actor_critic`: `spec` and `exposure` JSON files) judges, estimates and continues points of one mining-probe task and ranks them.
