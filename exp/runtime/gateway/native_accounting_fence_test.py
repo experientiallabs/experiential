@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.ledger_errors import AccountingRefusedError
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_accounting_fence import OrganizationFence
 from exp.runtime.gateway.native_accounting_test import (
     _admit,
     _deployment,
@@ -268,3 +269,66 @@ def test_refusal_maps_to_its_own_public_error_and_validates_its_wait() -> None:
     assert "internal" not in error.detail.message
     with pytest.raises(ValueError, match="must be positive"):
         AccountingRefusedError("internal", retry_after_seconds=0)
+
+
+def test_organization_fence_is_constant_time_and_releases_each_organization() -> None:
+    """An organization's entry exists only while it holds a fencing write id."""
+    fence = OrganizationFence()
+    fence.mark(_ORG_A, "a-1", fencing=True)
+    fence.mark(_ORG_A, "a-2", fencing=True)
+    fence.mark(_ORG_B, "b-1", fencing=True)
+    assert fence.fenced(_ORG_A) and fence.organizations() == frozenset({_ORG_A, _ORG_B})
+    fence.mark(_ORG_A, "a-1", fencing=False)
+    assert fence.fenced(_ORG_A)
+    fence.mark(_ORG_A, "a-2", fencing=False)
+    fence.mark(_ORG_A, "a-2", fencing=False)  # Releasing twice is a no-op.
+    fence.mark(_ORG_B, "b-1", fencing=False)
+    assert not fence.fenced(_ORG_A) and fence.organizations() == frozenset()
+    assert fence._requests == {}  # noqa: SLF001 - no per-organization residue.
+
+
+def test_a_write_failing_after_its_request_left_never_strands_a_fence() -> None:
+    """Only the live registry entry can fence; a removed or replaced one releases."""
+    accounting, _ledger = _accounting()
+    entry = _admit_org(accounting, "a-1", _ORG_A)
+    entry.settlement_write_failed = True
+    fence = OrganizationFence()
+    fence.sync({}, entry)
+    assert not fence.fenced(_ORG_A)
+    fence.sync({"a-1": entry}, entry)
+    assert fence.fenced(_ORG_A)
+    assert fence.drop({"a-1": entry}, "a-1") is entry
+    assert not fence.fenced(_ORG_A)
+
+
+def test_recovering_many_organizations_leaves_no_fence_entries() -> None:
+    """Fence state follows outstanding failed writes, never every organization seen."""
+    accounting, ledger = _accounting()
+    failure = GatewayFailure(failure_class=GatewayFailureClass.GUARDRAIL, safe_message="blocked")
+    organizations = [f"organization-{index}" for index in range(40)]
+    for index, organization in enumerate(organizations):
+        entry = _admit_org(accounting, f"r-{index}", organization)
+        _admit_org(accounting, f"s-{index}", organization)
+        attempt = _start(accounting, ordinal=0, request_id=f"s-{index}")
+        ledger.request_errors.append(RuntimeError("ledger write lost"))
+        assert not accounting.finish_request_quietly(entry.authorization, failure)
+        _fail_next_attempt_write(accounting, RuntimeError("ledger write lost"))
+        with pytest.raises(NativeBridgeError):
+            _settle(
+                accounting,
+                attempt_id=str(attempt["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id=f"s-{index}",
+            )
+    assert accounting.fenced_organizations() == frozenset(organizations)
+    for _ in range(50):
+        if accounting.accounting_healthy:
+            break
+        accounting.sweep_expired()
+    assert accounting.accounting_healthy
+    assert accounting.fenced_organizations() == frozenset()
+    assert accounting._fence._requests == {}  # noqa: SLF001 - released per organization.
+    assert accounting.request_settlements._fence._requests == {}  # noqa: SLF001
+    for organization in organizations:
+        accounting.require_clear(organization)

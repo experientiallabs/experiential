@@ -152,6 +152,11 @@ new paid admission work for the owning organization, on every native endpoint, u
 that organization's retained writes commit; other organizations keep serving. A
 ledger's deliberate refusal (`AccountingRefusedError`) is a retryable per-request
 error that is retained for replay but never refuses admission.
+A request-only terminal write refused with a plain `GatewayLedgerError` (unknown
+request, another organization's request, or already terminal with another outcome)
+can never commit, so it is finalized uncommitted with a warning instead of being
+replayed forever. The admission check is constant time per organization, and an
+organization's fence entry is released with its last retained write.
 Hosted ledgers must
 adopt this contract before enabling the coordinated release.
 
