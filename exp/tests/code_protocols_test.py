@@ -319,6 +319,30 @@ PROTOCOLS = (
         ),
         "b9e458048633de371b36772dea0c8196b7072e214ce09deb9acdea84baf1627a",
     ),
+    Protocol(
+        "exp.optimize.evaluation.variance.authoring_packet:AUTHORING_PACKET_PROTOCOL",
+        "authoring-packet-v1",
+        ("exp.optimize.evaluation.variance.authoring_packet",),
+        "b06ff0a6864fa60bbc6d73ac509494b71ce535948406d9610e09dc483ade6ba2",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.world_author:WORLD_AUTHOR_PROTOCOL",
+        "world-author-v1",
+        ("exp.optimize.evaluation.variance.world_author",),
+        "2a3833c66fff963d453044afed21d85931444df3675fd39548696c2aa5867445",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.rubric_author:RUBRIC_AUTHOR_PROTOCOL",
+        "rubric-author-v1",
+        ("exp.optimize.evaluation.variance.rubric_author",),
+        "2b196177c3d9d5e998a23358792d04b8906a7b8c6f6e90aa33ba01936f107735",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.world_freeze:WORLD_FREEZE_PROTOCOL",
+        "world-freeze-v1",
+        ("exp.optimize.evaluation.variance.world_freeze",),
+        "a0c92da5a0e548c2bfe4e307269578800c63c8437c8fba019dd85ee679ffc59f",
+    ),
 )
 
 
