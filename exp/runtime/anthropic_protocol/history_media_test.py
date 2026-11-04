@@ -13,13 +13,10 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_BASE64_BYTES,
     MAXIMUM_IMAGE_BASE64_BYTES,
 )
-from exp.runtime.anthropic_protocol.history_media import (
-    degrade_history_media,
-    placeholder_text,
-    unservable_reason,
-)
+from exp.runtime.anthropic_protocol.history_media import degrade_history_media, unservable_reason
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.history_media import placeholder_text
 
 _PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"

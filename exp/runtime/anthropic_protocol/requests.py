@@ -100,6 +100,7 @@ from exp.runtime.models.providers.cache_policy import (
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.history_documents import trim_history_documents
 from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.unknown_message_fields import drop_unknown_message_keys
@@ -423,6 +424,7 @@ def _decode(
                 + detail["msg"].removeprefix("Value error, ")
                 + ".",
             ) from exc
+    trimmed, document_disclosures = trim_history_documents(tuple(messages))
     tools, tool_change_disclosures = tools_after_changes(
         request.tools, [message.content for message in request.messages]
     )
@@ -443,7 +445,7 @@ def _decode(
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
-            messages=tuple(messages),
+            messages=trimmed,
             tools=tools,
             # Raw payload entries, mirroring thinking: the provider receives
             # each server tool byte-for-byte on Anthropic rungs.
@@ -484,6 +486,7 @@ def _decode(
             ignored_parameters=(
                 *unknown_disclosures,
                 *media_disclosures,
+                *document_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,

@@ -63,6 +63,8 @@ from exp.runtime.openai_protocol.errors import (
     unsupported_field,
     validated_operation_headers,
 )
+from exp.runtime.openai_protocol.history_documents import trim_history_documents
+from exp.runtime.openai_protocol.history_media import degrade_chat_media, degrade_responses_media
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
@@ -282,6 +284,7 @@ def decode_chat(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
+    payload, media_disclosures = degrade_chat_media(payload)
     breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
     payload = cache_payload = breakpoints.marked  # Breakpoints ride the cache_control path.
     payload = drop_opencode_cache_control(payload)
@@ -335,6 +338,7 @@ def decode_chat(
         _messages(request.messages, "messages"), cache_payload
     )
     messages = expand_chat_custom_calls(request.messages, messages)
+    messages, document_disclosures = trim_history_documents(messages)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -348,6 +352,8 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *media_disclosures,
+                *document_disclosures,
                 *cap_disclosures,
                 *breakpoints.disclosures,
                 *cache_disclosures,
@@ -457,6 +463,7 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
+    payload, media_disclosures = degrade_responses_media(payload)
     breakpoints = extract_prompt_cache_breakpoints(payload, container="input")
     payload = breakpoints.payload
     validate_manifest(payload, RESPONSES_MANIFEST)
@@ -526,10 +533,11 @@ def decode_responses(
         ) from exc
     if request.instructions is not None:
         messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
+    trimmed, document_disclosures = trim_history_documents(tuple(messages))
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.RESPONSES,
-            messages=tuple(messages),
+            messages=trimmed,
             tools=tuple(function_tools),
             provider_native_tools=tuple(native_tools),
             web_search=responses_web_search(native_tools, online_suffix=online_suffix),
@@ -540,6 +548,8 @@ def decode_responses(
             json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
                 *alias_disclosures,
+                *media_disclosures,
+                *document_disclosures,
                 *breakpoints.disclosures,
                 *cache_disclosures,
                 *replayed_reasoning_disclosures(

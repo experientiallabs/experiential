@@ -21,49 +21,24 @@ decoder's own typed rejection.
 
 from __future__ import annotations
 
-import base64
-import binascii
-from typing import Literal, cast
+from typing import cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import (
-    DOCUMENT_MEDIA_TYPES,
-    IMAGE_MEDIA_TYPES,
-    MAXIMUM_DOCUMENT_BASE64_BYTES,
-    MAXIMUM_DOCUMENT_BYTES,
-    MAXIMUM_IMAGE_BASE64_BYTES,
-    MAXIMUM_IMAGE_BYTES,
+from exp.common.models.content import DOCUMENT_MEDIA_TYPES, IMAGE_MEDIA_TYPES
+from exp.runtime.openai_protocol.history_media import (
+    MediaKind,
+    UnservableReason,
+    inline_reason,
+    oversized_error,
+    placeholder_part,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
-
-MediaKind = Literal["image", "document"]
-"""Content block types whose inline bytes this pass inspects."""
-
-UnservableReason = Literal["oversized", "undecodable", "unsupported_media_type"]
-"""Why an inline media block cannot be forwarded."""
-
-_CEILINGS: dict[MediaKind, tuple[int, int]] = {
-    "image": (MAXIMUM_IMAGE_BASE64_BYTES, MAXIMUM_IMAGE_BYTES),
-    "document": (MAXIMUM_DOCUMENT_BASE64_BYTES, MAXIMUM_DOCUMENT_BYTES),
-}
-"""Per-kind ``(encoded character ceiling, decoded byte ceiling)``."""
 
 _MEDIA_TYPES: dict[MediaKind, frozenset[str]] = {
     "image": frozenset(IMAGE_MEDIA_TYPES),
     "document": frozenset(DOCUMENT_MEDIA_TYPES),
 }
-"""Media types each kind may declare on a base64 source."""
-
-_FORMATS: dict[MediaKind, str] = {
-    "image": "a PNG, JPEG, GIF, or WebP image",
-    "document": "a PDF",
-}
-"""Human description of the accepted formats of each kind."""
-
-
-def _mebibytes(size: int) -> int:
-    """Return a byte ceiling in whole MiB."""
-    return size // (1024 * 1024)
+"""Media types each kind may declare on a base64 source, matched exactly as
+the Messages decoder matches them."""
 
 
 def unservable_reason(kind: MediaKind, block: JsonObject) -> UnservableReason | None:
@@ -92,45 +67,7 @@ def unservable_reason(kind: MediaKind, block: JsonObject) -> UnservableReason | 
         return None
     if source_object.get("media_type") not in _MEDIA_TYPES[kind]:
         return "unsupported_media_type"
-    if len(data) > _CEILINGS[kind][0]:
-        return "oversized"
-    try:
-        base64.b64decode(data, validate=True)
-    except (binascii.Error, ValueError):
-        return "undecodable"
-    return None
-
-
-def placeholder_text(kind: MediaKind, reason: UnservableReason) -> str:
-    """Return the text left in place of an omitted history block.
-
-    Args:
-        kind: The omitted block's content type.
-        reason: Why its bytes could not ride.
-
-    Returns:
-        One bracketed line the model reads where the block was.
-    """
-    match reason:
-        case "oversized":
-            detail = f"it is larger than the gateway's {_mebibytes(_CEILINGS[kind][1])} MiB limit"
-        case "undecodable":
-            detail = "its data is not valid base64"
-        case "unsupported_media_type":
-            detail = f"it is not {_FORMATS[kind]}"
-    return f"[{kind} omitted from conversation history: {detail}]"
-
-
-def _placeholder_block(kind: MediaKind, reason: UnservableReason, block: JsonObject) -> JsonObject:
-    """Build the text block that replaces one omitted media block.
-
-    The caller's cache marker moves onto the placeholder, so a prompt-cache
-    breakpoint placed on the media block keeps its position.
-    """
-    replacement: JsonObject = {"type": "text", "text": placeholder_text(kind, reason)}
-    if "cache_control" in block:
-        replacement["cache_control"] = block["cache_control"]
-    return replacement
+    return inline_reason(kind, None, data)
 
 
 def _media_kind(block: object) -> MediaKind | None:
@@ -143,17 +80,6 @@ def _media_kind(block: object) -> MediaKind | None:
     if block_type == "document":
         return "document"
     return None
-
-
-def _oversized_error(kind: MediaKind, param: str, characters: int) -> OpenAIProtocolError:
-    """Build the typed 400 for an oversized block in the latest user turn."""
-    encoded, decoded = _CEILINGS[kind]
-    return invalid_field(
-        f"{param}.source.data",
-        f"The {kind} at '{param}' is {characters:,} base64 characters; an inline {kind} may "
-        f"carry at most {encoded:,} base64 characters ({_mebibytes(decoded)} MiB decoded). "
-        f"Resize or compress the {kind} and resend it.",
-    )
 
 
 def degrade_history_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
@@ -208,9 +134,9 @@ def degrade_history_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, .
                 if message_index == latest_user:
                     if reason == "oversized":
                         data = cast(str, cast(JsonObject, block_object["source"])["data"])
-                        raise _oversized_error(kind, param, len(data))
+                        raise oversized_error(kind, f"{param}.source.data", len(data))
                     continue
-                blocks[block_index] = _placeholder_block(kind, reason, block_object)
+                blocks[block_index] = placeholder_part("text", kind, reason, block_object)
                 disclosures[f"messages.content.{kind}->placeholder({reason})"] = None
                 message_changed = True
                 continue
@@ -252,7 +178,7 @@ def _degrade_tool_result(block: object, disclosures: dict[str, None]) -> JsonObj
         reason = unservable_reason(kind, cast(JsonObject, part))
         if reason is None:
             continue
-        parts[index] = _placeholder_block(kind, reason, cast(JsonObject, part))
+        parts[index] = placeholder_part("text", kind, reason, cast(JsonObject, part))
         disclosures[f"messages.content.tool_result.{kind}->placeholder({reason})"] = None
         changed = True
     if not changed:
