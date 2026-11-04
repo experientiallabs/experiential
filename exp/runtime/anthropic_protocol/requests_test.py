@@ -1205,7 +1205,22 @@ def test_empty_content_off_the_final_assistant_turn_is_still_rejected() -> None:
     # A lone empty assistant turn would leave no conversation at all.
     with pytest.raises(OpenAIProtocolError, match="must not be empty"):
         decode_messages(_body(messages=[{"role": "assistant", "content": ""}]))
-    # So would one that follows only system turns.
+    # A marked empty block asks for a breakpoint: refused, never dropped silently.
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}
+                        ],
+                    },
+                ]
+            )
+        )
+    # An empty assistant after only system turns would leave no conversation too.
     with pytest.raises(OpenAIProtocolError, match="must not be empty"):
         decode_messages(
             _body(

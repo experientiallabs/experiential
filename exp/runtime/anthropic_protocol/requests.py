@@ -228,16 +228,21 @@ request is served exactly as Anthropic serves it."""
 def _is_empty_prefill(message: _Message) -> bool:
     """Whether ``message`` is an assistant turn carrying no content at all.
 
-    An empty string, or only text blocks whose text is empty (a cache marker
-    on such a block bounds nothing: the prefix it would mark ends at the
-    previous turn). An empty block list is not a prefill and stays refused.
+    An empty string, or only unmarked, uncited text blocks whose text is
+    empty. A block carrying ``cache_control`` is not dropped: the caller asked
+    for a breakpoint there, so it keeps the typed refusal (as Anthropic
+    refuses an empty text block) instead of losing the marker silently. An
+    empty block list is not a prefill and stays refused.
     """
     if message.role != "assistant":
         return False
     if isinstance(message.content, str):
         return not message.content
     return bool(message.content) and all(
-        isinstance(block, _TextBlock) and not block.text and not block.citations
+        isinstance(block, _TextBlock)
+        and not block.text
+        and not block.citations
+        and block.cache_control is None
         for block in message.content
     )
 
