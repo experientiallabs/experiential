@@ -13,22 +13,26 @@ The rule follows the tool-result image precedent in ``capability_policy``:
 media inside a ``tool_result`` (a tool screenshot, a PDF a tool read) is
 history the moment the tool returns it, so it degrades in every turn; a
 top-level image or document degrades in every user turn before the latest
-one. A top-level block in the LATEST user turn keeps the fail-closed
-contract, since the caller can still resend it differently: an oversized one
-gets a typed 400 that states the limit, and an undecodable one keeps the
-decoder's own typed rejection.
+one. A top-level block in the LATEST turn (the user messages since the last
+assistant message) keeps the fail-closed contract, since the caller can still
+resend it differently: an oversized one gets a typed 400 that states the
+limit, and an undecodable one keeps the decoder's own typed rejection.
 """
 
 from __future__ import annotations
 
 from typing import cast
 
+from pydantic import JsonValue
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import DOCUMENT_MEDIA_TYPES, IMAGE_MEDIA_TYPES
 from exp.runtime.openai_protocol.history_media import (
+    ANTHROPIC_CACHE_KEYS,
     MediaKind,
     UnservableReason,
     inline_reason,
+    latest_turn,
     oversized_error,
     placeholder_part,
 )
@@ -41,7 +45,9 @@ _MEDIA_TYPES: dict[MediaKind, frozenset[str]] = {
 the Messages decoder matches them."""
 
 
-def unservable_reason(kind: MediaKind, block: JsonObject) -> UnservableReason | None:
+def unservable_reason(
+    kind: MediaKind, block: JsonObject, *, check_decodable: bool = True
+) -> UnservableReason | None:
     """Return why one inline media block cannot be forwarded, if it cannot.
 
     Only a ``base64`` source is judged: URL, file, and plain-text sources
@@ -53,6 +59,8 @@ def unservable_reason(kind: MediaKind, block: JsonObject) -> UnservableReason | 
     Args:
         kind: The block's content type.
         block: Raw caller content block.
+        check_decodable: Whether to validate the base64 itself; a latest-turn
+            block skips it, because the strict decoder owns that rejection.
 
     Returns:
         The reason the bytes cannot ride, or ``None`` when they can (or when
@@ -67,10 +75,10 @@ def unservable_reason(kind: MediaKind, block: JsonObject) -> UnservableReason | 
         return None
     if source_object.get("media_type") not in _MEDIA_TYPES[kind]:
         return "unsupported_media_type"
-    return inline_reason(kind, None, data)
+    return inline_reason(kind, None, data, check_decodable=check_decodable)
 
 
-def _media_kind(block: object) -> MediaKind | None:
+def _media_kind(block: JsonValue) -> MediaKind | None:
     """Return the media kind of one raw content block, if it is one."""
     if not isinstance(block, dict):
         return None
@@ -103,56 +111,71 @@ def degrade_history_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, .
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return payload, ()
-    latest_user = max(
-        (
-            index
-            for index, message in enumerate(messages)
-            if isinstance(message, dict) and cast(JsonObject, message).get("role") == "user"
-        ),
-        default=-1,
-    )
+    latest = latest_turn(messages)
     disclosures: dict[str, None] = {}
-    rebuilt: list[object] = list(messages)
-    changed = False
+    rebuilt: list[JsonValue] | None = None
     for message_index, message in enumerate(messages):
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        message_object = cast(JsonObject, message)
-        content = message_object.get("content")
-        if message_object.get("role") != "user" or not isinstance(content, list):
+        content = message.get("content")
+        if not isinstance(content, list):
             continue
-        blocks: list[object] = list(cast(list[object], content))
-        message_changed = False
-        for block_index, block in enumerate(blocks):
-            param = f"messages.{message_index}.content.{block_index}"
-            kind = _media_kind(block)
-            if kind is not None:
-                block_object = cast(JsonObject, block)
-                reason = unservable_reason(kind, block_object)
-                if reason is None:
-                    continue
-                if message_index == latest_user:
-                    if reason == "oversized":
-                        data = cast(str, cast(JsonObject, block_object["source"])["data"])
-                        raise oversized_error(kind, f"{param}.source.data", len(data))
-                    continue
-                blocks[block_index] = placeholder_part("text", kind, reason, block_object)
-                disclosures[f"messages.content.{kind}->placeholder({reason})"] = None
-                message_changed = True
-                continue
-            replaced = _degrade_tool_result(block, disclosures)
+        blocks: list[JsonValue] | None = None
+        for block_index, block in enumerate(content):
+            replaced = _degrade_block(
+                block,
+                f"messages.{message_index}.content.{block_index}",
+                latest=message_index in latest,
+                disclosures=disclosures,
+            )
             if replaced is not None:
+                if blocks is None:
+                    blocks = list(content)
                 blocks[block_index] = replaced
-                message_changed = True
-        if message_changed:
-            rebuilt[message_index] = {**message_object, "content": blocks}
-            changed = True
-    if not changed:
+        if blocks is not None:
+            if rebuilt is None:
+                rebuilt = list(messages)
+            rebuilt[message_index] = {**message, "content": blocks}
+    if rebuilt is None:
         return payload, ()
     return {**payload, "messages": rebuilt}, tuple(disclosures)
 
 
-def _degrade_tool_result(block: object, disclosures: dict[str, None]) -> JsonObject | None:
+def _degrade_block(
+    block: JsonValue, param: str, *, latest: bool, disclosures: dict[str, None]
+) -> JsonObject | None:
+    """Return one top-level user block's replacement, or ``None`` to keep it.
+
+    Args:
+        block: Raw caller content block.
+        param: Public path of the block.
+        latest: Whether the block's message belongs to the latest turn.
+        disclosures: Ordered disclosure set, extended in place.
+
+    Returns:
+        A placeholder for unservable history media, a rebuilt tool result,
+        or ``None`` when the block rides unchanged.
+
+    Raises:
+        OpenAIProtocolError: An oversized top-level block sits in the latest turn.
+    """
+    kind = _media_kind(block)
+    if kind is None:
+        return _degrade_tool_result(block, disclosures)
+    block_object = cast(JsonObject, block)
+    reason = unservable_reason(kind, block_object, check_decodable=not latest)
+    if reason is None:
+        return None
+    if latest:
+        if reason == "oversized":
+            data = cast(str, cast(JsonObject, block_object["source"])["data"])
+            raise oversized_error(kind, f"{param}.source.data", len(data))
+        return None
+    disclosures[f"messages.content.{kind}->placeholder({reason})"] = None
+    return placeholder_part("text", kind, reason, block_object, cache_keys=ANTHROPIC_CACHE_KEYS)
+
+
+def _degrade_tool_result(block: JsonValue, disclosures: dict[str, None]) -> JsonObject | None:
     """Degrade unservable media inside one ``tool_result`` block.
 
     Args:
@@ -165,22 +188,24 @@ def _degrade_tool_result(block: object, disclosures: dict[str, None]) -> JsonObj
     """
     if not isinstance(block, dict):
         return None
-    block_object = cast(JsonObject, block)
-    inner = block_object.get("content")
-    if block_object.get("type") != "tool_result" or not isinstance(inner, list):
+    inner = block.get("content")
+    if block.get("type") != "tool_result" or not isinstance(inner, list):
         return None
-    parts: list[object] = list(cast(list[object], inner))
-    changed = False
-    for index, part in enumerate(parts):
+    parts: list[JsonValue] | None = None
+    for index, part in enumerate(inner):
         kind = _media_kind(part)
         if kind is None:
             continue
-        reason = unservable_reason(kind, cast(JsonObject, part))
+        part_object = cast(JsonObject, part)
+        reason = unservable_reason(kind, part_object)
         if reason is None:
             continue
-        parts[index] = placeholder_part("text", kind, reason, cast(JsonObject, part))
+        if parts is None:
+            parts = list(inner)
+        parts[index] = placeholder_part(
+            "text", kind, reason, part_object, cache_keys=ANTHROPIC_CACHE_KEYS
+        )
         disclosures[f"messages.content.tool_result.{kind}->placeholder({reason})"] = None
-        changed = True
-    if not changed:
+    if parts is None:
         return None
-    return {**block_object, "content": parts}
+    return {**block, "content": parts}

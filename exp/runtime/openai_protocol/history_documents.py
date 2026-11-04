@@ -79,10 +79,27 @@ def _replace_documents(message: GatewayMessage, positions: frozenset[int]) -> Ga
     )
     content = "".join(part.text for part in parts if part.kind == "text")
     blocks = () if message.role == "tool" else multimodal_text_cache_blocks(parts)
+    cache_control = message.cache_control
     if all(part.kind == "text" for part in parts):
+        if message.role == "tool" and cache_control is None:
+            # A text-only tool result carries its breakpoint on the message,
+            # so the last part marker (the replaced document's included) moves there.
+            cache_control = next(
+                (
+                    part.cache_control
+                    for part in reversed(parts)
+                    if isinstance(part, TextContentPart) and part.cache_control is not None
+                ),
+                None,
+            )
         parts = ()
     return message.model_copy(
-        update={"content": content, "content_parts": parts, "provider_text_blocks": blocks}
+        update={
+            "content": content,
+            "content_parts": parts,
+            "provider_text_blocks": blocks,
+            "cache_control": cache_control,
+        }
     )
 
 

@@ -12,8 +12,8 @@ omitted and why, and the substitution is disclosed in ``ignored_parameters``.
 The rule follows the tool-result image precedent in ``capability_policy``:
 media in a tool output (a tool screenshot, a PDF a tool read) is history the
 moment the tool returns it, so it degrades in every turn; media in any other
-message degrades everywhere except the LATEST user message. That message
-keeps the fail-closed contract, since the caller can still resend it
+message degrades everywhere except the LATEST turn (the user messages since
+the model last spoke). Those keep the fail-closed contract, since the caller can still resend it
 differently: an oversized part gets a typed 400 that states the limit, and an
 undecodable or unsupported one keeps the decoder's own typed rejection.
 
@@ -24,10 +24,11 @@ walker lives beside the Messages decoder.
 
 from __future__ import annotations
 
-import base64
 import binascii
 import re
-from typing import Literal, cast
+from typing import Final, Literal, cast
+
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
@@ -70,8 +71,44 @@ _DATA_URL = re.compile(
 )
 """The ``data:`` URL shape the canonical content constructors parse."""
 
-_REPLACED_KEYS = ("cache_control", "prompt_cache_breakpoint")
-"""Cache-marker keys a placeholder inherits from the part it replaces."""
+OPENAI_CACHE_KEYS: Final = ("cache_control", "prompt_cache_breakpoint")
+"""Cache-marker keys an OpenAI-surface placeholder inherits from the part it replaces."""
+
+ANTHROPIC_CACHE_KEYS: Final = ("cache_control",)
+"""Cache-marker keys a Messages placeholder inherits: its text block allows no other."""
+
+_VALIDATION_CHUNK: Final = 1 << 20
+"""Characters validated per step; a multiple of 4 so every inner chunk is whole quanta."""
+
+
+def base64_decodable(data: str, *, chunk: int = _VALIDATION_CHUNK) -> bool:
+    """Return ``base64.b64decode(data, validate=True)``'s verdict without decoding it whole.
+
+    The canonical content parts decode every inline payload once already, so
+    this pre-validation pass must not hold a second full decoded copy: it
+    checks strictly, one bounded chunk at a time, in linear time. Padding is
+    legal only at the very end, so an inner chunk ending in ``=`` (which
+    validates on its own) is refused here exactly as the whole string is.
+
+    Args:
+        data: The base64 payload.
+        chunk: Characters per step, a positive multiple of 4.
+
+    Returns:
+        Whether strict base64 decoding of ``data`` succeeds.
+    """
+    if not data.isascii():
+        return False
+    end = len(data)
+    for start in range(0, end, chunk):
+        piece = data[start : start + chunk]
+        if start + chunk < end and piece.endswith("="):
+            return False
+        try:
+            binascii.a2b_base64(piece.encode("ascii"), strict_mode=True)
+        except binascii.Error:
+            return False
+    return True
 
 
 def _mebibytes(size: int) -> int:
@@ -79,7 +116,9 @@ def _mebibytes(size: int) -> int:
     return size // (1024 * 1024)
 
 
-def inline_reason(kind: MediaKind, media_type: str | None, data: str) -> UnservableReason | None:
+def inline_reason(
+    kind: MediaKind, media_type: str | None, data: str, *, check_decodable: bool = True
+) -> UnservableReason | None:
     """Return why inline base64 bytes cannot be forwarded, if they cannot.
 
     Decodability uses the canonical content parts' own rule, so bytes judged
@@ -90,6 +129,9 @@ def inline_reason(kind: MediaKind, media_type: str | None, data: str) -> Unserva
         media_type: Declared media type, ``None`` when the carrier states none
             (a bare base64 file, which the canonical document treats as a PDF).
         data: The base64 payload, without any ``data:`` preamble.
+        check_decodable: Whether to validate the base64 itself. A latest-turn
+            part skips it: only its size is judged here, and the strict decoder
+            owns its undecodable rejection.
 
     Returns:
         The reason the bytes cannot ride, or ``None`` when they can.
@@ -98,14 +140,14 @@ def inline_reason(kind: MediaKind, media_type: str | None, data: str) -> Unserva
         return "unsupported_media_type"
     if len(data) > _CEILINGS[kind][0]:
         return "oversized"
-    try:
-        base64.b64decode(data, validate=True)
-    except (binascii.Error, ValueError):
+    if check_decodable and not base64_decodable(data):
         return "undecodable"
     return None
 
 
-def data_url_reason(kind: MediaKind, value: str, *, bare_base64: bool) -> UnservableReason | None:
+def data_url_reason(
+    kind: MediaKind, value: str, *, bare_base64: bool, check_decodable: bool = True
+) -> UnservableReason | None:
     """Return why one caller URL or file value cannot be forwarded, if it cannot.
 
     Args:
@@ -113,19 +155,26 @@ def data_url_reason(kind: MediaKind, value: str, *, bare_base64: bool) -> Unserv
         value: Caller ``image_url`` or ``file_data`` value.
         bare_base64: Whether a value that is not a ``data:`` URL is base64
             bytes (``file_data``) rather than a remote URL (``image_url``).
+        check_decodable: Whether to validate the base64 itself
+            (:func:`inline_reason`).
 
     Returns:
         The reason the inline bytes cannot ride, or ``None`` when they can
-        or when the value is a remote URL the provider fetches itself.
+        or when the value is a remote URL the provider fetches itself. A
+        ``data:`` value that does not parse is undecodable, never a remote URL.
     """
     match = _DATA_URL.match(value)
     if match is None:
-        return inline_reason(kind, None, value.strip()) if bare_base64 else None
+        if bare_base64:
+            return inline_reason(kind, None, value.strip(), check_decodable=check_decodable)
+        if value[:5].lower() == "data:":
+            return "undecodable" if check_decodable else None
+        return None
     if match["media_type"].lower() not in _MEDIA_TYPES[kind]:
         return "unsupported_media_type"
     if ";base64" not in (match["parameters"] or ""):
         return "undecodable"
-    return inline_reason(kind, None, match["data"].strip())
+    return inline_reason(kind, None, match["data"].strip(), check_decodable=check_decodable)
 
 
 def inline_characters(value: str) -> int:
@@ -155,7 +204,7 @@ def placeholder_text(kind: MediaKind, reason: UnservableReason) -> str:
 
 
 def oversized_error(kind: MediaKind, param: str, characters: int) -> OpenAIProtocolError:
-    """Build the typed 400 for an oversized part in the latest user message.
+    """Build the typed 400 for an oversized part in the latest turn's user messages.
 
     Args:
         kind: The part's media kind.
@@ -175,7 +224,12 @@ def oversized_error(kind: MediaKind, param: str, characters: int) -> OpenAIProto
 
 
 def placeholder_part(
-    text_type: str, kind: MediaKind, reason: UnservableReason, part: JsonObject
+    text_type: str,
+    kind: MediaKind,
+    reason: UnservableReason,
+    part: JsonObject,
+    *,
+    cache_keys: tuple[str, ...] = OPENAI_CACHE_KEYS,
 ) -> JsonObject:
     """Build the text part that replaces one omitted media part.
 
@@ -187,18 +241,19 @@ def placeholder_part(
         kind: The omitted part's media kind.
         reason: Why its bytes could not ride.
         part: The caller's media part.
+        cache_keys: The cache-marker keys the surface's text part accepts.
 
     Returns:
         The replacement text part.
     """
     replacement: JsonObject = {"type": text_type, "text": placeholder_text(kind, reason)}
-    for key in _REPLACED_KEYS:
+    for key in cache_keys:
         if key in part:
             replacement[key] = part[key]
     return replacement
 
 
-def _openai_media(part: object, param: str) -> tuple[MediaKind, str, str, bool] | None:
+def _openai_media(part: JsonValue, param: str) -> tuple[MediaKind, str, str, bool] | None:
     """Return one OpenAI media part's kind, value, value path, and value kind.
 
     Args:
@@ -232,21 +287,21 @@ def _openai_media(part: object, param: str) -> tuple[MediaKind, str, str, bool] 
 
 
 def _degrade_parts(
-    parts: list[object],
+    parts: list[JsonValue],
     param: str,
     *,
     text_type: str,
     latest: bool,
     position: str,
     disclosures: dict[str, None],
-) -> list[object] | None:
+) -> list[JsonValue] | None:
     """Degrade the unservable media in one ordered part list.
 
     Args:
         parts: Raw caller parts of one message or tool output.
         param: Public path of the list.
         text_type: The text part tag valid in this list.
-        latest: Whether the list is the latest user message's content.
+        latest: Whether the list is a user message of the latest turn.
         position: Disclosure position class (``messages.content`` or a tool output).
         disclosures: Ordered disclosure set, extended in place.
 
@@ -254,37 +309,59 @@ def _degrade_parts(
         The rebuilt list, or ``None`` when nothing was replaced.
 
     Raises:
-        OpenAIProtocolError: An oversized part sits in the latest user message.
+        OpenAIProtocolError: An oversized part sits in a latest-turn user message.
     """
-    rebuilt = list(parts)
-    changed = False
+    rebuilt: list[JsonValue] | None = None
     for index, part in enumerate(parts):
         media = _openai_media(part, f"{param}.{index}")
         if media is None:
             continue
         kind, value, value_param, bare_base64 = media
-        reason = data_url_reason(kind, value, bare_base64=bare_base64)
+        reason = data_url_reason(kind, value, bare_base64=bare_base64, check_decodable=not latest)
         if reason is None:
             continue
         if latest:
             if reason == "oversized":
                 raise oversized_error(kind, value_param, inline_characters(value))
             continue
+        if rebuilt is None:
+            rebuilt = list(parts)
         rebuilt[index] = placeholder_part(text_type, kind, reason, cast(JsonObject, part))
         disclosures[f"{position}.{kind}->placeholder({reason})"] = None
-        changed = True
-    return rebuilt if changed else None
+    return rebuilt
 
 
-def _latest_user_index(items: list[object]) -> int:
-    """Return the index of the last user-role entry, or ``-1``."""
-    return max(
-        (
-            index
-            for index, item in enumerate(items)
-            if isinstance(item, dict) and cast(JsonObject, item).get("role") == "user"
-        ),
+def _model_turn(item: JsonObject) -> bool:
+    """Whether one history entry is model output: an assistant message or a model item."""
+    item_type = item.get("type")
+    return (
+        item.get("role") == "assistant"
+        or item_type == "reasoning"
+        or (isinstance(item_type, str) and item_type.endswith("_call"))
+    )
+
+
+def latest_turn(items: list[JsonValue]) -> frozenset[int]:
+    """Return the indexes of the user entries after the last model-output entry.
+
+    The latest turn is everything the caller added since the model last
+    spoke, so consecutive user messages (an image, then its question) all
+    stay strict, exactly as the document-count pass reads the turn.
+
+    Args:
+        items: Raw conversation entries, in order.
+
+    Returns:
+        The latest turn's user-entry indexes.
+    """
+    last_model = max(
+        (index for index, item in enumerate(items) if isinstance(item, dict) and _model_turn(item)),
         default=-1,
+    )
+    return frozenset(
+        index
+        for index, item in enumerate(items)
+        if index > last_model and isinstance(item, dict) and item.get("role") == "user"
     )
 
 
@@ -292,7 +369,7 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
     """Replace unservable inline media in a Chat Completions history.
 
     Tool messages degrade in every position; every other message degrades
-    except the latest user message. The payload is never mutated.
+    except the latest turn's user messages. The payload is never mutated.
 
     Args:
         payload: Parsed Chat Completions body, before strict wire validation.
@@ -308,11 +385,10 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return payload, ()
-    items = cast(list[object], messages)
-    latest = _latest_user_index(items)
+    items = messages
+    latest = latest_turn(items)
     disclosures: dict[str, None] = {}
-    rebuilt = list(items)
-    changed = False
+    rebuilt: list[JsonValue] | None = None
     for index, message in enumerate(items):
         if not isinstance(message, dict):
             continue
@@ -322,17 +398,18 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
             continue
         tool = message_object.get("role") == "tool"
         parts = _degrade_parts(
-            cast(list[object], content),
+            content,
             f"messages.{index}.content",
             text_type="text",
-            latest=index == latest and not tool,
+            latest=index in latest and not tool,
             position="messages.tool.content" if tool else "messages.content",
             disclosures=disclosures,
         )
         if parts is not None:
+            if rebuilt is None:
+                rebuilt = list(items)
             rebuilt[index] = {**message_object, "content": parts}
-            changed = True
-    if not changed:
+    if rebuilt is None:
         return payload, ()
     return {**payload, "messages": rebuilt}, tuple(disclosures)
 
@@ -341,7 +418,7 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
     """Replace unservable inline media in a Responses input history.
 
     ``function_call_output`` parts degrade in every position; message items
-    degrade except the latest user message. The payload is never mutated.
+    degrade except the latest turn's user messages. The payload is never mutated.
 
     Args:
         payload: Parsed Responses body, before strict wire validation.
@@ -357,11 +434,10 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
     raw_input = payload.get("input")
     if not isinstance(raw_input, list):
         return payload, ()
-    items = cast(list[object], raw_input)
-    latest = _latest_user_index(items)
+    items = raw_input
+    latest = latest_turn(items)
     disclosures: dict[str, None] = {}
-    rebuilt = list(items)
-    changed = False
+    rebuilt: list[JsonValue] | None = None
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             continue
@@ -379,7 +455,7 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
                 "content",
                 "output_text" if assistant else "input_text",
                 "input.content",
-                index == latest,
+                index in latest,
             )
         else:
             continue
@@ -387,7 +463,7 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
         if not isinstance(parts_value, list):
             continue
         parts = _degrade_parts(
-            cast(list[object], parts_value),
+            parts_value,
             f"input.{index}.{field}",
             text_type=text_type,
             latest=is_latest,
@@ -395,8 +471,9 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
             disclosures=disclosures,
         )
         if parts is not None:
+            if rebuilt is None:
+                rebuilt = list(items)
             rebuilt[index] = {**item_object, field: parts}
-            changed = True
-    if not changed:
+    if rebuilt is None:
         return payload, ()
     return {**payload, "input": rebuilt}, tuple(disclosures)

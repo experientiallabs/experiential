@@ -187,3 +187,18 @@ def test_decode_serves_a_history_whose_tool_result_image_was_oversized() -> None
     tool_message = next(message for message in request.messages if message.role == "tool")
     assert not tool_message.images
     assert placeholder_text("image", "oversized") in (tool_message.content or "")
+
+
+def test_a_messages_placeholder_carries_only_the_cache_control_key() -> None:
+    """A Messages text block forbids ``prompt_cache_breakpoint``, so only the marker moves."""
+    part = _image(
+        _OVERSIZED_IMAGE,
+        cache_control={"type": "ephemeral"},
+        prompt_cache_breakpoint=True,
+    )
+    degraded, _ = degrade_history_media(_body(_tool_turns(part)))
+    turn = cast(JsonObject, cast(list[object], degraded["messages"])[2])
+    result = cast(JsonObject, cast(list[object], turn["content"])[0])
+    placeholder = cast(JsonObject, cast(list[object], result["content"])[1])
+    assert placeholder["cache_control"] == {"type": "ephemeral"}
+    assert "prompt_cache_breakpoint" not in placeholder

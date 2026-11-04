@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import copy
+import random
 from typing import cast
 
 import pytest
@@ -11,6 +14,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENT_BASE64_BYTES, MAXIMUM_IMAGE_BASE64_BYTES
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.history_media import (
+    base64_decodable,
     data_url_reason,
     degrade_chat_media,
     degrade_responses_media,
@@ -213,3 +217,77 @@ def test_responses_latest_user_media_stays_strict() -> None:
         {"model": "coding", "input": "hi"},
         (),
     )
+
+
+@pytest.mark.parametrize("chunk", [4, 8, 12])
+def test_base64_decodable_matches_strict_decoding_chunk_by_chunk(chunk: int) -> None:
+    """The bounded validator gives ``b64decode(validate=True)``'s verdict at every boundary."""
+    rng = random.Random(1291)
+    alphabet = "AB+/=\n é-_"
+    samples = ["", "QQ==", "QUI=", "QUJD", "QQ==QUJD", "QUJDRA==", "QUJD\n", "=QUJ", "QUJ"]
+    samples += [
+        "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 30))) for _ in range(4000)
+    ]
+    samples += [base64.b64encode(rng.randbytes(rng.randrange(0, 40))).decode() for _ in range(500)]
+    for sample in samples:
+        try:
+            base64.b64decode(sample, validate=True)
+            expected = True
+        except (binascii.Error, ValueError):
+            expected = False
+        assert base64_decodable(sample, chunk=chunk) is expected, sample
+
+
+def test_a_latest_turn_part_is_judged_by_size_alone() -> None:
+    """The latest turn's media is never base64-validated here: the strict decoder owns it."""
+    assert data_url_reason("image", "data:image/png;base64,@@@@", bare_base64=False) == (
+        "undecodable"
+    )
+    assert (
+        data_url_reason(
+            "image", "data:image/png;base64,@@@@", bare_base64=False, check_decodable=False
+        )
+        is None
+    )
+    assert inline_reason("image", None, "A" * 8, check_decodable=False) is None
+
+
+def test_a_malformed_data_url_in_history_is_undecodable_not_remote() -> None:
+    """A ``data:`` value that does not parse degrades instead of wedging as a non-HTTP URL."""
+    assert data_url_reason("image", "data:image/png;base64", bare_base64=False) == "undecodable"
+    assert data_url_reason("image", "https://example.com/a.png", bare_base64=False) is None
+    payload = _chat_body(_chat_tool_history(_chat_image("data:image/png;base64")))
+    degraded, disclosures = degrade_chat_media(payload)
+    assert disclosures == ("messages.tool.content.image->placeholder(undecodable)",)
+    assert degraded is not payload
+
+
+def test_every_user_message_of_the_latest_turn_stays_strict() -> None:
+    """An image sent, then its question, are one turn: the image still gets the typed 400."""
+    payload = _chat_body(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": [_chat_image(_OVERSIZED_URL)]},
+            {"role": "user", "content": "what is this?"},
+        ]
+    )
+    with pytest.raises(OpenAIProtocolError) as info:
+        degrade_chat_media(payload)
+    assert info.value.detail.param == "messages.2.content.0.image_url.url"
+    responses: JsonObject = {
+        "model": "coding",
+        "input": [
+            {"role": "user", "content": [{"type": "input_image", "image_url": _OVERSIZED_URL}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "what is this?"}]},
+        ],
+    }
+    with pytest.raises(OpenAIProtocolError):
+        degrade_responses_media(responses)
+
+
+def test_an_unchanged_history_is_returned_without_copies() -> None:
+    """A servable history allocates no rebuilt lists: the same payload object comes back."""
+    payload = _chat_body(_chat_tool_history(_chat_image(_PNG_URL)))
+    degraded, disclosures = degrade_chat_media(payload)
+    assert degraded is payload and disclosures == ()

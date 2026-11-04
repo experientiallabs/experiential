@@ -12,6 +12,7 @@ from exp.common.models.content import (
     DocumentContentPart,
     TextContentPart,
 )
+from exp.common.models.model import ToolCall
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import GatewayMessage
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -153,3 +154,31 @@ def test_chat_latest_turn_over_the_ceiling_keeps_the_canonical_rejection() -> No
     with pytest.raises(OpenAIProtocolError) as info:
         decode_chat({"model": "coding", "messages": [{"role": "user", "content": parts}]})
     assert f"at most {MAXIMUM_DOCUMENTS_PER_REQUEST} documents" in info.value.detail.message
+
+
+def test_a_collapsed_tool_result_keeps_its_document_marker_on_the_message() -> None:
+    """A tool result left text-only carries the replaced document's breakpoint on the message."""
+    marked_tool = GatewayMessage(
+        role="tool",
+        tool_call_id="call_0",
+        content="read",
+        content_parts=(
+            TextContentPart(text="read"),
+            DocumentContentPart(data=_PDF, name="old.pdf", cache_control={"type": "ephemeral"}),
+        ),
+    )
+    messages = (
+        GatewayMessage(role="user", content="go"),
+        GatewayMessage(
+            role="assistant",
+            tool_calls=(ToolCall(call_id="call_0", name="Read", arguments={}),),
+        ),
+        marked_tool,
+        *_turns(MAXIMUM_DOCUMENTS_PER_REQUEST),
+        GatewayMessage(role="user", content="next"),
+    )
+    trimmed, disclosures = trim_history_documents(messages)
+    assert disclosures == (DOCUMENT_COUNT_DISCLOSURE,)
+    tool = trimmed[2]
+    assert tool.content_parts == ()
+    assert tool.cache_control == {"type": "ephemeral"}

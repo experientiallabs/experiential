@@ -126,26 +126,43 @@ def test_tool_change_blocks_are_known_block_types() -> None:
 
 
 class _Source(BaseModel):
-    """One media source carrying data."""
+    """One media source carrying data.
+
+    Attributes:
+        data: The encoded payload, unbounded here.
+    """
 
     model_config = ConfigDict(extra="forbid")
     data: str
 
 
 class _WideSource(_Source):
-    """A source admitting up to 16 characters."""
+    """A source admitting up to 16 characters.
+
+    Attributes:
+        data: The encoded payload, at most 16 characters.
+    """
 
     data: str = Field(max_length=16)
 
 
 class _NarrowSource(_Source):
-    """A source admitting up to 4 characters."""
+    """A source admitting up to 4 characters.
+
+    Attributes:
+        data: The encoded payload, at most 4 characters.
+    """
 
     data: str = Field(max_length=4)
 
 
 class _Picture(BaseModel):
-    """An image arm with the wider bound."""
+    """An image arm with the wider bound.
+
+    Attributes:
+        type: The ``image`` discriminator literal.
+        source: The image source, bounded at 16 characters.
+    """
 
     model_config = ConfigDict(extra="forbid")
     type: Literal["image"]
@@ -153,7 +170,12 @@ class _Picture(BaseModel):
 
 
 class _Paper(BaseModel):
-    """A document arm with the narrower bound."""
+    """A document arm with the narrower bound.
+
+    Attributes:
+        type: The ``document`` discriminator literal.
+        source: The document source, bounded at 4 characters.
+    """
 
     model_config = ConfigDict(extra="forbid")
     type: Literal["document"]
@@ -161,7 +183,11 @@ class _Paper(BaseModel):
 
 
 class _Blocks(BaseModel):
-    """A body whose blocks are an undiscriminated union."""
+    """A body whose blocks are an undiscriminated union.
+
+    Attributes:
+        content: The blocks, each an image or a document arm.
+    """
 
     model_config = ConfigDict(extra="forbid")
     content: tuple[_Picture | _Paper, ...]
