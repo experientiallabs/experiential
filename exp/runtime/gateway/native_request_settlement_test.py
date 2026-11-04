@@ -15,6 +15,12 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
 )
+from exp.runtime.gateway.ledger_errors import (
+    AccountingRecoveryUnresolvedTerminalError,
+    AccountingRefusedError,
+    AttemptRejectedError,
+    GatewayLedgerError,
+)
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_accounting_test import (
     _RecordingLedger,
@@ -23,7 +29,10 @@ from exp.runtime.gateway.native_accounting_test import (
     _settle,
     _start,
 )
-from exp.runtime.gateway.native_request_settlement import RequestSettlements
+from exp.runtime.gateway.native_request_settlement import (
+    RequestSettlements,
+    permanently_refused,
+)
 
 
 def test_pre_dispatch_search_meter_is_retried_by_the_accounting_sweep() -> None:
@@ -263,3 +272,97 @@ def test_active_abandonment_owns_search_only_on_final_settlement(previous_attemp
     assert ledger.request_search_meters == []
     assert len(ledger.finished) == (2 if previous_attempt else 1)
     assert accounting.entry(entry.authorization.request_id) is None
+
+
+_BLOCKED = GatewayFailure(failure_class=GatewayFailureClass.GUARDRAIL, safe_message="blocked")
+
+
+def test_a_replay_the_ledger_permanently_refuses_is_dropped_and_clears_the_fence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A retained write whose replay fails a ledger contract is finalized, not replayed forever.
+
+    The first write fails transiently; the replay meets a deterministic refusal
+    (the request is already terminal with another outcome). No retry can commit
+    it, so it is dropped with a warning, the fence lifts and later sweeps never
+    call the ledger again.
+    """
+    accounting, ledger, entry = _registry()
+    replies: list[Exception] = [
+        RuntimeError("canceling statement due to lock timeout"),
+        GatewayLedgerError("request is already settled with another terminal state"),
+    ]
+    calls = 0
+
+    def finish_request(**_fields: object) -> bool:
+        nonlocal calls
+        calls += 1
+        raise replies.pop(0)
+
+    with patch.object(ledger, "finish_request", finish_request):
+        assert not accounting.finish_request_quietly(entry.authorization, _BLOCKED)
+        with pytest.raises(NativeBridgeError, match="accounting is recovering"):
+            accounting.require_clear(entry.authorization.organization_id)
+        accounting.sweep_expired()
+        assert calls == 2
+        assert accounting.accounting_healthy
+        assert not accounting.request_settlements.outstanding
+        assert accounting.fenced_organizations() == frozenset()
+        accounting.require_clear(entry.authorization.organization_id)
+        accounting.sweep_expired()
+        assert calls == 2
+    assert "permanently refused: GatewayLedgerError" in caplog.text
+
+
+def test_a_first_write_the_ledger_permanently_refuses_is_never_retained() -> None:
+    """A deterministic refusal on the first write returns uncommitted with no fence."""
+    accounting, ledger, entry = _registry()
+
+    def refuse(**_fields: object) -> bool:
+        raise GatewayLedgerError("request was not durably accepted")
+
+    with patch.object(ledger, "finish_request", refuse):
+        assert not accounting.request_settlements.finish(entry.authorization, _BLOCKED)
+    assert accounting.accounting_healthy
+    assert not accounting.request_settlements.outstanding
+    accounting.require_clear(entry.authorization.organization_id)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AccountingRecoveryUnresolvedTerminalError("liability remains unresolved"),
+        AttemptRejectedError(
+            "another ledger owns the organization",
+            failure=GatewayFailure(
+                failure_class=GatewayFailureClass.INTERNAL, safe_message="owned elsewhere"
+            ),
+        ),
+        RuntimeError("connection lost"),
+    ],
+    ids=["recovery_owner", "attempt_rejected", "transport"],
+)
+def test_replayable_failures_stay_retained_and_fence(error: Exception) -> None:
+    """Only a plain contract refusal is dropped; every replayable outcome keeps its owner."""
+    assert not permanently_refused(error)
+    accounting, ledger, entry = _registry()
+
+    def fail(**_fields: object) -> bool:
+        raise error
+
+    with patch.object(ledger, "finish_request", fail):
+        with pytest.raises(type(error)):
+            accounting.request_settlements.finish(entry.authorization, _BLOCKED)
+        assert not accounting.accounting_healthy
+        with pytest.raises(NativeBridgeError, match="accounting is recovering"):
+            accounting.require_clear(entry.authorization.organization_id)
+    accounting.sweep_expired()
+    assert accounting.accounting_healthy
+    assert accounting.fenced_organizations() == frozenset()
+
+
+def test_a_deliberate_refusal_is_never_classified_permanent() -> None:
+    """``AccountingRefusedError`` (another ledger owns the money for now) is replayed."""
+    assert not permanently_refused(AccountingRefusedError("owned elsewhere"))
+    assert permanently_refused(GatewayLedgerError("request authority differs"))
+    assert not permanently_refused(ValueError("not a ledger error"))

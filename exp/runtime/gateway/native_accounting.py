@@ -44,7 +44,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     authority_error,
     internal_protocol_error,
 )
-from exp.runtime.gateway.native_accounting_fence import fenced_entry_organizations, fences_after
+from exp.runtime.gateway.native_accounting_fence import OrganizationFence, fences_after
 from exp.runtime.gateway.native_accounting_recovery import (
     RecoveryRotation,
     recover_expired,
@@ -164,6 +164,7 @@ class NativeAttemptAccounting:
         # Cache-affinity spills stay on the rung holding the warmed conversation.
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
+        self._fence = OrganizationFence()  # Fencing write ids per org, under ``_lock``.
         self._lock = threading.Lock()
         self._active_settlements = 0
         self._retained_recovery = RecoveryRotation[tuple[str, InflightRequest]](
@@ -178,8 +179,7 @@ class NativeAttemptAccounting:
         self._admission_dead_rungs_skipped = 0
         self._admission_parameter_coercions = 0
         self._admission_lead_rungs_skipped = 0
-        # Count bypasses by bound, rate, fresh-session and tenant-share limits,
-        # plus forced dispatches when no other rung can serve.
+        # Bound, rate, fresh-session and tenant-share sheds; forced dispatches (no rung left).
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
         self._rung_saturation_refusals = 0
@@ -218,8 +218,8 @@ class NativeAttemptAccounting:
     def fenced_organizations(self) -> frozenset[str]:
         """Return the organizations whose admission a failed accounting write fences."""
         with self._lock:
-            fenced = fenced_entry_organizations(self._inflight.values())
-        return frozenset(fenced | self.request_settlements.fenced_organizations())
+            fenced = self._fence.organizations()
+        return fenced | self.request_settlements.fenced_organizations()
 
     def require_clear(self, organization_id: str) -> None:
         """Refuse one organization's new work while it owns a failed accounting write.
@@ -232,7 +232,9 @@ class NativeAttemptAccounting:
             NativeBridgeError: ``accounting_unavailable`` until the sweep lands
                 this organization's retained writes.
         """
-        if organization_id in self.fenced_organizations():
+        with self._lock:
+            fenced = self._fence.fenced(organization_id)
+        if fenced or self.request_settlements.fenced(organization_id):
             raise NativeBridgeError(accounting_recovering_error())
 
     @property
@@ -366,6 +368,7 @@ class NativeAttemptAccounting:
     def register(self, entry: InflightRequest) -> None:
         """Track one accepted request until its terminal settlement."""
         with self._lock:
+            self._fence.drop(self._inflight, entry.authorization.request_id)
             self._inflight[entry.authorization.request_id] = entry
 
     def entry(self, request_id: str) -> InflightRequest | None:
@@ -423,7 +426,7 @@ class NativeAttemptAccounting:
             )
             self.finish_request_quietly(entry.authorization, failure)
             with self._lock:
-                discard_guardrails(self._inflight.pop(request_id, None))
+                discard_guardrails(self._fence.drop(self._inflight, request_id))
             raise NativeBridgeError(public_failure_error(failure))
         failure = failure_from_boundary_payload(data.get("failure"))
         current_depth = data.get("current_depth")
@@ -656,7 +659,7 @@ class NativeAttemptAccounting:
                     )
                     self.finish_request_quietly(entry.authorization, budget_quota_failure())
                     with self._lock:
-                        discard_guardrails(self._inflight.pop(request_id, None))
+                        discard_guardrails(self._fence.drop(self._inflight, request_id))
                     raise error from exc
                 # A route whose hard monthly allocation cannot admit this
                 # call is skipped; a later certified route may still serve.
@@ -688,7 +691,7 @@ class NativeAttemptAccounting:
                     ),
                 )
                 with self._lock:
-                    discard_guardrails(self._inflight.pop(request_id, None))
+                    discard_guardrails(self._fence.drop(self._inflight, request_id))
                 raise error from exc
             if ticket is not None:
                 self._loads.bind(ticket, attempt_id)
@@ -735,7 +738,7 @@ class NativeAttemptAccounting:
         )
         with self._lock:
             if active or entry.pending_abandon is None:  # Settlement owns active exhaustion.
-                discard_guardrails(self._inflight.pop(request_id, None))
+                discard_guardrails(self._fence.drop(self._inflight, request_id))
         return exhausted_attempt_payload(exhaustion, known_unbilled=capacity_refused and certified)
 
     def settle(self, argument: str) -> str:
@@ -822,6 +825,7 @@ class NativeAttemptAccounting:
                 entry.pending_settlement = data
                 entry.settlement_write_failed = True
                 entry.refused_write = not fences_after(exc)
+                self._fence.sync(self._inflight, entry)
             raise authority_error(exc) from exc
         failure = terminal.failure
         record_attempt_health(
@@ -847,8 +851,9 @@ class NativeAttemptAccounting:
             if entry.pending_settlement == data:
                 entry.pending_settlement = None
                 entry.settlement_write_failed = False
+                self._fence.sync(self._inflight, entry)
             if finalize:
-                discard_guardrails(self._inflight.pop(request_id, None))
+                discard_guardrails(self._fence.drop(self._inflight, request_id))
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
         return "{}"
@@ -921,6 +926,7 @@ class NativeAttemptAccounting:
                 with self._lock:
                     entry.abandon_write_failed = True
                     entry.refused_write = not fences_after(exc)
+                    self._fence.sync(self._inflight, entry)
                 raise authority_error(exc) from exc
             with self._lock:
                 # A meter may arrive while the unknown cancellation is writing.
@@ -928,7 +934,7 @@ class NativeAttemptAccounting:
                 # owner must retain the evidence instead of reporting a drain.
                 if entry.pending_settlement is not None:
                     return '{"terminalized":false}'
-                discard_guardrails(self._inflight.pop(request_id, None))
+                discard_guardrails(self._fence.drop(self._inflight, request_id))
             return '{"terminalized":true}'
         finally:
             entry.execution_lock.release()
