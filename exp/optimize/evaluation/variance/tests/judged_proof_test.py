@@ -4,11 +4,16 @@ The whole path runs through its real owners on the grounded ticket world of
 :mod:`~exp.optimize.evaluation.variance.tests.grounded_world_test`; only the wire is scripted:
 
 1. **Authoring.** One authoring packet over the world's start, then independent world and rubric
-   author draws, a world freeze with restored variant starts, and a compatibility review.
+   author draws, a world freeze with restored variant starts and executed rule challenges, and a
+   compatibility review. The world's validated close program is served in every variant runtime.
 2. **Judge.** One :class:`~exp.optimize.evaluation.variance.episodes.JudgeProfile` fixed before
    any rubric, then a :class:`~exp.optimize.evaluation.variance.episodes.JudgeDefinition` per
    variant bound to the authored rubric and to the digests a run from that frozen variant has.
 3. **Error mining.** A small G/J/C/K/M run from the frozen urgent start, judged by that judge.
+   Its point selectors and critic are the default agentic investigators: each draw plans, reads
+   evidence, drafts, self checks and answers, and every phase is saved on its transcript. The
+   selector draws become group-relative selector training records. One judge-flip run forces
+   single-response selectors and critics instead.
 4. **Family.** Decision state, scenarios, frozen-variant witnesses, judged selection and fresh
    confirmation contrasts, the admission policy and training records.
 5. **Harbor.** A qualified executable task whose trial ledger the same judge rewards.
@@ -50,6 +55,7 @@ from exp.optimize.evaluation.executable.qualification import (
 from exp.optimize.evaluation.executable.task import persist_executable_task
 from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.challenges import ChallengeReport
 from exp.optimize.evaluation.rules.stage import (
     REPORT_TYPE,
     RulesStageReport,
@@ -93,6 +99,11 @@ from exp.optimize.evaluation.variance.contracts import (
     check_scenarios,
 )
 from exp.optimize.evaluation.variance.episodes import JudgeProfile, episode_reward
+from exp.optimize.evaluation.variance.evidence_tools import (
+    AGENTIC_PROFILE,
+    AnalysisTranscript,
+    EvidenceToolProfile,
+)
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import (
     DecisionFamilySpec,
@@ -115,10 +126,16 @@ from exp.optimize.evaluation.variance.judged_test import JudgeRouter, always, st
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     TrainingRecords,
+    selector_records,
     training_eligibility,
     training_records,
 )
-from exp.optimize.evaluation.variance.rewards import group_advantages
+from exp.optimize.evaluation.variance.rewards import SelectorObjective, group_advantages
+from exp.optimize.evaluation.variance.role_prompts import (
+    DRAFT_TOOL_NAME,
+    PLAN_TOOL,
+    SELF_CHECK_TOOL,
+)
 from exp.optimize.evaluation.variance.rubric_author import (
     RUBRIC_TOOL,
     author_rubric,
@@ -174,6 +191,12 @@ REVISION = "test"
 
 FIRST_REPLICATES = ("-cell-0", "-branch-0")
 """Episode id suffixes of each group's first replicate, which the policy judges a failure."""
+
+FREE_CHOICE = "required"
+"""The tool choice of an agentic turn that may read evidence or close its phase."""
+
+FORCED_PROFILE = EvidenceToolProfile()
+"""The single forced-response profile the judge-flip run gives its selectors and critic."""
 
 
 class Interrupted(BaseException):
@@ -268,6 +291,13 @@ def assessment(request: JsonObject, verdict: str) -> JsonHttpResponse:
     )
 
 
+def priced_reply(tool: str, arguments: JsonObject) -> JsonHttpResponse:
+    """One scripted reply calling ``tool``, reporting token usage the priced catalog can price."""
+    reply = tool_reply(tool, arguments)
+    usage = {"prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100}
+    return JsonHttpResponse(status_code=200, body={**reply.body, "usage": usage})
+
+
 class ProofWire(JudgeRouter):
     """The scripted author wire: queued role replies, and judge answers from per-judge policies.
 
@@ -293,6 +323,30 @@ class ProofWire(JudgeRouter):
     def queue(self, *replies: tuple[str, JsonObject]) -> None:
         """Queue forced role answers by tool name."""
         self.roles.extend((tool, tool_reply(tool, arguments)) for tool, arguments in replies)
+
+    def queue_agentic(self, answer_tool: str, answer: JsonObject) -> None:
+        """Queue one agentic draw: plan, one evidence read, draft, self check and final answer.
+
+        Args:
+            answer_tool: The role's answer tool, forced in the final phase.
+            answer: The answer given both as the draft and as the final answer.
+        """
+        plan: JsonObject = {
+            "hypotheses": ["The tier decides the handling."],
+            "planned_reads": ["group"],
+        }
+        self.roles.extend(
+            (
+                (PLAN_TOOL.name, priced_reply(PLAN_TOOL.name, plan)),
+                (FREE_CHOICE, priced_reply("list_divergence_points", {})),
+                (FREE_CHOICE, priced_reply(DRAFT_TOOL_NAME, answer)),
+                (
+                    FREE_CHOICE,
+                    priced_reply(SELF_CHECK_TOOL.name, {"issues": [], "revise": False}),
+                ),
+                (answer_tool, priced_reply(answer_tool, answer)),
+            )
+        )
 
     def post(
         self,
@@ -830,7 +884,7 @@ def build(root: Path, monkeypatch: pytest.MonkeyPatch) -> Proof:
     Returns:
         The proof with every stage's saved result.
     """
-    fixture = grounded_fixture(root, monkeypatch)
+    fixture = grounded_fixture(root, monkeypatch, priced=True)
     project, settings = fixture.project, fixture.settings
     wire = ProofWire(semantic)
     monkeypatch.setattr(
@@ -889,13 +943,16 @@ def build(root: Path, monkeypatch: pytest.MonkeyPatch) -> Proof:
         selector=settings,
         critic=settings,
         attempts=3,
-        selector_draws=1,
+        selector_draws=2,
         critic_draws=1,
         points=2,
         continuations=3,
         group_physical_attempts=40,
     )
-    wire.queue(("choose_points", selector_answer()), ("estimate_points", critic_answer()))
+    assert mining.selector_profile == mining.critic_profile == AGENTIC_PROFILE
+    for _ in mining.judges:
+        wire.queue_agentic("choose_points", selector_answer())
+    wire.queue_agentic("estimate_points", critic_answer())
     report = run_actor_critic(project, mining, exposure=exposure, code_revision=REVISION)
     assert all(row.failure is None for row in report.points), report.points
     spec = DecisionFamilySpec(
@@ -979,6 +1036,14 @@ def option_labels(
     return labels
 
 
+def role_transcript(project: ProjectStore, reference: ArtifactInput | None) -> AnalysisTranscript:
+    """Load one selector or critic draw's saved analysis transcript."""
+    assert reference is not None
+    return AnalysisTranscript.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "transcript.json")
+    )
+
+
 def trial_reward(project: ProjectStore, result: JsonObject) -> float | None:
     """Re-encode a Harbor result's saved assessment, the only source its reward may have."""
     binding = result["judge"]
@@ -1042,6 +1107,64 @@ def test_every_label_rate_advantage_and_reward_traces_to_a_saved_assessment(proo
         assert (
             result["label_authority"] == "frozen LLM episode judge" and "mechanical" not in result
         )
+
+
+def test_agentic_roles_record_every_phase_and_selector_draws_become_training_records(
+    proof: Proof,
+) -> None:
+    """Each selector and critic draw plans, reads, drafts, self checks and answers on disk."""
+    project, report = proof.project, proof.report
+    assert len(report.judges) == 2 and len(report.critics) == 1
+    for draw in (*report.judges, *report.critics):
+        transcript = role_transcript(project, draw.transcript)
+        assert transcript.stop == "answered" and transcript.skipped == ()
+        assert [call.phase for call in transcript.calls] == [
+            "plan",
+            "investigate",
+            "investigate",
+            "self_check",
+            "final",
+        ]
+        assert [row.phase for row in transcript.outputs] == ["plan", "draft", "self_check"]
+        assert transcript.outputs[1].host_validation == "valid"
+        assert [(row.name, row.status) for row in transcript.tools] == [
+            ("list_divergence_points", "ok")
+        ]
+        assert transcript.calls[-1].forced_answer and transcript.usage.unpriced_calls == 0
+    urgent = proof.judging["urgent"].judge.identity
+    # Each point has three judged continuations, so the objective scores points with three.
+    objective = SelectorObjective(minimum_scored=3)
+    selectors = selector_records(project, report, judge=urgent, objective=objective)
+    assert selectors.refused == () and len(selectors.draws) == 2
+    assert all(row.trainable and row.points == (0, 1) for row in selectors.draws)
+    # Both draws chose the same points, each judged 0, 1, 1: their rewards tie at the mean outcome
+    # variance and the advantages are zero.
+    for row in selectors.draws:
+        assert row.score is not None and row.score.reward == pytest.approx(8 / 9)
+    assert [row.advantage for row in selectors.draws] == [0.0, 0.0]
+    routine = proof.judging["routine"].judge.identity
+    other = selector_records(project, report, judge=routine, objective=objective)
+    assert not any(row.trainable for row in other.draws) and other.refused
+
+
+def test_the_frozen_world_serves_its_programs_and_records_its_rule_challenges(
+    proof: Proof,
+) -> None:
+    """Every variant runtime binds the validated close program; the freeze executed challenges."""
+    for binding in proof.judging.values():
+        assert binding.runtime is not None
+        runtime = GroundedRuntimeDefinition.model_validate(binding.runtime)
+        assert runtime.programs is not None and "close" in runtime.programs.induced_tools
+    freeze = proof.authored.freeze
+    assert freeze.challenges is not None
+    saved = ChallengeReport.model_validate_json(
+        proof.project.artifacts.read_bytes(freeze.challenges.artifact_id, "report.json")
+    )
+    # The ticket book's equality rules have no numeric or membership boundary to challenge, so
+    # the served world executed no workload and no rule changed status or became diagnostic.
+    assert saved.rulebook == proof.packet.rule_book and saved.runs == freeze.workloads == ()
+    assert saved.rules == freeze.challenge_rules
+    assert (saved.diagnostic, saved.world_defects) == ((), ())
 
 
 def test_the_mechanical_verifier_disagreeing_never_changes_a_label(proof: Proof) -> None:
@@ -1197,9 +1320,20 @@ def test_a_judge_flip_moves_every_downstream_number_over_the_same_evidence(proof
         temperature=1.0,
     )
     judging = flipped_judging(proof, profile, inverted(semantic))
-    wire.queue(("choose_points", selector_answer()), ("estimate_points", critic_answer()))
-    mining = proof.mining.model_copy(update={"episode_judge": judging["urgent"].judge})
+    # This run forces one response per selector and critic draw instead of the agentic loop.
+    wire.queue(*[("choose_points", selector_answer())] * 2, ("estimate_points", critic_answer()))
+    forced = proof.mining.model_copy(
+        update={
+            "episode_judge": judging["urgent"].judge,
+            "selector_profile": FORCED_PROFILE,
+            "critic_profile": FORCED_PROFILE,
+        }
+    )
+    mining = ActorCriticSpec.model_validate(forced.model_dump())
     report = run_actor_critic(project, mining, exposure=proof.exposure, code_revision=REVISION)
+    for draw in (*report.judges, *report.critics):
+        transcript = role_transcript(project, draw.transcript)
+        assert [call.phase for call in transcript.calls] == ["final"] and not transcript.outputs
     # The group replays; the start's continuations are the same saved episodes. The pick seed
     # derives from the run identity, so later points may come from another identical attempt.
     assert report.group == proof.report.group

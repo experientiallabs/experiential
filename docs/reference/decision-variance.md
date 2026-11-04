@@ -135,8 +135,49 @@ and shuffled by the spec seed, and the transcript records the variant with its s
 digests. `run_analysis` saves every request (with its phase), tool result, plan, draft, self check
 and final answer as an `AnalysisTranscript` that replays without calls. The CLI cost inventory is
 an upper bound: each selector and critic row is priced at `budget.model_calls` requests at the
-role's attempt ceiling, the group at its own ceiling and `J * K` suffix jobs of M continuations at
-the continuation ceiling.
+role's attempt ceiling (12 for `AGENTIC_PROFILE`), the group at its own ceiling, `J * K` suffix
+jobs of M continuations at the continuation ceiling, and the episode judge at
+`judge_model_calls(profile)` requests per episode over `G + J * K * M` episodes.
+
+### Agentic roles and prompt sets
+
+Every model role on this path that investigates evidence runs one versioned prompt set per draw
+and saves every phase; the set's digest is part of the draw's identity, so a prompt change is a
+new draw, never a silent replay.
+
+| Role | Owner | Prompt sets | Phases |
+|---|---|---|---|
+| Point selector, critic | `variance/role_prompts.py`, `variance/evidence_tools.py` | Stances assigned by `assign_prompts` | plan, investigate, draft, self check, final |
+| Episode judge | `variance/judge_prompt.py` | `episode-judge-prompt-v1` or an agentic stance (`DEFAULT_AGENTIC_JUDGE`) | plan, investigate (criterion checks), self check, final |
+| Rubric author | `variance/rubric_agent.py` | `requirements-first`, `failure-patterns-first`, `alternatives-first` | plan, draft, critique, final, then reconciliation |
+| World author | `variance/world_agent.py` | `contract-first`, `state-machine-first`, `failure-mode-first` | plan, draft, bounded repair, final |
+
+### Selector training objective
+
+Point selectors are trained on how decision-relevant their picks proved, never on their
+screening spread score. `SelectorObjective` (`variance/rewards.py`, `selector-decision-variance-v1`)
+scores one draw with `selector_score`: the mean judged outcome variance `4p(1 - p)` over its picks
+with at least `minimum_scored` (default 4) judged pass or fail continuations, minus
+`duplicate_penalty` per repeated pick and `unusable_penalty` per pick with no continuations, each
+as a share of the draw's picks. `selector_records` (`variance/records.py`) builds one
+`SelectorRecord` per selector draw of a saved run from its judged continuations only, as one
+group-relative group keyed by the run's group and pick. The group is refused, with each reason
+recorded, when the run's episode judge is not the expected selector judge, a point was judged by
+another judge or for another study, judge coverage fails the admission policy, or fewer than two
+draws were rewarded; a record is trainable exactly when nothing refuses it.
+
+### Training rollout schedule
+
+`variance/schedule.py` (CLI action `variance-schedule`: status, a plan that may be executed, or
+a revision registration) decides which error-mining rollout runs next and never trains. During warm-up
+every rollout runs the base registration's J selector and C critic draws. `TransitionRule` moves
+to steady state after a number of warm-up rollouts, after both the critic Brier score and the
+selector reward plateau (`PlateauRule`, measured on the current epoch's saved records), or either.
+In steady state every `steady_every`-th rollout runs `steady_draws` (15) selector and critic draws
+and the rollouts between are actor-only, still judged by the frozen episode judge.
+`register_revision` records a new frozen snapshot of a role and starts a new epoch; records never
+mix epochs. Every plan, completion and revision is an immutable event chained to the one before,
+so the schedule resumes and replays from disk without a model call.
 
 ## Decision families
 
@@ -227,6 +268,57 @@ variant's grounded runtime definition (`definition_sha256`). `frozen_run_digests
 produces, which are what the variant's judge definition binds.
 `review_compatibility` records every disagreement between the world and the rubric without
 reconciling them.
+
+### Coalition evidence, agentic rubrics and revision
+
+The packet carries the behavioral coalition (`variance/coalition.py`, `mining_coalition` and
+`contrast_outcomes`): every grouped attempt of every tier with its judged label (a label from an
+earlier discovery judge is `historical`), distinct mistakes, recoveries and valid alternatives,
+selector choices and rationales, critic estimates beside the judged rates they predicted, judged
+contrast outcomes per option and optional TraceML step labels, each with its locator and evidence
+status. Tiers are never pooled, attempts or labels from final evaluation are refused, and no
+criterion may name a tier or actor model. `author_rubric_agentic` (`variance/rubric_agent.py`)
+runs the rubric prompt variants independently, critiques each draft against the host's design
+checks (authoritative and fed back), and reconciles at least two ready drafts; a merge that drops
+any disagreement `host_disagreements` found is refused as a silent resolution.
+
+`variance/rubric_revision.py` revises a rubric from judging. `judged_problems` collects
+judge-reported rubric problems, calibration misses, coverage gaps attributable to the rubric and
+compatibility disagreements (an unjudged target blocks acceptance but is never sent as a rubric
+fault). `revise_until_stable` runs at most `max_rounds` forced revision draws; each revised rubric
+passes the author's host checks, is saved as a new `episode-rubric` and is bound to a new
+`JudgeDefinition`, and the calibration episodes and affected evidence are re-judged under it. A
+revision is accepted only when no problem remains; otherwise the family stays diagnostic under its
+original judge. `require_current_labels` refuses labels made under an earlier definition.
+
+### Served programs and the agentic world author
+
+A `GroundedRuntimeDefinition` (`executable/grounded.py`) may bind validated transition programs
+(`programs`, an `InducedCoverage`). Covered tools then run as exact sandboxed code inside their
+validated domain, and every other call, including one outside a program's domain, is predicted by
+the grounded model under the rule book. The programs are part of the definition, so its probe
+digest, the judge's world digest and the freeze's `definition_sha256` all cover them.
+`world_runtime_definition` binds a ready world's programs, and the world author refuses programs
+the served runtime would never run. Simulated state and history stay in the predictor image part;
+the programs' partition is a separate part that variant edits (`variance/variants.py`) keep.
+`author_world_agentic` (`variance/world_agent.py`) runs the world prompt sets, each planning,
+drafting and repairing from the exact host-check and sandbox-validation failures within bounded
+rounds; every round is bought once and replayed, and each final draft is an ordinary
+`world-draft` that `freeze_world` freezes unchanged.
+
+### Executed rule challenges
+
+`run_challenges` (`rules/challenges.py`) executes boundary workloads through a
+`ChallengeExecutor`: `ProgramChallenges` runs a tool's validated program in the sandbox (other
+tools stay unexecuted unless an observed transition is supplied) and `RuntimeChallenges` runs the
+bound served runtime. Each case is triaged against its rule. A rule is `supported` when an executed
+case agreed and none contradicted it; a contradicted rule without an independent witness becomes
+`contradicted` and listed in `diagnostic`, so families on it stay diagnostic; a contradicted
+independently witnessed rule keeps its status and is a `world_defects` entry. Executed witnesses
+are recorded as simulated `challenge:` evidence, never native. Results are saved per case and
+replay without execution. The rules stage runs this behind an explicit `challenge` executor, and
+`freeze_world` runs it for every variant's initial state, recording `challenge_rules` and the saved
+`challenges` report; a world defect rejects the world.
 
 ## Judge and evidence contracts
 
@@ -332,6 +424,32 @@ Legacy modes that keep their mechanical contract and are never used for decision
 | `executable/trial.py` `result` for a task without a `judge` | Observable mechanical grade of an executable task outside this path |
 | `harbor/trial.py` `result` | Mechanical grade combined with dual-evaluator axes for `EvaluationTask` Harbor trials |
 | `variance/grader.py` `grade_episodes` | Probabilistic criterion grading kept as calibration evidence |
+
+## TraceML step labels
+
+`exp/simulation/mining/traceml.py` labels every step of a trajectory (a tool call with its result,
+or a visible message) against the `ActionLabel` taxonomy through the existing decision tagging
+seam, over the `step` view: one unit per step (`step_units`) with the task, a few earlier steps
+and the focal step, row identity `<trace_id>::<locator>`. `derive_moves` derives pivots (a
+strategy change after evidence; retrying one target is recovery) and returns (back to an earlier
+state or a target used before a pivot) from labels plus tool and state evidence. Uncertain steps
+stay in every count and refused traces are listed in the coverage manifest. The saved
+`traceml-labels` artifact (`persist_traceml_labels`) carries labels, moves, coverage and per-tier
+comparisons; selectors, critics and rubric authors may read it, and `candidate_points` maps moves
+to actor-critic checkpoint indices.
+
+## Cross-talk probe
+
+`run_crosstalk_probe` (`variance/crosstalk.py`) measures whether in-context exemplars from one
+environment move judged scores in another. The source job runs N attempts labelled by the source's
+frozen judge; the `top_k` best become treatment exemplars and a seeded draw of completed attempts
+is the random control, both rendered with identical framing. Each target runs `none`, `random` and
+`top` arms that differ only in the delivered exemplars (`context` through a fresh initial
+checkpoint, so the target's task and world digests are unchanged, or a caller-supplied `file`
+delivery). Each target's own frozen judge labels every arm; branch `i` pairs across arms, unscored
+episodes stay in coverage and leave their pair unpaired. `crosstalk_verdict` reports cross-talk
+only when the paired-bootstrap lower 95 percent bound of both `top - none` and `top - random` is
+above zero. The spec is preregistered before any call and a rerun replays the saved result.
 
 ## What this does not establish
 

@@ -596,12 +596,16 @@ def _trajectory_problem(loaded: list[ContinuationCheckpoint]) -> str | None:
 
 
 def _grounded_images(world: WorldCheckpoint) -> tuple[NativeImage, ...]:
-    """Return the grounded simulator images a world holds."""
+    """Return the grounded simulator images a world holds.
+
+    An image served with transition programs also carries their partition part; the simulated
+    state and history still live only in the predictor part.
+    """
     worlds = (
         (world,) if isinstance(world, ExecutableCheckpoint) else (world.native, world.candidate)
     )
     return tuple(
-        row.image for row in worlds if row is not None and set(row.image.parts) == {_PREDICTOR_PART}
+        row.image for row in worlds if row is not None and _PREDICTOR_PART in row.image.parts
     )
 
 
@@ -639,7 +643,7 @@ def grounded_state(world: WorldCheckpoint) -> JsonObject | None:
 def _with_state(
     world: WorldCheckpoint, state: JsonObject, history: list[JsonValue]
 ) -> WorldCheckpoint:
-    """Replace the grounded image's state, keeping its history and every kernel field.
+    """Replace the grounded image's state, keeping its history, other parts and kernel fields.
 
     Args:
         world: The fork's world.
@@ -649,18 +653,17 @@ def _with_state(
     Returns:
         The world with a new image whose domain digests match the edited state.
     """
-    image = NativeImage(
-        parts={_PREDICTOR_PART: canonical_json_bytes({"state": state, "history": history})},
-        domains={key: sha256_json(value) for key, value in state.items()},
-    )
+    predictor = canonical_json_bytes({"state": state, "history": history})
+    domains = {key: sha256_json(value) for key, value in state.items()}
 
     def replaced(row: ExecutableCheckpoint) -> ExecutableCheckpoint:
-        """Swap the image of one grounded executable checkpoint."""
-        return row.model_copy(update={"image": image})
+        """Swap the predictor part of one grounded executable checkpoint's image."""
+        parts = {**row.image.parts, _PREDICTOR_PART: predictor}
+        return row.model_copy(update={"image": NativeImage(parts=parts, domains=domains)})
 
     if isinstance(world, ExecutableCheckpoint):
         return replaced(world)
-    if world.candidate is not None and set(world.candidate.image.parts) == {_PREDICTOR_PART}:
+    if world.candidate is not None and _PREDICTOR_PART in world.candidate.image.parts:
         return world.model_copy(update={"candidate": replaced(world.candidate)})
     assert world.native is not None
     return world.model_copy(update={"native": replaced(world.native)})

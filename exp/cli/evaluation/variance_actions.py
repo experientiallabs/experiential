@@ -50,6 +50,7 @@ from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
 from exp.optimize.evaluation.variance.schedule import (
     RevisionRegistration,
     RolloutPlan,
@@ -379,11 +380,11 @@ def actor_rollout_costs(project: ProjectStore, plan: RolloutPlan) -> tuple[CostC
         plan: The actor-only plan.
 
     Returns:
-        The group job's inventory and the episode judge's, at its evidence-tool budget plus one
-        request per attempt.
+        The group job's inventory and the episode judge's, at the most draws one judgment under
+        its profile can make (:func:`judge_model_calls`) per attempt.
     """
     judge = plan.episode_judge
-    calls = (judge.definition.profile.evidence_tool_budget + 1) * plan.actor_job.study.repeats
+    calls = judge_model_calls(judge.definition.profile) * plan.actor_job.study.repeats
     return (
         *job_costs(project, plan.actor_job),
         *(row.scaled(calls) for row in evaluation_costs(project, judge.settings)),
@@ -522,7 +523,8 @@ def actor_critic_costs(project: ProjectStore, spec: ActorCriticSpec) -> tuple[Co
     ``model_calls`` requests, each at the role's attempt ceiling, so every role row is scaled by
     that count. Each selector may choose ``K`` distinct points, so up to ``J * K`` points each run
     one suffix job of ``M`` continuations at the continuation attempt ceiling. The frozen episode
-    judge assesses each episode with at most its evidence-tool budget plus one requests, priced
+    judge assesses each episode with at most :func:`judge_model_calls` requests (its evidence-tool
+    budget plus one, plus the plan, criterion-check and self-check draws when agentic), priced
     over ``G + J * K * M`` episodes: the ``J * K * M`` continuations it labels, plus the ``G``
     group attempts so the bound holds however the group is judged. Saved work and assessments
     that replay, unchosen points and draws that answer early make the real cost lower.
@@ -545,7 +547,7 @@ def actor_critic_costs(project: ProjectStore, spec: ActorCriticSpec) -> tuple[Co
     count = len(spec.judges) * spec.points
     judge = spec.episode_judge
     episodes = spec.initial.study.repeats + count * spec.continuations
-    judge_calls = (judge.definition.profile.evidence_tool_budget + 1) * episodes
+    judge_calls = judge_model_calls(judge.definition.profile) * episodes
     return (
         *job_costs(project, spec.initial),
         *(
@@ -587,7 +589,7 @@ def actor_critic_lines(spec: ActorCriticSpec) -> tuple[str, ...]:
         f"{spec.continuations} continuations under {spec.continuation_physical_attempts} "
         "physical attempts each. Saved draws replay without a call.",
         f"Episode judge: up to {spec.initial.study.repeats + judges * points * spec.continuations}"
-        f" episodes x {spec.episode_judge.definition.profile.evidence_tool_budget + 1} judge "
+        f" episodes x {judge_model_calls(spec.episode_judge.definition.profile)} judge "
         "requests; saved assessments replay without a call.",
     )
 

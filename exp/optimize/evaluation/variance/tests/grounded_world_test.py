@@ -371,6 +371,7 @@ def grounded_fixture(
     *,
     first: str = "read_ticket",
     narrate: bool = False,
+    priced: bool = False,
 ) -> GroundedFixture:
     """Freeze a continuation job over a real grounded world, wired to scripted transports.
 
@@ -379,6 +380,8 @@ def grounded_fixture(
         monkeypatch: Installs the scripted transports.
         first: The first tool the scripted actor calls.
         narrate: Whether the actor restates the tier it saw when escalating.
+        priced: Whether the judge alias has per-million token rates, which agentic role budgets
+            need to verify their dollar allowance.
 
     Returns:
         The fixture.
@@ -397,6 +400,8 @@ def grounded_fixture(
                 supports_structured_output=True,
                 context_window_tokens=200_000,
                 maximum_output_tokens=8_192,
+                input_cost_per_million_tokens_usd=1.0 if priced and alias == "judge" else None,
+                output_cost_per_million_tokens_usd=2.0 if priced and alias == "judge" else None,
             ),
         )
         for alias in ("actor", "judge")

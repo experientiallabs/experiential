@@ -50,6 +50,11 @@ from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as VARIAN
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceBudget, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.judge_prompt import (
+    DEFAULT_AGENTIC_JUDGE,
+    judge_model_calls,
+    judge_profile,
+)
 from exp.optimize.evaluation.variance.schedule import (
     RevisionRegistration,
     TrainingScheduleSpec,
@@ -245,6 +250,21 @@ def test_actor_critic_cost_scales_role_draws_by_their_model_call_budget(
     judge = base.episode_judge.settings.maximum_physical_attempts
     assert forced[-1].attempts == judge * judged
     assert f"Episode judge: up to {judged} episodes x 1 judge requests" in summary
+    # An agentic judge adds its plan, criterion-check and self-check draws to every read.
+    profile = base.episode_judge.definition.profile
+    agentic = judge_profile(
+        model_alias=profile.model_alias,
+        model=profile.model,
+        maximum_output_tokens=profile.maximum_output_tokens,
+        evidence_tool_budget=2,
+        prompt_set=DEFAULT_AGENTIC_JUDGE,
+    )
+    definition = base.episode_judge.definition.model_copy(update={"profile": agentic})
+    episode_judge = base.episode_judge.model_copy(update={"definition": definition})
+    deep = base.model_copy(update={"episode_judge": episode_judge})
+    assert judge_model_calls(agentic) == 2 + 4
+    assert actor_critic_costs(project, deep)[-1].attempts == 6 * judge * judged
+    assert f"{judged} episodes x 6 judge requests" in " ".join(actor_critic_lines(deep))
 
 
 def test_actor_critic_refused_consent_stops_before_any_provider(

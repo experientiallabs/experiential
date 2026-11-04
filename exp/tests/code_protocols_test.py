@@ -415,7 +415,7 @@ PROTOCOLS = (
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",
         "traceml-v1",
         ("exp.simulation.mining.traceml",),
-        "ad808578b0ec14ece06aac20a290d08152f880bdeec32ab2fd291b19fb58f239",
+        "5faf94af60adf9d1cb65f8f4fc1558cd202bd9f4213e07b18121214142daac81",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.crosstalk:CROSSTALK_PROTOCOL",

@@ -51,7 +51,9 @@ from exp.runtime.gateway.reservation_tokenizer import count_reservation_tokens
 from exp.simulation.mining.descriptors import routing_descriptor
 
 VIEW_VERSION = "v1"
-TraceViewName = Literal["task", "observations"]
+TraceViewName = Literal["task", "observations", "step"]
+"""Every unit view. ``step`` units are rendered per trajectory step by
+:func:`exp.simulation.mining.traceml.step_units`, never by :func:`build_units`."""
 VIEWS: tuple[TraceViewName, ...] = ("task", "observations")
 
 ROUTER_SAFE_VIEWS: frozenset[str] = frozenset({"task"})

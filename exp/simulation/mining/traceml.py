@@ -72,7 +72,7 @@ TRACEML_BANK_ID = "traceml-action-v1"
 TRACEML_ARTIFACT_TYPE = "traceml-labels"
 """Artifact type of a saved :class:`TraceMLLabels`."""
 
-STEP_VIEW = "step"
+STEP_VIEW: TraceViewName = "step"
 """View name of a rendered step unit, recorded in the tag matrix."""
 
 ActionLabel = Literal[
@@ -529,7 +529,7 @@ def step_units(trajectory: TraceTrajectory, spec: StepViewSpec | None = None) ->
         spec: Rendering controls; defaults apply when omitted.
     """
     spec = spec or StepViewSpec()
-    view = cast(TraceViewName, STEP_VIEW)
+    view = STEP_VIEW
     context = (spec.context_cap, spec.context_cap, spec.context_cap)
     focal = (spec.argument_cap, spec.result_cap, spec.message_cap)
     units: list[Unit] = []
