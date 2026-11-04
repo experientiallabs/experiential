@@ -72,6 +72,11 @@ from exp.optimize.evaluation.variance.contracts import (
     WitnessStep,
 )
 from exp.optimize.evaluation.variance.contrast import run_observation_witness, run_option_contrast
+from exp.optimize.evaluation.variance.judged_test import (
+    episode_judge,
+    route_judge,
+    state_judge,
+)
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
@@ -639,6 +644,7 @@ def test_witness_and_option_contrast_run_on_the_grounded_world(
     )
     assert witness.holds, witness.problems
     assert witness.state == INITIAL
+    route_judge(monkeypatch, verdict=state_judge(("tickets", "outcome"), "right"))
 
     contrast = run_option_contrast(
         fixture.project,
@@ -647,6 +653,7 @@ def test_witness_and_option_contrast_run_on_the_grounded_world(
         actions=ACTIONS,
         job=fixture.job,
         repeats=2,
+        judge=episode_judge(fixture.project, fixture.settings),
         code_revision="test",
     )
 

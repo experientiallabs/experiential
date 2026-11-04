@@ -4,10 +4,11 @@ A decision family may be trained on only after every condition below holds, and 
 from saved evidence rather than asserted by a caller:
 
 - **family_flip**: the family qualified on its selection contrasts
-  (:func:`~exp.optimize.evaluation.variance.contrast.family_flip`).
+  (:func:`~exp.optimize.evaluation.variance.contrast.family_flip`), whose cells are labelled only
+  by each variant's frozen episode judge.
 - **fresh_confirmation**: every variant that qualified on selection was contrasted again with
-  independently drawn samples that took no part in selection, and the confirmation reproduced its
-  separated winner.
+  independently drawn samples that took no part in selection, labelled by the same frozen judge,
+  and the confirmation reproduced its separated winner.
 - **audit_dispositions**: every audit finding (actor-critic flags, decision-state flags, scenario
   problems, variant checks marked for review) has a recorded disposition.
 - **critic_scores**: no critic draw whose estimates were used is unscored.
@@ -15,19 +16,23 @@ from saved evidence rather than asserted by a caller:
 - **rule_witnesses**: no rule the family relies on was contradicted without a witness, or lacks
   a supporting witness.
 - **policy_consistency**: every estimate the records rest on shares one actor policy, harness,
-  budget, sampling setting, world and verifier; only the checkpoint and remaining calls differ.
-- **rubric_unambiguous**: the rubric was graded on the confirmed variants' episodes and no
-  criterion was found ambiguous. Ambiguous criteria are listed so they go back to rubric
-  authoring. A family whose rubric was not graded, or whose grading failed, does not hold this
-  condition: an ungraded rubric is not evidence of an unambiguous one.
+  budget, sampling setting and world; only the checkpoint, the calls remaining there and the
+  judge that labels each variant differ.
+- **judge_coverage**, **rubric_problems**, **rubric_compatibility**, **world_freeze**: every
+  confirmed variant meets the family's frozen admission policy
+  (:mod:`~exp.optimize.evaluation.variance.admission`); each failing variant is named with what
+  was found.
 
 Failed conditions are all listed, never only the first. Records are built only for an eligible
-family: critic records (estimate against measured rate under one meaning, with the draw's reward),
-one continuation group per point for group-relative training, stratified by actor tier when tiers
-are recorded, and judge screening scores, which are always marked non-trainable.
+family, from its judged confirmation episodes under each variant's frozen judge: one
+:class:`ContinuationGroup` per confirmed variant and forced option, referencing every saved
+assessment, with group-relative advantages read back from those assessments; the imposed first
+action is experiment-owned and never trainable as actor tokens. Discovery critic records and
+point-selector screening scores are kept, both marked non-trainable: they were scored under the
+discovery judge, not the variant's.
 
 Fresh confirmation draws come from :func:`confirmation_job`, and their episodes are rendered for
-the rubric grader by :func:`confirmation_episodes`.
+an optional calibration grader by :func:`confirmation_episodes`.
 """
 
 from __future__ import annotations
@@ -38,7 +43,13 @@ from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactInput,
+    ContractModel,
+    JsonObject,
+    Sha256,
+    sha256_json,
+)
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
 from exp.optimize.evaluation.continuations.job import ContinuationJob
@@ -48,7 +59,8 @@ from exp.optimize.evaluation.variance.authors import DecisionStateAnswer
 from exp.optimize.evaluation.variance.contrast import FlipVerdict, OptionContrast
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning
 from exp.optimize.evaluation.variance.grader import EpisodeView
-from exp.optimize.evaluation.variance.rewards import JudgeScore
+from exp.optimize.evaluation.variance.judged import JudgeCoverage, JudgedSlot, slot_rewards
+from exp.optimize.evaluation.variance.rewards import JudgeScore, group_advantages
 
 FindingSource = Literal[
     "actor_critic", "decision_state", "scenario", "variant_review", "replay_divergence"
@@ -66,7 +78,10 @@ ConditionName = Literal[
     "tool_coverage",
     "rule_witnesses",
     "policy_consistency",
-    "rubric_unambiguous",
+    "judge_coverage",
+    "rubric_problems",
+    "rubric_compatibility",
+    "world_freeze",
 ]
 """Every condition training eligibility checks."""
 
@@ -78,7 +93,10 @@ CONDITIONS: tuple[ConditionName, ...] = (
     "tool_coverage",
     "rule_witnesses",
     "policy_consistency",
-    "rubric_unambiguous",
+    "judge_coverage",
+    "rubric_problems",
+    "rubric_compatibility",
+    "world_freeze",
 )
 """The conditions in the order they are reported."""
 
@@ -280,7 +298,7 @@ def confirmation_job(job: ContinuationJob, seed: int) -> ContinuationJob:
 def confirmation_episodes(
     project: ProjectStore, scenario_id: str, contrast: OptionContrast
 ) -> tuple[EpisodeView, ...]:
-    """Render every graded confirmation episode of one variant for the rubric grader.
+    """Render every confirmation episode of one variant for the calibration criterion grader.
 
     Args:
         project: Project holding the saved action contrasts.
@@ -349,9 +367,11 @@ def policy_key(meaning: EstimateMeaning) -> str:
         meaning: An estimate's frozen meaning.
 
     Returns:
-        SHA-256 over every field except the checkpoint and the calls remaining there.
+        SHA-256 over every field except the checkpoint, the calls remaining there and the judge,
+        which labels outcomes and is not part of the actor policy.
     """
-    return sha256_json(meaning.model_dump(mode="json", exclude={"checkpoint", "remaining_calls"}))
+    excluded = {"checkpoint", "remaining_calls", "judge_sha256"}
+    return sha256_json(meaning.model_dump(mode="json", exclude=excluded))
 
 
 def unscored_critics(critics: Sequence[CriticDraw]) -> tuple[int, ...]:
@@ -382,8 +402,7 @@ def training_eligibility(
     contradicted_rules: Sequence[str],
     unwitnessed_rules: Sequence[str],
     meanings: Sequence[EstimateMeaning],
-    ambiguous_criteria: Sequence[str],
-    rubric_graded: bool,
+    judging: Mapping[str, dict[str, tuple[str, ...]]],
 ) -> TrainingEligibility:
     """Compute every eligibility condition from saved evidence.
 
@@ -398,9 +417,9 @@ def training_eligibility(
         contradicted_rules: The rules stage's ``families_must_stay_diagnostic``.
         unwitnessed_rules: Rule identities without a supporting witness.
         meanings: Meanings of every estimate the records would rest on.
-        ambiguous_criteria: Criterion identities the rubric grader found ambiguous on the
-            confirmed variants' episodes.
-        rubric_graded: Whether the rubric was graded on those episodes without failure.
+        judging: Admission-policy problems per condition and confirmed scenario, from
+            :func:`~exp.optimize.evaluation.variance.admission.judging_problems`; a condition
+            absent here was not checked and fails.
 
     Returns:
         The eligibility with every condition.
@@ -410,7 +429,6 @@ def training_eligibility(
     contradicted = sorted(set(relied_rules) & set(contradicted_rules))
     unwitnessed = sorted(set(relied_rules) & set(unwitnessed_rules) - set(contradicted))
     policies = {policy_key(meaning) for meaning in meanings}
-    ambiguous = sorted(set(ambiguous_criteria))
     missing = () if selection is None else unreproduced(selection, confirmation)
     qualified = selection is not None and selection.qualifies
     confirmed = qualified and confirmation is not None and not missing
@@ -474,33 +492,47 @@ def training_eligibility(
                 if len(policies) != 1
                 else f"{len(meanings)} estimates share one actor policy",
             ),
-            EligibilityCondition(
-                name="rubric_unambiguous",
-                holds=rubric_graded and not ambiguous,
-                detail=f"criteria {ambiguous} are ambiguous on the confirmed variants; route "
-                "them back to rubric authoring"
-                if ambiguous
-                else "no graded criterion is ambiguous"
-                if rubric_graded
-                else "the rubric was not graded on the confirmed variants; grade it before "
-                "training",
+            *(
+                _admission(name, judging.get(name))
+                for name in (
+                    "judge_coverage",
+                    "rubric_problems",
+                    "rubric_compatibility",
+                    "world_freeze",
+                )
             ),
         )
     )
 
 
+def _admission(
+    name: ConditionName, problems: Mapping[str, tuple[str, ...]] | None
+) -> EligibilityCondition:
+    """Turn one admission-policy check into a condition naming every failing variant."""
+    if problems is None:
+        return EligibilityCondition(
+            name=name, holds=False, detail="no confirmed variant was checked against the policy"
+        )
+    if problems:
+        detail = "; ".join(f"{s}: {', '.join(found)}" for s, found in sorted(problems.items()))
+        return EligibilityCondition(name=name, holds=False, detail=detail[:4000])
+    return EligibilityCondition(name=name, holds=True, detail="every confirmed variant passes")
+
+
 class CriticRecord(ContractModel):
-    """One critic estimate scored against the measured rate under one meaning.
+    """One discovery critic estimate scored against the discovery-judged rate under one meaning.
 
     Attributes:
         draw: Critic draw index.
         point: Point number estimated.
         estimate: The critic's probability of success.
-        measured_rate: Success rate of the point's graded continuations.
-        graded: Continuations behind the measured rate.
+        measured_rate: Judged success rate of the point's scored continuations.
+        graded: Judged continuations behind the measured rate.
         squared_error: The estimate's squared error against the measured rate.
-        meaning: What both the estimate and the rate are conditional on.
+        meaning: What both the estimate and the rate are conditional on, including the judge.
         reward: The draw's reward over every scored point (negative mean Brier score).
+        trainable: Always False: the discovery judge is not a variant's frozen judge, so this
+            is diagnostic until fresh variant-specific predictions are scored.
     """
 
     draw: int = Field(ge=0)
@@ -511,31 +543,40 @@ class CriticRecord(ContractModel):
     squared_error: float = Field(ge=0.0, le=1.0)
     meaning: EstimateMeaning
     reward: float = Field(ge=-1.0, le=0.0)
+    trainable: Literal[False] = False
 
 
 class ContinuationGroup(ContractModel):
-    """The continuations from one point as one group for group-relative training.
+    """One confirmed variant's episodes after one forced option, for group-relative training.
 
     Attributes:
-        point: Point number the continuations started from.
+        scenario_id: The confirmed variant.
+        option_id: The option every episode in the group was forced to take first.
         tier: Recorded tier of the actor, or :data:`UNTIERED`.
-        meaning: What the group's outcomes are conditional on.
-        study: Saved continuation study holding the episodes.
-        advantages: Group-relative advantage per continuation; None where ungraded.
+        meaning: What the group's outcomes are conditional on, including the variant's judge.
+        judge: Identity of the frozen judge whose saved verdicts label the group.
+        episodes: Each planned episode's saved assessment or gap, in plan order.
+        advantages: Group-relative advantage per episode, read from those assessments; None
+            where unscored.
+        imposed_action_trainable: Always False: the forced first action was imposed by the
+            experiment and is not actor-sampled; only the actor's suffix may carry advantages.
     """
 
-    point: int = Field(ge=0)
+    scenario_id: str
+    option_id: str
     tier: str = Field(min_length=1)
     meaning: EstimateMeaning
-    study: ArtifactInput
+    judge: Sha256
+    episodes: tuple[JudgedSlot, ...]
     advantages: tuple[float | None, ...]
+    imposed_action_trainable: Literal[False] = False
 
 
 class JudgeScreening(ContractModel):
-    """One judge draw's screening score, kept for analysis and never trained on.
+    """One point-selector draw's screening score, kept for analysis and never trained on.
 
     Attributes:
-        draw: Judge draw index.
+        draw: Selector draw index.
         score: The screening score.
         trainable: Always False.
     """
@@ -550,30 +591,34 @@ class TrainingRecords(ContractModel):
 
     Attributes:
         policy: Policy key every record shares (:func:`policy_key`).
-        critics: Critic records, by draw then point.
-        groups: Continuation groups per actor tier, each by point.
-        judges: Judge screening scores; none of them is trainable.
+        critics: Discovery critic records, by draw then point; none is trainable.
+        groups: Judged continuation groups per actor tier, each by variant then option.
+        judges: Point-selector screening scores; none of them is trainable.
+        coverage: The judge coverage of every confirmed variant behind the groups.
     """
 
     policy: str
     critics: tuple[CriticRecord, ...]
     groups: dict[str, tuple[ContinuationGroup, ...]]
     judges: tuple[JudgeScreening, ...]
+    coverage: dict[str, JudgeCoverage] = Field(default_factory=dict)
 
 
 def training_records(
+    project: ProjectStore,
     eligibility: TrainingEligibility,
     report: ActorCriticReport,
+    confirmed: Mapping[str, tuple[OptionContrast, EstimateMeaning]],
     *,
     tiers: Mapping[str, str] | None = None,
 ) -> TrainingRecords | tuple[str, ...]:
-    """Build the records of an eligible family, or return why there are none.
-
-    Only points whose continuations ran and that share the family's single policy contribute.
+    """Build the records of an eligible family from its judged confirmations, or say why not.
 
     Args:
+        project: Project holding the saved assessments.
         eligibility: The family's computed eligibility.
         report: The actor-critic run the family was built from.
+        confirmed: Confirmation contrast and its meaning per confirmed variant.
         tiers: Tier label per actor model identity, when tiers are recorded.
 
     Returns:
@@ -581,12 +626,48 @@ def training_records(
     """
     if not eligibility.eligible:
         return eligibility.reasons
-    rows = [row for row in report.points if row.failure is None and row.study is not None]
-    if not rows:
-        return ("no point has graded continuations to build records from",)
-    policy = policy_key(rows[0].meaning)
-    rows = [row for row in rows if policy_key(row.meaning) == policy]
-    by_point = {row.point: row for row in rows}
+    if not confirmed:
+        return ("no confirmed variant has judged episodes to build records from",)
+    policy = policy_key(next(iter(confirmed.values()))[1])
+    groups: dict[str, list[ContinuationGroup]] = {}
+    for scenario, (contrast, meaning) in sorted(confirmed.items()):
+        if policy_key(meaning) != policy:
+            return (f"variant {scenario} was confirmed under a different actor policy",)
+        tier = (tiers or {}).get(meaning.actor_model.model_id, UNTIERED)
+        for option in contrast.options:
+            slots = tuple(cell.slot for cell in option.cells)
+            rewards = slot_rewards(project, slots, contrast.judge)
+            groups.setdefault(tier, []).append(
+                ContinuationGroup(
+                    scenario_id=scenario,
+                    option_id=option.option_id,
+                    tier=tier,
+                    meaning=meaning,
+                    judge=contrast.judge,
+                    episodes=slots,
+                    advantages=group_advantages(
+                        f"{scenario}:{option.option_id}", rewards
+                    ).advantages,
+                )
+            )
+    return TrainingRecords(
+        policy=policy,
+        critics=_discovery_critics(report),
+        groups={tier: tuple(items) for tier, items in sorted(groups.items())},
+        judges=tuple(
+            JudgeScreening(draw=draw.draw, score=draw.score)
+            for draw in report.judges
+            if draw.score is not None
+        ),
+        coverage={scenario: contrast.coverage for scenario, (contrast, _) in confirmed.items()},
+    )
+
+
+def _discovery_critics(report: ActorCriticReport) -> tuple[CriticRecord, ...]:
+    """Return every scored discovery critic estimate against its point's judged rate."""
+    by_point = {
+        row.point: row for row in report.points if row.failure is None and row.study is not None
+    }
     critics: list[CriticRecord] = []
     for draw in report.critics:
         if draw.assessment is None or draw.score is None or draw.score.reward is None:
@@ -608,27 +689,4 @@ def training_records(
                     reward=draw.score.reward,
                 )
             )
-    groups: dict[str, list[ContinuationGroup]] = {}
-    for row in sorted(rows, key=lambda item: item.point):
-        if row.study is None:
-            continue
-        tier = (tiers or {}).get(row.meaning.actor_model.model_id, UNTIERED)
-        groups.setdefault(tier, []).append(
-            ContinuationGroup(
-                point=row.point,
-                tier=tier,
-                meaning=row.meaning,
-                study=row.study,
-                advantages=row.group.advantages,
-            )
-        )
-    return TrainingRecords(
-        policy=policy,
-        critics=tuple(critics),
-        groups={tier: tuple(items) for tier, items in sorted(groups.items())},
-        judges=tuple(
-            JudgeScreening(draw=draw.draw, score=draw.score)
-            for draw in report.judges
-            if draw.score is not None
-        ),
-    )
+    return tuple(critics)

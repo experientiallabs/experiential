@@ -10,8 +10,9 @@ task success.
 - **One owner, one draw.** Each judge request goes through the shared author-response owner, so a
   draw is bought once, replayed exactly and never redrawn. A malformed answer is saved as
   ``malformed`` and an unobtainable one as ``unavailable``; both are unscored and replay as such.
-- **Exact replay.** The assessment is keyed by this protocol, the judge definition identity, the
-  evidence identity and the frozen input budget. A saved assessment replays without a call.
+- **Exact replay.** The assessment is keyed by this protocol, the judge definition identity
+  (whose profile freezes the input budget) and the evidence identity. A saved assessment replays
+  without a call.
   Changing the rubric or profile is a new definition, hence a new assessment.
 - **Context-safe evidence.** The whole evidence is rendered when it fits the frozen input budget.
   When it does not, a judge with an evidence-tool budget receives an inventory of every event and
@@ -72,7 +73,7 @@ from exp.optimize.evaluation.variance.judge_prompt import (
     judge_schema_sha256,
 )
 
-JUDGE_PROTOCOL = "episode-judge-v1"
+JUDGE_PROTOCOL = "episode-judge-v2"
 """Version of the judge's rendering, reading and validation; bump it whenever they change."""
 
 EVIDENCE_TYPE = "episode-evidence"
@@ -178,18 +179,19 @@ def assessment_identity(
     Args:
         definition: The frozen judge definition.
         evidence: The judged evidence.
-        settings: Frozen request settings; only the input budget enters the key.
+        settings: Admitted request settings; they never enter the key, since the input budget
+            they must match is part of the definition's profile.
 
     Returns:
         The content-derived assessment id.
     """
+    del settings
     return stable_id(
         ASSESSMENT_TYPE,
         {
             "protocol": JUDGE_PROTOCOL,
             "judge": definition.identity,
             "evidence": evidence.identity,
-            "maximum_input_bytes": settings.maximum_input_bytes,
         },
     )
 
@@ -713,6 +715,7 @@ def _check_binding(
         or settings.model != profile.model
         or settings.output_tokens != profile.maximum_output_tokens
         or settings.reasoning_effort != profile.reasoning_effort
+        or settings.maximum_input_bytes != profile.maximum_input_bytes
     ):
         raise ValueError("judge request settings differ from the frozen judge profile")
     return _load_rubric(project, definition)

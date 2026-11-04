@@ -30,6 +30,12 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.evidence_tools_test import price_judge
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning, ExposurePlan, Role
+from exp.optimize.evaluation.variance.judged_test import (
+    JudgeRouter,
+    Verdict,
+    episode_judge,
+    route_judge,
+)
 from exp.optimize.evaluation.variance.rewards import PointOutcome, group_advantages
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
@@ -97,7 +103,12 @@ def _spec(project: ProjectStore, job: ContinuationJob, *, judges: int = 1) -> Ac
         }
     )
     return ActorCriticSpec(
-        initial=group, judges=(settings,) * judges, critics=(settings,), points=2, continuations=2
+        initial=group,
+        episode_judge=episode_judge(project, settings),
+        judges=(settings,) * judges,
+        critics=(settings,),
+        points=2,
+        continuations=2,
     )
 
 
@@ -129,17 +140,31 @@ def _wire(
     monkeypatch: pytest.MonkeyPatch,
     actor: list[JsonHttpResponse],
     roles: list[JsonHttpResponse],
-) -> tuple[ScriptedJsonTransport, ScriptedJsonTransport]:
-    """Route actor and role calls to separate scripted transports."""
+    verdict: Verdict | None = None,
+) -> tuple[ScriptedJsonTransport, JudgeRouter]:
+    """Route actor calls, scripted role calls and episode-judge calls to separate scripts."""
     actor_transport = ScriptedJsonTransport(tuple(actor))
-    role_transport = ScriptedJsonTransport(tuple(roles))
     monkeypatch.setattr(
         "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor_transport
     )
-    monkeypatch.setattr(
-        "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: role_transport
-    )
-    return actor_transport, role_transport
+    return actor_transport, route_judge(monkeypatch, roles, verdict)
+
+
+def deletes_row(row: int) -> Verdict:
+    """A judge that passes exactly the episodes whose actor deleted the given row."""
+
+    def verdict(evidence: JsonObject) -> str:
+        """Pass when a scored actor tool call deletes the row."""
+        events = evidence["events"]
+        assert isinstance(events, list)
+        for event in events:
+            if isinstance(event, dict) and event["kind"] == "tool_call":
+                deletions = json.dumps(event["content"])
+                if f'"start": {row}' in deletions and event["scope"] == "scored":
+                    return "pass"
+        return "fail"
+
+    return verdict
 
 
 def test_a_run_judges_estimates_continues_and_rewards_then_replays(
@@ -308,7 +333,11 @@ def test_the_error_mining_defaults_run_and_record_populations_and_usage(
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     settings = _settings(project, job)
     spec = ActorCriticSpec.error_mining(
-        job, selector=settings, critic=settings, group_physical_attempts=40
+        job,
+        episode_judge=episode_judge(project, settings),
+        selector=settings,
+        critic=settings,
+        group_physical_attempts=40,
     )
     assert (len(spec.judges), len(spec.critics), spec.points, spec.continuations) == (8, 8, 4, 8)
     assert spec.initial.study.repeats == 16 and spec.protocol == "error-mining-v1"
@@ -319,13 +348,10 @@ def test_the_error_mining_defaults_run_and_record_populations_and_usage(
         for p in selections
     ] + [_with_usage(_tool_reply("estimate_points", _estimates([0, 1])), 2000, 200)] * 8
     actor = _ReactiveActor()
-    role_transport = ScriptedJsonTransport(tuple(roles))
     monkeypatch.setattr(
         "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor
     )
-    monkeypatch.setattr(
-        "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: role_transport
-    )
+    role_transport = route_judge(monkeypatch, roles)
 
     report = run_actor_critic(
         project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
@@ -476,7 +502,7 @@ def test_groups_from_different_tiers_are_never_pooled() -> None:
         output_tokens=1,
         reasoning_effort=None,
         world_sha256="w",
-        verifier_sha256="v",
+        judge_sha256="4" * 64,
         probe_sha256="p",
     )
 
@@ -503,3 +529,83 @@ def test_groups_from_different_tiers_are_never_pooled() -> None:
     renamed = small.model_copy(update={"label": "other"})
     with pytest.raises(ValueError, match="two different tier labels"):
         policy_groups((row(small, (1.0,)), row(renamed, (1.0,)).model_copy(update={"point": 2})))
+
+
+def test_a_flipped_judge_verdict_moves_every_label_advantage_and_critic_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same episodes, opposite scripted verdicts: rates, advantages and rewards all follow."""
+    reports = []
+    flipped = {"pass": "fail", "fail": "pass"}
+    verdicts: list[Verdict] = [deletes_row(2), lambda e: flipped[deletes_row(2)(e)]]
+    for index, verdict in enumerate(verdicts):
+        root = tmp_path / f"run-{index}"
+        root.mkdir()
+        project, job, _ = job_fixture(root, monkeypatch)
+        spec = _spec(project, job)
+        group = [reply for row in (2, 3, 4) for reply in (_edit(row), _done())]
+        continuations = [_edit(2), _done(), _edit(3), _done(), _done(), _done()]
+        roles = [
+            _tool_reply("choose_points", {"points": [_point(0), _point(1)], "limitations": ["x"]}),
+            _tool_reply(
+                "estimate_points",
+                {
+                    "estimates": [
+                        {
+                            "step": s,
+                            "probability": 0.9,
+                            "rationale": "r",
+                            "evidence_refs": ["group"],
+                        }
+                        for s in (0, 1)
+                    ],
+                    "limitations": ["x"],
+                },
+            ),
+        ]
+        _, router = _wire(monkeypatch, group + continuations, roles, verdict)
+        reports.append(
+            run_actor_critic(
+                project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="t"
+            )
+        )
+        assert len(router.judged) == 4
+        assert all(row.judged is not None for row in reports[-1].points)
+    first, second = reports
+    for one, two in zip(first.points, second.points, strict=True):
+        assert one.study is not None and two.study is not None
+        assert (one.outcome.successes, one.outcome.failures) == (
+            two.outcome.failures,
+            two.outcome.successes,
+        )
+        assert one.group.advantages == tuple(
+            None if value is None else -value for value in two.group.advantages
+        )
+    critic = [draw.score for draw in (first.critics[0], second.critics[0])]
+    assert critic[0] is not None and critic[1] is not None
+    assert critic[0].reward is not None and critic[1].reward is not None
+    assert critic[0].reward != critic[1].reward
+
+
+def test_unscored_judgments_stay_unknown_in_the_point_denominator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed judge answer is a coverage gap: never a failure, never dropped."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    spec = _spec(project, job)
+    group = [reply for row in (2, 3, 4) for reply in (_edit(row), _done())]
+    continuations = [_edit(2), _done(), _edit(3), _done(), _done(), _done()]
+    roles = [
+        _tool_reply("choose_points", {"points": [_point(0), _point(1)], "limitations": ["x"]}),
+        _tool_reply("estimate_points", _estimates([0, 1])),
+    ]
+    _wire(monkeypatch, group + continuations, roles, lambda evidence: "malformed")
+
+    report = run_actor_critic(
+        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    )
+
+    assert all(row.outcome.unknown == 2 and row.outcome.graded == 0 for row in report.points)
+    assert all(row.group.advantages == (None, None) for row in report.points)
+    assert report.counts is not None and report.counts.continuations_unknown == 4
+    assert report.critics[0].score is not None and report.critics[0].score.reward is None

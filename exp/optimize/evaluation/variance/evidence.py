@@ -1,10 +1,16 @@
 """The privileged evidence packet point selectors and critics read about one group of attempts.
 
 The agent under test never sees this packet. Point selectors and critics see all of it: every
-attempt in the group with its whole trajectory and grade, the group's success rate, the task
-verifier (the grader specification the grades come from), every reference or specification the
-run registered, and, for the one trajectory whose value is being estimated, every boundary at
-which a continuation could start, each with the conversation the actor had seen by then.
+attempt in the group with its whole trajectory and historical grade, the group's historical
+verifier rate, the task verifier (the mechanical specification those grades come from), every
+reference or specification the run registered, and, for the one trajectory whose value is being
+estimated, every boundary at which a continuation could start, each with the conversation the
+actor had seen by then.
+
+The group grades and rate are **historical diagnostics** of the mechanical verifier. They are not
+the success labels the run's critics are scored against: continuation outcomes are labelled only
+by the frozen episode judge (:mod:`~exp.optimize.evaluation.variance.judged`), and the packet says
+so in its ``label_authority`` entry.
 
 The packet also names what it does *not* contain. Every reference kind the run did not register is
 listed as unavailable, and so is any independent correctness label, so a role is never told it
@@ -59,7 +65,9 @@ REFERENCE_KINDS: tuple[ReferenceKind, ...] = (
 ALWAYS_UNAVAILABLE: tuple[JsonObject, ...] = (
     {
         "material": "independent_correctness_labels",
-        "reason": "grades come only from the declared verifier; no independent label exists",
+        "reason": "group grades come only from the declared mechanical verifier and are "
+        "historical diagnostics; continuation labels come from the frozen episode judge, whose "
+        "verdicts on these attempts are not supplied",
     },
     {
         "material": "actor_hidden_reasoning",
@@ -70,6 +78,12 @@ ALWAYS_UNAVAILABLE: tuple[JsonObject, ...] = (
 
 _TRACE_KEYS = frozenset({"steps", "model_calls"})
 """Outcome keys served as trajectory locators rather than as grader evidence."""
+
+_HISTORICAL = (
+    "historical mechanical verifier diagnostic; continuation success labels come only from the "
+    "frozen episode judge"
+)
+"""How the packet labels every verifier grade it shows."""
 
 
 class ReferenceSource(ContractModel):
@@ -164,7 +178,9 @@ def load_references(
 
 
 def group_rate(study: ContinuationStudy) -> tuple[int, int]:
-    """Return ``(passes, graded)`` over the group's assessed attempts.
+    """Return the historical verifier ``(passes, graded)`` over the group's attempts.
+
+    This is a diagnostic of the mechanical verifier, never the judged success rate.
 
     Args:
         study: The group of attempts.
@@ -261,6 +277,7 @@ def evidence_packet(
         "attempts_graded": graded,
         "passes": passes,
         "success_rate": None if graded == 0 else passes / graded,
+        "label_authority": _HISTORICAL,
     }
     verifier = study.spec.verifier.model_dump(mode="json")
     documents: dict[str, JsonValue] = {"group": group, "verifier": verifier}
@@ -291,6 +308,7 @@ def evidence_packet(
         documents[f"grade:{row.index}"] = {
             "grade": grade,
             "grader": "verifier",
+            "label_authority": _HISTORICAL,
             "evaluator_projection": {
                 key: value for key, value in row.outcome.items() if key not in _TRACE_KEYS
             },

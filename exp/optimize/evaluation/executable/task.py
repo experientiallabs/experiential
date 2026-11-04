@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
@@ -33,6 +34,10 @@ class ExecutableTask(ContractModel):
         capability_brief: Optional private intent; unresolved assumptions prevent qualification.
         known_limits: Public qualifications that survive export.
         harbor_transport: Opt-in Unix IPC with no actor or verifier container networking.
+        judge: The frozen episode judge whose verdict over the trial's harness ledger is the
+            only reward of a decision-variance task. Without it the task is the explicitly
+            different observable-mechanical task type, rewarded by its verifier grade. The
+            binding holds only digests and references; the rubric stays on the host.
     """
 
     intent: str = Field(min_length=1)
@@ -43,6 +48,7 @@ class ExecutableTask(ContractModel):
     harbor_transport: Literal["http", "unix-no-network"] = Field(
         default="http", exclude_if=lambda value: value == "http"
     )
+    judge: EpisodeJudge | None = Field(default=None, exclude_if=lambda value: value is None)
     known_limits: tuple[str, ...] = (
         "Observable predicates do not certify unobserved effects or host containment.",
         "Authored or simulated behavior does not establish fidelity to a native production system.",

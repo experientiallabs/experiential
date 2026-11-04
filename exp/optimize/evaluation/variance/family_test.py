@@ -42,6 +42,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
     _tool_reply,
     _wire,
 )
+from exp.optimize.evaluation.variance.admission_test import bound_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
 from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
@@ -55,6 +56,8 @@ from exp.optimize.evaluation.variance.family import (
 )
 from exp.optimize.evaluation.variance.grader import EpisodeView
 from exp.optimize.evaluation.variance.grader_test import _SNAPSHOT, _Decider, _evidence
+from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgeCoverage
+from exp.optimize.evaluation.variance.judged_test import JudgeRouter
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     TrainingRecords,
@@ -63,7 +66,7 @@ from exp.optimize.evaluation.variance.records import (
 )
 from exp.optimize.evaluation.variance.variants import CoherenceCheck, VariantCheckpoint
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.rules.model import Rule, RuleBook, ToolContract
 
@@ -214,6 +217,7 @@ class _Stages:
         dispatches: Every first-time stage execution, by stage name.
         witnesses: Witnesses already produced, by scenario.
         contrasts: Contrasts already produced, by stage key.
+        judges: Judge identity each contrast was labelled by, by stage key.
         required: State parts each variant build was asked to hold, by scenario.
     """
 
@@ -222,6 +226,7 @@ class _Stages:
     dispatches: list[str] = field(default_factory=list)
     witnesses: dict[str, WitnessResult] = field(default_factory=dict)
     contrasts: dict[str, OptionContrast] = field(default_factory=dict)
+    judges: dict[str, str] = field(default_factory=dict)
     required: dict[str, frozenset[StatePart]] = field(default_factory=dict)
 
     def checkpoint(self, scenario_id: str) -> ArtifactInput:
@@ -350,6 +355,7 @@ class _Stages:
         actions: Mapping[str, ToolCall],
         job: ContinuationJob,
         repeats: int,
+        judge: EpisodeJudge,
         code_revision: str,
         evidence: tuple[ArtifactInput, ...] = (),
     ) -> OptionContrast:
@@ -362,11 +368,12 @@ class _Stages:
             actions: The option mapping, which must cover every option.
             job: The frozen job; its selector marks a fresh confirmation.
             repeats: Pairs per option.
+            judge: The variant's frozen judge, recorded per stage key.
             code_revision: Unused revision.
             evidence: Unused evidence.
 
         Returns:
-            The stand-in contrast.
+            The stand-in contrast, its judge coverage counting every planned cell.
         """
         del project, code_revision, evidence
         assert set(actions) == {option.option_id for option in decision.options}
@@ -378,13 +385,27 @@ class _Stages:
             one, two = (repeats, 0) if scenario == "six" else (0, repeats)
             if fresh:
                 one, two = self.confirm.get(scenario, (one, two))
+            self.judges[key] = judge.identity
             self.contrasts[key] = OptionContrast(
                 step=decision.step,
                 decision=decision.decision,
                 checkpoint=checkpoint,
                 reference_option="delete-1",
                 repeats=repeats,
-                options=(_outcome("delete-1", one, repeats), _outcome("delete-2", two, repeats)),
+                options=tuple(
+                    _outcome(option, wins, repeats).model_copy(
+                        update={
+                            "coverage": JudgeCoverage(
+                                judge=judge.identity,
+                                planned=repeats,
+                                passed=wins,
+                                failed=repeats - wins,
+                            )
+                        }
+                    )
+                    for option, wins in (("delete-1", one), ("delete-2", two))
+                ),
+                judge=judge.identity,
             )
         return self.contrasts[key]
 
@@ -425,7 +446,7 @@ class _Setup:
     spec: DecisionFamilySpec
     report: ActorCriticReport
     exposure: ExposurePlan
-    roles: ScriptedJsonTransport
+    roles: JudgeRouter
     stages: _Stages
     decider: _Decider
     job: ContinuationJob
@@ -485,12 +506,15 @@ def _setup(
     monkeypatch.setattr(stages_module, "run_option_contrast", stages.contrast)
     monkeypatch.setattr(stages_module, "confirmation_episodes", _episodes)
     settings = actor_spec.judges[0]
+    binding = bound_judging(project)
+    identities = [str(row["scenario_id"]) for row in scenarios or ()] or ["six", "seven"]
     spec = DecisionFamilySpec(
         decision_author=settings,
         scenario_author=settings,
         rules_stage=_rules_stage(project, settings),
         repeats=8,
         confirmation_repeats=8,
+        judging=dict.fromkeys(identities, binding),
         tiers={report.spec.initial.study.actor_model.model_id: "strong"},
     )
     decider = _Decider(lambda question, text: 0.9)
@@ -549,8 +573,20 @@ def test_family_qualifies_is_confirmed_and_yields_records_once_disposed(
     assert disposed.eligibility.eligible, disposed.eligibility.reasons
     assert isinstance(disposed.records, TrainingRecords)
     assert set(disposed.records.groups) == {"strong"}
-    assert [group.point for group in disposed.records.groups["strong"]] == [0, 1]
+    assert [(g.scenario_id, g.option_id) for g in disposed.records.groups["strong"]] == [
+        ("seven", "delete-1"),
+        ("seven", "delete-2"),
+        ("six", "delete-1"),
+        ("six", "delete-2"),
+    ]
+    assert setup.spec.judging is not None
+    judge = setup.spec.judging["six"].judge.identity
+    assert all(g.judge == judge for g in disposed.records.groups["strong"])
+    assert set(setup.stages.judges.values()) == {judge}
+    assert set(disposed.coverage) == {"six", "seven"}
+    assert disposed.judging == setup.spec.judging
     assert {record.point for record in disposed.records.critics} == {0, 1}
+    assert not any(record.trainable for record in disposed.records.critics)
     assert all(not judge.trainable for judge in disposed.records.judges)
     assert len(setup.roles.requests) == 4
     assert len(setup.stages.dispatches) == 6
@@ -664,10 +700,10 @@ def test_harbor_export_refuses_a_variant_the_family_did_not_build(
         )
 
 
-def test_ambiguous_rubric_criteria_block_eligibility_and_go_back_to_authoring(
+def test_uncertain_calibration_criteria_are_diagnostic_and_never_block_eligibility(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Grading draws that straddle the band make the criterion ambiguous for both variants."""
+    """Grading draws that straddle the band are recorded but do not decide eligibility."""
     setup = _setup(tmp_path, monkeypatch)
     setup.decider = _Decider(_evidence(0.9, 0.9, draw=0.1))
     first = setup.run()
@@ -675,8 +711,45 @@ def test_ambiguous_rubric_criteria_block_eligibility_and_go_back_to_authoring(
 
     assert report.confirmation is not None and report.confirmation.qualifies
     assert report.ambiguous_criteria == ("rows",)
-    assert [c.name for c in report.eligibility.conditions if not c.holds] == ["rubric_unambiguous"]
+    assert report.eligibility.eligible, report.eligibility.reasons
+
+
+def test_an_untrainable_world_freeze_and_a_missing_review_are_each_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The admission policy names every failed check for each confirmed variant."""
+    setup = _setup(tmp_path, monkeypatch)
+    binding = bound_judging(setup.project, trainable=False)
+    judging = {
+        "six": binding,
+        "seven": binding.model_copy(update={"compatibility": None}),
+    }
+    setup.spec = setup.spec.model_copy(update={"judging": judging})
+    first = setup.run()
+    report = setup.run(_disposed(setup, first))
+
+    failed = [c.name for c in report.eligibility.conditions if not c.holds]
+    assert failed == ["rubric_compatibility", "world_freeze"]
+    assert any("seven: no compatibility review" in reason for reason in report.eligibility.reasons)
+    assert any("six: the world freeze is not trainable" in r for r in report.eligibility.reasons)
     assert report.records is None
+
+
+def test_variant_judges_must_be_given_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A family without a frozen judge binding never falls back to mechanical labels."""
+    setup = _setup(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="variant judges"):
+        run_decision_family(
+            setup.project,
+            setup.spec.model_copy(update={"judging": None}),
+            exposure=setup.exposure,
+            report=setup.report,
+            point=0,
+            code_revision="test",
+            actions=_actions,
+        )
 
 
 def test_fresh_briefing_scenarios_flow_through_the_family_with_required_state(

@@ -17,20 +17,24 @@ saved actor-critic run over a mining-probe task:
    ``replay_diverged`` and not contrasted.
 5. **Witnesses.** Each variant's witness calls execute in its restored decision world; a variant
    whose witness fails is not contrasted.
-6. **Selection.** Every option is forced from each variant's decision checkpoint under the frozen
+6. **Judges.** Each scenario's :class:`~exp.optimize.evaluation.variance.admission.VariantJudging`
+   (its frozen episode judge, world freeze and rubric compatibility review) is fixed from the spec
+   or a caller function and saved in the report before any of the variant's contrasts run.
+   Every contrast cell is judged by it; those saved verdicts are the only labels.
+7. **Selection.** Every option is forced from each variant's decision checkpoint under the frozen
    job, citing the saved witness as evidence, and
    :func:`~exp.optimize.evaluation.variance.contrast.family_flip` decides whether the better option
    flips. The per-variant stages live in :mod:`~exp.optimize.evaluation.variance.family_stages`.
-7. **Fresh confirmation.** Each variant that qualified is contrasted again with independently drawn
+8. **Fresh confirmation.** Each variant that qualified is contrasted again with independently drawn
    samples: the job's selector names the confirmation seed and the selection contrasts are cited as
    evidence, so every confirmation draw has a new identity and none of its samples took part in
    selection. Qualification stands only when every qualifying variant's confirmation reproduces
    its separated, matching winner.
-8. **Rubric.** When a grader is supplied, the decision state's criteria are graded over the
-   confirmation episodes; ambiguous criteria are listed for rubric authoring and block training
-   eligibility.
-9. **Eligibility.** Every condition in :mod:`~exp.optimize.evaluation.variance.records` is computed,
-   and records are built only when all hold.
+9. **Coverage.** The judge's coverage of each confirmed variant is recorded. When a criterion
+   grader is supplied, its probabilistic grades are calibration evidence only.
+10. **Eligibility.** Every condition in :mod:`~exp.optimize.evaluation.variance.records`, including
+    the frozen admission policy (:mod:`~exp.optimize.evaluation.variance.admission`), is computed,
+    and records are built from the judged confirmations only when all hold.
 
 Option identities are authored, so the concrete forced action of each option comes either from the
 spec's mapping by option identity or from a caller-supplied function of the decision state; the
@@ -72,6 +76,11 @@ from exp.optimize.evaluation.executable.task import ExecutableTask, persist_exec
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageReport, load_rulebook
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
+from exp.optimize.evaluation.variance.admission import (
+    FamilyAdmissionPolicy,
+    VariantJudging,
+    judging_problems,
+)
 from exp.optimize.evaluation.variance.authors import (
     DecisionContext,
     DecisionStateDraft,
@@ -86,6 +95,7 @@ from exp.optimize.evaluation.variance.contracts import (
     ActorView,
     DecisionState,
     EstimationPoint,
+    Scenario,
     ScenarioLimits,
     StatePart,
     message_texts,
@@ -100,6 +110,7 @@ from exp.optimize.evaluation.variance.family_stages import (
     run_variant,
 )
 from exp.optimize.evaluation.variance.grader import GradeReport, GraderSettings
+from exp.optimize.evaluation.variance.judged import JudgeCoverage
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     AuditFinding,
@@ -120,6 +131,9 @@ FAMILY_REPORT_TYPE = "decision-family-report"
 
 OptionActions = Callable[[DecisionState], Mapping[str, ToolCall]]
 """Maps an authored decision state to the concrete forced first action of every option."""
+
+VariantJudges = Callable[[DecisionState, Scenario], VariantJudging]
+"""Gives one authored scenario its frozen judge, world freeze and compatibility review."""
 
 
 class DecisionFamilySpec(ContractModel):
@@ -145,7 +159,10 @@ class DecisionFamilySpec(ContractModel):
             briefings are leak-checked against what the actor had seen.
         required_state: State parts every variant must hold beyond the baseline, such as
             ``files``; a variant that cannot restore one is refused.
-        grading: Rubric grading controls.
+        judging: Frozen judge binding per scenario identity, when known in advance; else the
+            caller supplies a function of the decision state and scenario.
+        admission: Admission policy every confirmed variant must meet, frozen here.
+        grading: Calibration criterion-grading controls; never an eligibility input.
         tiers: Tier label per actor model identity, when tiers are recorded.
         dispositions: Recorded dispositions of audit findings. They never re-key a draw.
     """
@@ -162,6 +179,8 @@ class DecisionFamilySpec(ContractModel):
     instruction_variation: bool = False
     fresh_briefing: bool = False
     required_state: tuple[StatePart, ...] = Field(default=(), max_length=8)
+    judging: dict[str, VariantJudging] | None = None
+    admission: FamilyAdmissionPolicy = FamilyAdmissionPolicy()
     grading: GraderSettings = GraderSettings()
     tiers: dict[str, str] = Field(default_factory=dict)
     dispositions: tuple[AuditDisposition, ...] = ()
@@ -233,11 +252,13 @@ class FamilyReport(ContractModel):
         scenarios: The scenario draw, when the decision state was usable.
         job: The frozen job witnesses and contrasts ran under.
         actions: Concrete forced first action per option, when resolved.
+        judging: Frozen judge binding per scenario, fixed before any contrast ran.
         variants: One entry per scenario, in scenario order.
         selection: Verdict over the selection contrasts, when any ran.
         confirmation: Verdict over the fresh confirmation contrasts, when any ran.
-        grades: Rubric grades over each confirmed variant's episodes, by scenario.
-        ambiguous_criteria: Criteria routed back to rubric authoring; any blocks eligibility.
+        coverage: The judge's coverage of each confirmed variant's confirmation episodes.
+        grades: Calibration criterion grades over confirmed variants' episodes, by scenario.
+        ambiguous_criteria: Criteria the calibration grader found uncertain; diagnostic only.
         findings: Every audit finding.
         eligibility: Every computed eligibility condition.
         records: Training records, only when every condition holds.
@@ -254,9 +275,11 @@ class FamilyReport(ContractModel):
     scenarios: ScenarioDraft | None = None
     job: ContinuationJob
     actions: dict[str, ToolCall] | None = None
+    judging: dict[str, VariantJudging] | None = None
     variants: tuple[FamilyVariant, ...] = ()
     selection: FlipVerdict | None = None
     confirmation: FlipVerdict | None = None
+    coverage: dict[str, JudgeCoverage] = Field(default_factory=dict)
     grades: dict[str, GradeReport] = Field(default_factory=dict)
     ambiguous_criteria: tuple[str, ...] = ()
     findings: tuple[AuditFinding, ...] = ()
@@ -274,6 +297,7 @@ def run_decision_family(
     point: int,
     code_revision: str,
     actions: OptionActions | None = None,
+    judging: VariantJudges | None = None,
     grader: DecisionsTraceTagger | None = None,
 ) -> FamilyReport:
     """Run, or replay, one decision family from a chosen point of an actor-critic run.
@@ -287,20 +311,25 @@ def run_decision_family(
         code_revision: Producing source identity.
         actions: Function giving every option's concrete forced action, used when the spec has
             no mapping. Its result is saved, so a replay never calls it.
-        grader: Decision client grading rubric criteria over confirmation episodes; without it
-            criteria are not graded.
+        judging: Function giving every scenario its frozen judge binding, used when the spec has
+            no mapping. It is called before the scenario's first contrast and its result is
+            saved, so a replay never calls it.
+        grader: Calibration criterion grader over confirmation episodes; never an eligibility
+            input.
 
     Returns:
         The report, also saved as a ``decision-family-report`` artifact.
 
     Raises:
         ValueError: The task is not a mining probe, the point was not chosen and continued in the
-            run, the rules stage reference is not a saved stage report, or the action mapping is
-            missing or given twice.
+            run, the rules stage reference is not a saved stage report, or the action mapping or
+            judge binding is missing or given twice.
     """
     spec = DecisionFamilySpec.model_validate_json(spec.model_dump_json())
     if (spec.actions is None) == (actions is None):
         raise ValueError("give option actions either as spec.actions or as actions=, exactly once")
+    if (spec.judging is None) == (judging is None):
+        raise ValueError("give variant judges either as spec.judging or as judging=, exactly once")
     store = project.artifacts
     rows = {row.point: row for row in report.points}
     if point not in rows:
@@ -359,7 +388,9 @@ def run_decision_family(
             job=job,
             eligibility=family.eligibility(None, None, (), ()),
         )
-        result = _continue(family, base, context, decision, draws, actions, grader, code_revision)
+        result = _continue(
+            family, base, context, decision, draws, actions, judging, grader, code_revision
+        )
         store.write_json(
             artifact_id=result_id,
             artifact_type=FAMILY_REPORT_TYPE,
@@ -441,10 +472,10 @@ def family_executable_task(
         intent: The capability the environment measures.
 
     Returns:
-        The task under the family's frozen job.
+        The task under the family's frozen job, rewarded only by the variant's frozen judge.
 
     Raises:
-        ValueError: The scenario has no decision checkpoint in this family.
+        ValueError: The scenario has no decision checkpoint or judge binding in this family.
     """
     rows = {row.scenario_id: row for row in family_report.variants}
     row = rows.get(scenario_id)
@@ -454,7 +485,12 @@ def family_executable_task(
         raise ValueError(
             f"scenario {scenario_id} has no persisted decision checkpoint; choose from {built}"
         )
-    return ExecutableTask(intent=intent, job=bound_job(family_report.job, checkpoint))
+    judging = (family_report.judging or {}).get(scenario_id)
+    if judging is None:
+        raise ValueError(f"scenario {scenario_id} has no frozen judge binding in this family")
+    return ExecutableTask(
+        intent=intent, job=bound_job(family_report.job, checkpoint), judge=judging.judge
+    )
 
 
 @dataclass(frozen=True)
@@ -482,8 +518,8 @@ class _Family:
         findings: tuple[AuditFinding, ...],
         relied: tuple[str, ...],
         contrasted: tuple[EstimateMeaning, ...] = (),
-        ambiguous: tuple[str, ...] = (),
-        graded: bool = False,
+        judging: Mapping[str, VariantJudging] | None = None,
+        coverage: Mapping[str, JudgeCoverage] | None = None,
     ) -> TrainingEligibility:
         """Compute eligibility from the family's evidence so far.
 
@@ -493,13 +529,18 @@ class _Family:
             findings: Every audit finding.
             relied: Rule identities the decision state cites.
             contrasted: Meanings of every variant contrast.
-            ambiguous: Criteria the rubric grader found ambiguous.
-            graded: Whether the rubric was graded on the confirmed variants without failure.
+            judging: Frozen judge binding per scenario, once fixed.
+            coverage: Judge coverage of each confirmed variant, once confirmed.
 
         Returns:
             The computed eligibility.
         """
         meanings = tuple(row.meaning for row in self.report.points if row.failure is None)
+        problems = (
+            judging_problems(self.project, judging, coverage, self.spec.admission)
+            if judging is not None and coverage
+            else {}
+        )
         return training_eligibility(
             selection=selection,
             confirmation=confirmation,
@@ -511,8 +552,7 @@ class _Family:
             contradicted_rules=self.stage.families_must_stay_diagnostic,
             unwitnessed_rules=self.stage.diagnostic,
             meanings=(*meanings, *contrasted),
-            ambiguous_criteria=ambiguous,
-            rubric_graded=graded,
+            judging=problems,
         )
 
 
@@ -523,6 +563,7 @@ def _continue(
     decision: DecisionStateDraft,
     draws: str,
     actions: OptionActions | None,
+    judges: VariantJudges | None,
     grader: DecisionsTraceTagger | None,
     code_revision: str,
 ) -> FamilyReport:
@@ -535,7 +576,8 @@ def _continue(
         decision: The decision-state draw.
         draws: Identity every stage derives from.
         actions: Caller-supplied option action function, when the spec has no mapping.
-        grader: Rubric grader, when supplied.
+        judges: Caller-supplied judge binding function, when the spec has no mapping.
+        grader: Calibration criterion grader, when supplied.
         code_revision: Producing source identity.
 
     Returns:
@@ -588,6 +630,23 @@ def _continue(
     except (ValueError, KeyError, TypeError) as error:
         return _finish(family, base, findings, relied, failure=f"option actions: {error}")
     base = base.model_copy(update={"actions": mapping})
+    try:
+        judging = dict(
+            spec.judging
+            or (
+                {s.scenario_id: judges(state, s) for s in scenarios.scenarios.scenarios}
+                if judges is not None
+                else {}
+            )
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        return _finish(family, base, findings, relied, failure=f"variant judges: {error}")
+    unbound = sorted({s.scenario_id for s in scenarios.scenarios.scenarios} - set(judging))
+    if unbound:
+        return _finish(
+            family, base, findings, relied, failure=f"variant judges: none for {unbound}"
+        )
+    base = base.model_copy(update={"judging": judging})
     study = load_study(project.artifacts, report.group)
     picked = next(row for row in study.branches if row.index == report.picked)
     boundaries = (study.spec.checkpoint, *picked.checkpoints)
@@ -602,6 +661,7 @@ def _continue(
             actions=mapping,
             facts=spec.facts,
             repeats=spec.repeats,
+            judge=judging[scenario.scenario_id].judge,
             code_revision=code_revision,
             required_state=frozenset(spec.required_state),
         )
@@ -638,6 +698,7 @@ def _continue(
                 actions=mapping,
                 seed=spec.confirmation_seed,
                 repeats=spec.confirmation_repeats,
+                judge=judging[row.scenario_id].judge,
                 code_revision=code_revision,
             )
             if row.scenario_id in winners
@@ -648,7 +709,7 @@ def _continue(
             {r.scenario_id: r.confirmation for r in variants if r.confirmation is not None},
             [s for s in scenarios.scenarios.scenarios if s.scenario_id in winners],
         )
-    grades, ambiguous, grading_failure = grade_variants(
+    coverage, grades, uncertain, grading_failure = grade_variants(
         project, state, scenarios.scenarios.scenarios, variants, grader, spec.grading
     )
     base = base.model_copy(
@@ -656,8 +717,9 @@ def _continue(
             "variants": tuple(variants),
             "selection": selection,
             "confirmation": confirmation,
+            "coverage": coverage,
             "grades": grades,
-            "ambiguous_criteria": ambiguous,
+            "ambiguous_criteria": uncertain,
         }
     )
     contrasted = tuple(row.meaning for row in variants if row.meaning is not None)
@@ -669,8 +731,6 @@ def _continue(
         selection=selection,
         confirmation=confirmation,
         contrasted=contrasted,
-        ambiguous=ambiguous,
-        graded=bool(grades) and grading_failure is None,
         failure=grading_failure,
     )
 
@@ -684,8 +744,6 @@ def _finish(
     selection: FlipVerdict | None = None,
     confirmation: FlipVerdict | None = None,
     contrasted: tuple[EstimateMeaning, ...] = (),
-    ambiguous: tuple[str, ...] = (),
-    graded: bool = False,
     failure: str | None = None,
 ) -> FamilyReport:
     """Compute eligibility and, when every condition holds, the training records.
@@ -698,8 +756,6 @@ def _finish(
         selection: Selection verdict, when contrasts ran.
         confirmation: Confirmation verdict, when it ran.
         contrasted: Meanings of every variant contrast.
-        ambiguous: Criteria the rubric grader found ambiguous.
-        graded: Whether the rubric was graded on the confirmed variants without failure.
         failure: Why the family stopped early, when it did.
 
     Returns:
@@ -707,9 +763,16 @@ def _finish(
     """
     unique = tuple({finding.finding_id: finding for finding in findings}.values())
     eligibility = family.eligibility(
-        selection, confirmation, unique, relied, contrasted, ambiguous, graded
+        selection, confirmation, unique, relied, contrasted, base.judging, base.coverage
     )
-    built = training_records(eligibility, family.report, tiers=family.spec.tiers)
+    confirmed = {
+        row.scenario_id: (row.confirmation, row.meaning)
+        for row in base.variants
+        if row.confirmation is not None and row.meaning is not None
+    }
+    built = training_records(
+        family.project, eligibility, family.report, confirmed, tiers=family.spec.tiers
+    )
     return base.model_copy(
         update={
             "findings": unique,
@@ -847,6 +910,7 @@ def _save_context(
 def _dependencies(result: FamilyReport, report: ActorCriticReport) -> tuple[ArtifactInput, ...]:
     """Collect every saved artifact the family report rests on."""
     refs = {result.checkpoint, result.context, report.group, result.spec.rules_stage}
+    refs |= {row.judge.definition.rubric for row in (result.judging or {}).values()}
     for draft in (result.decision, result.scenarios):
         if draft is not None and draft.response is not None:
             refs.add(draft.response)

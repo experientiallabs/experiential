@@ -70,6 +70,14 @@ def export_executable_harbor(
             if qualification is None
             else qualification.model_dump(mode="json"),
             "native_environment_accessed": False,
+            **(
+                {}
+                if task.judge is None
+                else {
+                    "episode_judge": task.judge.identity,
+                    "reward_authority": "frozen LLM episode judge over the harness ledger",
+                }
+            ),
         },
         qualified=qualified,
         output_paths=task.output_paths,

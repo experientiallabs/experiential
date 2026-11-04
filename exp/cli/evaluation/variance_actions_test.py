@@ -228,6 +228,10 @@ def test_actor_critic_cost_scales_role_draws_by_their_model_call_budget(
         "(read_only_tools, 4 tool calls)" in summary
     )
     assert "1 critic draws x 3 model calls" in summary and "4 suffix jobs of 2" in summary
+    judged = base.initial.study.repeats + len(base.judges) * base.points * base.continuations
+    judge = base.episode_judge.settings.maximum_physical_attempts
+    assert forced[-1].attempts == judge * judged
+    assert f"Episode judge: up to {judged} episodes x 1 judge requests" in summary
 
 
 def test_actor_critic_refused_consent_stops_before_any_provider(

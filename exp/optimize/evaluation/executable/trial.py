@@ -3,7 +3,13 @@
 Besides its call, submission and grade records, every trial keeps a harness-owned, append-only
 ledger: the initial evaluator projection, each tool request and its observed reply or failure,
 each customer-facing message the actor sends through the bridge, and the final submission, in
-one sequence. The ledger is what an episode judge reads; it never changes how reward is computed.
+one sequence (:mod:`~exp.optimize.evaluation.executable.ledger`).
+
+A task bound to a frozen episode judge (``ExecutableTask.judge``) is rewarded only by that judge:
+once the trial closes, its ledger becomes the episode evidence, the judge assesses it once, and
+the reward is the verdict's encoding (pass 1, fail 0). An unscored verdict writes no reward, which
+is distinct from a reward of 0, and no mechanical grade is computed for such a task. A task
+without a judge is the observable-mechanical task type, rewarded by its verifier grade.
 """
 
 import base64
@@ -13,14 +19,10 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from threading import RLock
-from typing import Literal
-
-from pydantic import Field
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
-    ContractModel,
     JsonObject,
     sha256_bytes,
     sha256_json,
@@ -33,10 +35,14 @@ from exp.optimize.evaluation.continuations.study import (
     CheckpointSession,
     restore_continuation_world,
 )
+from exp.optimize.evaluation.executable.ledger import LedgerKind, TrialLedgerEntry, trial_ledger
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime, load_runtime_definition
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant, ProviderLimits
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
+from exp.optimize.evaluation.variance.episode_evidence import ledger_evidence
+from exp.optimize.evaluation.variance.episodes import episode_reward
+from exp.optimize.evaluation.variance.judge import judge_episode
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.world_artifacts import load_world_image, persist_world_image
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
@@ -54,57 +60,6 @@ MAXIMUM_MESSAGES = 256
 
 MAXIMUM_MESSAGE_CHARACTERS = 16_000
 """Characters in one customer-facing message."""
-
-LedgerKind = Literal["start", "tool_call", "tool_reply", "tool_failure", "message", "submission"]
-"""What one trial ledger entry records."""
-
-
-class TrialLedgerEntry(ContractModel):
-    """One harness-recorded entry of a trial's append-only ledger.
-
-    Attributes:
-        sequence: Logical position in the ledger, starting at 0 with the ``start`` entry.
-        kind: ``start`` holds the initial evaluator projection; ``tool_call`` the exact request;
-            ``tool_reply`` the saved step (observation, receipt and resulting projection);
-            ``tool_failure`` a dispatch or observation failure; ``message`` customer-facing
-            text the actor sent; ``submission`` the final answer and final projection.
-        content: The recorded payload.
-        record: Backing trial record artifact, or None when the ledger entry is the record.
-        recorded_at: Wall-clock time the harness appended the entry.
-        reconciled: Whether the entry was appended on restart from an already saved record,
-            because the process stopped between that record and its ledger entry.
-    """
-
-    sequence: int = Field(ge=0)
-    kind: LedgerKind
-    content: JsonObject
-    record: str | None = None
-    recorded_at: datetime
-    reconciled: bool = False
-
-
-def trial_ledger(project: ProjectStore, identity: str) -> tuple[TrialLedgerEntry, ...]:
-    """Read a trial's contiguous ledger without opening its runtime.
-
-    Args:
-        project: Project holding the trial records.
-        identity: Durable trial identity (``ExecutableHarborTrial.identity``).
-
-    Returns:
-        Every saved entry in sequence order.
-
-    Raises:
-        ValueError: An entry's recorded sequence differs from its position.
-    """
-    entries: list[TrialLedgerEntry] = []
-    while project.artifacts.exists(f"{identity}-ledger-{len(entries)}"):
-        entry = TrialLedgerEntry.model_validate_json(
-            project.artifacts.read_bytes(f"{identity}-ledger-{len(entries)}", "record.json")
-        )
-        if entry.sequence != len(entries):
-            raise ValueError("trial ledger entry differs from its position")
-        entries.append(entry)
-    return tuple(entries)
 
 
 class ExecutableHarborTrial:
@@ -393,11 +348,17 @@ class ExecutableHarborTrial:
             return {"recorded": True, "sequence": self._append("message", {"text": text})}
 
     def result(self) -> JsonObject:
-        """Grade observed goals and policy separately; only a qualified contract emits reward."""
+        """Reward a closed trial; only a qualified task emits reward.
+
+        A judged task's reward is its frozen judge's verdict over the ledger; any other task's
+        is its observable mechanical grade.
+        """
         with self._lock:
             saved = self._saved("result")
             if saved is not None:
                 return saved
+            if self.task.judge is not None:
+                return self._judged_result()
             answer = self._saved("answer")
             outcome: JsonObject = {
                 "initial_state": self._initial,
@@ -434,6 +395,67 @@ class ExecutableHarborTrial:
                     "result", result, () if self.qualification is None else (self.qualification,)
                 )
             return result
+
+    def _judged_result(self) -> JsonObject:
+        """Judge the closed trial's ledger once; an open trial has no assessment yet."""
+        judge = self.task.judge
+        if judge is None:
+            raise ValueError("this task has no episode judge")
+        qualified, scope = self._qualification()
+        closed = self._saved("answer") is not None or self._failed
+        result: JsonObject = {
+            "status": "incomplete",
+            "reward": None,
+            "label_authority": "frozen LLM episode judge",
+            "judge": {"definition": judge.identity, "assessment": None, "verdict": None},
+            "qualification": "qualified_observable_contract" if qualified else "diagnostic_only",
+            "judge_qualification": "not_qualified_by_observable_contract",
+            "scope": scope,
+            "outcome_unknown": self._outcome_unknown,
+            "execution_failed": self._failed,
+            "execution_registration": self.registration.model_dump(mode="json"),
+        }
+        if not closed:
+            return result
+        start = self.task.job.study.checkpoint
+        evidence = ledger_evidence(
+            self._ledger,
+            load_continuation_checkpoint(self.project.artifacts, start),
+            episode_id=self.identity,
+            task_sha256=judge.definition.task_sha256,
+            world_sha256=judge.definition.world_sha256,
+            ledger_source=self.identity,
+            checkpoint_source=start.artifact_id,
+        )
+        reference, assessment = judge_episode(
+            self.project,
+            judge.definition,
+            evidence,
+            settings=judge.settings,
+            code_revision=self.code_revision,
+        )
+        reward = episode_reward(assessment)
+        rewarded = reward is not None and qualified
+        result["judge"] = {
+            "definition": judge.identity,
+            "assessment": reference.model_dump(mode="json"),
+            "status": assessment.status,
+            "verdict": assessment.verdict,
+        }
+        result["status"] = "completed" if rewarded else "incomplete"
+        result["reward"] = int(reward) if rewarded and reward is not None else None
+        inputs = (reference, *(() if self.qualification is None else (self.qualification,)))
+        self._save("result", result, inputs)
+        return result
+
+    def _qualification(self) -> tuple[bool, str]:
+        """Return whether the exact task profile is qualified, and the qualification scope."""
+        if self.qualification is None:
+            return False, "diagnostic; observable mechanical predicate only"
+        report = load_executable_qualification(self.project, self.qualification)
+        if report.task != self.task_ref or report.profile_sha256 != self.task.profile():
+            raise ValueError("qualification differs from this exact executable profile")
+        return report.qualified, report.scope
 
     def output_files(self) -> JsonObject:
         """Export only declared final files after submission, with exact digest verification."""

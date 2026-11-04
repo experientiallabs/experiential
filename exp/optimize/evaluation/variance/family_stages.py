@@ -14,8 +14,11 @@ reason recorded on its :class:`FamilyVariant`:
 4. **Selection.** Every option is forced from the decision checkpoint, citing the saved witness as
    evidence.
 
-A variant whose selection winner qualifies is contrasted again on fresh samples by
-:func:`confirm_variant`, and :func:`grade_variants` grades the rubric on confirmation episodes.
+Every contrast cell is judged by the variant's own frozen episode judge, fixed before the variant's
+first contrast runs. A variant whose selection winner qualifies is contrasted again on fresh
+samples by :func:`confirm_variant`, and :func:`grade_variants` reports the judge's coverage of the
+confirmation episodes, with optional probabilistic criterion grades kept as calibration evidence
+only.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from exp.optimize.evaluation.variance.grader import (
     GraderSettings,
     grade_episodes,
 )
+from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgeCoverage
 from exp.optimize.evaluation.variance.records import (
     bound_job,
     confirmation_episodes,
@@ -107,6 +111,7 @@ def run_variant(
     actions: Mapping[str, ToolCall],
     facts: InstanceFacts | None,
     repeats: int,
+    judge: EpisodeJudge,
     code_revision: str,
     required_state: frozenset[StatePart] = frozenset(),
 ) -> FamilyVariant:
@@ -122,6 +127,7 @@ def run_variant(
         actions: Concrete forced first action of every option.
         facts: Instance facts the world model was given, if any.
         repeats: Pairs per selection contrast.
+        judge: The variant's frozen episode judge.
         code_revision: Producing source identity.
         required_state: State parts the variant must hold beyond the baseline, such as
             ``files``.
@@ -196,13 +202,16 @@ def run_variant(
             actions=actions,
             job=job,
             repeats=repeats,
+            judge=judge,
             code_revision=code_revision,
             evidence=(cited,),
         )
     except (ValueError, RuntimeError, OSError) as error:
         return row.model_copy(update={"stopped": f"selection contrast: {failure_reason(error)}"})
     meaning = estimate_meaning(
-        bound_job(job, reference), load_continuation_checkpoint(project.artifacts, reference)
+        bound_job(job, reference),
+        load_continuation_checkpoint(project.artifacts, reference),
+        judge=judge.definition,
     )
     return row.model_copy(update={"selection": selection, "meaning": meaning})
 
@@ -216,6 +225,7 @@ def confirm_variant(
     actions: Mapping[str, ToolCall],
     seed: int,
     repeats: int,
+    judge: EpisodeJudge,
     code_revision: str,
 ) -> FamilyVariant:
     """Contrast a qualifying variant again on fresh samples, citing the selection as evidence.
@@ -228,6 +238,7 @@ def confirm_variant(
         actions: Concrete forced first action of every option.
         seed: Confirmation seed named in every confirmation draw's selector.
         repeats: Pairs per confirmation contrast.
+        judge: The variant's frozen episode judge, the same one selection used.
         code_revision: Producing source identity.
 
     Returns:
@@ -248,6 +259,7 @@ def confirm_variant(
             actions=actions,
             job=confirmation_job(job, seed),
             repeats=repeats,
+            judge=judge,
             code_revision=code_revision,
             evidence=cited,
         )
@@ -263,22 +275,34 @@ def grade_variants(
     variants: Sequence[FamilyVariant],
     grader: DecisionsTraceTagger | None,
     settings: GraderSettings,
-) -> tuple[dict[str, GradeReport], tuple[str, ...], str | None]:
-    """Grade each confirmed variant's episodes on the criteria that apply to it.
+) -> tuple[dict[str, JudgeCoverage], dict[str, GradeReport], tuple[str, ...], str | None]:
+    """Report the judge's coverage of each confirmed variant, and optional calibration grades.
+
+    The episode judge already labelled every confirmation cell; this counts, per variant, how
+    many were judged pass or fail, unassessable, malformed, unavailable or without evidence, and
+    how many carried insufficient evidence or a rubric problem. When a criterion grader is
+    supplied, its probabilistic criterion grades are calibration evidence only: an uncertain
+    criterion is never treated as proof of an ambiguous rubric and never decides eligibility.
 
     Args:
         project: Project holding the saved contrasts.
         decision: The decision state declaring the criteria.
         scenarios: Every scenario, for its applicable criteria.
         variants: Every variant.
-        grader: Rubric grader, or None to skip grading.
-        settings: Grading controls.
+        grader: Calibration criterion grader, or None to skip it.
+        settings: Calibration grading controls.
 
     Returns:
-        Reports by scenario, ambiguous criterion identities, and a grading failure if any.
+        Judge coverage by confirmed scenario, calibration reports by scenario, criteria the
+        calibration grader found uncertain, and a calibration grading failure if any.
     """
+    coverage = {
+        row.scenario_id: row.confirmation.coverage
+        for row in variants
+        if row.confirmation is not None
+    }
     if grader is None:
-        return {}, (), None
+        return coverage, {}, (), None
     criteria = {criterion.criterion_id: criterion for criterion in decision.criteria}
     applies = {scenario.scenario_id: scenario.criteria for scenario in scenarios}
     reports: dict[str, GradeReport] = {}
@@ -297,9 +321,9 @@ def grade_variants(
                 settings=settings,
             )
     except ValueError as error:
-        failure = f"rubric grading: {failure_reason(error)}"
-    ambiguous = {s.criterion_id for r in reports.values() for s in r.summaries if s.ambiguous}
-    return reports, tuple(sorted(ambiguous)), failure
+        failure = f"calibration grading: {failure_reason(error)}"
+    uncertain = {s.criterion_id for r in reports.values() for s in r.summaries if s.ambiguous}
+    return coverage, reports, tuple(sorted(uncertain)), failure
 
 
 def failure_reason(error: BaseException) -> str:

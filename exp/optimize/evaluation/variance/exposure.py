@@ -35,9 +35,10 @@ from typing import Literal
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ArtifactInput, ContractModel, sha256_json
+from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.models import ModelSnapshot
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.variance.episodes import JudgeDefinition
 from exp.simulation.continuations import ContinuationCheckpoint
 from exp.simulation.mining.bindings import TaskTraceLineageBinding
 from exp.simulation.mining.tag_selection import TagSelection
@@ -265,7 +266,8 @@ class EstimateMeaning(ContractModel):
         output_tokens: Output allowance per actor call.
         reasoning_effort: Requested reasoning effort, or None for the model default.
         world_sha256: Identity of the world runtime configuration, including the world model.
-        verifier_sha256: Identity of the terminal verifier.
+        judge_sha256: Identity of the frozen episode judge definition whose verdicts are the
+            success labels; a new rubric or judging profile is a new estimate.
         probe_sha256: Identity of the evaluator state projection.
     """
 
@@ -279,16 +281,19 @@ class EstimateMeaning(ContractModel):
     output_tokens: int
     reasoning_effort: str | None
     world_sha256: str
-    verifier_sha256: str
+    judge_sha256: Sha256
     probe_sha256: str
 
 
-def estimate_meaning(job: ContinuationJob, checkpoint: ContinuationCheckpoint) -> EstimateMeaning:
+def estimate_meaning(
+    job: ContinuationJob, checkpoint: ContinuationCheckpoint, *, judge: JudgeDefinition
+) -> EstimateMeaning:
     """Record what a success estimate from a job's checkpoint is conditional on.
 
     Args:
-        job: The continuation job that measures success from the checkpoint.
+        job: The continuation job that runs episodes from the checkpoint.
         checkpoint: The loaded checkpoint the job starts from.
+        judge: The frozen episode judge whose verdicts label those episodes.
 
     Returns:
         The estimate's frozen meaning.
@@ -305,7 +310,7 @@ def estimate_meaning(job: ContinuationJob, checkpoint: ContinuationCheckpoint) -
         output_tokens=study.maximum_output_tokens,
         reasoning_effort=study.reasoning_effort,
         world_sha256=sha256_json(job.configuration),
-        verifier_sha256=sha256_json(study.verifier),
+        judge_sha256=judge.identity,
         probe_sha256=study.probe_sha256,
     )
 

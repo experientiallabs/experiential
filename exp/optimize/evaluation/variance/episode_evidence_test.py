@@ -16,10 +16,11 @@ from exp.optimize.evaluation.continuations.job import ContinuationJob, execute_c
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
+from exp.optimize.evaluation.executable.ledger import trial_ledger
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.task import load_executable_task
-from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial, trial_ledger
+from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial
 from exp.optimize.evaluation.executable.trial_test import _post
 from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
 from exp.optimize.evaluation.variance.episode_evidence import (

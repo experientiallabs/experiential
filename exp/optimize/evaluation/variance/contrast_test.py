@@ -32,6 +32,12 @@ from exp.optimize.evaluation.variance.contrast import (
     states_action,
     witness_reference,
 )
+from exp.optimize.evaluation.variance.judged_test import (
+    JudgeRouter,
+    episode_judge,
+    judge_settings,
+    route_judge,
+)
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.worlds import ExecutableWorld
@@ -253,6 +259,23 @@ def _finish_transport(monkeypatch: pytest.MonkeyPatch, count: int) -> ScriptedJs
     return transport
 
 
+def _one_row_judge(monkeypatch: pytest.MonkeyPatch) -> JudgeRouter:
+    """A judge passing a complete episode whose imposed action deletes exactly one row."""
+
+    def verdict(evidence: JsonObject) -> str:
+        """Fail any other imposed deletion; an incomplete one-row episode is unassessable."""
+        events = evidence["events"]
+        assert isinstance(events, list)
+        imposed = next(e for e in events if isinstance(e, dict) and e["event_id"] == "imposed.call")
+        assert isinstance(imposed, dict)
+        assert (imposed["owner"], imposed["scope"]) == ("experiment", "scored")
+        if '"count": 1' not in str(imposed["content"]).replace("'", '"'):
+            return "fail"
+        return "pass" if evidence["complete"] else "unassessable"
+
+    return route_judge(monkeypatch, verdict=verdict)
+
+
 def _deletion(count: int) -> ToolCall:
     """Delete ``count`` data rows; the fixture verifier passes only with one deletion."""
     call = workbook_case().first
@@ -289,6 +312,8 @@ def test_forced_options_separate_under_one_frozen_job_and_replay(
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     transport = _finish_transport(monkeypatch, 8)
     decision = _row_decision(1, 2)
+    router = _one_row_judge(monkeypatch)
+    judge = episode_judge(project, judge_settings(project))
 
     def run() -> OptionContrast:
         """Run or replay the one-versus-two row contrast."""
@@ -299,19 +324,27 @@ def test_forced_options_separate_under_one_frozen_job_and_replay(
             actions={"delete-1": _deletion(1), "delete-2": _deletion(2)},
             job=job,
             repeats=4,
+            judge=judge,
             code_revision="test",
         )
 
     contrast = run()
     one, two = contrast.options
     assert (one.option_id, one.planned, one.successes, one.unknown) == ("delete-1", 4, 4, 0)
-    assert (two.option_id, two.planned, two.successes, two.goal_failures) == ("delete-2", 4, 0, 4)
+    assert (two.option_id, two.planned, two.successes, two.not_met) == (
+        "delete-2",
+        4,
+        0,
+        {"right_order": 4},
+    )
+    assert contrast.judge == judge.identity and contrast.coverage.scored == 8
+    assert all(cell.slot.episode is not None for cell in (*one.cells, *two.cells))
     assert one.bounds[0] > two.bounds[1]
     assert one.wilson_95 == one.bounds and len(contrast.contrasts) == 1
-    assert len(transport.requests) == 8
+    assert len(transport.requests) == 8 and len(router.judged) == 8
     job.runtime_file.unlink()
     assert run() == contrast
-    assert len(transport.requests) == 8
+    assert len(transport.requests) == 8 and len(router.judged) == 8
     scenario = _scenario().model_copy(update={"correct_option": "delete-1"})
     verdict = family_flip({"gold": contrast}, [scenario])
     assert verdict.variants[0].status == "separated_matches" and not verdict.qualifies
@@ -323,6 +356,7 @@ def test_three_options_pool_the_reference_and_keep_unknowns(
     """Each non-reference option is one contrast; an unavailable suffix widens its bounds."""
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     transport = _finish_transport(monkeypatch, 3)
+    _one_row_judge(monkeypatch)
     original = action_contrast.execute_continuation_job
     calls = []
 
@@ -343,12 +377,14 @@ def test_three_options_pool_the_reference_and_keep_unknowns(
         actions={f"delete-{n}": _deletion(n) for n in (1, 2, 3)},
         job=job,
         repeats=1,
+        judge=episode_judge(project, judge_settings(project)),
         code_revision="test",
     )
     reference, two, three = contrast.options
     assert contrast.reference_option == "delete-1" and len(contrast.contrasts) == 2
     assert (reference.planned, reference.assessable, reference.unknown) == (2, 1, 1)
     assert reference.failures == ("RuntimeError",)
+    assert reference.coverage.unassessable == 1 and reference.coverage.insufficient_evidence == 1
     assert reference.wilson_95 is not None and reference.bounds[1] == 1.0
     assert reference.bounds[0] < reference.wilson_95[0]
     assert (two.planned, two.successes, three.planned, three.successes) == (1, 0, 1, 0)
@@ -372,6 +408,7 @@ def test_option_actions_must_cover_distinct_declared_options(
                 actions=actions,
                 job=job,
                 repeats=1,
+                judge=episode_judge(project, judge_settings(project)),
                 code_revision="test",
             )
     assert not transport.requests
@@ -405,6 +442,7 @@ def _contrast(refund: int, decline: int, planned: int = 20, unknown: int = 0) ->
             _outcome("refund", refund, planned, unknown),
             _outcome("decline", decline, planned),
         ),
+        judge="5" * 64,
     )
 
 

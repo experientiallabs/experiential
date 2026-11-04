@@ -2,7 +2,7 @@
 
 Structural scenario gates (:mod:`contracts`) only show that a variant is well formed. A point is a
 decision only when competing actions executed from the same checkpoint, continued under one frozen
-policy and budget, lead to measurably different graded outcomes, and a family qualifies only when
+policy and budget, lead to measurably different judged outcomes, and a family qualifies only when
 which option is better flips across coherent variants. Spread of success rates between points is
 never used as evidence here.
 
@@ -14,7 +14,10 @@ Three steps establish that:
   states the correct option.
 - :func:`run_option_contrast` forces each option as the first action from the checkpoint and runs
   the suffixes through the preregistered action-contrast experiments, so every option gets the
-  same frozen actor, budget and verifier, and unknown outcomes stay in the denominator.
+  same frozen actor and budget. Every cell is judged once, as its imposed action followed by its
+  suffix, by the variant's frozen episode judge
+  (:func:`~exp.optimize.evaluation.variance.judged.judge_cells`); those verdicts are the only
+  labels, and unscored cells stay in the denominator.
 - :func:`family_flip` compares the per-variant winners: a variant has a winner only when the best
   option's lower bound is above every other option's upper bound, and the family qualifies only
   when at least two variants have different separated winners that match what their scenarios
@@ -37,6 +40,7 @@ from exp.common.core.artifacts import (
     ContractModel,
     JsonObject,
     JsonValue,
+    Sha256,
     sha256_json,
     stable_id,
 )
@@ -61,12 +65,22 @@ from exp.optimize.evaluation.continuations.job import (
     load_continuation_runtime,
     preflight_continuation_job,
 )
-from exp.optimize.evaluation.continuations.study import known_outcomes, restore_continuation_world
+from exp.optimize.evaluation.continuations.study import restore_continuation_world
 from exp.optimize.evaluation.variance.contracts import (
     DecisionState,
     Scenario,
     WitnessStep,
     resolve_pointer,
+)
+from exp.optimize.evaluation.variance.judged import (
+    EpisodeJudge,
+    JudgeCoverage,
+    JudgedCell,
+    assessment_inputs,
+    judge_cells,
+    judged_episode,
+    slot_coverage,
+    slot_rewards,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.interface import Observation
@@ -146,18 +160,19 @@ class WitnessResult(ContractModel):
 
 
 class OptionOutcome(ContractModel):
-    """Graded continuations after forcing one option as the first action.
+    """Judged episodes after forcing one option as the first action.
 
     Attributes:
         option_id: Decision option identity.
         action: The concrete forced first action.
-        planned: Planned continuations, the denominator.
-        assessable: Continuations with a known pass or fail.
-        successes: Known passes.
-        unknown: Planned continuations without a known outcome.
-        goal_failures: Assessed continuations whose goal check failed.
-        policy_failures: Assessed continuations whose policy check failed, including the forced
-            action itself.
+        planned: Planned episodes, the denominator.
+        assessable: Episodes the judge scored pass or fail.
+        successes: Judged passes.
+        unknown: Planned episodes without a judged pass or fail.
+        not_met: Per rubric criterion, judged episodes that did not meet it; the imposed action
+            is part of every judged episode.
+        cells: Each planned cell's saved assessment or gap, the source of every count here.
+        coverage: How completely the judge labelled the planned cells.
         failures: Sanitized operational failures of unavailable continuations.
         wilson_95: Two-sided 95 percent Wilson interval over assessable continuations only, or
             None when none are assessable.
@@ -172,8 +187,9 @@ class OptionOutcome(ContractModel):
     assessable: int = Field(ge=0)
     successes: int = Field(ge=0)
     unknown: int = Field(ge=0)
-    goal_failures: int = Field(default=0, ge=0)
-    policy_failures: int = Field(default=0, ge=0)
+    not_met: dict[str, int] = Field(default_factory=dict)
+    cells: tuple[JudgedCell, ...] = ()
+    coverage: JudgeCoverage = JudgeCoverage()
     failures: tuple[str, ...] = ()
     wilson_95: tuple[float, float] | None = None
     bounds: tuple[float, float]
@@ -191,6 +207,7 @@ class OptionContrast(ContractModel):
         repeats: Pairs per contrast.
         options: Outcomes in the decision state's option order.
         contrasts: Saved action-contrast results, one per non-reference option.
+        judge: Identity of the frozen episode judge that labelled every cell.
         scope: What the contrast does and does not establish.
     """
 
@@ -201,11 +218,20 @@ class OptionContrast(ContractModel):
     repeats: int = Field(ge=1)
     options: tuple[OptionOutcome, ...] = Field(min_length=2)
     contrasts: tuple[ArtifactInput, ...] = ()
+    judge: Sha256
     scope: str = (
         "forced first actions from one checkpoint with equal actor allowances; intervals are over "
         "independent suffix draws at this checkpoint, not over tasks; simulated effects are "
         "predictions and differences do not authorize training"
     )
+
+    @property
+    def coverage(self) -> JudgeCoverage:
+        """The judge's coverage over every planned cell of every option."""
+        total = JudgeCoverage(judge=self.judge)
+        for option in self.options:
+            total = total.plus(option.coverage)
+        return total
 
 
 def _bind(job: ContinuationJob, checkpoint: ArtifactInput, repeats: int) -> ContinuationJob:
@@ -590,7 +616,7 @@ def option_contrast_specs(
     """Register one preregistered action contrast per non-reference option.
 
     The first declared option is the reference; every other option is contrasted against it
-    under the same frozen job, so all options share checkpoint, actor, budget and verifier.
+    under the same frozen job, so all options share checkpoint, actor and budget.
 
     Args:
         checkpoint: Shared starting checkpoint.
@@ -625,7 +651,7 @@ def option_contrast_specs(
             alternative=actions[option],
             hypothesis=(
                 f"At step {decision.step}, deciding {decision.decision!r}: forcing option "
-                f"{option!r} instead of {reference!r} changes graded downstream outcomes."
+                f"{option!r} instead of {reference!r} changes judged downstream outcomes."
             ),
             evidence=tuple(sorted(set(evidence), key=lambda ref: ref.artifact_id)),
         )
@@ -641,14 +667,17 @@ def run_option_contrast(
     actions: Mapping[str, ToolCall],
     job: ContinuationJob,
     repeats: int,
+    judge: EpisodeJudge,
     code_revision: str,
     evidence: tuple[ArtifactInput, ...] = (),
 ) -> OptionContrast:
-    """Force every option from one checkpoint and grade the frozen-policy continuations.
+    """Force every option from one checkpoint and judge every frozen-policy episode.
 
-    Suffix running, AB/BA ordering, durable intents, recovery and grading of the forced action
-    together with its suffix all come from :func:`run_action_contrast`. Every contrast is
-    preflighted before any of them dispatches, and saved contrasts replay without runtime code.
+    Suffix running, AB/BA ordering, durable intents and recovery come from
+    :func:`run_action_contrast`. Each cell is then judged once by ``judge`` as its forced action
+    plus its suffix; the mechanical grade the contrast owner records is diagnostic only. Every
+    contrast is preflighted before any of them dispatches, and saved contrasts and assessments
+    replay without runtime code or judge calls.
 
     Args:
         project: Trusted project.
@@ -657,11 +686,13 @@ def run_option_contrast(
         actions: Concrete forced first action of every option, by option identity.
         job: Frozen job; its study is rebound to the checkpoint and repeat count.
         repeats: Pairs per contrast.
+        judge: The frozen episode judge, fixed before any of its labels exist.
         code_revision: Installed implementation identity.
         evidence: Saved sources supporting the hypothesis, such as observation witnesses.
 
     Returns:
-        Per-option outcomes with unknowns explicit; saved as an ``option-contrast`` artifact.
+        Per-option judged outcomes with unscored cells explicit; saved as an ``option-contrast``
+        artifact.
     """
     specs = option_contrast_specs(
         checkpoint=checkpoint,
@@ -684,12 +715,19 @@ def run_option_contrast(
         artifact_input(store.read(spec.identity(code_revision) + "-result").manifest)
         for spec in specs
     )
-    result = _option_contrast(checkpoint, decision, actions, repeats, reports, references)
+    judged = [
+        judge_cells(project, report, reference, judge, code_revision=code_revision)
+        for report, reference in zip(reports, references, strict=True)
+    ]
+    result = _option_contrast(
+        project, checkpoint, decision, actions, repeats, reports, references, judged, judge
+    )
     identity = stable_id(
         "option-contrast",
         {
             "specs": [spec.identity(code_revision) for spec in specs],
             "decision": sha256_json(decision),
+            "judge": judge.identity,
         },
     )
     if store.exists(identity):
@@ -704,7 +742,17 @@ def run_option_contrast(
             schema_version=1,
             created_at=datetime.now(UTC),
             code_revision=code_revision,
-            inputs=tuple(sorted({checkpoint, *references}, key=lambda ref: ref.artifact_id)),
+            inputs=tuple(
+                sorted(
+                    {
+                        checkpoint,
+                        judge.definition.rubric,
+                        *references,
+                        *assessment_inputs([cell.slot for cells in judged for cell in cells]),
+                    },
+                    key=lambda ref: ref.artifact_id,
+                )
+            ),
         ),
         files={"contrast.json": result},
     )
@@ -712,19 +760,24 @@ def run_option_contrast(
 
 
 def _option_contrast(
+    project: ProjectStore,
     checkpoint: ArtifactInput,
     decision: DecisionState,
     actions: Mapping[str, ToolCall],
     repeats: int,
     reports: Sequence[ActionContrast],
     references: tuple[ArtifactInput, ...],
+    judged: Sequence[tuple[JudgedCell, ...]],
+    judge: EpisodeJudge,
 ) -> OptionContrast:
-    """Pool every cell by the option it forced; the reference pools its arm across contrasts."""
+    """Pool every judged cell by the option it forced; the reference pools its arm."""
     reference = decision.options[0].option_id
-    cells: dict[str, list[ContrastCell]] = {option.option_id: [] for option in decision.options}
-    for option, report in zip(decision.options[1:], reports, strict=True):
-        for cell in report.cells:
-            cells[reference if cell.arm == "baseline" else option.option_id].append(cell)
+    cells: dict[str, list[tuple[ContrastCell, JudgedCell]]] = {
+        option.option_id: [] for option in decision.options
+    }
+    for option, report, labelled in zip(decision.options[1:], reports, judged, strict=True):
+        for cell, row in zip(report.cells, labelled, strict=True):
+            cells[reference if cell.arm == "baseline" else option.option_id].append((cell, row))
     return OptionContrast(
         step=decision.step,
         decision=decision.decision,
@@ -732,29 +785,50 @@ def _option_contrast(
         reference_option=reference,
         repeats=repeats,
         options=tuple(
-            option_outcome(option.option_id, actions[option.option_id], cells[option.option_id])
+            option_outcome(
+                project,
+                option.option_id,
+                actions[option.option_id],
+                cells[option.option_id],
+                judge.identity,
+            )
             for option in decision.options
         ),
         contrasts=references,
+        judge=judge.identity,
     )
 
 
 def option_outcome(
-    option_id: str, action: ToolCall, cells: Sequence[ContrastCell]
+    project: ProjectStore,
+    option_id: str,
+    action: ToolCall,
+    cells: Sequence[tuple[ContrastCell, JudgedCell]],
+    judge: str,
 ) -> OptionOutcome:
-    """Summarize one option's planned cells with explicit unknowns and conservative bounds.
+    """Summarize one option's planned cells from their saved assessments.
 
     Args:
+        project: Project holding the assessments.
         option_id: Decision option identity.
         action: The forced first action.
-        cells: Every planned cell that forced this option.
+        cells: Every planned cell that forced this option, with its judged slot.
+        judge: Identity of the judge that labelled them.
 
     Returns:
-        Counts, a Wilson interval over assessable cells, and the separation bounds.
+        Judged counts, coverage, a Wilson interval over scored cells, and the separation bounds
+        with every unscored cell counted as a failure below and a success above.
     """
-    labels = known_outcomes(cell.assessment for cell in cells)
-    planned, assessable, successes = len(cells), len(labels), sum(labels)
+    slots = [row.slot for _, row in cells]
+    labels = [reward for reward in slot_rewards(project, slots, judge) if reward is not None]
+    planned, assessable, successes = len(cells), len(labels), int(sum(labels))
     unknown = planned - assessable
+    not_met: dict[str, int] = {}
+    for slot in slots:
+        assessment = judged_episode(project, slot, judge)
+        for finding in () if assessment is None else assessment.findings:
+            if finding.status == "not_met":
+                not_met[finding.criterion_id] = not_met.get(finding.criterion_id, 0) + 1
     return OptionOutcome(
         option_id=option_id,
         action=action,
@@ -762,19 +836,10 @@ def option_outcome(
         assessable=assessable,
         successes=successes,
         unknown=unknown,
-        goal_failures=sum(
-            cell.assessment is not None
-            and cell.assessment.goal is not None
-            and cell.assessment.goal.status == "fail"
-            for cell in cells
-        ),
-        policy_failures=sum(
-            cell.assessment is not None
-            and cell.assessment.policy is not None
-            and cell.assessment.policy.status == "fail"
-            for cell in cells
-        ),
-        failures=tuple(cell.failure for cell in cells if cell.failure is not None),
+        not_met=dict(sorted(not_met.items())),
+        cells=tuple(row for _, row in cells),
+        coverage=slot_coverage(project, slots, judge),
+        failures=tuple(cell.failure for cell, _ in cells if cell.failure is not None),
         wilson_95=wilson_interval(successes / assessable, assessable) if assessable else None,
         bounds=(
             wilson_interval(successes / planned, planned)[0],

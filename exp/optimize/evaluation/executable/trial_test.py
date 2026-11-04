@@ -11,15 +11,16 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.optimize.evaluation.executable.ledger import LedgerKind, trial_ledger
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
+from exp.optimize.evaluation.executable.task import load_executable_task, persist_executable_task
 from exp.optimize.evaluation.executable.trial import (
     ExecutableHarborTrial,
-    LedgerKind,
     open_executable_harbor_trial,
-    trial_ledger,
 )
 from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
+from exp.optimize.evaluation.variance.judged_test import episode_judge, judge_settings, route_judge
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.workbook_edits import read_supported_workbook
@@ -313,3 +314,45 @@ def test_ledger_reconciles_a_committed_reply_after_the_process_stops(
         ]
         assert resumed.call(workbook_case().first)["is_error"] is False
         assert resumed.ledger() == ledger
+
+
+def test_a_judged_task_is_rewarded_only_by_its_frozen_judge_over_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same submitted episode under pass, fail and unassessable verdicts: 1, 0 and none."""
+    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
+    judge = episode_judge(project, judge_settings(project))
+    judged = load_executable_task(project, task).model_copy(update={"judge": judge})
+    reference = persist_executable_task(
+        project, judged, created_at=datetime.now(UTC), code_revision="test"
+    )
+    qualification = qualify_executable_task(
+        project,
+        spec.model_copy(update={"task": reference}),
+        created_at=datetime.now(UTC),
+        code_revision="test",
+    )
+    verdicts = iter(["pass", "fail", "unassessable"])
+    router = route_judge(monkeypatch, verdict=lambda evidence: next(verdicts))
+    rewards = []
+    for trial_id in ("judged-pass", "judged-fail", "judged-unscored"):
+        with open_executable_harbor_trial(
+            project, reference, trial_id=trial_id, code_revision="test", qualification=qualification
+        ) as trial:
+            before = len(router.judged)
+            assert trial.result()["reward"] is None and len(router.judged) == before
+            trial.message("Deleting the row now.")
+            trial.call(workbook_case().first)
+            trial.submit({"answer": "done"})
+            result = trial.result()
+            binding = result["judge"]
+            assert isinstance(binding, dict) and binding["definition"] == judge.identity
+            assert "mechanical" not in result
+            assert trial.result() == result
+            rewards.append((result["status"], result["reward"]))
+    assert rewards == [("completed", 1), ("completed", 0), ("incomplete", None)]
+    assert len(router.judged) == 3
+    events = router.judged[0]["events"]
+    assert isinstance(events, list)
+    kinds = [e["kind"] for e in events if isinstance(e, dict) and e["scope"] == "scored"]
+    assert kinds[:2] == ["assistant_message", "tool_call"] and "final_answer" in kinds

@@ -40,6 +40,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
     _spec,
     _tool_reply,
 )
+from exp.optimize.evaluation.variance.admission_test import bound_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import (
@@ -50,6 +51,7 @@ from exp.optimize.evaluation.variance.family import (
     run_decision_family,
 )
 from exp.optimize.evaluation.variance.grader_test import _SNAPSHOT, Answer, _Decider, _evidence
+from exp.optimize.evaluation.variance.judged_test import JudgeRouter, state_judge
 from exp.optimize.evaluation.variance.records import AuditDisposition, TrainingRecords
 from exp.optimize.evaluation.variance.tests.grounded_world_test import (
     ACTIONS,
@@ -170,7 +172,7 @@ class _Run:
     """
 
     fixture: GroundedFixture
-    roles: ScriptedJsonTransport
+    roles: JudgeRouter
     report: ActorCriticReport
     exposure: ExposurePlan
     spec: DecisionFamilySpec
@@ -217,7 +219,7 @@ def _run(
 ) -> _Run:
     """Run the actor-critic stage for real over the grounded world and register a family."""
     fixture = grounded_fixture(tmp_path, monkeypatch, first=first)
-    roles = _roles(held=held)
+    roles = JudgeRouter(_roles(held=held), state_judge(("tickets", "outcome"), "right"))
     monkeypatch.setattr(
         "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: roles
     )
@@ -230,6 +232,7 @@ def _run(
         scenario_author=fixture.settings,
         rules_stage=grounded_rules_stage(project, fixture.settings),
         actions=ACTIONS,
+        judging=dict.fromkeys(("urgent", "routine", "held"), bound_judging(project)),
         repeats=4,
         confirmation_repeats=4,
         tiers={job.study.actor_model.model_id: "strong"},
@@ -380,7 +383,14 @@ def test_a_grounded_family_is_qualified_confirmed_eligible_and_exported(
 
     assert eligible.eligibility.eligible, eligible.eligibility.reasons
     assert isinstance(eligible.records, TrainingRecords)
-    assert [group.point for group in eligible.records.groups["strong"]] == [0, 1]
+    groups = eligible.records.groups["strong"]
+    assert sorted((group.scenario_id, group.option_id) for group in groups) == [
+        ("routine", "close"),
+        ("routine", "escalate"),
+        ("urgent", "close"),
+        ("urgent", "escalate"),
+    ]
+    assert all(group.episodes and None not in group.advantages for group in groups)
     assert {record.point for record in eligible.records.critics} == {0, 1}
     assert len(run.roles.requests) == 4
     qualified = export_family_harbor(
@@ -395,6 +405,9 @@ def test_a_grounded_family_is_qualified_confirmed_eligible_and_exported(
     )
     binding = verify_harbor_export(qualified)
     assert binding["qualification"] == "qualified_observable_contract"
+    assert run.spec.judging is not None
+    assert binding["episode_judge"] == run.spec.judging["urgent"].judge.identity
+    assert "rubric" not in json.dumps(binding)
     assert binding["qualification_evidence"] == qualification.model_dump(mode="json")
     assert verify_executable_package(run.project, qualified) == exported
     unqualified = export_family_harbor(
@@ -433,7 +446,6 @@ def test_variants_forked_before_the_decision_replay_to_it_or_diverge(
     assert ambiguous.ambiguous_criteria == ("handled",)
     assert [c.name for c in ambiguous.eligibility.conditions if not c.holds] == [
         "audit_dispositions",
-        "rubric_unambiguous",
     ]
     assert ambiguous.records is None
 

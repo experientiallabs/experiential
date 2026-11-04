@@ -4,7 +4,8 @@ The milestone question is whether judge and critic point selection earns its cos
 chooses the same number ``K`` of points from the same picked trajectory of the same group that an
 actor-critic run already measured, and every chosen point then goes through the same downstream
 test: a decision-state author describes the decision there, and every authored option is forced
-from that point's checkpoint by ``contrast.run_option_contrast``. A point counts as a
+from that point's checkpoint by ``contrast.run_option_contrast``, every cell judged by the
+actor-critic run's frozen episode judge. A point counts as a
 **separated decision** only when some option's conservative lower bound is above every other
 option's upper bound.
 
@@ -71,6 +72,7 @@ from exp.optimize.evaluation.variance.contracts import DecisionState, Estimation
 from exp.optimize.evaluation.variance.contrast import OptionContrast, run_option_contrast
 from exp.optimize.evaluation.variance.evidence import evidence_packet
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 
 SelectionStrategy = Literal["judge", "drop", "uniform", "late_failure", "midpoint"]
@@ -390,6 +392,7 @@ def run_selection_comparison(
                 project,
                 spec,
                 report.spec.initial,
+                report.spec.episode_judge,
                 identity,
                 point,
                 pool.points[point],
@@ -570,6 +573,7 @@ def _trial(
     project: ProjectStore,
     spec: SelectionComparisonSpec,
     job: ContinuationJob,
+    judge: EpisodeJudge,
     identity: str,
     point: int,
     checkpoint: ArtifactInput,
@@ -583,7 +587,7 @@ def _trial(
     if store.exists(trial_id):
         return PointTrial.model_validate_json(store.read_bytes(trial_id, "trial.json"))
     trial = _run_trial(
-        project, spec, job, identity, point, checkpoint, turns, loader, code_revision
+        project, spec, job, judge, identity, point, checkpoint, turns, loader, code_revision
     )
     inputs = {checkpoint}
     if trial.draft is not None and trial.draft.response is not None:
@@ -603,6 +607,7 @@ def _run_trial(
     project: ProjectStore,
     spec: SelectionComparisonSpec,
     job: ContinuationJob,
+    judge: EpisodeJudge,
     identity: str,
     point: int,
     checkpoint: ArtifactInput,
@@ -654,6 +659,7 @@ def _run_trial(
             actions=actions,
             job=bound,
             repeats=spec.repeats,
+            judge=judge,
             code_revision=code_revision,
         )
     except (ValueError, RuntimeError, OSError) as error:

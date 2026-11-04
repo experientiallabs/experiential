@@ -165,6 +165,7 @@ def _fixture(
             model=model,
             maximum_output_tokens=1024,
             evidence_tool_budget=tools,
+            maximum_input_bytes=input_bytes,
         ),
         rubric=artifact_input(manifest),
         rubric_sha256=manifest.files[0].sha256,
@@ -440,5 +441,8 @@ def test_scope_and_bindings_are_rendered_and_checked(
     changed = settings.model_copy(update={"output_tokens": 2048})
     with pytest.raises(ValueError, match="differ from the frozen judge profile"):
         judge_episode(project, definition, _evidence(), settings=changed, code_revision="test")
+    widened = settings.model_copy(update={"maximum_input_bytes": 256000})
+    with pytest.raises(ValueError, match="differ from the frozen judge profile"):
+        judge_episode(project, definition, _evidence(), settings=widened, code_revision="test")
     assert len(transport.requests) == 1
     assert ToolChoice(name="assess_episode").name == "assess_episode"

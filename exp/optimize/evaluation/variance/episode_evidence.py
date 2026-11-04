@@ -24,7 +24,7 @@ from exp.common.models import ModelFinishReason, ModelMessage, ModelResponse, To
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrastSpec, ContrastCell
 from exp.optimize.evaluation.continuations.intervention import ActionIntervention
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
-from exp.optimize.evaluation.executable.trial import TrialLedgerEntry
+from exp.optimize.evaluation.executable.ledger import TrialLedgerEntry
 from exp.optimize.evaluation.variance.episodes import (
     EpisodeEvent,
     EpisodeEvidence,

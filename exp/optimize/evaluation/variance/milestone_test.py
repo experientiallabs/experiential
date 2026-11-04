@@ -29,6 +29,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
 )
 from exp.optimize.evaluation.variance.contracts import DecisionState
 from exp.optimize.evaluation.variance.contrast_test import _deletion, _finish_transport
+from exp.optimize.evaluation.variance.judged_test import JudgeRouter, route_judge, state_judge
 from exp.optimize.evaluation.variance.milestone import (
     SelectionComparison,
     SelectionComparisonSpec,
@@ -38,7 +39,7 @@ from exp.optimize.evaluation.variance.milestone import (
     register_option_mapping,
     run_selection_comparison,
 )
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.continuations import ContinuationCheckpoint
 
 
@@ -130,15 +131,9 @@ def _comparison_spec(
     )
 
 
-def _author_transport(
-    monkeypatch: pytest.MonkeyPatch, *replies: JsonHttpResponse
-) -> ScriptedJsonTransport:
-    """Route decision-state author calls to a scripted transport."""
-    transport = ScriptedJsonTransport(replies)
-    monkeypatch.setattr(
-        "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: transport
-    )
-    return transport
+def _author_transport(monkeypatch: pytest.MonkeyPatch, *replies: JsonHttpResponse) -> JudgeRouter:
+    """Route decision-state author calls to a script, and judge one-row deletions as passes."""
+    return route_judge(monkeypatch, replies, state_judge(("rows",), 6))
 
 
 def _units(result: SelectionComparison, count: int) -> list[SelectionComparison]:

@@ -18,7 +18,10 @@ explicit spec field.
 4. **Critics.** ``C`` critic draws each estimate the probability of success from every distinct
    chosen point, from the same evidence, before any continuation from those points runs.
 5. **Continuations.** ``M`` continuations run from each distinct point (up to ``J*K`` of them
-   after deduplication) and are graded by the task verifier.
+   after deduplication), and every one is judged by the registered frozen episode judge
+   (:func:`~exp.optimize.evaluation.variance.judged.judge_study`). Its saved verdicts are the only
+   labels: the verifier grade the continuation owner records is diagnostic only, and an unscored
+   continuation stays in the point's denominator as unknown.
 6. **Rewards.** Each critic is scored by squared error against the measured rates, each judge by
    how far its points' measured rates separate beyond sampling noise, and each point's
    continuations form their own group for group-relative advantages.
@@ -30,7 +33,7 @@ selector draw, critic draw, the group and each point's continuation study carry 
 provider responses. No cost ratio between roles is assumed.
 
 Every attempt group and continuation group carries its :class:`ActorTier`: the declared tier label
-and the digest of the actor/harness/budget/world/verifier profile. Groups with different tiers are
+and the digest of the actor/harness/budget/world/judge profile. Groups with different tiers are
 never pooled into one policy group (:func:`policy_groups`).
 
 The report ranks points by how informative they are (measured rate near one half, and a large drop
@@ -67,7 +70,7 @@ from exp.optimize.evaluation.continuations.job import (
     execute_continuation_job,
     saved_continuation_job,
 )
-from exp.optimize.evaluation.continuations.study import ContinuationStudy, known_outcomes
+from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
@@ -92,6 +95,7 @@ from exp.optimize.evaluation.variance.exposure import (
     ExposurePlan,
     estimate_meaning,
 )
+from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study, slot_rewards
 from exp.optimize.evaluation.variance.rewards import (
     CriticScore,
     GroupAdvantage,
@@ -138,9 +142,11 @@ class ActorCriticSpec(ContractModel):
             kind not registered is named unavailable in the packet.
         actor_tier: Declared model-tier label of the actor policy; groups with different tiers
             are never pooled.
+        episode_judge: The frozen episode judge whose verdicts label every continuation.
     """
 
     initial: ContinuationJob
+    episode_judge: EpisodeJudge
     judges: tuple[AuthorSettings, ...] = Field(min_length=1, max_length=16)
     critics: tuple[AuthorSettings, ...] = Field(min_length=1, max_length=16)
     points: int = Field(default=4, ge=1, le=8, strict=True)
@@ -166,6 +172,7 @@ class ActorCriticSpec(ContractModel):
         cls,
         initial: ContinuationJob,
         *,
+        episode_judge: EpisodeJudge,
         selector: AuthorSettings,
         critic: AuthorSettings,
         attempts: int = 16,
@@ -184,7 +191,8 @@ class ActorCriticSpec(ContractModel):
         """Register an error-mining run; the defaults are G=16, J=8, C=8, K=4 and M=8.
 
         Args:
-            initial: Job registering the actor, world, verifier and starting checkpoint.
+            initial: Job registering the actor, world and starting checkpoint.
+            episode_judge: The frozen episode judge labelling every continuation.
             selector: Frozen model setting of every point-selector draw.
             critic: Frozen model setting of every critic draw.
             attempts: Group size ``G``.
@@ -213,6 +221,7 @@ class ActorCriticSpec(ContractModel):
         return cls.model_validate(
             {
                 "initial": group,
+                "episode_judge": episode_judge,
                 "judges": (selector,) * selector_draws,
                 "critics": (critic,) * critic_draws,
                 "points": points,
@@ -240,7 +249,7 @@ class ActorTier(ContractModel):
     Attributes:
         label: Declared tier label.
         actor_model: Actor policy snapshot.
-        profile_sha256: Digest of the actor, harness, budget, sampling, world and verifier,
+        profile_sha256: Digest of the actor, harness, budget, sampling, world and judge,
             excluding the checkpoint and the calls left there.
     """
 
@@ -298,8 +307,8 @@ class MiningCounts(ContractModel):
         suffixes_per_point: Planned continuations per distinct point ``M``.
         continuations_planned: ``points_distinct * M``.
         continuations_recorded: Continuation branches saved across every point study.
-        continuations_graded: Recorded branches with a known pass or fail.
-        continuations_unknown: Recorded branches without a known grade.
+        continuations_graded: Recorded branches the episode judge scored pass or fail.
+        continuations_unknown: Recorded branches without a judged pass or fail.
         point_failures: Points whose continuations could not run.
     """
 
@@ -392,11 +401,12 @@ class PointResult(ContractModel):
         checkpoint: The paired actor/world checkpoint continuations started from.
         meaning: What the measured rate is conditional on.
         study: Saved continuation study, or None when it could not run.
-        outcome: Graded outcome counts.
-        group: Group-relative advantages of the point's continuations.
+        outcome: Judged outcome counts.
+        group: Group-relative advantages of the point's judged continuation rewards.
         failure: Why continuations could not run.
         tier: Policy tier the continuations were sampled under.
         cost: Measured cost of the point's continuation study, when it ran.
+        judged: Saved judging of the point's continuations, when they ran.
     """
 
     point: int
@@ -408,6 +418,7 @@ class PointResult(ContractModel):
     failure: str | None
     tier: ActorTier | None = None
     cost: StudyCost | None = None
+    judged: ArtifactInput | None = None
 
 
 class ActorCriticReport(ContractModel):
@@ -540,7 +551,10 @@ def run_actor_critic(
             _continue(project, spec, packet, point, loader, catalog, code_revision)
             for point in chosen
         )
-        group_tier = actor_tier(spec.actor_tier, estimate_meaning(spec.initial, start))
+        group_tier = actor_tier(
+            spec.actor_tier,
+            estimate_meaning(spec.initial, start, judge=spec.episode_judge.definition),
+        )
         policy_groups(points)
         if any(row.tier is not None and row.tier != group_tier for row in points):
             raise ValueError("a continuation group was sampled under a different tier")
@@ -576,6 +590,7 @@ def run_actor_critic(
         dependencies = {source, *(d.response for d in (*judges, *critics) if d.response)}
         dependencies |= {d.transcript for d in (*judges, *critics) if d.transcript}
         dependencies |= {r.study for r in points if r.study} | {r.checkpoint for r in points}
+        dependencies |= {r.judged for r in points if r.judged}
         store.write_json(
             artifact_id=result_id,
             artifact_type="actor-critic-report",
@@ -604,8 +619,9 @@ def export_point_harbor(
     """Package one chosen point as a Harbor environment that starts exactly there.
 
     The environment uses the run's own world runtime, so tool calls are answered by the same
-    world model and learned rules the continuations ran against. Without a qualification for
-    the exact task the package is diagnostic and awards no reward.
+    world model and learned rules the continuations ran against, and its reward is the run's
+    frozen episode judge over the trial ledger. Without a qualification for the exact task the
+    package is diagnostic and awards no reward.
 
     Args:
         project: Project holding the run.
@@ -627,7 +643,7 @@ def export_point_harbor(
     if point not in rows:
         raise ValueError(f"point {point} was not chosen in this run; choose from {sorted(rows)}")
     job = _point_job(report.spec, rows[point].checkpoint)
-    task = ExecutableTask(intent=intent, job=job)
+    task = ExecutableTask(intent=intent, job=job, judge=report.spec.episode_judge)
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=code_revision
     )
@@ -849,10 +865,10 @@ def _continue(
     catalog: ModelCatalog,
     code_revision: str,
 ) -> PointResult:
-    """Run or replay one point's continuations, grade them and measure their cost."""
+    """Run or replay one point's continuations, judge them and measure their cost."""
     checkpoint = packet.pool.points[point]
     job = _point_job(spec, checkpoint)
-    meaning = estimate_meaning(job, loader(checkpoint))
+    meaning = estimate_meaning(job, loader(checkpoint), judge=spec.episode_judge.definition)
     tier = actor_tier(spec.actor_tier, meaning)
     point_id = f"point-{point}"
     try:
@@ -872,13 +888,11 @@ def _continue(
             failure=(type(error).__name__ + ": " + str(error))[:2000],
             tier=tier,
         )
-    labels = known_outcomes(branch.assessment for branch in study.branches)
-    rewards = tuple(
-        None
-        if branch.assessment is None or branch.assessment.status == "unassessable"
-        else float(branch.assessment.status == "pass")
-        for branch in study.branches
+    judged_ref, judged = judge_study(
+        project, reference, spec.episode_judge, code_revision=code_revision
     )
+    rewards = slot_rewards(project, judged.branches, judged.judge)
+    labels = [int(reward) for reward in rewards if reward is not None]
     return PointResult(
         point=point,
         checkpoint=checkpoint,
@@ -895,6 +909,7 @@ def _continue(
         failure=None,
         tier=tier,
         cost=_study_cost(project, job, study, catalog, code_revision),
+        judged=judged_ref,
     )
 
 

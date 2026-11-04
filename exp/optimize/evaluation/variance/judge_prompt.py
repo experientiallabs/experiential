@@ -18,7 +18,12 @@ from pydantic import Field
 from exp.common.core.artifacts import ContractModel, sha256_bytes, sha256_json
 from exp.common.models import ModelSnapshot
 from exp.common.tasks import ToolSchema
-from exp.optimize.evaluation.variance.episodes import CriterionStatus, JudgeProfile, Verdict
+from exp.optimize.evaluation.variance.episodes import (
+    JUDGE_INPUT_BYTES,
+    CriterionStatus,
+    JudgeProfile,
+    Verdict,
+)
 
 JUDGE_PROMPT_VERSION = "episode-judge-prompt-v1"
 """Version label of :data:`JUDGE_PROMPT` and its schemas; change it whenever either changes."""
@@ -216,6 +221,7 @@ def judge_profile(
     temperature: float = 0.0,
     reasoning_effort: str | None = None,
     evidence_tool_budget: int = 0,
+    maximum_input_bytes: int = JUDGE_INPUT_BYTES,
 ) -> JudgeProfile:
     """Build a judge profile bound to this module's prompt and schemas.
 
@@ -226,6 +232,8 @@ def judge_profile(
         temperature: Sampling temperature.
         reasoning_effort: Requested reasoning effort, or None for the model default.
         evidence_tool_budget: Ranges the judge may read when the evidence does not fit whole.
+        maximum_input_bytes: Whole serialized request ceiling per judge request; the admitted
+            request settings must use the same value.
 
     Returns:
         The frozen profile.
@@ -240,4 +248,5 @@ def judge_profile(
         maximum_output_tokens=maximum_output_tokens,
         reasoning_effort=reasoning_effort,
         evidence_tool_budget=evidence_tool_budget,
+        maximum_input_bytes=maximum_input_bytes,
     )
