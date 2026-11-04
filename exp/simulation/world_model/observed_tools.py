@@ -50,6 +50,31 @@ def observed_tool_schemas(calls: Iterable[tuple[str, JsonValue]]) -> tuple[ToolS
     )
 
 
+def signature_calls(calls: Iterable[tuple[str, JsonValue]]) -> list[tuple[str, JsonValue]]:
+    """Collapse recorded calls to one call per tool name carrying every observed argument name.
+
+    :func:`observed_tool_schemas` reads only tool names and argument names, so the collapsed
+    inventory yields exactly the same schemas while staying as small as the tool vocabulary.
+    Callers that merge one large shared inventory with many small per-trace ones use it to
+    avoid re-scanning every recorded call per trace.
+
+    Args:
+        calls: Recorded ``(tool name, arguments)`` pairs, in any order.
+
+    Returns:
+        One ``(name, {argument: None, ...})`` pair per distinct name, sorted by name.
+
+    Raises:
+        ValueError: A recorded call's arguments are not a JSON object.
+    """
+    arguments: dict[str, set[str]] = {}
+    for name, values in calls:
+        if not isinstance(values, dict):
+            raise ValueError("Observed tool arguments must be JSON objects for tool simulation")
+        arguments.setdefault(name, set()).update(values)
+    return [(name, dict.fromkeys(sorted(keys))) for name, keys in sorted(arguments.items())]
+
+
 def observed_calls(transitions: Iterable[RAGTransition]) -> list[tuple[str, JsonValue]]:
     """Recorded tool calls of real transitions, skipping message transitions.
 
