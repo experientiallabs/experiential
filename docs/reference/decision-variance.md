@@ -183,7 +183,10 @@ The tools read only frozen documents: trace steps, actor outputs, grader evidenc
 prefixes, the saved world state at each offered point (by JSON pointer), the public task and
 harness definition, declared tool schemas with their rule-book contracts, registered references,
 side-by-side attempt comparisons, divergence points across the group and, when a
-`traceml-labels` artifact is registered as a `traceml_labels` reference, step labels and moves.
+`traceml-labels` artifact is registered as a `traceml_labels` reference, step labels and moves
+and, when an `error-points` artifact is registered as an `error_points` reference, each attempt's
+points ranked by the error tags of the steps decided there (`read_error_points`, locators
+`errors:<n>` and `errors:<n>/point:<k>`).
 `retrieval` registers a `TraceSearchSpec`: tag-aware retrieval (with the `TagRetrievalBinding`)
 over a fit-only index restricted to a world-learning `CorpusScope`; held-out partitions, another
 scope, or any scoped trace outside world learning are refused before any search. Unavailable
@@ -239,7 +242,10 @@ In steady state every `steady_every`-th rollout runs `steady_draws` (15) selecto
 and the rollouts between are actor-only, still judged by the frozen episode judge.
 `register_revision` records a new frozen snapshot of a role and starts a new epoch; records never
 mix epochs. Every plan, completion and revision is an immutable event chained to the one before,
-so the schedule resumes and replays from disk without a model call.
+so the schedule resumes and replays from disk without a model call. A schedule given a nudge
+curriculum (`TrainingScheduleSpec.curriculum`, a `CurriculumPlan` over the records stage's
+curriculum) names the current strength tier's rungs in each plan, strongest first, until only the
+un-nudged targets remain; without one its identity and plans are unchanged.
 
 ## Decision families
 
@@ -269,6 +275,20 @@ so the schedule resumes and replays from disk without a model call.
    unavailable, without evidence, insufficient evidence, rubric problems). Probabilistic criterion
    grading (`variance/grader.py`) may still run, as calibration evidence only; an uncertain
    criterion never decides eligibility.
+
+**Searched scenarios and the nudge ladder** (`variance/family_search.py`). With
+`DecisionFamilySpec.search` set, step 1's scenario draw is replaced by a measured variant search
+(`searched_scenarios`, over `search_variants` and `variant_measurer`): every round's set is
+bound, witnessed, contrasted and measured with the joint measure, and only an admitted set becomes
+the family's scenarios, whose later stages replay the measured variants. With
+`DecisionFamilySpec.ladder` set, an admitted family builds a nudge ladder (`family_ladder`, over
+`build_nudge_ladder` and `ladder_measurer`) over the measured state whose free agents least often
+chose its correct option (`ladder_base`). Every curriculum rung (each admitted nudged rung,
+strongest first, then always the un-nudged base) is recorded as its own `RungTask` with its
+strength, ladder position, judge binding and replayed variant. Both hooks need the joint measure,
+stay out of the draws identity while unset, and bind each scenario set through one
+`FamilyBinder`: the caller's judge function is asked for a whole set at a time, before any of the
+set's contrasts, so a caller can author one frozen world, rubric and judge per set.
 
 **Initialization modes.** A scenario starts by `resume` (the coherent actor-visible prefix and its
 remaining calls) or `fresh_briefing` (an authored `FreshBriefing` at the fork, with the same
@@ -374,7 +394,11 @@ rubric against the design checks with forced, cited verdicts, and the host refus
 violation. The plan prices labeling (two draws per labeler variant), curation (three draws),
 authoring including critic reviews (`RubricAuthoringProfile.draws`) and one reviser plus critic
 review per revision round. Judged criteria have three roles: `required_correctness` decides
-success; `efficiency_diagnostic` and `behavior_diagnostic` are reported and never decide it.
+success; `efficiency_diagnostic` and `behavior_diagnostic` are reported and never decide it. The
+rubric author (`rubric-author-v4`) may write either diagnostic role, and a library entry decided
+`diagnostic` is cited only by diagnostic criteria; a bad-behavior linter decided `diagnostic` is
+cited only by `behavior_diagnostic` criteria (`behavior-library-v2`), which the judge reports but
+never requires.
 
 `variance/rubric_revision.py` revises a rubric from judging. `judged_problems` collects
 judge-reported rubric problems, calibration misses, coverage gaps attributable to the rubric and
@@ -532,7 +556,8 @@ with forced, cited answers; code checks only coverage and citations, and a move 
 majority of the usable judgments (minority claims are recorded as contested). The pipeline's
 `traceml.move_judge` is required whenever the stage runs, and every draw is saved and replayed.
 With `traceml.error_bank`, each tier's attempts are also error tagged as wholes (the coalition's
-mistake patterns) and step by step (error-ranked points, recorded for review). Uncertain steps
+mistake patterns) and step by step (error-ranked points, saved as each tier's `error-points`
+artifact and registered as its selectors' and critics' `error_points` reference). Uncertain steps
 stay in every count and refused traces are listed in the coverage manifest. The saved
 `traceml-labels` artifact (`persist_traceml_labels`) carries labels, moves, coverage and per-tier
 comparisons; selectors, critics and rubric authors may read it, and `candidate_points` maps moves
@@ -624,17 +649,36 @@ What the stages read beyond their own owners lives in `variance/pipeline_inputs.
   (`decision_free_repeats`), with an open-weight classifier (`decision_classifier`, default the
   scenario author) and clarity reviewer (`decision_reviewer`, default the rubric author), and
   admission requires the joint verdict.
-- **Version 2 selector records.** The records stage scores each tier's selector picks by the
-  joint decision-variance score of the family built from that point (`family_decisions`); a
-  point whose family was measured but not admitted scores zero, and a pick with no measured
-  family stays unscored. A family's eligibility names the `decision_variance` condition when the
+- **Version 2 selector records.** The records stage scores every selector draw. With
+  `records.point_decisions` (default on), every continued point of each tier's run gets its
+  options derived from its judged continuations (`variance/point_options.py`): an agentic option
+  proposer (`records.option_proposer`, default the decision author) draws once per stance
+  (`action_clustering`, `outcome_contrast`, `commitment_tracing`), each option citing the
+  continuation events that show it, and a reconciling draw merges two or more valid proposals;
+  each judged continuation is then classified by the shared choice classifier
+  (`classify_free_study`, `records.option_classifier`, default the family classifier) into a
+  `PointDecision`. A point a family was measured from also carries that family's joint score
+  (`family_decisions`), which decides its value; a point whose family was measured but not
+  admitted scores zero. Each point is saved as a `point-options` artifact and replays without
+  calls; the plan prices every proposer, reconcile and classifier draw. A family's eligibility names the `decision_variance` condition when the
   joint measure blocks it.
-- **Nudges, the nudge ladder and variant search** (`variance/nudge_ladder.py`,
-  `variance/variant_search.py`). Their owners measure a set of scenarios, or a ladder of
-  instruction nudges from strongest to none, under one frozen judge and rubric with the same
-  joint measure. The pipeline does not yet run them: the family owner offers no hook for a
-  searched scenario set or a ladder in place of its single scenario draw, so each family still
-  authors one scenario set.
+- **Variant search and the nudge ladder** (`variance/variant_search.py`,
+  `variance/nudge_ladder.py`, wired by `variance/family_search.py`). On by default with the
+  decision measure (`authoring.variant_search`, `authoring.nudge_ladder`): each family's
+  scenarios come from up to `authoring.search_rounds` measured search rounds on
+  `authoring.search_author` (default the scenario author), and each admitted family builds a
+  ladder of up to `authoring.ladder_rounds` rounds with nudges of `authoring.ladder_strengths` on
+  `authoring.nudge_author` (default the scenario author), leak- and realism-reviewed by
+  `authoring.nudge_reviewer` (default the rubric author), all open-weight. Each search round's set
+  and each ladder round's rungs get their own packet, world, rubric, freeze and judges, so every
+  rung of one measured round shares one rubric. The plan prices every round at its ceiling
+  (`variance/pipeline_ladder.py`). A re-registration under revised judges contrasts one scenario
+  draw; the search and ladder of the first registration stay recorded on the family's outcome.
+  The records stage turns the ladders of admitted families into one curriculum
+  (`RecordsOutputs.curriculum`, from `nudge_curriculum`): admitted rungs from strong to weak,
+  every un-nudged target last. A `TrainingScheduleSpec` given that curriculum as a
+  `CurriculumPlan` names the current strength tier's rungs in every rollout plan
+  (`RolloutPlan.curriculum`), moving to the next tier every `rollouts_per_tier` rollouts.
 - **Option actions.** The decision-state author gives each option its executable first call
   (`DecisionOption.call`). When `authoring.actions` is empty the family forces those calls
   (`option_calls`); an option without a call becomes the family's recorded failure. Explicit
