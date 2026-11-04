@@ -1203,6 +1203,18 @@ def dispositions_for(project: ProjectStore, report: PipelineReport) -> tuple[Aud
     return tuple(found[key] for key in sorted(found))
 
 
+def reviewed(run: Run, dispositions: tuple[AuditDisposition, ...]) -> PipelineReport:
+    """Run or replay the reviewed registration, so its families stage is saved.
+
+    Tests that change only a records field compare against this run. Running it here, instead of
+    relying on an earlier test having run it, keeps each test independent of order and of how a
+    runner distributes the module.
+    """
+    report = run.run(make_spec(run.fixture, run.rubric, run.bank, dispositions=dispositions))
+    assert report.complete
+    return report
+
+
 @pytest.fixture(scope="module")
 def pipeline(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Run, PipelineReport]]:
     """Run the whole pipeline once over a fresh two-tier grounded project."""
@@ -1316,6 +1328,7 @@ def test_a_changed_records_field_rekeys_only_the_records_stage(
     """Disabling cross-talk keeps every earlier stage and makes no call."""
     run, first = pipeline
     dispositions = dispositions_for(run.project, first)
+    reviewed(run, dispositions)
     spec = make_spec(run.fixture, run.rubric, run.bank, dispositions=dispositions, crosstalk=False)
     before = run.calls()
     report = run.run(spec)
@@ -1552,6 +1565,7 @@ def test_admitted_variants_are_qualified_before_their_harbor_export(
     run, first = pipeline
     project = run.project
     dispositions = dispositions_for(project, first)
+    reviewed(run, dispositions)
     qualification = ticket_qualification(project, run.fixture.job.study.verifier)
     spec = make_spec(
         run.fixture,
