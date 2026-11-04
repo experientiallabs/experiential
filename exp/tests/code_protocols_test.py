@@ -394,6 +394,24 @@ PROTOCOLS = (
         "f6fd09c20d5584d8009ae756762d3d307d4ade09ce8ff8ad83d4d6a038449e1c",
     ),
     Protocol(
+        "exp.optimize.evaluation.variance.rewards:SELECTOR_OBJECTIVE",
+        "selector-decision-variance-v1",
+        (
+            "exp.optimize.evaluation.variance.rewards:SelectorObjective",
+            "exp.optimize.evaluation.variance.rewards:SelectorScore",
+            "exp.optimize.evaluation.variance.rewards:decision_variance",
+            "exp.optimize.evaluation.variance.rewards:selector_score",
+            "exp.optimize.evaluation.variance.records:selector_records",
+        ),
+        "24d4ef40e1f85b274af268a0816d3e249be7bc7e1a34fea40b4c01f7f8063903",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.schedule:SCHEDULE_PROTOCOL",
+        "variance-schedule-v1",
+        ("exp.optimize.evaluation.variance.schedule",),
+        "0fc1f8f881d0af8ce0d5986c5f5714a85c880a01b740516d959f5066ac7b5533",
+    ),
+    Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",
         "traceml-v1",
         ("exp.simulation.mining.traceml",),
