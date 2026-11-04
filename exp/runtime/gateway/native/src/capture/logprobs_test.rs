@@ -120,6 +120,7 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
         &FrameOutput {
             content: "a".into(),
             refusal: String::new(),
+            ..Default::default()
         },
     );
     probabilities.retain(
@@ -128,6 +129,7 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
         &FrameOutput {
             content: "a".into(),
             refusal: String::new(),
+            ..Default::default()
         },
     );
     let (taken, truncated) = probabilities.take().unwrap();
@@ -159,6 +161,7 @@ fn an_output_frame_without_probabilities_marks_the_sequence_incomplete() {
             &FrameOutput {
                 content: "a".into(),
                 refusal: String::new(),
+                ..Default::default()
             },
         );
         assert!(probabilities.take().unwrap().1);
@@ -213,6 +216,7 @@ fn records_on_the_wrong_channel_mark_the_sequence_incomplete() {
         &FrameOutput {
             content: "a".into(),
             refusal: String::new(),
+            ..Default::default()
         },
     );
     // The misaligned frame is never retained; retention ends before it.
@@ -244,6 +248,7 @@ fn records_must_reproduce_the_emitted_text_exactly() {
             &FrameOutput {
                 content: text.into(),
                 refusal: String::new(),
+                ..Default::default()
             },
         );
         probabilities.take().unwrap().1
@@ -275,16 +280,19 @@ fn misaligned_and_refusal_frames_end_retention_without_entering_it() {
     let output = |content: &str, refusal: &str| FrameOutput {
         content: content.into(),
         refusal: refusal.into(),
+        ..Default::default()
     };
     probabilities.retain(Some(&json!({"content":[one("a")]})), 0, &output("a", ""));
-    // Records spelling more than the frame emitted are not retained.
+    // Records may run ahead of the text (a held-back token), but text that
+    // then disagrees with them is a hole and is not retained.
     probabilities.retain(
         Some(&json!({"content":[one("b"), one("c")]})),
         0,
         &output("b", ""),
     );
+    probabilities.retain(Some(&json!({"content":[one("d")]})), 0, &output("xd", ""));
     let (taken, truncated) = probabilities.take().unwrap();
-    assert_eq!(taken.len(), 1);
+    assert_eq!(taken.len(), 2);
     assert!(truncated);
     let mut probabilities = ChatProbabilities::Capture(Buffer::default());
     probabilities.retain(Some(&json!({"refusal":[one("no")]})), 0, &output("", "no"));
@@ -316,6 +324,7 @@ fn each_record_is_checked_by_its_own_representation() {
             &FrameOutput {
                 content: text.into(),
                 refusal: String::new(),
+                ..Default::default()
             },
         );
         probabilities.take().unwrap().1
@@ -343,4 +352,207 @@ fn off_and_caller_states_never_capture() {
     assert!(!ChatProbabilities::Off.captures());
     assert!(!ChatProbabilities::Caller.captures());
     assert!(ChatProbabilities::Capture(Buffer::default()).captures());
+}
+
+fn record(token: &str) -> serde_json::Value {
+    json!({"token": token, "logprob": -1.0, "bytes": token.as_bytes(), "top_logprobs": []})
+}
+
+fn frame(reasoning: &str, content: &str, finishes: bool) -> FrameOutput {
+    FrameOutput {
+        content: content.into(),
+        reasoning: reasoning.into(),
+        finishes,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_reasoning_model_keeps_its_whole_token_sequence() {
+    // vLLM with a reasoning parser: reasoning tokens' records on `content`,
+    // the end-of-thinking delimiter in a frame of its own, then the answer,
+    // then a stop token on the finishing frame.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("Think")]})),
+        0,
+        &frame("Think", "", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record(" more")]})),
+        0,
+        &frame(" more", "", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record("</think>")]})),
+        0,
+        &frame("", "", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record("Hi")]})),
+        0,
+        &frame("", "Hi", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record("!"), record("<|user|>")]})),
+        0,
+        &frame("", "!", true),
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert!(!truncated);
+    let tokens: Vec<String> = taken
+        .iter()
+        .flat_map(|delta| delta.logprobs.as_ref().unwrap().content.clone().unwrap())
+        .map(|record| record.token)
+        .collect();
+    assert_eq!(
+        tokens,
+        ["Think", " more", "</think>", "Hi", "!", "<|user|>"]
+    );
+}
+
+#[test]
+fn speculative_frames_spanning_reasoning_delimiter_and_answer_align() {
+    // MTP / speculative decoding emits several tokens per frame.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("ok"), record("</think>"), record("Hel"), record("lo")]})),
+        0,
+        &frame("ok", "Hello", false),
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(!truncated);
+}
+
+#[test]
+fn silent_tokens_anywhere_else_end_retention() {
+    // A silent token after the answer started is a hole once text follows.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("Hi")]})),
+        0,
+        &frame("", "Hi", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record("<x>")]})),
+        0,
+        &frame("", "", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record("!")]})),
+        0,
+        &frame("", "!", false),
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 2);
+    assert!(truncated);
+    // One silent delimiter before the answer, not two.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("a"), record("</think>")]})),
+        0,
+        &frame("a", "", false),
+    );
+    probabilities.retain(
+        Some(&json!({"content":[record("<y>"), record("b")]})),
+        0,
+        &frame("", "b", false),
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(truncated);
+    // Records leading the text past the bound are a hole.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    let long = "x".repeat(MAXIMUM_RECORD_LEAD_BYTES + 1);
+    probabilities.retain(
+        Some(&json!({"content":[record(&long)]})),
+        0,
+        &frame("", "", false),
+    );
+    assert!(probabilities.take().unwrap().1);
+    // Reasoning records that do not spell the reasoning are a hole.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("x")]})),
+        0,
+        &frame("a", "", false),
+    );
+    assert!(probabilities.take().unwrap().1);
+}
+
+#[test]
+fn reasoning_without_records_still_keeps_the_answer() {
+    // A provider that prices only the answer (records on answer frames only).
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(None, 0, &frame("thinking", "", false));
+    probabilities.retain(
+        Some(&json!({"content":[record("Hi")]})),
+        0,
+        &frame("", "Hi", true),
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(!truncated);
+}
+
+#[test]
+fn tool_call_frames_with_records_stay_a_hole() {
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("{")]})),
+        0,
+        &FrameOutput {
+            opaque: true,
+            ..Default::default()
+        },
+    );
+    assert!(probabilities.take().unwrap().1);
+}
+
+/// Replay one recorded vLLM stream (house HEL2 box, 2026-11-04, prompt "Say
+/// hi in 3 words.", `logprobs: true` as injection sends it) through the
+/// OpenAI-compatible normalizer in capture mode.
+fn replay(stream: &str) -> (usize, bool, String) {
+    let mut normalizer =
+        crate::dialects::Normalizer::new(crate::dialects::Dialect::OpenAiCompatible);
+    normalizer.enable_logprobs_capture();
+    for line in stream.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data.starts_with('{') {
+                normalizer
+                    .feed(&crate::sse::SseEvent {
+                        event: None,
+                        data: data.to_owned(),
+                    })
+                    .unwrap();
+            }
+        }
+    }
+    let (deltas, truncated) = normalizer.take_captured_logprobs().unwrap();
+    let tokens: String = deltas
+        .iter()
+        .flat_map(|delta| delta.logprobs.as_ref().unwrap().content.clone().unwrap())
+        .map(|record| record.token)
+        .collect();
+    (deltas.len(), truncated, tokens)
+}
+
+#[test]
+fn a_recorded_glm_mtp_stream_is_captured_whole() {
+    let (frames, truncated, tokens) = replay(include_str!("fixtures/vllm_glm53_mtp_logprobs.sse"));
+    assert!(!truncated);
+    assert_eq!(frames, 3);
+    assert_eq!(tokens, "</think>Hi there, friend!<|user|>");
+}
+
+#[test]
+fn a_recorded_deepseek_stream_with_held_back_text_is_captured_whole() {
+    // vLLM's incremental detokenizer emits some tokens' text a frame late, so
+    // records run up to a few bytes ahead of the reasoning text.
+    let (frames, truncated, tokens) =
+        replay(include_str!("fixtures/vllm_dsv41_dspark_logprobs.sse"));
+    assert!(!truncated);
+    assert_eq!(frames, 21);
+    assert!(tokens.starts_with("We need answer exactly"));
 }

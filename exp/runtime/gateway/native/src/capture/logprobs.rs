@@ -183,35 +183,158 @@ pub(crate) fn may_be_refusal(failure: &Failure) -> bool {
             .is_none_or(|param| param == "logprobs" || param == "top_logprobs")
 }
 
-/// The answer text one frame emits on each channel (empty when none).
+/// The text one frame emits on each channel (empty when none), and the frame
+/// facts that decide where tokens which emit no text may sit.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrameOutput {
     pub content: String,
     pub refusal: String,
+    /// Reasoning text the provider emitted in this frame (`reasoning_content`
+    /// or `reasoning`). A self-hosted reasoning model (vLLM with a reasoning
+    /// parser) reports these tokens' probabilities on the `content` channel,
+    /// before the answer's.
+    pub reasoning: String,
+    /// The frame carries a finish reason: tokens after its text (a stop or
+    /// end-of-turn token the provider does not render) end the sequence.
+    pub finishes: bool,
+    /// The frame emits output this check cannot spell (tool or function call
+    /// arguments): any records on it are a hole, as before.
+    pub opaque: bool,
 }
 
-/// Whether a channel's records reproduce exactly the text it emitted, each
-/// record by its bytes when it carries them and by its token text otherwise.
-fn reproduces(records: Option<&Vec<TokenLogprob>>, text: &str) -> bool {
-    let mut produced = Vec::with_capacity(text.len());
-    for record in records.map_or(&[][..], Vec::as_slice) {
-        match &record.bytes {
-            Some(bytes) => produced.extend_from_slice(bytes),
-            None => produced.extend_from_slice(record.token.as_bytes()),
+fn record_bytes(record: &TokenLogprob) -> &[u8] {
+    record.bytes.as_deref().unwrap_or(record.token.as_bytes())
+}
+
+/// Bytes the records may run ahead of the emitted text. An OpenAI-compatible
+/// server detokenizes incrementally and may hold back a token's text (a quote,
+/// a space, a partial UTF-8 sequence) until the next frame, so alignment is
+/// judged on the whole sequence, not frame by frame; a lead past this bound is
+/// text the gateway never saw, a hole.
+const MAXIMUM_RECORD_LEAD_BYTES: usize = 1024;
+
+/// How one capture-only frame's records relate to the text emitted so far.
+#[derive(Debug, PartialEq, Eq)]
+enum Alignment {
+    /// The sequence still spells the emitted text: keep the frame.
+    Retain,
+    /// No records and no text that needed them.
+    Empty,
+    /// A missing, surplus or wrong-channel record: retention ends.
+    Hole,
+}
+
+/// The attempt's alignment state: record bytes not yet matched by emitted
+/// text, token by token, and where in the answer the sequence stands.
+#[derive(Debug, Default)]
+pub(crate) struct Position {
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// Bytes of the front pending token already matched.
+    offset: usize,
+    pending_bytes: usize,
+    /// Answer (content) text has been emitted.
+    answer_started: bool,
+    /// The one silent delimiter before the answer has been skipped.
+    delimiter_seen: bool,
+    /// Whether this provider prices reasoning tokens (decided by the first
+    /// reasoning frame: records present or not).
+    reasoning_priced: Option<bool>,
+}
+
+impl Position {
+    /// Match `text` against the front of the pending record bytes. With
+    /// `delimiter`, one whole token that does not start the text may be
+    /// skipped first (a template's end-of-thinking token, rendered nowhere).
+    fn consume(&mut self, text: &[u8], delimiter: bool) -> bool {
+        let mut position = 0;
+        let mut may_skip = delimiter;
+        while position < text.len() {
+            let Some(front) = self.pending.front() else {
+                // Text the records never spelled.
+                return false;
+            };
+            let rest = &front[self.offset..];
+            let take = rest.len().min(text.len() - position);
+            if rest[..take] != text[position..position + take] {
+                if may_skip && self.offset == 0 && position == 0 {
+                    let skipped = self.pending.pop_front().map_or(0, |token| token.len());
+                    self.pending_bytes -= skipped;
+                    self.delimiter_seen = true;
+                    may_skip = false;
+                    continue;
+                }
+                return false;
+            }
+            position += take;
+            self.offset += take;
+            if self.offset == front.len() {
+                let done = self.pending.pop_front().map_or(0, |token| token.len());
+                self.pending_bytes -= done;
+                self.offset = 0;
+            }
+        }
+        true
+    }
+
+    /// Align one frame: append its records, then match its reasoning text and
+    /// its answer text, in that order. Tokens that emit no text are accepted at
+    /// two places only: once before the first answer text (the delimiter), and
+    /// still unmatched when the frame finishes (stop or end-of-turn tokens).
+    fn align(&mut self, delta: &ChoiceLogprobsDelta, output: &FrameOutput) -> Alignment {
+        let (content, refusal) = delta.logprobs.as_ref().map_or((None, None), |logprobs| {
+            (logprobs.content.as_deref(), logprobs.refusal.as_deref())
+        });
+        let records = content.unwrap_or(&[]);
+        if refusal.is_some_and(|r| !r.is_empty()) || (output.opaque && !records.is_empty()) {
+            // Refusal records beside answer text are on the wrong channel; tool
+            // call arguments are output this check cannot spell.
+            return Alignment::Hole;
+        }
+        if !output.reasoning.is_empty() && self.reasoning_priced.is_none() {
+            self.reasoning_priced = Some(!records.is_empty());
+        }
+        if records.is_empty() && output.content.is_empty() {
+            // Reasoning text alone is matched only when the provider prices it.
+            if self.reasoning_priced == Some(true) && !output.reasoning.is_empty() {
+                return if self.consume(output.reasoning.as_bytes(), false) {
+                    Alignment::Empty
+                } else {
+                    Alignment::Hole
+                };
+            }
+            return Alignment::Empty;
+        }
+        for record in records {
+            let bytes = record_bytes(record);
+            if !bytes.is_empty() {
+                self.pending_bytes += bytes.len();
+                self.pending.push_back(bytes.to_vec());
+            }
+        }
+        if self.reasoning_priced == Some(true) && !self.consume(output.reasoning.as_bytes(), false)
+        {
+            return Alignment::Hole;
+        }
+        if !output.content.is_empty() {
+            let delimiter = !self.answer_started && !self.delimiter_seen;
+            if !self.consume(output.content.as_bytes(), delimiter) {
+                return Alignment::Hole;
+            }
+            self.answer_started = true;
+        }
+        if output.finishes {
+            self.pending.clear();
+            self.pending_bytes = 0;
+            self.offset = 0;
+        } else if self.pending_bytes > MAXIMUM_RECORD_LEAD_BYTES {
+            return Alignment::Hole;
+        }
+        if records.is_empty() {
+            Alignment::Empty
+        } else {
+            Alignment::Retain
         }
     }
-    produced == text.as_bytes()
-}
-
-/// Whether the frame has any records, and whether they cover every channel's
-/// emitted text exactly (a missing, partial or wrong-channel record does not).
-fn covers(delta: &ChoiceLogprobsDelta, output: &FrameOutput) -> (bool, bool) {
-    let (content, refusal) = delta.logprobs.as_ref().map_or((None, None), |logprobs| {
-        (logprobs.content.as_ref(), logprobs.refusal.as_ref())
-    });
-    let any = content.is_some_and(|r| !r.is_empty()) || refusal.is_some_and(|r| !r.is_empty());
-    let complete = reproduces(content, &output.content) && reproduces(refusal, &output.refusal);
-    (any, complete)
 }
 
 /// How a normalizer treats Chat probabilities on its wire.
@@ -260,15 +383,18 @@ impl ChatProbabilities {
                 // captured answer; otherwise retention ends before it. Refusal
                 // text is not rendered on every surface (Messages drops it), so
                 // a refusal frame always ends retention.
-                Ok(Some(delta)) if output.refusal.is_empty() => match covers(&delta, output) {
-                    (true, true) => buffer.push(delta),
-                    (false, true) => {}
-                    (_, false) => buffer.truncated = true,
-                },
-                Ok(Some(_)) => buffer.truncated = true,
-                Ok(None) => {
-                    buffer.truncated |= !output.content.is_empty() || !output.refusal.is_empty();
+                Ok(parsed) if output.refusal.is_empty() => {
+                    let delta = parsed.unwrap_or(ChoiceLogprobsDelta {
+                        choice_index,
+                        logprobs: None,
+                    });
+                    match buffer.position.align(&delta, output) {
+                        Alignment::Retain => buffer.push(delta),
+                        Alignment::Empty => {}
+                        Alignment::Hole => buffer.truncated = true,
+                    }
                 }
+                Ok(_) => buffer.truncated = true,
                 Err(_) => buffer.truncated = true,
             }
         }
@@ -342,6 +468,8 @@ pub(crate) struct Buffer {
     pub deltas: Vec<ChoiceLogprobsDelta>,
     pub bytes: usize,
     pub truncated: bool,
+    /// Alignment state across the attempt's frames.
+    pub position: Position,
 }
 
 impl Buffer {

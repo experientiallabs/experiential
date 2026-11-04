@@ -252,9 +252,31 @@ impl Normalizer {
                     _ => String::new(),
                 }
             };
+            let delta = choice.get("delta");
+            let reasoning = match delta
+                .and_then(|delta| delta.get("reasoning_content"))
+                .filter(|value| !value.is_null())
+            {
+                Some(_) => text("reasoning_content"),
+                None => text("reasoning"),
+            };
+            let present = |key: &str| {
+                delta
+                    .and_then(|delta| delta.get(key))
+                    .is_some_and(|value| match value {
+                        Value::Null => false,
+                        Value::Array(items) => !items.is_empty(),
+                        _ => true,
+                    })
+            };
             let output = crate::capture::logprobs::FrameOutput {
                 content: text("content"),
                 refusal: text("refusal"),
+                reasoning,
+                finishes: choice
+                    .get("finish_reason")
+                    .is_some_and(|reason| reason.is_string()),
+                opaque: present("tool_calls") || present("function_call"),
             };
             self.chat_logprobs
                 .retain(choice.get("logprobs"), choice_index as u32, &output);

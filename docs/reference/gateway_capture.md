@@ -86,10 +86,19 @@ probabilities too. Retention is bounded at 4 MiB per attempt, by the collector's
 response and pending budgets, and by the destination's record ceiling after the
 request and the largest admissible response; an overflow sets `truncated` and
 keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
-`nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
-channel, or a frame whose answer text (not typed thinking or reference parts)
-its records do not reproduce exactly (by their bytes, else their token text),
-is never a
+`nul_replaced` (the token's `bytes` keep it exactly). Alignment is judged on the
+whole sequence: the records (by their bytes, else their token text) must spell
+the emitted reasoning text (`reasoning_content` / `reasoning`, when the provider
+prices reasoning tokens at all) followed by the answer text (not typed thinking
+or reference parts). Records may run ahead of the text by at most 1 KiB, because
+an OpenAI-compatible server detokenizes incrementally and can emit a token's text
+a frame late. Tokens that emit no text are kept at exactly two places: once
+before the first answer text (a template's end-of-thinking delimiter such as
+`</think>`), and on the frame that finishes (stop or end-of-turn tokens). So a
+self-hosted reasoning model (vLLM with a reasoning parser, speculative decoding
+included) retains its full token sequence, reasoning first. A malformed
+probability channel, text the records never spelled, a silent token anywhere
+else, or records on a tool-call frame is never a
 failure: it ends retention before that frame and marks the prefix `truncated`.
 Refusal text is not rendered on every surface, so a refusal frame ends
 retention the same way. The record's
