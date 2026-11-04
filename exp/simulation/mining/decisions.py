@@ -26,12 +26,15 @@ value, which is why it is an argument here rather than part of any persisted spe
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelSnapshot
+from exp.common.project.errors import ArtifactStoreError
+from exp.common.project.request_budget import validate_provider_response
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_QUESTIONS,
     DecisionRequest,
@@ -146,6 +149,7 @@ class DecisionsTraceTagger:
         self.maximum_concurrency = maximum_concurrency
         self._decide = decide
         self._model_id = model.model_id
+        self._provider_model_id = model.model_id
 
     @classmethod
     def for_alias(
@@ -215,13 +219,15 @@ class DecisionsTraceTagger:
 
             return run_with_retry(attempt, policy=policy)
 
-        return cls(
+        tagger = cls(
             decide,
             resolved.snapshot,
             cache=cache,
             batch_limit=batch_limit,
             maximum_concurrency=maximum_concurrency,
         )
+        tagger._provider_model_id = profile.model_id
+        return tagger
 
     def tag(self, units: Sequence[Unit], bank: QuestionBank) -> TagMatrix:
         """Answer the whole bank about every unit, replaying what this project already bought.
@@ -322,6 +328,33 @@ class DecisionsTraceTagger:
                 tokens += int(_number(usage.get("input_tokens")) or 0)
         return _UnitAnswers(values=tuple(values), bought=bought, spend=spend, tokens=tokens)
 
+    def validate_unit(self, unit: Unit, bank: QuestionBank) -> None:
+        """Validate every input batch before a parallel pass claims or dispatches this unit.
+
+        Raises:
+            TraceTaggingError: Input cannot cross the existing credential boundary.
+        """
+        for chunk in question_chunks(bank.questions, self.batch_limit):
+            self._request(unit, chunk)
+
+    def _request(self, unit: Unit, chunk: Sequence[Question]) -> DecisionRequest:
+        """Build and validate the exact native input without claiming its decision cache key."""
+        request = DecisionRequest(
+            state=unit.text,
+            questions={
+                question.question_id: NoulQuestion(instructions=question.text) for question in chunk
+            },
+        )
+        try:
+            validate_provider_response(
+                json.dumps(request.provider_body(self._provider_model_id), ensure_ascii=False)
+            )
+        except ArtifactStoreError:
+            raise TraceTaggingError(
+                "decision input violates the credential boundary; unit excluded before dispatch"
+            ) from None
+        return request
+
     def _body(self, unit: Unit, chunk: Sequence[Question]) -> tuple[JsonObject, bool]:
         """Return one batch's response and whether this run paid for it.
 
@@ -335,12 +368,7 @@ class DecisionsTraceTagger:
         Returns:
             The response body, and True when a provider call was actually dispatched.
         """
-        request = DecisionRequest(
-            state=unit.text,
-            questions={
-                question.question_id: NoulQuestion(instructions=question.text) for question in chunk
-            },
-        )
+        request = self._request(unit, chunk)
         if self.cache is None:
             return self._decide(request), True
         dispatched = False

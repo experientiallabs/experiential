@@ -116,6 +116,30 @@ def test_the_tagger_satisfies_the_shared_seam() -> None:
     assert isinstance(tagger, TraceTagger)
 
 
+def test_unsafe_input_is_refused_before_cache_claim_or_native_dispatch(tmp_path: Path) -> None:
+    """Credential-shaped input creates neither a cache frontier nor a physical request."""
+    bank = _bank()
+    unit = _unit("unsafe", "password = entirely-fake-test-value")
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    profile = GatewayWireProfile(
+        dialect="typesafe_systemone",
+        url="https://example.test/v1/systemone",
+        decisions_url="https://example.test/v1/systemone",
+        model_id="clef",
+    )
+    transport = ScriptedJsonTransport([])
+    tagger = DecisionsTraceTagger.for_alias(
+        _resolved(_Client(profile)), transport=transport, cache=cache
+    )
+    key = decision_key(unit, bank.questions, tagger.model_identity)
+    with pytest.raises(TraceTaggingError, match="unit excluded before dispatch") as caught:
+        tagger.tag([unit], bank)
+    assert "entirely-fake-test-value" not in str(caught.value)
+    assert transport.requests == []
+    assert cache.records.read(f"intent/{key}") is None
+    assert cache.saved(key) is None
+
+
 def test_the_whole_packaged_bank_fits_one_decision() -> None:
     """Repeating a 9,500-token episode per call is the dominant cost, so batching matters."""
     bank = packaged_question_bank()

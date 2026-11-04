@@ -621,12 +621,10 @@ def _tag(
 def _tag_units(
     tagger: DecisionsTraceTagger, units: tuple[Unit, ...], bank: QuestionBank
 ) -> tuple[TagMatrix, tuple[tuple[str, str], ...]]:
-    """Tag units in one pass; when it fails, find each failing trace and keep the rest.
+    """Quarantine invalid inputs, tag the rest in parallel, and retain failed trace evidence.
 
-    A failed pass is retried unit by unit. Committed decisions replay from the cache and a
-    decision whose outcome is unknown is refused by the cache, so finding the failing traces
-    buys nothing the first pass did not already attempt or would not have bought. A spend or
-    admission refusal is not a tagging failure and stops the run.
+    Other tagging failures are isolated unit by unit, replaying committed decisions and refusing
+    unknown outcomes. Spend, admission and artifact-storage refusals still stop the run.
 
     Args:
         tagger: The decision tagger, with a cache.
@@ -641,13 +639,22 @@ def _tag_units(
     """
     if not units:
         raise TraceTaggingError(f"no trace to tag with bank {bank.bank_id}; check the exposure")
+    ready: list[Unit] = []
+    failed: list[tuple[str, str]] = []
+    for unit in units:
+        try:
+            tagger.validate_unit(unit, bank)
+        except TraceTaggingError as exc:
+            failed.append((unit.trace_id, str(exc)))
+        else:
+            ready.append(unit)
     try:
-        return tagger.tag(units, bank), ()
+        if ready:
+            return tagger.tag(ready, bank), tuple(failed)
     except (TraceTaggingError, ProviderTransportError):
         pass
     kept: list[Unit] = []
-    failed: list[tuple[str, str]] = []
-    for unit in units:
+    for unit in ready:
         try:
             tagger.tag([unit], bank)
         except (TraceTaggingError, ProviderTransportError) as exc:
