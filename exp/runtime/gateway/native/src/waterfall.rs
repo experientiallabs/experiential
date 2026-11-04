@@ -502,7 +502,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     )
                     .await
                 {
-                    return Won::Failed(PublicError::internal());
+                    return Won::Failed(guard.settlement_error());
                 }
                 if !possible {
                     return Won::Failed(collection_public_error(&failure.boundary()));
@@ -600,7 +600,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                             )
                             .await
                         {
-                            return Won::Failed(PublicError::internal());
+                            return Won::Failed(guard.settlement_error());
                         }
                         return Won::Failed(collection_public_error(
                             &inspection_failure.boundary(),
@@ -617,7 +617,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     )
                     .await
                 {
-                    return Won::Failed(PublicError::internal());
+                    return Won::Failed(guard.settlement_error());
                 }
                 if let Some(delay) = backoff {
                     // The failed attempt is settled; the wait is the only

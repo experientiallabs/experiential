@@ -465,7 +465,7 @@ async fn respond_from_messages_events(
     };
     if !settled {
         // Success is only reported once the terminal accounting write landed.
-        return messages_error_response(&PublicError::internal());
+        return messages_error_response(&guard.settlement_error());
     }
     let served = Served {
         empty_completion,

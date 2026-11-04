@@ -330,7 +330,7 @@ class NativeControlPlane(
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
             authorization = with_client_identity(authorization, data)  # reporting-only app facts
-            self._accounting.require_clear()
+            self._accounting.require_clear(authorization.organization_id)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
