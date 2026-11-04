@@ -704,138 +704,84 @@ Legacy modes that keep their mechanical contract and are never used for decision
 
 ## Dense error-mode reward
 
-The dense reward is a training signal kept beside the outcome reward, never in place of it. The
-frozen episode judge's verdict stays the only outcome reward (pass 1, fail 0, else unscored). The
-dense signal says where, inside the actor's own actions, a tagged behavior was established as a
-violation (a penalty) or as genuinely useful (a bounded credit).
+The dense reward is a separate bounded training signal. The frozen episode judge remains the
+only outcome reward (pass 1, fail 0, else unscored). `RecordsSettings.dense` freezes its vocabulary
+and request bounds before confirmation grading, executable qualification and Harbor export.
+The records-stage plan prices confirmation judgments; saved records cite every dense assessment
+beside unchanged outcome advantages.
 
-### Frozen definition
+### Frozen definition and judging
 
-`DenseRewardDefinition` (`variance/dense_reward.py`) is authored with the Harbor environment and
-bound to the task as `ExecutableTask.dense` (a `DenseRewardJudge`: the definition plus admitted
-request settings), so it is part of `ExecutableTask.profile()` and of the exported package's
-`profile_sha256`. The package's `frozen-binding.json` also records
-`dense_reward: {schema_version, definition_sha256}` and `task.toml` declares
-`dense_reward = "dense-reward-v1"`. Tag definitions and grading instructions stay on the trusted
-backend and never reach the actor.
+`DenseRewardDefinition` (`variance/dense_reward.py`) binds the task, world and vocabulary.
+`ExecutableTask.dense` holds that definition and its admitted settings, so qualification and
+package identity include it. Grading instructions stay on the trusted backend.
 
-Each `DenseTag` has a polarity (`penalty` or `credit`), an axis (`correctness`, scored, or
-`efficiency`, diagnostic only), a severity (`decisive` only for a correctness penalty), a
-magnitude in (0, 1], grading instructions, `acceptable_when` look-alikes, `sources` (error-tag
-proposition ids and linter locators that propose it) and `obligation_required`. `DenseBounds`
-caps credit per behavior and per episode; the definition refuses an episode cap at or above any
-decisive magnitude.
+Each `DenseTag` declares penalty or credit, correctness or diagnostic efficiency, magnitude,
+grading instructions, acceptable look-alikes, candidate sources and any required obligation.
+Only correctness penalties may be decisive. Credit caps must remain below every decisive penalty.
 
-### Agentic judging
+`judge_dense` (`variance/dense_judge.py`) runs the frozen profile's independent prompt variants.
+Each plans, reads bounded evidence, reports candidate findings and may repair once after host
+validation. Candidates come from the immutable definition, error tags and behavior linters
+(`variance/dense_candidates.py`). They remain hypotheses until judged as absent, acceptable,
+uncertain or established. Malformed and unavailable variants vote uncertain; strict majority
+reconciliation cannot turn missing evidence into an established finding.
 
-`judge_dense` (`variance/dense_judge.py`) judges one `EpisodeEvidence` with every prompt variant
-of the profile (`variance/dense_prompt.py`: obligation-first, chronological and defense stances by
-default, built with `dense_profile`, an open-weight judge alias). Each variant plans, reads ranges
-when the evidence exceeds its input budget, reports one finding per candidate and gets at most one
-repair after host validation. Candidates (`variance/dense_candidates.py`) come from every frozen
-tag (`definition_candidates`), from error tags (`error_tag_candidates` over an
-`ErrorTraceTags` summary) and from behavior linters (`linter_candidates` over `BehaviorGuidance`);
-they are hypotheses, and the judge decides `absent`, `acceptable`, `uncertain` or `established`.
-
-Observing is not establishing. For an `obligation_required` tag such as `modified_evaluation`,
-the host accepts `established` only with the cited obligation (what the task, tests or grader
-required), the actor's cited change, `result_refs` and a `weakening` explanation; otherwise the
-repair is requested and a still unsupported finding votes `uncertain`. Legitimate test
-corrections and alternative valid solutions are `acceptable` (scored, reward 0).
-
-Variants are reconciled by strict majority; without one the finding is `uncertain`. A malformed
-or unavailable variant votes `uncertain`, so it can never help establish anything. Uncertain
-findings are recorded and unscored. Efficiency findings are recorded as diagnostics and never
-scored.
+For an obligation-required tag such as `modified_evaluation`, establishment requires the cited
+obligation, the actor's change, result references and a weakening explanation. Unsupported
+findings become uncertain. Legitimate test corrections and valid alternative repairs are
+acceptable, with zero penalty. Efficiency findings remain unscored diagnostics.
 
 ### Bounded aggregation
 
-`aggregate` assigns rewards:
+`aggregate` scores only established correctness findings. Credits count once per behavior,
+within both behavior and episode caps. A decisive violation suppresses all credit. Penalties
+count each behavior once and are scaled so the episode total stays at least -1; each behavior's
+penalty is divided across its retained findings. Duplicate same-tag findings over already covered
+actor actions earn zero, including duplicate candidates from different sources. Per-finding
+rewards therefore sum to the episode total. Uncertain findings and findings without actor spans
+remain unscored, with their reasons recorded.
 
-- only `established` correctness findings are nonzero; decided non-established ones are 0;
-  uncertain and efficiency findings are None;
-- a credit behavior counts once (its first finding), capped at `per_behavior_credit`; repeats
-  earn 0, so verbosity, repeated checks or extra steps add nothing;
-- total credit is scaled to at most `episode_credit` (strictly below every decisive magnitude);
-- once a decisive violation is established every credit is zeroed, so the episode total is at or
-  below minus the largest decisive magnitude;
-- the episode penalty sums behaviors once each and is scaled so the total is never below -1;
-  a behavior's bounded penalty is split equally across its retained findings;
-- per behavior, a finding whose actor actions an earlier same-tag finding already covers is a
-  duplicate and earns 0, so a behavior proposed by several candidates (definition, error tag,
-  linter) is applied once, and the per-finding rewards always sum to the episode total;
-- an established finding with no actor span (for example one citing only an experiment-imposed
-  action or its reply) is unscored with an `unscored_reason`; host validation already refuses
-  such citations, since observed refs must resolve to the actor's own scored actions or the
-  replies to them.
+### Actor spans and sampled tokens
 
-`dense_reward_test.py` checks these properties over randomized definitions and finding lists.
+`actor_spans` (`variance/dense_spans.py`) maps cited events to their actor occurrences, using
+ordered calls and messages. A world reply binds to its nearest preceding matching call before
+ownership is checked. Repeated provider call IDs cannot redirect a later imposed reply to an
+earlier actor action. Context events and experiment-imposed actions never receive actor credit.
 
-### Spans: rendered versus sampled tokens
+Each `DenseSpan` records the turn, message or tool-call part, rendered character offsets and text
+digest. Tool arguments use sorted-key JSON (`tool-call-arguments-json-v1`). Rendered offsets are
+not sampled-token positions. `SampledTokens` must carry an exact binding and decoded text matching
+the recorded part before `sampled_tokens` granularity is permitted; otherwise granularity is
+`action`. Continuation turns index model calls. Harbor-ledger turns index actor actions, which
+the trainer aligns with its own recorded trajectory.
 
-`actor_spans` (`variance/dense_spans.py`) maps each cited event to the actor's trajectory: a tool
-call by `call_id`, a message or final answer by exact text, and a world reply to the call it
-answers. Context events and experiment-imposed actions never map. Every `DenseSpan` carries
-rendered coordinates: `turn_index`, `part` (`content` or `tool_call`), `tool_call_index`,
-`call_id`, `char_start`/`char_end` within the rendered part text and that text's digest. Tool-call
-text is `json.dumps(arguments, sort_keys=True)` (`tool-call-arguments-json-v1`).
+### Harbor and training records
 
-Rendered offsets are not sampled-token positions. A span carries `sampled` offsets (and
-`granularity: sampled_tokens`) only when the actor's actual sampled tokens were bound
-(`SampledTokens`, from a provider response with token records or the trainer rollout, under a
-named `binding`) and their decoded text reproduces the part text exactly. Otherwise the span is
-`granularity: action`. A continuation branch indexes turns by model call; a Harbor ledger
-(`trajectory_from_ledger`) has one turn per actor action, and the trainer realigns by `call_id`
-or message text.
+`DenseRewardExport` (`dense-reward-v1`) records evidence and definition digests, the separate
+outcome reference, findings and votes, spans, bounded aggregates, trajectory, token binding and
+trainability. A `dense-assessment` also saves judge draws in `inspection.json`.
+`frozen-binding.json` records its schema and definition digest, and `task.toml` declares the
+schema. The Harbor verifier writes `dense.json` beside unchanged `reward.json`, grading both
+signals against the same closed-ledger evidence without exposing grading details to the actor.
 
-### Export schema `dense-reward-v1`
-
-`DenseRewardExport` (`dense.json`): `schema_version`, `episode_id`, `evidence_sha256`,
-`definition_sha256`, `status` (`judged` or `unavailable`), `outcome` (the separate outcome
-reward: judge, assessment, verdict, reward), `findings` (every finding: `tag_id`,
-`candidate_ids`, `decision`, `observed_refs`, `obligation`, `change`, `result_refs`, `weakening`,
-`rationale`, `unscored_reason`, `quote`, `votes`, `axis`, `polarity`, `severity`, `scored`, `reward`, `spans`),
-`episode` (`total`, `credit`, `penalty`, `decisive`, `decisive_magnitude`, `credit_capped`,
-`penalty_scaled`, `scored`, `unscored`, `diagnostics`), `trajectory`, `tool_call_rendering`,
-`sampled_tokens` (the bound binding or null), `granularity` (`sampled_tokens`, `action` or
-`mixed` over rewarded spans), `trainable`, `variants` (each prompt variant's status and saved
-draws) and `failure`. It is saved in a `dense-assessment` artifact with `inspection.json` (every
-draw of every variant).
-
-### Harbor
-
-For a task with both `judge` and `dense`, `ExecutableHarborTrial.result` judges the closed
-ledger's evidence for the outcome, then runs `judge_dense` over the same evidence with
-`definition_candidates` and the ledger trajectory, and adds the export as `result["dense"]`
-(`trainable` is true only when the outcome is rewarded). The verifier (`harbor/client.py`) writes
-it to `dense.json` next to `reward.json`, which is unchanged. The verifier runs in its own
-environment, so unscored findings are recorded and never shown to the actor.
-
-### Training records and the trainer
-
-`attach_dense` (`variance/dense_records.py`) fills `ContinuationGroup.dense` with one
-`DenseEpisode` (findings, spans, episode total) per judged slot, after checking the dense
-assessment judged exactly the evidence the slot's outcome assessment judged. Advantages are
-unchanged.
-
-The external GRPO trainer combines them as `combine_advantages` (`variance/dense_trainer.py`),
-which is the executable specification. For a group of `G` episodes with outcome rewards `R_i`:
+`attach_dense` (`variance/dense_records.py`) fills `ContinuationGroup.dense` only after verifying
+that each dense assessment used the exact evidence judged by its outcome assessment.
+The external trainer can combine the signals with `combine_advantages`
+(`variance/dense_trainer.py`); this API does not implement a GRPO optimizer:
 
 ```text
-A_i     = (R_i - mean_g R) / std_g R        population std over scored episodes; 0 when std = 0
-                                            (group_advantages); unscored R_i masks every token
-D_i,t   = sum of r_f over scored findings f whose placed range covers actor token t
-d_i,t   = clip(beta * D_i,t, -kappa, +kappa)
-A_i,t   = clip(A_i + d_i,t, -C, +C)
+A_i   = (R_i - mean_g R) / std_g R      population std; 0 when std = 0
+D_i,t = sum of rewards for findings covering actor token t
+d_i,t = clip(beta * D_i,t, -kappa, +kappa)
+A_i,t = clip(A_i + d_i,t, -C, +C)
 defaults: beta = 0.5, kappa = 0.5, C = 5
 ```
 
-`r_f` is the export's bounded finding reward; the dense term is not group-normalized because it
-is sparse. `token_rewards` places findings on the trainer's sampled token stream: a span is
-token-local only when it carries `sampled` offsets under the same binding the trainer's rollout
-declares; otherwise its credit falls back to the whole action (every sampled token of that
-message or tool call). `EpisodeTokens` refuses token-local rewards without a declared
-`sampled_binding`, so rendered offsets alone never become token-local credit.
+Unscored outcomes mask every token. The sparse dense term is not group-normalized.
+`token_rewards` uses token-local spans only under the trainer's matching sampled binding;
+otherwise credit applies to the whole actor action. `EpisodeTokens` rejects token-local rewards
+without that binding, so character offsets alone never become token-local credit.
 
 ## TraceML step labels
 

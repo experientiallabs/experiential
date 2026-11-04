@@ -29,7 +29,7 @@ class _BuildStage:
     """The ``variance-build`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """The build reads only its spec and the project's completed build."""
+        """Bind the selected bootstrap task as well as the shared family build."""
         del project
         binding = spec.mining.bootstrap
         return {} if binding is None else {"bootstrap": sha256_json(binding)}
