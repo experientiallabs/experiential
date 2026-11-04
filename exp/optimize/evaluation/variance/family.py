@@ -463,6 +463,7 @@ class _Family:
         relied: tuple[str, ...],
         contrasted: tuple[EstimateMeaning, ...] = (),
         ambiguous: tuple[str, ...] = (),
+        graded: bool = False,
     ) -> TrainingEligibility:
         """Compute eligibility from the family's evidence so far.
 
@@ -473,6 +474,7 @@ class _Family:
             relied: Rule identities the decision state cites.
             contrasted: Meanings of every variant contrast.
             ambiguous: Criteria the rubric grader found ambiguous.
+            graded: Whether the rubric was graded on the confirmed variants without failure.
 
         Returns:
             The computed eligibility.
@@ -490,6 +492,7 @@ class _Family:
             unwitnessed_rules=self.stage.diagnostic,
             meanings=(*meanings, *contrasted),
             ambiguous_criteria=ambiguous,
+            rubric_graded=graded,
         )
 
 
@@ -582,6 +585,12 @@ def _continue(
             )
             for check in row.variant.needs_review
         )
+        if row.stopped is not None and row.stopped.startswith("replay_diverged"):
+            findings.append(
+                audit_finding(
+                    "replay_divergence", {"scenario_id": row.scenario_id, "reason": row.stopped}
+                )
+            )
     measured = {row.scenario_id: row.selection for row in variants if row.selection is not None}
     if not measured:
         base = base.model_copy(update={"variants": tuple(variants)})
@@ -631,6 +640,7 @@ def _continue(
         confirmation=confirmation,
         contrasted=contrasted,
         ambiguous=ambiguous,
+        graded=bool(grades) and grading_failure is None,
         failure=grading_failure,
     )
 
@@ -645,6 +655,7 @@ def _finish(
     confirmation: FlipVerdict | None = None,
     contrasted: tuple[EstimateMeaning, ...] = (),
     ambiguous: tuple[str, ...] = (),
+    graded: bool = False,
     failure: str | None = None,
 ) -> FamilyReport:
     """Compute eligibility and, when every condition holds, the training records.
@@ -658,13 +669,16 @@ def _finish(
         confirmation: Confirmation verdict, when it ran.
         contrasted: Meanings of every variant contrast.
         ambiguous: Criteria the rubric grader found ambiguous.
+        graded: Whether the rubric was graded on the confirmed variants without failure.
         failure: Why the family stopped early, when it did.
 
     Returns:
         The complete report.
     """
     unique = tuple({finding.finding_id: finding for finding in findings}.values())
-    eligibility = family.eligibility(selection, confirmation, unique, relied, contrasted, ambiguous)
+    eligibility = family.eligibility(
+        selection, confirmation, unique, relied, contrasted, ambiguous, graded
+    )
     built = training_records(eligibility, family.report, tiers=family.spec.tiers)
     return base.model_copy(
         update={

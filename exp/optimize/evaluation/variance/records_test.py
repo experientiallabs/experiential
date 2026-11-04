@@ -102,6 +102,7 @@ def test_eligibility_reports_every_condition_and_cannot_be_asserted() -> None:
         unwitnessed_rules=("rule.a", "rule.b"),
         meanings=(_meaning(), _meaning(temperature=0.0)),
         ambiguous_criteria=("handled", "handled"),
+        rubric_graded=True,
     )
     assert not eligibility.eligible
     failed = [c.name for c in eligibility.conditions if not c.holds]
@@ -153,8 +154,8 @@ def test_only_ambiguous_criteria_block_an_otherwise_eligible_family() -> None:
         _verdict("x", "separated_matches", "a"), _verdict("y", "separated_matches", "b")
     )
 
-    def eligibility(ambiguous: tuple[str, ...]) -> TrainingEligibility:
-        """Compute eligibility for a confirmed family with the given ambiguous criteria."""
+    def eligibility(ambiguous: tuple[str, ...], *, graded: bool = True) -> TrainingEligibility:
+        """Compute eligibility for a confirmed family with the given rubric outcome."""
         return training_eligibility(
             selection=selection,
             confirmation=selection,
@@ -167,9 +168,14 @@ def test_only_ambiguous_criteria_block_an_otherwise_eligible_family() -> None:
             unwitnessed_rules=(),
             meanings=(_meaning(),),
             ambiguous_criteria=ambiguous,
+            rubric_graded=graded,
         )
 
     assert eligibility(()).eligible
+    ungraded = eligibility((), graded=False)
+    assert not ungraded.eligible
+    assert [c.name for c in ungraded.conditions if not c.holds] == ["rubric_unambiguous"]
+    assert "not graded" in ungraded.reasons[0]
     blocked = eligibility(("handled",))
     assert not blocked.eligible
     assert [c.name for c in blocked.conditions if not c.holds] == ["rubric_unambiguous"]

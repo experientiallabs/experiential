@@ -16,9 +16,10 @@ from saved evidence rather than asserted by a caller:
   a supporting witness.
 - **policy_consistency**: every estimate the records rest on shares one actor policy, harness,
   budget, sampling setting, world and verifier; only the checkpoint and remaining calls differ.
-- **rubric_unambiguous**: no rubric criterion graded on the confirmed variants' episodes was
-  found ambiguous. Ambiguous criteria are listed so they go back to rubric authoring; a family
-  whose criteria were not graded has none.
+- **rubric_unambiguous**: the rubric was graded on the confirmed variants' episodes and no
+  criterion was found ambiguous. Ambiguous criteria are listed so they go back to rubric
+  authoring. A family whose rubric was not graded, or whose grading failed, does not hold this
+  condition: an ungraded rubric is not evidence of an unambiguous one.
 
 Failed conditions are all listed, never only the first. Records are built only for an eligible
 family: critic records (estimate against measured rate under one meaning, with the draw's reward),
@@ -49,7 +50,9 @@ from exp.optimize.evaluation.variance.exposure import EstimateMeaning
 from exp.optimize.evaluation.variance.grader import EpisodeView
 from exp.optimize.evaluation.variance.rewards import JudgeScore
 
-FindingSource = Literal["actor_critic", "decision_state", "scenario", "variant_review"]
+FindingSource = Literal[
+    "actor_critic", "decision_state", "scenario", "variant_review", "replay_divergence"
+]
 """Where an audit finding was raised."""
 
 Resolution = Literal["fixed", "accepted_with_reason", "not_applicable"]
@@ -380,6 +383,7 @@ def training_eligibility(
     unwitnessed_rules: Sequence[str],
     meanings: Sequence[EstimateMeaning],
     ambiguous_criteria: Sequence[str],
+    rubric_graded: bool,
 ) -> TrainingEligibility:
     """Compute every eligibility condition from saved evidence.
 
@@ -396,6 +400,7 @@ def training_eligibility(
         meanings: Meanings of every estimate the records would rest on.
         ambiguous_criteria: Criterion identities the rubric grader found ambiguous on the
             confirmed variants' episodes.
+        rubric_graded: Whether the rubric was graded on those episodes without failure.
 
     Returns:
         The eligibility with every condition.
@@ -471,11 +476,14 @@ def training_eligibility(
             ),
             EligibilityCondition(
                 name="rubric_unambiguous",
-                holds=not ambiguous,
+                holds=rubric_graded and not ambiguous,
                 detail=f"criteria {ambiguous} are ambiguous on the confirmed variants; route "
                 "them back to rubric authoring"
                 if ambiguous
-                else "no graded criterion is ambiguous",
+                else "no graded criterion is ambiguous"
+                if rubric_graded
+                else "the rubric was not graded on the confirmed variants; grade it before "
+                "training",
             ),
         )
     )
