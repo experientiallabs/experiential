@@ -67,7 +67,7 @@ def behavior_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[C
     if settings is None or bank is None:
         return ()
     mining = spec.mining
-    steps = mining.job.maximum_model_calls * (spec.traceml.steps_per_call + 1)
+    steps = mining.registered.maximum_model_calls * (spec.traceml.steps_per_call + 1)
     calls = mining.attempts * steps * math.ceil(len(bank.questions) / 32)
     costs = [
         decision_cost(project, spec.traceml.decision_alias, calls * RetryPolicy().maximum_attempts)

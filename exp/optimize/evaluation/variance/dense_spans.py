@@ -215,8 +215,10 @@ def _alignment(
 def actor_event(evidence: EpisodeEvidence, event: EpisodeEvent) -> EpisodeEvent | None:
     """Return the scored actor event a cited event lands on, or None when it has none.
 
-    A reply binds to the nearest preceding actor call with its ``tool_call_id``, so a reused
-    call id never attributes a later reply to an earlier call.
+    A reply binds to the nearest preceding call with its ``tool_call_id``, whoever owns it, so a
+    reused call id never attributes a later reply to an earlier call. Ownership is decided only
+    after that binding: when the nearest call is not a scored actor call (for example one an
+    experiment imposed), the reply has no actor event and earns no actor reward.
     """
     if event.scope != "scored" or event.owner == "experiment":
         return None
@@ -228,14 +230,9 @@ def actor_event(evidence: EpisodeEvidence, event: EpisodeEvent) -> EpisodeEvent 
         return None
     for candidate in reversed(evidence.events[: event.sequence]):
         call = candidate.content
-        if (
-            candidate.scope == "scored"
-            and candidate.owner == "actor"
-            and candidate.kind == "tool_call"
-            and isinstance(call, dict)
-            and call.get("call_id") == key
-        ):
-            return candidate
+        if candidate.kind == "tool_call" and isinstance(call, dict) and call.get("call_id") == key:
+            actor = candidate.scope == "scored" and candidate.owner == "actor"
+            return candidate if actor else None
     return None
 
 

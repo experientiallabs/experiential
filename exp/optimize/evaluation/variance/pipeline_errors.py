@@ -221,7 +221,7 @@ def error_tag_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[
         len(bank_for_view(bank, "observations").questions) / _QUESTIONS_PER_CALL
     )
     per_step = math.ceil(len(bank_for_view(bank, "step").questions) / _QUESTIONS_PER_CALL)
-    steps = mining.job.maximum_model_calls * settings.steps_per_call
+    steps = mining.registered.maximum_model_calls * settings.steps_per_call
     calls = mining.attempts * (per_attempt + steps * per_step)
     return tuple(
         decision_cost(project, settings.decision_alias, calls * RetryPolicy().maximum_attempts)

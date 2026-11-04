@@ -40,6 +40,7 @@ from exp.optimize.evaluation.variance.dense_spans import (
 )
 from exp.optimize.evaluation.variance.dense_trainer import (
     EpisodeTokens,
+    PartKey,
     combine_advantages,
     token_rewards,
 )
@@ -615,3 +616,42 @@ def test_aggregation_marks_an_established_finding_without_actor_span_unscored() 
     assert rewarded[0].reward is None and rewarded[0].unscored_reason == "no actor-owned action"
     assert rewarded[1].reward == pytest.approx(0.05) and episode.total == pytest.approx(0.05)
     assert episode.unscored == 1 and not episode.decisive
+
+
+def test_a_reply_to_an_imposed_call_reusing_an_actor_call_id_is_refused_and_untrained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host attribution refuses the citation and the trainer places no credit for it."""
+    imposed_call = ToolCall(call_id="c1", name="run_tests", arguments={})
+    events = list(evidence().events)
+    events[3] = event(3, "tool_call", "experiment", "scored", imposed_call.model_dump(mode="json"))
+    events[4] = event(4, "tool_result", "world", "scored", {"tool_call_id": "c1", "content": "ok"})
+    episode = evidence().model_copy(update={"events": tuple(events)})
+    turns = ActorTrajectory(
+        kind="continuation-branch",
+        turns=(
+            ActorTurn(turn_index=0, tool_calls=(EDIT,)),
+            ActorTurn(turn_index=1, content=ANSWER),
+        ),
+    )
+    blamed = {**WEAKENED, "observed_refs": ["e4"]}
+    replies = [r for _ in DEFAULT_DENSE_VARIANTS for r in (plan(), report(blamed), report(blamed))]
+    project, judge, transport = fixture(tmp_path, monkeypatch, replies)
+
+    _, export = judge_dense(
+        project, judge, episode, definition_candidates(judge.definition), turns, code_revision="t"
+    )
+
+    assert "experiment-imposed" in str(message(transport, 2, -1)["problems"])
+    (violation,) = by_tag(export, "modified_evaluation")
+    assert violation.decision == "uncertain" and violation.reward is None
+    ranges: dict[PartKey, tuple[int, int]] = {
+        (0, "tool_call", 0): (0, 6),
+        (1, "content", None): (6, 10),
+    }
+    placed = token_rewards(export.findings, ranges, sampled_binding=None)
+    assert placed == ()
+    (advantage,) = combine_advantages((EpisodeTokens(outcome=1.0, tokens=10, rewards=placed),))
+    assert advantage == (0.0,) * 10
+    forced = violation.model_copy(update={"decision": "established", "reward": -1.0, "spans": ()})
+    assert token_rewards((forced,), ranges, sampled_binding=None) == ()

@@ -65,6 +65,7 @@ from exp.optimize.evaluation.variance.family import (
     family_executable_task,
 )
 from exp.optimize.evaluation.variance.nudge_ladder import load_ladder, nudge_curriculum
+from exp.optimize.evaluation.variance.pipeline_dense import attach_family_dense, dense_costs
 from exp.optimize.evaluation.variance.pipeline_spec import (
     CostLine,
     DecisionVarianceSpec,
@@ -120,6 +121,21 @@ class _RecordsStage:
             f"their confirmed variants ({exports}).",
         ]
         costs: list[CostComponent] = []
+        if records.dense is not None:
+            authoring = spec.authoring
+            # Decision authors may emit at most six executable options.
+            episodes = (
+                len(spec.mining.actors)
+                * authoring.families_per_tier
+                * (authoring.maximum_variants + 1)
+                * (len(authoring.actions) or 6)
+                * authoring.confirmation_repeats
+            )
+            costs.extend(dense_costs(project, records.dense, episodes))
+            lines.append(
+                f"Dense training signal: up to {episodes} confirmation episodes, bounded "
+                "separately from outcome rewards; recorded actor actions only."
+            )
         options = spec.point_options()
         if options is not None:
             populations = []
@@ -152,7 +168,7 @@ class _RecordsStage:
         if qualify:
             variants = spec.authoring.families_per_tier * (spec.authoring.maximum_variants + 1)
             for alias in spec.mining.actors:
-                feasibility = group_job(project, spec, spec.mining.job, alias)
+                feasibility = group_job(project, spec, spec.mining.registered, alias)
                 costs.extend(row.scaled(variants) for row in job_costs(project, feasibility))
             lines.append(
                 f"Qualification: one feasibility run per exported variant, up to {variants} per "
@@ -162,7 +178,7 @@ class _RecordsStage:
         if not records.crosstalk:
             return cost_lines(tuple(costs)), tuple(lines)
         alias = spec.mining.actors[0]
-        episode = tier_job(project, spec.mining.job, alias, 1)
+        episode = tier_job(project, spec.mining.registered, alias, 1)
         jobs = 1 + 3 * 1
         episodes = records.crosstalk_attempts + 3 * records.crosstalk_repeats
         costs.extend(row.scaled(jobs) for row in job_costs(project, episode))
@@ -187,7 +203,13 @@ class _RecordsStage:
             report = reports[key]
             assert row.report is not None
             if report.records is not None:
-                training[key] = _save(context, "training", key, report.records, (row.report,))
+                records = report.records
+                refs = ()
+                if spec.records.dense is not None:
+                    records, refs = attach_family_dense(
+                        project, report, spec.records.dense, code_revision=context.code_revision
+                    )
+                training[key] = _save(context, "training", key, records, (row.report, *refs))
         selectors: dict[str, ArtifactInput] = {}
         derived: dict[str, tuple[ArtifactInput, ...]] = {}
         options = spec.point_options()
@@ -329,6 +351,7 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
                 intent=context.spec.records.intent,
                 code_revision=context.code_revision,
                 qualification=None if export.diagnostic else export.qualification,
+                dense=context.spec.records.dense,
             )
         exports.append(export)
     return exports
@@ -352,7 +375,12 @@ def _qualify(context: StageContext, report: FamilyReport, export: HarborExport) 
     project, revision = context.project, context.code_revision
     settings = context.spec.records.qualification
     assert settings is not None
-    task = family_executable_task(report, export.scenario_id, intent=context.spec.records.intent)
+    task = family_executable_task(
+        report,
+        export.scenario_id,
+        intent=context.spec.records.intent,
+        dense=context.spec.records.dense,
+    )
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=revision
     )

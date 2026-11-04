@@ -330,7 +330,7 @@ def retrieval_embedder(context: StageContext, index: ArtifactInput) -> RAGEmbedd
     if alias is None:
         return None
     transport = admitted_transport(
-        context, "retrieval", _searches(context.spec), context.spec.mining.job.deadline
+        context, "retrieval", _searches(context.spec), context.spec.mining.registered.deadline
     )
     resolved = RuntimeModelCatalog(catalog, transport_factory=lambda: transport).resolve(alias)
     if resolved.embedding_client is None or resolved.snapshot != loaded.embedder:

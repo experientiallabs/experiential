@@ -468,7 +468,7 @@ class _FamiliesStage:
         costs: list[CostComponent] = []
         search_lines: tuple[str, ...] = ()
         for alias in mining.actors:
-            episode = tier_job(project, mining.job, alias, 1)
+            episode = tier_job(project, mining.registered, alias, 1)
             passes = 2 if authoring.revision_rounds else 1
             reviews = briefing_review_draws() if authoring.fresh_briefing else 0
             per_family: list[CostComponent] = []

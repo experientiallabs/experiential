@@ -41,6 +41,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
     run_actor_critic,
 )
 from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
+from exp.optimize.evaluation.variance.bootstrap_stage import PLAN_LINE, run_bootstrapped_rules
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
@@ -197,15 +198,19 @@ class _RulesStage:
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
         """The stage also reads the mining job it binds the rule book into."""
         del project
-        return {"job": sha256_json(spec.mining.job)}
+        return {"job": sha256_json(spec.mining.registered)}
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
     ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
         """Price one extraction draw per world-learning trace, up to the trace cap."""
         del code_revision
+        if spec.mining.bootstrap is not None:
+            return (), (PLAN_LINE,)
         settings = spec.rules
-        start = load_continuation_checkpoint(project.artifacts, spec.mining.job.study.checkpoint)
+        start = load_continuation_checkpoint(
+            project.artifacts, spec.mining.registered.study.checkpoint
+        )
         costs, draws = rules_costs(
             project, settings.stage_spec(), settings.maximum_traces, len(start.task.tools)
         )
@@ -217,11 +222,13 @@ class _RulesStage:
             f"{bound} the mining runtime before any probe.",
         )
         if challenge:
-            costs += _runtime_allowance(project, spec.mining.job)
+            costs += _runtime_allowance(project, spec.mining.registered)
         return cost_lines(costs), lines
 
     def run(self, context: StageContext) -> StageRun:
         """Learn the rule book, execute its challenges and bind it before any probe."""
+        if context.spec.mining.bootstrap is not None:
+            return run_bootstrapped_rules(context)
         project, spec, revision = context.project, context.spec, context.code_revision
         build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
         exposure = load_exposure_plan(project, build.exposure)
@@ -231,7 +238,7 @@ class _RulesStage:
                 f"the build gave {len(traces)} world-learning traces, more than "
                 f"rules.maximum_traces={spec.rules.maximum_traces}; raise the cap"
             )
-        world = _world(spec.mining.job, build, None)
+        world = _world(spec.mining.registered, build, None)
         stage = spec.rules.stage_spec()
         challenge = spec.rules.challenge and stage.base_state is not None
         search = _rules_search(context, build, exposure)
@@ -266,7 +273,7 @@ class _RulesStage:
                 memory_set=report.memory_set, recall=RecallPolicy(jev_alias=spec.rules.jev_alias)
             )
         )
-        job = spec.mining.job
+        job = spec.mining.registered
         if spec.rules.bind_rule_book:
             definition = _world(job, build, report.rulebook, memory)
             job = bound_job(project, job, definition, revision)
@@ -345,14 +352,16 @@ class _TraceMLStage:
         if not settings.enabled:
             return (), ("TraceML: disabled; groups run in error mining.",)
         costs: list[CostComponent] = []
-        steps = spec.mining.attempts * spec.mining.job.maximum_model_calls
+        steps = spec.mining.attempts * spec.mining.registered.maximum_model_calls
         steps *= settings.steps_per_call
         bank = traceml_bank(settings.bank_root)
         calls = steps * math.ceil(len(bank.questions) / 32)
         judged = move_draws(spec)
         assert settings.move_judge is not None
         for alias in spec.mining.actors:
-            costs.extend(job_costs(project, group_job(project, spec, spec.mining.job, alias)))
+            costs.extend(
+                job_costs(project, group_job(project, spec, spec.mining.registered, alias))
+            )
             costs.append(decision_cost(project, settings.decision_alias, calls))
             costs.extend(
                 row.scaled(judged) for row in evaluation_costs(project, settings.move_judge)
@@ -500,13 +509,13 @@ class _MiningStage:
                 if mining.behaviors is not None:
                     if not spec.traceml.enabled:
                         costs.extend(
-                            job_costs(project, group_job(project, spec, mining.job, alias))
+                            job_costs(project, group_job(project, spec, mining.registered, alias))
                         )
                     costs.extend(judge_costs(project, spec, mining.attempts))
                 continue
             if not spec.traceml.enabled:
-                costs.extend(job_costs(project, group_job(project, spec, mining.job, alias)))
-            suffix = tier_job(project, mining.job, alias, mining.continuations).model_copy(
+                costs.extend(job_costs(project, group_job(project, spec, mining.registered, alias)))
+            suffix = tier_job(project, mining.registered, alias, mining.continuations).model_copy(
                 update={"maximum_physical_attempts": mining.continuation_physical_attempts}
             )
             for settings, draws, profile in (
@@ -803,7 +812,7 @@ def _rules_search(
     project, spec = context.project, context.spec
     if not spec.mining.retrieval:
         return None
-    start = load_continuation_checkpoint(project.artifacts, spec.mining.job.study.checkpoint)
+    start = load_continuation_checkpoint(project.artifacts, spec.mining.registered.study.checkpoint)
     registered = trace_search(project, build, start.task.task_id, spec.mining.retrieval_top_k)
     if registered is None or build.index is None:
         return None
@@ -819,7 +828,7 @@ def _runtime_allowance(project: ProjectStore, job: ContinuationJob) -> tuple[Cos
 def move_draws(spec: DecisionVarianceSpec) -> int:
     """Most move-judge draws one tier's group may buy: every window, stance and repair."""
     settings = spec.traceml
-    steps = spec.mining.job.maximum_model_calls * settings.steps_per_call
+    steps = spec.mining.registered.maximum_model_calls * settings.steps_per_call
     per_attempt = math.ceil(steps / settings.move_window.focal_steps)
     stances = len(settings.move_variants) * (1 + settings.move_repairs)
     return spec.mining.attempts * per_attempt * stances
@@ -869,7 +878,7 @@ def _tagger(context: StageContext) -> TraceTagger:
     project, settings = context.project, context.spec.traceml
     catalog = load_model_catalog(project.model_catalog_path)
     resolved = RuntimeModelCatalog(catalog).resolve(settings.decision_alias)
-    attempts = context.spec.mining.attempts * context.spec.mining.job.maximum_model_calls
+    attempts = context.spec.mining.attempts * context.spec.mining.registered.maximum_model_calls
     attempts *= settings.steps_per_call * len(context.spec.mining.actors)
     transport = admitted_transport(
         context, "traceml", attempts, datetime.now(UTC) + timedelta(hours=settings.deadline_hours)

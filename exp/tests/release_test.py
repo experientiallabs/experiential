@@ -3520,6 +3520,7 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     driver = execution / "installed_release_evidence.py"
     driver.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
     driver_environment = environment.copy()
+    driver_environment.pop("PYTHONPATH", None)
     driver_environment.update(
         {
             "EXP_INSTALLED_RELEASE_EVIDENCE": "1",

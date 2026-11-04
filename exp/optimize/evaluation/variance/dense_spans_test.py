@@ -125,3 +125,13 @@ def test_a_call_whose_arguments_differ_from_the_trajectory_gets_no_span() -> Non
     )
     assert actor_spans(episode, shifted, ("e2",)) == ()
     assert [s.turn_index for s in actor_spans(episode, shifted, ("e0",))] == [0]
+
+
+def test_a_reply_to_an_imposed_call_with_a_reused_id_has_no_actor_span() -> None:
+    """The reply binds to its nearest call first; that call is imposed, so no actor span."""
+    episode, turns = _occurrences()
+    events = list(episode.events)
+    events[2] = events[2].model_copy(update={"owner": "experiment"})
+    imposed = episode.model_copy(update={"events": tuple(events)})
+    assert actor_spans(imposed, turns, ("e3",)) == ()
+    assert [(s.event_id, s.turn_index) for s in actor_spans(imposed, turns, ("e1",))] == [("e0", 0)]

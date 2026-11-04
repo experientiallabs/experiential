@@ -183,6 +183,36 @@ A bound rule book makes the world model a state machine: the model proposes each
 re-asked with the broken rules as feedback and never committed. Durable sessions take an opt-in
 `transition_checker`; executable worlds bind the rule book into `GroundedRuntimeDefinition`.
 
+## Start bootstrap from traces
+
+`run_bootstrap` (`variance/bootstrap.py`) accepts selected tasks in compatible environment
+families, without a pre-existing mining job. `family_from_simulator` preserves the shared
+simulator's scoped corpus, tool contracts, state domains, frozen rule book, rule memory and
+rules report. Frozen family knowledge is reused. A family without rules learns them once from
+its own world-learning traces, never from a global corpus.
+
+The bounded agent loop authors a start, reviews it for coherence and task support, and researches
+missing deciding facts against the family's evidence. Unresolved or refused starts remain
+explicit refusals. Every fact carries observed, inferred or unknown provenance and source
+citations. Capture binds the accepted instruction, state, manifest and evaluator projection to
+the frozen runtime; another instance's facts are discarded.
+
+| Provenance | Validation |
+|---|---|
+| `observed` | The recorded state snapshot restores exactly. |
+| `reconstructed` | The source trace prefix replays with equal observations and error status. |
+| `authored` | Independent review and first-reveal checks support the generated facts. |
+
+Only observed starts claim original-state restoration. Each accepted start becomes a preflighted `start-bootstrap-registration` with its exact checkpoint and continuation job.
+A batch manifest records every registered, refused or failed task. Saved outcomes replay
+without calls; failed tasks can resume without repeating completed tasks.
+
+`freeze_batch` saves the manifest. `MiningSettings.bootstrap = BootstrapBinding(batch, task_id)`
+selects its exact registered job. Both pipeline planning and execution resolve this binding.
+The RULES stage verifies and reuses the family's frozen report, book and memory with no global
+extraction or challenge. Bootstrap preparation has its own governed cost plan before those
+registrations exist; the subsequent six-stage plan uses the resulting exact jobs.
+
 ## Paired behavioral differences
 
 Register `mining.behaviors` with a `BehaviorDifferenceSpec`

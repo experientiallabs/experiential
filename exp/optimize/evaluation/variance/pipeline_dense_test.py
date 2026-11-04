@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.project import artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.variance.dense_judge_test import call
 from exp.optimize.evaluation.variance.dense_prompt import (
@@ -25,6 +26,17 @@ from exp.optimize.evaluation.variance.pipeline_dense import (
     bind_dense_task,
     dense_costs,
 )
+from exp.optimize.evaluation.variance.pipeline_records import RECORDS_STAGE
+from exp.optimize.evaluation.variance.pipeline_spec import (
+    FamiliesOutputs,
+    FamilyOutcome,
+    MiningOutputs,
+    RecordsOutputs,
+    StageContext,
+    StageRecord,
+)
+from exp.optimize.evaluation.variance.pipeline_test import make_spec
+from exp.optimize.evaluation.variance.records import TrainingRecords
 from exp.optimize.evaluation.variance.tests.family_end_to_end_test import _run
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 
@@ -134,6 +146,12 @@ def test_dense_definitions_and_confirmations_bind_exact_variants_and_replay(
     bound = bind_dense_task(task, settings)
     assert bound.judge == task.judge and bound.job == task.job
     assert bound.profile() != task.profile()
+    assert (
+        family_executable_task(
+            family, "urgent", intent="Handle the ticket correctly", dense=settings
+        )
+        == bound
+    )
     assert bound.dense is not None and bound.judge is not None
     assert bound.dense.definition.task_sha256 == bound.judge.definition.task_sha256
     assert bind_dense_task(bound, settings) == bound
@@ -176,6 +194,59 @@ def test_dense_definitions_and_confirmations_bind_exact_variants_and_replay(
         attached,
         references,
     )
+    # The real records stage saves dense attachments and their artifact ancestry on replay.
+    judge = (family.judging or {})["urgent"].judge.definition
+    spec = make_spec(run.fixture, judge.rubric, tmp_path, actors=("actor",), crosstalk=False)
+    spec = spec.model_copy(
+        update={
+            "records": spec.records.model_copy(
+                update={
+                    "dense": settings,
+                    "harbor": False,
+                    "point_decisions": False,
+                }
+            )
+        }
+    )
+    family_ref = artifact_input(run.project.artifacts.read(family.identity + "-result").manifest)
+    context = StageContext(
+        project=run.project,
+        spec=spec,
+        identity="dense-records-stage",
+        code_revision="test",
+        upstream={
+            "families": StageRecord(
+                stage="families",
+                identity="families",
+                outputs=FamiliesOutputs(
+                    families=(
+                        FamilyOutcome(tier="actor", point=1, report=family_ref, admitted=True),
+                    )
+                ).model_dump(mode="json"),
+            ),
+            "error-mining": StageRecord(
+                stage="error-mining",
+                identity="mining",
+                outputs=MiningOutputs(
+                    profile=judge.profile,
+                    rubric=judge.rubric,
+                    tiers=(),
+                ).model_dump(mode="json"),
+            ),
+        },
+    )
+    stage = RECORDS_STAGE.run(context)
+    assert isinstance(stage.outputs, RecordsOutputs)
+    saved = stage.outputs.training["actor/1"]
+    assert (
+        TrainingRecords.model_validate_json(
+            run.project.artifacts.read_bytes(saved.artifact_id, "records.json")
+        )
+        == attached
+    )
+    manifest = run.project.artifacts.read(saved.artifact_id).manifest
+    assert set(references).issubset(manifest.inputs)
+    assert RECORDS_STAGE.run(context).outputs == stage.outputs
     count = sum(len(group.episodes) for groups in attached.groups.values() for group in groups)
     costs = dense_costs(run.project, settings, count)
     calls = dense_model_calls(settings.profile) * count

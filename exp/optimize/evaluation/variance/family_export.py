@@ -19,6 +19,7 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
+from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings, bind_dense_task
 from exp.optimize.evaluation.variance.records import bound_job
 
 if TYPE_CHECKING:
@@ -35,6 +36,7 @@ def export_family_harbor(
     intent: str,
     code_revision: str,
     qualification: ArtifactInput | None = None,
+    dense: DenseSettings | None = None,
 ) -> Path:
     """Package one variant's checkpoint as a Harbor environment that starts there.
 
@@ -50,6 +52,7 @@ def export_family_harbor(
         destination: New package directory.
         name: Harbor ``organization/name``.
         intent: The capability the environment measures.
+        dense: Frozen training signal for the exact task and world.
         code_revision: Producing source identity.
         qualification: Qualification report for the exact executable task, when it has one.
 
@@ -59,7 +62,7 @@ def export_family_harbor(
     Raises:
         ValueError: The scenario has no decision checkpoint in this family.
     """
-    task = family_executable_task(family_report, scenario_id, intent=intent)
+    task = family_executable_task(family_report, scenario_id, intent=intent, dense=dense)
     confirmed = family_report.confirmation is not None and any(
         verdict.scenario_id == scenario_id and verdict.status == "separated_matches"
         for verdict in family_report.confirmation.variants
@@ -79,7 +82,11 @@ def export_family_harbor(
 
 
 def family_executable_task(
-    family_report: FamilyReport, scenario_id: str, *, intent: str
+    family_report: FamilyReport,
+    scenario_id: str,
+    *,
+    intent: str,
+    dense: DenseSettings | None = None,
 ) -> ExecutableTask:
     """Return the executable task that starts at one variant's decision checkpoint.
 
@@ -90,6 +97,7 @@ def family_executable_task(
         family_report: The saved family.
         scenario_id: The variant.
         intent: The capability the environment measures.
+        dense: Frozen training signal for the exact task and world.
 
     Returns:
         The task under the family's frozen job, rewarded only by the variant's frozen judge.
@@ -113,7 +121,8 @@ def family_executable_task(
         if judging.runtime is None:
             raise ValueError(f"frozen scenario {scenario_id} has no frozen runtime definition")
         job = variant_job(job, (row.frozen, judging.runtime))
-    return ExecutableTask(intent=intent, job=bound_job(job, checkpoint), judge=judging.judge)
+    task = ExecutableTask(intent=intent, job=bound_job(job, checkpoint), judge=judging.judge)
+    return task if dense is None else bind_dense_task(task, dense)
 
 
 def variant_job(

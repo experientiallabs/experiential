@@ -1,7 +1,9 @@
 """The variance-build pipeline executor, including bounded compatibility review."""
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
+from exp.optimize.evaluation.variance.bootstrap_stage import bootstrapped_registration
 from exp.optimize.evaluation.variance.build import (
     plan_variance_build,
     run_variance_build,
@@ -28,8 +30,9 @@ class _BuildStage:
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
         """The build reads only its spec and the project's completed build."""
-        del project, spec
-        return {}
+        del project
+        binding = spec.mining.bootstrap
+        return {} if binding is None else {"bootstrap": sha256_json(binding)}
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
@@ -98,17 +101,39 @@ class _BuildStage:
             selected_probes=report.selected_probes,
             probe_ranking=report.probe_ranking,
         )
+        binding = context.spec.mining.bootstrap
+        if binding is not None:
+            registration = bootstrapped_registration(project, binding)
+            scoping = report.environment_families
+            if scoping is None:
+                raise ValueError(
+                    "a bootstrapped pipeline needs its selected environment-family build"
+                )
+            scope = scoping.scope(registration.family_id)
+            definition = GroundedRuntimeDefinition.model_validate(registration.job.configuration)
+            if definition.world_model != scope.world_model:
+                raise ValueError("the bootstrap world differs from its saved family scope")
+            outputs = outputs.model_copy(
+                update={
+                    "world_model": scope.world_model,
+                    "tag_retrieval": scope.tag_retrieval,
+                    "rules_traces": scope.rules_traces,
+                    "index": scope.index,
+                    "retrieval_scope": scope.retrieval_scope,
+                    "selected_probes": (registration.task_id,),
+                }
+            )
         summary: JsonObject = {
             "exposure": report.exposure.artifact_id,
-            "world_model": report.world_model.artifact_id,
-            "rules_traces": len(report.rules_stage_traces),
+            "world_model": outputs.world_model.artifact_id,
+            "rules_traces": len(outputs.rules_traces),
             "probes": len(report.probes),
             "selected_probes": list(report.selected_probes),
             "cluster_admitted": None
             if report.admission is None
             else len(report.admission.admitted),
         }
-        refs = (saved, report.exposure, report.world_model, report.tag_retrieval, report.index)
+        refs = (saved, report.exposure, outputs.world_model, outputs.tag_retrieval, outputs.index)
         return StageRun(outputs, refs, summary)
 
 

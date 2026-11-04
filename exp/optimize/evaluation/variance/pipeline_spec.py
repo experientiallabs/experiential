@@ -49,6 +49,7 @@ from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, Va
 from exp.optimize.evaluation.variance.behavior_curation import CuratorVariant
 from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
 from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
+from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
@@ -58,6 +59,7 @@ from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.nudge_ladder import CurriculumStage, NudgeLadderSpec
 from exp.optimize.evaluation.variance.nudges import NudgeStrength
+from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings
 from exp.optimize.evaluation.variance.pipeline_plan import STAGES as STAGES
 from exp.optimize.evaluation.variance.pipeline_plan import CostLine as CostLine
 from exp.optimize.evaluation.variance.pipeline_plan import PipelineApproval as PipelineApproval
@@ -236,7 +238,12 @@ class MiningSettings(ContractModel):
     """The ``error-mining`` stage: one actor-critic run per actor tier.
 
     Attributes:
-        job: Mining-probe job every tier copies; only its actor alias and snapshot change.
+        job: Mining-probe job every tier copies; only its actor alias and snapshot change. None
+            when ``bootstrap`` names it: the pipeline entry then resolves the bootstrap's
+            registered job into this field before any stage plans or runs.
+        bootstrap: A task's registered start in a frozen start-bootstrap batch
+            (:mod:`~exp.optimize.evaluation.variance.bootstrap`), in place of a hand-registered
+            job.
         rubric: Saved ``episode-rubric`` of the mining-probe task the episode judge applies, or
             None to author it: the agentic rubric author (``authoring.rubric_author`` with
             ``authoring.rubric_profile``) reads a whole-task authoring packet over the
@@ -265,7 +272,8 @@ class MiningSettings(ContractModel):
         retrieval_top_k: Most matches one search returns.
     """
 
-    job: ContinuationJob
+    job: ContinuationJob | None = None
+    bootstrap: BootstrapBinding | None = Field(default=None, exclude_if=lambda value: value is None)
     rubric: ArtifactInput | None = None
     judge: AuthorSettings
     judge_prompt_set: str = DEFAULT_AGENTIC_JUDGE
@@ -290,9 +298,18 @@ class MiningSettings(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
 
+    @property
+    def registered(self) -> ContinuationJob:
+        """Return the mining job; a bootstrap binding is resolved at the pipeline entry."""
+        if self.job is None:
+            raise ValueError("the bootstrap binding is unresolved; run through the pipeline entry")
+        return self.job
+
     @model_validator(mode="after")
     def _tiers(self) -> Self:
-        """Require distinct actor aliases that are valid tier labels."""
+        """Require a job source and distinct actor aliases that are valid tier labels."""
+        if self.job is None and self.bootstrap is None:
+            raise ValueError("register a mining job or bind a task's start-bootstrap batch")
         if self.behaviors is not None and self.schedule is not None:
             raise ValueError(
                 "mine behavior differences before registering a frozen training schedule"
@@ -472,6 +489,7 @@ class RecordsSettings(ContractModel):
             and classify them (:mod:`~exp.optimize.evaluation.variance.point_options`), so the
             version 2 selector records score every selector draw, not only picks that reached
             a family.
+        dense: Optional frozen training-error vocabulary and bounded dense judge settings.
         option_proposer: Open-weight option proposer; None uses ``authoring.decision_author``.
         option_classifier: Open-weight choice classifier; None uses the family measure's.
     """
@@ -483,6 +501,7 @@ class RecordsSettings(ContractModel):
     crosstalk_top_k: int = Field(default=2, ge=1, le=16, strict=True)
     crosstalk_repeats: int = Field(default=4, ge=1, le=64, strict=True)
     qualification: VariantQualification | None = None
+    dense: DenseSettings | None = None
     point_decisions: bool = True
     option_proposer: AuthorSettings | None = None
     option_classifier: AuthorSettings | None = None

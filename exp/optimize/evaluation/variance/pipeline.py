@@ -23,6 +23,10 @@
 6. ``records``: training records of admitted families, selector records, executable
    qualification and Harbor exports of admitted variants, and the optional cross-talk probe.
 
+**Bootstrap.** ``mining.bootstrap`` may name a task's registered start in a frozen
+start-bootstrap batch instead of a hand-registered ``mining.job``; the entry resolves it to the
+registered job before planning, so every stage reads that job.
+
 **Resume.** Every stage saves one ``decision-variance-stage`` record naming its outputs. A rerun
 replays saved records with no call and continues the first unsaved stage, whose owners in turn
 replay every draw, study and judgment they already saved, so an interrupted stage resumes where
@@ -55,6 +59,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.variance.bootstrap import resolve_bootstrap
 from exp.optimize.evaluation.variance.pipeline_build import BUILD_STAGE
 from exp.optimize.evaluation.variance.pipeline_families import FAMILIES_STAGE
 from exp.optimize.evaluation.variance.pipeline_records import RECORDS_STAGE
@@ -142,6 +147,7 @@ def plan_decision_variance(
     Returns:
         The plan; a saved stage carries no cost.
     """
+    spec = resolve_bootstrap(project, spec)
     bound = _executors(executors)
     rows: list[StagePlan] = []
     for stage, identity in _identities(project, spec, code_revision, bound):
@@ -184,7 +190,9 @@ def run_decision_variance(
         SpendConsentRequired: A stage is unsaved and the approval is missing, names another
             plan, or does not accept the plan's unpriced components.
     """
-    spec = DecisionVarianceSpec.model_validate_json(spec.model_dump_json())
+    spec = resolve_bootstrap(
+        project, DecisionVarianceSpec.model_validate_json(spec.model_dump_json())
+    )
     bound = _executors(executors)
     plan = plan_decision_variance(project, spec, code_revision=code_revision, executors=bound)
     if not plan.complete:
