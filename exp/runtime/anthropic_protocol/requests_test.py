@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -11,7 +12,11 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, TextContentPart
-from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
+from exp.runtime.anthropic_protocol.requests import (
+    EMPTY_FINAL_ASSISTANT_DROPPED,
+    decode_messages,
+    decode_messages_count_tokens,
+)
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
     GatewayApiSurface,
@@ -25,6 +30,7 @@ from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.models.providers.wire_messages import anthropic_blocks, openai_chat_message
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 
 _PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
@@ -1127,6 +1133,103 @@ def test_role_misplaced_blocks_and_empty_content_are_rejected() -> None:
         decode_messages(_body(messages=[{"role": "user", "content": ""}]))
     with pytest.raises(OpenAIProtocolError, match="must contain text"):
         decode_messages(_body(messages=[{"role": "assistant", "content": []}]))
+
+
+@pytest.mark.parametrize(
+    "prefill",
+    [
+        "",
+        [{"type": "text", "text": ""}],
+        [{"type": "text", "text": ""}, {"type": "text", "text": ""}],
+    ],
+    ids=["empty_string", "empty_text_block", "empty_text_blocks"],
+)
+@pytest.mark.parametrize("decode", [decode_messages, decode_messages_count_tokens])
+def test_empty_final_assistant_prefill_is_dropped_with_disclosure(
+    prefill: JsonValue, decode: Callable[[JsonObject], DecodedGatewayRequest]
+) -> None:
+    """An empty final assistant turn is Anthropic's no-prefill, not a 400.
+
+    Anthropic refuses empty content on every turn "except for the optional
+    final assistant message", and Anthropic SDK clients send exactly that
+    turn. Both decoders drop it and disclose.
+    """
+    decoded = decode(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": prefill},
+            ]
+        )
+    )
+    assert [(message.role, message.content) for message in decoded.request.messages] == [
+        ("user", "hi")
+    ]
+    assert EMPTY_FINAL_ASSISTANT_DROPPED in decoded.request.ignored_parameters
+
+
+def test_empty_content_off_the_final_assistant_turn_is_still_rejected() -> None:
+    """Only the trailing assistant turn may be empty, exactly like Anthropic."""
+    with pytest.raises(OpenAIProtocolError, match="must not be empty") as mid_string:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": ""},
+                    {"role": "user", "content": "again"},
+                ]
+            )
+        )
+    assert mid_string.value.detail.param == "messages.1.content"
+    with pytest.raises(OpenAIProtocolError, match="messages.1"):
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+                    {"role": "user", "content": "again"},
+                ]
+            )
+        )
+    with pytest.raises(OpenAIProtocolError, match="must not be empty") as final_user:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": ""},
+                ]
+            )
+        )
+    assert final_user.value.detail.param == "messages.2.content"
+    # A lone empty assistant turn would leave no conversation at all.
+    with pytest.raises(OpenAIProtocolError, match="must not be empty"):
+        decode_messages(_body(messages=[{"role": "assistant", "content": ""}]))
+    # A marked empty block asks for a breakpoint: refused, never dropped silently.
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}
+                        ],
+                    },
+                ]
+            )
+        )
+    # An empty assistant after only system turns would leave no conversation too.
+    with pytest.raises(OpenAIProtocolError, match="must not be empty"):
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "system", "content": "be brief"},
+                    {"role": "assistant", "content": ""},
+                ]
+            )
+        )
 
 
 def test_tool_choice_forms_and_stop_sequence_validation() -> None:
