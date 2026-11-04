@@ -24,7 +24,10 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     JobTemplate,
     RuntimeTemplate,
 )
-from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
+from exp.optimize.evaluation.variance.bootstrap_plan import (
+    BootstrapPreparationSpec,
+    plan_bootstrap_preparation,
+)
 from exp.optimize.evaluation.variance.bootstrap_selection import (
     BootstrapLimits,
     select_bootstrap_families,
@@ -38,7 +41,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import BuildSettings
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.mining.environment_families_test import answer, reviewer
 from exp.simulation.mining.environment_review import CompatibilityReviewer
-from exp.simulation.mining.tag_clusters import ClusterAdmissionSpec
+from exp.simulation.mining.tag_clusters import ClusterAdmissionSpec, ClusteringSpec
 
 
 def compatible(members: frozenset[str], variant: str) -> JsonObject:
@@ -251,4 +254,32 @@ def test_narrow_retrieval_preserves_full_family_learning_members(
                     update={"ids": ("foreign-trace",), "ids_sha256": sha256_json(["foreign-trace"])}
                 ),
             }
+        )
+
+
+def test_automatic_selection_skips_families_excluded_from_retrieval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unserved family's placement cannot block valid probes or bypass explicit selection."""
+    project, spec, bound = preparation_fixture(tmp_path, monkeypatch)
+    build = spec.build.spec.model_copy(
+        update={
+            "clustering": ClusteringSpec(min_clusters=2, max_clusters=2),
+            "cluster_admission": ClusterAdmissionSpec(total=1),
+            "probe_fraction": 0.5,
+        }
+    )
+    spec = spec.model_copy(update={"build": spec.build.model_copy(update={"spec": build})})
+    report = saved_build(project, spec, bound)
+    scoping = report.environment_families
+    assert scoping is not None and scoping.left_out and scoping.scopes
+    rows = select_bootstrap_families(project, report, spec.bootstrap, spec.limits)
+    available = {scope.family_id for scope in scoping.scopes}
+    assert rows and all(row.simulator.family_id in available for row in rows)
+    plan = plan_bootstrap_preparation(project, spec, code_revision="test")
+    assert plan.remaining_tasks and plan.task_bound == len(plan.remaining_tasks)
+    excluded = next(row.task_id for row in scoping.placements if row.family_id in scoping.left_out)
+    with pytest.raises(ValueError, match="compatible family placement"):
+        select_bootstrap_families(
+            project, report, spec.bootstrap, spec.limits, task_ids=(excluded,)
         )

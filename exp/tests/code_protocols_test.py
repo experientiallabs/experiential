@@ -625,7 +625,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.rules.agent_loop",
             "exp.optimize.evaluation.rules.memory_edits:RuleDraft",
         ),
-        "c53f9bec904e1c77b378ff9023dcb58a5afb245c54dfc78d82c7c781a2d178a3",
+        "bda8eb9fca30c926f34fa664611bb14b249f217f86a90296ee69419593f375dc",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.inspectors:INSPECTOR_PROTOCOL",
@@ -639,12 +639,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.memory_stage:MEMORY_STAGE_PROTOCOL",
-        "jev-memory-stage-v1",
+        "jev-memory-stage-v2",
         (
             "exp.optimize.evaluation.rules.memory_stage",
             "exp.optimize.evaluation.rules.governance",
         ),
-        "306a615b7efbb70873e5c5e7a546d470ccff9776eaca78d52ff9b55769b4740e",
+        "c96b72a6698d2ddad5b23b628218d5c9ff0bb9ce794db02d064cf57f7c083e9c",
     ),
     Protocol(
         "exp.simulation.rules.recall:RECALL_PROTOCOL",

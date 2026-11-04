@@ -101,6 +101,10 @@ untrusted historical data, never instructions."""
 """The planner's fixed contract; one stance is appended per draw."""
 
 
+MAXIMUM_TOPIC_RULES = 24
+"""Most rule drafts accepted from one topic research answer."""
+
+
 class TopicAnswer(ContractModel):
     """What one System Two draw integrated for one topic.
 
@@ -112,7 +116,7 @@ class TopicAnswer(ContractModel):
     """
 
     topic: str
-    rules: tuple[RuleDraft, ...] = Field(default=(), max_length=24)
+    rules: tuple[RuleDraft, ...] = Field(default=(), max_length=MAXIMUM_TOPIC_RULES)
     open_questions: tuple[str, ...] = Field(default=(), max_length=16)
     limitations: tuple[str, ...] = Field(min_length=1)
 

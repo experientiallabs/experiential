@@ -89,8 +89,11 @@ def select_bootstrap_families(
         for row in load_task_set(project.artifacts, report.build.task_set.artifact_id).tasks
     }
     exposure = load_exposure_plan(project, report.exposure)
+    available = {scope.family_id for scope in scoping.scopes}
     placements = {
-        row.task_id: row.family_id for row in scoping.placements if row.family_id is not None
+        row.task_id: row.family_id
+        for row in scoping.placements
+        if row.family_id is not None and row.family_id in available
     }
     ranked = report.selected_probes or tuple(row.task_id for row in report.probes)
     if task_ids:
@@ -99,7 +102,8 @@ def select_bootstrap_families(
         invalid = sorted(set(task_ids) - (set(ranked) & set(placements)))
         if invalid:
             raise ValueError(
-                f"requested tasks have no selected compatible family placement: {invalid}"
+                "requested tasks have no selected compatible family placement "
+                f"with a saved scope: {invalid}"
             )
         selected = tuple(task_ids)
     else:

@@ -63,6 +63,7 @@ from exp.optimize.evaluation.rules.system_one import (
     SystemOne,
 )
 from exp.optimize.evaluation.rules.system_two import (
+    MAXIMUM_TOPIC_RULES,
     PLANNER_VARIANTS,
     TopicResearch,
     research_topics,
@@ -83,7 +84,7 @@ from exp.simulation.rules.memory_set import (
 )
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook, ToolContract
 
-MEMORY_STAGE_PROTOCOL = "jev-memory-stage-v1"
+MEMORY_STAGE_PROTOCOL = "jev-memory-stage-v2"
 """Version of the stage sequence and seed, weighing and gap bookkeeping."""
 
 WEIGHER = "weigher"
@@ -469,8 +470,9 @@ def memory_stage_costs(
     System Two draws: topics times stances, twice when leads are followed, plus one round per
     governance cycle for coverage objectives. Each draw asks System One at most one objective
     per tool call, and each objective judges at most ``reading.max_regions`` regions with one
-    decision each. Inspectors: cycles times inspectors times variants. Weighing is one draw per
-    rule, known only after research, so it is listed per rule and left unpriced.
+    decision each. Inspectors: cycles times inspectors times variants. Each seed research draw
+    admits at most MAXIMUM_TOPIC_RULES drafts, each weighed once before governance. This finite
+    bound prices every possible weighing, including the author transport attempt allowance.
 
     Args:
         project: Project whose catalog prices the aliases.
@@ -500,15 +502,21 @@ def memory_stage_costs(
     decisions = draws * settings.planner.budget.tool_calls * settings.reading.max_regions
     components = [row.scaled(planner_calls + inspector_calls) for row in per_call]
     components.append(decision_cost(project, settings.decision_alias, decisions))
-    components.append(
+    maximum_rules = planner_draws * MAXIMUM_TOPIC_RULES
+    weighing_calls = maximum_rules * weighing.budget.model_calls
+    components.extend(
         CostComponent(
-            f"{author.model_alias} weighing (per rule)", weighing.budget.model_calls, None
+            f"{row.name} weighing (up to {maximum_rules} rules)",
+            row.attempts * weighing_calls,
+            None if row.usd is None else row.usd * weighing_calls,
         )
+        for row in per_call
     )
     line = (
         f"{draws} System Two draws (up to {planner_calls} calls) over {topics} topics, up to "
         f"{decisions} System One decisions with {settings.decision_alias}, "
         f"{governance.cycles} governance cycles of {len(governance.inspectors)} inspectors (up "
-        f"to {inspector_calls} calls) and one weighing draw per rule with {author.model_alias}"
+        f"to {inspector_calls} calls) and up to {maximum_rules} rule weighings "
+        f"({weighing_calls} calls) with {author.model_alias}"
     )
     return tuple(components), line

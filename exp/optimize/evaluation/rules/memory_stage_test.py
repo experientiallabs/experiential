@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.governance import GovernanceSettings
 from exp.optimize.evaluation.rules.governance_test import SMALL, RoleScript
@@ -158,7 +159,7 @@ def test_profile_defaults_and_requirements(tmp_path: Path, monkeypatch: pytest.M
 def test_costs_price_planner_decisions_inspectors_and_weighing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The plan lists every role with an upper bound; weighing per rule is unpriced."""
+    """The plan prices every role, including the schema-bounded seed-rule weighing population."""
     project, settings = agent_setup(tmp_path, monkeypatch)
     registered = spec(settings)
     assert registered.memory is not None
@@ -166,7 +167,28 @@ def test_costs_price_planner_decisions_inspectors_and_weighing(
         project, settings, registered.weighing, registered.memory, topics=3
     )
     names = [c.name for c in components]
-    assert names[-1].endswith("weighing (per rule)") and components[-1].usd is None
+    assert names[-1].endswith("weighing (up to 144 rules)")
+    expected = evaluation_costs(project, settings)[0].scaled(
+        144 * registered.weighing.budget.model_calls
+    )
+    assert components[-1].attempts == expected.attempts
+    assert components[-1].usd == expected.usd
     decisions = next(c for c in components[:-1] if c.attempts == (6 + 12) * 4 * 24)
     assert decisions is not None
     assert "System One decisions" in line and "governance cycles" in line
+
+
+def test_cost_bound_includes_every_possible_seed_rule_weighing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-start preparation budget cannot substitute a per-rule price for all seed rules."""
+    project, author = agent_setup(tmp_path, monkeypatch)
+    registered = spec(author)
+    memory = registered.memory
+    assert memory is not None
+    components, _ = memory_stage_costs(project, author, registered.weighing, memory, topics=3)
+    seed_draws = 3 * memory.draws_per_topic * (2 if memory.follow_leads else 1)
+    # The executable TopicAnswer schema permits 24 distinct rules in each research answer.
+    rules = seed_draws * 24
+    attempts = rules * registered.weighing.budget.model_calls * author.maximum_physical_attempts
+    assert sum(row.attempts for row in components if "weighing" in row.name) >= attempts
