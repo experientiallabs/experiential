@@ -981,7 +981,7 @@ It owns and bounds admitted tasks, upstream streams, disconnect cleanup, replay,
 and final ledger settlement. Stuck cancellation cannot stop content-free terminal flusher attempts.
 A failed terminal write stays owned by the recovery sweep and fences only the admitting organization
 (503 `accounting_unavailable`, counted by `accounting_fenced_organizations`) until it lands; other
-organizations keep serving, and readiness fails only when the durable writer itself is gone. A
+organizations keep serving, and readiness fails only while the durable writer cannot commit. A
 deliberate `AccountingRefusedError` answers a retryable 503 `accounting_refused` and fences no one.
 
 ## Certification boundary

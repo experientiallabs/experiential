@@ -165,6 +165,8 @@ class GroupCommitAttemptLedger:
         self._max_batch_size = max_batch_size
         self._queue: queue.SimpleQueue[_PendingWrite | None] = queue.SimpleQueue()
         self._closed = False
+        # The latest batch transaction failed to begin or commit (writer-wide).
+        self._transaction_failed = False
         # Serializes enqueue against close so no operation can land behind the
         # stop sentinel and strand its caller after the writer thread exits.
         self._submit_lock = threading.Lock()
@@ -184,6 +186,22 @@ class GroupCommitAttemptLedger:
         readiness closed instead of queueing writes that only fail per call.
         """
         return self._closed
+
+    def writable(self) -> bool:
+        """Return whether this writer can still make writes durable.
+
+        False once closed, and while its latest batch transaction failed to
+        begin or commit (a locked, full or failing database). That failure is
+        writer-wide, unlike one operation rolled back to its savepoint. While
+        failed, each call re-proves storage with one empty transaction, so a
+        recovered store reports writable again without waiting for traffic.
+        """
+        if self._transaction_failed and not self._closed:
+            try:
+                self.submit_blocking(lambda _connection: None)
+            except Exception:  # noqa: BLE001 - a failed probe is the answer.
+                return False
+        return not self._closed and not self._transaction_failed
 
     async def accept_request(self, *, authorization: AuthorizationSnapshot) -> None:
         """Durably persist accepted authority before route selection or dispatch.
@@ -413,8 +431,9 @@ class GroupCommitAttemptLedger:
                             else:
                                 ready.append(_PendingWrite(apply, pending.future))
                         if ready:
-                            self._commit_batch(connection, ready)
+                            self._transaction_failed = not self._commit_batch(connection, ready)
                 except Exception as exc:  # noqa: BLE001 - blocked callers receive the failure.
+                    self._transaction_failed = True
                     _logger.exception("gateway ledger batch failed outside its own transaction")
                     for pending in batch:
                         if not pending.future.done():
@@ -453,7 +472,7 @@ class GroupCommitAttemptLedger:
     def _commit_batch(
         connection: sqlite3.Connection,
         batch: list[_PendingWrite],
-    ) -> None:
+    ) -> bool:
         """Apply each queued operation under its own savepoint and commit once.
 
         A failing operation rolls back to its savepoint so its effects never
@@ -464,13 +483,16 @@ class GroupCommitAttemptLedger:
         Args:
             connection: Writer-owned configured SQLite connection.
             batch: Queued operations resolved after this shared commit.
+
+        Returns:
+            Whether the shared transaction began and committed.
         """
         try:
             connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
             for pending in batch:
                 _resolve_exception(pending.future, exc)
-            return
+            return False
         outcomes: list[tuple[_PendingWrite, object, BaseException | None]] = []
         for index, pending in enumerate(batch):
             savepoint = f"gateway_op_{index}"
@@ -493,12 +515,13 @@ class GroupCommitAttemptLedger:
                 _logger.exception("gateway ledger batch rollback failed after commit failure")
             for pending in batch:
                 _resolve_exception(pending.future, exc)
-            return
+            return False
         for pending, value, error in outcomes:
             if error is not None:
                 _resolve_exception(pending.future, error)
             else:
                 _resolve_result(pending.future, value)
+        return True
 
     def submit_blocking(self, apply: Callable[[sqlite3.Connection], _T]) -> _T:
         """Enqueue one operation and block the calling thread on its durable commit.

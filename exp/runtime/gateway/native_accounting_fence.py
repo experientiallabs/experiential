@@ -12,8 +12,8 @@ per-request error. Its write is still retained and replayed, but it never
 fences any organization.
 
 A process-wide accounting outage is not decided here. When the durable writer
-itself is gone, every organization's admission already fails per request at
-``accept_request``, and the composition's own health answers readiness.
+cannot commit at all, every organization's admission already fails per request
+at ``accept_request``, and the composition's own health answers readiness.
 """
 
 from __future__ import annotations
@@ -46,9 +46,11 @@ def entry_fences(entry: InflightRequest) -> bool:
         entry: The admitted request.
 
     Returns:
-        Whether its retained settlement or abandonment failed to land.
+        Whether its retained settlement or abandonment failed to land for a
+        reason other than a deliberate ledger refusal.
     """
-    return entry.settlement_write_failed or entry.abandon_write_failed
+    failed = entry.settlement_write_failed or entry.abandon_write_failed
+    return failed and not entry.refused_write
 
 
 def fenced_entry_organizations(entries: Iterable[InflightRequest]) -> set[str]:

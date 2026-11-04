@@ -225,6 +225,8 @@ def test_deliberate_settle_refusal_is_a_clean_retryable_error_that_fences_no_one
     assert _public(refused)["code"] == "accounting_refused"
     assert _public(refused)["retry_after_seconds"] == 1
     assert accounting.fenced_organizations() == frozenset()
+    # Still an unlanded terminal write: health reports it, admission ignores it.
+    assert not accounting.accounting_healthy
     accounting.require_clear(_ORG_A)
     _serve(accounting, "a-2", _ORG_A)
 
@@ -233,6 +235,7 @@ def test_deliberate_settle_refusal_is_a_clean_retryable_error_that_fences_no_one
     assert retained is not None and retained.pending_settlement is not None
     accounting.sweep_expired()
     assert accounting.entry("a-1") is None
+    assert accounting.accounting_healthy
     assert {row["attempt_id"] for row in ledger.finished} == {"attempt-1", "attempt-2"}
 
 

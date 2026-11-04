@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
-use crate::errors::{Failure, FailureClass};
+use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::replay::OwnerLease;
@@ -206,14 +206,24 @@ fn settle_argument(
 /// keeps the in-flight entry on a failed terminal write, so retries can
 /// still land. A persistent failure fences only the owning organization's
 /// admission control-plane side and is reconciled at the next startup.
-async fn deliver(bridge: &Bridge, method: &'static str, argument: String) -> bool {
+///
+/// A failed delivery returns the control plane's last public error, so a
+/// caller answers with what the ledger said (for example a retryable
+/// accounting refusal) instead of a generic internal error.
+async fn deliver(
+    bridge: &Bridge,
+    method: &'static str,
+    argument: String,
+) -> Result<(), PublicError> {
+    let mut last = PublicError::internal();
     for backoff_ms in [0u64, 100, 500, 2_000] {
         if backoff_ms > 0 {
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             METRICS.record_settlement_retry();
         }
-        if bridge.call(method, argument.clone()).await.is_ok() {
-            return true;
+        match bridge.call(method, argument.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => last = error,
         }
     }
     // The control plane keeps the in-flight entry; its sweep keeps retrying
@@ -229,7 +239,7 @@ async fn deliver(bridge: &Bridge, method: &'static str, argument: String) -> boo
         "outcome": parsed.get("outcome").cloned().unwrap_or(Value::Null),
     });
     eprintln!("exp-gateway-native: {line}");
-    false
+    Err(last)
 }
 
 /// Exactly-once settlement owner for one admitted request and its physical
@@ -290,6 +300,8 @@ pub struct AttemptGuard {
     tool_search_requests: u32,
     observation: Observation,
     dispatch: Option<crate::dispatch_capacity::DispatchPermit>,
+    /// The control plane's public error from the last failed delivery.
+    settlement_error: Option<PublicError>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -348,6 +360,7 @@ impl AttemptGuard {
             tool_search_requests: 0,
             observation: Observation::default(),
             dispatch: None,
+            settlement_error: None,
         }
     }
 
@@ -640,7 +653,7 @@ impl AttemptGuard {
 
     /// Deliver one decided settlement and update the guard's ownership.
     async fn deliver_decided(&mut self, argument: String, finalize: bool) -> bool {
-        let delivered = deliver(&self.bridge, "settle", argument).await;
+        let delivered = self.record_delivery(deliver(&self.bridge, "settle", argument).await);
         if finalize {
             // The control plane retained a failed terminal write verbatim,
             // so its sweep (not the drop backstop) owns the retry.
@@ -708,7 +721,7 @@ impl AttemptGuard {
     pub async fn abandon(&mut self, failure: &Failure) -> bool {
         self.record_terminal("failed", failure.failure_class == FailureClass::Cancelled);
         self.armed = false;
-        deliver(
+        let delivered = deliver(
             &self.bridge,
             "abandon",
             compact_json(&json!({
@@ -719,7 +732,27 @@ impl AttemptGuard {
                 },
             })),
         )
-        .await
+        .await;
+        self.record_delivery(delivered)
+    }
+
+    /// Retain a failed delivery's public error and report whether it landed.
+    fn record_delivery(&mut self, delivered: Result<(), PublicError>) -> bool {
+        match delivered {
+            Ok(()) => true,
+            Err(error) => {
+                self.settlement_error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// The public error a caller answers after a terminal write did not land:
+    /// the control plane's own error, or the shared internal error.
+    pub fn settlement_error(&self) -> PublicError {
+        self.settlement_error
+            .clone()
+            .unwrap_or_else(PublicError::internal)
     }
 
     /// Disarm the guard after the control plane itself finalized the request
@@ -893,7 +926,7 @@ impl Drop for AttemptGuard {
         pending.fetch_add(1, Ordering::SeqCst);
         handle.spawn(async move {
             let _dispatch = dispatch;
-            deliver(&bridge, method, argument).await;
+            let _ = deliver(&bridge, method, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -902,3 +935,7 @@ impl Drop for AttemptGuard {
 #[cfg(test)]
 #[path = "settlement_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "settlement_refusal_tests.rs"]
+mod refusal_tests;

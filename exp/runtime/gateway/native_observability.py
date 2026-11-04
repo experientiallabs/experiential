@@ -237,7 +237,7 @@ class NativeObservabilityMixin:
         """Return whether this instance's composition accounting can still land writes.
 
         Only a process-wide failure (the composition's durable writer or store
-        is gone) fails readiness closed. One organization's retained terminal
+        cannot commit) fails readiness closed. One organization's retained terminal
         writes fence only that organization's admission, never the worker.
         A host composing several instances owns process readiness separately.
         """

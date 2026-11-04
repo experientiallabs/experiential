@@ -820,7 +820,8 @@ class NativeAttemptAccounting:
             # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
-                entry.settlement_write_failed = fences_after(exc)
+                entry.settlement_write_failed = True
+                entry.refused_write = not fences_after(exc)
             raise authority_error(exc) from exc
         failure = terminal.failure
         record_attempt_health(
@@ -918,7 +919,8 @@ class NativeAttemptAccounting:
                     )
             except Exception as exc:  # noqa: BLE001 - the data plane retries.
                 with self._lock:
-                    entry.abandon_write_failed = fences_after(exc)
+                    entry.abandon_write_failed = True
+                    entry.refused_write = not fences_after(exc)
                 raise authority_error(exc) from exc
             with self._lock:
                 # A meter may arrive while the unknown cancellation is writing.

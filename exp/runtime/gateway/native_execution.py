@@ -162,6 +162,8 @@ class InflightRequest:
             waiting for an active execution alone is not an accounting failure.
         settlement_write_failed: Whether the retained terminal write needs recovery;
             an observed meter waiting for its first commit does not fence admission.
+        refused_write: Whether the latest failed terminal write was a deliberate
+            ledger refusal, which stays retained but fences no organization.
         ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
             counts; semantic tool turns and reasoning-repair successors do not increment them.
         attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
@@ -206,6 +208,7 @@ class InflightRequest:
     execution_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     pending_abandon: GatewayFailure | None = None
     abandon_write_failed: bool = False
+    refused_write: bool = False
     # Responses-only retention facts consumed by ``remember`` after a
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None
