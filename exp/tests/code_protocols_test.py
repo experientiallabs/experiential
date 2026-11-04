@@ -455,6 +455,18 @@ PROTOCOLS = (
         "5faf94af60adf9d1cb65f8f4fc1558cd202bd9f4213e07b18121214142daac81",
     ),
     Protocol(
+        "exp.simulation.mining.error_tags:ERROR_TAGS_PROTOCOL",
+        "error-tags-v1",
+        ("exp.simulation.mining.error_tags",),
+        "b592705beb4cb34fee35664aa3e50aaae4a1da20d622c33c47393c7f46e7ee66",
+    ),
+    Protocol(
+        "exp.simulation.mining.tag_clusters:TAG_CLUSTERS_PROTOCOL",
+        "tag-clusters-v1",
+        ("exp.simulation.mining.tag_clusters", "exp.simulation.mining.tag_cluster_names"),
+        "66f5d43c569f052817ac2fab344cb98396623a2998508b869234f648858153d3",
+    ),
+    Protocol(
         "exp.optimize.evaluation.variance.crosstalk:CROSSTALK_PROTOCOL",
         "crosstalk-probe-v1",
         ("exp.optimize.evaluation.variance.crosstalk",),

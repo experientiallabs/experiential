@@ -24,6 +24,7 @@ from exp.common.models import (
     ConnectionConfig,
     ModelCapabilities,
     ModelRecord,
+    ModelRequest,
     load_model_catalog,
     write_model_catalog,
 )
@@ -40,13 +41,27 @@ from exp.optimize.evaluation.variance.build_records import (
     load_tag_matrix,
     load_tag_retrieval_binding,
 )
+from exp.optimize.evaluation.variance.coalition import BehaviorPattern
 from exp.optimize.evaluation.variance.exposure import plan_exposure
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
-from exp.simulation.mining.questions import LOCAL_BANK_ROOT_VARIABLE
+from exp.simulation.mining.error_tags import ERROR_BANK_ID, error_patterns, load_error_tags
+from exp.simulation.mining.questions import LOCAL_BANK_ROOT_VARIABLE, resolve_question_bank
+from exp.simulation.mining.tag_cluster_names import (
+    ClusterNamer,
+    ClusterNamingSpec,
+    load_cluster_names,
+)
+from exp.simulation.mining.tag_cluster_names_test import SNAPSHOT as NAMER
+from exp.simulation.mining.tag_cluster_names_test import ScriptedNamer, name_reply
+from exp.simulation.mining.tag_clusters import (
+    ClusterAdmissionSpec,
+    ClusteringSpec,
+    load_tag_clustering,
+)
 from exp.simulation.mining.tag_selection import TagRule
 from exp.simulation.mining.tagging import DecisionCache
 from exp.simulation.mining.views import observations_view, task_view
@@ -57,6 +72,11 @@ PROJECT = "support"
 TASK_BANK = "shape-task-v1"
 OBSERVATIONS_BANK = "shape-observations-v1"
 _QUESTIONS = ("shape.q0", "shape.q1", "shape.q2")
+ERROR_QUESTIONS = (
+    ("error.check.unverified_success_claim", "error.check"),
+    ("error.feedback.ignored_error_output", "error.feedback"),
+    ("risk.destructive_request", "risk"),
+)
 
 
 def _bank_toml(bank_id: str, prefix: str) -> str:
@@ -67,6 +87,16 @@ def _bank_toml(bank_id: str, prefix: str) -> str:
         for index in range(3)
     )
     return f'bank_id = "{bank_id}"\nversion = 1\n{questions}'
+
+
+def _error_bank_toml() -> str:
+    """Render a small error bank with two error propositions and one task-view risk."""
+    questions = "".join(
+        f'\n[[questions]]\nquestion_id = "{question}"\nfamily = "{family}"\n'
+        f'text = "Does {question} hold?"\n'
+        for question, family in ERROR_QUESTIONS
+    )
+    return f'bank_id = "{ERROR_BANK_ID}"\nversion = 1\n{questions}'
 
 
 def _probability(state: str, question: str) -> float:
@@ -92,16 +122,19 @@ class FakeDecisions:
     Attributes:
         drop: Exact state whose answers are withheld, making that trace fail.
         states: Every state sent, in order.
+        asked: Every state with the questions asked about it, in order.
     """
 
     drop: str | None = None
     states: list[str] = field(default_factory=list)
+    asked: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
 
     def __call__(self, request: DecisionRequest) -> JsonObject:
         """Answer one typed decision request."""
         state = request.state
         assert isinstance(state, str)
         self.states.append(state)
+        self.asked.append((state, tuple(request.questions)))
         return _answers(state, request.questions, drop=self.drop)
 
 
@@ -180,6 +213,7 @@ def variance_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Project
     banks.mkdir()
     (banks / f"{TASK_BANK}.toml").write_text(_bank_toml(TASK_BANK, "shape"))
     (banks / f"{OBSERVATIONS_BANK}.toml").write_text(_bank_toml(OBSERVATIONS_BANK, "obs"))
+    (banks / f"{ERROR_BANK_ID}.toml").write_text(_error_bank_toml())
     monkeypatch.setenv(LOCAL_BANK_ROOT_VARIABLE, str(banks))
     monkeypatch.setenv("DECISION_TEST_KEY", "fixture-only")
     return project
@@ -235,7 +269,13 @@ def test_variance_build_tags_scopes_indexes_binds_and_replays(
     tasks, observations = _rendered(project)
     sent = set(decide.states)
     assert not sent & ({tasks[trace] for trace in final} | {observations[t] for t in final})
-    assert not sent & {observations[trace] for trace in probes}
+    probe_views = {observations[trace] for trace in probes}
+    assert probe_views <= sent
+    assert all(
+        all(q.startswith("error.") for q in questions)
+        for state, questions in decide.asked
+        if state in probe_views
+    )
     assert {tasks[trace] for trace in learning | probes} <= sent
     assert {observations[trace] for trace in learning} <= sent
     assert len(decide.states) == report.plan.decision_calls
@@ -250,6 +290,13 @@ def test_variance_build_tags_scopes_indexes_binds_and_replays(
 
     assert set(report.retrieval_scope.ids) == learning == set(report.construction_scope.ids)
     assert report.rules_stage_traces == tuple(sorted(learning))
+    assert report.plan.errors is not None and report.errors is not None
+    assert report.clustering is not None and report.admission is not None
+    assert {row.trace_id for row in report.admissions} == learning
+    assert all(row.corpora == ("construction", "retrieval") for row in report.admissions)
+    assert all(
+        row.cluster_id is not None and "cluster c" in row.reason for row in report.admissions
+    )
     index = load_rag_index(project.artifacts, report.index.artifact_id)
     indexed = {row.trace_id for row in index.transitions}
     assert indexed == learning
@@ -312,12 +359,98 @@ def test_tag_rules_narrow_retrieval_inside_world_learning(
     assert {row.trace_id for row in index.transitions} == fired
 
 
+def test_clusters_choose_world_learning_and_error_tags_choose_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cluster admission narrows construction, a rule still overrides retrieval, error tags rank
+    the probes, names are bought once, and the whole run replays without any call."""
+    project = variance_project(tmp_path, monkeypatch)
+    rule = ScopeRule(rule=TagRule(name="retrieval", require_any=("shape.q0",)))
+    spec = VarianceBuildSpec(
+        task_bank=TASK_BANK,
+        retrieval_rule=rule,
+        clustering=ClusteringSpec(max_clusters=4, seeds=4),
+        cluster_admission=ClusterAdmissionSpec(total=4),
+        cluster_naming=ClusterNamingSpec(),
+        probe_limit=1,
+    )
+    with pytest.raises(ValueError, match="admitted namer"):
+        run_variance_build(project, spec, code_revision="test", tagger=_tagger(project, _refuse))
+    planned = plan_variance_build(project, spec, code_revision="test")
+    assert planned.errors is not None and planned.naming_calls == 16
+    decide = FakeDecisions()
+    namer = ScriptedNamer(name_reply)
+
+    report = run_variance_build(
+        project,
+        spec,
+        code_revision="test",
+        tagger=_tagger(project, decide),
+        namer=ClusterNamer(namer, NAMER),
+    )
+
+    assert len(decide.states) == report.plan.decision_calls
+    plan = load_exposure_plan(project, report.exposure)
+    learning = {t for t in plan.traces if plan.role_of(t) == "world_learning"}
+    held_out = {t for t in plan.traces if plan.role_of(t) == "final_evaluation"}
+    assert report.clustering is not None and report.admission is not None
+    clustering = load_tag_clustering(project.artifacts, report.clustering)
+    assert set(clustering.trace_ids) == learning and not set(clustering.trace_ids) & held_out
+    assert {s.split(":", 1)[0] for s in clustering.columns} == {"task", "errors"}
+    assert len(report.construction_scope.ids) == 4
+    assert set(report.construction_scope.ids) == set(report.admission.trace_ids())
+    assert report.rules_stage_traces == report.construction_scope.ids
+    tasks, _ = _rendered(project)
+    fired = {t for t in learning if _probability(tasks[t], "shape.q0") > 0.5}
+    assert set(report.retrieval_scope.ids) == fired
+    by_trace = {row.trace_id: row for row in report.admissions}
+    assert set(by_trace) == set(report.construction_scope.ids) | fired
+    for trace in report.construction_scope.ids:
+        assert "construction: cluster c" in by_trace[trace].reason
+    for trace in fired:
+        assert "retrieval: tag rule 'retrieval'" in by_trace[trace].reason
+    assert report.cluster_names is not None
+    names = load_cluster_names(project.artifacts, report.cluster_names)
+    assert all(row.status == "named" for row in names.names)
+    assert len(namer.requests) == 4 * len(clustering.clusters)
+    assert all(row.cluster_name is not None for row in report.admission.admitted)
+
+    assert report.errors is not None
+    errors = load_error_tags(project.artifacts, report.errors)
+    assert {row.trace_id for row in errors.matrix.rows} == learning | {
+        t for t in plan.traces if plan.role_of(t) == "mining_probes"
+    }
+    assert {row.task_id for row in report.probe_ranking} == {row.task_id for row in report.probes}
+    scores = [row.score for row in report.probe_ranking]
+    assert scores == sorted(scores, reverse=True)
+    assert report.selected_probes == (report.probe_ranking[0].task_id,)
+    patterns = error_patterns(errors, resolve_question_bank(ERROR_BANK_ID), include_uncertain=True)
+    assert patterns
+    assert BehaviorPattern.model_validate(patterns[0].model_dump()).kind == "mistake"
+
+    def refuse_naming(request: ModelRequest) -> str:
+        """Fail the test: a replay must not name anything."""
+        raise AssertionError("replay made a naming call")
+
+    replay = run_variance_build(
+        project,
+        spec,
+        code_revision="test",
+        tagger=_tagger(project, _refuse),
+        namer=ClusterNamer(ScriptedNamer(refuse_naming), NAMER),
+    )
+    assert replay == report
+
+
 def test_a_failed_trace_is_recorded_and_kept_out_of_retrieval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A trace whose answers are missing is a recorded failure, never a fabricated row."""
+    """A trace whose answers are missing is a recorded failure, never a fabricated row.
+
+    Without clustering construction keeps the trace; retrieval, which records tags, does not.
+    """
     project = variance_project(tmp_path, monkeypatch)
-    spec = VarianceBuildSpec(task_bank=TASK_BANK)
+    spec = VarianceBuildSpec(task_bank=TASK_BANK, clustering=None)
     build = project.load_project().build
     assert build is not None
     rows = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id).bindings

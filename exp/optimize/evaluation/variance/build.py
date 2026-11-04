@@ -11,9 +11,15 @@ One run is a frozen, saved, replayable stage over the project's selected build:
    only, as annotation. Decisions are bought through the shared decision cache, and every
    matrix is saved as a ``variance-tag-matrix`` artifact naming its bank, revision and view. A
    trace whose tagging fails is recorded with its error and is never redrawn.
-3. **Scopes.** Optional tag rules narrow the construction and retrieval corpora inside world
-   learning; by default both hold every world-learning trace. Traces whose tags the index would
-   record but could not be bought are left out of retrieval.
+   The error bank (``error_bank``) is asked over the observations view of every world-learning
+   and mining-probe trace and saved as an ``error-tags`` record.
+3. **Scopes.** The world-learning tag space (every tagged view plus the error tags) is clustered
+   with a data-chosen cluster count and saved as ``tag-clusters`` (named by an injected model
+   when ``cluster_naming`` is set); cluster admission then chooses which world-learning traces
+   enter the construction and retrieval corpora. An explicit tag rule overrides admission for
+   its corpus; with neither, a corpus holds every world-learning trace. The report records why
+   each trace was admitted. Traces whose tags the index would record but could not be bought
+   are left out of retrieval.
 4. **Index.** The scoped, tagged fit-only index is built with the build serving index's
    embedder identity, chunking and ``default_top_k``. Vectors come from the build's embedding
    checkpoint: a semantic embedder is bound to a client that refuses every call, so a missing
@@ -22,7 +28,8 @@ One run is a frozen, saved, replayable stage over the project's selected build:
    construction scope with an injected admitted constructor) is rebound to the scoped index.
 6. **Bindings.** Every mining-probe task with tagged source evidence receives task-view query
    tags under the spec's tag policy, saved as a ``tag-retrieval-binding``; a control binding
-   with weight zero is saved beside it for cosine-only baselines.
+   with weight zero is saved beside it for cosine-only baselines. Probe tasks are ranked by
+   their source traces' error tags and the most error-laden are selected for error mining.
 7. **Report.** Exposure counts, tagging coverage and failures, every artifact and the inputs the
    rules stage and actor-critic runs need are saved as a ``variance-build-report`` artifact.
 
@@ -62,25 +69,27 @@ from exp.optimize.evaluation.variance.build_records import (
     REPORT_TYPE,
     ConstructionSettings,
     ProbeBinding,
-    RoleCount,
     ScopeRule,
     TagFailure,
     TagMatrixRecord,
     VarianceBuildPlan,
     VarianceBuildReport,
     VarianceBuildSpec,
-    ViewPlan,
     ViewTagging,
+    corpus_scope,
+    next_steps,
+    probe_selection,
+    role_counts,
     save_artifact,
+    trace_admissions,
+    view_plan,
 )
 from exp.optimize.evaluation.variance.exposure import (
     ExposurePlan,
     Role,
     plan_exposure,
-    world_learning_scope,
 )
 from exp.optimize.evaluation.variance.tag_retrieval import index_tag_view, query_task_tags
-from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import (
     HttpxJsonTransport,
@@ -91,7 +100,21 @@ from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
+from exp.simulation.mining.error_tags import (
+    ErrorTags,
+    bank_for_view,
+    error_bank,
+    persist_error_tags,
+    tag_errors,
+)
 from exp.simulation.mining.questions import QuestionBank, resolve_question_bank
+from exp.simulation.mining.tag_cluster_names import ClusterNamer, named_clusters
+from exp.simulation.mining.tag_clusters import (
+    ClusterAdmission,
+    admit_by_cluster,
+    cluster_tags,
+    persist_tag_clustering,
+)
 from exp.simulation.mining.tag_selection import (
     TagSelection,
     select_traces,
@@ -100,8 +123,6 @@ from exp.simulation.mining.tagging import (
     DecisionCache,
     TagMatrix,
     TraceTaggingError,
-    distinct_units,
-    question_chunks,
 )
 from exp.simulation.mining.views import Unit, observations_view, task_view
 from exp.simulation.retrieval.build import persist_trace_rag
@@ -132,7 +153,6 @@ from exp.simulation.world_model.runtime import (
 Constructor = Callable[[JsonObject, str], JsonObject]
 """Admitted world-model constructor, as :func:`construct_world_model` takes it."""
 
-_ROLES: tuple[Role, ...] = ("world_learning", "mining_probes", "final_evaluation")
 _TASK_ROLES: tuple[Role, ...] = ("world_learning", "mining_probes")
 
 
@@ -148,6 +168,7 @@ class _Prepared:
         banks: Selected bank per tagged view.
         units: Rendered units per tagged view, in trace order.
         summary: The credential-free summary.
+        errors: Error bank and its observations units, when error tags are requested.
     """
 
     build: ProjectBuildArtifacts
@@ -157,6 +178,7 @@ class _Prepared:
     banks: Mapping[TagView, QuestionBank]
     units: Mapping[TagView, tuple[Unit, ...]]
     summary: VarianceBuildPlan
+    errors: tuple[QuestionBank, tuple[Unit, ...]] | None
 
 
 def plan_variance_build(
@@ -209,6 +231,7 @@ def run_variance_build(
     code_revision: str,
     tagger: DecisionsTraceTagger | None = None,
     constructor: Constructor | None = None,
+    namer: ClusterNamer | None = None,
 ) -> VarianceBuildReport:
     """Run, or replay, the variance build over the project's completed build.
 
@@ -220,14 +243,15 @@ def run_variance_build(
             alias over the admitted transport when omitted.
         constructor: Admitted world-model constructor, required when the spec requests
             construction and unused otherwise.
+        namer: Admitted cluster-naming model, required when the spec requests naming.
 
     Returns:
         The report, also saved as a ``variance-build-report`` artifact.
 
     Raises:
-        ValueError: There is no completed build, a bank, alias or constructor is missing, a rule
-            selects nothing, every trace of a view failed tagging, or the build's embedding
-            checkpoint lacks a vector the scoped index needs.
+        ValueError: There is no completed build, a bank, alias, constructor or namer is
+            missing, a rule or cluster admission selects nothing, every trace of a view failed
+            tagging, or the build's embedding checkpoint lacks a vector the scoped index needs.
         FileLockTimeout: Another process is running the same variance build.
     """
     spec = VarianceBuildSpec.model_validate_json(spec.model_dump_json())
@@ -235,6 +259,11 @@ def run_variance_build(
         raise ValueError(
             "construction makes paid reconstruction calls; pass an admitted constructor or "
             "leave construction off to bind the build's world model"
+        )
+    if spec.cluster_naming is not None and (namer is None or spec.clustering is None):
+        raise ValueError(
+            "cluster naming makes paid calls over clusters; pass an admitted namer and keep "
+            "clustering on, or leave cluster_naming unset"
         )
     if tagger is not None and tagger.cache is None:
         raise ValueError("a variance build tagger needs a project decision cache to replay")
@@ -253,6 +282,8 @@ def run_variance_build(
         )
         active = tagger or _admitted_tagger(project, spec, prepared.summary, code_revision)
         tagging, matrices = _tag(store, prepared, active, code_revision)
+        errors = _tag_errors(store, prepared, active, code_revision)
+        clusters = _cluster(store, spec, prepared, matrices, errors, namer, code_revision)
         report = _bind(
             project,
             spec,
@@ -262,6 +293,21 @@ def run_variance_build(
             matrices,
             code_revision=code_revision,
             constructor=constructor,
+            admission=None if clusters is None else clusters[2],
+        )
+        ranking, selected, failures = probe_selection(
+            prepared.plan, prepared.tasks, None if errors is None else errors[0], spec.probe_limit
+        )
+        report = report.model_copy(
+            update={
+                "errors": None if errors is None else errors[1],
+                "error_failures": failures,
+                "clustering": None if clusters is None else clusters[0],
+                "cluster_names": None if clusters is None else clusters[1],
+                "admission": None if clusters is None else clusters[2],
+                "probe_ranking": ranking,
+                "selected_probes": selected,
+            }
         )
         dependencies = {
             exposure,
@@ -270,6 +316,7 @@ def run_variance_build(
             report.tag_retrieval,
             report.control_retrieval,
             *(row.matrix for row in tagging),
+            *(ref for ref in (report.errors, report.clustering, report.cluster_names) if ref),
         }
         store.write_json(
             artifact_id=result_id,
@@ -339,6 +386,7 @@ def _prepare(
     }
     tasks = load_task_set(store, build.task_set.artifact_id).tasks
     ordered = sorted(trace for trace in traces if trace in plan.traces)
+    units_of = {trace for trace in ordered if plan.role_of(trace) in _TASK_ROLES}
     units: dict[TagView, tuple[Unit, ...]] = {
         "task": tuple(
             task_view(traces[trace]) for trace in ordered if plan.role_of(trace) in _TASK_ROLES
@@ -350,8 +398,17 @@ def _prepare(
             for trace in ordered
             if plan.role_of(trace) == "world_learning"
         )
-    views = tuple(_view_plan(view, banks[view], units[view], plan) for view in sorted(banks))
-    calls = sum(view.decision_calls for view in views)
+    views = tuple(view_plan(view, banks[view], units[view], plan) for view in sorted(banks))
+    errors = None
+    if spec.error_bank is not None:
+        asked = bank_for_view(
+            error_bank(spec.error_bank, families=spec.error_families), "observations"
+        )
+        errors = (asked, tuple(observations_view(traces[t]) for t in ordered if t in units_of))
+    error_plan = None if errors is None else view_plan("observations", *errors, plan)
+    calls = sum(
+        view.decision_calls for view in (*views, *(() if error_plan is None else (error_plan,)))
+    )
     serving = load_rag_index(store, build.serving_rag.artifact_id).index
     total, saved_inputs = _embedding_reuse(project, build, plan, serving)
     identity = stable_id(
@@ -361,13 +418,14 @@ def _prepare(
             "build": build.model_dump(mode="json"),
             "decision_model": model.model_dump(mode="json"),
             "banks": {view: sha256_json(bank) for view, bank in sorted(banks.items())},
+            "error_bank": None if errors is None else sha256_json(errors[0]),
         },
     )
     summary = VarianceBuildPlan(
         identity=identity,
         saved=store.exists(identity + "-result"),
         decision_model=model,
-        roles=_role_counts(plan, tasks),
+        roles=role_counts(plan, tasks),
         views=views,
         decision_calls=calls,
         decision_attempts=calls * RetryPolicy().maximum_attempts,
@@ -375,60 +433,12 @@ def _prepare(
         embedding_inputs=total,
         embedding_inputs_saved=saved_inputs,
         construction=spec.construction is not None,
+        errors=error_plan,
+        naming_calls=0
+        if spec.cluster_naming is None or spec.clustering is None
+        else spec.cluster_naming.calls(spec.clustering.max_clusters),
     )
-    return _Prepared(build, plan, traces, tasks, banks, units, summary)
-
-
-def _view_plan(
-    view: TagView, bank: QuestionBank, units: tuple[Unit, ...], plan: ExposurePlan
-) -> ViewPlan:
-    """Count the decisions one view may buy.
-
-    Args:
-        view: Rendered view.
-        bank: Selected bank.
-        units: Rendered units of the view.
-        plan: Exposure plan naming each unit's role.
-
-    Returns:
-        The view's plan.
-    """
-    per_unit = len(question_chunks(bank.questions, MAX_DECISION_QUESTIONS))
-    distinct = len(distinct_units(units)) if units else 0
-    return ViewPlan(
-        view=view,
-        bank_id=bank.bank_id,
-        bank_version=bank.version,
-        bank_sha256=sha256_json(bank),
-        questions=len(bank.questions),
-        roles=tuple(
-            role for role in _ROLES if any(plan.role_of(u.trace_id) == role for u in units)
-        ),
-        traces=len(units),
-        distinct_units=distinct,
-        calls_per_unit=per_unit,
-        decision_calls=distinct * per_unit,
-    )
-
-
-def _role_counts(plan: ExposurePlan, tasks: Sequence[TaskCase]) -> dict[Role, RoleCount]:
-    """Count lineages, traces and tasks per role.
-
-    Args:
-        plan: Exposure plan.
-        tasks: Build tasks.
-
-    Returns:
-        Counts for every role.
-    """
-    return {
-        role: RoleCount(
-            lineages=sum(1 for value in plan.roles.values() if value == role),
-            traces=sum(1 for lineage in plan.traces.values() if plan.roles[lineage] == role),
-            tasks=sum(1 for task in tasks if plan.roles.get(task.lineage_group_id) == role),
-        )
-        for role in _ROLES
-    }
+    return _Prepared(build, plan, traces, tasks, banks, units, summary, errors)
 
 
 def _embedding_reuse(
@@ -528,8 +538,8 @@ def _tag(
     rows: list[ViewTagging] = []
     matrices: dict[TagView, TagMatrix] = {}
     model = prepared.summary.decision_model
-    for view_plan in prepared.summary.views:
-        view, bank = view_plan.view, prepared.banks[view_plan.view]
+    for planned in prepared.summary.views:
+        view, bank = planned.view, prepared.banks[planned.view]
         matrix, failed = _tag_units(tagger, prepared.units[view], bank)
         failures = tuple(
             TagFailure(trace_id=trace, role=prepared.plan.role_of(trace), view=view, error=error)
@@ -538,9 +548,9 @@ def _tag(
         record = TagMatrixRecord(
             bank_id=bank.bank_id,
             bank_version=bank.version,
-            bank_sha256=view_plan.bank_sha256,
+            bank_sha256=planned.bank_sha256,
             view=view,
-            roles=view_plan.roles,
+            roles=planned.roles,
             decision_model=model,
             matrix_sha256=sha256_json(matrix),
             traces=len(matrix.rows),
@@ -552,10 +562,10 @@ def _tag(
             (prepared.build.trace_dataset,),
             code_revision,
         )
-        tagged: dict[Role, int] = {role: 0 for role in view_plan.roles}
+        tagged: dict[Role, int] = {role: 0 for role in planned.roles}
         for row in matrix.rows:
             tagged[prepared.plan.role_of(row.trace_id)] += 1
-        rows.append(ViewTagging(plan=view_plan, matrix=saved, tagged=tagged, failures=failures))
+        rows.append(ViewTagging(plan=planned, matrix=saved, tagged=tagged, failures=failures))
         matrices[view] = matrix
     return tuple(rows), matrices
 
@@ -614,6 +624,7 @@ def _bind(
     *,
     code_revision: str,
     constructor: Constructor | None,
+    admission: ClusterAdmission | None,
 ) -> VarianceBuildReport:
     """Declare scopes, build the index, bind the world model and the probe bindings.
 
@@ -626,6 +637,7 @@ def _bind(
         matrices: Matrices by view.
         code_revision: Producing source identity.
         constructor: Admitted constructor when construction is requested.
+        admission: Cluster admission narrowing every corpus without an explicit rule.
 
     Returns:
         The report.
@@ -636,11 +648,12 @@ def _bind(
     store, plan, build = project.artifacts, prepared.plan, prepared.build
     construction_selection = _select(spec.construction_rule, matrices, prepared, plan)
     retrieval_selection = _select(spec.retrieval_rule, matrices, prepared, plan)
-    construction_scope = world_learning_scope(
-        plan, name="world-learning-construction", selection=construction_selection
-    )
-    retrieval_scope = world_learning_scope(
-        plan, name="world-learning-retrieval", selection=retrieval_selection
+    construction_scope = corpus_scope(plan, "construction", construction_selection, admission)
+    retrieval_scope = corpus_scope(plan, "retrieval", retrieval_selection, admission)
+    admissions = trace_admissions(
+        (construction_scope, spec.construction_rule),
+        (retrieval_scope, spec.retrieval_rule),
+        admission,
     )
     untagged = {
         failure.trace_id
@@ -744,8 +757,87 @@ def _bind(
         control_retrieval=bindings[1],
         probes=probes,
         rules_stage_traces=rules_traces,
-        next_steps=_next_steps(exposure, world, bindings, len(rules_traces), len(queries)),
+        admissions=admissions,
+        next_steps=next_steps(exposure, world, bindings, len(rules_traces), len(queries)),
     )
+
+
+def _tag_errors(
+    store: ArtifactStore,
+    prepared: _Prepared,
+    tagger: DecisionsTraceTagger,
+    code_revision: str,
+) -> tuple[ErrorTags, ArtifactInput] | None:
+    """Tag world-learning and mining-probe observations with the error bank and save them.
+
+    Returns:
+        The record and its artifact, or None when no error bank is named.
+    """
+    if prepared.errors is None:
+        return None
+    bank, units = prepared.errors
+    errors = tag_errors(
+        units, tagger=tagger, bank=bank, unit_concurrency=tagger.maximum_concurrency
+    )
+    return errors, persist_error_tags(
+        store, errors, code_revision=code_revision, inputs=(prepared.build.trace_dataset,)
+    )
+
+
+def _cluster(
+    store: ArtifactStore,
+    spec: VarianceBuildSpec,
+    prepared: _Prepared,
+    matrices: Mapping[TagView, TagMatrix],
+    errors: tuple[ErrorTags, ArtifactInput] | None,
+    namer: ClusterNamer | None,
+    code_revision: str,
+) -> tuple[ArtifactInput, ArtifactInput | None, ClusterAdmission] | None:
+    """Cluster the world-learning tag space, name it when asked and admit traces by cluster.
+
+    Returns:
+        The saved clustering, the saved names (or None) and the admission, or None when
+        clustering is off.
+    """
+    if spec.clustering is None:
+        return None
+    plan = prepared.plan
+    joined = [matrices[view] for view in sorted(matrices)]
+    texts = {f"{v}:{q.question_id}": q.text for v, b in prepared.banks.items() for q in b.questions}
+    if errors is not None:
+        joined.append(errors[0].matrix.model_copy(update={"view": "errors"}))
+        bank = prepared.errors[0] if prepared.errors else None
+        texts |= {f"errors:{q.question_id}": q.text for q in (bank.questions if bank else ())}
+    learning = {t for t in plan.traces if plan.role_of(t) == "world_learning"}
+    clustering = cluster_tags(joined, spec.clustering, trace_ids=learning & set(prepared.traces))
+    inputs = () if errors is None else (errors[1],)
+    saved = persist_tag_clustering(store, clustering, code_revision=code_revision, inputs=inputs)
+    names = reference = None
+    if spec.cluster_naming is not None and namer is not None:
+        exemplars = {
+            trace: observations_view(prepared.traces[trace]).text
+            for cluster in clustering.clusters
+            for trace in cluster.exemplars
+        }
+        names, reference = named_clusters(
+            store,
+            clustering,
+            namer,
+            questions=texts,
+            exemplar_texts=exemplars,
+            spec=spec.cluster_naming,
+            code_revision=code_revision,
+            inputs=(saved,),
+        )
+    held_out = {t for t in plan.traces if plan.role_of(t) == "final_evaluation"}
+    admission = admit_by_cluster(
+        clustering,
+        spec.cluster_admission,
+        eligible=learning,
+        held_out=held_out,
+        names=None if names is None else names.mapping(),
+    )
+    return saved, reference, admission
 
 
 def _select(
@@ -894,33 +986,3 @@ def _probe_tags(
             )
         )
     return tuple(rows), queries
-
-
-def _next_steps(
-    exposure: ArtifactInput,
-    world: ArtifactInput,
-    bindings: tuple[ArtifactInput, ...],
-    rules_traces: int,
-    probes: int,
-) -> tuple[str, ...]:
-    """Describe how later stages consume this build's artifacts.
-
-    Args:
-        exposure: Saved exposure plan.
-        world: Scoped world model.
-        bindings: Treatment and control bindings.
-        rules_traces: Number of traces for the rules stage.
-        probes: Number of probe tasks with query tags.
-
-    Returns:
-        One line per consumer.
-    """
-    return (
-        f"rules-stage: exposure {exposure.artifact_id} (load_exposure_plan), traces "
-        f"rules_stage_traces ({rules_traces} world-learning traces)",
-        f"actor-critic: one spec per mining-probe task, with the same exposure plan; the "
-        f"simulator is world model {world.artifact_id}",
-        f"tag retrieval: load_grounded_world_model({world.artifact_id}, tag_retrieval="
-        f"load_tag_retrieval_binding({bindings[0].artifact_id})) for {probes} probe tasks; "
-        f"control {bindings[1].artifact_id} ranks by cosine similarity alone",
-    )

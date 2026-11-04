@@ -2,14 +2,17 @@
 
 A variance build (:mod:`exp.optimize.evaluation.variance.build`) saves its exposure plan, every
 tag matrix, both tag retrieval bindings and its report as content-addressed artifacts. This module
-holds their contracts and the readers later stages use to load them by the references a report
-names.
+holds their contracts, the pure builders of their records (view plans, role counts, the
+world-learning corpora from a rule or cluster admission with why each trace was admitted, and the
+error-ranked probe selection) and the readers later stages use to load them by the references a
+report names.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,10 +31,26 @@ from exp.common.project import (
     ProjectStore,
     artifact_input,
 )
-from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role
+from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role, world_learning_scope
+from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.simulation.mining.dispatch import DEFAULT_TAGGING_CONCURRENCY
-from exp.simulation.mining.tag_selection import DEFAULT_FIRE_THRESHOLD, TagRule
-from exp.simulation.mining.tagging import TagMatrix
+from exp.simulation.mining.error_tags import (
+    ERROR_BANK_ID,
+    ErrorTags,
+    TaskErrorRank,
+    rank_error_tasks,
+)
+from exp.simulation.mining.questions import QuestionBank
+from exp.simulation.mining.tag_cluster_names import ClusterNamingSpec
+from exp.simulation.mining.tag_clusters import (
+    ClusterAdmission,
+    ClusterAdmissionSpec,
+    ClusteringSpec,
+)
+from exp.simulation.mining.tag_selection import DEFAULT_FIRE_THRESHOLD, TagRule, TagSelection
+from exp.simulation.mining.tagging import TagMatrix, distinct_units, question_chunks
+from exp.simulation.mining.views import Unit
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.tags import TagRetrievalBinding, TagRetrievalMode, TagView
 
@@ -49,6 +68,12 @@ BINDING_TYPE = "tag-retrieval-binding"
 
 REPORT_TYPE = "variance-build-report"
 """Artifact type of a saved :class:`VarianceBuildReport` (``report.json``)."""
+
+_ROLES: tuple[Role, ...] = ("world_learning", "mining_probes", "final_evaluation")
+
+
+Corpus = Literal["construction", "retrieval"]
+"""A world-learning corpus a trace may be admitted to."""
 
 
 class ScopeRule(ContractModel):
@@ -88,8 +113,23 @@ class VarianceBuildSpec(ContractModel):
         observations_families: Families of the observations bank to ask; all when empty.
         seed: Seed of the fit-lineage split.
         probe_fraction: Share of fit lineages reserved as mining probes.
-        construction_rule: Optional tag rule narrowing the construction corpus.
-        retrieval_rule: Optional tag rule narrowing the retrieval corpus.
+        error_bank: Local error bank asked over the observations view of every world-learning
+            and mining-probe trace (never final evaluation), or None to skip error tags. Error
+            tags rank the mining probes and join the clustered tag space.
+        error_families: Families of the error bank to ask; all when empty.
+        clustering: How the world-learning tag space (every tagged view plus the error tags) is
+            clustered, its cluster count chosen by the data; None skips clustering.
+        cluster_admission: Which clusters, and how many traces of each, enter world learning.
+            By default every eligible member of every cluster is admitted. It narrows both the
+            construction and retrieval corpora unless an explicit rule overrides that corpus.
+        cluster_naming: How an injected naming model names the clusters, or None to leave them
+            unnamed; naming needs a namer passed to the run.
+        probe_limit: Most mining-probe tasks selected for error mining, most error-laden first;
+            None selects every probe task, still ranked.
+        construction_rule: Optional explicit tag rule for the construction corpus; it overrides
+            cluster admission for that corpus.
+        retrieval_rule: Optional explicit tag rule for the retrieval corpus; it overrides
+            cluster admission for that corpus.
         construction: Reconstruct the world model over the construction scope. Off by default:
             reconstruction makes paid calls and needs an injected constructor.
         threshold: Probability strictly above which a proposition fires, for the index, the
@@ -110,6 +150,12 @@ class VarianceBuildSpec(ContractModel):
     observations_families: tuple[str, ...] = ()
     seed: int = Field(default=0, ge=0)
     probe_fraction: float = Field(default=0.3, gt=0.0, lt=1.0)
+    error_bank: str | None = ERROR_BANK_ID
+    error_families: tuple[str, ...] = ()
+    clustering: ClusteringSpec | None = Field(default_factory=ClusteringSpec)
+    cluster_admission: ClusterAdmissionSpec = Field(default_factory=ClusterAdmissionSpec)
+    cluster_naming: ClusterNamingSpec | None = None
+    probe_limit: int | None = Field(default=None, ge=1)
     construction_rule: ScopeRule | None = None
     retrieval_rule: ScopeRule | None = None
     construction: ConstructionSettings | None = None
@@ -198,6 +244,9 @@ class VarianceBuildPlan(ContractModel):
         embedding_inputs_saved: Of those, the inputs already in the build's checkpoint; the
             scoped index is a subset, so it needs no embedding call when these are equal.
         construction: Whether paid reconstruction was requested.
+        errors: Decisions the error tags may buy, when an error bank is named; included in
+            ``decision_calls``.
+        naming_calls: Upper bound on cluster-naming calls, at the largest cluster count.
     """
 
     identity: str
@@ -211,6 +260,8 @@ class VarianceBuildPlan(ContractModel):
     embedding_inputs: int = Field(ge=0)
     embedding_inputs_saved: int = Field(ge=0)
     construction: bool
+    errors: ViewPlan | None = None
+    naming_calls: int = Field(default=0, ge=0)
 
 
 class TagMatrixRecord(ContractModel):
@@ -286,6 +337,22 @@ class ProbeBinding(ContractModel):
     fired: int = Field(ge=0)
 
 
+class TraceAdmission(ContractModel):
+    """Why one world-learning trace entered the world-learning corpora.
+
+    Attributes:
+        trace_id: The trace.
+        corpora: The corpora it entered.
+        cluster_id: Its cluster, when cluster admission chose it.
+        reason: One sentence per corpus, joined.
+    """
+
+    trace_id: str
+    corpora: tuple[Literal["construction", "retrieval"], ...]
+    cluster_id: str | None = None
+    reason: str
+
+
 class VarianceBuildReport(ContractModel):
     """The complete record of one variance build.
 
@@ -310,6 +377,14 @@ class VarianceBuildReport(ContractModel):
         rules_stage_traces: World-learning traces for ``run_rules_stage``: the construction
             scope's traces.
         next_steps: How the rules stage and actor-critic runs consume these artifacts.
+        errors: Saved ``error-tags`` record over world-learning and mining-probe traces.
+        error_failures: Traces whose error tags were refused; recorded, never redrawn.
+        clustering: Saved ``tag-clusters`` record over world learning.
+        cluster_names: Saved ``tag-cluster-names`` record, when naming was requested.
+        admission: The cluster admission, when clustering ran.
+        admissions: Why every world-learning trace in either corpus is there.
+        probe_ranking: Every mining-probe task ranked by its source traces' error tags.
+        selected_probes: Probe tasks selected for error mining, most error-laden first.
     """
 
     spec: VarianceBuildSpec
@@ -331,6 +406,181 @@ class VarianceBuildReport(ContractModel):
     probes: tuple[ProbeBinding, ...]
     rules_stage_traces: tuple[str, ...]
     next_steps: tuple[str, ...]
+    errors: ArtifactInput | None = None
+    error_failures: tuple[TagFailure, ...] = ()
+    clustering: ArtifactInput | None = None
+    cluster_names: ArtifactInput | None = None
+    admission: ClusterAdmission | None = None
+    admissions: tuple[TraceAdmission, ...] = ()
+    probe_ranking: tuple[TaskErrorRank, ...] = ()
+    selected_probes: tuple[str, ...] = ()
+
+
+def view_plan(
+    view: TagView, bank: QuestionBank, units: tuple[Unit, ...], plan: ExposurePlan
+) -> ViewPlan:
+    """Count the decisions one view may buy.
+
+    Args:
+        view: Rendered view.
+        bank: Selected bank.
+        units: Rendered units of the view.
+        plan: Exposure plan naming each unit's role.
+
+    Returns:
+        The view's plan.
+    """
+    per_unit = len(question_chunks(bank.questions, MAX_DECISION_QUESTIONS))
+    distinct = len(distinct_units(units)) if units else 0
+    return ViewPlan(
+        view=view,
+        bank_id=bank.bank_id,
+        bank_version=bank.version,
+        bank_sha256=sha256_json(bank),
+        questions=len(bank.questions),
+        roles=tuple(
+            role for role in _ROLES if any(plan.role_of(u.trace_id) == role for u in units)
+        ),
+        traces=len(units),
+        distinct_units=distinct,
+        calls_per_unit=per_unit,
+        decision_calls=distinct * per_unit,
+    )
+
+
+def role_counts(plan: ExposurePlan, tasks: Sequence[TaskCase]) -> dict[Role, RoleCount]:
+    """Count lineages, traces and tasks per role.
+
+    Args:
+        plan: Exposure plan.
+        tasks: Build tasks.
+
+    Returns:
+        Counts for every role.
+    """
+    return {
+        role: RoleCount(
+            lineages=sum(1 for value in plan.roles.values() if value == role),
+            traces=sum(1 for lineage in plan.traces.values() if plan.roles[lineage] == role),
+            tasks=sum(1 for task in tasks if plan.roles.get(task.lineage_group_id) == role),
+        )
+        for role in _ROLES
+    }
+
+
+def corpus_scope(
+    plan: ExposurePlan,
+    corpus: str,
+    selection: TagSelection | None,
+    admission: ClusterAdmission | None,
+) -> CorpusScope:
+    """Declare one world-learning corpus from its rule, else cluster admission, else the role.
+
+    Raises:
+        ValueError: An admitted trace is outside world learning, or nothing is selected.
+    """
+    name = f"world-learning-{corpus}"
+    if selection is not None or admission is None:
+        return world_learning_scope(plan, name=name, selection=selection)
+    plan.require(admission.trace_ids(), "world_learning")
+    return CorpusScope.declare(
+        name=name, kind="trace", ids=admission.trace_ids(), source_plan=sha256_json(plan)
+    )
+
+
+def trace_admissions(
+    construction: tuple[CorpusScope, ScopeRule | None],
+    retrieval: tuple[CorpusScope, ScopeRule | None],
+    admission: ClusterAdmission | None,
+) -> tuple[TraceAdmission, ...]:
+    """Record why every trace of either corpus was admitted."""
+    admitted = {row.trace_id: row for row in (admission.admitted if admission else ())}
+    rows: dict[str, list[tuple[Corpus, str]]] = {}
+    corpora: tuple[tuple[Corpus, tuple[CorpusScope, ScopeRule | None]], ...] = (
+        ("construction", construction),
+        ("retrieval", retrieval),
+    )
+    for label, (scope, rule) in corpora:
+        for trace in scope.ids:
+            if rule is not None:
+                why = f"tag rule {rule.rule.name!r} over the {rule.view} view selected it"
+            elif admission is not None:
+                why = admitted[trace].reason
+            else:
+                why = "every world-learning trace (no rule and no clustering)"
+            rows.setdefault(trace, []).append((label, f"{label}: {why}"))
+    return tuple(
+        TraceAdmission(
+            trace_id=trace,
+            corpora=tuple(label for label, _ in rows[trace]),
+            cluster_id=admitted[trace].cluster_id if trace in admitted else None,
+            reason="; ".join(why for _, why in rows[trace]),
+        )
+        for trace in sorted(rows)
+    )
+
+
+def probe_selection(
+    plan: ExposurePlan,
+    tasks: Sequence[TaskCase],
+    errors: ErrorTags | None,
+    limit: int | None,
+) -> tuple[tuple[TaskErrorRank, ...], tuple[str, ...], tuple[TagFailure, ...]]:
+    """Rank mining-probe tasks by their source traces' error tags and select the top ones.
+
+    Args:
+        plan: Exposure plan naming the probe lineages.
+        tasks: Build tasks.
+        errors: Error record, or None when no error bank was asked.
+        limit: Most tasks selected, or None for all of them.
+
+    Returns:
+        The ranking, the selected task identities and every trace whose error tags were refused.
+    """
+    if errors is None:
+        return (), (), ()
+    probes = {
+        task.task_id: task.source_trace_ids
+        for task in tasks
+        if plan.roles.get(task.lineage_group_id) == "mining_probes"
+    }
+    ranking = rank_error_tasks(errors, probes)
+    failures = tuple(
+        TagFailure(trace_id=trace, role=plan.role_of(trace), view="observations", error=error)
+        for trace, error in errors.failed.items()
+    )
+    selected = ranking if limit is None else ranking[:limit]
+    return ranking, tuple(row.task_id for row in selected), failures
+
+
+def next_steps(
+    exposure: ArtifactInput,
+    world: ArtifactInput,
+    bindings: tuple[ArtifactInput, ...],
+    rules_traces: int,
+    probes: int,
+) -> tuple[str, ...]:
+    """Describe how later stages consume this build's artifacts.
+
+    Args:
+        exposure: Saved exposure plan.
+        world: Scoped world model.
+        bindings: Treatment and control bindings.
+        rules_traces: Number of traces for the rules stage.
+        probes: Number of probe tasks with query tags.
+
+    Returns:
+        One line per consumer.
+    """
+    return (
+        f"rules-stage: exposure {exposure.artifact_id} (load_exposure_plan), traces "
+        f"rules_stage_traces ({rules_traces} world-learning traces)",
+        f"actor-critic: one spec per mining-probe task, with the same exposure plan; the "
+        f"simulator is world model {world.artifact_id}",
+        f"tag retrieval: load_grounded_world_model({world.artifact_id}, tag_retrieval="
+        f"load_tag_retrieval_binding({bindings[0].artifact_id})) for {probes} probe tasks; "
+        f"control {bindings[1].artifact_id} ranks by cosine similarity alone",
+    )
 
 
 def load_exposure_plan(project: ProjectStore, reference: ArtifactInput) -> ExposurePlan:
