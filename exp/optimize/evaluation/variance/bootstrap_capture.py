@@ -20,6 +20,8 @@ Validation depends on what the start claims to be:
 
 Executing replay and reveal calls in a learned world may buy simulator predictions within the
 runtime's own provider allowance; the actor is never involved.
+Every probe or prefix has an immutable intent before execution and saves its known observations.
+Only a completed result replays; an unfinished intent is refused without another dispatch.
 """
 
 from __future__ import annotations
@@ -27,10 +29,20 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from datetime import UTC, datetime
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    ContractModel,
+    JsonObject,
+    JsonValue,
+    sha256_json,
+    stable_id,
+)
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall, load_model_catalog
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition, capture_initial_world
 from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
@@ -203,7 +215,10 @@ def validate_start(
     if draft.provenance == "reconstructed":
         assert draft.replay_trace is not None
         steps = material.recorded_prefix(draft.replay_trace)[: draft.prefix_steps]
-        replay = replay_prefix(project, template, definition, checkpoint, steps)
+        replay = replay_prefix(
+            project, template, definition, checkpoint, steps,
+            identity=identity, code_revision=code_revision,
+        )  # fmt: skip
         disagree = [row.locator for row in replay if not row.agrees]
         detail = (
             f"{len(replay)} recorded steps of {draft.replay_trace} replay to their observations"
@@ -217,7 +232,10 @@ def validate_start(
             detail=detail,
             replay=replay,
         )
-    reveals = first_reveals(project, template, definition, checkpoint, draft)
+    reveals = first_reveals(
+        project, template, definition, checkpoint, draft,
+        identity=identity, code_revision=code_revision,
+    )  # fmt: skip
     checks = check_reveals(
         project,
         spec,
@@ -257,6 +275,9 @@ def replay_prefix(
     definition: GroundedRuntimeDefinition,
     checkpoint: ArtifactInput,
     steps: Sequence[JsonObject],
+    *,
+    identity: str,
+    code_revision: str,
 ) -> tuple[ReplayStep, ...]:
     """Execute recorded steps in order in one fresh restore of the start and compare each.
 
@@ -266,38 +287,46 @@ def replay_prefix(
         definition: The start's runtime.
         checkpoint: The captured start.
         steps: Recorded trajectory steps, as the trajectory view renders them.
+        identity: Task bootstrap identity.
+        code_revision: Producing source identity.
 
     Returns:
         One comparison per step.
     """
-    rows: list[ReplayStep] = []
-    with _restored(project, template, definition, checkpoint) as session:
-        for index, step in enumerate(steps):
-            action = step["action"]
-            assert isinstance(action, dict)
-            arguments = action.get("arguments")
-            call = ToolCall(
+    actions: list[ToolCall] = []
+    for index, step in enumerate(steps):
+        action = step["action"]
+        assert isinstance(action, dict)
+        arguments = action.get("arguments")
+        actions.append(
+            ToolCall(
                 name=str(action["name"]),
                 call_id=f"replay-{index}",
                 arguments=arguments if isinstance(arguments, dict) else {},
+            )  # fmt: skip
+        )
+    observations = _probe_observations(
+        project, template, definition, checkpoint, actions,
+        identity=identity, code_revision=code_revision,
+    )  # fmt: skip
+    rows: list[ReplayStep] = []
+    for step, observation in zip(steps, observations, strict=True):
+        action = step["action"]
+        assert isinstance(action, dict)
+        replayed = _decode(observation)
+        recorded_error = step.get("failure") is not None
+        rows.append(
+            ReplayStep(
+                locator=str(step["locator"]),
+                action=action,
+                recorded=step.get("observation"),
+                recorded_error=recorded_error,
+                replayed=replayed,
+                replayed_error=observation.is_error,
+                agrees=observation.is_error == recorded_error
+                and (recorded_error or replayed == step.get("observation")),
             )
-            observation = session.execute(call)
-            replayed = _decode(observation)
-            recorded_error = step.get("failure") is not None
-            agrees = observation.is_error == recorded_error and (
-                recorded_error or replayed == step.get("observation")
-            )
-            rows.append(
-                ReplayStep(
-                    locator=str(step["locator"]),
-                    action=action,
-                    recorded=step.get("observation"),
-                    recorded_error=recorded_error,
-                    replayed=replayed,
-                    replayed_error=observation.is_error,
-                    agrees=agrees,
-                )
-            )
+        )
     return tuple(rows)
 
 
@@ -307,6 +336,9 @@ def first_reveals(
     definition: GroundedRuntimeDefinition,
     checkpoint: ArtifactInput,
     draft: StartDraft,
+    *,
+    identity: str,
+    code_revision: str,
 ) -> tuple[Reveal, ...]:
     """Execute each reveal probe once, each from its own fresh restore of the start.
 
@@ -315,10 +347,12 @@ def first_reveals(
     """
     rows: list[Reveal] = []
     for index, probe in enumerate(draft.reveal_probes):
-        with _restored(project, template, definition, checkpoint) as session:
-            observation = session.execute(
-                ToolCall(name=probe.name, call_id=f"reveal-{index}", arguments=probe.arguments)
-            )
+        observations = _probe_observations(
+            project, template, definition, checkpoint,
+            (ToolCall(name=probe.name, call_id=f"reveal-{index}", arguments=probe.arguments),),
+            identity=identity, code_revision=code_revision,
+        )  # fmt: skip
+        observation = observations[0]
         rows.append(
             Reveal(
                 probe=index,
@@ -329,6 +363,94 @@ def first_reveals(
             )
         )
     return tuple(rows)
+
+
+class _ProbeResult(ContractModel):
+    """Completed observations from one validation execution.
+
+    Attributes:
+        observations: Known results in the exact registered action order.
+    """
+
+    observations: tuple[Observation, ...]
+
+
+def _probe_observations(
+    project: ProjectStore,
+    template: RuntimeTemplate,
+    definition: GroundedRuntimeDefinition,
+    checkpoint: ArtifactInput,
+    actions: Sequence[ToolCall],
+    *,
+    identity: str,
+    code_revision: str,
+) -> tuple[Observation, ...]:
+    """Execute once in one restore, replay a completed result or refuse an unfinished intent.
+
+    Each known observation is saved before the next action. An interrupted prefix keeps those
+    observations but never restores a new session to repeat or continue its incomplete sample.
+    Exceptions from admission, execution, persistence and cleanup propagate unchanged.
+    """
+    request: JsonObject = {
+        "task": identity,
+        "template": template.model_dump(mode="json"),
+        "definition": definition.model_dump(mode="json"),
+        "checkpoint": checkpoint.model_dump(mode="json"),
+        "actions": [action.model_dump(mode="json") for action in actions],
+    }
+    probe_id = stable_id(
+        "start-bootstrap-probe", {"request": request, "code_revision": code_revision}
+    )
+    store = project.artifacts
+    result_id = probe_id + "-result"
+    with CoordinationLock(store.project_directory / (probe_id + ".lock"), timeout=0):
+        if store.exists(result_id):
+            return _ProbeResult.model_validate_json(
+                store.read_bytes(result_id, "result.json")
+            ).observations
+        if store.exists(probe_id):
+            raise ValueError(
+                "bootstrap validation has an unfinished probe intent; inspect its saved "
+                "observations before preparing a fresh bootstrap, no implicit restart"
+            )
+        envelope = ArtifactEnvelope(
+            schema_version=1,
+            created_at=datetime.now(UTC),
+            code_revision=code_revision,
+            inputs=(checkpoint,),
+        )
+        intent = artifact_input(
+            store.write_json(
+                artifact_id=probe_id,
+                artifact_type="start-bootstrap-probe",
+                envelope=envelope,
+                files={"request.json": request},
+            )
+        )
+        rows: list[Observation] = []
+        sources = [intent]
+        with _restored(project, template, definition, checkpoint) as session:
+            for index, action in enumerate(actions):
+                observation = session.execute(action)
+                sources.append(
+                    artifact_input(
+                        store.write_json(
+                            artifact_id=f"{probe_id}-step-{index}",
+                            artifact_type="start-bootstrap-probe-step",
+                            envelope=envelope.model_copy(update={"inputs": (intent,)}),
+                            files={"observation.json": observation},
+                        )
+                    )
+                )
+                rows.append(observation)
+        result = _ProbeResult(observations=tuple(rows))
+        store.write_json(
+            artifact_id=result_id,
+            artifact_type="start-bootstrap-probe-result",
+            envelope=envelope.model_copy(update={"inputs": tuple(sources)}),
+            files={"result.json": result},
+        )
+        return result.observations
 
 
 def mining_job(
