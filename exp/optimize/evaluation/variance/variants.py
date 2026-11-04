@@ -31,8 +31,9 @@ none fails:
 - **replay_stability**: the turns the actor replays did not themselves change an edited path, so
   the edits still describe the decision's before-state.
 - **reachability**: the replay fits the actor's call allowance when one is supplied; otherwise it
-  is marked for review. Replay is a fresh draw of the actor, not a guaranteed path back to the
-  decision, so the replay length is always reported.
+  is marked for review. The replay length is always reported; reaching the decision again is
+  :func:`~exp.optimize.evaluation.variance.replay.replay_to_decision`, which forces the original
+  trajectory's recorded calls in the edited world and may diverge.
 
 Value matching is deliberately conservative: a value counts as revealed when it appears as a
 whole token anywhere in the text, regardless of which field it came from, so short or common
@@ -192,7 +193,7 @@ def build_variant_checkpoint(
     run.check("trajectory", "passed", f"{len(loaded)} boundaries extend one conversation")
 
     paths = tuple(edit.path for edit in scenario.edits)
-    states = [_editable_state(checkpoint.world) for checkpoint in loaded]
+    states = [grounded_state(checkpoint.world) for checkpoint in loaded]
     values = _watched_values(scenario, states)
     keys = frozenset(name for path in paths if (name := _field_name(path)) is not None)
     run.add(_public_context_check(loaded[-1], paths, values))
@@ -242,7 +243,7 @@ def build_variant_checkpoint(
     run.check("edits", "passed", f"{len(paths)} declared axes applied at boundary {fork}")
 
     run.add(_clock_check(forked.world, paths, edited))
-    retained = _revealing_texts(_message_texts(forked.actor.messages), values, keys)
+    retained = revealing_texts(message_texts(forked.actor.messages), values, keys)
     run.check(
         "retained_messages",
         "failed" if retained else "passed",
@@ -250,7 +251,7 @@ def build_variant_checkpoint(
         if retained
         else f"{len(forked.actor.messages)} retained messages show no edited value",
     )
-    seen = _revealing_texts(_history_texts(history, forked.world), values, keys)
+    seen = revealing_texts(_history_texts(history, forked.world), values, keys)
     run.check(
         "retained_world_history",
         "failed" if seen else "passed",
@@ -460,7 +461,7 @@ def _grounded_parts(world: WorldCheckpoint) -> tuple[JsonObject, list[JsonValue]
     return wire["state"], wire["history"]
 
 
-def _editable_state(world: WorldCheckpoint) -> JsonObject | None:
+def grounded_state(world: WorldCheckpoint) -> JsonObject | None:
     """Return a boundary's simulated state, or None when it holds none."""
     parts = _grounded_parts(world)
     return None if isinstance(parts, str) else parts[0]
@@ -508,27 +509,27 @@ def _watched_values(scenario: Scenario, states: list[JsonObject | None]) -> tupl
     """
     found: list[JsonValue] = []
     for edit in scenario.edits:
-        found.extend(_scalars(edit.value))
+        found.extend(json_scalars(edit.value))
         for state in states:
             if state is None:
                 continue
             exists, value = resolve_pointer(state, edit.path)
             if exists:
-                found.extend(_scalars(value))
+                found.extend(json_scalars(value))
     unique: dict[str, JsonValue] = {}
     for value in found:
         unique.setdefault(json.dumps(value), value)
     return tuple(unique.values())
 
 
-def _scalars(value: JsonValue) -> Iterator[JsonValue]:
+def json_scalars(value: JsonValue) -> Iterator[JsonValue]:
     """Yield every scalar inside a JSON value."""
     if isinstance(value, dict):
         for item in value.values():
-            yield from _scalars(item)
+            yield from json_scalars(item)
     elif isinstance(value, list):
         for item in value:
-            yield from _scalars(item)
+            yield from json_scalars(item)
     else:
         yield value
 
@@ -542,7 +543,7 @@ def _field_name(path: str) -> str | None:
     return None
 
 
-def _message_texts(messages: Iterable[ModelMessage]) -> tuple[str, ...]:
+def message_texts(messages: Iterable[ModelMessage]) -> tuple[str, ...]:
     """Return every actor-visible text of some messages: content and tool-call arguments."""
     texts: list[str] = []
     for message in messages:
@@ -587,12 +588,12 @@ def _first_revealing_turn(
     for turn, checkpoint in enumerate(loaded):
         messages = checkpoint.actor.messages[seen:]
         seen = len(checkpoint.actor.messages)
-        if _revealing_texts(_message_texts(messages), values, keys):
+        if revealing_texts(message_texts(messages), values, keys):
             return turn
     return None
 
 
-def _revealing_texts(
+def revealing_texts(
     texts: Iterable[str], values: tuple[JsonValue, ...], keys: frozenset[str]
 ) -> list[str]:
     """Return which watched values or field names appear in some texts.
@@ -687,7 +688,7 @@ def _public_context_check(
         )
         found.extend(
             f"{label} initial_context shows {item}"
-            for item in _revealing_texts((json.dumps(context),), values, frozenset())
+            for item in revealing_texts((json.dumps(context),), values, frozenset())
         )
     if found:
         return CoherenceCheck(
@@ -734,7 +735,7 @@ def _facts_check(
             elif (
                 key
                 and key[-1] == _field_name(path)
-                and any(json.dumps(item) in watched for item in _scalars(fact.value))
+                and any(json.dumps(item) in watched for item in json_scalars(fact.value))
             ):
                 conflicts.append(f"fact {fact.key!r} names the field of {path} with its value")
     if conflicts:

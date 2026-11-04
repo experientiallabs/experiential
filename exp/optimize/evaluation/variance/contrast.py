@@ -311,6 +311,40 @@ def saved_observation_witness(
     return result
 
 
+def witness_reference(
+    project: ProjectStore,
+    *,
+    checkpoint: ArtifactInput,
+    scenario: Scenario,
+    job: ContinuationJob,
+    code_revision: str,
+) -> ArtifactInput:
+    """Return the saved witness artifact, for citing it as evidence of an option contrast.
+
+    Args:
+        project: Trusted project.
+        checkpoint: Variant checkpoint the witness ran from.
+        scenario: Scenario whose witness ran.
+        job: Frozen job the witness ran under.
+        code_revision: Installed implementation identity.
+
+    Returns:
+        The ``observation-witness`` artifact.
+
+    Raises:
+        ValueError: No witness was saved for this checkpoint, scenario and job; run
+            :func:`run_observation_witness` first.
+    """
+    bound = _bind(job, checkpoint, job.study.repeats)
+    identity = witness_identity(checkpoint, scenario, bound, code_revision=code_revision)
+    if not project.artifacts.exists(identity + "-result"):
+        raise ValueError(
+            f"scenario {scenario.scenario_id} has no saved witness at this checkpoint; run "
+            "run_observation_witness before citing it"
+        )
+    return artifact_input(project.artifacts.read(identity + "-result").manifest)
+
+
 def run_observation_witness(
     project: ProjectStore,
     *,

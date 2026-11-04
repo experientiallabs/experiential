@@ -1,9 +1,11 @@
-"""Decision families end to end over a real actor-critic run, offline.
+"""Decision-family orchestration over a real actor-critic run on the native workbook, offline.
 
 The actor-critic run, the before-state probe and both authors run for real over the workbook
-fixture with scripted transports. The variant, witness and contrast owners are replaced by
-deterministic stand-ins that save nothing new but record every dispatch, because the workbook
-world is native and cannot carry pointer edits; their own tests cover them.
+fixture with scripted transports. The workbook world is native and cannot carry pointer edits, so
+these tests replace the per-variant stage owners with deterministic stand-ins that record every
+dispatch, to exercise orchestration, replay of saved reports and dispositions cheaply. The same
+pipeline runs with no stand-in over a grounded world in
+:mod:`~exp.optimize.evaluation.variance.tests.family_end_to_end_test`.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from exp.optimize.evaluation.rules.stage import (
     RulesStageSpec,
     rulebook_files,
 )
-from exp.optimize.evaluation.variance import family as family_module
+from exp.optimize.evaluation.variance import family_stages as stages_module
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, run_actor_critic
 from exp.optimize.evaluation.variance.actor_critic_test import (
     _done,
@@ -52,7 +54,7 @@ from exp.optimize.evaluation.variance.family import (
     run_decision_family,
 )
 from exp.optimize.evaluation.variance.grader import EpisodeView
-from exp.optimize.evaluation.variance.grader_test import _SNAPSHOT, _Decider
+from exp.optimize.evaluation.variance.grader_test import _SNAPSHOT, _Decider, _evidence
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     TrainingRecords,
@@ -311,6 +313,31 @@ class _Stages:
             )
         return self.witnesses[scenario.scenario_id]
 
+    def cited(
+        self,
+        project: ProjectStore,
+        *,
+        checkpoint: ArtifactInput,
+        scenario: Scenario,
+        job: ContinuationJob,
+        code_revision: str,
+    ) -> ArtifactInput:
+        """Cite the stand-in variant's own saved checkpoint as its witness artifact.
+
+        Args:
+            project: Unused project.
+            checkpoint: The variant checkpoint.
+            scenario: The scenario, which must have a stand-in witness.
+            job: Unused job.
+            code_revision: Unused revision.
+
+        Returns:
+            A saved artifact reference.
+        """
+        del project, job, code_revision
+        assert scenario.scenario_id in self.witnesses
+        return checkpoint
+
     def contrast(
         self,
         project: ProjectStore,
@@ -447,11 +474,12 @@ def _setup(
     exposure = _exposure(project, job, "mining_probes")
     report = run_actor_critic(project, actor_spec, exposure=exposure, code_revision="test")
     stages = _Stages(report=report, confirm=confirm or {})
-    monkeypatch.setattr(family_module, "build_variant_checkpoint", stages.build)
-    monkeypatch.setattr(family_module, "verify_restoration", _restores)
-    monkeypatch.setattr(family_module, "run_observation_witness", stages.witness)
-    monkeypatch.setattr(family_module, "run_option_contrast", stages.contrast)
-    monkeypatch.setattr(family_module, "confirmation_episodes", _episodes)
+    monkeypatch.setattr(stages_module, "build_variant_checkpoint", stages.build)
+    monkeypatch.setattr(stages_module, "verify_restoration", _restores)
+    monkeypatch.setattr(stages_module, "run_observation_witness", stages.witness)
+    monkeypatch.setattr(stages_module, "witness_reference", stages.cited)
+    monkeypatch.setattr(stages_module, "run_option_contrast", stages.contrast)
+    monkeypatch.setattr(stages_module, "confirmation_episodes", _episodes)
     settings = actor_spec.judges[0]
     spec = DecisionFamilySpec(
         decision_author=settings,
@@ -620,7 +648,7 @@ def test_harbor_export_refuses_a_variant_the_family_did_not_build(
     """Only persisted variants can be packaged."""
     setup = _setup(tmp_path, monkeypatch)
     report = setup.run()
-    with pytest.raises(ValueError, match="no persisted variant"):
+    with pytest.raises(ValueError, match="no persisted decision checkpoint"):
         export_family_harbor(
             setup.project,
             report,
@@ -630,3 +658,18 @@ def test_harbor_export_refuses_a_variant_the_family_did_not_build(
             intent="Choose the deletion the row count calls for.",
             code_revision="test",
         )
+
+
+def test_ambiguous_rubric_criteria_block_eligibility_and_go_back_to_authoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grading draws that straddle the band make the criterion ambiguous for both variants."""
+    setup = _setup(tmp_path, monkeypatch)
+    setup.decider = _Decider(_evidence(0.9, 0.9, draw=0.1))
+    first = setup.run()
+    report = setup.run(_disposed(setup, first))
+
+    assert report.confirmation is not None and report.confirmation.qualifies
+    assert report.ambiguous_criteria == ("rows",)
+    assert [c.name for c in report.eligibility.conditions if not c.holds] == ["rubric_unambiguous"]
+    assert report.records is None

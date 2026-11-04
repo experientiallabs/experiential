@@ -30,6 +30,7 @@ from exp.optimize.evaluation.variance.contrast import (
     run_option_contrast,
     shows_value,
     states_action,
+    witness_reference,
 )
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
@@ -130,8 +131,26 @@ def test_witness_shows_deciding_fact_and_replays_without_runtime(
             code_revision="test",
         )
 
+    with pytest.raises(ValueError, match="no saved witness"):
+        witness_reference(
+            project,
+            checkpoint=job.study.checkpoint,
+            scenario=_scenario(),
+            job=job,
+            code_revision="test",
+        )
     result = run()
     assert result.holds, result.problems
+    cited = witness_reference(
+        project,
+        checkpoint=job.study.checkpoint,
+        scenario=_scenario(),
+        job=job,
+        code_revision="test",
+    )
+    assert project.artifacts.read(cited.artifact_id).manifest.artifact_type == (
+        "observation-witness"
+    )
     assert result.state["account"] == {"tier": "gold"}
     assert result.paths[0].shown_by == (0,) and result.paths[0].declared_by == (0,)
     assert result.remaining_calls == 4 and len(calls) == 1

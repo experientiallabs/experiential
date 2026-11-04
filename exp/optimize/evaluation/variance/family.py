@@ -12,20 +12,23 @@ saved actor-critic run over a mining-probe task:
 3. **Scenarios.** One forced scenario draw varies it; a set with any structural problem stops the
    family.
 4. **Variants.** Each scenario becomes a coherent variant checkpoint, proven to restore to its
-   edited state. A variant forked before the decision is kept but not contrasted, because forcing
-   an option there would not force this decision.
-5. **Witnesses.** Each variant's witness calls execute in its restored world; a variant whose
-   witness fails is not contrasted.
-6. **Selection.** Every option is forced from each variant's checkpoint under the frozen job, and
+   edited state. A variant forked before the decision is replayed to it by imposing the original
+   trajectory's recorded calls in the edited world; a replay that diverges is kept as
+   ``replay_diverged`` and not contrasted.
+5. **Witnesses.** Each variant's witness calls execute in its restored decision world; a variant
+   whose witness fails is not contrasted.
+6. **Selection.** Every option is forced from each variant's decision checkpoint under the frozen
+   job, citing the saved witness as evidence, and
    :func:`~exp.optimize.evaluation.variance.contrast.family_flip` decides whether the better option
-   flips.
+   flips. The per-variant stages live in :mod:`~exp.optimize.evaluation.variance.family_stages`.
 7. **Fresh confirmation.** Each variant that qualified is contrasted again with independently drawn
    samples: the job's selector names the confirmation seed and the selection contrasts are cited as
    evidence, so every confirmation draw has a new identity and none of its samples took part in
    selection. Qualification stands only when every qualifying variant's confirmation reproduces
    its separated, matching winner.
 8. **Rubric.** When a grader is supplied, the decision state's criteria are graded over the
-   confirmation episodes; ambiguous criteria are listed for rubric authoring, not trained on.
+   confirmation episodes; ambiguous criteria are listed for rubric authoring and block training
+   eligibility.
 9. **Eligibility.** Every condition in :mod:`~exp.optimize.evaluation.variance.records` is computed,
    and records are built only when all hold.
 
@@ -82,45 +85,28 @@ from exp.optimize.evaluation.variance.authors import (
 from exp.optimize.evaluation.variance.contracts import (
     DecisionState,
     EstimationPoint,
-    Scenario,
     ScenarioLimits,
 )
-from exp.optimize.evaluation.variance.contrast import (
-    FlipVerdict,
-    OptionContrast,
-    WitnessResult,
-    family_flip,
-    run_observation_witness,
-    run_option_contrast,
-)
+from exp.optimize.evaluation.variance.contrast import FlipVerdict, family_flip
 from exp.optimize.evaluation.variance.coverage import uncovered_tools
-from exp.optimize.evaluation.variance.exposure import (
-    EstimateMeaning,
-    ExposurePlan,
-    estimate_meaning,
+from exp.optimize.evaluation.variance.exposure import EstimateMeaning, ExposurePlan
+from exp.optimize.evaluation.variance.family_stages import (
+    FamilyVariant,
+    confirm_variant,
+    grade_variants,
+    run_variant,
 )
-from exp.optimize.evaluation.variance.grader import (
-    GradedCriterion,
-    GradeReport,
-    GraderSettings,
-    grade_episodes,
-)
+from exp.optimize.evaluation.variance.grader import GradeReport, GraderSettings
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     AuditFinding,
     TrainingEligibility,
     TrainingRecords,
     audit_finding,
-    confirmation_episodes,
-    confirmation_job,
+    bound_job,
     relied_rules,
     training_eligibility,
     training_records,
-)
-from exp.optimize.evaluation.variance.variants import (
-    VariantCheckpoint,
-    build_variant_checkpoint,
-    verify_restoration,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.simulation.continuations import load_continuation_checkpoint
@@ -213,30 +199,6 @@ class DecisionFamilySpec(ContractModel):
         )
 
 
-class FamilyVariant(ContractModel):
-    """One scenario's variant and how far it got.
-
-    Attributes:
-        scenario_id: The scenario.
-        variant: The built variant checkpoint with every coherence check.
-        restored: Whether the saved variant restores to its edited state, or None when unbuilt.
-        witness: The executed observation witness, when one ran.
-        selection: The selection option contrast, when one ran.
-        confirmation: The fresh confirmation option contrast, when one ran.
-        meaning: What the variant's contrast outcomes are conditional on, when contrasted.
-        stopped: Why the variant went no further, when it stopped before confirmation.
-    """
-
-    scenario_id: str
-    variant: VariantCheckpoint
-    restored: bool | None = None
-    witness: WitnessResult | None = None
-    selection: OptionContrast | None = None
-    confirmation: OptionContrast | None = None
-    meaning: EstimateMeaning | None = None
-    stopped: str | None = None
-
-
 class FamilyReport(ContractModel):
     """The complete record of one decision family, failed and unconfirmed parts included.
 
@@ -255,7 +217,7 @@ class FamilyReport(ContractModel):
         selection: Verdict over the selection contrasts, when any ran.
         confirmation: Verdict over the fresh confirmation contrasts, when any ran.
         grades: Rubric grades over each confirmed variant's episodes, by scenario.
-        ambiguous_criteria: Criteria routed back to rubric authoring.
+        ambiguous_criteria: Criteria routed back to rubric authoring; any blocks eligibility.
         findings: Every audit finding.
         eligibility: Every computed eligibility condition.
         records: Training records, only when every condition holds.
@@ -405,9 +367,10 @@ def export_family_harbor(
 ) -> Path:
     """Package one variant's checkpoint as a Harbor environment that starts there.
 
-    The package is diagnostic, awarding no reward, unless the family is eligible, the variant's
-    winner was confirmed on fresh samples, and an executable qualification for the exact task is
-    supplied.
+    The package starts at the variant's decision checkpoint, the replayed one when the variant
+    forks before the decision. It is diagnostic, awarding no reward, unless the family is
+    eligible, the variant's winner was confirmed on fresh samples, and an executable
+    qualification for the exact task (:func:`family_executable_task`) is supplied.
 
     Args:
         project: Project holding the family.
@@ -423,19 +386,14 @@ def export_family_harbor(
         The published package directory.
 
     Raises:
-        ValueError: The scenario has no persisted variant checkpoint in this family.
+        ValueError: The scenario has no decision checkpoint in this family.
     """
-    rows = {row.scenario_id: row for row in family_report.variants}
-    row = rows.get(scenario_id)
-    if row is None or row.variant.reference is None:
-        built = sorted(key for key, item in rows.items() if item.variant.reference is not None)
-        raise ValueError(f"scenario {scenario_id} has no persisted variant; choose from {built}")
+    task = family_executable_task(family_report, scenario_id, intent=intent)
     confirmed = family_report.confirmation is not None and any(
         verdict.scenario_id == scenario_id and verdict.status == "separated_matches"
         for verdict in family_report.confirmation.variants
     )
     qualified = family_report.eligibility.eligible and confirmed and qualification is not None
-    task = ExecutableTask(intent=intent, job=_bound(family_report.job, row.variant.reference))
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=code_revision
     )
@@ -447,6 +405,36 @@ def export_family_harbor(
         qualification=qualification if qualified else None,
         diagnostic=not qualified,
     )
+
+
+def family_executable_task(
+    family_report: FamilyReport, scenario_id: str, *, intent: str
+) -> ExecutableTask:
+    """Return the executable task that starts at one variant's decision checkpoint.
+
+    It is the exact task :func:`export_family_harbor` packages, so a qualification for it can be
+    built before export.
+
+    Args:
+        family_report: The saved family.
+        scenario_id: The variant.
+        intent: The capability the environment measures.
+
+    Returns:
+        The task under the family's frozen job.
+
+    Raises:
+        ValueError: The scenario has no decision checkpoint in this family.
+    """
+    rows = {row.scenario_id: row for row in family_report.variants}
+    row = rows.get(scenario_id)
+    checkpoint = None if row is None else row.decision_checkpoint
+    if checkpoint is None:
+        built = sorted(key for key, item in rows.items() if item.decision_checkpoint is not None)
+        raise ValueError(
+            f"scenario {scenario_id} has no persisted decision checkpoint; choose from {built}"
+        )
+    return ExecutableTask(intent=intent, job=bound_job(family_report.job, checkpoint))
 
 
 @dataclass(frozen=True)
@@ -474,6 +462,7 @@ class _Family:
         findings: tuple[AuditFinding, ...],
         relied: tuple[str, ...],
         contrasted: tuple[EstimateMeaning, ...] = (),
+        ambiguous: tuple[str, ...] = (),
     ) -> TrainingEligibility:
         """Compute eligibility from the family's evidence so far.
 
@@ -483,6 +472,7 @@ class _Family:
             findings: Every audit finding.
             relied: Rule identities the decision state cites.
             contrasted: Meanings of every variant contrast.
+            ambiguous: Criteria the rubric grader found ambiguous.
 
         Returns:
             The computed eligibility.
@@ -499,6 +489,7 @@ class _Family:
             contradicted_rules=self.stage.families_must_stay_diagnostic,
             unwitnessed_rules=self.stage.diagnostic,
             meanings=(*meanings, *contrasted),
+            ambiguous_criteria=ambiguous,
         )
 
 
@@ -569,7 +560,18 @@ def _continue(
     picked = next(row for row in study.branches if row.index == report.picked)
     boundaries = (study.spec.checkpoint, *picked.checkpoints)
     variants = [
-        _variant(family, base, state, scenario, boundaries, code_revision)
+        run_variant(
+            project,
+            job=base.job,
+            base=base.checkpoint,
+            boundaries=boundaries,
+            decision=state,
+            scenario=scenario,
+            actions=mapping,
+            facts=spec.facts,
+            repeats=spec.repeats,
+            code_revision=code_revision,
+        )
         for scenario in scenarios.scenarios.scenarios
     ]
     for row in variants:
@@ -589,14 +591,25 @@ def _continue(
     confirmation: FlipVerdict | None = None
     if selection.qualifies:
         variants = [
-            _confirm(family, base, state, row, code_revision) if row.scenario_id in winners else row
+            confirm_variant(
+                project,
+                job=base.job,
+                decision=state,
+                row=row,
+                actions=mapping,
+                seed=spec.confirmation_seed,
+                repeats=spec.confirmation_repeats,
+                code_revision=code_revision,
+            )
+            if row.scenario_id in winners
+            else row
             for row in variants
         ]
         confirmation = family_flip(
             {r.scenario_id: r.confirmation for r in variants if r.confirmation is not None},
             [s for s in scenarios.scenarios.scenarios if s.scenario_id in winners],
         )
-    grades, ambiguous, grading_failure = _grade(
+    grades, ambiguous, grading_failure = grade_variants(
         project, state, scenarios.scenarios.scenarios, variants, grader, spec.grading
     )
     base = base.model_copy(
@@ -617,172 +630,9 @@ def _continue(
         selection=selection,
         confirmation=confirmation,
         contrasted=contrasted,
+        ambiguous=ambiguous,
         failure=grading_failure,
     )
-
-
-def _variant(
-    family: _Family,
-    base: FamilyReport,
-    decision: DecisionState,
-    scenario: Scenario,
-    boundaries: tuple[ArtifactInput, ...],
-    code_revision: str,
-) -> FamilyVariant:
-    """Build, prove, witness and contrast one scenario's variant, stopping at the first gap.
-
-    Args:
-        family: Shared inputs.
-        base: The report so far, with the resolved actions.
-        decision: The decision state.
-        scenario: The scenario.
-        boundaries: Every saved boundary of the picked attempt, start first.
-        code_revision: Producing source identity.
-
-    Returns:
-        The variant with every stage it reached.
-    """
-    project, job = family.project, base.job
-    variant = build_variant_checkpoint(
-        project,
-        base=base.checkpoint,
-        branch_checkpoints=boundaries,
-        decision=decision,
-        scenario=scenario,
-        facts=family.spec.facts,
-        code_revision=code_revision,
-        maximum_model_calls=job.maximum_model_calls,
-    )
-    row = FamilyVariant(scenario_id=scenario.scenario_id, variant=variant)
-    reference = variant.reference
-    if reference is None:
-        return row.model_copy(update={"stopped": "variant: " + "; ".join(variant.problems)})
-    restored = verify_restoration(
-        project, reference, expected_state_sha256=variant.edited_state_sha256
-    )
-    row = row.model_copy(update={"restored": restored})
-    if not restored:
-        return row.model_copy(update={"stopped": "variant does not restore to its edited state"})
-    if variant.replay_turns:
-        return row.model_copy(
-            update={
-                "stopped": f"variant forks {variant.replay_turns} turns before the decision; "
-                "forcing an option there would not force this decision"
-            }
-        )
-    try:
-        witness = run_observation_witness(
-            project,
-            checkpoint=reference,
-            scenario=scenario,
-            decision=decision,
-            job=job,
-            code_revision=code_revision,
-        )
-    except (ValueError, RuntimeError, OSError) as error:
-        return row.model_copy(update={"stopped": f"witness: {_reason(error)}"})
-    row = row.model_copy(update={"witness": witness})
-    if not witness.holds:
-        return row.model_copy(update={"stopped": "witness: " + "; ".join(witness.problems)})
-    try:
-        selection = run_option_contrast(
-            project,
-            checkpoint=reference,
-            decision=decision,
-            actions=base.actions or {},
-            job=job,
-            repeats=family.spec.repeats,
-            code_revision=code_revision,
-        )
-    except (ValueError, RuntimeError, OSError) as error:
-        return row.model_copy(update={"stopped": f"selection contrast: {_reason(error)}"})
-    meaning = estimate_meaning(
-        _bound(job, reference), load_continuation_checkpoint(project.artifacts, reference)
-    )
-    return row.model_copy(update={"selection": selection, "meaning": meaning})
-
-
-def _confirm(
-    family: _Family,
-    base: FamilyReport,
-    decision: DecisionState,
-    row: FamilyVariant,
-    code_revision: str,
-) -> FamilyVariant:
-    """Contrast a qualifying variant again on fresh samples, citing the selection as evidence.
-
-    Args:
-        family: Shared inputs.
-        base: The report so far.
-        decision: The decision state.
-        row: A variant whose selection winner separated and matched.
-        code_revision: Producing source identity.
-
-    Returns:
-        The variant with its confirmation, or why it has none.
-    """
-    if row.variant.reference is None or row.selection is None:
-        return row
-    try:
-        confirmation = run_option_contrast(
-            family.project,
-            checkpoint=row.variant.reference,
-            decision=decision,
-            actions=base.actions or {},
-            job=confirmation_job(base.job, family.spec.confirmation_seed),
-            repeats=family.spec.confirmation_repeats,
-            code_revision=code_revision,
-            evidence=row.selection.contrasts,
-        )
-    except (ValueError, RuntimeError, OSError) as error:
-        return row.model_copy(update={"stopped": f"confirmation contrast: {_reason(error)}"})
-    return row.model_copy(update={"confirmation": confirmation})
-
-
-def _grade(
-    project: ProjectStore,
-    decision: DecisionState,
-    scenarios: tuple[Scenario, ...],
-    variants: list[FamilyVariant],
-    grader: DecisionsTraceTagger | None,
-    settings: GraderSettings,
-) -> tuple[dict[str, GradeReport], tuple[str, ...], str | None]:
-    """Grade each confirmed variant's episodes on the criteria that apply to it.
-
-    Args:
-        project: Project holding the saved contrasts.
-        decision: The decision state declaring the criteria.
-        scenarios: Every scenario, for its applicable criteria.
-        variants: Every variant.
-        grader: Rubric grader, or None to skip grading.
-        settings: Grading controls.
-
-    Returns:
-        Reports by scenario, ambiguous criterion identities, and a grading failure if any.
-    """
-    if grader is None:
-        return {}, (), None
-    criteria = {criterion.criterion_id: criterion for criterion in decision.criteria}
-    applies = {scenario.scenario_id: scenario.criteria for scenario in scenarios}
-    reports: dict[str, GradeReport] = {}
-    failure: str | None = None
-    try:
-        for row in variants:
-            if row.confirmation is None:
-                continue
-            episodes = confirmation_episodes(project, row.scenario_id, row.confirmation)
-            if not episodes:
-                continue
-            reports[row.scenario_id] = grade_episodes(
-                grader,
-                episodes,
-                [GradedCriterion(criterion=criteria[c]) for c in applies[row.scenario_id]],
-                settings=settings,
-            )
-    except ValueError as error:
-        failure = f"rubric grading: {_reason(error)}"
-    ambiguous = {s.criterion_id for r in reports.values() for s in r.summaries if s.ambiguous}
-    return reports, tuple(sorted(ambiguous)), failure
 
 
 def _finish(
@@ -794,6 +644,7 @@ def _finish(
     selection: FlipVerdict | None = None,
     confirmation: FlipVerdict | None = None,
     contrasted: tuple[EstimateMeaning, ...] = (),
+    ambiguous: tuple[str, ...] = (),
     failure: str | None = None,
 ) -> FamilyReport:
     """Compute eligibility and, when every condition holds, the training records.
@@ -806,13 +657,14 @@ def _finish(
         selection: Selection verdict, when contrasts ran.
         confirmation: Confirmation verdict, when it ran.
         contrasted: Meanings of every variant contrast.
+        ambiguous: Criteria the rubric grader found ambiguous.
         failure: Why the family stopped early, when it did.
 
     Returns:
         The complete report.
     """
     unique = tuple({finding.finding_id: finding for finding in findings}.values())
-    eligibility = family.eligibility(selection, confirmation, unique, relied, contrasted)
+    eligibility = family.eligibility(selection, confirmation, unique, relied, contrasted, ambiguous)
     built = training_records(eligibility, family.report, tiers=family.spec.tiers)
     return base.model_copy(
         update={
@@ -893,7 +745,7 @@ def _saved_before(
             store.read_bytes(draws + "-context", "context.json")
         )
         return dict(saved.before)
-    bound = _bound(job, checkpoint)
+    bound = bound_job(job, checkpoint)
     preflight_continuation_job(project, bound)
     original = load_continuation_checkpoint(store, checkpoint)
     with (
@@ -948,21 +800,6 @@ def _save_context(
     )
 
 
-def _bound(job: ContinuationJob, checkpoint: ArtifactInput) -> ContinuationJob:
-    """Start the frozen job at a checkpoint, with no carried prediction or selection plan."""
-    study = job.study.model_copy(
-        update={
-            "checkpoint": checkpoint,
-            "critic_prediction": None,
-            "predicted_success": None,
-            "selection_plan": None,
-        }
-    )
-    return ContinuationJob.model_validate_json(
-        job.model_copy(update={"study": study}).model_dump_json()
-    )
-
-
 def _dependencies(result: FamilyReport, report: ActorCriticReport) -> tuple[ArtifactInput, ...]:
     """Collect every saved artifact the family report rests on."""
     refs = {result.checkpoint, result.context, report.group, result.spec.rules_stage}
@@ -970,14 +807,12 @@ def _dependencies(result: FamilyReport, report: ActorCriticReport) -> tuple[Arti
         if draft is not None and draft.response is not None:
             refs.add(draft.response)
     for row in result.variants:
-        if row.variant.reference is not None:
-            refs.add(row.variant.reference)
+        refs |= {
+            ref
+            for ref in (row.variant.reference, row.decision_checkpoint, row.witness_artifact)
+            if ref is not None
+        }
         for contrast in (row.selection, row.confirmation):
             if contrast is not None:
                 refs |= set(contrast.contrasts)
     return tuple(sorted(refs, key=lambda ref: ref.artifact_id))
-
-
-def _reason(error: BaseException) -> str:
-    """Return a bounded failure reason naming the error type."""
-    return (type(error).__name__ + ": " + str(error))[:2000]

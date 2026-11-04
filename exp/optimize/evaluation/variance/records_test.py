@@ -101,6 +101,7 @@ def test_eligibility_reports_every_condition_and_cannot_be_asserted() -> None:
         contradicted_rules=("rule.a",),
         unwitnessed_rules=("rule.a", "rule.b"),
         meanings=(_meaning(), _meaning(temperature=0.0)),
+        ambiguous_criteria=("handled", "handled"),
     )
     assert not eligibility.eligible
     failed = [c.name for c in eligibility.conditions if not c.holds]
@@ -111,8 +112,13 @@ def test_eligibility_reports_every_condition_and_cannot_be_asserted() -> None:
         "tool_coverage",
         "rule_witnesses",
         "policy_consistency",
+        "rubric_unambiguous",
     ]
     assert any("rule.a was contradicted" in r and "rule.b has no" in r for r in eligibility.reasons)
+    assert eligibility.reasons[-1] == (
+        "rubric_unambiguous: criteria ['handled'] are ambiguous on the confirmed variants; route "
+        "them back to rubric authoring"
+    )
     with pytest.raises(ValidationError, match="every condition"):
         TrainingEligibility(
             conditions=(EligibilityCondition(name="family_flip", holds=True, detail="ok"),)
@@ -139,3 +145,33 @@ def test_confirmation_must_reproduce_every_selected_winner() -> None:
     weaker = _flip(_verdict("x", "separated_matches", "a"), _verdict("y", "unseparated", "b"))
     assert unreproduced(selection, weaker) == ("y",)
     assert unreproduced(selection, None) == ("x", "y")
+
+
+def test_only_ambiguous_criteria_block_an_otherwise_eligible_family() -> None:
+    """Every other condition holds, so the ambiguous criterion is the one listed reason."""
+    selection = _flip(
+        _verdict("x", "separated_matches", "a"), _verdict("y", "separated_matches", "b")
+    )
+
+    def eligibility(ambiguous: tuple[str, ...]) -> TrainingEligibility:
+        """Compute eligibility for a confirmed family with the given ambiguous criteria."""
+        return training_eligibility(
+            selection=selection,
+            confirmation=selection,
+            findings=(),
+            dispositions=(),
+            critics=(),
+            uncovered_tools=(),
+            relied_rules=(),
+            contradicted_rules=(),
+            unwitnessed_rules=(),
+            meanings=(_meaning(),),
+            ambiguous_criteria=ambiguous,
+        )
+
+    assert eligibility(()).eligible
+    blocked = eligibility(("handled",))
+    assert not blocked.eligible
+    assert [c.name for c in blocked.conditions if not c.holds] == ["rubric_unambiguous"]
+    with pytest.raises(ValidationError, match="every condition"):
+        TrainingEligibility(conditions=blocked.conditions[:-1])

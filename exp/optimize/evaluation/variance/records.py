@@ -16,6 +16,9 @@ from saved evidence rather than asserted by a caller:
   a supporting witness.
 - **policy_consistency**: every estimate the records rest on shares one actor policy, harness,
   budget, sampling setting, world and verifier; only the checkpoint and remaining calls differ.
+- **rubric_unambiguous**: no rubric criterion graded on the confirmed variants' episodes was
+  found ambiguous. Ambiguous criteria are listed so they go back to rubric authoring; a family
+  whose criteria were not graded has none.
 
 Failed conditions are all listed, never only the first. Records are built only for an eligible
 family: critic records (estimate against measured rate under one meaning, with the draw's reward),
@@ -60,6 +63,7 @@ ConditionName = Literal[
     "tool_coverage",
     "rule_witnesses",
     "policy_consistency",
+    "rubric_unambiguous",
 ]
 """Every condition training eligibility checks."""
 
@@ -71,6 +75,7 @@ CONDITIONS: tuple[ConditionName, ...] = (
     "tool_coverage",
     "rule_witnesses",
     "policy_consistency",
+    "rubric_unambiguous",
 )
 """The conditions in the order they are reported."""
 
@@ -226,6 +231,29 @@ def unreproduced(selection: FlipVerdict, confirmation: FlipVerdict | None) -> tu
     return tuple(missing)
 
 
+def bound_job(job: ContinuationJob, checkpoint: ArtifactInput) -> ContinuationJob:
+    """Start a frozen job at a checkpoint, with no carried prediction or selection plan.
+
+    Args:
+        job: The frozen job.
+        checkpoint: Where its study starts.
+
+    Returns:
+        The rebound job; policy, budget and verifier are unchanged.
+    """
+    study = job.study.model_copy(
+        update={
+            "checkpoint": checkpoint,
+            "critic_prediction": None,
+            "predicted_success": None,
+            "selection_plan": None,
+        }
+    )
+    return ContinuationJob.model_validate_json(
+        job.model_copy(update={"study": study}).model_dump_json()
+    )
+
+
 def confirmation_job(job: ContinuationJob, seed: int) -> ContinuationJob:
     """Return the job whose draws are independent of selection: its selector names the seed.
 
@@ -351,6 +379,7 @@ def training_eligibility(
     contradicted_rules: Sequence[str],
     unwitnessed_rules: Sequence[str],
     meanings: Sequence[EstimateMeaning],
+    ambiguous_criteria: Sequence[str],
 ) -> TrainingEligibility:
     """Compute every eligibility condition from saved evidence.
 
@@ -365,6 +394,8 @@ def training_eligibility(
         contradicted_rules: The rules stage's ``families_must_stay_diagnostic``.
         unwitnessed_rules: Rule identities without a supporting witness.
         meanings: Meanings of every estimate the records would rest on.
+        ambiguous_criteria: Criterion identities the rubric grader found ambiguous on the
+            confirmed variants' episodes.
 
     Returns:
         The eligibility with every condition.
@@ -374,6 +405,7 @@ def training_eligibility(
     contradicted = sorted(set(relied_rules) & set(contradicted_rules))
     unwitnessed = sorted(set(relied_rules) & set(unwitnessed_rules) - set(contradicted))
     policies = {policy_key(meaning) for meaning in meanings}
+    ambiguous = sorted(set(ambiguous_criteria))
     missing = () if selection is None else unreproduced(selection, confirmation)
     qualified = selection is not None and selection.qualifies
     confirmed = qualified and confirmation is not None and not missing
@@ -436,6 +468,14 @@ def training_eligibility(
                 detail=f"estimates span {len(policies)} actor policies; train within one only"
                 if len(policies) != 1
                 else f"{len(meanings)} estimates share one actor policy",
+            ),
+            EligibilityCondition(
+                name="rubric_unambiguous",
+                holds=not ambiguous,
+                detail=f"criteria {ambiguous} are ambiguous on the confirmed variants; route "
+                "them back to rubric authoring"
+                if ambiguous
+                else "no graded criterion is ambiguous",
             ),
         )
     )
