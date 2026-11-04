@@ -1,30 +1,36 @@
 """Bounded read-only evidence tools and the persisted analysis loop of selectors and critics.
 
 A point selector or critic answers through one typed tool call. Its evidence-tool profile decides
-how it may read first:
+how it investigates first:
 
-- ``forced_response``: one forced answer over the complete packet. It is a valid non-agentic
-  profile, not agentic exploration, and is the default.
-- ``read_only_tools``: the role opens on a compact overview and may fetch exact evidence by
-  locator, through the tools in :data:`EVIDENCE_TOOLS`, before it submits its answer.
+- ``forced_response``: one forced answer over the complete packet. A valid non-agentic profile,
+  not agentic exploration; the class default, and available explicitly everywhere.
+- ``read_only_tools``: the role opens on a compact overview and may read evidence through the
+  tools in :data:`~exp.optimize.evaluation.variance.role_prompts.EVIDENCE_TOOLS` before answering.
+- ``agentic``: the role plans, investigates, drafts, checks its draft against the evidence (with
+  the host's validation of it, reading more if needed) and then gives a forced final answer
+  (:mod:`~exp.optimize.evaluation.variance.role_prompts` holds every phase prompt).
+  :data:`AGENTIC_PROFILE` is the error-mining default.
 
 The tools only read the packet's frozen documents
-(:class:`~exp.optimize.evaluation.variance.evidence.EvidencePacket`). They execute nothing, write
-no world or study state, change no grade and never reach the actor: the packet is privileged
-analysis evidence and no actor request is built from it. A result too large for the profile is
-refused with that reason, never silently truncated.
+(:class:`~exp.optimize.evaluation.variance.evidence.EvidencePacket`) and, when registered, the
+world-learning-only :class:`~exp.optimize.evaluation.variance.evidence.TraceSearch`. They execute
+nothing, write no world or study state, change no grade and never reach the actor: no actor request
+is built from them. Unavailable material is refused by name; a result too large for the profile is
+refused with its size, never silently truncated.
 
 Every draw has frozen finite budgets: model calls, evidence-tool calls, input and output tokens,
-wall-clock seconds and dollars. Before each call the loop checks there is room for it; when there
-is room for only one more call, or the model-call or tool-call budget is spent, that call forces
-the answer tool. A draw that runs out before answering, or whose measured usage exceeds a budget,
-fails explicitly. Dollars are priced from the usage on each saved response; a call whose usage
-cannot be priced makes the dollar budget unverifiable, so no further call is made.
+wall-clock seconds and dollars. Before each call the loop checks there is room for it and for every
+later mandatory phase; without room a reading turn becomes the phase's forced tool, and a phase
+without room for itself is skipped and recorded. A draw that cannot afford its final answer, or
+whose measured usage exceeds a budget, fails explicitly. Dollars are priced from the usage on each
+saved response; unpriceable usage makes the dollar budget unverifiable, so no further call is made.
 
-Every model call goes through the shared author-response owner, which saves its exact request
-and response; every tool result is saved as an ``evidence-tool-result`` artifact; and the whole
-exchange, its measured usage and the final structured answer are saved as one
-``role-analysis-transcript``. A saved transcript replays without any call.
+Every model call goes through the shared author-response owner, which saves its exact request and
+response; every tool result is saved as an ``evidence-tool-result`` artifact; and the whole
+exchange (each call's phase, every plan, draft and self check, the prompt variant, measured usage
+and the final answer) is saved as one ``role-analysis-transcript``. A saved transcript, and each
+saved call of an interrupted one, replays without any call.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal, Self
 
@@ -59,10 +65,24 @@ from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
-from exp.optimize.evaluation.variance.evidence import EvidencePacket
+from exp.optimize.evaluation.variance.evidence import (
+    EvidencePacket,
+    TraceSearch,
+    execute_evidence_tool,
+)
+from exp.optimize.evaluation.variance.role_prompts import (
+    EVIDENCE_TOOLS,
+    PLAN_TOOL,
+    SELF_CHECK_TOOL,
+    PhaseName,
+    PromptAssignment,
+    draft_tool,
+    loop_instruction,
+    phase_prompt,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 
-EVIDENCE_TOOLS_PROTOCOL = "variance-evidence-tools-v1"
+EVIDENCE_TOOLS_PROTOCOL = "variance-evidence-tools-v2"
 """Version of the evidence tools, their schemas and the analysis loop's budget rules."""
 
 TRANSCRIPT_TYPE = "role-analysis-transcript"
@@ -96,19 +116,20 @@ class EvidenceToolProfile(ContractModel):
     """How one role reads its evidence, and the budget each of its draws runs under.
 
     Attributes:
-        mode: ``forced_response`` for one forced answer over the complete packet, or
-            ``read_only_tools`` for bounded evidence reads before the answer.
+        mode: ``forced_response`` for one forced answer over the complete packet,
+            ``read_only_tools`` for bounded evidence reads before the answer, or ``agentic`` for
+            the plan, investigate, draft, self-check and final phases.
         budget: Frozen allowance per draw.
         maximum_result_bytes: Largest serialized tool result returned; larger ones are refused.
     """
 
-    mode: Literal["forced_response", "read_only_tools"] = "forced_response"
+    mode: Literal["forced_response", "read_only_tools", "agentic"] = "forced_response"
     budget: EvidenceBudget = EvidenceBudget()
     maximum_result_bytes: int = Field(default=32_000, ge=256, le=256_000, strict=True)
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:
-        """Keep the forced profile to exactly one call and the tool profile able to read."""
+        """Keep the forced profile to one call and the tool profiles able to read and answer."""
         if self.mode == "forced_response" and (
             self.budget.model_calls != 1 or self.budget.tool_calls != 0
         ):
@@ -117,7 +138,23 @@ class EvidenceToolProfile(ContractModel):
             self.budget.model_calls < 2 or self.budget.tool_calls < 1
         ):
             raise ValueError("a tool profile needs two model calls and one tool call at least")
+        if self.mode == "agentic" and (self.budget.model_calls < 4 or self.budget.tool_calls < 1):
+            raise ValueError("an agentic profile needs four model calls and one tool call at least")
         return self
+
+
+AGENTIC_PROFILE = EvidenceToolProfile(
+    mode="agentic",
+    budget=EvidenceBudget(
+        model_calls=12,
+        tool_calls=24,
+        input_tokens=2_000_000,
+        output_tokens=98_304,
+        wall_clock_seconds=1_800.0,
+        maximum_usd=10.0,
+    ),
+)
+"""The default error-mining profile: four phases plus up to eight reading turns per draw."""
 
 
 class MeasuredUsage(ContractModel):
@@ -236,143 +273,6 @@ def study_usage(
     return total_usage(rows)
 
 
-def _schema(properties: JsonObject, required: Sequence[str]) -> JsonObject:
-    """Return a closed object schema."""
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(required),
-        "additionalProperties": False,
-    }
-
-
-_INT: JsonObject = {"type": "integer", "minimum": 0}
-
-EVIDENCE_TOOLS: tuple[ToolSchema, ...] = (
-    ToolSchema(
-        name="list_evidence",
-        description="List supplied evidence locators that start with a prefix.",
-        input_schema=_schema({"prefix": {"type": "string", "maxLength": 128}}, ("prefix",)),
-    ),
-    ToolSchema(
-        name="read_trace_step",
-        description="Read one exact tool turn (1-based) of one attempt's trajectory.",
-        input_schema=_schema({"attempt": _INT, "step": _INT}, ("attempt", "step")),
-    ),
-    ToolSchema(
-        name="read_checkpoint_prefix",
-        description="Read actor-visible prefix messages at one offered point, by slice.",
-        input_schema=_schema(
-            {"point": _INT, "start": _INT, "count": {"type": "integer", "minimum": 1}},
-            ("point", "start", "count"),
-        ),
-    ),
-    ToolSchema(
-        name="read_rule",
-        description="Read one supplied rule-book entry by rule id.",
-        input_schema=_schema({"rule_id": {"type": "string", "maxLength": 128}}, ("rule_id",)),
-    ),
-    ToolSchema(
-        name="read_grader_evidence",
-        description="Read one attempt's grade and the evaluator projection it was graded on.",
-        input_schema=_schema({"attempt": _INT}, ("attempt",)),
-    ),
-    ToolSchema(
-        name="read_evidence",
-        description="Read any supplied evidence by its exact locator.",
-        input_schema=_schema({"locator": {"type": "string", "maxLength": 256}}, ("locator",)),
-    ),
-)
-"""The complete read-only tool set; nothing else is ever executed for a role."""
-
-TOOLS_INSTRUCTION = """
-
-You may read evidence before answering. The opening message is an overview: the group, the
-verifier, attempt summaries, the checkpoint inventory, the evidence inventory (including material
-that was not supplied) and every locator. The read-only tools fetch exact evidence by locator;
-they cannot run actions, change any state or grade, or reach the actor. Your budget is frozen:
-{budget}. When it runs low you must submit your answer with {answer}. Cite only listed locators."""
-
-
-def tools_instruction(profile: EvidenceToolProfile, answer: str) -> str:
-    """Return the addendum a role reads under the read-only tool profile."""
-    return TOOLS_INSTRUCTION.format(
-        budget=json.dumps(profile.budget.model_dump(mode="json"), sort_keys=True), answer=answer
-    )
-
-
-def execute_evidence_tool(
-    documents: Mapping[str, JsonValue], call: ToolCall, *, maximum_bytes: int
-) -> tuple[Literal["ok", "refused"], JsonValue]:
-    """Answer one evidence-tool call from frozen documents, reading only.
-
-    Args:
-        documents: Exact content per locator.
-        call: The role's tool call.
-        maximum_bytes: Largest serialized result returned.
-
-    Returns:
-        ``ok`` and the result, or ``refused`` and the reason. An unknown tool, a malformed
-        argument, an unknown locator or an oversized result is refused, never executed or cut.
-    """
-    arguments = call.arguments
-    locator: str | None = None
-    try:
-        if call.name == "list_evidence":
-            prefix = str(arguments["prefix"])
-            found = [key for key in sorted(documents) if key.startswith(prefix)]
-            return _bounded({"prefix": prefix, "locators": found}, maximum_bytes)
-        if call.name == "read_trace_step":
-            locator = f"attempt:{_integer(arguments['attempt'])}/step:{_integer(arguments['step'])}"
-        elif call.name == "read_rule":
-            locator = f"rule:{arguments['rule_id']}"
-        elif call.name == "read_grader_evidence":
-            locator = f"grade:{_integer(arguments['attempt'])}"
-        elif call.name == "read_evidence":
-            locator = str(arguments["locator"])
-        elif call.name == "read_checkpoint_prefix":
-            locator = f"point:{_integer(arguments['point'])}"
-            point = documents.get(locator)
-            prefix_rows = point.get("public_prefix") if isinstance(point, dict) else None
-            if not isinstance(point, dict) or not isinstance(prefix_rows, list):
-                return "refused", f"locator {locator} was not supplied"
-            start, count = _integer(arguments["start"]), _integer(arguments["count"])
-            if start < 0 or count < 1:
-                return "refused", "start must be non-negative and count positive"
-            return _bounded(
-                {
-                    "locator": locator,
-                    "actor_calls_spent": point.get("actor_calls_spent"),
-                    "messages_total": len(prefix_rows),
-                    "start": start,
-                    "messages": prefix_rows[start : start + count],
-                },
-                maximum_bytes,
-            )
-        else:
-            return "refused", f"tool {call.name} is not a read-only evidence tool"
-    except (KeyError, TypeError, ValueError):
-        return "refused", f"malformed arguments for {call.name}"
-    if locator not in documents:
-        return "refused", f"locator {locator} was not supplied"
-    return _bounded({"locator": locator, "content": documents[locator]}, maximum_bytes)
-
-
-def _integer(value: JsonValue) -> int:
-    """Return an integer argument, refusing any other JSON value."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError("expected an integer argument")
-    return value
-
-
-def _bounded(value: JsonValue, maximum_bytes: int) -> tuple[Literal["ok", "refused"], JsonValue]:
-    """Return a result, or a refusal naming its size when it is too large to return whole."""
-    size = len(json.dumps(value, sort_keys=True).encode())
-    if size > maximum_bytes:
-        return "refused", f"result is {size} bytes, above the {maximum_bytes}-byte limit; narrow it"
-    return "ok", value
-
-
 def forced_request(
     instruction: str, content: JsonObject, answer: ToolSchema, *, output_tokens: int
 ) -> ModelRequest:
@@ -406,12 +306,16 @@ class AnalysisCall(ContractModel):
         response: Saved author response; its input is the saved request intent.
         forced_answer: Whether the call forced the answer tool.
         usage: Measured usage of this call.
+        phase: Loop phase the call was made in.
+        forced: Tool the call forced, when it forced one.
     """
 
     index: int = Field(ge=0)
     response: ArtifactInput
     forced_answer: bool
     usage: MeasuredUsage
+    phase: PhaseName = "final"
+    forced: str | None = None
 
 
 class ToolResultRecord(ContractModel):
@@ -432,6 +336,22 @@ class ToolResultRecord(ContractModel):
     result: ArtifactInput
 
 
+class PhaseOutput(ContractModel):
+    """What one agentic phase recorded: the plan, the draft or the self check.
+
+    Attributes:
+        phase: ``plan``, ``draft`` or ``self_check``.
+        call: Model call that recorded it.
+        arguments: The phase tool's exact arguments.
+        host_validation: For a draft, the host's validation result shown in the self check.
+    """
+
+    phase: PhaseName
+    call: int = Field(ge=0)
+    arguments: JsonObject
+    host_validation: str | None = None
+
+
 class AnalysisTranscript(ContractModel):
     """The complete persisted analysis of one selector or critic draw.
 
@@ -448,6 +368,9 @@ class AnalysisTranscript(ContractModel):
         stop: ``answered``, ``budget_exhausted`` or ``protocol_failure``.
         exhausted: Budget dimensions that stopped or invalidated the draw.
         failure: Why the draw produced no usable answer.
+        prompt: The prompt variant assigned to the draw, with its digests.
+        outputs: Every recorded plan, draft and self check, in order.
+        skipped: Agentic phases skipped because the budget had no room for them.
     """
 
     protocol: str = EVIDENCE_TOOLS_PROTOCOL
@@ -462,6 +385,9 @@ class AnalysisTranscript(ContractModel):
     stop: Literal["answered", "budget_exhausted", "protocol_failure"]
     exhausted: tuple[str, ...] = ()
     failure: str | None = None
+    prompt: PromptAssignment | None = None
+    outputs: tuple[PhaseOutput, ...] = ()
+    skipped: tuple[PhaseName, ...] = ()
 
 
 def run_analysis(
@@ -476,6 +402,9 @@ def run_analysis(
     identity: str,
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
+    prompt: PromptAssignment | None = None,
+    check: Callable[[JsonObject], str | None] | None = None,
+    search: TraceSearch | None = None,
 ) -> tuple[ArtifactInput, AnalysisTranscript]:
     """Run, or replay, one bounded role analysis and persist its whole transcript.
 
@@ -485,13 +414,17 @@ def run_analysis(
         project: Project whose artifacts hold the draw.
         settings: Frozen role model and per-call allowance.
         profile: Evidence-tool profile and budgets.
-        instruction: Role system instruction.
+        instruction: Role system instruction (its fixed contract).
         packet: Privileged evidence; its documents back the tools.
         content: Role-specific fields added to the opening message.
         answer: The typed answer tool.
         identity: Stable identity of this draw.
         sources: Saved artifacts the packet was rendered from.
         code_revision: Producing source identity.
+        prompt: The draw's prompt variant; its stance is appended to the instruction.
+        check: Host validation of a draft against the packet, returning the refusal reason or
+            None when valid; its result is shown in the self check.
+        search: World-learning retrieval for the tool modes, when one is registered.
 
     Returns:
         The saved transcript reference and the transcript. Its ``answer`` is unvalidated; the
@@ -503,10 +436,12 @@ def run_analysis(
         saved = AnalysisTranscript.model_validate_json(
             store.read_bytes(transcript_id, "transcript.json")
         )
-        if saved.profile != profile or saved.answer_tool != answer.name:
-            raise ValueError("saved role analysis was made under a different profile")
+        if saved.profile != profile or saved.answer_tool != answer.name or saved.prompt != prompt:
+            raise ValueError("saved role analysis was made under a different profile or prompt")
         return artifact_input(store.read(transcript_id).manifest), saved
-    loop = _Loop(project, settings, profile, identity, sources, code_revision)
+    if prompt is not None:
+        instruction += f"\n\nSTANCE ({prompt.variant})\n{prompt.stance}"
+    loop = _Loop(project, settings, profile, identity, sources, code_revision, prompt)
     if profile.mode == "forced_response":
         request = forced_request(
             instruction,
@@ -516,10 +451,17 @@ def run_analysis(
         )
         transcript = loop.forced(request, answer)
     else:
-        opening = {**(packet.overview or packet.payload), **content}
-        transcript = loop.explore(
-            instruction + tools_instruction(profile, answer.name), opening, packet, answer
+        retrieval = (
+            search.inventory()
+            if search is not None
+            else {"available": False, "reason": "no world-learning retrieval index registered"}
         )
+        opening = {**(packet.overview or packet.payload), **content}
+        opening["world_learning_retrieval"] = retrieval
+        addendum = loop_instruction(profile.mode, profile.budget.model_dump(mode="json"))
+        system = instruction + addendum.replace("{answer}", answer.name)
+        tools = _Tools(packet, search, profile.maximum_result_bytes)
+        transcript = loop.loop(system, opening, tools, answer, check)
     inputs = {call.response for call in transcript.calls} | {t.result for t in transcript.tools}
     manifest = store.write_json(
         artifact_id=transcript_id,
@@ -535,6 +477,34 @@ def run_analysis(
     return artifact_input(manifest), transcript
 
 
+class _Tools:
+    """The read-only tools of one draw: the packet documents and optional retrieval."""
+
+    def __init__(
+        self, packet: EvidencePacket, search: TraceSearch | None, maximum_bytes: int
+    ) -> None:
+        """Bind the frozen documents, the retrieval and the result-size limit."""
+        self.packet, self.search, self.maximum_bytes = packet, search, maximum_bytes
+
+    def run(self, call: ToolCall) -> tuple[Literal["ok", "refused"], JsonValue]:
+        """Answer one evidence-tool call."""
+        return execute_evidence_tool(
+            self.packet.documents, call, maximum_bytes=self.maximum_bytes, search=self.search
+        )
+
+
+_MANDATORY: dict[PhaseName, int] = {"plan": 4, "investigate": 3, "self_check": 2, "final": 1}
+"""Model calls a phase needs, including itself, to still reach the final answer."""
+
+_NEXT: dict[PhaseName, PhaseName] = {
+    "plan": "investigate",
+    "investigate": "self_check",
+    "draft": "self_check",
+    "self_check": "final",
+}
+"""The phase that follows each phase."""
+
+
 class _Loop:
     """State of one analysis draw: calls made, tools run and usage measured."""
 
@@ -546,17 +516,24 @@ class _Loop:
         identity: str,
         sources: tuple[ArtifactInput, ...],
         code_revision: str,
+        prompt: PromptAssignment | None,
     ) -> None:
         """Bind the frozen draw settings."""
         self.project, self.settings, self.profile = project, settings, profile
         self.identity, self.sources, self.revision = identity, sources, code_revision
+        self.prompt = prompt
         self.catalog = load_model_catalog(project.model_catalog_path)
         self.calls: list[AnalysisCall] = []
         self.tools: list[ToolResultRecord] = []
+        self.outputs: list[PhaseOutput] = []
+        self.skipped: list[PhaseName] = []
+        self.executed = 0
         self.usage = MeasuredUsage()
         self.started = time.monotonic()
 
-    def _call(self, request: ModelRequest, *, forced: bool) -> ModelResponse:
+    def _call(
+        self, request: ModelRequest, *, phase: PhaseName, forced: str | None, answer: str
+    ) -> ModelResponse:
         """Buy or replay one model call and measure it."""
         index = len(self.calls)
         name = (
@@ -575,7 +552,14 @@ class _Loop:
         usage = response_usage(self.catalog, self.settings.model_alias, response)
         self.usage = self.usage.plus(usage)
         self.calls.append(
-            AnalysisCall(index=index, response=reference, forced_answer=forced, usage=usage)
+            AnalysisCall(
+                index=index,
+                response=reference,
+                forced_answer=forced == answer,
+                usage=usage,
+                phase=phase,
+                forced=forced,
+            )
         )
         return response
 
@@ -639,6 +623,9 @@ class _Loop:
             stop=stop,
             exhausted=exhausted,
             failure=failure,
+            prompt=self.prompt,
+            outputs=tuple(self.outputs),
+            skipped=tuple(self.skipped),
         )
 
     def _answered(self, response: ModelResponse, answer: str) -> AnalysisTranscript | None:
@@ -668,7 +655,7 @@ class _Loop:
             return self._finish(
                 answer.name, "budget_exhausted", exhausted=short, failure="no room for one call"
             )
-        response = self._call(request, forced=True)
+        response = self._call(request, phase="final", forced=answer.name, answer=answer.name)
         if len(response.output.tool_calls) != 1:
             return self._finish(
                 answer.name,
@@ -681,67 +668,153 @@ class _Loop:
             failure=f"role must complete exactly one {answer.name} call",
         )
 
-    def explore(
-        self, instruction: str, opening: JsonObject, packet: EvidencePacket, answer: ToolSchema
+    def _request(
+        self, messages: list[ModelMessage], tools: tuple[ToolSchema, ...], forced: str | None
+    ) -> ModelRequest:
+        """Build one loop request, forcing ``forced`` when it is set."""
+        return ModelRequest(
+            messages=tuple(messages),
+            tools=tools,
+            tool_choice=ToolChoice(name=forced) if forced else "required",
+            maximum_output_tokens=self.settings.output_tokens,
+        )
+
+    def _run_reads(self, calls: Sequence[ToolCall], tools: _Tools) -> list[ModelMessage]:
+        """Execute read calls within the tool budget, persisting each result."""
+        messages: list[ModelMessage] = []
+        for position, call in enumerate(calls):
+            if self.executed >= self.profile.budget.tool_calls:
+                status, result = "refused", "evidence-tool budget exhausted; not executed"
+            else:
+                self.executed += 1
+                status, result = tools.run(call)
+            self.tools.append(self._save_tool(position, call, status, result))
+            messages.append(_tool_message(call, {"status": status, "result": result}))
+        return messages
+
+    def loop(
+        self,
+        instruction: str,
+        opening: JsonObject,
+        tools: _Tools,
+        answer: ToolSchema,
+        check: Callable[[JsonObject], str | None] | None,
     ) -> AnalysisTranscript:
-        """Run the read-only tool profile until an answer or a budget stop."""
-        budget = self.profile.budget
+        """Run the tool-reading phases until the final answer or an explicit stop.
+
+        The read-only profile has one reading phase whose own tool is the answer. The agentic
+        profile runs plan, investigate (ending in a draft), self check and final. A phase runs
+        only when the budget has room for it and every later mandatory phase; a reading turn runs
+        only with room for one more call beyond that and evidence-tool budget left, otherwise the
+        phase's own tool is forced. A phase without room is recorded as skipped (a skipped draft
+        also skips the self check); the final answer is attempted while one call fits, and its
+        absence is an explicit budget stop.
+        """
+        agentic = self.profile.mode == "agentic"
+        phase: PhaseName = "plan" if agentic else "investigate"
+        own_tool: dict[PhaseName, ToolSchema] = {
+            "plan": PLAN_TOOL,
+            "investigate": draft_tool(answer) if agentic else answer,
+            "self_check": SELF_CHECK_TOOL,
+            "final": answer,
+        }
+        mandatory = _MANDATORY if agentic else {"investigate": 1, "final": 1}
+        if agentic:
+            opening = {**opening, "phase": "plan", "phase_instruction": phase_prompt("plan", "")}
         messages = [
             ModelMessage(role="system", content=instruction),
             ModelMessage(role="user", content=json.dumps(opening, sort_keys=True)),
         ]
-        tools = (*EVIDENCE_TOOLS, answer)
-        executed = 0
         while True:
-            probe = ModelRequest(
-                messages=tuple(messages),
-                tools=tools,
-                tool_choice="required",
-                maximum_output_tokens=self.settings.output_tokens,
+            own = own_tool[phase]
+            reading = phase in ("investigate", "self_check")
+            offered = (*EVIDENCE_TOOLS, own) if reading else (own,)
+            probe = self._request(messages, offered, None)
+            free = (
+                reading
+                and self.executed < self.profile.budget.tool_calls
+                and not self._short(probe, mandatory[phase] + 1)
             )
-            short = self._short(probe, 1)
-            if short:
-                return self._finish(
-                    answer.name,
-                    "budget_exhausted",
-                    exhausted=short,
-                    failure="budget exhausted before an answer: " + ", ".join(short),
-                )
-            final = executed >= budget.tool_calls or bool(self._short(probe, 2))
-            request = probe.model_copy(
-                update={"tool_choice": ToolChoice(name=answer.name) if final else "required"}
+            short = self._short(probe, mandatory[phase])
+            if not free and short:
+                if phase == "final" or not agentic:
+                    return self._finish(
+                        answer.name,
+                        "budget_exhausted",
+                        exhausted=short,
+                        failure="budget exhausted before an answer: " + ", ".join(short),
+                    )
+                self.skipped.extend(("investigate", "self_check") if reading else (phase,))
+                phase = "final" if phase == "investigate" else _NEXT[phase]
+                body: JsonObject = {"phase": phase, "skipped": list(self.skipped)}
+                body["phase_instruction"] = phase_prompt(phase, answer.name)
+                messages.append(ModelMessage(role="user", content=json.dumps(body, sort_keys=True)))
+                continue
+            forced = None if free else own.name
+            response = self._call(
+                self._request(messages, offered, forced),
+                phase=phase,
+                forced=forced,
+                answer=answer.name,
             )
-            response = self._call(request, forced=final)
-            done = self._answered(response, answer.name)
+            done = self._answered(response, answer.name) if own is answer else None
             if done is not None:
                 return done
             calls = response.output.tool_calls
-            if final or not calls or response.finish_reason.value != "completed":
+            mine = [call for call in calls if call.name == own.name]
+            if phase == "final" or (forced and not mine):
                 return self._finish(
                     answer.name,
                     "protocol_failure",
-                    failure="role made no complete tool call"
-                    if not final
-                    else f"role did not answer with {answer.name} when forced",
+                    failure=f"role did not call {own.name} when forced in the {phase} phase",
+                )
+            if not calls or response.finish_reason.value != "completed":
+                return self._finish(
+                    answer.name, "protocol_failure", failure="role made no complete tool call"
                 )
             messages.append(ModelMessage(role="assistant", assistant_action=response.output))
-            for position, call in enumerate(calls):
-                if executed >= budget.tool_calls:
-                    status, result = "refused", "evidence-tool budget exhausted; not executed"
-                else:
-                    executed += 1
-                    status, result = execute_evidence_tool(
-                        packet.documents, call, maximum_bytes=self.profile.maximum_result_bytes
-                    )
-                record = self._save_tool(position, call, status, result)
-                self.tools.append(record)
-                messages.append(
-                    ModelMessage(
-                        role="tool",
-                        tool_call_id=call.call_id,
-                        content=json.dumps({"status": status, "result": result}, sort_keys=True),
-                    )
-                )
+            messages.extend(self._run_reads([c for c in calls if c.name != own.name], tools))
+            if mine:
+                phase = self._record(phase, mine, messages, answer.name, check)
+
+    def _record(
+        self,
+        phase: PhaseName,
+        mine: Sequence[ToolCall],
+        messages: list[ModelMessage],
+        answer: str,
+        check: Callable[[JsonObject], str | None] | None,
+    ) -> PhaseName:
+        """Record a plan, draft or self check, answer it with the next phase, and return it."""
+        recorded: PhaseName = "draft" if phase == "investigate" else phase
+        validation = None
+        if recorded == "draft":
+            validation = ("not checked" if check is None else check(mine[0].arguments)) or "valid"
+        self.outputs.append(
+            PhaseOutput(
+                phase=recorded,
+                call=len(self.calls) - 1,
+                arguments=mine[0].arguments,
+                host_validation=validation,
+            )
+        )
+        following = _NEXT[recorded]
+        text = phase_prompt(following, answer)
+        if recorded == "draft":
+            text = phase_prompt("draft", answer) + "\n" + text
+        body: JsonObject = {
+            "status": "recorded",
+            "next_phase": following,
+            "phase_instruction": text,
+        }
+        if validation is not None:
+            body["host_validation"] = validation
+        messages.append(_tool_message(mine[0], body))
+        messages.extend(
+            _tool_message(extra, {"status": "refused", "result": "one record per phase"})
+            for extra in mine[1:]
+        )
+        return following
 
     def _save_tool(
         self, position: int, call: ToolCall, status: Literal["ok", "refused"], result: JsonValue
@@ -780,12 +853,19 @@ class _Loop:
         )
 
 
+def _tool_message(call: ToolCall, body: JsonObject) -> ModelMessage:
+    """Return the tool-result message answering one call."""
+    return ModelMessage(
+        role="tool", tool_call_id=call.call_id, content=json.dumps(body, sort_keys=True)
+    )
+
+
 def evidence_tools_sha256() -> str:
-    """Return the identity of the tool set, its instruction and the loop protocol."""
+    """Return the identity of the tool set and the loop protocol."""
     return sha256_json(
         {
             "protocol": EVIDENCE_TOOLS_PROTOCOL,
             "tools": [tool.model_dump(mode="json") for tool in EVIDENCE_TOOLS],
-            "instruction": TOOLS_INSTRUCTION,
+            "mandatory": _MANDATORY,
         }
     )

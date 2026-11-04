@@ -2,9 +2,14 @@
 
 The point selector is called the judge in saved field names; it is not the episode judge that
 supplies final task-success labels. Both roles read the same privileged packet
-(:mod:`exp.optimize.evaluation.variance.evidence`) and answer through one typed tool call, either
-as one forced response or after bounded read-only evidence reads
-(:mod:`exp.optimize.evaluation.variance.evidence_tools`). Every call is saved by the shared
+(:mod:`exp.optimize.evaluation.variance.evidence`) and answer through one typed tool call: as one
+forced response, after bounded read-only evidence reads, or as an agentic investigation that
+plans, reads, drafts and checks its draft before answering
+(:mod:`exp.optimize.evaluation.variance.evidence_tools`). Each draw runs under one assigned prompt
+variant (:mod:`exp.optimize.evaluation.variance.role_prompts`), whose stance is appended to the
+role contract below and recorded with the draw. In the tool modes a draft is validated by the same
+checks as the final answer, and the result is shown to the role in its self check. Every call is
+saved by the shared
 author-response owner so a draw is bought once, replayed exactly and never silently redrawn.
 Answers are refused when they cite a locator the packet did not supply, choose a point it did not
 offer, or, for a critic, fail to estimate exactly the chosen points.
@@ -15,13 +20,15 @@ reports the design problems that would make an environment teach the wrong thing
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.models import ModelRequest, ModelResponse
 from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.contracts import CriticAssessment, JudgeSelection
-from exp.optimize.evaluation.variance.evidence import EvidencePacket
+from exp.optimize.evaluation.variance.evidence import EvidencePacket, TraceSearch
 from exp.optimize.evaluation.variance.evidence_tools import (
     AnalysisTranscript,
     EvidenceToolProfile,
@@ -29,6 +36,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
     forced_request,
     run_analysis,
 )
+from exp.optimize.evaluation.variance.role_prompts import PromptAssignment, role_prompts_sha256
 
 AUDIT_CHECKLIST = """While reading, report eval-design problems as audit entries, one category each:
 - instruction_verifier_mismatch: a plausibly correct outcome the verifier rejects, or a wrong
@@ -95,7 +103,7 @@ only supplied locators.
     + AUDIT_CHECKLIST
 )
 
-ROLE_PROTOCOL = "variance-roles-v3"
+ROLE_PROTOCOL = "variance-roles-v4"
 """Version of the role prompts and answer schemas; change it whenever either changes."""
 
 FORCED_PROFILE = EvidenceToolProfile()
@@ -103,7 +111,7 @@ FORCED_PROFILE = EvidenceToolProfile()
 
 
 def role_protocol_sha256() -> str:
-    """Return the identity of the role prompts, their answer schemas and the evidence tools."""
+    """Return the identity of the role prompts, variants, answer schemas and evidence tools."""
     return sha256_json(
         {
             "protocol": ROLE_PROTOCOL,
@@ -112,6 +120,7 @@ def role_protocol_sha256() -> str:
             "judge_schema": JudgeSelection.model_json_schema(),
             "critic_schema": CriticAssessment.model_json_schema(),
             "evidence_tools": evidence_tools_sha256(),
+            "role_prompts": role_prompts_sha256(),
         }
     )
 
@@ -282,6 +291,8 @@ def draw_judge(
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
     profile: EvidenceToolProfile = FORCED_PROFILE,
+    prompt: PromptAssignment | None = None,
+    search: TraceSearch | None = None,
 ) -> tuple[ArtifactInput, AnalysisTranscript, JudgeSelection | None, str | None]:
     """Buy or replay one point-selector draw and validate its answer.
 
@@ -296,6 +307,8 @@ def draw_judge(
         sources: Saved artifacts the packet was rendered from.
         code_revision: Producing source identity.
         profile: Evidence-tool profile and per-draw budgets.
+        prompt: Assigned prompt variant, or None for the bare role contract.
+        search: World-learning retrieval for the tool modes, when registered.
 
     Returns:
         The saved transcript reference, the transcript, the validated selection (None when
@@ -312,6 +325,9 @@ def draw_judge(
         identity=identity,
         sources=sources,
         code_revision=code_revision,
+        prompt=prompt,
+        check=lambda draft: _refusal(lambda: validate_judge(draft, packet, points=points)),
+        search=search,
     )
     if transcript.stop != "answered" or transcript.answer is None:
         return reference, transcript, None, transcript.failure or "role gave no answer"
@@ -331,6 +347,8 @@ def draw_critic(
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
     profile: EvidenceToolProfile = FORCED_PROFILE,
+    prompt: PromptAssignment | None = None,
+    search: TraceSearch | None = None,
 ) -> tuple[ArtifactInput, AnalysisTranscript, CriticAssessment | None, str | None]:
     """Buy or replay one critic draw and validate its answer.
 
@@ -343,6 +361,8 @@ def draw_critic(
         sources: Saved artifacts the packet was rendered from.
         code_revision: Producing source identity.
         profile: Evidence-tool profile and per-draw budgets.
+        prompt: Assigned prompt variant, or None for the bare role contract.
+        search: World-learning retrieval for the tool modes, when registered.
 
     Returns:
         The saved transcript reference, the transcript, the validated assessment (None when
@@ -359,6 +379,9 @@ def draw_critic(
         identity=identity,
         sources=sources,
         code_revision=code_revision,
+        prompt=prompt,
+        check=lambda draft: _refusal(lambda: validate_critic(draft, packet, chosen)),
+        search=search,
     )
     if transcript.stop != "answered" or transcript.answer is None:
         return reference, transcript, None, transcript.failure or "role gave no answer"
@@ -366,6 +389,15 @@ def draw_critic(
         return reference, transcript, validate_critic(transcript.answer, packet, chosen), None
     except ValueError as error:
         return reference, transcript, None, str(error)[:2000]
+
+
+def _refusal(validate: Callable[[], object]) -> str | None:
+    """Return why ``validate`` refuses its answer, or None when it accepts it."""
+    try:
+        validate()
+    except ValueError as error:
+        return str(error)[:2000]
+    return None
 
 
 def _tool_arguments(response: ModelResponse, tool: str) -> object:

@@ -7,12 +7,16 @@ from pydantic import ValidationError
 
 from exp.common.models import BillingSource, ModelSnapshot
 from exp.optimize.evaluation.variance.judge_prompt import (
+    AGENTIC_JUDGE_PROTOCOL,
     ASSESS_SCHEMA,
+    DEFAULT_AGENTIC_JUDGE,
     JUDGE_PROMPT,
+    JUDGE_PROMPT_SETS,
     JUDGE_PROMPT_VERSION,
     READ_SCHEMA,
     JudgeAnswer,
     judge_profile,
+    judge_prompt_set,
     judge_prompt_sha256,
     judge_schema_sha256,
 )
@@ -73,3 +77,29 @@ def test_answer_schema_accepts_only_the_registered_statuses() -> None:
         JudgeAnswer.model_validate(
             {"verdict": "fail", "criterion_findings": [], "reason": "r", "score": 1}
         )
+
+
+def test_agentic_prompt_sets_are_distinct_frozen_choices() -> None:
+    """Each agentic set extends the single-pass prompt with the protocol and its own stance."""
+    model = ModelSnapshot(
+        provider="openai-compatible",
+        model_id="judge-v1",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        capabilities_sha256="a" * 64,
+        connection_sha256="b" * 64,
+    )
+    agentic = [version for version, row in JUDGE_PROMPT_SETS.items() if row.agentic]
+    assert len(agentic) == 3 and DEFAULT_AGENTIC_JUDGE in agentic
+    profiles = [
+        judge_profile(model_alias="judge", model=model, maximum_output_tokens=512, prompt_set=v)
+        for v in agentic
+    ]
+    assert len({p.prompt_sha256 for p in profiles}) == 3
+    assert {p.output_schema_sha256 for p in profiles} == {judge_schema_sha256(agentic[0])}
+    assert judge_schema_sha256(agentic[0]) != judge_schema_sha256()
+    for version in agentic:
+        system = judge_prompt_set(version).system
+        assert system.startswith(JUDGE_PROMPT) and AGENTIC_JUDGE_PROTOCOL in system
+    assert judge_prompt_sha256() == judge_prompt_sha256(JUDGE_PROMPT_VERSION)
+    with pytest.raises(ValueError, match="no judge prompt set"):
+        judge_profile(model_alias="judge", model=model, maximum_output_tokens=1, prompt_set="x")

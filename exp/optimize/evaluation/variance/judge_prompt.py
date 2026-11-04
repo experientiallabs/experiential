@@ -1,6 +1,19 @@
-"""The versioned episode-judge prompt, its structured answer schema and its evidence-reading tool.
+"""The versioned episode-judge prompt sets, the answer schema and the judge's read-only tools.
 
-The prompt is the reusable instruction of the one final judge on the decision-variance path. Data
+A judge profile selects exactly one prompt set by its ``prompt_version``; the profile pins that
+set's digest and its schema digest, so the choice is part of the judge definition's identity and
+one definition always runs one frozen prompt. :data:`JUDGE_PROMPT_SETS` holds:
+
+- ``episode-judge-prompt-v1`` (single pass): :data:`JUDGE_PROMPT` alone. The judge answers in one
+  request, reading ranges first only when the evidence exceeds its input budget.
+- the agentic sets: :data:`JUDGE_PROMPT` plus :data:`AGENTIC_JUDGE_PROTOCOL` and one stance. The
+  judge plans which evidence each criterion needs (:data:`PLAN_SCHEMA`), reads ranges, records a
+  per-criterion check of that evidence (:data:`CHECKS_SCHEMA`), checks it against the host's
+  validation and may read more (:data:`SELF_CHECK_SCHEMA`), and then gives its one final
+  assessment. It is still one judgment with one verdict: phases are never graded separately.
+
+The single-pass prompt is the reusable instruction of the one final judge on the decision-variance
+path. Data
 reaches it as one JSON user message rendered by :mod:`exp.optimize.evaluation.variance.judge`:
 trusted identities, the private rubric with its criteria, the assessment scope, and either the
 complete episode evidence or, when that exceeds the judge's input budget, an inventory of every
@@ -13,9 +26,11 @@ bound to exactly this prompt text and these schemas, so changing either is a new
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, sha256_bytes, sha256_json
+from exp.common.core.artifacts import ContractModel, JsonObject, sha256_bytes, sha256_json
 from exp.common.models import ModelSnapshot
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.variance.episodes import (
@@ -198,19 +213,172 @@ READ_SCHEMA = ToolSchema(
 """The bounded read-only evidence tool."""
 
 
-def judge_prompt_sha256() -> str:
-    """Return the digest of the exact judge prompt text."""
-    return sha256_bytes(JUDGE_PROMPT.encode())
+AGENTIC_JUDGE_PROTOCOL = """
+
+AGENTIC PROTOCOL
+You judge this one episode in phases, inside one conversation, and make one final assessment.
+1. plan: call record_plan with, for each criterion, the evidence (event ids or ranges) that would
+   decide it, and the ranges you will read.
+2. investigate: when you received evidence_inventory, read the planned ranges with read_events.
+   Then call record_criterion_checks with one finding per criterion, citing only events you have
+   read, and the verdict you are leaning towards.
+3. self_check: the host returns its validation of your checks in host_checks (criteria missing
+   or repeated, citations you never read, scored events still unread, findings that contradict
+   the overall rule). Re-examine each finding against the evidence; read more ranges if a finding
+   is unsupported and reads remain. Then call record_self_check.
+4. final: call assess_episode once. Your checks are working notes, not separate grades: the final
+   assessment judges the whole episode and may differ from them.
+Each tool result names the next phase. Reads are limited to reads_allowed across all phases."""
+"""Phase protocol appended to :data:`JUDGE_PROMPT` by every agentic prompt set."""
+
+JUDGE_STANCES: dict[str, str] = {
+    "episode-judge-agentic-chronological-v1": """Read the scored events in order, from the scored
+start to the end, before settling any criterion, so that ordering, consent and recovery are judged
+as they happened.""",
+    "episode-judge-agentic-criterion-walk-v1": """Take the criteria one at a time. For each, find
+every event that bears on it, including events far from where the agent claims to address it, and
+decide it before moving to the next.""",
+    "episode-judge-agentic-disconfirming-v1": """Once you lean towards a verdict, look for the
+events that would refute it (an unrecovered error behind a claimed success, an earlier prohibited
+effect, or a legitimate alternative behind an apparent omission) and read them before deciding.""",
+}
+"""The stance of each agentic judge prompt set, keyed by prompt version."""
+
+JUDGE_PHASE_PROMPTS: dict[str, str] = {
+    "plan": "PLAN. Call record_plan before judging anything.",
+    "investigate": "INVESTIGATE. Read what your plan needs, then call record_criterion_checks.",
+    "self_check": "SELF CHECK. Address every host check against the evidence, read more if a "
+    "finding is unsupported, then call record_self_check.",
+    "final": "FINAL. Call assess_episode once with your assessment of the whole episode.",
+}
+"""Instruction delivered at the start of each agentic judge phase."""
 
 
-def judge_schema_sha256() -> str:
-    """Return the digest of the answer and evidence-tool schemas."""
-    return sha256_json(
-        {
-            ASSESS_TOOL: ASSESS_SCHEMA.model_dump(mode="json"),
-            READ_TOOL: READ_SCHEMA.model_dump(mode="json"),
-        }
-    )
+class JudgePlan(ContractModel):
+    """The arguments of the plan phase.
+
+    Attributes:
+        criteria: For each criterion, the evidence that would decide it.
+        ranges: Event ranges the judge intends to read.
+    """
+
+    criteria: tuple[dict[str, str], ...] = Field(max_length=128)
+    ranges: tuple[EventRange, ...] = Field(default=(), max_length=64)
+
+
+class CriterionChecks(ContractModel):
+    """The arguments of the per-criterion evidence check.
+
+    Attributes:
+        findings: One working finding per rubric criterion.
+        leaning: The verdict the judge leans towards.
+        open_questions: What the judge still needs to resolve.
+    """
+
+    findings: tuple[AnswerFinding, ...] = Field(max_length=128)
+    leaning: Verdict
+    open_questions: tuple[str, ...] = Field(default=(), max_length=32)
+
+
+class JudgeSelfCheck(ContractModel):
+    """The arguments of the self check.
+
+    Attributes:
+        issues: Problems found in the checks, including host checks addressed.
+        revise: Whether the final assessment must differ from the checks.
+    """
+
+    issues: tuple[str, ...] = Field(max_length=32)
+    revise: bool
+
+
+PLAN_SCHEMA = ToolSchema(
+    name="record_plan",
+    description="Record which evidence decides each criterion and the ranges to read.",
+    input_schema=JudgePlan.model_json_schema(),
+)
+"""The plan phase's tool."""
+
+CHECKS_SCHEMA = ToolSchema(
+    name="record_criterion_checks",
+    description="Record a working finding per criterion and the leaning verdict.",
+    input_schema=CriterionChecks.model_json_schema(),
+)
+"""The investigate phase's closing tool."""
+
+SELF_CHECK_SCHEMA = ToolSchema(
+    name="record_self_check",
+    description="Record the self check of the criterion checks against the evidence.",
+    input_schema=JudgeSelfCheck.model_json_schema(),
+)
+"""The self-check phase's tool."""
+
+
+class JudgePromptSet(ContractModel):
+    """One selectable judge prompt set.
+
+    Attributes:
+        version: Prompt version a profile names.
+        agentic: Whether the judge runs the plan, investigate, self-check and final phases.
+        system: The exact system prompt.
+    """
+
+    version: str
+    agentic: bool
+    system: str
+
+
+JUDGE_PROMPT_SETS: dict[str, JudgePromptSet] = {
+    JUDGE_PROMPT_VERSION: JudgePromptSet(
+        version=JUDGE_PROMPT_VERSION, agentic=False, system=JUDGE_PROMPT
+    ),
+    **{
+        version: JudgePromptSet(
+            version=version,
+            agentic=True,
+            system=f"{JUDGE_PROMPT}{AGENTIC_JUDGE_PROTOCOL}\n\nSTANCE\n{stance}",
+        )
+        for version, stance in JUDGE_STANCES.items()
+    },
+}
+"""Every judge prompt set a profile may select, keyed by prompt version."""
+
+DEFAULT_AGENTIC_JUDGE = "episode-judge-agentic-chronological-v1"
+"""The agentic prompt set orchestration selects unless it chooses another."""
+
+
+def judge_prompt_set(version: str) -> JudgePromptSet:
+    """Return the prompt set a profile's ``prompt_version`` names.
+
+    Raises:
+        ValueError: No prompt set has that version.
+    """
+    found = JUDGE_PROMPT_SETS.get(version)
+    if found is None:
+        raise ValueError(
+            f"no judge prompt set {version!r}; choose from {sorted(JUDGE_PROMPT_SETS)}"
+        )
+    return found
+
+
+def judge_prompt_sha256(version: str = JUDGE_PROMPT_VERSION) -> str:
+    """Return the digest of one prompt set: its prompt text, and its phase prompts if agentic."""
+    prompt_set = judge_prompt_set(version)
+    if not prompt_set.agentic:
+        return sha256_bytes(prompt_set.system.encode())
+    return sha256_json({"system": prompt_set.system, "phases": JUDGE_PHASE_PROMPTS})
+
+
+def judge_schema_sha256(version: str = JUDGE_PROMPT_VERSION) -> str:
+    """Return the digest of the answer and tool schemas one prompt set uses."""
+    schemas: JsonObject = {
+        ASSESS_TOOL: ASSESS_SCHEMA.model_dump(mode="json"),
+        READ_TOOL: READ_SCHEMA.model_dump(mode="json"),
+    }
+    if judge_prompt_set(version).agentic:
+        for schema in (PLAN_SCHEMA, CHECKS_SCHEMA, SELF_CHECK_SCHEMA):
+            schemas[schema.name] = schema.model_dump(mode="json")
+    return sha256_json(schemas)
 
 
 def judge_profile(
@@ -222,8 +390,9 @@ def judge_profile(
     reasoning_effort: str | None = None,
     evidence_tool_budget: int = 0,
     maximum_input_bytes: int = JUDGE_INPUT_BYTES,
+    prompt_set: str = JUDGE_PROMPT_VERSION,
 ) -> JudgeProfile:
-    """Build a judge profile bound to this module's prompt and schemas.
+    """Build a judge profile bound to one of this module's prompt sets and its schemas.
 
     Args:
         model_alias: Catalog alias of the judge model.
@@ -234,6 +403,8 @@ def judge_profile(
         evidence_tool_budget: Ranges the judge may read when the evidence does not fit whole.
         maximum_input_bytes: Whole serialized request ceiling per judge request; the admitted
             request settings must use the same value.
+        prompt_set: Version of the prompt set; the single-pass set by default, or one of the
+            agentic sets such as :data:`DEFAULT_AGENTIC_JUDGE`.
 
     Returns:
         The frozen profile.
@@ -241,12 +412,40 @@ def judge_profile(
     return JudgeProfile(
         model_alias=model_alias,
         model=model,
-        prompt_version=JUDGE_PROMPT_VERSION,
-        prompt_sha256=judge_prompt_sha256(),
-        output_schema_sha256=judge_schema_sha256(),
+        prompt_version=judge_prompt_set(prompt_set).version,
+        prompt_sha256=judge_prompt_sha256(prompt_set),
+        output_schema_sha256=judge_schema_sha256(prompt_set),
         temperature=temperature,
         maximum_output_tokens=maximum_output_tokens,
         reasoning_effort=reasoning_effort,
         evidence_tool_budget=evidence_tool_budget,
         maximum_input_bytes=maximum_input_bytes,
     )
+
+
+JudgePhaseName = Literal["plan", "investigate", "self_check", "final"]
+"""The phases of an agentic judgment, in order."""
+
+JUDGE_PHASE_TOOLS: dict[JudgePhaseName, ToolSchema] = {
+    "plan": PLAN_SCHEMA,
+    "investigate": CHECKS_SCHEMA,
+    "self_check": SELF_CHECK_SCHEMA,
+    "final": ASSESS_SCHEMA,
+}
+"""The tool that closes each agentic judge phase."""
+JUDGE_NEXT_PHASE: dict[JudgePhaseName, JudgePhaseName] = {
+    "plan": "investigate",
+    "investigate": "self_check",
+    "self_check": "final",
+}
+"""The phase that follows each agentic judge phase."""
+
+
+def judge_model_calls(profile: JudgeProfile) -> int:
+    """Return the most judge draws one judgment under ``profile`` can make.
+
+    A single-pass judgment makes one draw per read plus its answer; an agentic one adds the plan,
+    criterion-check and self-check draws.
+    """
+    extra = 3 if judge_prompt_set(profile.prompt_version).agentic else 0
+    return profile.evidence_tool_budget + 1 + extra

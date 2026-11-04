@@ -14,6 +14,12 @@ task success.
   (whose profile freezes the input budget) and the evidence identity. A saved assessment replays
   without a call.
   Changing the rubric or profile is a new definition, hence a new assessment.
+- **Agentic prompt sets.** A profile whose prompt set is agentic runs one multi-phase judgment in
+  one conversation: a plan of the evidence each criterion needs, range reads, a per-criterion check
+  of that evidence, a self check against host validation (which may read more ranges within the
+  same budget) and the one final assessment. Every phase is persisted in ``inspection.json`` and
+  every draw is saved, so an interrupted judgment resumes without buying a draw twice. The draws
+  per judgment are at most ``evidence_tool_budget + 4`` (:func:`judge_model_calls`).
 - **Context-safe evidence.** The whole evidence is rendered when it fits the frozen input budget.
   When it does not, a judge with an evidence-tool budget receives an inventory of every event and
   reads contiguous ranges in full before its single final answer; it may pass only after reading
@@ -38,7 +44,7 @@ import json
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -64,11 +70,20 @@ from exp.optimize.evaluation.variance.episodes import (
 from exp.optimize.evaluation.variance.judge_prompt import (
     ASSESS_SCHEMA,
     ASSESS_TOOL,
-    JUDGE_PROMPT,
-    JUDGE_PROMPT_VERSION,
+    JUDGE_NEXT_PHASE,
+    JUDGE_PHASE_PROMPTS,
+    JUDGE_PHASE_TOOLS,
+    JUDGE_PROMPT_SETS,
+    PLAN_SCHEMA,
     READ_SCHEMA,
+    READ_TOOL,
+    CriterionChecks,
     EventRange,
     JudgeAnswer,
+    JudgePhaseName,
+    JudgePromptSet,
+    judge_model_calls,
+    judge_prompt_set,
     judge_prompt_sha256,
     judge_schema_sha256,
 )
@@ -98,6 +113,26 @@ class _Rubric(ContractModel):
         return frozenset(c for c, role in self.criteria if role == _REQUIRED)
 
 
+class JudgePhase(ContractModel):
+    """One persisted turn of an agentic judgment.
+
+    Attributes:
+        turn: Draw index within the judgment.
+        phase: Phase the draw was made in.
+        tool: Tool the judge called.
+        arguments: Its exact arguments.
+        response: The saved draw.
+        host_checks: For criterion checks, the host validation shown in the self check.
+    """
+
+    turn: int = Field(ge=0)
+    phase: JudgePhaseName
+    tool: str
+    arguments: JsonObject
+    response: ArtifactInput
+    host_checks: tuple[str, ...] = ()
+
+
 class _Inspection(ContractModel):
     """What the judge actually saw, saved beside its assessment.
 
@@ -108,6 +143,8 @@ class _Inspection(ContractModel):
         reads: Evidence-tool calls made.
         inspected: Event ids whose full content the judge received, in sequence order.
         answer: The validated wire answer, when one was parsed.
+        prompt_set: Version of the prompt set the judge ran.
+        phases: Every turn of an agentic judgment, in order.
     """
 
     protocol: str
@@ -115,6 +152,8 @@ class _Inspection(ContractModel):
     reads: int
     inspected: tuple[str, ...]
     answer: JudgeAnswer | None = None
+    prompt_set: str | None = None
+    phases: tuple[JudgePhase, ...] = ()
 
 
 def save_evidence(
@@ -247,6 +286,15 @@ def judge_episode(
         return artifact_input(manifest), assessment
 
 
+class _Stop(Exception):
+    """Ends a judgment early with its saved unscored outcome."""
+
+    def __init__(self, assessment: EpisodeAssessment, inspection: _Inspection) -> None:
+        """Carry the outcome."""
+        super().__init__(assessment.failure)
+        self.result = (assessment, inspection)
+
+
 class _Judgment:
     """One judgment in progress: its requests, saved responses and inspected events."""
 
@@ -281,6 +329,8 @@ class _Judgment:
         self.responses: list[ArtifactInput] = []
         self.inspected: set[str] = set()
         self.reads = 0
+        self.prompt_set: JudgePromptSet = judge_prompt_set(definition.profile.prompt_version)
+        self.phases: list[JudgePhase] = []
 
     def judge(self, evidence_ref: ArtifactInput) -> tuple[EpisodeAssessment, _Inspection]:
         """Render, draw and validate; every outcome becomes one assessment.
@@ -292,6 +342,8 @@ class _Judgment:
             The assessment and the record of what the judge saw.
         """
         sources = (evidence_ref, self.definition.rubric)
+        if self.prompt_set.agentic:
+            return self._agentic(sources)
         whole = self._request(
             self._payload(inventory=False), tools=(ASSESS_SCHEMA,), final=True, messages=()
         )
@@ -336,36 +388,11 @@ class _Judgment:
         budget = self.definition.profile.evidence_tool_budget
         turn = 0
         while True:
-            draw = f"{self.identity}-turn-{turn}"
-            if _size(request) > self.settings.maximum_input_bytes:
-                failure = "insufficient evidence: reading exhausted the frozen input budget"
-                return self._unscored("unavailable", failure, None), self._record(mode)
             try:
-                reference, response = author_response(
-                    self.project,
-                    self.settings,
-                    request,
-                    identity=draw,
-                    sources=sources,
-                    code_revision=self.code_revision,
-                )
-            except Exception as error:
-                store = self.project.artifacts
-                if not store.exists(draw + "-intent") or store.exists(draw + "-response"):
-                    raise
-                failure = f"no judge response, never redrawn: {type(error).__name__}: {error}"
-                return self._unscored("unavailable", failure, None), self._record(mode)
-            self.responses.append(reference)
-            calls = response.output.tool_calls
-            allowed = {tool.name for tool in request.tools}
-            if (
-                response.finish_reason.value != "completed"
-                or len(calls) != 1
-                or calls[0].name not in allowed
-            ):
-                failure = f"judge must complete exactly one call of {sorted(allowed)}"
-                return self._unscored("malformed", failure, reference), self._record(mode)
-            call = calls[0]
+                reference, response = self._draw(request, sources, turn, mode)
+            except _Stop as stop:
+                return stop.result
+            call = response.output.tool_calls[0]
             if call.name == ASSESS_TOOL:
                 return self._assess(call.arguments, reference, mode)
             self.reads += 1
@@ -383,6 +410,199 @@ class _Judgment:
                 messages=messages,
             )
             turn += 1
+
+    def _agentic(self, sources: tuple[ArtifactInput, ...]) -> tuple[EpisodeAssessment, _Inspection]:
+        """Run plan, investigate, self check and final as one judgment with one verdict.
+
+        The whole evidence is rendered when it fits; otherwise the event inventory is, and the
+        judge reads ranges (shared across the investigate and self-check phases) within the
+        profile's evidence-tool budget. Each phase tool is forced once a reading turn is not
+        allowed; a reading turn counts against the budget even when refused.
+
+        Args:
+            sources: Saved artifacts every draw was rendered from.
+
+        Returns:
+            The assessment and the record of what the judge saw, with every phase.
+        """
+        budget = self.definition.profile.evidence_tool_budget
+        payload = self._payload(inventory=False)
+        reading = _size(self._request(payload, tools=(PLAN_SCHEMA,), final=False)) > (
+            self.settings.maximum_input_bytes
+        )
+        if reading:
+            payload = self._payload(inventory=True)
+            fits = _size(self._request(payload, tools=(PLAN_SCHEMA,), final=False)) <= (
+                self.settings.maximum_input_bytes
+            )
+            if budget == 0 or not fits:
+                reason = (
+                    "insufficient evidence: the whole episode exceeds the frozen input budget and "
+                    + ("the profile has no evidence-tool budget" if fits else "even its inventory")
+                    + "; it is not graded in parts"
+                )
+                return self._unscored("unavailable", reason, None), self._record("insufficient")
+        else:
+            self.inspected = set(self.evidence.event_ids())
+        mode: Literal["whole", "tools"] = "tools" if reading else "whole"
+        phase: JudgePhaseName = "plan"
+        payload["phase"], payload["phase_instruction"] = phase, JUDGE_PHASE_PROMPTS[phase]
+        messages = self._request(payload, tools=(PLAN_SCHEMA,), final=False).messages
+        for turn in range(judge_model_calls(self.definition.profile)):
+            own = JUDGE_PHASE_TOOLS[phase]
+            free = reading and phase != "plan" and phase != "final" and self.reads < budget
+            tools = (READ_SCHEMA, own) if free else (own,)
+            request = self._request(None, tools=tools, final=False, messages=messages)
+            if not free:
+                request = request.model_copy(update={"tool_choice": ToolChoice(name=own.name)})
+            try:
+                reference, response = self._draw(request, sources, turn, mode)
+            except _Stop as stop:
+                return stop.result
+            call = response.output.tool_calls[0]
+            if call.name == ASSESS_TOOL:
+                self._phase(turn, phase, call.name, call.arguments, reference)
+                return self._assess(call.arguments, reference, mode)
+            if call.name == READ_TOOL:
+                self.reads += 1
+                reply = self._read(call.arguments, call.call_id, request, response)
+                self._phase(turn, phase, call.name, call.arguments, reference)
+            else:
+                checks = self._host_checks(call.arguments) if phase == "investigate" else ()
+                self._phase(turn, phase, call.name, call.arguments, reference, checks)
+                phase = JUDGE_NEXT_PHASE[phase]
+                body: JsonObject = {
+                    "status": "recorded",
+                    "next_phase": phase,
+                    "phase_instruction": JUDGE_PHASE_PROMPTS[phase],
+                    "reads_left": budget - self.reads,
+                }
+                if checks or phase == "self_check":
+                    body["host_checks"] = list(checks) or ["no problems found"]
+                reply = json.dumps(body, sort_keys=True)
+            messages = (
+                *request.messages,
+                ModelMessage(role="assistant", assistant_action=response.output),
+                ModelMessage(role="tool", tool_call_id=call.call_id, content=reply),
+            )
+        failure = "judge did not assess within its draw ceiling, never redrawn"
+        return self._unscored("malformed", failure, None), self._record(mode)
+
+    def _draw(
+        self,
+        request: ModelRequest,
+        sources: tuple[ArtifactInput, ...],
+        turn: int,
+        mode: Literal["whole", "tools"],
+    ) -> tuple[ArtifactInput, ModelResponse]:
+        """Buy or replay one judge draw, or stop the judgment with its unscored outcome.
+
+        Args:
+            request: The request.
+            sources: Saved artifacts the draw was rendered from.
+            turn: Draw index.
+            mode: How the evidence was presented.
+
+        Returns:
+            The saved response reference and the response, which makes exactly one offered call.
+
+        Raises:
+            _Stop: The request does not fit, no response exists, or the response is malformed;
+                it carries the unscored assessment and inspection.
+        """
+        if _size(request) > self.settings.maximum_input_bytes:
+            failure = "insufficient evidence: reading exhausted the frozen input budget"
+            raise _Stop(self._unscored("unavailable", failure, None), self._record(mode))
+        draw = f"{self.identity}-turn-{turn}"
+        try:
+            reference, response = author_response(
+                self.project,
+                self.settings,
+                request,
+                identity=draw,
+                sources=sources,
+                code_revision=self.code_revision,
+            )
+        except Exception as error:
+            store = self.project.artifacts
+            if not store.exists(draw + "-intent") or store.exists(draw + "-response"):
+                raise
+            failure = f"no judge response, never redrawn: {type(error).__name__}: {error}"
+            raise _Stop(self._unscored("unavailable", failure, None), self._record(mode)) from error
+        self.responses.append(reference)
+        calls = response.output.tool_calls
+        allowed = {tool.name for tool in request.tools}
+        if (
+            response.finish_reason.value != "completed"
+            or len(calls) != 1
+            or calls[0].name not in allowed
+        ):
+            failure = f"judge must complete exactly one call of {sorted(allowed)}"
+            raise _Stop(self._unscored("malformed", failure, reference), self._record(mode))
+        return reference, response
+
+    def _phase(
+        self,
+        turn: int,
+        phase: JudgePhaseName,
+        tool: str,
+        arguments: JsonObject,
+        reference: ArtifactInput,
+        host_checks: tuple[str, ...] = (),
+    ) -> None:
+        """Persist one agentic turn in the inspection record."""
+        self.phases.append(
+            JudgePhase(
+                turn=turn,
+                phase=phase,
+                tool=tool,
+                arguments=arguments,
+                response=reference,
+                host_checks=host_checks,
+            )
+        )
+
+    def _host_checks(self, arguments: JsonObject) -> tuple[str, ...]:
+        """Validate working criterion checks the way the final answer will be validated.
+
+        Args:
+            arguments: The record_criterion_checks arguments.
+
+        Returns:
+            Problems the self check must address; empty when none were found.
+        """
+        try:
+            checks = CriterionChecks.model_validate(arguments)
+        except ValidationError as error:
+            return (f"checks do not match their schema ({error.error_count()} errors)",)
+        problems: list[str] = []
+        found = [row.criterion_id for row in checks.findings]
+        expected = [criterion for criterion, _ in self.rubric.criteria]
+        if sorted(found) != sorted(expected):
+            problems.append(f"findings must cover each criterion {expected} once, not {found}")
+        known = set(self.evidence.event_ids())
+        cited = {ref for row in checks.findings for ref in row.event_refs}
+        if cited - known:
+            problems.append(f"cited events that do not exist: {sorted(cited - known)}")
+        if (cited & known) - self.inspected:
+            problems.append(
+                f"cited events not yet read: {sorted((cited & known) - self.inspected)}"
+            )
+        statuses = {row.criterion_id: row.status for row in checks.findings}
+        required = [statuses.get(criterion) for criterion in self.rubric.required()]
+        if checks.leaning == "pass":
+            if {"not_met", "insufficient_evidence", None} & set(required):
+                problems.append("pass needs every required criterion established as met")
+            unread = [
+                e.event_id
+                for e in self.evidence.events
+                if e.scope == "scored" and e.event_id not in self.inspected
+            ]
+            if unread:
+                problems.append(f"pass needs every scored event read; unread: {unread}")
+        if checks.leaning == "fail" and "not_met" not in required:
+            problems.append("fail needs a required criterion found not_met")
+        return tuple(problems)
 
     def _read(
         self, arguments: JsonObject, call_id: str, request: ModelRequest, response: ModelResponse
@@ -564,6 +784,8 @@ class _Judgment:
                 e.event_id for e in self.evidence.events if e.event_id in self.inspected
             ),
             answer=answer,
+            prompt_set=self.prompt_set.version,
+            phases=tuple(self.phases),
         )
 
     def _payload(self, *, inventory: bool) -> JsonObject:
@@ -629,7 +851,7 @@ class _Judgment:
         """
         if payload is not None:
             messages = (
-                ModelMessage(role="system", content=JUDGE_PROMPT),
+                ModelMessage(role="system", content=self.prompt_set.system),
                 ModelMessage(role="user", content=json.dumps(payload, sort_keys=True)),
             )
         profile = self.definition.profile
@@ -698,11 +920,11 @@ def _check_binding(
     """
     profile = definition.profile
     if (
-        profile.prompt_version != JUDGE_PROMPT_VERSION
-        or profile.prompt_sha256 != judge_prompt_sha256()
-        or profile.output_schema_sha256 != judge_schema_sha256()
+        profile.prompt_version not in JUDGE_PROMPT_SETS
+        or profile.prompt_sha256 != judge_prompt_sha256(profile.prompt_version)
+        or profile.output_schema_sha256 != judge_schema_sha256(profile.prompt_version)
     ):
-        raise ValueError("judge profile is not bound to this judge prompt and schema")
+        raise ValueError("judge profile is not bound to a judge prompt set and its schema")
     if definition.event_contract != EVENT_CONTRACT_VERSION:
         raise ValueError(f"judge definition binds event contract {definition.event_contract}")
     if (evidence.task_sha256, evidence.world_sha256) != (

@@ -2,44 +2,30 @@
 
 One error-mining run (protocol :data:`ERROR_MINING_PROTOCOL`) follows a fixed sequence over saved,
 replayable owners. :meth:`ActorCriticSpec.error_mining` registers the reference configuration
-G=16, J=8, C=8, K=4, M=8; every count, model setting, evidence-tool budget and seed stays an
-explicit spec field.
+G=16, J=8, C=8, K=4, M=8 with agentic selectors and critics; every count, model setting, prompt
+variant weight, evidence-tool budget and seed stays an explicit spec field.
 
-1. **Group.** The registered initial job runs ``G`` attempts of one task from one starting
-   checkpoint in the configured world (typically the grounded world model with learned rules),
-   saving a paired actor/world checkpoint after every tool turn.
-2. **Pick.** One attempt is chosen with a seed derived from the registration without its episode
-   judge, so changing only the judge never re-picks the trajectory. This is not an
-   unconditional draw over every attempt: it is a seeded uniform choice over the *eligible*
-   population (completed, at least one saved tool turn, and at least two boundaries with actor
-   calls left). The rule, the seed material, the shuffled order and every attempt's eligibility
-   are saved in :class:`PickRecord`.
-3. **Point selectors.** ``J`` selector draws (saved as ``judges``; they are not the episode judge)
-   each choose up to ``K`` points of that attempt, reading the privileged evidence packet.
-4. **Critics.** ``C`` critic draws each estimate the probability of success from every distinct
-   chosen point, from the same evidence, before any continuation from those points runs.
-5. **Continuations.** ``M`` continuations run from each distinct point (up to ``J*K`` of them
-   after deduplication), and every one is judged by the registered frozen episode judge
-   (:func:`~exp.optimize.evaluation.variance.judged.judge_study`). Its saved verdicts are the only
-   labels: the verifier grade the continuation owner records is diagnostic only, and an unscored
-   continuation stays in the point's denominator as unknown.
+1. **Group.** The initial job runs ``G`` attempts of one task from one starting checkpoint in the
+   configured world, saving a paired actor/world checkpoint after every tool turn.
+2. **Pick.** A seeded uniform choice over the *eligible* attempts (completed, at least one saved
+   tool turn, at least two boundaries with actor calls left), never an unconditional draw over
+   every attempt; the seed excludes the episode judge. :class:`PickRecord` saves the rule, seed
+   material, shuffled order and every attempt's eligibility.
+3. **Point selectors.** ``J`` selector draws (saved as ``judges``; not the episode judge) each
+   choose up to ``K`` points from the privileged evidence under a seeded prompt variant.
+4. **Critics.** ``C`` critic draws estimate success from every distinct chosen point first.
+5. **Continuations.** ``M`` continuations per distinct point (up to ``J*K`` points), each judged by
+   the frozen episode judge (:func:`~exp.optimize.evaluation.variance.judged.judge_study`), whose
+   saved verdicts are the only labels; an unscored continuation stays in the denominator as unknown.
 6. **Rewards.** Each critic is scored by squared error against the measured rates, each judge by
    how far its points' measured rates separate beyond sampling noise, and each point's
    continuations form their own group for group-relative advantages.
 
-The report records the actual populations and costs: :class:`MiningCounts` holds planned and
-actual counts, including distinct points after deduplication and continuations run, and every
-selector draw, critic draw, the group and each point's continuation study carry their
-:class:`~exp.optimize.evaluation.variance.evidence_tools.MeasuredUsage`, read from the saved
-provider responses. No cost ratio between roles is assumed.
-
-Every attempt group and continuation group carries its :class:`ActorTier`: the declared tier label
-and the digest of the actor/harness/budget/world/judge profile. Groups with different tiers are
-never pooled into one policy group (:func:`policy_groups`).
-
-The report ranks points by how informative they are (measured rate near one half, and a large drop
-to the next point) so the best of them can become Harbor environments that start exactly there.
-Unknown outcomes are kept explicit and never redrawn.
+:class:`MiningCounts` records planned and actual populations; every draw, the group and each
+point's study carry measured usage, and no cost ratio between roles is assumed. Every group carries
+its :class:`ActorTier`; groups of different tiers are never pooled (:func:`policy_groups`). Points
+are ranked by informativeness (rate near one half, large drop to the next point) as candidate
+Harbor starts. Unknown outcomes stay explicit and are never redrawn.
 """
 
 from __future__ import annotations
@@ -80,12 +66,16 @@ from exp.optimize.evaluation.variance.evidence import (
     EvidencePacket,
     LoadedReference,
     ReferenceSource,
+    TraceSearch,
+    TraceSearchSpec,
     candidate_branches,
     continuable_points,
     evidence_packet,
     load_references,
+    open_trace_search,
 )
 from exp.optimize.evaluation.variance.evidence_tools import (
+    AGENTIC_PROFILE,
     EvidenceToolProfile,
     MeasuredUsage,
     study_usage,
@@ -107,6 +97,7 @@ from exp.optimize.evaluation.variance.rewards import (
     group_advantages,
     judge_score,
 )
+from exp.optimize.evaluation.variance.role_prompts import PromptDistribution, assign_prompts
 from exp.optimize.evaluation.variance.roles import draw_critic, draw_judge, role_protocol_sha256
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
@@ -137,8 +128,11 @@ class ActorCriticSpec(ContractModel):
         seed: Seed mixed into the trajectory pick.
         protocol: Error-mining configuration version.
         selector_profile: Evidence-tool profile and per-draw budgets of every selector draw;
-            the default is one forced response.
+            one forced response here, agentic in :meth:`error_mining`.
         critic_profile: Evidence-tool profile and per-draw budgets of every critic draw.
+        selector_prompts: Selector prompt-variant weights; draws are assigned by ``seed``.
+        critic_prompts: Critic prompt-variant weights.
+        retrieval: Tag-aware world-learning retrieval for the tool modes, or None.
         references: Registered reference and specification material the roles may read; any
             kind not registered is named unavailable in the packet.
         actor_tier: Declared model-tier label of the actor policy; groups with different tiers
@@ -157,6 +151,9 @@ class ActorCriticSpec(ContractModel):
     protocol: Literal["error-mining-v1"] = ERROR_MINING_PROTOCOL
     selector_profile: EvidenceToolProfile = EvidenceToolProfile()
     critic_profile: EvidenceToolProfile = EvidenceToolProfile()
+    selector_prompts: PromptDistribution = PromptDistribution.uniform("selector")
+    critic_prompts: PromptDistribution = PromptDistribution.uniform("critic")
+    retrieval: TraceSearchSpec | None = None
     references: tuple[ReferenceSource, ...] = Field(default=(), max_length=16)
     actor_tier: str = Field(default="default", pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 
@@ -184,8 +181,8 @@ class ActorCriticSpec(ContractModel):
         seed: int = 0,
         group_physical_attempts: int | None = None,
         continuation_physical_attempts: int = 64,
-        selector_profile: EvidenceToolProfile | None = None,
-        critic_profile: EvidenceToolProfile | None = None,
+        selector_profile: EvidenceToolProfile = AGENTIC_PROFILE,
+        critic_profile: EvidenceToolProfile = AGENTIC_PROFILE,
         references: tuple[ReferenceSource, ...] = (),
         actor_tier: str = "default",
     ) -> ActorCriticSpec:
@@ -204,8 +201,8 @@ class ActorCriticSpec(ContractModel):
             seed: Trajectory pick seed.
             group_physical_attempts: Transport ceiling of the group, or None to keep the job's.
             continuation_physical_attempts: Transport ceiling of each point's continuations.
-            selector_profile: Selector evidence-tool profile, or None for one forced response.
-            critic_profile: Critic evidence-tool profile, or None for one forced response.
+            selector_profile: Selector evidence-tool profile; agentic unless forced explicitly.
+            critic_profile: Critic evidence-tool profile; agentic unless forced explicitly.
             references: Registered reference material.
             actor_tier: Declared actor tier label.
 
@@ -229,8 +226,8 @@ class ActorCriticSpec(ContractModel):
                 "continuations": continuations,
                 "continuation_physical_attempts": continuation_physical_attempts,
                 "seed": seed,
-                "selector_profile": selector_profile or EvidenceToolProfile(),
-                "critic_profile": critic_profile or EvidenceToolProfile(),
+                "selector_profile": selector_profile,
+                "critic_profile": critic_profile,
                 "references": references,
                 "actor_tier": actor_tier,
             }
@@ -528,6 +525,7 @@ def run_actor_critic(
         source = continuation_result_reference(project, spec.initial, code_revision=code_revision)
         loader = cache(lambda ref: load_continuation_checkpoint(store, ref))
         references = load_references(store, spec.references)
+        search = open_trace_search(store, spec.retrieval, exposure) if spec.retrieval else None
         pick, packet = _pick(group, identity, spec, loader, references)
         sources = (
             source,
@@ -535,7 +533,7 @@ def run_actor_critic(
             *{reference.artifact for reference in spec.references},
         )
         judges = tuple(
-            _judge(project, spec, packet, j, identity, sources, code_revision)
+            _judge(project, spec, packet, j, identity, sources, code_revision, search)
             for j in range(len(spec.judges))
         )
         chosen = tuple(
@@ -544,7 +542,7 @@ def run_actor_critic(
         if not chosen:
             raise ValueError("no judge produced a usable selection; inspect the saved draws")
         critic_answers = tuple(
-            _critic(project, spec, packet, chosen, c, identity, sources, code_revision)
+            _critic(project, spec, packet, chosen, c, identity, sources, code_revision, search)
             for c in range(len(spec.critics))
         )
         catalog = load_model_catalog(project.model_catalog_path)
@@ -724,8 +722,10 @@ def _judge(
     identity: str,
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
+    search: TraceSearch | None,
 ) -> JudgeDraw:
-    """Make or replay one point-selector draw, keeping a refusal as a failed draw."""
+    """Make or replay one point-selector draw under its assigned prompt variant."""
+    prompts = assign_prompts(spec.selector_prompts, seed=spec.seed, draws=len(spec.judges))
     try:
         reference, transcript, selection, failure = draw_judge(
             project,
@@ -736,6 +736,8 @@ def _judge(
             sources=sources,
             code_revision=code_revision,
             profile=spec.selector_profile,
+            prompt=prompts[draw],
+            search=search,
         )
     except ValueError as error:
         return JudgeDraw(draw=draw, response=None, selection=None, failure=str(error)[:2000])
@@ -758,8 +760,10 @@ def _critic(
     identity: str,
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
+    search: TraceSearch | None,
 ) -> CriticDraw:
-    """Make or replay one critic draw before any continuation from the chosen points runs."""
+    """Make or replay one critic draw, under its assigned variant, before any continuation."""
+    prompts = assign_prompts(spec.critic_prompts, seed=spec.seed, draws=len(spec.critics))
     try:
         reference, transcript, assessment, failure = draw_critic(
             project,
@@ -770,6 +774,8 @@ def _critic(
             sources=sources,
             code_revision=code_revision,
             profile=spec.critic_profile,
+            prompt=prompts[draw],
+            search=search,
         )
     except ValueError as error:
         return CriticDraw(draw=draw, response=None, assessment=None, failure=str(error)[:2000])

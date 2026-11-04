@@ -108,13 +108,35 @@ prefixes and registered references by locator and names every reference kind tha
 unavailable.
 
 `selector_profile` and `critic_profile` are `EvidenceToolProfile`s (`variance/evidence_tools.py`):
-`forced_response` (the default: one model call, no tools) or `read_only_tools`, which serves
-those locators from frozen documents under an `EvidenceBudget` per draw (model calls, tool calls,
-input and output tokens, wall clock, dollars). Nothing is executed and nothing reaches the actor.
-`run_analysis` saves every request, tool result and answer as an `AnalysisTranscript` that
-replays without calls. The CLI cost inventory is an upper bound: each selector and critic row is
-priced at `budget.model_calls` requests at the role's attempt ceiling, the group at its own
-ceiling and `J * K` suffix jobs of M continuations at the continuation ceiling.
+`forced_response` (the field default: one model call, no tools), `read_only_tools` (read, then
+answer) or `agentic`, which `error_mining` registers by default (`AGENTIC_PROFILE`). An agentic
+draw plans (`record_plan`), investigates with the read-only tools, submits a draft
+(`submit_draft`), sees the host's validation of that draft in a self check that may read more
+(`record_self_check`), and then gives its forced final answer. Every draw runs under an
+`EvidenceBudget` (model calls, tool calls, input and output tokens, wall clock, dollars); a phase
+runs only when there is room for it and every later mandatory phase, otherwise it is skipped and
+recorded, and a draw that cannot afford its final answer stops as `budget_exhausted`.
+
+The tools read only frozen documents: trace steps, actor outputs, grader evidence, checkpoint
+prefixes, the saved world state at each offered point (by JSON pointer), the public task and
+harness definition, declared tool schemas with their rule-book contracts, registered references,
+side-by-side attempt comparisons, divergence points across the group and, when a
+`traceml-labels` artifact is registered as a `traceml_labels` reference, step labels and moves.
+`retrieval` registers a `TraceSearchSpec`: tag-aware retrieval (with the `TagRetrievalBinding`)
+over a fit-only index restricted to a world-learning `CorpusScope`; held-out partitions, another
+scope, or any scoped trace outside world learning are refused before any search. Unavailable
+material is refused by name. Nothing is executed and nothing reaches the actor.
+
+Each draw is assigned one prompt variant (`variance/role_prompts.py`): selector stances
+`divergence_seeking`, `failure_forensics`, `counterfactual_branching` and `pivot_and_return`;
+critic stances `base_rate_anchored`, `mechanism_tracing` and `adversarial_skeptical`.
+`selector_prompts` and `critic_prompts` weight them; draws are apportioned by largest remainder
+and shuffled by the spec seed, and the transcript records the variant with its stance and phase
+digests. `run_analysis` saves every request (with its phase), tool result, plan, draft, self check
+and final answer as an `AnalysisTranscript` that replays without calls. The CLI cost inventory is
+an upper bound: each selector and critic row is priced at `budget.model_calls` requests at the
+role's attempt ceiling, the group at its own ceiling and `J * K` suffix jobs of M continuations at
+the continuation ceiling.
 
 ## Decision families
 
@@ -259,8 +281,15 @@ every scored event. Without that budget the episode is saved unscored as insuffi
 Evidence is never truncated, graded in chunks or averaged. Code validates shape, rubric coverage,
 the verdict rule over the judge's own findings and every citation; a malformed or unobtainable
 answer is saved `malformed` or `unavailable`, unscored and never redrawn. Assessments replay
-exactly by protocol, definition identity, evidence identity and input budget. The prompt and its
-schema live in `variance/judge_prompt.py` (`JUDGE_PROMPT_VERSION`); `judge_profile` binds both.
+exactly by protocol, definition identity, evidence identity and input budget. The prompt sets and
+schemas live in `variance/judge_prompt.py`; `judge_profile(prompt_set=...)` binds one set, so the
+choice is part of the definition identity. `episode-judge-prompt-v1` is the single-pass prompt.
+The agentic sets (`DEFAULT_AGENTIC_JUDGE` and two other stances) run one judgment in phases: a plan
+of the evidence each criterion needs, range reads, working per-criterion checks, a self check
+against host validation (missing criteria, unread citations, unread scored events, verdict-rule
+contradictions) that may read more ranges within the same budget, and the one final
+`assess_episode`. Every phase is saved in the assessment's `inspection.json`; one judgment makes
+at most `judge_model_calls(profile)` draws (`evidence_tool_budget + 4` for an agentic set).
 
 Every place on the execution-to-reward path that derives a success bit, an empirical rate, a
 critic target, an advantage, an eligibility result or a Harbor reward, in its migrated state.

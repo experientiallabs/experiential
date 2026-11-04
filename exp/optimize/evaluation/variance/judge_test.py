@@ -24,7 +24,12 @@ from exp.optimize.evaluation.variance.judge import (
     load_assessment,
     save_evidence,
 )
-from exp.optimize.evaluation.variance.judge_prompt import judge_profile
+from exp.optimize.evaluation.variance.judge_prompt import (
+    DEFAULT_AGENTIC_JUDGE,
+    JUDGE_STANCES,
+    judge_model_calls,
+    judge_profile,
+)
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 
@@ -446,3 +451,156 @@ def test_scope_and_bindings_are_rendered_and_checked(
         judge_episode(project, definition, _evidence(), settings=widened, code_revision="test")
     assert len(transport.requests) == 1
     assert ToolChoice(name="assess_episode").name == "assess_episode"
+
+
+def _agentic(definition: JudgeDefinition, version: str = DEFAULT_AGENTIC_JUDGE) -> JudgeDefinition:
+    """The same definition under an agentic judge prompt set."""
+    profile = definition.profile
+    agentic = judge_profile(
+        model_alias=profile.model_alias,
+        model=profile.model,
+        maximum_output_tokens=profile.maximum_output_tokens,
+        evidence_tool_budget=profile.evidence_tool_budget,
+        maximum_input_bytes=profile.maximum_input_bytes,
+        prompt_set=version,
+    )
+    return definition.model_copy(update={"profile": agentic})
+
+
+def _checks(leaning: str, refs: list[str]) -> JsonHttpResponse:
+    """A record_criterion_checks call with every criterion met, citing ``refs``."""
+    return _call(
+        "record_criterion_checks",
+        {
+            "findings": [
+                {"criterion_id": c, "status": "met", "event_refs": refs, "reason": "seen"}
+                for c in ("verified_first", "right_order", "few_calls")
+            ],
+            "leaning": leaning,
+        },
+    )
+
+
+_PLAN = _call("record_plan", {"criteria": [{"criterion_id": "verified_first", "needs": "e2"}]})
+_SELF = _call("record_self_check", {"issues": [], "revise": False})
+
+
+def test_prompt_sets_are_selectable_and_bound_into_the_judge_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each prompt set has its own digests; a profile naming an unknown set is refused."""
+    project, definition, settings, _ = _fixture(tmp_path, monkeypatch, [])
+    identities = {_agentic(definition, version).identity for version in JUDGE_STANCES}
+    assert len(identities | {definition.identity}) == len(JUDGE_STANCES) + 1
+    assert judge_model_calls(definition.profile) == 1
+    assert judge_model_calls(_agentic(definition).profile) == 4
+    unknown = definition.model_copy(
+        update={"profile": definition.profile.model_copy(update={"prompt_version": "nope"})}
+    )
+    with pytest.raises(ValueError, match="not bound to a judge prompt set"):
+        judge_episode(project, unknown, _evidence(), settings=settings, code_revision="test")
+
+
+def test_an_agentic_judge_plans_checks_self_checks_and_assesses_once_then_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every phase is forced in order, persisted, and the saved judgment replays without calls."""
+    replies = [_PLAN, _checks("pass", ["e4"]), _SELF, _answer("pass")]
+    project, definition, settings, transport = _fixture(tmp_path, monkeypatch, replies)
+    definition = _agentic(definition)
+
+    reference, assessment = judge_episode(
+        project, definition, _evidence(), settings=settings, code_revision="test"
+    )
+
+    assert assessment.status == "judged" and episode_reward(assessment) == 1.0
+    forced = [_at(_sent(transport, i), "tool_choice", "function", "name") for i in range(4)]
+    assert forced == [
+        "record_plan",
+        "record_criterion_checks",
+        "record_self_check",
+        "assess_episode",
+    ]
+    system = json.loads(json.dumps(_sent(transport, 0)["messages"]))[0]["content"]
+    assert "AGENTIC PROTOCOL" in system and JUDGE_STANCES[DEFAULT_AGENTIC_JUDGE] in system
+    assert _user(transport)["phase"] == "plan"
+    assert "no problems found" in str(_sent(transport, 2)["messages"])
+    inspection = json.loads(project.artifacts.read_bytes(reference.artifact_id, "inspection.json"))
+    assert inspection["prompt_set"] == DEFAULT_AGENTIC_JUDGE
+    assert [(row["phase"], row["tool"]) for row in inspection["phases"]] == [
+        ("plan", "record_plan"),
+        ("investigate", "record_criterion_checks"),
+        ("self_check", "record_self_check"),
+        ("final", "assess_episode"),
+    ]
+    assert len(project.artifacts.read(reference.artifact_id).manifest.inputs) == 6
+
+    again = judge_episode(project, definition, _evidence(), settings=settings, code_revision="test")
+    assert again == (reference, assessment) and len(transport.requests) == 4
+
+
+def test_an_agentic_self_check_reads_more_evidence_before_the_one_assessment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host checks flag unread citations; the self check reads them within the same budget."""
+    replies = [
+        _PLAN,
+        _call("read_events", {"first_event_id": "e2", "last_event_id": "e3"}),
+        _checks("pass", ["e4"]),
+        _call("read_events", {"first_event_id": "e4", "last_event_id": "e4"}),
+        _SELF,
+        _answer("pass"),
+    ]
+    project, definition, settings, transport = _fixture(
+        tmp_path, monkeypatch, replies, tools=3, input_bytes=19000
+    )
+    definition = _agentic(definition)
+
+    reference, assessment = judge_episode(
+        project, definition, _large(), settings=settings, code_revision="test"
+    )
+
+    assert assessment.status == "judged", assessment.failure
+    inspection = json.loads(project.artifacts.read_bytes(reference.artifact_id, "inspection.json"))
+    phases = [(row["phase"], row["tool"]) for row in inspection["phases"]]
+    assert phases == [
+        ("plan", "record_plan"),
+        ("investigate", "read_events"),
+        ("investigate", "record_criterion_checks"),
+        ("self_check", "read_events"),
+        ("self_check", "record_self_check"),
+        ("final", "assess_episode"),
+    ]
+    checks = inspection["phases"][2]["host_checks"]
+    assert any("not yet read" in row and "e4" in row for row in checks)
+    assert inspection["reads"] == 2 and inspection["inspected"] == ["e2", "e3", "e4"]
+    assert _sent(transport, 3)["tool_choice"] == "required"
+    assert "not yet read" in str(_sent(transport, 3)["messages"])
+
+
+def test_an_agentic_judge_with_its_reads_spent_is_forced_through_the_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once reads are spent every phase tool is forced; nothing is graded in parts."""
+    replies = [
+        _PLAN,
+        _call("read_events", {"first_event_id": "e4", "last_event_id": "e4"}),
+        _checks("pass", ["e4"]),
+        _SELF,
+        _answer("pass"),
+    ]
+    project, definition, settings, transport = _fixture(
+        tmp_path, monkeypatch, replies, tools=1, input_bytes=19000
+    )
+
+    _, assessment = judge_episode(
+        project, _agentic(definition), _large(), settings=settings, code_revision="test"
+    )
+
+    assert _sent(transport, 2)["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "record_criterion_checks"},
+    }
+    assert "unread" in str(_sent(transport, 3)["messages"])
+    assert assessment.status == "malformed"
+    assert assessment.failure is not None and "without reading scored events" in assessment.failure

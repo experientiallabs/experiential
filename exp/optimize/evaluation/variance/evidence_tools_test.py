@@ -23,19 +23,24 @@ from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
-from exp.optimize.evaluation.variance.evidence import EstimationPool, EvidencePacket
+from exp.optimize.evaluation.variance.evidence import (
+    EstimationPool,
+    EvidencePacket,
+    execute_evidence_tool,
+)
 from exp.optimize.evaluation.variance.evidence_tools import (
+    AGENTIC_PROFILE,
     TOOL_RESULT_TYPE,
     TRANSCRIPT_TYPE,
     AnalysisTranscript,
     EvidenceBudget,
     EvidenceToolProfile,
     MeasuredUsage,
-    execute_evidence_tool,
     response_usage,
     run_analysis,
     total_usage,
 )
+from exp.optimize.evaluation.variance.role_prompts import PromptAssignment, assignment
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 
@@ -71,12 +76,15 @@ def _call(name: str, arguments: JsonObject) -> ToolCall:
 
 
 def test_profiles_are_coherent_and_the_forced_profile_is_the_default() -> None:
-    """A forced response makes one call; a tool profile can read and still answer."""
+    """A forced response makes one call; tool profiles can read and still reach an answer."""
     assert EvidenceToolProfile().mode == "forced_response"
+    assert AGENTIC_PROFILE.mode == "agentic" and AGENTIC_PROFILE.budget.model_calls >= 4
     with pytest.raises(ValueError, match="one model call"):
         EvidenceToolProfile(budget=EvidenceBudget(model_calls=2))
     with pytest.raises(ValueError, match="two model calls"):
         EvidenceToolProfile(mode="read_only_tools")
+    with pytest.raises(ValueError, match="four model calls"):
+        EvidenceToolProfile(mode="agentic", budget=EvidenceBudget(model_calls=3, tool_calls=1))
 
 
 def test_tools_read_exact_evidence_and_refuse_everything_else() -> None:
@@ -349,19 +357,208 @@ def _loop_fixture(
     return project, settings, transport
 
 
+def _positive(draft: JsonObject) -> str | None:
+    """Accept a draft whose value is a positive integer."""
+    value = draft.get("value")
+    return None if isinstance(value, int) and value > 0 else "value must be positive"
+
+
+def _message(transport: ScriptedJsonTransport, request: int, index: int) -> str:
+    """Return the text content of one message of one sent request."""
+    messages = transport.requests[request].payload["messages"]
+    assert isinstance(messages, list) and isinstance(messages[index], dict)
+    content = messages[index]["content"]
+    assert isinstance(content, str)
+    return content
+
+
 def _run(
-    project: ProjectStore, settings: AuthorSettings, profile: EvidenceToolProfile
+    project: ProjectStore,
+    settings: AuthorSettings,
+    profile: EvidenceToolProfile,
+    *,
+    prompt: PromptAssignment | None = None,
+    packet: EvidencePacket = _PACKET,
 ) -> tuple[ArtifactInput, AnalysisTranscript]:
-    """Run the loop over the fixture packet."""
+    """Run the loop over the fixture packet; a draft is valid when its value is positive."""
     return run_analysis(
         project,
         settings,
         profile,
         instruction="Read and answer.",
-        packet=_PACKET,
+        packet=packet,
         content={"task": "estimate"},
         answer=_ANSWER,
         identity="draw-0",
         sources=(),
         code_revision="test",
+        prompt=prompt,
+        check=_positive,
     )
+
+
+_RICH: JsonObject = {
+    **_DOCUMENTS,
+    "attempt:0": {"attempt": 0, "grade_status": "pass"},
+    "attempt:1": {"attempt": 1, "grade_status": "fail"},
+    "attempt:1/step:1": {"action": {"name": "edit"}, "status": "valid"},
+    "attempt:0/step:2": {"action": {"name": "lock"}, "status": "valid"},
+    "attempt:1/step:2": {"action": {"name": "delete"}, "status": "error"},
+    "world:1": {"current": {"business_state": {"orders": {"7": {"locked": False}}}}},
+    "environment": {"public_task": {"instruction": "Delete order 7."}},
+    "tool:edit": {"name": "edit"},
+    "contract:edit": {"effect": "writes a row"},
+    "reference:policy": {"kind": "task_specification", "content": {"rules": ["lock first"]}},
+}
+_RICH_PACKET = _PACKET.model_copy(update={"documents": _RICH, "refs": frozenset(_RICH)})
+_AGENTIC = EvidenceToolProfile(mode="agentic", budget=EvidenceBudget(model_calls=8, tool_calls=4))
+
+
+def test_new_tools_read_world_state_contracts_comparisons_and_name_missing_material() -> None:
+    """World state by pointer, contracts, comparisons and divergence read; absent tools refuse."""
+    run = lambda name, arguments, size=4096: execute_evidence_tool(  # noqa: E731
+        _RICH, _call(name, arguments), maximum_bytes=size
+    )
+    status, state = run("read_world_state", {"point": 1, "path": "/current/business_state/orders"})
+    assert status == "ok" and isinstance(state, dict)
+    assert state["content"] == {"7": {"locked": False}}
+    status, detail = run("read_world_state", {"point": 1, "path": ""}, 64)
+    assert status == "refused" and "children: ['current']" in str(detail)
+    assert run("read_world_state", {"point": 1, "path": "/missing"})[0] == "refused"
+    assert run("read_world_state", {"point": 4, "path": ""}) == (
+        "refused",
+        "locator world:4 was not supplied",
+    )
+    assert run("read_tool_contract", {"tool": "edit"}) == (
+        "ok",
+        {"tool": {"name": "edit"}, "contract": {"effect": "writes a row"}, "not_supplied": []},
+    )
+    assert run("read_reference", {"name": "policy", "path": "/content/rules/0"})[1] == {
+        "locator": "reference:policy",
+        "path": "/content/rules/0",
+        "content": "lock first",
+    }
+    assert run("read_environment", {})[0] == "ok"
+    status, compared = run("compare_attempts", {"attempts": [0, 1], "start": 1, "count": 2})
+    assert status == "ok" and isinstance(compared, dict)
+    assert [row["same_action"] for row in compared["steps"]] == [True, False]  # type: ignore[index]
+    status, splits = run("list_divergence_points", {})
+    assert status == "ok" and isinstance(splits, dict)
+    (split,) = splits["divergence_points"]  # type: ignore[misc]
+    assert split["step"] == 2 and split["shared_by"] == [0, 1]  # type: ignore[index]
+    assert run("read_step_labels", {"attempt": 0, "step": 1})[1] == (
+        "no traceml-labels reference was registered; labels not supplied"
+    )
+    status, detail = run(
+        "search_world_traces", {"situation": "delete order", "message": "done", "top_k": 1}
+    )
+    assert status == "refused" and "no world-learning retrieval index" in str(detail)
+
+
+def test_the_agentic_loop_persists_every_phase_and_replays_without_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan, reads, draft, self check with an extra read, and final are all saved and replay."""
+    prompt = assignment("selector", "failure_forensics", 2)
+    project, settings, transport = _loop_fixture(
+        tmp_path,
+        monkeypatch,
+        [
+            _reply(
+                [("record_plan", {"hypotheses": ["lock missing"], "planned_reads": ["world:1"]})]
+            ),
+            _reply([("read_world_state", {"point": 1, "path": "/current"})]),
+            _reply([("submit_draft", {"value": 0})]),
+            _reply([("list_divergence_points", {})]),
+            _reply([("record_self_check", {"issues": ["value must be positive"], "revise": True})]),
+            _reply([("submit", {"value": 2})]),
+        ],
+    )
+
+    reference, transcript = _run(project, settings, _AGENTIC, prompt=prompt, packet=_RICH_PACKET)
+
+    assert transcript.stop == "answered" and transcript.answer == {"value": 2}
+    assert [call.phase for call in transcript.calls] == [
+        "plan",
+        "investigate",
+        "investigate",
+        "self_check",
+        "self_check",
+        "final",
+    ]
+    assert [call.forced for call in transcript.calls] == [
+        "record_plan",
+        None,
+        None,
+        None,
+        None,
+        "submit",
+    ]
+    assert [(row.phase, row.call) for row in transcript.outputs] == [
+        ("plan", 0),
+        ("draft", 2),
+        ("self_check", 4),
+    ]
+    assert transcript.outputs[1].host_validation == "value must be positive"
+    assert [(t.name, t.call, t.status) for t in transcript.tools] == [
+        ("read_world_state", 1, "ok"),
+        ("list_divergence_points", 3, "ok"),
+    ]
+    assert transcript.calls[3].phase == "self_check" and transcript.prompt == prompt
+    system = _message(transport, 0, 0)
+    assert "STANCE (failure_forensics)" in system and prompt.stance in system
+    opening = json.loads(_message(transport, 0, 1))
+    assert opening["phase"] == "plan" and opening["world_learning_retrieval"]["available"] is False
+    check_turn = json.dumps(transport.requests[3].payload)
+    assert "value must be positive" in check_turn and "SELF CHECK" in check_turn
+
+    assert _run(project, settings, _AGENTIC, prompt=prompt, packet=_RICH_PACKET) == (
+        reference,
+        transcript,
+    )
+    assert len(transport.requests) == 6
+    with pytest.raises(ValueError, match="different profile or prompt"):
+        _run(project, settings, _AGENTIC, prompt=assignment("selector", "pivot_and_return", 2))
+
+
+def test_budget_exhaustion_mid_loop_skips_phases_or_stops_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without room for later phases the loop skips to the final answer, or stops without one."""
+    profile = EvidenceToolProfile(
+        mode="agentic",
+        budget=EvidenceBudget(model_calls=8, tool_calls=4, input_tokens=50_000),
+    )
+    plan = _reply([("record_plan", {"hypotheses": [], "planned_reads": []})], prompt_tokens=45_000)
+    project, settings, transport = _loop_fixture(
+        tmp_path, monkeypatch, [plan, _reply([("submit", {"value": 1})])]
+    )
+
+    _, transcript = _run(project, settings, profile)
+
+    assert transcript.stop == "answered" and transcript.skipped == ("investigate", "self_check")
+    assert [call.phase for call in transcript.calls] == ["plan", "final"]
+    assert "investigate" in _message(transport, 1, -1)
+
+    plan = _reply([("record_plan", {"hypotheses": [], "planned_reads": []})], prompt_tokens=49_900)
+    project, settings, transport = _loop_fixture(tmp_path / "second", monkeypatch, [plan])
+
+    _, stopped = _run(project, settings, profile)
+
+    assert stopped.stop == "budget_exhausted" and stopped.answer is None
+    assert "input_tokens" in stopped.exhausted and stopped.outputs[0].phase == "plan"
+    assert len(transport.requests) == 1
+
+
+def test_an_agentic_role_that_ignores_a_forced_phase_tool_fails_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forced plan answered with anything else is a protocol failure, never retried."""
+    project, settings, transport = _loop_fixture(
+        tmp_path, monkeypatch, [_reply([("submit", {"value": 1})])]
+    )
+
+    _, transcript = _run(project, settings, _AGENTIC)
+
+    assert transcript.stop == "protocol_failure" and "record_plan" in str(transcript.failure)
+    assert len(transport.requests) == 1

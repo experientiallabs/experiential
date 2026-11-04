@@ -278,7 +278,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v3",
+        "variance-roles-v4",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -287,8 +287,10 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.contracts:CriticEstimate",
             "exp.optimize.evaluation.variance.contracts:CriticAssessment",
             "exp.optimize.evaluation.variance.evidence_tools",
+            "exp.optimize.evaluation.variance.role_prompts",
+            "exp.optimize.evaluation.variance.evidence",
         ),
-        "6d6ab9cdcee19d0f8a75263d4def4fde1102955c3f88f66f4b85f289e7ba633e",
+        "c87fac16157626c349a8aa23777f9157663f702633cab27757c7c9de710d16cb",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -323,7 +325,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.judge",
             "exp.optimize.evaluation.variance.judge_prompt",
         ),
-        "915fcaea4a777a806e710977612bc79d3fe3488ac85d0f62d3d9418af9d6a241",
+        "7538fbec6025c8fe9c5cfceaa8e62001c5832f98ebe7e04a6bd3a0b106934cfc",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judged:JUDGED_LABELS_PROTOCOL",

@@ -26,6 +26,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
 )
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.evidence_tools import (
+    AGENTIC_PROFILE,
     AnalysisTranscript,
     EvidenceBudget,
     EvidenceToolProfile,
@@ -40,6 +41,7 @@ from exp.optimize.evaluation.variance.judged_test import (
     run_digests,
 )
 from exp.optimize.evaluation.variance.rewards import PointOutcome, group_advantages
+from exp.optimize.evaluation.variance.roles import FORCED_PROFILE
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -348,7 +350,9 @@ def test_the_error_mining_defaults_run_and_record_populations_and_usage(
     )
     assert (len(spec.judges), len(spec.critics), spec.points, spec.continuations) == (8, 8, 4, 8)
     assert spec.initial.study.repeats == 16 and spec.protocol == "error-mining-v1"
-    assert spec.selector_profile.mode == "forced_response"
+    assert spec.selector_profile == spec.critic_profile == AGENTIC_PROFILE
+    forced = {"selector_profile": FORCED_PROFILE, "critic_profile": FORCED_PROFILE}
+    spec = ActorCriticSpec.model_validate({**spec.model_dump(), **forced})
     selections = [[_point(0), _point(1)]] * 4 + [[_point(1)]] * 4
     roles = [
         _with_usage(_tool_reply("choose_points", {"points": p, "limitations": ["x"]}), 1000, 100)
