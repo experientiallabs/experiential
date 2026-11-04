@@ -4,8 +4,9 @@ This pipeline turns agent traffic into long-horizon environments whose difficult
 decisions that matter. A point in a trajectory counts as a decision only when competing actions
 taken from that exact checkpoint, continued under one frozen policy and budget, lead to measurably
 different outcomes. A family of environments qualifies only when which action is better flips
-across coherent variants of the world. Everything here is a Python API; three stages are also
-`exp eval` continuation actions.
+across coherent variants of the world. Everything here is a Python API; three stages, and the
+whole pipeline (see [End-to-end pipeline](#end-to-end-pipeline)), are also `exp eval`
+continuation actions.
 
 ## Data roles
 
@@ -450,6 +451,71 @@ delivery). Each target's own frozen judge labels every arm; branch `i` pairs acr
 episodes stay in coverage and leave their pair unpaired. `crosstalk_verdict` reports cross-talk
 only when the paired-bootstrap lower 95 percent bound of both `top - none` and `top - random` is
 above zero. The spec is preregistered before any call and a rerun replays the saved result.
+
+## End-to-end pipeline
+
+`run_decision_variance` (`variance/pipeline.py`, CLI action `decision-variance`) runs the whole
+sequence from one `DecisionVarianceSpec` (`variance/pipeline_spec.py`) in six stages, each run
+through the owners described above:
+
+| Stage | Spec slice | Owner and saved outputs |
+|---|---|---|
+| `variance-build` | `build` | `run_variance_build`: exposure plan, scoped world model, scoped index, tag binding |
+| `rules` | `rules` | `run_rules_stage` over world-learning traces, boundary workloads executed in the bound world; the rule book is bound into the mining runtime before any probe |
+| `traceml` | `traceml` | Each tier's group of attempts labelled step by step |
+| `error-mining` | `mining` | The mining rubric, then one `run_actor_critic` per actor tier and its judged group |
+| `families` | `authoring` | Coalition, packet, independent agentic authors, freeze, judges, families, revision, admission |
+| `records` | `records` | Training and selector records, qualification, Harbor exports, cross-talk |
+
+Each stage saves one `decision-variance-stage` record. Its identity binds its spec slice, the
+identity of every earlier stage, the code revision and anything outside the spec it reads (a
+TraceML bank's content; the rubric author's settings when the mining rubric is authored), so a
+changed field re-keys that stage and every later one while the earlier ones replay. A rerun
+replays saved stages with no call, and an interrupted stage resumes through its owners' saved
+draws. `plan_decision_variance` prices every unsaved stage as a credential-free upper bound; a run
+with unsaved stages needs one `PipelineApproval` of that exact plan, and a stage whose bound
+exceeds what is left of the approved ceiling never starts. Measured provider attempts (and spend,
+when an operation ceiling is installed) are recorded per stage. The open-weight actor council
+(`COUNCIL_ACTORS`) is the default tier set, each actor its own tier and never pooled.
+
+What the stages read beyond their own owners lives in `variance/pipeline_inputs.py`:
+
+- **World-learning search.** With `mining.retrieval` (default on), each tier's selectors and
+  critics get a `TraceSearchSpec` over the build's scoped, fit-only world-learning index, its
+  `CorpusScope` and, when the build saved one, its tag retrieval binding for the mining task.
+  `TraceSearch` refuses an index that is not fit-only or a scope that reaches any trace outside
+  world learning, so held-out traces never enter. A semantic index binds the project's catalog
+  embedder role behind the admitted transport (its identity must equal the index's); a local
+  hashing index needs no provider. Query embeddings are listed as unpriced in the plan.
+- **Observed replay episodes.** Every authoring packet carries, as `observed_episodes`, the
+  world-learning traces that call the task's tools (up to `authoring.maximum_episodes`), so the
+  world author's programs are validated against real episodes. A trace's starting state is not
+  recorded, so steps that read an unknown domain stay unverifiable; recorded states are compared
+  exactly.
+- **Authored mining rubric.** When `mining.rubric` is omitted, the error-mining stage fixes the
+  judge profile, then runs the agentic rubric author (`authoring.rubric_author` with
+  `authoring.rubric_profile`) over a whole-task packet: the rule-bound start (which must be the
+  task's initial context), the world-learning sources, the rule book and the observed episodes,
+  with a brief that proposes no option or axis and a single baseline variant. A registered rubric
+  overrides it.
+- **Option actions.** The decision-state author gives each option its executable first call
+  (`DecisionOption.call`). When `authoring.actions` is empty the family forces those calls
+  (`option_calls`); an option without a call becomes the family's recorded failure. Explicit
+  `authoring.actions` override them.
+
+**Qualification before export.** With `records.qualification` (an independent
+`evaluation-specification` and declared controls), each confirmed variant of an admitted family
+is turned into its exact executable task (`family_executable_task`: frozen start, frozen runtime
+and the variant's own frozen judge), executed once for feasibility, witnessed with
+`witness_controls` and qualified with `qualify_executable_task`. A variant that qualifies is
+exported qualified; any other is exported as diagnostic with its refusals or failure in the
+stage's `HarborExport` row. Without qualification every export is diagnostic.
+
+The CLI action reads `{"spec": "decision-variance.json"}`. By default it prints the stage plan:
+each stage's identity, whether it is saved, what it will do and its upper-bound cost inventory.
+With `"execute": true` it asks spend consent once for the whole plan, runs or resumes the
+pipeline, and prints each stage's replay status, measured usage and summary; the full report is
+saved beside the run.
 
 ## What this does not establish
 

@@ -763,7 +763,6 @@ def open_trace_search(
     store: ArtifactStore,
     spec: TraceSearchSpec,
     plan: ExposurePlan,
-    *,
     embedder: RAGEmbedderBinding | None = None,
 ) -> TraceSearch:
     """Load the registered index and bind its world-learning-only search.

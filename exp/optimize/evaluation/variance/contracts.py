@@ -192,16 +192,31 @@ class VariationAxis(ContractModel):
     effect: str = Field(min_length=1, max_length=800)
 
 
+class OptionCall(ContractModel):
+    """The exact first tool call that executes one option as a competing branch.
+
+    Attributes:
+        tool: A tool the actor may call.
+        arguments: The call's JSON arguments.
+    """
+
+    tool: str = Field(min_length=1, max_length=256)
+    arguments: JsonObject = Field(default_factory=dict)
+
+
 class DecisionOption(ContractModel):
     """One action the actor could take at the decision.
 
     Attributes:
         option_id: Stable identity; scenarios name their correct choice by it.
         action: The action, stated concretely enough to execute as a competing branch.
+        call: The exact first tool call that executes the option, when the author gave one;
+            contrasts force it as the option's branch.
     """
 
     option_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     action: str = Field(min_length=1, max_length=600)
+    call: OptionCall | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Criterion(ContractModel):

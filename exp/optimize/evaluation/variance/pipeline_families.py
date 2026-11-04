@@ -26,11 +26,10 @@ contrasts run afresh. A family is admitted exactly when its computed eligibility
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject, stable_id
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
@@ -40,11 +39,10 @@ from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_run_digests
 from exp.optimize.evaluation.variance.authoring_packet import (
     AuthoringPacket,
-    SourceRef,
     build_authoring_packet,
     save_packet,
 )
-from exp.optimize.evaluation.variance.authors import DecisionContext, ScenarioDraft
+from exp.optimize.evaluation.variance.authors import DecisionContext, ScenarioDraft, option_calls
 from exp.optimize.evaluation.variance.build_records import load_exposure_plan
 from exp.optimize.evaluation.variance.coalition import mining_coalition
 from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario
@@ -57,6 +55,12 @@ from exp.optimize.evaluation.variance.family import (
 from exp.optimize.evaluation.variance.judge import EVIDENCE_TYPE, load_assessment
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedStudy
+from exp.optimize.evaluation.variance.pipeline_inputs import (
+    local_id,
+    observed_episodes,
+    rubric_draws,
+    world_sources,
+)
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
     CostLine,
@@ -102,6 +106,9 @@ from exp.simulation.induction.sandbox import ProgramSandbox
 
 __all__ = ["FAMILIES_STAGE"]
 
+MAXIMUM_OPTIONS = 6
+"""Most options a decision state may have; prices a family whose actions are authored."""
+
 
 @dataclass
 class _Authored:
@@ -116,6 +123,8 @@ class _Authored:
         review: The compatibility review.
         freeze: The freeze report.
         freeze_ref: Its saved reference.
+        identity: Prefix of every author and reviser draw, binding the family's draws and the
+            packet, so a packet that changes with another tier's coalition is authored afresh.
         judging: Frozen judge binding per variant.
     """
 
@@ -127,6 +136,7 @@ class _Authored:
     review: CompatibilityReview
     freeze: WorldFreeze
     freeze_ref: ArtifactInput
+    identity: str
     judging: dict[str, VariantJudging] = field(default_factory=dict)
 
 
@@ -194,6 +204,7 @@ class _Point:
             )
         packet = self.packet(state, scenarios)
         packet_ref = save_packet(project, packet, code_revision=revision)
+        prefix = stable_id("family-authoring", {"draws": self.draws, "packet": packet_ref.sha256})
         base = GroundedRuntimeDefinition.model_validate(self.tier.job.configuration)
         with ProgramSandbox() as sandbox:
             world_run = author_world_agentic(
@@ -201,7 +212,7 @@ class _Point:
                 authoring.world_author,
                 packet_ref,
                 sandbox=sandbox,
-                identity=self.draws + "-world",
+                identity=prefix + "-world",
                 code_revision=revision,
                 prompt_sets=authoring.world_prompt_sets,
                 maximum_repairs=authoring.world_repairs,
@@ -210,7 +221,7 @@ class _Point:
                 project,
                 authoring.rubric_author,
                 packet_ref,
-                identity=self.draws + "-rubric",
+                identity=prefix + "-rubric",
                 code_revision=revision,
                 profile=authoring.rubric_profile,
             )
@@ -238,7 +249,7 @@ class _Point:
             )
         freeze_ref = artifact_input(project.artifacts.read(freeze.identity + "-result").manifest)
         authored = _Authored(
-            packet, packet_ref, world, world_run.draft, rubric, review, freeze, freeze_ref
+            packet, packet_ref, world, world_run.draft, rubric, review, freeze, freeze_ref, prefix
         )
         for scenario in scenarios:
             authored.judging[scenario.scenario_id] = self.binding(
@@ -280,6 +291,7 @@ class _Point:
             project.artifacts.read_bytes(self.draws + "-context", "context.json")
         )
         checkpoint = load_continuation_checkpoint(project.artifacts, saved.checkpoint)
+        exposure = load_exposure_plan(project, build.exposure)
         job = self.tier.job
         remaining = ChatAgentRuntime(
             maximum_model_calls=job.maximum_model_calls, system_prompt=job.system_prompt
@@ -292,26 +304,25 @@ class _Point:
             step_labels=labels.get(self.tier.tier),
         )
         return build_authoring_packet(
-            family_id=_local(f"{self.tier.tier}-{self.point}"),
+            family_id=local_id(f"{self.tier.tier}-{self.point}"),
             task=checkpoint.task,
             checkpoint=saved.checkpoint,
             before_state=dict(saved.before),
             public_history=saved.prefix,
             remaining_calls=remaining,
-            sources=tuple(
-                SourceRef(
-                    source_id=_local(f"trace-{trace_id}"),
-                    kind="trace",
-                    trace_id=trace_id,
-                    summary="World-learning trajectory the rule book was learned from.",
-                )
-                for trace_id in build.rules_traces
-            ),
-            exposure=load_exposure_plan(project, build.exposure),
+            sources=world_sources(build),
+            exposure=exposure,
             rule_book=rules.rulebook,
             book=load_rulebook(project, rules.rulebook),
             decision=state,
             scenarios=scenarios,
+            observed_episodes=observed_episodes(
+                project,
+                build,
+                exposure,
+                tuple(tool.name for tool in checkpoint.task.tools),
+                context.spec.authoring.maximum_episodes,
+            ),
             coalition=coalition,
         )
 
@@ -331,12 +342,9 @@ class _FamiliesStage:
         del code_revision
         authoring, mining = spec.authoring, spec.mining
         families = len(mining.actors) * authoring.families_per_tier
-        variants, options = authoring.maximum_variants + 1, len(authoring.actions)
+        variants = authoring.maximum_variants + 1
+        options = len(authoring.actions) or MAXIMUM_OPTIONS
         cells = variants * (options * (authoring.repeats + authoring.confirmation_repeats) + 1)
-        rubric_draws = (
-            len(authoring.rubric_profile.variants) * (4 if authoring.rubric_profile.agentic else 1)
-            + 1
-        )
         world_draws = len(authoring.world_prompt_sets) * (2 + authoring.world_repairs)
         revision_draws = authoring.revision_rounds
         confirmation = variants * options * authoring.confirmation_repeats
@@ -349,7 +357,7 @@ class _FamiliesStage:
                 (authoring.decision_author, passes),
                 (authoring.scenario_author, passes),
                 (authoring.world_author, world_draws),
-                (authoring.rubric_author, rubric_draws + revision_draws),
+                (authoring.rubric_author, rubric_draws(authoring.rubric_profile) + revision_draws),
             ):
                 per_family.extend(row.scaled(draws) for row in evaluation_costs(project, settings))
             per_family.extend(
@@ -360,7 +368,8 @@ class _FamiliesStage:
             costs.extend(row.scaled(authoring.families_per_tier) for row in per_family)
         lines = (
             f"Families: up to {families} ({authoring.families_per_tier} per tier), each up to "
-            f"{authoring.maximum_variants} scenarios plus a baseline and {options} options; "
+            f"{authoring.maximum_variants} scenarios plus a baseline and "
+            f"{len(authoring.actions) or f'up to {MAXIMUM_OPTIONS} authored'} options; "
             f"world author {len(authoring.world_prompt_sets)} prompt sets, rubric author "
             f"{len(authoring.rubric_profile.variants)} variants, independent of each other.",
             f"Each variant: world freeze with challenges, judged selection ({authoring.repeats}"
@@ -442,7 +451,7 @@ def _family(point: _Point) -> FamilyOutcome:
         decision_author=authoring.decision_author,
         scenario_author=authoring.scenario_author,
         rules_stage=RulesOutputs.model_validate(context.upstream["rules"].outputs).report,
-        actions=authoring.actions,
+        actions=authoring.actions or None,
         repeats=authoring.repeats,
         confirmation_repeats=authoring.confirmation_repeats,
         confirmation_seed=authoring.confirmation_seed,
@@ -460,6 +469,7 @@ def _family(point: _Point) -> FamilyOutcome:
         report=point.report,
         point=point.point,
         code_revision=revision,
+        actions=None if authoring.actions else option_calls,
         judging=point.judge,
     )
     if family.judging and point.authored is None:
@@ -475,6 +485,7 @@ def _family(point: _Point) -> FamilyOutcome:
                 report=point.report,
                 point=point.point,
                 code_revision=revision,
+                actions=None if authoring.actions else option_calls,
             )
     saved = artifact_input(project.artifacts.read(family.identity + "-result").manifest)
     authored = point.authored
@@ -535,7 +546,7 @@ def _revise(
             for cell in option.cells
             if cell.slot.episode is not None
         )
-        identity = f"{point.draws}-revision-{row.scenario_id}"
+        identity = f"{authored.identity}-revision-{row.scenario_id}"
         result = revise_until_stable(
             project,
             spec.authoring.rubric_author,
@@ -587,12 +598,6 @@ def _scenarios(project: ProjectStore, draws: str) -> tuple[Scenario, ...]:
     if draft.scenarios is None:
         raise ValueError("the family has no parsed scenario set")
     return draft.scenarios.scenarios
-
-
-def _local(value: str) -> str:
-    """Turn a label into a locator-safe identity."""
-    cleaned = re.sub(r"[^A-Za-z0-9_.:-]", "-", value)
-    return (cleaned if cleaned[:1].isalnum() else "x" + cleaned)[:128]
 
 
 FAMILIES_STAGE = _FamiliesStage()

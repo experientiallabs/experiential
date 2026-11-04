@@ -41,31 +41,61 @@ def fit_episodes(
     Raises:
         ValueError: The project has no completed build or a trace's facts are invalid.
     """
-    names = set(tools)
+    names = frozenset(tools)
     episodes = []
     for trace, lineage in fit_traces(project):
-        exchanges = recorded_exchanges(trace, lineage)
-        if not any(row.name in names for row in exchanges):
+        episode = trace_episode(trace, lineage, tools=names, initial_state=initial_state)
+        if episode is None:
             continue
-        episodes.append(
-            InductionEpisode(
-                episode_id=trace.trace_id,
-                initial_state=dict(initial_state or {}),
-                facts=_starting_facts(trace, lineage),
-                steps=tuple(
-                    InductionStep(
-                        tool=row.name,
-                        arguments=row.arguments,
-                        reply=row.reply,
-                        is_error=_is_error(row.reply),
-                    )
-                    for row in exchanges
-                ),
-            )
-        )
+        episodes.append(episode)
         if len(episodes) == maximum_episodes:
             break
     return tuple(episodes)
+
+
+def trace_episode(
+    trace: Trace,
+    lineage: str,
+    *,
+    tools: Iterable[str],
+    initial_state: JsonObject | None,
+) -> InductionEpisode | None:
+    """Return one trace as an episode, or None when it calls none of ``tools``.
+
+    The caller decides which traces may be read; this never checks a partition.
+
+    Args:
+        trace: One normalized trace.
+        lineage: The trace's leakage lineage.
+        tools: Tools of the world manifest.
+        initial_state: Declared starting state, or None when unknown; steps that read an
+            unknown domain stay unverifiable during validation.
+
+    Returns:
+        The episode with every recorded exchange and its starting conditioning facts.
+
+    Raises:
+        ValueError: A recorded call's arguments are not an object, or the trace's facts are
+            invalid.
+    """
+    names = set(tools)
+    exchanges = recorded_exchanges(trace, lineage)
+    if not any(row.name in names for row in exchanges):
+        return None
+    return InductionEpisode(
+        episode_id=trace.trace_id,
+        initial_state=dict(initial_state or {}),
+        facts=_starting_facts(trace, lineage),
+        steps=tuple(
+            InductionStep(
+                tool=row.name,
+                arguments=row.arguments,
+                reply=row.reply,
+                is_error=_is_error(row.reply),
+            )
+            for row in exchanges
+        ),
+    )
 
 
 def fit_traces(project: ProjectStore) -> Iterator[tuple[Trace, str]]:

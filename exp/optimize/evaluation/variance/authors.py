@@ -42,7 +42,7 @@ from exp.common.core.artifacts import (
     sha256_json,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolChoice
+from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolCall, ToolChoice
 from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
@@ -62,7 +62,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
 
-AUTHORS_PROTOCOL = "variance-authors-v3"
+AUTHORS_PROTOCOL = "variance-authors-v4"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"
@@ -91,7 +91,8 @@ right option. Tier labels and model names say who behaved how; never put them in
 Return a decision state that a scenario author will vary. Requirements, all of them mandatory:
 - Options are concrete executable actions that can be run as competing branches from the same
   checkpoint: name the tool and the arguments or the observable change, never a vague intent.
-  Give two or more, each with a distinct option_id.
+  Give two or more, each with a distinct option_id. Give each option's call: the exact first
+  tool call (a listed tool and its arguments) that executes it, so the option can be forced.
 - Each variation axis is a JSON-pointer path in the before-state whose value changes which option
   is correct. A path whose value never changes the right option is not an axis. Every axis path
   must sit inside one of relevant_paths.
@@ -388,7 +389,8 @@ def validate_decision_state(arguments: object, context: DecisionContext) -> Deci
             or absent state, varies a path outside the relevant paths, leaves an axis ungrounded
             or undiscoverable, excludes the observed value of an axis, declares an instruction axis
             without permission, declares one whose original is not the task's instruction, or
-            names a tier or actor model in a criterion.
+            names a tier or actor model in a criterion, or gives an option a call to a tool the
+            actor may not call.
     """
     answer = DecisionStateAnswer.model_validate(arguments)
     state, before = answer.state, context.before
@@ -419,6 +421,11 @@ def validate_decision_state(arguments: object, context: DecisionContext) -> Deci
     if len(grounded) != len(answer.grounding) or set(grounded) != {a.path for a in state.axes}:
         raise ValueError("grounding must name every variation axis exactly once and nothing else")
     tools = {tool.name for tool in context.tools}
+    called = sorted(
+        {option.call.tool for option in state.options if option.call is not None} - tools
+    )
+    if called:
+        raise ValueError(f"options call tools the actor may not call: {called}")
     for axis in state.axes:
         if not any(_within(axis.path, relevant) for relevant in state.relevant_paths):
             raise ValueError(f"axis {axis.path} is not inside any decision-relevant path")
@@ -435,6 +442,34 @@ def validate_decision_state(arguments: object, context: DecisionContext) -> Deci
         if exists and not any(_same(value, permitted) for permitted in axis.values):
             raise ValueError(f"axis {axis.path} excludes its observed before-state value")
     return answer
+
+
+def option_calls(state: DecisionState) -> dict[str, ToolCall]:
+    """Return every option's executable first call, keyed by option identity.
+
+    Args:
+        state: An authored decision state.
+
+    Returns:
+        One forced call per option, with a call identity naming the option.
+
+    Raises:
+        ValueError: An option has no executable call, so its branch cannot be forced.
+    """
+    missing = [option.option_id for option in state.options if option.call is None]
+    if missing:
+        raise ValueError(
+            f"options {missing} have no executable call; give the family explicit actions"
+        )
+    return {
+        option.option_id: ToolCall(
+            name=option.call.tool,
+            call_id=f"force-{option.option_id}",
+            arguments=dict(option.call.arguments),
+        )
+        for option in state.options
+        if option.call is not None
+    }
 
 
 def parse_decision_state(response: ModelResponse, context: DecisionContext) -> DecisionStateAnswer:

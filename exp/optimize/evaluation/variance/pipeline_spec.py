@@ -12,7 +12,7 @@ Stage                     Spec slice         Saved outputs
 ``traceml``               ``traceml``        Step labels per actor tier
 ``error-mining``          ``mining``         One actor-critic report per tier, its judge
 ``families``              ``authoring``      Authored, frozen, judged and admitted families
-``records``               ``records``        Training records, Harbor exports, cross-talk
+``records``               ``records``        Records, qualified Harbor exports, cross-talk
 ========================  =================  ============================================
 
 A stage's identity binds its own slice, the identities of every earlier stage and the producing
@@ -40,12 +40,14 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ToolCall
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.executable.controls import DeclaredControl
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, VariantJudging
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
+from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
 from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
@@ -53,6 +55,7 @@ from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.rubric_agent import RubricAuthoringProfile
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
 from exp.optimize.evaluation.variance.world_agent import DEFAULT_PROMPT_SETS
+from exp.simulation.retrieval.scope import CorpusScope
 
 if TYPE_CHECKING:
     from exp.common.project import ProjectStore
@@ -60,7 +63,7 @@ if TYPE_CHECKING:
     from exp.simulation.mining.decisions import DecisionsTraceTagger
     from exp.simulation.mining.tagging import TraceTagger
 
-PIPELINE_PROTOCOL = "decision-variance-pipeline-v1"
+PIPELINE_PROTOCOL = "decision-variance-pipeline-v2"
 """Version of the stage graph, its identities and its saved records."""
 
 STAGE_TYPE = "decision-variance-stage"
@@ -152,7 +155,11 @@ class MiningSettings(ContractModel):
 
     Attributes:
         job: Mining-probe job every tier copies; only its actor alias and snapshot change.
-        rubric: Saved ``episode-rubric`` of the mining-probe task the episode judge applies.
+        rubric: Saved ``episode-rubric`` of the mining-probe task the episode judge applies, or
+            None to author it: the agentic rubric author (``authoring.rubric_author`` with
+            ``authoring.rubric_profile``) reads a whole-task authoring packet over the
+            rule-bound start, the world-learning sources, the rule book and observed replay
+            episodes, after the judge profile is fixed.
         judge: Admitted episode-judge request settings.
         judge_prompt_set: Episode-judge prompt set, fixed in the profile before any rubric.
         judge_evidence_tool_budget: Event ranges the judge may read when evidence is large.
@@ -171,10 +178,13 @@ class MiningSettings(ContractModel):
         critic_profile: Critic evidence-tool profile; agentic by default.
         schedule: Training schedule whose next selector-critic rollout replaces the run of the
             tier whose alias its actor job uses, or None.
+        retrieval: Give selectors and critics tag-aware search over the build's scoped
+            world-learning index; never held-out traces.
+        retrieval_top_k: Most matches one search returns.
     """
 
     job: ContinuationJob
-    rubric: ArtifactInput
+    rubric: ArtifactInput | None = None
     judge: AuthorSettings
     judge_prompt_set: str = DEFAULT_AGENTIC_JUDGE
     judge_evidence_tool_budget: int = Field(default=8, ge=0, le=64, strict=True)
@@ -192,6 +202,8 @@ class MiningSettings(ContractModel):
     selector_profile: EvidenceToolProfile = AGENTIC_PROFILE
     critic_profile: EvidenceToolProfile = AGENTIC_PROFILE
     schedule: TrainingScheduleSpec | None = None
+    retrieval: bool = True
+    retrieval_top_k: int = Field(default=5, ge=1, le=20, strict=True)
 
     @model_validator(mode="after")
     def _tiers(self) -> Self:
@@ -212,7 +224,9 @@ class AuthoringSettings(ContractModel):
         scenario_author: Scenario author settings.
         world_author: Agentic world author settings.
         rubric_author: Agentic rubric author settings, also the reviser's.
-        actions: Concrete forced first action per decision option identity.
+        actions: Concrete forced first action per decision option identity, overriding the
+            decision-state author's executable option calls; empty derives them from those
+            calls, and a family whose option has no call records that as its failure.
         world_prompt_sets: World-author prompt sets, each a separate trajectory.
         world_repairs: Repair rounds per world-author trajectory.
         rubric_profile: Rubric-author prompt variants and phases.
@@ -229,13 +243,15 @@ class AuthoringSettings(ContractModel):
         admission: Admission policy every confirmed variant must meet.
         dispositions: Reviewer dispositions of audit findings, by finding identity, applied to
             every family. They never re-key an authored draw.
+        maximum_episodes: Most observed replay episodes, from world-learning traces calling the
+            task's tools, put in each authoring packet for program validation.
     """
 
     decision_author: AuthorSettings
     scenario_author: AuthorSettings
     world_author: AuthorSettings
     rubric_author: AuthorSettings
-    actions: dict[str, ToolCall] = Field(min_length=2)
+    actions: dict[str, ToolCall] = Field(default_factory=dict)
     world_prompt_sets: tuple[str, ...] = Field(default=DEFAULT_PROMPT_SETS, min_length=1)
     world_repairs: int = Field(default=2, ge=0, le=8, strict=True)
     rubric_profile: RubricAuthoringProfile = RubricAuthoringProfile()
@@ -249,6 +265,33 @@ class AuthoringSettings(ContractModel):
     revision_rounds: int = Field(default=3, ge=0, le=8, strict=True)
     admission: FamilyAdmissionPolicy = FamilyAdmissionPolicy()
     dispositions: tuple[AuditDisposition, ...] = ()
+    maximum_episodes: int = Field(default=16, ge=0, le=256, strict=True)
+
+    @model_validator(mode="after")
+    def _actions(self) -> Self:
+        """Require two or more explicit actions when any are given."""
+        if len(self.actions) == 1:
+            raise ValueError("give two or more option actions, or none to derive them")
+        return self
+
+
+class VariantQualification(ContractModel):
+    """Executable qualification of every exported variant, before its Harbor export.
+
+    Each confirmed variant of an admitted family is turned into its exact executable task (its
+    frozen start, its frozen runtime and its own frozen judge), executed once for feasibility,
+    and qualified by
+    :func:`~exp.optimize.evaluation.executable.qualification.qualify_executable_task` with these
+    controls witnessed by :func:`~exp.optimize.evaluation.executable.controls.witness_controls`.
+
+    Attributes:
+        specification: Independent ``evaluation-specification`` the controls are witnessed
+            against; never the task's own verifier.
+        controls: Declared controls, each on a feasibility branch or a literal outcome.
+    """
+
+    specification: ArtifactInput
+    controls: tuple[DeclaredControl, ...] = Field(min_length=1, max_length=64)
 
 
 class RecordsSettings(ContractModel):
@@ -261,6 +304,9 @@ class RecordsSettings(ContractModel):
         crosstalk_attempts: Source best-of-N size.
         crosstalk_top_k: Exemplars per exemplar arm.
         crosstalk_repeats: Attempts per target arm.
+        qualification: Qualify each exported variant first, or None to export every variant
+            as diagnostic. A variant that does not qualify is exported as diagnostic with its
+            refusals or failure recorded.
     """
 
     intent: str = Field(min_length=1, max_length=400)
@@ -269,6 +315,7 @@ class RecordsSettings(ContractModel):
     crosstalk_attempts: int = Field(default=8, ge=2, le=64, strict=True)
     crosstalk_top_k: int = Field(default=2, ge=1, le=16, strict=True)
     crosstalk_repeats: int = Field(default=4, ge=1, le=64, strict=True)
+    qualification: VariantQualification | None = None
 
 
 class DecisionVarianceSpec(ContractModel):
@@ -290,7 +337,7 @@ class DecisionVarianceSpec(ContractModel):
     mining: MiningSettings
     authoring: AuthoringSettings
     records: RecordsSettings
-    protocol: Literal["decision-variance-pipeline-v1"] = PIPELINE_PROTOCOL
+    protocol: Literal["decision-variance-pipeline-v2"] = PIPELINE_PROTOCOL
 
     def slice(self, stage: StageName) -> JsonObject:
         """Return exactly the fields one stage reads, as keyed JSON.
@@ -580,12 +627,16 @@ class BuildOutputs(ContractModel):
         tag_retrieval: Tag retrieval binding of the mining-probe tasks, when one was saved.
         trace_dataset: Trace dataset the world-learning traces are read from.
         rules_traces: World-learning traces for the rules stage, in order.
+        index: Scoped, fit-only retrieval index over world-learning traces, when one was saved.
+        retrieval_scope: The scope that index was built with.
     """
 
     report: ArtifactInput
     exposure: ArtifactInput
     world_model: ArtifactInput
     tag_retrieval: ArtifactInput | None = None
+    index: ArtifactInput | None = None
+    retrieval_scope: CorpusScope | None = None
     trace_dataset: ArtifactInput
     rules_traces: tuple[str, ...] = Field(min_length=1)
 
@@ -628,6 +679,7 @@ class TierMining(ContractModel):
         judged_group: The group of attempts judged by the tier's episode judge.
         judge: The tier's frozen episode judge.
         job: The tier's mining job.
+        retrieval: The world-learning search its selectors and critics had, if any.
     """
 
     tier: str
@@ -635,6 +687,7 @@ class TierMining(ContractModel):
     judged_group: ArtifactInput
     judge: EpisodeJudge
     job: ContinuationJob
+    retrieval: TraceSearchSpec | None = None
 
 
 class MiningOutputs(ContractModel):
@@ -642,10 +695,14 @@ class MiningOutputs(ContractModel):
 
     Attributes:
         profile: The episode-judge profile, fixed before any family rubric.
+        rubric: The mining-probe task's rubric every tier's judge applies.
+        rubric_packet: The whole-task packet the rubric was authored from, when it was authored.
         tiers: One entry per actor tier, in spec order.
     """
 
     profile: JudgeProfile
+    rubric: ArtifactInput
+    rubric_packet: ArtifactInput | None = None
     tiers: tuple[TierMining, ...]
 
 
@@ -699,8 +756,12 @@ class HarborExport(ContractModel):
         point: The family's point.
         scenario_id: The variant.
         path: Export directory.
-        diagnostic: Whether the export is diagnostic, as every export without an executable
-            qualification is.
+        diagnostic: Whether the export is diagnostic, as every export without a passing
+            executable qualification is.
+        task: The saved executable task, when qualification ran.
+        qualification: The saved qualification report, passing or not, when one was saved.
+        refusals: Unmet qualification requirements, when it did not qualify.
+        failure: Why qualification could not run or complete, when it could not.
     """
 
     tier: str
@@ -708,6 +769,10 @@ class HarborExport(ContractModel):
     scenario_id: str
     path: str
     diagnostic: bool = True
+    task: ArtifactInput | None = None
+    qualification: ArtifactInput | None = None
+    refusals: tuple[str, ...] = ()
+    failure: str | None = None
 
 
 class RecordsOutputs(ContractModel):

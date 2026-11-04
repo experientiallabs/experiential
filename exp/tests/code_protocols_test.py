@@ -290,7 +290,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "c87fac16157626c349a8aa23777f9157663f702633cab27757c7c9de710d16cb",
+        "d6819ef386e9c92a10d4ebe7b0e12ed062ee23075fa15aebeeb60876b1b4437d",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -304,13 +304,13 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v3",
+        "variance-authors-v4",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "b670e4a7e6d0e007b8880d6dbdb005389be904e98d8f3b109d213db442d79a27",
+        "79e500540e9484a9f7f55bf6af77bd692d6c1b5a7aeaeda2286fb947ad8cd2f6",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.grader:GRADER_PROTOCOL",
@@ -344,12 +344,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authoring_packet:AUTHORING_PACKET_PROTOCOL",
-        "authoring-packet-v2",
+        "authoring-packet-v3",
         (
             "exp.optimize.evaluation.variance.authoring_packet",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "eae16e2f9432498ef0a56a0ff232a440041fc2ab4ddd3fb151d1b85a095f22f2",
+        "7724b2776207f710b3160a4644d07051d3a100b73fbb9b805685bf2f9269d7ee",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_author:WORLD_AUTHOR_PROTOCOL",
@@ -425,7 +425,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.pipeline_spec:PIPELINE_PROTOCOL",
-        "decision-variance-pipeline-v1",
+        "decision-variance-pipeline-v2",
         (
             "exp.optimize.evaluation.variance.pipeline_spec:DecisionVarianceSpec.slice",
             "exp.optimize.evaluation.variance.pipeline_spec:stage_identity",

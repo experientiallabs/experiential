@@ -101,6 +101,7 @@ from exp.optimize.evaluation.variance.role_prompts import PromptDistribution, as
 from exp.optimize.evaluation.variance.roles import draw_critic, draw_judge, role_protocol_sha256
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
+from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 
 ERROR_MINING_PROTOCOL = "error-mining-v1"
 """Version of the error-mining experiment configuration and its recorded populations."""
@@ -119,8 +120,7 @@ class ActorCriticSpec(ContractModel):
 
     Attributes:
         initial: Job whose study runs the group of attempts; its ``repeats`` is ``G``.
-        judges: One frozen model setting per point-selector draw (``J`` draws); repeating a
-            setting draws again.
+        judges: One frozen setting per point-selector draw (``J``); repeating a setting redraws.
         critics: One frozen model setting per critic draw (``C`` draws).
         points: Most estimation points each selector may choose (``K``).
         continuations: Continuations run from each distinct chosen point (``M``).
@@ -493,23 +493,23 @@ def run_actor_critic(
     *,
     exposure: ExposurePlan,
     code_revision: str,
+    embedder: RAGEmbedderBinding | None = None,
 ) -> ActorCriticReport:
     """Run, or replay, one actor-critic registration over a mining-probe task.
 
     Args:
         project: Project holding every saved step.
         spec: The registration.
-        exposure: The frozen data roles; the task must come from a mining-probe lineage, never
-            from world learning or the final evaluation.
+        exposure: The frozen data roles; the task must come from a mining-probe lineage.
         code_revision: Producing source identity.
+        embedder: Query embedder of a semantic retrieval index; a hashing index needs none.
 
     Returns:
         The report, also saved as an ``actor-critic-report`` artifact.
 
     Raises:
-        ValueError: The task is not a mining probe, the group has no attempt with enough
-            continuable points, no judge produced a usable selection, or a continuation group
-            was sampled under a different tier than the group.
+        ValueError: The task is not a mining probe, no attempt has enough continuable points,
+            no judge produced a usable selection, or a continuation group has another tier.
     """
     spec = ActorCriticSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
@@ -525,7 +525,7 @@ def run_actor_critic(
         source = continuation_result_reference(project, spec.initial, code_revision=code_revision)
         loader = cache(lambda ref: load_continuation_checkpoint(store, ref))
         references = load_references(store, spec.references)
-        search = open_trace_search(store, spec.retrieval, exposure) if spec.retrieval else None
+        search = open_trace_search(store, r, exposure, embedder) if (r := spec.retrieval) else None
         pick, packet = _pick(group, identity, spec, loader, references)
         sources = (
             source,

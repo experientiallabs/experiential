@@ -2,12 +2,15 @@
 
 Every stage runs through its owner on the grounded ticket world of
 :mod:`~exp.optimize.evaluation.variance.tests.grounded_world_test`; only the wire is scripted.
-Two stand-ins are explicit: the variance build is replaced by a fixture executor that saves the
-exposure plan and a world-learning trace dataset (the grounded world is not an ``exp build``
-project), and the rules owner's extraction is replaced by the fixture's saved ticket rule book.
-Everything after that (binding the rule book into the mining runtime, TraceML labels, two-tier
-error mining, the coalition, the packet, the agentic world and rubric authors, the freeze, the
-judges, the families, admission, records, Harbor export and cross-talk) is real.
+The variance build is replaced by a fixture executor that saves the exposure plan, a
+world-learning trace dataset and a scoped, fit-only retrieval index over it (the grounded world
+is not an ``exp build`` project). The module run also replaces the rules owner's extraction with
+the fixture's saved ticket rule book; :func:`test_agentic_roles_authored_rubric_and_learned_rules`
+instead learns the rule book from the traces through the real extraction owner and executes its
+membership boundary in the bound world. Everything else (binding the rule book into the mining
+runtime, TraceML labels, error mining with world-learning search, the coalition, the packet with
+observed replay episodes, the agentic world and rubric authors, the freeze, the judges, the
+families, admission, records, executable qualification, Harbor export and cross-talk) is real.
 
 The scripted judge answers from an explicit synthetic policy: an episode passes exactly when its
 last recorded ticket outcome is ``right``, except that the first replicate of every group fails,
@@ -21,6 +24,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -44,21 +48,39 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace, TraceSource
 from exp.common.traces.ingest import TraceNormalizationResult, persist_trace_dataset
 from exp.common.traces.trace import TraceOutcome
-from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageReport, RulesStageSpec
+from exp.optimize.evaluation.executable.controls import DeclaredControl
+from exp.optimize.evaluation.executable.qualification import load_executable_qualification
+from exp.optimize.evaluation.executable.task import load_executable_task
+from exp.optimize.evaluation.harbor.export import verify_harbor_export
+from exp.optimize.evaluation.rules.extraction import EXTRACTION_TOOL
+from exp.optimize.evaluation.rules.stage import (
+    REPORT_TYPE,
+    RulesStageReport,
+    RulesStageSpec,
+    load_rulebook,
+    run_rules_stage,
+)
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.authoring_packet import (
+    WHOLE_TASK,
     AuthoringPacket,
     SourceRef,
     build_authoring_packet,
+    load_packet,
     save_packet,
 )
 from exp.optimize.evaluation.variance.authoring_packet_test import save_book, tool_reply
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
 from exp.optimize.evaluation.variance.build_records import EXPOSURE_TYPE, VarianceBuildSpec
-from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
+from exp.optimize.evaluation.variance.contracts import OptionCall
+from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import FamilyReport
-from exp.optimize.evaluation.variance.judge_prompt import ASSESS_TOOL, JUDGE_PROMPT_VERSION
+from exp.optimize.evaluation.variance.judge_prompt import (
+    ASSESS_TOOL,
+    DEFAULT_AGENTIC_JUDGE,
+    JUDGE_PROMPT_VERSION,
+)
 from exp.optimize.evaluation.variance.judge_test import _call
 from exp.optimize.evaluation.variance.judged_test import state_judge
 from exp.optimize.evaluation.variance.pipeline import (
@@ -91,8 +113,14 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     StageRun,
     TraceMLOutputs,
     TraceMLSettings,
+    VariantQualification,
 )
 from exp.optimize.evaluation.variance.records import AuditDisposition
+from exp.optimize.evaluation.variance.role_prompts import (
+    DRAFT_TOOL_NAME,
+    PLAN_TOOL,
+    SELF_CHECK_TOOL,
+)
 from exp.optimize.evaluation.variance.rubric_agent import (
     CRITIQUE_TOOL,
     RubricAuthoringProfile,
@@ -103,6 +131,7 @@ from exp.optimize.evaluation.variance.rubric_agent import (
 from exp.optimize.evaluation.variance.rubric_author import RUBRIC_TOOL, author_rubric, save_rubric
 from exp.optimize.evaluation.variance.rubric_author_test import covering_answer, criterion
 from exp.optimize.evaluation.variance.rubric_revision import REVISION_TOOL, load_revision
+from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec, schedule_state
 from exp.optimize.evaluation.variance.tests.grounded_world_test import (
     ACTIONS,
     INITIAL,
@@ -119,8 +148,11 @@ from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.evaluation.admission import EvaluationSpecification, persist_specification
+from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.traceml import ACTION_LABELS, TRACEML_BANK_ID
+from exp.simulation.retrieval import CorpusScope, RAGLineageBinding, persist_trace_rag
 from exp.simulation.rules.contracts_test import call, result
 from exp.simulation.rules.model import RuleBook
 
@@ -150,9 +182,85 @@ def _user(payload: JsonObject) -> JsonObject:
     return content
 
 
+def _find(payload: JsonObject, key: str) -> JsonValue:
+    """The value under ``key`` in the first JSON message content that has it, else None."""
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and key in parsed:
+            return parsed[key]
+    return None
+
+
 def _packet(payload: JsonObject) -> AuthoringPacket:
     """The authoring packet an author request carries."""
-    return AuthoringPacket.model_validate(_user(payload)["authoring_packet"])
+    return AuthoringPacket.model_validate(_find(payload, "authoring_packet"))
+
+
+def _relocate(value: JsonValue, supplied: frozenset[str], variants: tuple[str, ...]) -> JsonValue:
+    """Point fixture rule locators and variant ids a packet does not supply at ones it does.
+
+    A rule book learned from traces names its rules by content digest, and a whole-task packet
+    has only its baseline variant, so scripted answers written for the saved ticket book are
+    re-pointed at what the packet actually supplies.
+    """
+    rules = sorted(ref for ref in supplied if ref.startswith("rule:"))
+    if isinstance(value, dict):
+        fixed: JsonObject = {}
+        for key, item in value.items():
+            if key == "scenario_ids" and isinstance(item, list):
+                kept = [row for row in item if row in variants]
+                fixed[key] = list(kept or variants)
+            elif key == "scenario_id" and isinstance(item, str) and item not in variants:
+                fixed[key] = variants[0]
+            else:
+                fixed[key] = _relocate(item, supplied, variants)
+        return fixed
+    if isinstance(value, list):
+        return [_relocate(item, supplied, variants) for item in value]
+    if isinstance(value, str) and value.startswith("rule:") and value not in supplied:
+        return rules[0] if rules else "tool:check_sla"
+    return value
+
+
+def _rebind(answer: JsonObject, packet: AuthoringPacket) -> None:
+    """Bind the packet's own rules when the scripted world binds rules the packet lacks."""
+    world = answer.get("world")
+    if not isinstance(world, dict) or not isinstance(world.get("rule_bindings"), list):
+        return
+    known = {rule.rule_id for rule in packet.rules}
+    bindings = world["rule_bindings"]
+    assert isinstance(bindings, list)
+    if all(isinstance(row, dict) and row.get("rule_id") in known for row in bindings):
+        return
+    world["rule_bindings"] = [
+        {
+            "rule_id": rule.rule_id,
+            "use": "enforced" if rule.status == "supported" else "diagnostic",
+            "note": "bound",
+        }
+        for rule in packet.rules
+    ]
+
+
+def _supplied_only(value: JsonValue, supplied: frozenset[str]) -> JsonValue:
+    """Drop rule locators the decision author was not given."""
+    if isinstance(value, dict):
+        return {key: _supplied_only(item, supplied) for key, item in value.items()}
+    if isinstance(value, list):
+        return [
+            _supplied_only(item, supplied)
+            for item in value
+            if not (isinstance(item, str) and item.startswith("rule:") and item not in supplied)
+        ]
+    return value
 
 
 def semantic(request: JsonObject) -> str:
@@ -204,10 +312,21 @@ def assessment(
     )
 
 
-def decision_answer(step: int) -> JsonObject:
-    """The decision-state author's answer, grounded in the before-state and the tier rule."""
-    return {
-        "state": tier_decision(step).model_dump(mode="json", exclude_defaults=True),
+def decision_answer(payload: JsonObject) -> JsonObject:
+    """The decision-state author's answer, grounded in the before-state and the tier rule.
+
+    Each option carries its executable first call, so a family without explicit actions forces
+    exactly these calls. Rule locators the author was not given are dropped.
+    """
+    state = tier_decision(0)
+    options = tuple(
+        option.model_copy(update={"call": OptionCall(tool=option.option_id)})
+        for option in state.options
+    )
+    answer: JsonObject = {
+        "state": state.model_copy(update={"options": options}).model_dump(
+            mode="json", exclude_defaults=True
+        ),
         "grounding": [
             {
                 "path": "/tickets/severity",
@@ -217,6 +336,52 @@ def decision_answer(step: int) -> JsonObject:
         ],
         "limitations": ["Simulated tickets only."],
     }
+    citable = _find(payload, "citable_locators")
+    assert isinstance(citable, list)
+    fixed = _supplied_only(answer, frozenset(str(ref) for ref in citable))
+    assert isinstance(fixed, dict)
+    return fixed
+
+
+def extraction_answer(payload: JsonObject) -> JsonObject:
+    """Rule proposals from one trajectory: the check_sla lock boundary and handling effects."""
+    view = _find(payload, "trajectory")
+    assert isinstance(view, dict) and isinstance(view["steps"], list)
+    rules: list[JsonValue] = []
+    seen: set[str] = set()
+    for step in view["steps"]:
+        assert isinstance(step, dict) and isinstance(step["action"], dict)
+        name = str(step["action"]["name"])
+        evidence = [step["observation_locator"] or step["locator"]]
+        if name in seen:
+            continue
+        seen.add(name)
+        if name == "check_sla":
+            rules.append(
+                {
+                    "tool": "check_sla",
+                    "kind": "precondition",
+                    "statement": "check_sla answers only for a ticket nobody holds.",
+                    "predicate": {
+                        "op": "in",
+                        "left": {"scope": "before", "path": "/tickets/lock"},
+                        "right": {"value": ["none"]},
+                    },
+                    "evidence": evidence,
+                    "confidence": 0.8,
+                }
+            )
+        elif name in ("escalate", "close"):
+            rules.append(
+                {
+                    "tool": name,
+                    "kind": "effect",
+                    "statement": f"{name} records the ticket's handling status.",
+                    "evidence": evidence,
+                    "confidence": 0.8,
+                }
+            )
+    return {"trace_id": view["trace_id"], "rules": rules, "limitations": ["One trajectory."]}
 
 
 def scenario_answer() -> JsonObject:
@@ -325,15 +490,100 @@ ANSWERS: dict[str, Answer] = {
     REVISION_TOOL: revision_answer,
     "choose_points": lambda _: selector_answer(),
     "estimate_points": lambda _: critic_answer(),
-    DECISION_STATE_TOOL: lambda _: decision_answer(0),
+    DECISION_STATE_TOOL: decision_answer,
     SCENARIO_TOOL: lambda _: scenario_answer(),
     WORLD_PLAN_TOOL: lambda _: WORLD_PLAN,
     WORLD_TOOL: lambda payload: world_answer(_packet(payload)),
     RUBRIC_PLAN_TOOL: lambda _: RUBRIC_PLAN,
     RUBRIC_TOOL: lambda _: covering_answer(),
     CRITIQUE_TOOL: lambda _: RUBRIC_CRITIQUE,
+    EXTRACTION_TOOL: extraction_answer,
 }
 """Every non-judge role's answer, by the forced tool it must call."""
+
+PACKET_TOOLS = frozenset(
+    {REVISION_TOOL, WORLD_PLAN_TOOL, WORLD_TOOL, RUBRIC_PLAN_TOOL, RUBRIC_TOOL, CRITIQUE_TOOL}
+)
+"""Author tools whose answers are re-pointed at what the request's packet supplies."""
+
+FREE_CHOICE = "required"
+"""The tool choice of an agentic role turn that may read evidence or close its phase."""
+
+ROLE_PLAN: JsonObject = {
+    "hypotheses": ["The tier decides the handling."],
+    "planned_reads": ["group"],
+}
+"""An agentic selector or critic draw's plan."""
+
+
+def _called(payload: JsonObject) -> set[str]:
+    """Tools the conversation's earlier assistant turns called."""
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    names: set[str] = set()
+    for message in messages:
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        for made in calls if isinstance(calls, list) else ():
+            function = made.get("function") if isinstance(made, dict) else None
+            if isinstance(function, dict):
+                names.add(str(function.get("name")))
+    return names
+
+
+def _draft_answer(payload: JsonObject) -> JsonObject:
+    """The draft an agentic draw submits: its role's answer, chosen by the draft schema."""
+    tools = payload["tools"]
+    assert isinstance(tools, list)
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict) and function.get("name") == DRAFT_TOOL_NAME:
+            schema = function.get("parameters")
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            if isinstance(properties, dict) and "points" in properties:
+                return selector_answer()
+            return critic_answer()
+    raise AssertionError("an agentic investigate turn offered no draft tool")
+
+
+def _free_turn(payload: JsonObject) -> tuple[str, JsonObject]:
+    """One agentic role turn after the plan: one evidence read, the draft, then the self check."""
+    called = _called(payload)
+    if "list_divergence_points" not in called:
+        return "list_divergence_points", {}
+    if DRAFT_TOOL_NAME not in called:
+        return DRAFT_TOOL_NAME, _draft_answer(payload)
+    return SELF_CHECK_TOOL.name, {"issues": [], "revise": False}
+
+
+def _judge_phase(tool: str, request: JsonObject) -> JsonObject:
+    """An agentic judge's plan, criterion checks or self check, citing the decisive event."""
+    criteria = request["rubric_criteria"]
+    evidence = request["episode_evidence"]
+    assert isinstance(criteria, list) and isinstance(evidence, dict)
+    events = evidence["events"]
+    assert isinstance(events, list)
+    scored = [e for e in events if isinstance(e, dict) and e["scope"] == "scored"]
+    decisive = (scored or events)[0]
+    assert isinstance(decisive, dict)
+    ids = [str(row["criterion_id"]) for row in criteria if isinstance(row, dict)]
+    if tool == "record_plan":
+        return {"criteria": [{"criterion_id": c, "needs": str(decisive["event_id"])} for c in ids]}
+    if tool == "record_criterion_checks":
+        verdict = semantic(request)
+        status = {"pass": "met", "fail": "not_met", "unassessable": "insufficient_evidence"}
+        return {
+            "findings": [
+                {
+                    "criterion_id": c,
+                    "status": status[verdict],
+                    "event_refs": [] if verdict == "unassessable" else [decisive["event_id"]],
+                    "reason": f"{c} read at the decisive event.",
+                }
+                for c in ids
+            ],
+            "leaning": verdict,
+        }
+    return {"issues": [], "revise": False}
 
 
 class Wire(JsonHttpTransport):
@@ -345,14 +595,18 @@ class Wire(JsonHttpTransport):
         interrupt_at: Judge request number (1-based, counted from now) that raises
             :class:`Interrupted` once, if set.
         troubled: Whether the judge reports a rubric problem for a judge request, if set.
+        usage: Whether replies report token usage, which agentic role budgets price.
+        phases: Every agentic judge phase request before an assessment, by its tool.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, usage: bool = False) -> None:
         """Start with no request served."""
         self.requests: list[tuple[str, JsonObject]] = []
         self.judged: list[str] = []
         self.interrupt_at: int | None = None
         self.troubled: Callable[[JsonObject], bool] | None = None
+        self.usage = usage
+        self.phases: list[str] = []
 
     def get(
         self, url: str, *, headers: Mapping[str, str], timeout_seconds: float
@@ -381,13 +635,17 @@ class Wire(JsonHttpTransport):
         del url, headers, timeout_seconds
         choice = payload.get("tool_choice")
         function = choice.get("function") if isinstance(choice, dict) else None
-        tool = str(function.get("name")) if isinstance(function, dict) else "required"
-        if tool != ASSESS_TOOL:
+        tool = str(function.get("name")) if isinstance(function, dict) else FREE_CHOICE
+        judged = _find(payload, "judge_binding")
+        if judged is None:
             self.requests.append((tool, payload))
-            return tool_reply(tool, ANSWERS[tool](payload))
+            return self.reply(*self.role(tool, payload))
         messages = payload["messages"]
         assert isinstance(messages, list) and isinstance(messages[1], dict)
         request = json.loads(str(messages[1]["content"]))
+        if tool != ASSESS_TOOL:
+            self.phases.append(tool)
+            return self.reply(tool, _judge_phase(tool, request))
         binding = request["judge_binding"]
         self.judged.append(f"{binding['judge_definition']}/{binding['episode_id']}")
         if self.interrupt_at is not None:
@@ -396,7 +654,41 @@ class Wire(JsonHttpTransport):
                 self.interrupt_at = None
                 raise Interrupted
         problems = (AMBIGUOUS,) if self.troubled is not None and self.troubled(request) else ()
-        return assessment(request, semantic(request), problems)
+        response = assessment(request, semantic(request), problems)
+        return self.priced(response)
+
+    def role(self, tool: str, payload: JsonObject) -> tuple[str, JsonObject]:
+        """Answer one author or role request by its forced tool, or an agentic free turn."""
+        if tool == FREE_CHOICE:
+            return _free_turn(payload)
+        if tool == PLAN_TOOL.name:
+            return tool, ROLE_PLAN
+        if tool == SELF_CHECK_TOOL.name:
+            return tool, {"issues": [], "revise": False}
+        answer = ANSWERS[tool](payload)
+        if tool in PACKET_TOOLS and _find(payload, "authoring_packet") is not None:
+            packet = _packet(payload)
+            variants = tuple(variant.variant_id for variant in packet.variants)
+            fixed = _relocate(answer, packet.locators(), variants)
+            assert isinstance(fixed, dict)
+            answer = fixed
+            if tool == WORLD_TOOL:
+                _rebind(answer, packet)
+        return tool, answer
+
+    def reply(self, tool: str, arguments: JsonObject) -> JsonHttpResponse:
+        """One reply calling ``tool``, with token usage when the wire is priced."""
+        return self.priced(tool_reply(tool, arguments))
+
+    def priced(self, response: JsonHttpResponse) -> JsonHttpResponse:
+        """Add token usage a priced catalog can price, when the wire is priced."""
+        if not self.usage:
+            return response
+        assert isinstance(response.body, dict)
+        usage = {"prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100}
+        return JsonHttpResponse(
+            status_code=response.status_code, body={**response.body, "usage": usage}
+        )
 
     def calls(self) -> tuple[int, int]:
         """Role and judge requests so far."""
@@ -437,18 +729,32 @@ class TieredActor(JsonHttpTransport):
         )
 
 
+TRACE_STEPS: dict[str, tuple[tuple[str, JsonObject], ...]] = {
+    "trace-1": (
+        ("check_sla", {"severity": "high", "lock": "none"}),
+        ("escalate", {"status": "escalated"}),
+    ),
+    "trace-2": (
+        ("read_ticket", {"ticket": "T-2", "status": "open"}),
+        ("check_sla", {"severity": "low", "lock": "none"}),
+        ("close", {"status": "closed"}),
+    ),
+}
+"""Each world-learning trajectory's tool calls and replies, covering every ticket tool."""
+
+
 def _ticket_trace(trace_id: str) -> Trace:
-    """A world-learning trajectory: check the tier, then escalate the high ticket."""
+    """A world-learning trajectory: check the tier, then handle the ticket the tier requires."""
+    spans = []
+    for index, (name, reply) in enumerate(TRACE_STEPS[trace_id]):
+        key = f"k{index}"
+        spans.append(call(f"c{index}", 2 * index, name, {}, key))
+        spans.append(result(f"r{index}", 2 * index + 1, name, reply, key))
     return Trace(
         trace_id=trace_id,
         task="Resolve the support ticket with the tools you have.",
         tools=(),
-        spans=(
-            call("c1", 0, "check_sla", {}, "k1"),
-            result("r1", 1, "check_sla", {"severity": "high", "lock": "none"}, "k1"),
-            call("c2", 2, "escalate", {}, "k2"),
-            result("r2", 3, "escalate", {"status": "escalated"}, "k2"),
-        ),
+        spans=tuple(spans),
         outcome=TraceOutcome(status="success"),
         source=TraceSource(
             identity=SourceIdentity(kind="otlp", source_id="tickets.otlp", sha256="a" * 64),
@@ -514,14 +820,36 @@ class FixtureBuild:
                 dataset_id="fixture-traces",
             )
         dataset = artifact_input(store.read("fixture-traces").manifest)
+        scope = CorpusScope.declare(
+            name="world-learning-retrieval",
+            kind="trace",
+            ids=("trace-1", "trace-2"),
+            source_plan=exposure,
+        )
+        if not store.exists("fixture-index"):
+            persist_trace_rag(
+                store,
+                (dataset,),
+                tuple(
+                    RAGLineageBinding(trace_id=trace_id, lineage_id="sources", partition="fit")
+                    for trace_id in ("trace-1", "trace-2")
+                ),
+                created_at=datetime.now(UTC),
+                code_revision=REVISION,
+                rag_id="fixture-index",
+                corpus_scope=scope,
+            )
+        index = artifact_input(store.read("fixture-index").manifest)
         outputs = BuildOutputs(
             report=exposure,
             exposure=exposure,
             world_model=self.fixture.definition.world_model,
             trace_dataset=dataset,
             rules_traces=("trace-1", "trace-2"),
+            index=index,
+            retrieval_scope=scope,
         )
-        return StageRun(outputs, (exposure, dataset), {"fixture": True})
+        return StageRun(outputs, (exposure, dataset, index), {"fixture": True})
 
 
 def fixture_rules_stage(
@@ -685,44 +1013,71 @@ def mining_rubric(fixture: GroundedFixture) -> ArtifactInput:
 
 def make_spec(
     fixture: GroundedFixture,
-    rubric: ArtifactInput,
+    rubric: ArtifactInput | None,
     bank: Path,
     *,
     actors: tuple[str, ...] = ("actor", TIER_B),
     dispositions: tuple[AuditDisposition, ...] = (),
     crosstalk: bool = True,
+    agentic: bool = False,
+    schedule: TrainingScheduleSpec | None = None,
+    qualification: VariantQualification | None = None,
 ) -> DecisionVarianceSpec:
-    """A small run: G=3, J=1, C=1, K=2, M=3, forced selectors and critics, single-pass judge."""
+    """A small run: G=3, J=1, C=1, K=2, M=3.
+
+    By default selectors and critics answer once, the judge is single pass, actions are explicit
+    and the rules stage only binds a saved book. ``agentic`` keeps the default agentic selector,
+    critic and judge profiles, derives option actions from the decision-state author and gives
+    the rules stage a base state, so the learned membership boundary is executed.
+    """
     settings = fixture.settings
     forced = EvidenceToolProfile()
+    rules = RulesStageSpec(author=settings)
+    if agentic:
+        rules = RulesStageSpec(
+            author=settings,
+            base_state=INITIAL,
+            observed_values={"before:/tickets/lock": ("held",)},
+        )
+    roles: JsonObject = (
+        {}
+        if agentic
+        else {
+            "judge_prompt_set": JUDGE_PROMPT_VERSION,
+            "judge_evidence_tool_budget": 0,
+            "selector_profile": forced.model_dump(mode="json"),
+            "critic_profile": forced.model_dump(mode="json"),
+        }
+    )
+    mining = MiningSettings.model_validate(
+        {
+            "job": fixture.job.model_dump(mode="json"),
+            "rubric": None if rubric is None else rubric.model_dump(mode="json"),
+            "judge": settings.model_dump(mode="json"),
+            "selector": settings.model_dump(mode="json"),
+            "critic": settings.model_dump(mode="json"),
+            "actors": list(actors),
+            "attempts": 3,
+            "selector_draws": 1,
+            "critic_draws": 1,
+            "points": 2,
+            "continuations": 3,
+            "group_physical_attempts": 40,
+            "schedule": None if schedule is None else schedule.model_dump(mode="json"),
+            **roles,
+        }
+    )
     return DecisionVarianceSpec(
         build=BuildSettings(spec=VarianceBuildSpec()),
-        rules=RulesSettings(spec=RulesStageSpec(author=settings), maximum_traces=4),
+        rules=RulesSettings(spec=rules, maximum_traces=4),
         traceml=TraceMLSettings(decision_alias="judge", bank_root=bank, steps_per_call=2),
-        mining=MiningSettings(
-            job=fixture.job,
-            rubric=rubric,
-            judge=settings,
-            judge_prompt_set=JUDGE_PROMPT_VERSION,
-            judge_evidence_tool_budget=0,
-            selector=settings,
-            critic=settings,
-            actors=actors,
-            attempts=3,
-            selector_draws=1,
-            critic_draws=1,
-            points=2,
-            continuations=3,
-            group_physical_attempts=40,
-            selector_profile=forced,
-            critic_profile=forced,
-        ),
+        mining=mining,
         authoring=AuthoringSettings(
             decision_author=settings,
             scenario_author=settings,
             world_author=settings,
             rubric_author=settings,
-            actions=ACTIONS,
+            actions={} if agentic else ACTIONS,
             world_prompt_sets=("failure-mode-first",),
             rubric_profile=RubricAuthoringProfile(variants=("failure-patterns-first",)),
             repeats=6,
@@ -735,6 +1090,7 @@ def make_spec(
             crosstalk_attempts=3,
             crosstalk_top_k=1,
             crosstalk_repeats=2,
+            qualification=qualification,
         ),
     )
 
@@ -746,7 +1102,7 @@ class Run:
     Attributes:
         fixture: The grounded world and its transports.
         wire: The author, role and judge wire.
-        rubric: The mining rubric.
+        rubric: The operator's mining rubric, or None when the run authors it.
         bank: The TraceML bank directory.
         executors: The build stand-in.
         dependencies: The injected TraceML tagger and Harbor root.
@@ -754,7 +1110,7 @@ class Run:
 
     fixture: GroundedFixture
     wire: Wire
-    rubric: ArtifactInput
+    rubric: ArtifactInput | None
     bank: Path
     executors: dict[StageName, StageExecutor]
     dependencies: StageDependencies
@@ -788,10 +1144,21 @@ class Run:
         )
 
 
-def wired(root: Path, monkeypatch: pytest.MonkeyPatch) -> Run:
-    """A grounded fixture with two actor tiers, the scripted wire and the stand-ins installed."""
-    fixture = rebound(grounded_fixture(root, monkeypatch), TIER_B)
-    wire = Wire()
+def wired(root: Path, monkeypatch: pytest.MonkeyPatch, *, agentic: bool = False) -> Run:
+    """A grounded fixture with two actor tiers, the scripted wire and the stand-ins installed.
+
+    Args:
+        root: Project root.
+        monkeypatch: Installs the scripted transports.
+        agentic: Price the judge alias and report usage, which agentic role budgets need, and
+            keep the real rules extraction and the authored mining rubric instead of the saved
+            rule book and the operator's rubric.
+
+    Returns:
+        The wired run.
+    """
+    fixture = rebound(grounded_fixture(root, monkeypatch, priced=agentic), TIER_B)
+    wire = Wire(usage=agentic)
     actor = TieredActor(fixture.actor)
     monkeypatch.setattr(
         "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor
@@ -800,9 +1167,10 @@ def wired(root: Path, monkeypatch: pytest.MonkeyPatch) -> Run:
         "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: wire
     )
     monkeypatch.setattr(
-        "exp.optimize.evaluation.variance.pipeline_stages.run_rules_stage", fixture_rules_stage
+        "exp.optimize.evaluation.variance.pipeline_stages.run_rules_stage",
+        run_rules_stage if agentic else fixture_rules_stage,
     )
-    rubric = mining_rubric(fixture)
+    rubric = None if agentic else mining_rubric(fixture)
     return Run(
         fixture=fixture,
         wire=wire,
@@ -874,8 +1242,10 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
     assert rules.job.study.checkpoint != run.fixture.job.study.checkpoint
     labels = _outputs(run, report, 2, TraceMLOutputs).labels
     assert set(labels) == {"actor", TIER_B}
+    build = _outputs(run, report, 0, BuildOutputs)
     mining = _outputs(run, report, 3, MiningOutputs)
     assert mining.profile.prompt_version == JUDGE_PROMPT_VERSION
+    assert mining.rubric == run.rubric and mining.rubric_packet is None
     assert [tier.tier for tier in mining.tiers] == ["actor", TIER_B]
     for tier in mining.tiers:
         saved = ActorCriticReport.model_validate_json(
@@ -885,11 +1255,20 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
         assert saved.spec.initial.study.checkpoint == rules.job.study.checkpoint
         assert [ref.artifact for ref in saved.spec.references] == [labels[tier.tier]]
         assert saved.spec.initial.actor_alias == tier.tier
+        # Selectors and critics search the scoped world-learning index, never held-out traces.
+        assert tier.retrieval is not None and saved.spec.retrieval == tier.retrieval
+        assert tier.retrieval.index == build.index
+        assert tier.retrieval.scope == build.retrieval_scope
+        assert tier.retrieval.task_id == "ticket"
     families = _outputs(run, report, 4, FamiliesOutputs).families
     assert [(row.tier, row.point) for row in families] == [("actor", 0), (TIER_B, 0)]
     for row in families:
         assert row.failure is None, row.failure
         assert None not in (row.packet, row.world, row.rubric, row.freeze)
+        assert row.packet is not None
+        episodes = load_packet(project, row.packet).observed_episodes
+        assert [episode.episode_id for episode in episodes] == ["trace-1", "trace-2"]
+        assert [step.tool for step in episodes[1].steps] == ["read_ticket", "check_sla", "close"]
         assert set(row.judging) == {"urgent", "routine"}
         for binding in row.judging.values():
             assert binding.world_freeze == row.freeze
@@ -1082,3 +1461,241 @@ def test_an_interrupted_stage_resumes_without_recalling_finished_work(
     judged = run.wire.judged
     assert len(judged) == len(set(judged)), "no judgment is asked twice"
     assert run.calls()[0] >= before[0]
+
+
+def ticket_qualification(project: ProjectStore, verifier: TaskVerifier) -> VariantQualification:
+    """Independent ticket acceptance and ten controls on each variant's first feasible branch.
+
+    Per partition: two valid outcomes that differ only in what the agent said, a wrong outcome,
+    a changed tier (a prohibited effect) and a missing step log (unavailable evidence).
+
+    Args:
+        project: Project receiving the specification.
+        verifier: The task verifier, whose permitted tools and preserved paths the independent
+            specification keeps.
+
+    Returns:
+        The qualification settings.
+    """
+    specification = persist_specification(
+        project.artifacts,
+        EvaluationSpecification(
+            description="A handled ticket's outcome is right and its tier and lock are kept.",
+            predicate=TaskVerifier(
+                description="Authored ticket acceptance with an independent outcome schema.",
+                outcome_schema={
+                    "properties": {
+                        "final_state": {
+                            "properties": {
+                                "tickets": {
+                                    "properties": {"outcome": {"const": "right"}},
+                                    "required": ["outcome"],
+                                }
+                            },
+                            "required": ["tickets"],
+                        }
+                    },
+                    "required": ["final_state"],
+                },
+                allowed_tools=verifier.allowed_tools,
+                preserved_paths=verifier.preserved_paths,
+            ),
+            subject="outcome",
+        ),
+        created_at=datetime.now(UTC),
+        code_revision=REVISION,
+    )
+    edits: dict[str, tuple[JsonValue, ...]] = {
+        "valid-one": (),
+        "valid-two": (),
+        "goal-miss": (
+            {"op": "set", "path": ["final_state", "tickets", "outcome"], "value": "wrong"},
+        ),
+        "side-effect": (
+            {"op": "set", "path": ["final_state", "tickets", "severity"], "value": "low"},
+        ),
+        "unknown": ({"op": "set", "path": ["steps"], "value": None},),
+    }
+    controls = []
+    for partition in ("development", "confirmation"):
+        for index, (kind, changes) in enumerate(edits.items()):
+            said = {"op": "set", "path": ["final_answer"], "value": f"{partition} control {index}"}
+            expected: Literal["pass", "fail", "unassessable"] = (
+                "unassessable"
+                if kind == "unknown"
+                else "pass"
+                if kind.startswith("valid")
+                else "fail"
+            )
+            controls.append(
+                DeclaredControl(
+                    id=f"{partition}-{kind}",
+                    lineage=f"ticket-pipeline-{partition}-{index}",
+                    partition=partition,
+                    expected=expected,
+                    branch=0,
+                    edits=(said, *changes),
+                    rationale="Authored observation-level control over the feasible branch.",
+                )
+            )
+    return VariantQualification(specification=specification, controls=tuple(controls))
+
+
+def test_admitted_variants_are_qualified_before_their_harbor_export(
+    pipeline: tuple[Run, PipelineReport],
+) -> None:
+    """A variant whose feasible run and controls qualify is exported qualified; others record why.
+
+    The scripted actor always escalates, so the routine (low tier) variant has no successful
+    feasibility run: it stays diagnostic with its failure recorded, never silently qualified.
+    """
+    run, first = pipeline
+    project = run.project
+    dispositions = dispositions_for(project, first)
+    qualification = ticket_qualification(project, run.fixture.job.study.verifier)
+    spec = make_spec(
+        run.fixture,
+        run.rubric,
+        run.bank,
+        dispositions=dispositions,
+        crosstalk=False,
+        qualification=qualification,
+    )
+    report = run.run(spec)
+    assert report.complete
+    assert [row.replayed for row in report.stages] == [True] * 5 + [False]
+    families = _outputs(run, report, 4, FamiliesOutputs).families
+    judging = {(row.tier, row.point): row.judging for row in families}
+    records = _outputs(run, report, 5, RecordsOutputs)
+    assert records.harbor
+    qualified = [row for row in records.harbor if not row.diagnostic]
+    assert {row.scenario_id for row in qualified} == {"urgent"}
+    for row in records.harbor:
+        assert row.task is not None
+        task = load_executable_task(project, row.task)
+        assert task.judge == judging[(row.tier, row.point)][row.scenario_id].judge
+        binding = verify_harbor_export(Path(row.path))
+        if row.diagnostic:
+            assert row.failure is not None or row.refusals, row
+            assert binding["qualification"] == "diagnostic_only"
+            continue
+        assert row.qualification is not None and row.failure is None and not row.refusals
+        assert load_executable_qualification(project, row.qualification).qualified
+        assert binding["qualification"] == "qualified_observable_contract"
+        assert binding["qualification_evidence"] == row.qualification.model_dump(mode="json")
+    routine = [row for row in records.harbor if row.scenario_id == "routine"]
+    assert all(row.diagnostic and row.failure for row in routine)
+    before = run.calls()
+    assert [row.replayed for row in run.run(spec, approve=False).stages] == [True] * 6
+    assert run.calls() == before
+
+
+def test_a_training_schedule_drives_its_tier_and_leaves_the_others(
+    pipeline: tuple[Run, PipelineReport],
+) -> None:
+    """The scheduled tier runs the schedule's warm-up rollout and records its completion."""
+    run, first = pipeline
+    project = run.project
+    mining = _outputs(run, first, 3, MiningOutputs)
+    base = ActorCriticReport.model_validate_json(
+        project.artifacts.read_bytes(mining.tiers[0].report.artifact_id, "report.json")
+    ).spec
+    schedule = TrainingScheduleSpec(name="pipeline-schedule", base=base)
+    spec = make_spec(run.fixture, run.rubric, run.bank, crosstalk=False, schedule=schedule)
+    report = run.run(spec)
+    assert report.complete
+    assert [row.replayed for row in report.stages] == [True] * 3 + [False] * 3
+    scheduled, other = _outputs(run, report, 3, MiningOutputs).tiers
+    state = schedule_state(project, schedule)
+    assert state.pending is None and len(state.completed) == 1
+    (completed,) = state.completed
+    assert completed.result == scheduled.report and completed.plan.kind == "warmup"
+    assert completed.plan.spec is not None
+    saved = ActorCriticReport.model_validate_json(
+        project.artifacts.read_bytes(scheduled.report.artifact_id, "report.json")
+    )
+    assert saved.spec == completed.plan.spec and saved.spec != base
+    assert scheduled.job == completed.plan.spec.initial
+    assert scheduled.judge == completed.plan.spec.episode_judge
+    # The other tier is not scheduled: its registration and report are unchanged.
+    assert other.report == mining.tiers[1].report
+    before = run.calls()
+    assert [row.replayed for row in run.run(spec, approve=False).stages] == [True] * 6
+    assert run.calls() == before
+    assert len(schedule_state(project, schedule).completed) == 1
+
+
+def test_agentic_roles_authored_rubric_and_learned_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default agentic selectors, critics and judge, an authored mining rubric, derived actions,
+    and a rule book learned from the traces whose membership boundary is executed."""
+    run = wired(tmp_path, monkeypatch, agentic=True)
+    spec = make_spec(run.fixture, None, run.bank, actors=("actor",), crosstalk=False, agentic=True)
+    assert spec.mining.selector_profile == spec.mining.critic_profile == AGENTIC_PROFILE
+    assert spec.mining.judge_prompt_set == DEFAULT_AGENTIC_JUDGE
+    assert spec.mining.rubric is None and not spec.authoring.actions
+    report = run.run(spec)
+    assert report.complete, report.stopped
+    project = run.project
+    # Rules: one real extraction draw per world-learning trace, then executed challenges.
+    rules = _outputs(run, report, 1, RulesOutputs)
+    stage = RulesStageReport.model_validate_json(
+        project.artifacts.read_bytes(rules.report.artifact_id, "report.json")
+    )
+    assert len(stage.draws) == 2 and all(draw.rules is not None for draw in stage.draws)
+    assert sum(tool == EXTRACTION_TOOL for tool, _ in run.wire.requests) == 2
+    book = load_rulebook(project, rules.rulebook)
+    assert set(book.contracts) == {"read_ticket", "check_sla", "escalate", "close"}
+    (boundary,) = [rule for rule in book.rules if rule.predicate is not None]
+    assert boundary.tool == "check_sla" and boundary.predicate is not None
+    assert boundary.predicate.op == "in"
+    assert stage.challenges is not None and rules.challenges == len(stage.challenges.runs) >= 2
+    assert {run_.case.workload.expected for run_ in stage.challenges.runs} >= {
+        "permitted",
+        "refused",
+    }
+    assert rules.job.configuration["rule_book"] == rules.rulebook.model_dump(mode="json")
+    # Error mining: the rubric was authored over a whole-task packet before any family.
+    mining = _outputs(run, report, 3, MiningOutputs)
+    assert mining.profile.prompt_version == DEFAULT_AGENTIC_JUDGE
+    assert mining.rubric_packet is not None
+    packet = load_packet(project, mining.rubric_packet)
+    assert packet.brief.decision == WHOLE_TASK and not packet.brief.options
+    assert [variant.variant_id for variant in packet.variants] == ["baseline"]
+    assert [episode.episode_id for episode in packet.observed_episodes] == ["trace-1", "trace-2"]
+    (tier,) = mining.tiers
+    assert tier.judge.definition.rubric == mining.rubric
+    assert tier.retrieval is not None
+    saved = ActorCriticReport.model_validate_json(
+        project.artifacts.read_bytes(tier.report.artifact_id, "report.json")
+    )
+    assert saved.spec.selector_profile == saved.spec.critic_profile == AGENTIC_PROFILE
+    # Agentic roles plan, read, draft and self check; their opening offers world-learning search.
+    tools = [tool for tool, _ in run.wire.requests]
+    assert {PLAN_TOOL.name, FREE_CHOICE, "choose_points", "estimate_points"} <= set(tools)
+    plans = [payload for tool, payload in run.wire.requests if tool == PLAN_TOOL.name]
+    assert all("world-learning-retrieval" in json.dumps(payload) for payload in plans)
+    # The agentic judge planned, checked and self checked before every assessment.
+    assert run.wire.judged
+    assert {
+        "record_plan",
+        "record_criterion_checks",
+        "record_self_check",
+    } <= set(run.wire.phases)
+    assert run.wire.phases.count("record_self_check") == len(run.wire.judged)
+    # Families: option actions come from the decision-state author's executable calls.
+    (family,) = _outputs(run, report, 4, FamiliesOutputs).families
+    assert family.failure is None, family.failure
+    assert family.report is not None
+    final = FamilyReport.model_validate_json(
+        project.artifacts.read_bytes(family.report.artifact_id, "report.json")
+    )
+    assert final.actions is not None
+    assert {key: call.name for key, call in final.actions.items()} == {
+        "escalate": "escalate",
+        "close": "close",
+    }
+    before = run.calls()
+    assert [row.replayed for row in run.run(spec, approve=False).stages] == [True] * 6
+    assert run.calls() == before

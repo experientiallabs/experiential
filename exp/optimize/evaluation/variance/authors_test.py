@@ -30,14 +30,19 @@ from exp.optimize.evaluation.variance.authors import (
     author_scenarios,
     authors_protocol_sha256,
     decision_state_request,
+    option_calls,
     relevant_questions,
     relevant_rules,
     validate_decision_state,
 )
 from exp.optimize.evaluation.variance.contracts import (
+    Criterion,
+    DecisionOption,
     DecisionState,
     EstimationPoint,
+    OptionCall,
     ScenarioLimits,
+    VariationAxis,
 )
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -285,6 +290,17 @@ def test_a_decision_state_must_stay_grounded_in_what_was_shown() -> None:
         (_answer(refs=["question:0"]), "only a guess"),
         (_answer(_state(instruction_axis=_axis())), "not declared variable"),
         (_answer(path="/clock"), "exactly once"),
+        (
+            _answer(
+                _state(
+                    options=[
+                        {"option_id": "refund", "action": "Refund", "call": {"tool": "wire"}},
+                        {"option_id": "deny", "action": "Deny"},
+                    ]
+                )
+            ),
+            "may not call",
+        ),
     )
     for answer, message in cases:
         with pytest.raises(ValueError, match=message):
@@ -420,3 +436,35 @@ def test_the_decision_state_author_reads_the_coalition_and_never_names_actors() 
     named = _state(criteria=[{"criterion_id": "decision.correct", "text": "Did kimi refund?"}])
     with pytest.raises(ValueError, match=r"tiers or actor models \('kimi',\)"):
         validate_decision_state(_answer(named), context)
+
+
+def test_option_calls_force_each_options_executable_call() -> None:
+    """Every option's call becomes its forced action; an option without one is refused."""
+    options = (
+        DecisionOption(option_id="escalate", action="Escalate", call=OptionCall(tool="escalate")),
+        DecisionOption(
+            option_id="close",
+            action="Close with a note",
+            call=OptionCall(tool="close", arguments={"note": "done"}),
+        ),
+    )
+    state = DecisionState(
+        step=0,
+        decision="Escalate or close.",
+        options=options,
+        relevant_paths=("/tickets",),
+        axes=(VariationAxis(path="/tickets/severity", values=("high", "low"), effect="Tier."),),
+        criteria=(Criterion(criterion_id="handled", text="Handled correctly."),),
+        evidence_refs=("point",),
+    )
+    calls = option_calls(state)
+    assert {key: (call.name, call.arguments) for key, call in calls.items()} == {
+        "escalate": ("escalate", {}),
+        "close": ("close", {"note": "done"}),
+    }
+    assert "call" not in DecisionOption(option_id="wait", action="Wait").model_dump(mode="json")
+    bare = state.model_copy(
+        update={"options": (options[0], DecisionOption(option_id="wait", action="Wait"))}
+    )
+    with pytest.raises(ValueError, match=r"options \['wait'\] have no executable call"):
+        option_calls(bare)

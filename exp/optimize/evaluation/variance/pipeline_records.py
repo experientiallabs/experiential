@@ -4,10 +4,14 @@ Only admitted families contribute. Each admitted family's training records (judg
 groups per tier and their critics, read back from saved assessments by the family owner) are
 saved beside the family report, and each tier's point-selector records are saved from its
 error-mining report under its episode judge. Every confirmed variant of an admitted family is
-exported for Harbor at its frozen start; without an executable qualification every export is
-diagnostic and awards no reward. When enabled and two families are admitted, the cross-talk
-probe measures whether exemplars from the first family's best judged attempts move the second
-family's judged scores.
+exported for Harbor at its frozen start. With ``records.qualification`` each variant's exact
+executable task (frozen start, frozen runtime and the variant's own frozen judge) is first
+executed once for feasibility and qualified by the executable qualification owner against
+independently witnessed controls; a variant that qualifies is exported qualified, and one that
+does not is exported as diagnostic, awarding no reward, with its refusals or failure recorded.
+Without qualification every export is diagnostic. When enabled and two families are admitted,
+the cross-talk probe measures whether exemplars from the first family's best judged attempts
+move the second family's judged scores.
 """
 
 from __future__ import annotations
@@ -24,17 +28,32 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.continuations.job import (
+    ContinuationJob,
+    continuation_result_reference,
+    execute_continuation_job,
+    saved_continuation_job,
+)
+from exp.optimize.evaluation.executable.controls import ControlWitnessSpec, witness_controls
 from exp.optimize.evaluation.executable.costs import job_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.model_costs import CostComponent
+from exp.optimize.evaluation.executable.qualification import (
+    load_executable_qualification,
+    qualify_executable_task,
+)
+from exp.optimize.evaluation.executable.task import persist_executable_task
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_start
 from exp.optimize.evaluation.variance.crosstalk import (
     CrosstalkProbeSpec,
     ProbeTarget,
     run_crosstalk_probe,
 )
-from exp.optimize.evaluation.variance.family import FamilyReport, export_family_harbor
+from exp.optimize.evaluation.variance.family import (
+    FamilyReport,
+    export_family_harbor,
+    family_executable_task,
+)
 from exp.optimize.evaluation.variance.pipeline_spec import (
     CostLine,
     DecisionVarianceSpec,
@@ -48,7 +67,12 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     cost_lines,
     family_key,
 )
-from exp.optimize.evaluation.variance.pipeline_stages import judge_costs, load_report, tier_job
+from exp.optimize.evaluation.variance.pipeline_stages import (
+    group_job,
+    judge_costs,
+    load_report,
+    tier_job,
+)
 from exp.optimize.evaluation.variance.records import selector_records
 
 __all__ = ["RECORDS_STAGE"]
@@ -68,20 +92,39 @@ class _RecordsStage:
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
     ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
-        """Records and exports make no call; only the optional cross-talk probe is priced."""
+        """Price the feasibility runs of qualification and the optional cross-talk probe."""
         del code_revision
         records = spec.records
+        qualify = records.harbor and records.qualification is not None
+        exports = (
+            "disabled"
+            if not records.harbor
+            else "qualified first, diagnostic when they do not qualify"
+            if qualify
+            else "diagnostic without a qualification"
+        )
         lines = [
             "Records: training and selector records of admitted families; Harbor exports of "
-            f"their confirmed variants {'(diagnostic without a qualification)' if records.harbor else 'disabled'}.",  # noqa: E501
+            f"their confirmed variants ({exports}).",
         ]
+        costs: list[CostComponent] = []
+        if qualify:
+            variants = spec.authoring.families_per_tier * (spec.authoring.maximum_variants + 1)
+            for alias in spec.mining.actors:
+                feasibility = group_job(project, spec, spec.mining.job, alias)
+                costs.extend(row.scaled(variants) for row in job_costs(project, feasibility))
+            lines.append(
+                f"Qualification: one feasibility run per exported variant, up to {variants} per "
+                f"tier, and {len(records.qualification.controls)} witnessed controls each; "
+                "qualification itself makes no model call."
+            )
         if not records.crosstalk:
-            return (), tuple(lines)
+            return cost_lines(tuple(costs)), tuple(lines)
         alias = spec.mining.actors[0]
         episode = tier_job(project, spec.mining.job, alias, 1)
         jobs = 1 + 3 * 1
         episodes = records.crosstalk_attempts + 3 * records.crosstalk_repeats
-        costs: list[CostComponent] = [row.scaled(jobs) for row in job_costs(project, episode)]
+        costs.extend(row.scaled(jobs) for row in job_costs(project, episode))
         costs.extend(judge_costs(project, spec, episodes))
         lines.append(
             f"Cross-talk: best-of-{records.crosstalk_attempts} source, top "
@@ -128,10 +171,17 @@ class _RecordsStage:
             "admitted": len(admitted),
             "training": sorted(training),
             "harbor": [row.path for row in exports],
+            "qualified": [row.path for row in exports if not row.diagnostic],
             "crosstalk": None if crosstalk is None else crosstalk.artifact_id,
             "crosstalk_skipped": skipped,
         }
-        refs = (*training.values(), *selectors.values(), crosstalk)
+        refs = (
+            *training.values(),
+            *selectors.values(),
+            crosstalk,
+            *(row.task for row in exports),
+            *(row.qualification for row in exports),
+        )
         return StageRun(outputs, refs, summary)
 
 
@@ -181,7 +231,16 @@ def _confirmed(report: FamilyReport) -> tuple[str, ...]:
 
 
 def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> list[HarborExport]:
-    """Export every confirmed variant of one admitted family, reusing an earlier export."""
+    """Qualify and export every confirmed variant of one admitted family, reusing earlier work.
+
+    Args:
+        context: The running stage.
+        row: The admitted family.
+        report: Its saved report.
+
+    Returns:
+        One export per confirmed variant, qualified or diagnostic.
+    """
     root = context.dependencies.harbor_root
     if root is None:
         root = context.project.paths.runtime_directory / "decision-variance"
@@ -189,6 +248,11 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
     for scenario in _confirmed(report):
         name = _slug(f"{row.tier}-{row.point}-{scenario}")
         destination = root / context.identity / name
+        export = HarborExport(
+            tier=row.tier, point=row.point, scenario_id=scenario, path=str(destination)
+        )
+        if context.spec.records.qualification is not None:
+            export = _qualify(context, report, export)
         if not destination.exists():
             export_family_harbor(
                 context.project,
@@ -198,13 +262,63 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
                 name=f"decision-variance/{name}",
                 intent=context.spec.records.intent,
                 code_revision=context.code_revision,
+                qualification=None if export.diagnostic else export.qualification,
             )
-        exports.append(
-            HarborExport(
-                tier=row.tier, point=row.point, scenario_id=scenario, path=str(destination)
-            )
-        )
+        exports.append(export)
     return exports
+
+
+def _qualify(context: StageContext, report: FamilyReport, export: HarborExport) -> HarborExport:
+    """Qualify one variant's exact executable task, recording every refusal or failure.
+
+    The task is the one :func:`export_family_harbor` packages, rewarded only by the variant's
+    frozen judge. Its feasibility run executes, or replays, once; the declared controls are
+    witnessed against the independent specification and the result is saved, passing or not.
+
+    Args:
+        context: The running stage.
+        report: The admitted family.
+        export: The variant's export, diagnostic so far.
+
+    Returns:
+        The export, qualified when every observable-contract check passed.
+    """
+    project, revision = context.project, context.code_revision
+    settings = context.spec.records.qualification
+    assert settings is not None
+    task = family_executable_task(report, export.scenario_id, intent=context.spec.records.intent)
+    reference = persist_executable_task(
+        project, task, created_at=datetime.now(UTC), code_revision=revision
+    )
+    export = export.model_copy(update={"task": reference})
+    try:
+        if saved_continuation_job(project, task.job, code_revision=revision) is None:
+            execute_continuation_job(project, task.job, code_revision=revision)
+        feasibility = continuation_result_reference(project, task.job, code_revision=revision)
+        cases = witness_controls(
+            project,
+            ControlWitnessSpec(
+                task=reference,
+                feasibility=feasibility,
+                specification=settings.specification,
+                controls=settings.controls,
+            ),
+            created_at=datetime.now(UTC),
+            code_revision=revision,
+        )
+        qualification = qualify_executable_task(
+            project, cases, created_at=datetime.now(UTC), code_revision=revision
+        )
+        result = load_executable_qualification(project, qualification)
+    except ValueError as error:
+        return export.model_copy(update={"failure": f"{type(error).__name__}: {error}"})
+    return export.model_copy(
+        update={
+            "qualification": qualification,
+            "diagnostic": not result.qualified,
+            "refusals": result.refusals,
+        }
+    )
 
 
 def _crosstalk(

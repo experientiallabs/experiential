@@ -24,6 +24,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.factory.candidates_test import _reply
 from exp.optimize.evaluation.rules.stage import RULE_BOOK_TYPE, rulebook_files
 from exp.optimize.evaluation.variance.authoring_packet import (
+    WHOLE_TASK,
     AuthoringPacket,
     SourceRef,
     author_request,
@@ -505,3 +506,41 @@ def test_the_packet_carries_the_coalition_and_refuses_held_out_behavior(
                 BehaviorPattern(pattern_id="p", kind="recovery", description="d", attempts=("x",)),
             )
         )
+
+
+def test_a_whole_task_packet_has_only_its_baseline_and_refuses_scenarios(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a decision the brief proposes nothing and the start is the one variant."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    reference, book = save_book(fixture.project)
+
+    def build(scenarios: tuple[Scenario, ...]) -> AuthoringPacket:
+        """Build the whole-task packet with the given scenarios."""
+        return build_authoring_packet(
+            family_id="ticket-mining",
+            task=fixture.definition.task,
+            checkpoint=fixture.job.study.checkpoint,
+            before_state=INITIAL,
+            public_history=(),
+            remaining_calls=6,
+            sources=(
+                SourceRef(
+                    source_id="trace-1", kind="trace", trace_id="trace-1", summary="Escalated."
+                ),
+            ),
+            exposure=plan(),
+            rule_book=reference,
+            book=book,
+            decision=None,
+            scenarios=scenarios,
+            observed_episodes=(observed_episode(),),
+        )
+
+    packet = build(())
+    assert packet.brief.decision == WHOLE_TASK
+    assert not packet.brief.options and not packet.brief.axes and not packet.brief.proposed_correct
+    assert [variant.variant_id for variant in packet.variants] == ["baseline"]
+    assert packet.variants[0].state == INITIAL and len(packet.observed_episodes) == 1
+    with pytest.raises(ValueError, match="cannot carry scenarios"):
+        build((tier_scenario("urgent", "high"),))

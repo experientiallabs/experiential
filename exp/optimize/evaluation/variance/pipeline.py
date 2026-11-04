@@ -10,15 +10,18 @@
    probe runs.
 3. ``traceml``: each tier's group of mining-probe attempts labelled step by step and registered
    as a reference for that tier's selectors and critics (optional, on by default).
-4. ``error-mining``: one actor-critic run per actor tier, never pooled, each labelled by an
-   episode judge whose profile is fixed before any family rubric; optionally driven by the
-   training schedule.
-5. ``families``: per screened point, the coalition evidence, one authoring packet, independent
-   agentic world and rubric authors, the compatibility review, the world freeze with its
-   challenges, the judge definitions, the family's contrasts from frozen starts, judged
-   confirmation, the rubric-revision loop when judging reports rubric problems, and admission.
-6. ``records``: training records of admitted families, selector records, Harbor exports of
-   admitted variants and the optional cross-talk probe.
+4. ``error-mining``: the mining-probe task's rubric (registered, or authored over a whole-task
+   packet), then one actor-critic run per actor tier, never pooled, each labelled by an episode
+   judge whose profile is fixed before any family rubric, its selectors and critics searching
+   the scoped world-learning index; optionally driven by the training schedule.
+5. ``families``: per screened point, the coalition evidence, one authoring packet with observed
+   replay episodes, independent agentic world and rubric authors, the compatibility review, the
+   world freeze with its challenges, the judge definitions, the family's contrasts from frozen
+   starts (options forced by the decision-state author's calls unless the spec gives actions),
+   judged confirmation, the rubric-revision loop when judging reports rubric problems, and
+   admission.
+6. ``records``: training records of admitted families, selector records, executable
+   qualification and Harbor exports of admitted variants, and the optional cross-talk probe.
 
 **Resume.** Every stage saves one ``decision-variance-stage`` record naming its outputs. A rerun
 replays saved records with no call and continues the first unsaved stage, whose owners in turn

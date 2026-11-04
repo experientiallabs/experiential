@@ -11,28 +11,26 @@ own owner, which saves and replays its work:
   grounded runtime, and a new start is captured there before any probe.
 - ``traceml``: every tier's group of attempts (run or replayed by its continuation owner) is
   labelled by :func:`~exp.simulation.mining.traceml.label_traces` and saved per tier.
-- ``error-mining``: one :func:`~exp.optimize.evaluation.variance.actor_critic.run_actor_critic`
-  per tier, its episode judge bound to the tier's run digests, and its group of attempts judged
-  by the same judge for the coalition.
-- ``records``: training and selector records, Harbor exports and the cross-talk probe.
+- ``error-mining``: the mining-probe task's rubric (the spec's, or authored by the agentic
+  rubric author over a whole-task packet), then one
+  :func:`~exp.optimize.evaluation.variance.actor_critic.run_actor_critic` per tier, its episode
+  judge bound to the tier's run digests, its selectors and critics given tag-aware search over
+  the build's scoped world-learning index, and its group of attempts judged by the same judge
+  for the coalition.
 
-The families stage lives in :mod:`~exp.optimize.evaluation.variance.pipeline_families`.
+The families stage lives in :mod:`~exp.optimize.evaluation.variance.pipeline_families` and the
+records stage in :mod:`~exp.optimize.evaluation.variance.pipeline_records`.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from exp.common.core.artifacts import (
-    ArtifactInput,
-    JsonObject,
-    sha256_json,
-)
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
-from exp.common.traces import Trace
-from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
     continuation_result_reference,
@@ -58,13 +56,25 @@ from exp.optimize.evaluation.variance.build import (
     run_variance_build,
     variance_build_costs,
 )
-from exp.optimize.evaluation.variance.build_records import load_exposure_plan
+from exp.optimize.evaluation.variance.build_records import (
+    load_exposure_plan,
+)
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
+from exp.optimize.evaluation.variance.pipeline_inputs import (
+    admitted_transport,
+    mining_rubric,
+    retrieval_costs,
+    retrieval_embedder,
+    rubric_author_sha256,
+    rubric_draws,
+    trace_search,
+    world_learning_traces,
+)
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
     CostLine,
@@ -94,6 +104,7 @@ from exp.simulation.mining.traceml import (
     traceml_bank,
     trajectory_from_workflow_steps,
 )
+from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 
 __all__ = ["BUILD_STAGE", "MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
 
@@ -206,6 +217,8 @@ class _BuildStage:
             tag_retrieval=report.tag_retrieval,
             trace_dataset=report.build.trace_dataset,
             rules_traces=report.rules_stage_traces,
+            index=report.index,
+            retrieval_scope=report.retrieval_scope,
         )
         summary: JsonObject = {
             "exposure": report.exposure.artifact_id,
@@ -213,7 +226,7 @@ class _BuildStage:
             "rules_traces": len(report.rules_stage_traces),
             "probes": len(report.probes),
         }
-        refs = (saved, report.exposure, report.world_model, report.tag_retrieval)
+        refs = (saved, report.exposure, report.world_model, report.tag_retrieval, report.index)
         return StageRun(outputs, refs, summary)
 
 
@@ -249,7 +262,7 @@ class _RulesStage:
         project, spec, revision = context.project, context.spec, context.code_revision
         build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
         exposure = load_exposure_plan(project, build.exposure)
-        traces = _traces(project, build)
+        traces = world_learning_traces(project, build)
         if len(traces) > spec.rules.maximum_traces:
             raise ValueError(
                 f"the build gave {len(traces)} world-learning traces, more than "
@@ -417,17 +430,23 @@ class _MiningStage:
     """The ``error-mining`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """Error mining reads only its spec and the earlier stages."""
-        del project, spec
-        return {}
+        """An authored mining rubric also reads the rubric author's settings and profile."""
+        del project
+        if spec.mining.rubric is not None:
+            return {}
+        return {"rubric_author": rubric_author_sha256(spec)}
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
     ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
-        """Price every tier's draws, suffixes and judgments as upper bounds."""
+        """Price the mining rubric and every tier's draws, suffixes and judgments as bounds."""
         del code_revision
         mining = spec.mining
         costs: list[CostComponent] = []
+        if mining.rubric is None:
+            draws = rubric_draws(spec.authoring.rubric_profile)
+            author = spec.authoring.rubric_author
+            costs.extend(row.scaled(draws) for row in evaluation_costs(project, author))
         points = mining.selector_draws * mining.points
         episodes = mining.attempts + points * mining.continuations
         for alias in mining.actors:
@@ -444,14 +463,29 @@ class _MiningStage:
                 costs.extend(row.scaled(calls) for row in evaluation_costs(project, settings))
             costs.extend(row.scaled(points) for row in job_costs(project, suffix))
             costs.extend(judge_costs(project, spec, episodes))
+        costs.extend(retrieval_costs(project, spec))
         profile = mining_profile(spec)
+        rubric = (
+            f"saved rubric {mining.rubric.artifact_id}"
+            if mining.rubric is not None
+            else f"rubric authored by {spec.authoring.rubric_author.model_alias} over a "
+            "whole-task packet after the judge profile is fixed"
+        )
         lines = (
             f"Error mining: {len(mining.actors)} tiers ({', '.join(mining.actors)}), each "
             f"G={mining.attempts} J={mining.selector_draws} C={mining.critic_draws} "
             f"K={mining.points} M={mining.continuations}; at most {points} points and "
             f"{episodes} judged episodes per tier; never pooled across tiers.",
             f"Episode judge: {profile.prompt_version} on {profile.model_alias}, up to "
-            f"{judge_model_calls(profile)} draws per judgment, profile fixed before any rubric.",
+            f"{judge_model_calls(profile)} draws per judgment, profile fixed before any rubric; "
+            f"{rubric}.",
+            "Selectors and critics "
+            + (
+                f"search the scoped world-learning index (top {mining.retrieval_top_k}, "
+                "tag-aware when the build saved a binding); held-out traces never enter."
+                if mining.retrieval
+                else "have no world-learning search."
+            ),
         )
         return cost_lines(tuple(costs)), lines
 
@@ -460,20 +494,39 @@ class _MiningStage:
         project, spec = context.project, context.spec
         build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
         exposure = load_exposure_plan(project, build.exposure)
-        job = RulesOutputs.model_validate(context.upstream["rules"].outputs).job
+        rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
         labels = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs).labels
         profile = mining_profile(spec)
+        rubric, packet = spec.mining.rubric, None
+        if rubric is None:
+            rubric, packet = mining_rubric(context, build, rules)
+        embedder = None
+        if spec.mining.retrieval and build.index is not None:
+            embedder = retrieval_embedder(context, build.index)
         tiers: list[TierMining] = []
-        references: list[ArtifactInput] = []
+        references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
         for alias in spec.mining.actors:
-            tier = self._tier(context, exposure, job, profile, alias, labels.get(alias))
+            tier = self._tier(
+                context,
+                _Tier(exposure, rules.job, profile, rubric, alias, labels.get(alias)),
+                build,
+                embedder,
+            )
             tiers.append(tier)
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))
-        outputs = MiningOutputs(profile=profile, tiers=tuple(tiers))
+        outputs = MiningOutputs(
+            profile=profile, rubric=rubric, rubric_packet=packet, tiers=tuple(tiers)
+        )
         summary: JsonObject = {
             "judge_profile": profile.prompt_version,
+            "rubric": rubric.artifact_id,
+            "rubric_authored": packet is not None,
             "tiers": {
-                tier.tier: {"report": tier.report.artifact_id, "judge": tier.judge.identity}
+                tier.tier: {
+                    "report": tier.report.artifact_id,
+                    "judge": tier.judge.identity,
+                    "retrieval": tier.retrieval is not None,
+                }
                 for tier in tiers
             },
         }
@@ -482,37 +535,34 @@ class _MiningStage:
     def _tier(
         self,
         context: StageContext,
-        exposure: ExposurePlan,
-        job: ContinuationJob,
-        profile: JudgeProfile,
-        alias: str,
-        labels: ArtifactInput | None,
+        tier_inputs: _Tier,
+        build: BuildOutputs,
+        embedder: RAGEmbedderBinding | None,
     ) -> TierMining:
         """Run one tier: its judge, its registration (or the schedule's) and its group judging.
 
         Args:
             context: The running stage.
-            exposure: The frozen data roles.
-            job: The rule-bound mining job.
-            profile: The episode-judge profile.
-            alias: The tier's actor alias.
-            labels: The tier's TraceML labels, when labelled.
+            tier_inputs: The frozen roles, rule-bound job, judge profile, rubric and tier.
+            build: The variance build, whose scoped index the roles search.
+            embedder: Query embedder of a semantic index, or None.
 
         Returns:
             The tier's mining.
         """
         project, spec, revision = context.project, context.spec, context.code_revision
-        mining = spec.mining
-        tier = group_job(project, spec, job, alias)
+        mining, alias = spec.mining, tier_inputs.alias
+        tier = group_job(project, spec, tier_inputs.job, alias)
         start = load_continuation_checkpoint(project.artifacts, tier.study.checkpoint)
         definition = judge_definition(
             project,
-            profile,
-            mining.rubric,
+            tier_inputs.profile,
+            tier_inputs.rubric,
             task_sha256=run_task_sha256(start),
             world_sha256=run_world_sha256(tier.configuration),
         )
         judge = EpisodeJudge(definition=definition, settings=mining.judge)
+        labels = tier_inputs.labels
         references = (
             ()
             if labels is None
@@ -521,6 +571,11 @@ class _MiningStage:
                     kind="traceml_labels", name="traceml", artifact=labels, file="labels.json"
                 ),
             )
+        )
+        retrieval = (
+            trace_search(project, build, start.task.task_id, mining.retrieval_top_k)
+            if mining.retrieval
+            else None
         )
         registration = ActorCriticSpec.error_mining(
             tier,
@@ -538,9 +593,11 @@ class _MiningStage:
             critic_profile=mining.critic_profile,
             references=references,
             actor_tier=alias,
-        )
+        ).model_copy(update={"retrieval": retrieval})
         schedule = mining.schedule
-        if schedule is not None and schedule.base.initial.actor_alias == alias:
+        scheduled = schedule is not None and schedule.base.initial.actor_alias == alias
+        if scheduled:
+            assert schedule is not None
             plan = next_rollout_plan(project, schedule, code_revision=revision)
             if plan.spec is None:
                 raise ValueError(
@@ -550,14 +607,49 @@ class _MiningStage:
             registration = plan.spec
             judge = registration.episode_judge
             tier = registration.initial
-        report = run_actor_critic(project, registration, exposure=exposure, code_revision=revision)
+        report = run_actor_critic(
+            project,
+            registration,
+            exposure=tier_inputs.exposure,
+            code_revision=revision,
+            embedder=embedder if registration.retrieval is not None else None,
+        )
         saved = _report_reference(project, registration, revision)
-        if schedule is not None and schedule.base.initial.actor_alias == alias:
+        if scheduled:
+            assert schedule is not None
             complete_rollout(project, schedule, saved, code_revision=revision)
         judged, _ = judge_study(
             project, report.group, judge, configuration=tier.configuration, code_revision=revision
         )
-        return TierMining(tier=alias, report=saved, judged_group=judged, judge=judge, job=tier)
+        return TierMining(
+            tier=alias,
+            report=saved,
+            judged_group=judged,
+            judge=judge,
+            job=tier,
+            retrieval=registration.retrieval,
+        )
+
+
+@dataclass(frozen=True)
+class _Tier:
+    """What one tier's error mining reads besides the stage context.
+
+    Attributes:
+        exposure: The frozen data roles.
+        job: The rule-bound mining job.
+        profile: The episode-judge profile.
+        rubric: The mining-probe task's rubric.
+        alias: The tier's actor alias.
+        labels: The tier's TraceML labels, when labelled.
+    """
+
+    exposure: ExposurePlan
+    job: ContinuationJob
+    profile: JudgeProfile
+    rubric: ArtifactInput
+    alias: str
+    labels: ArtifactInput | None
 
 
 def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:
@@ -572,22 +664,6 @@ def _report_reference(
 ) -> ArtifactInput:
     """Return the saved report of a registration."""
     return artifact_input(project.artifacts.read(spec.identity(code_revision) + "-result").manifest)
-
-
-def _traces(project: ProjectStore, build: BuildOutputs) -> tuple[Trace, ...]:
-    """Read the build's world-learning traces from its pinned dataset, in order."""
-    dataset = build.trace_dataset
-    stored = project.artifacts.read(dataset.artifact_id)
-    if artifact_input(stored.manifest) != dataset:
-        raise ValueError(f"trace dataset {dataset.artifact_id} differs from its pinned reference")
-    by_id = {
-        trace.trace_id: trace
-        for trace in load_trace_dataset(project.artifacts, dataset.artifact_id).traces
-    }
-    missing = [trace_id for trace_id in build.rules_traces if trace_id not in by_id]
-    if missing:
-        raise ValueError(f"world-learning traces missing from the dataset: {', '.join(missing)}")
-    return tuple(by_id[trace_id] for trace_id in build.rules_traces)
 
 
 def _world(
@@ -611,25 +687,13 @@ def _runtime_allowance(project: ProjectStore, job: ContinuationJob) -> tuple[Cos
 
 def _tagger(context: StageContext) -> TraceTagger:
     """Resolve the TraceML decision alias behind the admitted transport."""
-    from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
-    from exp.runtime.models.providers.transport import HttpxJsonTransport
-    from exp.runtime.sessions.dispatch_ledger import DispatchLedger
-
     project, settings = context.project, context.spec.traceml
     catalog = load_model_catalog(project.model_catalog_path)
     resolved = RuntimeModelCatalog(catalog).resolve(settings.decision_alias)
     attempts = context.spec.mining.attempts * context.spec.mining.job.maximum_model_calls
     attempts *= settings.steps_per_call * len(context.spec.mining.actors)
-    transport = AdmittedJsonTransport(
-        HttpxJsonTransport(),
-        ledger=DispatchLedger(
-            project.artifacts.project_directory / (context.identity + "-traceml.sqlite"),
-            max(1, attempts),
-            sha256_json(context.identity),
-        ),
-        artifacts=project.artifacts,
-        code_revision=context.code_revision,
-        deadline=datetime.now(UTC) + timedelta(hours=settings.deadline_hours),
+    transport = admitted_transport(
+        context, "traceml", attempts, datetime.now(UTC) + timedelta(hours=settings.deadline_hours)
     ).priced_as(settings.decision_alias)
     return DecisionsTraceTagger.for_alias(
         resolved,

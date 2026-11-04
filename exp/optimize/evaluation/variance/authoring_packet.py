@@ -69,7 +69,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.induction.contracts import InductionEpisode
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook, ToolContract
 
-AUTHORING_PACKET_PROTOCOL = "authoring-packet-v2"
+AUTHORING_PACKET_PROTOCOL = "authoring-packet-v3"
 """Version of the packet contract; change it whenever what authors are shown changes."""
 
 PACKET_TYPE = "authoring-packet"
@@ -432,7 +432,7 @@ def build_authoring_packet(
     exposure: ExposurePlan,
     rule_book: ArtifactInput,
     book: RuleBook,
-    decision: DecisionState,
+    decision: DecisionState | None,
     scenarios: tuple[Scenario, ...],
     observed_episodes: tuple[InductionEpisode, ...] = (),
     extra_claims: tuple[PacketClaim, ...] = (),
@@ -452,8 +452,10 @@ def build_authoring_packet(
         exposure: The frozen data roles.
         rule_book: The saved rule book artifact ``book`` was read from.
         book: The rule book.
-        decision: The proposed decision state.
-        scenarios: The proposed scenario variants.
+        decision: The proposed decision state, or None for a whole-task packet: an episode
+            judged from the task's start before any decision point exists, such as the
+            error-mining task's. Its brief proposes no option, axis or correct choice.
+        scenarios: The proposed scenario variants; none for a whole-task packet.
         observed_episodes: Source-derived replay episodes for program validation.
         extra_claims: Further source claims, with their own evidence status.
         unresolved: Interpretations the brief left open.
@@ -465,8 +467,11 @@ def build_authoring_packet(
 
     Raises:
         ValueError: A source trace or coalition row belongs to final evaluation, a scenario
-            edits an absent path, or two variants have the same complete task identity.
+            edits an absent path, a whole-task packet has scenarios, or two variants have the
+            same complete task identity.
     """
+    if decision is None and scenarios:
+        raise ValueError("a whole-task packet has no decision, so it cannot carry scenarios")
     final = sorted(
         source.trace_id
         for source in sources
@@ -482,7 +487,11 @@ def build_authoring_packet(
     names = {tool.name for tool in task.tools}
     rules = tuple(rule for rule in book.rules if rule.tool is None or rule.tool in names)
     questions = tuple(item for item in book.questions if item.tool is None or item.tool in names)
-    variants = [_variant(task, before_state, scenario, decision) for scenario in scenarios]
+    variants = [
+        _variant(task, before_state, scenario, decision)
+        for scenario in scenarios
+        if decision is not None
+    ]
     baseline = variant_task_sha256(task, task.instruction, before_state)
     if all(variant.task_sha256 != baseline for variant in variants):
         variants.insert(
@@ -524,15 +533,7 @@ def build_authoring_packet(
         claims=(*rule_claims(rules), *brief_claims, *extra_claims),
         observed_episodes=observed_episodes,
         variants=tuple(variants),
-        brief=DecisionBrief(
-            decision=decision.decision,
-            options=decision.options,
-            axes=decision.axes,
-            relevant_paths=decision.relevant_paths,
-            proposed_correct={s.scenario_id: s.correct_option for s in scenarios},
-            rationales={s.scenario_id: s.rationale for s in scenarios},
-            unresolved=unresolved,
-        ),
+        brief=_brief(decision, scenarios, unresolved),
         coalition=coalition,
     )
 
@@ -596,6 +597,38 @@ def load_packet(project: ProjectStore, reference: ArtifactInput) -> AuthoringPac
             "reference save_packet returned"
         )
     return AuthoringPacket.model_validate_json(stored.payloads[PACKET_FILE])
+
+
+WHOLE_TASK = (
+    "The whole task, judged from its start; no decision point has been chosen, so the brief "
+    "proposes no option, axis or correct choice."
+)
+"""The decision text of a whole-task packet's brief."""
+
+
+def _brief(
+    decision: DecisionState | None, scenarios: tuple[Scenario, ...], unresolved: tuple[str, ...]
+) -> DecisionBrief:
+    """Return the proposal the decision and scenario authors made, or the whole-task brief."""
+    if decision is None:
+        return DecisionBrief(
+            decision=WHOLE_TASK,
+            options=(),
+            axes=(),
+            relevant_paths=(),
+            proposed_correct={},
+            rationales={},
+            unresolved=unresolved,
+        )
+    return DecisionBrief(
+        decision=decision.decision,
+        options=decision.options,
+        axes=decision.axes,
+        relevant_paths=decision.relevant_paths,
+        proposed_correct={s.scenario_id: s.correct_option for s in scenarios},
+        rationales={s.scenario_id: s.rationale for s in scenarios},
+        unresolved=unresolved,
+    )
 
 
 def _variant(
