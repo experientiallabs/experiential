@@ -182,3 +182,32 @@ def test_grounding_pins_an_explicit_rule_book_into_definition_and_sources(
         "rule_book": reference.model_dump(mode="json"),
     }
     assert checked.sources == (*ordinary.sources, reference)
+
+
+def test_grounding_pins_an_explicit_tag_binding_into_definition_and_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A requested tag binding joins the frozen definition and the capture sources, nothing else."""
+    from exp.optimize.evaluation.variance.build_records import BINDING_TYPE, save_artifact
+    from exp.simulation.retrieval.tags import TagRetrievalBinding, TagRetrievalPolicy
+
+    project = built(tmp_path, monkeypatch, learn=False)
+    task = development_tasks(project)[0]
+    ordinary = grounded_capture(project, request(task, memory="none"))
+    assert "tag_retrieval" not in ordinary.configuration
+    policy = TagRetrievalPolicy(bank_id="bank", bank_version=1, threshold=0.5, weight=0.0)
+    reference = save_artifact(
+        project.artifacts,
+        BINDING_TYPE,
+        {"binding.json": TagRetrievalBinding(policy=policy)},
+        (),
+        "fixture",
+    )
+    tagged = grounded_capture(
+        project, request(task, memory="none", tag_retrieval=reference.model_dump(mode="json"))
+    )
+    assert tagged.configuration == {
+        **ordinary.configuration,
+        "tag_retrieval": reference.model_dump(mode="json"),
+    }
+    assert tagged.sources == (*ordinary.sources, reference)

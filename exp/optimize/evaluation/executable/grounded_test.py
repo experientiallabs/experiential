@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    SourceIdentity,
+    sha256_json,
+)
 from exp.common.models import (
     ReasoningEffort,
     ToolCall,
@@ -17,6 +23,8 @@ from exp.common.models import (
 from exp.common.project import ProjectStore
 from exp.common.project.manifests import artifact_input
 from exp.common.tasks.facts import ConditioningFacts, InstanceFacts
+from exp.common.traces import Trace, TraceSource, TraceSpan
+from exp.common.traces.ingest import TraceNormalizationResult, persist_trace_dataset
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
@@ -26,14 +34,28 @@ from exp.optimize.evaluation.executable.grounded import (
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec
 from exp.optimize.evaluation.fidelity.runner_test import source_project
+from exp.optimize.evaluation.variance.build_records import BINDING_TYPE, save_artifact
 from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
+from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
+from exp.simulation.retrieval import RAGLineageBinding, load_rag_index, persist_trace_rag
+from exp.simulation.retrieval.tags import (
+    RAGIndexTags,
+    RAGTagQuestion,
+    RAGTagView,
+    RAGTraceTags,
+    TagRetrievalBinding,
+    TagRetrievalEvidence,
+    TagRetrievalPolicy,
+    TaskQueryTags,
+)
 from exp.simulation.rules.model import Predicate, Rule, RuleBook
 from exp.simulation.rules.rulebook import RULES_JSON, rulebook_json
+from exp.simulation.world_model.artifact import persist_grounded_world_model
 from exp.simulation.world_model.prediction_reading import PredictionReading
 
 
@@ -105,7 +127,7 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
             ),
         )
     )
-    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda t=transport: t)
     runtime = continuation_runtime(project, spec.model_dump(mode="json"))
     with runtime.world.open(task) as world:
         saved = world.checkpoint()
@@ -422,7 +444,7 @@ def test_declared_record_facts_reach_the_wire_and_survive_continuation_restore(
     plain = spec.model_dump(mode="json")
     assert "facts" not in plain and GroundedRuntimeDefinition.model_validate(plain) == spec
     transport = ScriptedJsonTransport((_prediction("first"), _prediction("second")))
-    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda t=transport: t)
     runtime = continuation_runtime(project, configuration)
     task = spec.task
     with runtime.world.open(task) as world:
@@ -515,7 +537,7 @@ def test_facts_derived_from_a_foreign_trace_refuse_before_any_call(
         }
     )
     transport = ScriptedJsonTransport(())
-    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda t=transport: t)
     with pytest.raises(InstanceFactsError, match="someone-else"):
         continuation_runtime(project, with_facts(spec, InstanceFacts(facts=(foreign,))))
     assert not transport.requests
@@ -560,7 +582,7 @@ def test_predictor_reasoning_override_reaches_wire_and_receipts_without_catalog_
         assert sha256_json(spec) != sha256_json(baseline)
     transport = ScriptedJsonTransport((_prediction("read"),))
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
-    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda t=transport: t)
     runtime = continuation_runtime(project, spec.model_dump(mode="json"))
     with runtime.world.open(spec.task) as world:
         assert (
@@ -671,7 +693,7 @@ def test_bound_rule_book_refuses_a_rule_breaking_proposal_and_reasks(
         update={"rule_book": reference, "maximum_reasks": 1}
     )
     transport = ScriptedJsonTransport((_prediction("read", "done"), _prediction("read")))
-    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda t=transport: t)
     runtime = continuation_runtime(project, spec.model_dump(mode="json"))
     with runtime.world.open(spec.task) as world:
         result = world.execute(ToolCall(name="inspect", call_id="read", arguments={}))
@@ -689,3 +711,227 @@ def test_bound_rule_book_refuses_a_rule_breaking_proposal_and_reasks(
     for artifact_id in events:
         inputs = project.artifacts.read(artifact_id).manifest.inputs
         assert reference in inputs
+
+
+TAG_POLICY = TagRetrievalPolicy(bank_id="bank", bank_version=1, threshold=0.5, weight=10.0)
+"""Treatment policy: a fired shared task tag outweighs any cosine difference."""
+
+TASK_TAGS = TaskQueryTags(
+    bank_id="bank",
+    bank_version=1,
+    view="task",
+    threshold=0.5,
+    matrix_sha256="f" * 64,
+    fired=("req.export",),
+)
+"""The bound task's own task-view tags."""
+
+
+def _inspect_trace(index: int, key: str, value: str) -> Trace:
+    """One recorded ``inspect`` call on ``key`` answered with ``value``."""
+    start = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=index)
+    shared = {"gen_ai.tool.name": "inspect", "gen_ai.tool.call.id": f"call-{index}"}
+    return Trace(
+        trace_id=f"tagged-{index}",
+        task=f"Read the {key} entry",
+        source=TraceSource(
+            identity=SourceIdentity(kind="file", source_id="tagged"),
+            semantic_convention_version="1.37.0",
+        ),
+        spans=(
+            TraceSpan(
+                span_id=f"request-{index}",
+                name="request",
+                started_at=start,
+                ended_at=start,
+                attributes={**shared, "gen_ai.tool.call.arguments": json.dumps({"key": key})},
+            ),
+            TraceSpan(
+                span_id=f"result-{index}",
+                name="result",
+                started_at=start + timedelta(seconds=1),
+                ended_at=start + timedelta(seconds=1),
+                attributes={
+                    **shared,
+                    "gen_ai.operation.name": "execute_tool",
+                    "gen_ai.tool.message": value,
+                },
+            ),
+        ),
+    )
+
+
+def tagged_world(project: ProjectStore) -> tuple[ArtifactInput, ArtifactInput]:
+    """Persist three fit traces, a task-tagged index over them and a world model over it.
+
+    Only the trace least like the records task (``tagged-2``) fires the bound task's tag.
+
+    Returns:
+        The world model and its serving index.
+    """
+    traces = (
+        _inspect_trace(0, "current", "pending"),
+        _inspect_trace(1, "current entries", "pending"),
+        _inspect_trace(2, "archive", "stored"),
+    )
+    source = persist_trace_dataset(
+        TraceNormalizationResult(traces=traces, issues=()),
+        project.artifacts,
+        created_at=datetime.now(UTC),
+        code_revision="fixture",
+    )
+    fired = {trace.trace_id: () for trace in traces} | {"tagged-2": ("req.export",)}
+    tags = RAGIndexTags(
+        views=(
+            RAGTagView(
+                bank_id="bank",
+                bank_version=1,
+                view="task",
+                threshold=0.5,
+                questions=(RAGTagQuestion(question_id="req.export", family="requirement"),),
+                matrix_sha256="e" * 64,
+                traces=tuple(
+                    RAGTraceTags(trace_id=key, fired=value) for key, value in sorted(fired.items())
+                ),
+            ),
+        )
+    )
+    rag = persist_trace_rag(
+        project.artifacts,
+        (artifact_input(source.manifest),),
+        tuple(
+            RAGLineageBinding(trace_id=t.trace_id, lineage_id=f"tagged-{i}", partition="fit")
+            for i, t in enumerate(traces)
+        ),
+        created_at=datetime.now(UTC),
+        code_revision="fixture",
+        trace_tags=tags,
+    )
+    catalog = load_model_catalog(project.model_catalog_path)
+    model, _ = RuntimeModelCatalog(catalog).snapshot("model")
+    world = persist_grounded_world_model(
+        project.artifacts,
+        artifact_input(rag.manifest),
+        model_alias="model",
+        model=model,
+        created_at=datetime.now(UTC),
+        code_revision="fixture",
+        top_k=3,
+    )
+    return artifact_input(world.manifest), artifact_input(rag.manifest)
+
+
+def save_binding(
+    project: ProjectStore, policy: TagRetrievalPolicy, index: ArtifactInput
+) -> ArtifactInput:
+    """Save a tag retrieval binding for the records task as the variance build does."""
+    return save_artifact(
+        project.artifacts,
+        BINDING_TYPE,
+        {"binding.json": TagRetrievalBinding(policy=policy, tasks={"test": TASK_TAGS})},
+        (index,),
+        "fixture",
+    )
+
+
+def test_definition_without_tag_binding_keeps_its_identity_and_refuses_a_wrong_digest(
+    tmp_path: Path,
+) -> None:
+    """An absent binding changes nothing; a bound one joins the definition and is verified."""
+    project, fidelity = source_project(tmp_path)
+    spec = _record_spec(project, fidelity)
+    plain = spec.model_dump(mode="json")
+    assert "tag_retrieval" not in plain
+    assert GroundedRuntimeDefinition.model_validate(plain) == spec
+    world, index = tagged_world(project)
+    reference = save_binding(project, TAG_POLICY, index)
+    tagged = spec.model_copy(update={"world_model": world, "tag_retrieval": reference})
+    dumped = tagged.model_dump(mode="json")
+    assert dumped == {
+        **plain,
+        "world_model": world.model_dump(mode="json"),
+        "tag_retrieval": reference.model_dump(mode="json"),
+    }
+    assert sha256_json(dumped) != sha256_json({**dumped, "tag_retrieval": None})
+    preflight_grounded_runtime(project, GroundedRuntimeDefinition.model_validate(dumped))
+    stale = reference.model_copy(update={"sha256": "0" * 64})
+    with pytest.raises(ValueError, match="not the pinned tag-retrieval-binding"):
+        preflight_grounded_runtime(project, tagged.model_copy(update={"tag_retrieval": stale}))
+    rules = save_rules(project, pending_rules())
+    with pytest.raises(ValueError, match="not the pinned tag-retrieval-binding"):
+        preflight_grounded_runtime(project, tagged.model_copy(update={"tag_retrieval": rules}))
+
+
+def _list(value: object) -> tuple[str, ...]:
+    """Return a recorded JSON list of strings, refusing any other value."""
+    assert isinstance(value, list)
+    return tuple(str(item) for item in value)
+
+
+def test_bound_tag_retrieval_ranks_the_executable_world_and_records_its_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A treatment binding re-ranks the bound task's retrieval; a weight-0 control keeps cosine.
+
+    Both record the policy as retrieval evidence and pin the binding in every event's inputs.
+    """
+    project, fidelity = source_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    world, index = tagged_world(project)
+    treatment = save_binding(project, TAG_POLICY, index)
+    control = save_binding(project, TAG_POLICY.model_copy(update={"weight": 0.0}), index)
+    base = _record_spec(project, fidelity).model_copy(update={"world_model": world})
+    evidence: dict[str, JsonObject] = {}
+    checkpoints: dict[str, WorldCheckpoint] = {}
+    for name, binding in (("plain", None), ("control", control), ("treatment", treatment)):
+        spec = base.model_copy(update={"tag_retrieval": binding})
+        transport = ScriptedJsonTransport((_prediction("read"),))
+        monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda t=transport: t)
+        before = set(project.artifacts.list_ids(artifact_type="grounded-world-prediction"))
+        runtime = continuation_runtime(project, spec.model_dump(mode="json"))
+        with runtime.world.open(spec.task) as opened:
+            result = opened.execute(ToolCall(name="inspect", call_id="read", arguments={}))
+            checkpoints[name] = opened.checkpoint()
+        assert result.content == "pending"
+        (intent,) = (
+            artifact_id
+            for artifact_id in project.artifacts.list_ids(artifact_type="grounded-world-prediction")
+            if artifact_id not in before and artifact_id.endswith("-intent")
+        )
+        evidence[name] = json.loads(project.artifacts.read_bytes(intent, "event.json"))["payload"][
+            "evidence"
+        ]
+        inputs = project.artifacts.read(intent).manifest.inputs
+        assert (binding in inputs) if binding is not None else len(inputs) == 1
+    trace_of = {
+        row.transition_id: row.trace_id
+        for row in load_rag_index(project.artifacts, index.artifact_id).transitions
+    }
+    order = {
+        name: tuple(trace_of[transition] for transition in _list(row["grounded_transition_ids"]))
+        for name, row in evidence.items()
+    }
+    assert "tag_retrieval" not in evidence["plain"]
+    assert order["control"] == order["plain"]
+    assert order["plain"][0] != "tagged-2"
+    assert order["treatment"][0] == "tagged-2"
+    assert sorted(order["treatment"]) == sorted(order["plain"])
+    for name, policy in (
+        ("control", TAG_POLICY.model_copy(update={"weight": 0.0})),
+        ("treatment", TAG_POLICY),
+    ):
+        recorded = TagRetrievalEvidence.model_validate(evidence[name]["tag_retrieval"])
+        assert recorded.policy == policy and recorded.policy_sha256 == policy.identity
+        assert recorded.query == TASK_TAGS and recorded.index_matrix_sha256 == "e" * 64
+    # The binding is part of the world's identity: a tagged checkpoint never resumes untagged.
+    from exp.optimize.evaluation.continuations.study import restore_continuation_world
+
+    untagged = continuation_runtime(project, base.model_dump(mode="json"))
+    with pytest.raises(ValueError, match="another backend definition"):
+        with restore_continuation_world(untagged.world, base.task, checkpoints["treatment"]):
+            pass
+    tagged = continuation_runtime(
+        project, base.model_copy(update={"tag_retrieval": treatment}).model_dump(mode="json")
+    )
+    with restore_continuation_world(tagged.world, base.task, checkpoints["treatment"]) as world:
+        assert world.checkpoint() == checkpoints["treatment"]

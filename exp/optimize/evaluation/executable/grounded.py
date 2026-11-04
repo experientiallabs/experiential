@@ -11,6 +11,10 @@ prediction exactly as in fidelity replay and are never derived from native state
 A rule book is bound the same way: the definition pins one immutable artifact holding the
 book as ``rules.json``, and the runtime verifies that exact artifact before every proposal is
 judged against it.
+
+A tag retrieval binding is pinned likewise: the definition names one saved
+``tag-retrieval-binding`` artifact, the runtime verifies its manifest and type, and the grounded
+world ranks the task's retrieval by its policy when the binding lists the task.
 """
 
 import json
@@ -39,6 +43,7 @@ from exp.optimize.evaluation.fidelity.decision_access import decision_caller, re
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
+from exp.optimize.evaluation.variance.build_records import load_tag_retrieval_binding
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint, WorldManifest
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.budget import RequestBudget
@@ -57,6 +62,7 @@ from exp.simulation.development_scope import require_development_task
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
+from exp.simulation.retrieval.tags import TagRetrievalBinding
 from exp.simulation.rules.model import RuleBook
 from exp.simulation.rules.rulebook import RULES_JSON
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
@@ -98,6 +104,10 @@ class GroundedRuntimeDefinition(ContractModel):
             Every proposal must satisfy its supported rules before it commits; a rejected
             proposal is re-asked with the broken rules within ``maximum_reasks``. Absent, the
             definition and every derived identity are unchanged.
+        tag_retrieval: Optional saved ``tag-retrieval-binding`` artifact. When it lists the
+            task, retrieval ranks by its tag policy and records the policy as evidence; a task it
+            does not list retrieves by cosine similarity. Absent, the definition and every
+            derived identity are unchanged.
     """
 
     task: TaskCase
@@ -121,6 +131,9 @@ class GroundedRuntimeDefinition(ContractModel):
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
     rule_book: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    tag_retrieval: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _starting_facts_only(self) -> Self:
@@ -223,16 +236,23 @@ def preflight_grounded_runtime(project: ProjectStore, spec: GroundedRuntimeDefin
 
     Raises:
         ValueError: The task is not development data, the state or probe disagrees with the
-            manifest, the catalog changed, a provider wire is not admitted, or the rule book
-            artifact differs from its reference.
+            manifest, the catalog changed, a provider wire is not admitted, the rule book or
+            tag retrieval binding artifact differs from its reference, or a memory-first
+            simulator is given a tag binding.
     """
     _checked(project, spec)
 
 
 def _checked(
     project: ProjectStore, spec: GroundedRuntimeDefinition
-) -> tuple[ModelCatalog, GroundedWorldModelArtifact, str | None, RuleBook | None]:
-    """Run every credential-free check and return the catalog, simulator, embedder and rules."""
+) -> tuple[
+    ModelCatalog,
+    GroundedWorldModelArtifact,
+    str | None,
+    RuleBook | None,
+    TagRetrievalBinding | None,
+]:
+    """Run every credential-free check; return catalog, simulator, embedder, rules and tags."""
     require_development_task(project.artifacts, spec.task)
     if spec.task.reference_answer is not None:
         raise ValueError("grounded executable tasks must not contain private expected answers")
@@ -269,7 +289,12 @@ def _checked(
     rule_book = (
         None if spec.rule_book is None else load_rule_book(project.artifacts, spec.rule_book)
     )
-    return catalog, artifact, embedder_alias, rule_book
+    tag_retrieval = None
+    if spec.tag_retrieval is not None:
+        tag_retrieval = load_tag_retrieval_binding(project, spec.tag_retrieval)
+        if artifact.original_evidence == "none":
+            raise ValueError("a memory-first simulator retrieves nothing to rank by tags")
+    return catalog, artifact, embedder_alias, rule_book, tag_retrieval
 
 
 def _runtime(
@@ -278,7 +303,7 @@ def _runtime(
     provider_grant: ProviderGrant | None = None,
 ) -> ContinuationRuntime:
     """Compose identical state/predictor definitions under one explicitly selected call ledger."""
-    catalog, artifact, embedder_alias, rule_book = _checked(project, spec)
+    catalog, artifact, embedder_alias, rule_book, tag_retrieval = _checked(project, spec)
     revision = installed_execution_revision()
     identity_fields: JsonObject = {"definition": spec.model_dump(mode="json"), "code": revision}
     if provider_grant is not None:
@@ -326,6 +351,7 @@ def _runtime(
         client=predictor.client,
         capabilities=predictor.capabilities,
         embedder=embedding,
+        tag_retrieval=tag_retrieval,
     )
     memory = (
         None
@@ -413,7 +439,8 @@ def _runtime(
                     sorted(
                         (spec.world_model,)
                         + (() if provider_grant is None else (provider_grant.registration,))
-                        + (() if spec.rule_book is None else (spec.rule_book,)),
+                        + (() if spec.rule_book is None else (spec.rule_book,))
+                        + (() if spec.tag_retrieval is None else (spec.tag_retrieval,)),
                         key=lambda reference: reference.artifact_id,
                     )
                 ),

@@ -47,6 +47,10 @@ declared world-learning traces; held-out traces can never enter a scoped index o
    admitted constructor.
 6. Every mining-probe task gets task-view query tags in a `tag-retrieval-binding` (default boost
    weight 0.25), with a weight-zero control binding for cosine-only baselines.
+   Executable worlds (continuation jobs, actor-critic runs, decision families and Harbor trials)
+   bind one by its reference in `GroundedRuntimeDefinition.tag_retrieval`: the artifact is verified
+   against its manifest and type, the bound task's retrieval records the policy as evidence, and
+   the binding joins the definition identity, so a tagged checkpoint never resumes untagged.
 
 The dry run prints traces per role, decision calls per view (distinct traces x
 ceil(questions/32)) and how many world-learning embedding inputs the build already saved. Decision
