@@ -125,6 +125,61 @@ uniform, late-failure and midpoint baselines at an equal point budget and counts
 to be decisions. `compare` reports `judge_better` only when the paired lower bound beats every
 baseline; otherwise `not_shown`.
 
+## Reward ownership
+
+One frozen LLM episode judge is the only semantic success authority on this path.
+`judge_episode` (`variance/judge.py`) judges one complete `EpisodeEvidence`
+(`variance/episodes.py`) with one `JudgeDefinition` (a `JudgeProfile` bound to the authored rubric,
+event contract, task and world) and saves an `episode-assessment` artifact whose inputs are the
+saved `episode-evidence`, the rubric and every judge response. `episode_reward` maps its verdict to
+pass 1, fail 0, anything else unscored. Downstream records cite the assessment (`JudgedEpisode`);
+they never copy a success flag.
+
+The judge renders the whole evidence when it fits the frozen input budget. Otherwise a profile
+with an `evidence_tool_budget` receives an inventory of every event (ids, kinds, owners, scopes,
+sources, content sizes) and reads contiguous event ranges in full through `read_events` before
+its one `assess_episode` answer; it may cite only events it read and may pass only after reading
+every scored event. Without that budget the episode is saved unscored as insufficient evidence.
+Evidence is never truncated, graded in chunks or averaged. Code validates shape, rubric coverage,
+the verdict rule over the judge's own findings and every citation; a malformed or unobtainable
+answer is saved `malformed` or `unavailable`, unscored and never redrawn. Assessments replay
+exactly by protocol, definition identity, evidence identity and input budget. The prompt and its
+schema live in `variance/judge_prompt.py` (`JUDGE_PROMPT_VERSION`); `judge_profile` binds both.
+
+Every place on the execution-to-reward path that derives a success bit, an empirical rate, a
+critic target, an advantage, an eligibility result or a Harbor reward, classified as semantic
+grading (migrates to the judge) or simulator and protocol validity (stays code). Paths are relative
+to `exp/optimize/evaluation/`; function names are authoritative where line numbers move.
+
+| Site (file:line) | Current source | Kind | Target |
+|---|---|---|---|
+| `continuations/study.py:687`, `:721` `_run_branch` | `grade(spec.verifier, outcome)` sets `ContinuationBranch.assessment` (`VerifierGrade`) for completed and failed branches | semantic | Build `EpisodeEvidence` from the branch's actor calls, steps, receipts and final state; `judge_episode`; store the `JudgedEpisode` reference. Branch `status` (completed, failed, outcome_unknown) and `actor_stop` stay protocol facts; an outcome-unknown branch is still unscored, an actor budget stop is still judged |
+| `continuations/study.py:191` `known_outcomes` | `VerifierGrade.status == "pass"`, unassessable dropped | semantic aggregation | Labels from `episode_reward(load_assessment(...))`; unscored stays in the planned denominator |
+| `continuations/study.py:259` `ContinuationStudy.metrics` | `resumed_success_rate` and `brier` against `predicted_success` from verifier labels | semantic | Same arithmetic over judged labels, reported with the judge definition identity |
+| `continuations/action_contrast.py:177` `_assessment`, `:187` `grade_intervention_outcome` (`grade` at `:207`) | Re-grades the imposed action plus suffix with the task verifier | semantic | One `EpisodeEvidence` with the imposed action as `owner=experiment`, `scope=scored`, then the suffix, judged once; no separate regrade |
+| `continuations/action_contrast.py:210` `_metrics` | Arm success bounds and pair differences from verifier labels; `goal_failures`/`policy_failures` from `VerifierGrade.goal/policy` | semantic | Bounds from judged labels; goal/policy counts replaced by counts of judged not_met required criteria |
+| `variance/evidence.py:51` `group_rate`, `:125` attempt `grade`, `:147` `success_rate` | Verifier grades and group rate shown to point selectors and critics | semantic (historical) | Discovery packets label these historical; scored variant predictions read judged rates of the frozen variant judge |
+| `variance/evidence.py:64` `candidate_branches`; `variance/actor_critic.py:336` `_pick` | Completed attempts with checkpoints and enough remaining calls | protocol | Unchanged; record the eligible population as selected, not an unconditional draw |
+| `variance/actor_critic.py:465`-`:484` `_point_result` | `known_outcomes` and per-branch 1/0/None from `VerifierGrade` feed `PointOutcome` and `group_advantages` | semantic | `episode_reward` of each continuation's assessment |
+| `variance/actor_critic.py:489` `_reward_judge`, `:498` `_reward_critic`, `:526` `_ineligible`, `:550` `_rank` | Selector spread score, critic negative Brier, ranking over `PointOutcome` rates | consumer of semantic rates | Unchanged arithmetic over judged rates; the spread score stays screening only |
+| `variance/rewards.py:125` `critic_score`, `:158` `judge_score`, `:182` `group_advantages` | Pure arithmetic over supplied rates and rewards | encoding | Unchanged; inputs come only from judged assessments |
+| `variance/exposure.py:286` `estimate_meaning` (`verifier_sha256` at `:308`) | Estimate meaning binds the verifier digest | identity | Bind the `JudgeDefinition.identity` instead, so a new rubric or profile is a new estimate |
+| `variance/contrast.py:742` `option_outcome` | Option counts, Wilson and separation bounds, goal/policy failures from cell `VerifierGrade` | semantic | Judged labels of each forced-action cell |
+| `variance/contrast.py:835` `variant_verdict`, `:877` `family_flip` | Separated leader from option bounds, compared with the declared `correct_option` | consumer of semantic rates; the declared option is an authoring hypothesis | Bounds from judged cells; a mismatch with the declared option stays a triage finding, never a reward |
+| `variance/contrast.py:452` `_verdict` (witness) | Executed witness calls show each deciding fact, no error, no verbatim answer, enough calls | protocol | Unchanged; it proves discoverability, not success |
+| `variance/milestone.py:650`-`:673`, `:780` | Point separation from `run_option_contrast` | consumer of semantic rates | Follows judged contrasts; no separate grading |
+| `variance/family_stages.py:255` `grade_variants` (`variance/grader.py:281` `grade_episodes`) | Probabilistic criterion grading of confirmation episodes; only ambiguity and grading success reach eligibility | semantic diagnostic | Judge every confirmation episode; eligibility counts judged, unscored, insufficient-evidence and rubric-problem outcomes separately; criterion probabilities stay calibration evidence only |
+| `variance/records.py:424`, `:432` `family_flip`, `fresh_confirmation` conditions | From `FlipVerdict` over verifier-labelled contrasts | semantic | From judged contrasts of the frozen variant judge |
+| `variance/records.py:450` `critic_scores` | Critic draws without a scored reward | consumer of semantic rates | Unchanged over judged rates |
+| `variance/records.py:478` `rubric_unambiguous` | `rubric_graded` and ambiguous criteria from `grade_variants` | semantic | Replaced by judged-coverage and rubric-problem conditions; one uncertain criterion is not proof of ambiguity |
+| `variance/records.py:443`, `:457`, `:464`, `:471` (dispositions, tool coverage, rule witnesses, policy consistency) | Audit and world evidence | protocol | Unchanged |
+| `variance/records.py:564` `training_records` (`measured_rate` `:604`, `advantages` `:622`) | Copies critic targets and group advantages from the discovery `ActorCriticReport` | semantic handoff | Build from the family's judged variant studies under the frozen variant judge; discovery scores stay diagnostic |
+| `variance/family.py:598`, `:617`, `:621`, `:682` `_continue`/`_finish` | Selection, confirmation, rubric grading and records wiring | consumer | Freeze the `JudgeDefinition` per variant before scored critic predictions and fresh continuations; pass judged studies to records |
+| `variance/family.py:357` `export_family_harbor` (`:396`) | Qualified only when eligible, confirmed and an executable qualification exists | consumer | Package the exact private judge binding; qualification of the LLM assessment path is separate from observable-contract qualification |
+| `executable/trial.py:231` `result` (`grade` `:245`, `reward` `:258`) | Harbor reward from `grade(task.job.study.verifier, outcome)` when qualified | semantic | `judge_episode` over the trial's harness-recorded evidence, including captured intermediate dialogue; reward `episode_reward` |
+| `harbor/client.py:164`-`:165` | Writes `reward.json` from the backend's `reward` and `status` | encoding | Unchanged; it only serializes the judged reward |
+| `harbor/trial.py:304` `result` (`grade` `:310`, `task_decision` `:365`) | Mechanical grade combined with dual-evaluator axes for `EvaluationTask` Harbor trials | separate evaluation mode | Keeps its explicit contract; never used for decision-variance family exports |
+
 ## What this does not establish
 
 Structural gates are necessary, not sufficient. Simulator continuations reduce sampling noise but

@@ -310,6 +310,15 @@ PROTOCOLS = (
         ("exp.optimize.evaluation.variance.grader",),
         "5581d2240bfa5181f7eb71729c0de7e2d3e5deed6f816b29f01bc9ffe070058e",
     ),
+    Protocol(
+        "exp.optimize.evaluation.variance.judge:JUDGE_PROTOCOL",
+        "episode-judge-v1",
+        (
+            "exp.optimize.evaluation.variance.judge",
+            "exp.optimize.evaluation.variance.judge_prompt",
+        ),
+        "b9e458048633de371b36772dea0c8196b7072e214ce09deb9acdea84baf1627a",
+    ),
 )
 
 
