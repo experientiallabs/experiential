@@ -611,9 +611,14 @@ What the stages read beyond their own owners lives in `variance/pipeline_inputs.
   saved, the admissions and selected probes in the plan. Error mining refuses a job whose task
   the build did not select as a probe. With `traceml.error_bank`, the coalition's mistake
   patterns come from each tier's attempt error tags, one pattern per tier and proposition.
-- **Rules research search.** With `mining.retrieval`, the rules stage's research draws query
-  the same world-learning search the selectors use. The plan prices research, weighing (per
-  merged rule, listed as unpriced until research ends) and condensation draws.
+- **Rules memory and research search.** The pipeline's rules stage learns the governed rule
+  memory by default (`rules.jev_memory`, the `jev_memory` profile with System One decisions on
+  `rules.jev_alias`); its plan prices that profile over one topic per task tool plus the
+  environment. The saved memory set is bound with its recall policy (`RuleMemoryBinding`) beside
+  the rule book into the rule-bound mining runtime, from which every tier group, frozen variant
+  world and Harbor export derives. With `mining.retrieval`, research draws query the same
+  world-learning search the selectors use; the research profile is priced as research, weighing
+  (per merged rule, unpriced until research ends) and condensation draws.
 - **Decision variance.** On by default (`authoring.decision_variance`): each family measures
   every confirmed variant's choice shift, consequence and clarity from judged free continuations
   (`decision_free_repeats`), with an open-weight classifier (`decision_classifier`, default the

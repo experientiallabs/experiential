@@ -26,6 +26,7 @@ from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinitio
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.fidelity.retrieval_binding import rag_index_embedder_alias
 from exp.optimize.evaluation.induction.episodes import trace_episode
+from exp.optimize.evaluation.rules.memory_stage import memory_stage_costs
 from exp.optimize.evaluation.rules.stage import RulesStageSpec, load_rulebook
 from exp.optimize.evaluation.variance.authoring_packet import (
     SourceRef,
@@ -139,23 +140,29 @@ def observed_episodes(
 
 
 def rules_costs(
-    project: ProjectStore, spec: RulesStageSpec, traces: int
+    project: ProjectStore, spec: RulesStageSpec, traces: int, tools: int = 0
 ) -> tuple[tuple[CostComponent, ...], str]:
     """Price a rules stage's draws and describe them.
 
-    Agentic research buys one bounded draw per trace, variant and round, then one weighing per
-    merged rule and one condensation. The rule count is known only after research, so the
-    weighings are listed with their per-rule bound and left unpriced in the total.
+    The ``jev_memory`` profile is priced by its owner over one topic per tool plus the
+    environment, capped by its topic limit. Agentic research buys one bounded draw per trace,
+    variant and round, then one weighing per merged rule and one condensation. The rule count is
+    known only after research, so the weighings are listed with their per-rule bound and left
+    unpriced in the total.
 
     Args:
         project: Project whose catalog prices the author.
         spec: The registration.
         traces: World-learning traces read, at most.
+        tools: Tools of the task, for the memory profile's topics.
 
     Returns:
         The cost components and one line describing them.
     """
     author = spec.author
+    if spec.profile == "jev_memory" and spec.memory is not None:
+        topics = min(tools + 1, spec.memory.maximum_topics)
+        return memory_stage_costs(project, author, spec.weighing, spec.memory, topics=topics)
     per_call = evaluation_costs(project, author)
     if spec.profile == "single_draw":
         line = f"{traces} extraction draws with {author.model_alias}"

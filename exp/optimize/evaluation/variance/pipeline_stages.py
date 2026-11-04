@@ -44,12 +44,13 @@ from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
+    RuleMemoryBinding,
     continuation_runtime,
 )
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.rules.challenges import RuntimeChallenges
-from exp.optimize.evaluation.rules.stage import RulesStageReport, run_rules_stage
+from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
     ActorCriticSpec,
@@ -127,6 +128,7 @@ from exp.simulation.mining.traceml import (
 )
 from exp.simulation.mining.traceml_moves import MoveJudge, MoveJudgeError
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
+from exp.simulation.rules.recall import RecallPolicy
 
 __all__ = ["BUILD_STAGE", "MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
 
@@ -278,7 +280,10 @@ class _RulesStage:
         """Price one extraction draw per world-learning trace, up to the trace cap."""
         del code_revision
         settings = spec.rules
-        costs, draws = rules_costs(project, settings.spec, settings.maximum_traces)
+        start = load_continuation_checkpoint(project.artifacts, spec.mining.job.study.checkpoint)
+        costs, draws = rules_costs(
+            project, settings.stage_spec(), settings.maximum_traces, len(start.task.tools)
+        )
         challenge = settings.challenge and settings.spec.base_state is not None
         bound = "bound into" if settings.bind_rule_book else "kept out of"
         lines = (
@@ -302,34 +307,52 @@ class _RulesStage:
                 f"rules.maximum_traces={spec.rules.maximum_traces}; raise the cap"
             )
         world = _world(spec.mining.job, build, None)
-        challenge = spec.rules.challenge and spec.rules.spec.base_state is not None
+        stage = spec.rules.stage_spec()
+        challenge = spec.rules.challenge and stage.base_state is not None
         search = _rules_search(context, build, exposure)
+        decisions = None if stage.memory is None else _rules_decisions(context, stage)
         if challenge:
-            with RuntimeChallenges(project, world, refusal=spec.rules.spec.refusal) as executor:
+            with RuntimeChallenges(project, world, refusal=stage.refusal) as executor:
                 report = run_rules_stage(
                     project,
-                    spec.rules.spec,
+                    stage,
                     exposure=exposure,
                     traces=traces,
                     code_revision=revision,
                     challenge=executor,
                     search=search,
+                    decisions=decisions,
                 )
         else:
             report = run_rules_stage(
                 project,
-                spec.rules.spec,
+                stage,
                 exposure=exposure,
                 traces=traces,
                 code_revision=revision,
                 search=search,
+                decisions=decisions,
             )
         saved = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
+        memory = (
+            None
+            if report.memory_set is None
+            else RuleMemoryBinding(
+                memory_set=report.memory_set, recall=RecallPolicy(jev_alias=spec.rules.jev_alias)
+            )
+        )
         job = spec.mining.job
         if spec.rules.bind_rule_book:
-            job = bound_job(project, job, _world(job, build, report.rulebook), revision)
+            definition = _world(job, build, report.rulebook, memory)
+            job = bound_job(project, job, definition, revision)
         executed = 0 if report.challenges is None else len(report.challenges.runs)
-        outputs = RulesOutputs(report=saved, rulebook=report.rulebook, challenges=executed, job=job)
+        outputs = RulesOutputs(
+            report=saved,
+            rulebook=report.rulebook,
+            challenges=executed,
+            job=job,
+            rule_memory=memory if spec.rules.bind_rule_book else None,
+        )
         summary = _rules_summary(report) | {"challenges_executed": executed}
         return StageRun(outputs, (saved, report.rulebook, job.study.checkpoint), summary)
 
@@ -757,16 +780,45 @@ def _report_reference(
 
 
 def _world(
-    job: ContinuationJob, build: BuildOutputs, rulebook: ArtifactInput | None
+    job: ContinuationJob,
+    build: BuildOutputs,
+    rulebook: ArtifactInput | None,
+    memory: RuleMemoryBinding | None = None,
 ) -> GroundedRuntimeDefinition:
-    """Return the job's grounded runtime over the build's world, binding, and rule book."""
+    """Return the job's grounded runtime over the build's world, binding, rules and memory.
+
+    Every later served world (the tiers' groups, the frozen variant worlds and the Harbor
+    exports) derives from this definition, so they all recall the same rule memory.
+    """
     definition = GroundedRuntimeDefinition.model_validate(job.configuration)
     return definition.model_copy(
         update={
             "world_model": build.world_model,
             "tag_retrieval": build.tag_retrieval,
             "rule_book": rulebook,
+            "rule_memory": memory,
         }
+    )
+
+
+def _rules_decisions(context: StageContext, stage: RulesStageSpec) -> DecisionsTraceTagger:
+    """Bind the rules memory's System One decisions to its admitted native decision alias."""
+    injected = context.dependencies.rules_decisions
+    if injected is not None:
+        return injected
+    assert stage.memory is not None
+    project = context.project
+    catalog = load_model_catalog(project.model_catalog_path)
+    resolved = RuntimeModelCatalog(catalog).resolve(stage.memory.decision_alias)
+    deadline = datetime.now(UTC) + timedelta(hours=context.spec.traceml.deadline_hours)
+    transport = admitted_transport(context, "rules-decisions", 100_000, deadline).priced_as(
+        stage.memory.decision_alias
+    )
+    return DecisionsTraceTagger.for_alias(
+        resolved,
+        transport=transport,
+        cache=DecisionCache(project.paths),
+        maximum_concurrency=stage.concurrency,
     )
 
 

@@ -931,9 +931,10 @@ def fixture_rules_stage(
     traces: tuple[Trace, ...],
     code_revision: str,
     search: TraceSearch | None = None,
+    decisions: DecisionsTraceTagger | None = None,
 ) -> RulesStageReport:
     """The rules owner's stand-in: the saved ticket rule book, after the owner's exposure check."""
-    del search
+    del search, decisions
     exposure.require((trace.trace_id for trace in traces), "world_learning")
     rulebook, book = save_book(project)
     report = _report(spec, book, rulebook)
@@ -1157,7 +1158,11 @@ def make_spec(
     )
     return DecisionVarianceSpec(
         build=BuildSettings(spec=VarianceBuildSpec()),
-        rules=RulesSettings(spec=rules, maximum_traces=4),
+        # The stand-in rules owner ignores the memory profile, so the default jev_memory profile
+        # stays on with the fixture's decision alias; the agentic run learns rules by research.
+        rules=RulesSettings(
+            spec=rules, maximum_traces=4, jev_memory=not agentic, jev_alias="judge"
+        ),
         traceml=TraceMLSettings(
             decision_alias="judge",
             bank_root=bank,
@@ -1275,7 +1280,9 @@ def wired(root: Path, monkeypatch: pytest.MonkeyPatch, *, agentic: bool = False)
         bank=write_bank(root),
         executors={"variance-build": FixtureBuild(fixture)},
         dependencies=StageDependencies(
-            traceml_tagger=step_tagger(fixture.project), harbor_root=root / "harbor"
+            traceml_tagger=step_tagger(fixture.project),
+            rules_decisions=step_tagger(fixture.project),
+            harbor_root=root / "harbor",
         ),
     )
 

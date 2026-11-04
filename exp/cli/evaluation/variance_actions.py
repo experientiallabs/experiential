@@ -66,6 +66,7 @@ from exp.optimize.evaluation.variance.schedule import (
     schedule_state,
 )
 from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.rules.contracts import parse_tool_contracts
 
 
 class VarianceBuildAction(ContractModel):
@@ -261,7 +262,8 @@ def handle_rules_stage(context: ContinuationContext, action: RulesStageAction) -
     exposure.require(action.traces, "world_learning")
     traces = select_traces(store, action.traces, action.dataset)
     saved = store.artifacts.exists(rules_stage_identity(spec, traces, revision) + "-result")
-    components, draws = rules_costs(store, spec, len(traces))
+    tools = len(parse_tool_contracts(traces))
+    components, draws = rules_costs(store, spec, len(traces), tools)
     console.print(
         f"Rules stage: {len(traces)} traces; {draws}; {spec.concurrency} at once; at most "
         f"{spec.author.maximum_physical_attempts} author HTTP attempts per call. Saved draws "

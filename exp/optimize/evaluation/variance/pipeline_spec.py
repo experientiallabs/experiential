@@ -41,8 +41,10 @@ from exp.common.core.artifacts import (
 from exp.common.models import ToolCall
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.controls import DeclaredControl
+from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.memory_stage import MemorySetSettings
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, VariantJudging
 from exp.optimize.evaluation.variance.behavior_curation import CuratorVariant
@@ -145,12 +147,32 @@ class RulesSettings(ContractModel):
             runtime over the build's world model) instead of leaving workloads unexecuted.
         bind_rule_book: Bind the saved rule book into the mining job's runtime and capture a new
             start there, before any probe. False keeps the job's own runtime definition.
+        jev_memory: Learn the governed rule memory (the ``jev_memory`` profile) when ``spec``
+            registers no memory and uses the default research profile; the memory set is then
+            recalled step by step in every served world.
+        jev_alias: Catalog alias of the native decision model System One reads with and recall
+            uses, the same alias the decision tagging uses.
     """
 
     spec: RulesStageSpec
     maximum_traces: int = Field(default=64, ge=1, le=10_000, strict=True)
     challenge: bool = True
     bind_rule_book: bool = True
+    jev_memory: bool = True
+    jev_alias: str = Field(default="jev", min_length=1)
+
+    def stage_spec(self) -> RulesStageSpec:
+        """Return the registration the stage runs: ``jev_memory`` by default."""
+        spec = self.spec
+        if not self.jev_memory or spec.memory is not None or spec.profile != "agentic_research":
+            return spec
+        return RulesStageSpec.model_validate(
+            {
+                **spec.model_dump(mode="json"),
+                "profile": "jev_memory",
+                "memory": MemorySetSettings(decision_alias=self.jev_alias).model_dump(mode="json"),
+            }
+        )
 
 
 class TraceMLSettings(ContractModel):
@@ -666,6 +688,8 @@ class StageDependencies:
         build_constructor: Admitted world-model constructor, when the build reconstructs.
         build_namer: Cluster naming model, or None for the admitted ``build.naming_alias``.
         traceml_tagger: Tagger for TraceML labels, or None for the admitted decision tagger.
+        rules_decisions: System One decisions client of the rules memory, or None for the
+            admitted ``rules.jev_alias`` tagger.
         harbor_root: Directory receiving Harbor exports, or None for the project runtime
             directory.
     """
@@ -674,6 +698,7 @@ class StageDependencies:
     build_namer: ClusterNamer | None = None
     build_constructor: Constructor | None = None
     traceml_tagger: TraceTagger | None = None
+    rules_decisions: DecisionsTraceTagger | None = None
     harbor_root: Path | None = None
 
 
@@ -733,14 +758,16 @@ class RulesOutputs(ContractModel):
         report: Saved ``rules-stage-report``.
         rulebook: The frozen rule book.
         challenges: Executed challenge cases.
-        job: The mining job bound to the build's world, its binding and the rule book, with
-            a start captured there.
+        job: The mining job bound to the build's world, its binding, the rule book and the rule
+            memory, with a start captured there.
+        rule_memory: The governed rule memory set and its recall policy, under ``jev_memory``.
     """
 
     report: ArtifactInput
     rulebook: ArtifactInput
     challenges: int = Field(default=0, ge=0)
     job: ContinuationJob
+    rule_memory: RuleMemoryBinding | None = None
 
 
 class TraceMLOutputs(ContractModel):

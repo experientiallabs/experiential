@@ -596,7 +596,7 @@ def _family(point: _Point) -> FamilyOutcome:
         tiers={point.report.spec.initial.study.actor_model.model_id: point.tier.tier},
         dispositions=authoring.dispositions,
         decision_variance=authoring.decision_measure(),
-    )
+    ).model_copy(update=_measure_switch(authoring.decision_variance))
     point.draws = family_spec.draws_identity(point.report, point.point, revision)
     family = run_decision_family(
         project,
@@ -638,6 +638,20 @@ def _family(point: _Point) -> FamilyOutcome:
         admitted=family.eligibility.eligible,
         reasons=tuple(family.eligibility.reasons),
         failure=family.failure,
+    )
+
+
+def _measure_switch(enabled: bool) -> dict[str, bool]:
+    """Switch the family's joint decision measure, when its owner offers the switch.
+
+    The family owner gates confirmation on the measure by default; the pipeline's
+    ``authoring.decision_variance`` decides it, so a disabled measure is never run under the
+    owner's own default settings.
+    """
+    return (
+        {"measure_decisions": enabled}
+        if "measure_decisions" in DecisionFamilySpec.model_fields
+        else {}
     )
 
 
