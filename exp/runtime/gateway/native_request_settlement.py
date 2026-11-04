@@ -7,10 +7,7 @@ from dataclasses import dataclass, field
 from inspect import signature
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
-from exp.runtime.gateway.native_accounting_errors import (
-    NativeBridgeError,
-    accounting_recovering_error,
-)
+from exp.runtime.gateway.native_accounting_fence import fences_after
 from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import SyncWriteLedger
 
@@ -25,6 +22,8 @@ class _Settlement:
         certify_no_effects: Whether accounting can certify no paid work occurred.
         web_search_requests: Completed search count to persist with the request.
         retained: Whether a failed write needs recovery, false initially.
+        fences: Whether the latest failed write fences its organization's
+            admission; a deliberate ledger refusal never does. False initially.
         committed: Durable result shared by concurrent callers, initially unknown.
         lock: Per-request lock serializing terminal writes and recovery attempts.
     """
@@ -34,6 +33,7 @@ class _Settlement:
     certify_no_effects: bool
     web_search_requests: int
     retained: bool = False
+    fences: bool = False
     committed: bool | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -69,10 +69,14 @@ class RequestSettlements:
         with self._lock:
             return bool(self._pending)
 
-    def require_clear(self) -> None:
-        """Refuse new paid work while this registry retains a failed meter write."""
-        if self.pending:
-            raise NativeBridgeError(accounting_recovering_error())
+    def fenced_organizations(self) -> set[str]:
+        """Return the organizations owning a retained write that fences their admission."""
+        with self._lock:
+            return {
+                settlement.authorization.organization_id
+                for settlement in self._pending.values()
+                if settlement.retained and settlement.fences
+            }
 
     def finish(
         self,
@@ -107,9 +111,10 @@ class RequestSettlements:
                     certify_no_effects=settlement.certify_no_effects,
                     web_search_requests=settlement.web_search_requests,
                 )
-            except Exception:  # noqa: BLE001 - failed ownership must survive any ledger fault.
+            except Exception as exc:  # noqa: BLE001 - failed ownership must survive any ledger fault.
                 with self._lock:
                     settlement.retained = True
+                    settlement.fences = fences_after(exc)
                 raise
             settlement.committed = committed is True
             with self._lock:

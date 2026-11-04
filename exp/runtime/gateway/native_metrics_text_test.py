@@ -58,6 +58,7 @@ def _control_plane() -> JsonObject:
         "reconciled_expired_requests": 0,
         "reconciled_unknown_attempts": 0,
         "accounting_healthy": True,
+        "accounting_fenced_organizations": 1,
         "observation_recording_dropped": 3,
         "observation_recording_failed": 2,
     }
@@ -172,6 +173,9 @@ exp_gateway_sticky_spill_bindings 4
 # HELP exp_gateway_accounting_healthy Control-plane accounting health (1 healthy, 0 failed).
 # TYPE exp_gateway_accounting_healthy gauge
 exp_gateway_accounting_healthy 1
+# HELP exp_gateway_accounting_fenced_organizations Organizations fenced by failed accounting writes.
+# TYPE exp_gateway_accounting_fenced_organizations gauge
+exp_gateway_accounting_fenced_organizations 1
 """
 
 _EXPECTED_FULL = (

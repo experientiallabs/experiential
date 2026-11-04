@@ -24,6 +24,32 @@ class AccountingRecoveryUnresolvedTerminalError(GatewayLedgerError):
     """
 
 
+class AccountingRefusedError(GatewayLedgerError):
+    """A deliberate, clean per-request refusal from the durable ledger.
+
+    A host ledger raises this when it answers a write on purpose rather than
+    failing to reach durable storage: for example when another ledger owns the
+    organization's balance for now. The write did not land, but the ledger is
+    healthy, so the refusal is a retryable error for this one request only and
+    never counts as a settle failure: it fences no organization's admission.
+    A refused terminal write stays owned by the recovery sweep and is replayed
+    until it lands.
+    """
+
+    def __init__(self, message: str, *, retry_after_seconds: int | None = 1) -> None:
+        """Retain the internal message and the advertised client wait.
+
+        Args:
+            message: Internal diagnostic message, never shown to callers.
+            retry_after_seconds: Positive ``Retry-After`` for the caller, or
+                ``None`` to advertise no wait.
+        """
+        if retry_after_seconds is not None and retry_after_seconds <= 0:
+            raise ValueError("an accounting refusal's retry wait must be positive")
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class AttemptRejectedError(GatewayLedgerError):
     """A typed pre-dispatch rejection during authorization, acceptance or reservation.
 

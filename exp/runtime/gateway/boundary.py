@@ -14,6 +14,7 @@ from pathlib import Path
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.ledger import (
+    AccountingRefusedError,
     AttemptRejectedError,
     IdempotencyConflictError,
     IdempotencyReplayUnavailableError,
@@ -106,6 +107,14 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             ),
             error_type="api_error",
             param="Idempotency-Key",
+        )
+    elif isinstance(exception, AccountingRefusedError):
+        error = OpenAIProtocolError(
+            status_code=503,
+            code="accounting_refused",
+            message="Request accounting refused this request. Retry it.",
+            error_type="api_error",
+            retry_after_seconds=exception.retry_after_seconds,
         )
     elif isinstance(exception, GuardrailRejected):
         error = public_failure_error(exception.failure)

@@ -204,8 +204,8 @@ fn settle_argument(
 
 /// Deliver one control-plane write with bounded backoff; the control plane
 /// keeps the in-flight entry on a failed terminal write, so retries can
-/// still land. A persistent failure stays latched as accounting-unhealthy
-/// control-plane side and is reconciled at the next startup.
+/// still land. A persistent failure fences only the owning organization's
+/// admission control-plane side and is reconciled at the next startup.
 async fn deliver(bridge: &Bridge, method: &'static str, argument: String) -> bool {
     for backoff_ms in [0u64, 100, 500, 2_000] {
         if backoff_ms > 0 {
@@ -217,7 +217,7 @@ async fn deliver(bridge: &Bridge, method: &'static str, argument: String) -> boo
         }
     }
     // The control plane keeps the in-flight entry; its sweep keeps retrying
-    // and latches readiness if the loss is durable. Leave an operator signal
+    // while the owning organization stays fenced. Leave an operator signal
     // as one structured, content-free stderr line beside the counter.
     METRICS.record_settlement_give_up();
     let parsed: Value = serde_json::from_str(&argument).unwrap_or(Value::Null);

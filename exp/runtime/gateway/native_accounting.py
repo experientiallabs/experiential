@@ -44,6 +44,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     authority_error,
     internal_protocol_error,
 )
+from exp.runtime.gateway.native_accounting_fence import fenced_entry_organizations, fences_after
 from exp.runtime.gateway.native_accounting_recovery import (
     RecoveryRotation,
     recover_expired,
@@ -122,7 +123,8 @@ class NativeAttemptAccounting:
     """Registry of admitted requests and their durable attempt settlements.
 
     A lock protects Rust callbacks; a background sweep owns abandoned reservations.
-    Failed terminal writes block this control plane's admission until recovery.
+    A failed terminal write fences only its own organization's admission until
+    recovery lands it (``native_accounting_fence``).
     """
 
     def __init__(
@@ -213,15 +215,24 @@ class NativeAttemptAccounting:
             )
         return not pending and not self.request_settlements.pending
 
-    def require_clear(self) -> None:
-        """Refuse new work while this control plane owns a failed accounting write."""
-        self.request_settlements.require_clear()
+    def fenced_organizations(self) -> frozenset[str]:
+        """Return the organizations whose admission a failed accounting write fences."""
         with self._lock:
-            pending = any(
-                entry.settlement_write_failed or entry.abandon_write_failed
-                for entry in self._inflight.values()
-            )
-        if pending:
+            fenced = fenced_entry_organizations(self._inflight.values())
+        return frozenset(fenced | self.request_settlements.fenced_organizations())
+
+    def require_clear(self, organization_id: str) -> None:
+        """Refuse one organization's new work while it owns a failed accounting write.
+
+        Args:
+            organization_id: The admitting authorization's organization. Other
+                organizations' failed writes never refuse it.
+
+        Raises:
+            NativeBridgeError: ``accounting_unavailable`` until the sweep lands
+                this organization's retained writes.
+        """
+        if organization_id in self.fenced_organizations():
             raise NativeBridgeError(accounting_recovering_error())
 
     @property
@@ -809,7 +820,7 @@ class NativeAttemptAccounting:
             # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
-                entry.settlement_write_failed = True
+                entry.settlement_write_failed = fences_after(exc)
             raise authority_error(exc) from exc
         failure = terminal.failure
         record_attempt_health(
@@ -907,7 +918,7 @@ class NativeAttemptAccounting:
                     )
             except Exception as exc:  # noqa: BLE001 - the data plane retries.
                 with self._lock:
-                    entry.abandon_write_failed = True
+                    entry.abandon_write_failed = fences_after(exc)
                 raise authority_error(exc) from exc
             with self._lock:
                 # A meter may arrive while the unknown cancellation is writing.
@@ -978,22 +989,3 @@ class NativeAttemptAccounting:
     def sweep_expired(self) -> None:
         """Recover a fair bounded selection without running in admission callbacks."""
         recover_expired(self)
-
-    def _settle_swept(
-        self,
-        request_id: str,
-        entry: InflightRequest,
-        settlement: JsonObject,
-    ) -> bool:
-        """Replay owned evidence, skipping busy requests and stale sweep selections."""
-        if not entry.execution_lock.acquire(blocking=False):
-            return False
-        try:
-            if self.entry(request_id) is not entry or entry.pending_settlement != settlement:
-                return False
-            self._commit_settlement(request_id, entry, settlement)
-            return True
-        except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
-            return False
-        finally:
-            entry.execution_lock.release()
