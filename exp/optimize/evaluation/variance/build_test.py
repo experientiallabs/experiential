@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+import threading
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,9 +30,15 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectConfig, ProjectStore
+from exp.common.project.errors import ArtifactStoreError
+from exp.common.project.paths import ProjectPaths
 from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
-from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
+from exp.optimize.evaluation.variance.build import (
+    _tag_units,
+    plan_variance_build,
+    run_variance_build,
+)
 from exp.optimize.evaluation.variance.build_records import (
     REPORT_TYPE,
     ConstructionSettings,
@@ -46,10 +53,16 @@ from exp.optimize.evaluation.variance.exposure import plan_exposure
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from exp.runtime.models.spend_ceiling import SpendCeilingReached
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.error_tags import ERROR_BANK_ID, error_patterns, load_error_tags
-from exp.simulation.mining.questions import LOCAL_BANK_ROOT_VARIABLE, resolve_question_bank
+from exp.simulation.mining.questions import (
+    LOCAL_BANK_ROOT_VARIABLE,
+    Question,
+    QuestionBank,
+    resolve_question_bank,
+)
 from exp.simulation.mining.tag_cluster_names import (
     ClusterNamer,
     ClusterNamingSpec,
@@ -63,8 +76,8 @@ from exp.simulation.mining.tag_clusters import (
     load_tag_clustering,
 )
 from exp.simulation.mining.tag_selection import TagRule
-from exp.simulation.mining.tagging import DecisionCache
-from exp.simulation.mining.views import observations_view, task_view
+from exp.simulation.mining.tagging import DecisionCache, TagMatrix, TraceTaggingError
+from exp.simulation.mining.views import Unit, observations_view, task_view
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -526,3 +539,116 @@ def test_a_project_without_a_build_is_refused(tmp_path: Path) -> None:
     project.initialize(ProjectConfig(project_id="empty"))
     with pytest.raises(ValueError, match="completed `exp build`"):
         plan_variance_build(project, VarianceBuildSpec(), code_revision="test")
+
+
+def _recovery_bank() -> QuestionBank:
+    """Return a single proposition for focused recovery checks."""
+    return QuestionBank(
+        bank_id="recovery-v1",
+        version=1,
+        questions=(Question(question_id="shape.valid", family="shape", text="Is this valid?"),),
+    )
+
+
+def test_unsafe_input_is_quarantined_without_losing_valid_rows(tmp_path: Path) -> None:
+    """One unsafe observation leaves valid source rows and an explicit trace failure."""
+    bank = _recovery_bank()
+    units = (
+        Unit("unsafe", "observations", "password: synthetic-placeholder"),
+        Unit("safe", "observations", "Repair the feature and run tests."),
+    )
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    decide = FakeDecisions()
+    tagger = DecisionsTraceTagger(decide, NAMER, cache=cache, maximum_concurrency=2)
+
+    matrix, failed = _tag_units(tagger, units, bank)
+
+    assert [row.trace_id for row in matrix.rows] == ["safe"]
+    assert len(failed) == 1 and failed[0][0] == "unsafe"
+    assert "credential boundary" in failed[0][1]
+    assert decide.states == [units[1].text]
+    assert len(cache.records.list_ids()) == 1
+
+
+def test_recovery_keeps_remaining_calls_bounded_and_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed initial pass must not turn uncached recovery calls into serial work."""
+    bank = _recovery_bank()
+    units = (Unit("bad", "observations", "bad"),) + tuple(
+        Unit(f"valid-{i}", "observations", f"valid-{i}") for i in range(4)
+    )
+    barrier = threading.Barrier(2, timeout=10)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+    calls: list[str] = []
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        """Require two recovery calls to overlap and count actual in-flight work."""
+        nonlocal active, peak
+        state = request.state
+        assert isinstance(state, str)
+        if state == "bad":
+            raise TraceTaggingError("invalid source")
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            calls.append(state)
+        try:
+            barrier.wait()
+            return _answers(state, request.questions, drop=None)
+        finally:
+            with lock:
+                active -= 1
+
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    tagger = DecisionsTraceTagger(decide, NAMER, cache=cache, maximum_concurrency=2)
+    original_tag = tagger.tag
+    initial = True
+
+    def tag(items: Sequence[Unit], questions: QuestionBank) -> TagMatrix:
+        """Make the first pass fail before testing real per-unit recovery."""
+        nonlocal initial
+        if initial:
+            initial = False
+            raise TraceTaggingError("initial pass failed")
+        return original_tag(items, questions)
+
+    monkeypatch.setattr(tagger, "tag", tag)
+    matrix, failed = _tag_units(tagger, units, bank)
+
+    assert [row.trace_id for row in matrix.rows] == [unit.trace_id for unit in units[1:]]
+    assert len(failed) == 1 and failed[0][0] == "bad"
+    assert sorted(calls) == sorted(unit.text for unit in units[1:])
+    assert peak == 2
+
+
+@pytest.mark.parametrize("after_first_failure", [False, True])
+@pytest.mark.parametrize("budget_refusal", [False, True])
+def test_artifact_refusals_abort_tagging_and_recovery(
+    tmp_path: Path, after_first_failure: bool, budget_refusal: bool
+) -> None:
+    """Output, storage and spend refusals must not become skipped input rows."""
+    refusal = (
+        SpendCeilingReached(1, 1, 2)
+        if budget_refusal
+        else ArtifactStoreError("provider output was refused")
+    )
+    units = ((Unit("bad", "observations", "bad"),) if after_first_failure else ()) + (
+        Unit("safe", "observations", "safe"),
+    )
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        """Optionally fail one input, then raise a fatal output refusal."""
+        if request.state == "bad":
+            raise TraceTaggingError("invalid source")
+        raise refusal
+
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    tagger = DecisionsTraceTagger(decide, NAMER, cache=cache, maximum_concurrency=1)
+
+    with pytest.raises(type(refusal)) as caught:
+        _tag_units(tagger, units, _recovery_bank())
+
+    assert caught.value is refusal

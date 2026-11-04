@@ -11,6 +11,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot
+from exp.common.project.errors import ArtifactStoreError
 from exp.common.project.paths import ProjectPaths
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS, DecisionRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -132,7 +133,7 @@ def test_unsafe_input_is_refused_before_cache_claim_or_native_dispatch(tmp_path:
         _resolved(_Client(profile)), transport=transport, cache=cache
     )
     key = decision_key(unit, bank.questions, tagger.model_identity)
-    with pytest.raises(TraceTaggingError, match="unit excluded before dispatch") as caught:
+    with pytest.raises(TraceTaggingError, match="credential boundary") as caught:
         tagger.tag([unit], bank)
     assert "entirely-fake-test-value" not in str(caught.value)
     assert transport.requests == []
@@ -698,3 +699,51 @@ def test_a_nonpositive_concurrency_is_refused_before_anything_is_rendered() -> N
     """A tagger that can never dispatch is a configuration mistake, not a quiet no-op."""
     with pytest.raises(TraceTaggingError, match="at least one call in flight"):
         DecisionsTraceTagger(_Recorder([]), _SNAPSHOT, maximum_concurrency=0)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("unsafe_part", ["state", "question"])
+def test_unsafe_native_input_never_claims_or_dispatches(
+    tmp_path: Path, cached: bool, unsafe_part: str
+) -> None:
+    """Reject unsafe source content before either a cache claim or a provider call."""
+    bank = _bank(1)
+    unit = _unit("unsafe-source")
+    if unsafe_part == "state":
+        unit = _unit("unsafe-source", "password: synthetic-placeholder")
+    else:
+        bank = bank.model_copy(
+            update={
+                "questions": (
+                    bank.questions[0].model_copy(
+                        update={"text": "password: synthetic-placeholder"}
+                    ),
+                )
+            }
+        )
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    recorder = _Recorder([_answers(bank)])
+    tagger = DecisionsTraceTagger(recorder, _SNAPSHOT, cache=cache if cached else None)
+
+    with pytest.raises(TraceTaggingError, match="unsafe-source.*credential boundary"):
+        tagger.tag([unit], bank)
+
+    assert recorder.requests == []
+    assert not cache.records.list_ids()
+
+
+def test_dispatch_artifact_refusal_is_not_an_input_failure(tmp_path: Path) -> None:
+    """A provider output or storage refusal must retain its original fatal classification."""
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    refusal = ArtifactStoreError("provider output was refused")
+
+    def refuse_output(request: DecisionRequest) -> JsonObject:
+        """Raise the original downstream refusal after safe input was admitted."""
+        raise refusal
+
+    tagger = DecisionsTraceTagger(refuse_output, _SNAPSHOT, cache=cache)
+    with pytest.raises(ArtifactStoreError) as caught:
+        tagger.tag([_unit("safe-source")], _bank(1))
+
+    assert caught.value is refusal
+    assert len(cache.records.list_ids()) == 1

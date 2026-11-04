@@ -328,33 +328,6 @@ class DecisionsTraceTagger:
                 tokens += int(_number(usage.get("input_tokens")) or 0)
         return _UnitAnswers(values=tuple(values), bought=bought, spend=spend, tokens=tokens)
 
-    def validate_unit(self, unit: Unit, bank: QuestionBank) -> None:
-        """Validate every input batch before a parallel pass claims or dispatches this unit.
-
-        Raises:
-            TraceTaggingError: Input cannot cross the existing credential boundary.
-        """
-        for chunk in question_chunks(bank.questions, self.batch_limit):
-            self._request(unit, chunk)
-
-    def _request(self, unit: Unit, chunk: Sequence[Question]) -> DecisionRequest:
-        """Build and validate the exact native input without claiming its decision cache key."""
-        request = DecisionRequest(
-            state=unit.text,
-            questions={
-                question.question_id: NoulQuestion(instructions=question.text) for question in chunk
-            },
-        )
-        try:
-            validate_provider_response(
-                json.dumps(request.provider_body(self._provider_model_id), ensure_ascii=False)
-            )
-        except ArtifactStoreError:
-            raise TraceTaggingError(
-                "decision input violates the credential boundary; unit excluded before dispatch"
-            ) from None
-        return request
-
     def _body(self, unit: Unit, chunk: Sequence[Question]) -> tuple[JsonObject, bool]:
         """Return one batch's response and whether this run paid for it.
 
@@ -368,7 +341,25 @@ class DecisionsTraceTagger:
         Returns:
             The response body, and True when a provider call was actually dispatched.
         """
-        request = self._request(unit, chunk)
+        request = DecisionRequest(
+            state=unit.text,
+            questions={
+                question.question_id: NoulQuestion(instructions=question.text) for question in chunk
+            },
+        )
+        try:
+            validate_provider_response(
+                json.dumps(
+                    request.provider_body(self._provider_model_id),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+        except ArtifactStoreError as exc:
+            raise TraceTaggingError(
+                f"trace {unit.trace_id} input violates the credential boundary; "
+                "remove credential-bearing source content or exclude this trace"
+            ) from exc
         if self.cache is None:
             return self._decide(request), True
         dispatched = False

@@ -103,6 +103,7 @@ from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
+from exp.simulation.mining.dispatch import dispatch_tagging
 from exp.simulation.mining.environment_review import CompatibilityReviewer
 from exp.simulation.mining.error_tags import (
     ErrorTags,
@@ -621,10 +622,12 @@ def _tag(
 def _tag_units(
     tagger: DecisionsTraceTagger, units: tuple[Unit, ...], bank: QuestionBank
 ) -> tuple[TagMatrix, tuple[tuple[str, str], ...]]:
-    """Quarantine invalid inputs, tag the rest in parallel, and retain failed trace evidence.
+    """Tag units in one pass; when it fails, find each failing trace and keep the rest.
 
-    Other tagging failures are isolated unit by unit, replaying committed decisions and refusing
-    unknown outcomes. Spend, admission and artifact-storage refusals still stop the run.
+    A failed pass is retried in bounded parallel units. Committed decisions replay from the cache.
+    A decision whose outcome is unknown is refused by the cache, so finding the failing traces
+    buys nothing the first pass did not already attempt or would not have bought. A spend or
+    admission refusal is not a tagging failure and stops the run.
 
     Args:
         tagger: The decision tagger, with a cache.
@@ -639,28 +642,22 @@ def _tag_units(
     """
     if not units:
         raise TraceTaggingError(f"no trace to tag with bank {bank.bank_id}; check the exposure")
-    ready: list[Unit] = []
-    failed: list[tuple[str, str]] = []
-    for unit in units:
-        try:
-            tagger.validate_unit(unit, bank)
-        except TraceTaggingError as exc:
-            failed.append((unit.trace_id, str(exc)))
-        else:
-            ready.append(unit)
     try:
-        if ready:
-            return tagger.tag(ready, bank), tuple(failed)
+        return tagger.tag(units, bank), ()
     except (TraceTaggingError, ProviderTransportError):
         pass
-    kept: list[Unit] = []
-    for unit in ready:
+
+    def recover(unit: Unit) -> tuple[Unit, str | None]:
+        """Replay or finish one unit, preserving fatal budget and storage refusals."""
         try:
             tagger.tag([unit], bank)
         except (TraceTaggingError, ProviderTransportError) as exc:
-            failed.append((unit.trace_id, str(exc)))
-        else:
-            kept.append(unit)
+            return unit, str(exc)
+        return unit, None
+
+    outcomes = dispatch_tagging(units, recover, maximum_concurrency=tagger.maximum_concurrency)
+    kept = [unit for unit, error in outcomes if error is None]
+    failed = [(unit.trace_id, error) for unit, error in outcomes if error is not None]
     if not kept:
         raise TraceTaggingError(
             f"every {units[0].view} unit failed tagging with bank {bank.bank_id}, for example "
