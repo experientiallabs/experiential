@@ -20,13 +20,22 @@ affected saved evidence under the new definition and accepts the revision only w
 remains, neither an old one nor a new one. Every round is recorded. When the round limit passes
 without an accepted revision the family stays ``diagnostic`` under its original judge.
 
+When the rubric was assembled from a behavior library
+(:mod:`~exp.optimize.evaluation.variance.behavior_profiles`), its problems also feed back into the
+library before the first round: the agentic curator
+(:func:`~exp.optimize.evaluation.variance.behavior_curation.curate_library`, problems mode) reads
+the problems beside which criteria came from which entries and may narrow a misfiring linter, add
+a false-positive note with the misjudged episode as a negative example, or retire it; rubric
+problems alone never add an entry. An accepted change saves the next library version, the reviser
+sees that version, and every revised rubric is assembled from it, so its judge guidance and hence
+its judge definition change. An optional LLM design critic reviews every revised rubric.
+
 Labels made under any earlier definition stay valid only for that definition:
 :func:`require_current_labels` refuses them under the revised judge.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
@@ -43,9 +52,8 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.common.models import ModelRequest
 from exp.common.project import ProjectStore, artifact_input
-from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.authoring_packet import (
     AuthoringPacket,
@@ -53,6 +61,13 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     buy_author_draw,
     forced_tool_arguments,
     load_packet,
+)
+from exp.optimize.evaluation.variance.behavior_curation import curate_library
+from exp.optimize.evaluation.variance.behavior_profiles import (
+    CurationEvidence,
+    LibraryBinding,
+    TraceExample,
+    load_library,
 )
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence, JudgeDefinition, Verdict
 from exp.optimize.evaluation.variance.judge import judge_episode
@@ -64,16 +79,21 @@ from exp.optimize.evaluation.variance.judged import (
 )
 from exp.optimize.evaluation.variance.rubric_author import (
     RUBRIC_AUTHOR_PROMPT,
+    DesignReviewer,
     Rubric,
     RubricAnswer,
+    assemble_rubric,
+    authoring_payload,
     check_rubric_answer,
+    forced_request,
     judge_definition,
     load_rubric,
     save_rubric_content,
 )
+from exp.optimize.evaluation.variance.rubric_critic import DesignCritic, DesignCriticProfile
 from exp.optimize.evaluation.variance.world_freeze import CompatibilityReview
 
-RUBRIC_REVISION_PROTOCOL = "rubric-revision-v1"
+RUBRIC_REVISION_PROTOCOL = "rubric-revision-v2"
 """Version of the revision prompt, answer schema, problem collection and acceptance rule."""
 
 REVISION_TOOL = "submit_rubric_revision"
@@ -87,14 +107,16 @@ REVISION_PROMPT = (
     + """
 REVISION
 You are revising a rubric that a frozen LLM judge already applied. The user message adds
-current_rubric, problems and earlier_rounds to the packet. Each problem is evidence that the
-rubric, not an episode, is at fault: the judge called a criterion ambiguous or insufficient, an
-independently labelled calibration episode got another verdict, complete evidence was still
-unassessable, or the rubric needs evidence the world does not record. Revise only what the cited
-problems require, keep every requirement the sources support, and never weaken a requirement to
-make a defective world or a failing calibration case pass. Earlier rejected rounds show changes
-that did not resolve the problems or introduced new ones. For every problem_id say in resolutions
-what you changed. If a problem cannot be resolved from the packet's sources, return status
+current_rubric, problems and earlier_rounds to the packet, and behavior_library when the rubric
+is assembled from one (already updated from these problems; decide every offered entry again).
+Each problem is evidence that the rubric, not an episode, is at fault: the judge called a
+criterion ambiguous or insufficient, an independently labelled calibration episode got another
+verdict, complete evidence was still unassessable, or the rubric needs evidence the world does
+not record. Revise only what the cited problems require, keep every requirement the sources
+support, and never weaken a requirement to make a defective world or a failing calibration case
+pass. Earlier rejected rounds show changes that did not resolve the problems or introduced new
+ones. For every problem_id say in resolutions what you changed. If a problem cannot be resolved
+from the packet's sources, return status
 needs_research. Call submit_rubric_revision exactly once.
 """
 )
@@ -219,6 +241,8 @@ class RubricRevision(ContractModel):
         status: ``stable`` when no problem was found, ``revised`` when a round was accepted,
             ``needs_research`` when the reviser asked for evidence, otherwise ``diagnostic``.
         final: The judge definition to use: the accepted revision's, or the initial one.
+        library_curation: The saved curation the problems fed into the library, if one ran.
+        library: The library version every revised rubric was assembled from, if any.
     """
 
     protocol: str = RUBRIC_REVISION_PROTOCOL
@@ -230,6 +254,8 @@ class RubricRevision(ContractModel):
     rounds: tuple[RevisionRound, ...]
     status: Literal["stable", "revised", "needs_research", "diagnostic"]
     final: JudgeDefinition
+    library_curation: ArtifactInput | None = None
+    library: ArtifactInput | None = None
 
     @property
     def trainable(self) -> bool:
@@ -323,6 +349,8 @@ def revise_until_stable(
     code_revision: str,
     max_rounds: int = 3,
     compatibility: Callable[[Rubric], CompatibilityReview] | None = None,
+    library: LibraryBinding | None = None,
+    critic: DesignCriticProfile | None = None,
 ) -> RubricRevision:
     """Revise a judge's rubric until judging reports no problem, or the round limit passes.
 
@@ -336,6 +364,9 @@ def revise_until_stable(
         code_revision: Producing source identity.
         max_rounds: Most revision rounds before the family stays diagnostic.
         compatibility: Reviews a rubric against the frozen world, when one exists.
+        library: The library version the rubric was assembled from; its problems feed back into
+            it and revised rubrics are assembled from the curated version.
+        critic: The LLM design critic reviewing every revised rubric, if any.
 
     Returns:
         The revision record, also saved as a ``rubric-revision`` artifact and replayed from it.
@@ -362,6 +393,19 @@ def revise_until_stable(
         problems, initial = judged_problems(
             project, judge, targets, code_revision=code_revision, compatibility=review
         )
+        curation, binding = None, library
+        if library is not None and problems:
+            curation, binding = _feed_library(
+                project, settings, packet, current, library, problems, targets,
+                f"{identity}-library", code_revision,
+            )  # fmt: skip
+        reviewer = None
+        if critic is not None:
+            reviewer = DesignCritic(
+                project, settings, packet, packet_reference, identity=f"{identity}-critic",
+                code_revision=code_revision, library=binding, profile=critic,
+            )  # fmt: skip
+        revise = _Revise(binding, reviewer)
         rounds: list[RevisionRound] = []
         final = judge.definition
         status: Literal["stable", "revised", "needs_research", "diagnostic"] = (
@@ -371,6 +415,7 @@ def revise_until_stable(
             row = _round(
                 project, settings, judge, packet, packet_reference, current, problems, rounds,
                 targets, number, f"{identity}-round-{number}", code_revision, compatibility,
+                revise,
             )  # fmt: skip
             rounds.append(row)
             if row.status == "needs_research":
@@ -389,8 +434,11 @@ def revise_until_stable(
             rounds=tuple(rounds),
             status=status,
             final=final,
+            library_curation=curation,
+            library=None if binding is None else binding.reference,
         )
         inputs = {packet_reference, judge.definition.rubric, *initial}
+        inputs |= {ref for ref in (curation, revision.library) if ref is not None}
         for row in rounds:
             inputs |= {*row.assessments, *(r for r in (row.response, row.rubric) if r)}
         store.write_json(
@@ -438,16 +486,19 @@ def _round(
     identity: str,
     code_revision: str,
     compatibility: Callable[[Rubric], CompatibilityReview] | None,
+    revise: _Revise,
 ) -> RevisionRound:
     """Run one revision round: draw, check, save, bind a new judge, re-judge and compare."""
     cited = tuple(problem for problem in problems if problem.kind != "unjudged")
-    request = _request(packet, current, cited, earlier, settings.output_tokens)
+    library = revise.library
+    request = _request(packet, current, cited, earlier, settings.output_tokens, library)
+    sources = (packet_reference, judge.definition.rubric)
     bought = buy_author_draw(
         project,
         settings,
         request,
         identity=identity,
-        sources=(packet_reference, judge.definition.rubric),
+        sources=(*sources, *((library.reference,) if library is not None else ())),
         code_revision=code_revision,
     )
     if isinstance(bought, str):
@@ -455,11 +506,12 @@ def _round(
     response, raw = bought
     try:
         answer = RevisionAnswer.model_validate(forced_tool_arguments(raw, REVISION_TOOL))
-        check_rubric_answer(answer, packet)
+        check_rubric_answer(answer, packet, library=library, reviewer=revise.reviewer)
         missing = sorted({p.problem_id for p in cited} - {r.problem_id for r in answer.resolutions})
         if answer.status == "ready" and missing:
             raise ValueError(f"the revision resolves no change for problems {missing}")
-        if answer.rubric is not None and answer.rubric == current.body:
+        same_library = current.library == (None if library is None else library.citation())
+        if answer.rubric is not None and answer.rubric == current.body and same_library:
             raise ValueError("the revised rubric is identical to the current rubric")
     except ValueError as error:
         return RevisionRound(
@@ -477,10 +529,10 @@ def _round(
             cited=problems,
             failure="; ".join(item.question for item in answer.research)[:2000],
         )
-    revised = Rubric(
-        family_id=current.family_id,
-        packet_sha256=current.packet_sha256,
-        body=answer.rubric,
+    revised = assemble_rubric(
+        packet,
+        answer.rubric,
+        library=library,
         variants=current.variants,
         parent_sha256=current.identity,
         revision=current.revision + 1,
@@ -536,33 +588,115 @@ def _request(
     cited: tuple[RubricProblem, ...],
     earlier: Sequence[RevisionRound],
     output_tokens: int,
+    library: LibraryBinding | None,
 ) -> ModelRequest:
-    """Render one revision draw: the packet, the current rubric, the problems and past rounds."""
-    payload: JsonObject = {
-        "authoring_packet": packet.model_dump(mode="json"),
-        "citable_locators": sorted(packet.locators()),
-        "current_rubric": current.body.model_dump(mode="json"),
-        "problems": [problem.model_dump(mode="json") for problem in cited],
-        "earlier_rounds": [
-            row.model_dump(mode="json", include={"round", "status", "remaining", "new", "failure"})
-            for row in earlier
-        ],
-    }
-    return ModelRequest(
-        messages=(
-            ModelMessage(role="system", content=REVISION_PROMPT),
-            ModelMessage(role="user", content=json.dumps(payload, sort_keys=True)),
-        ),
-        tools=(
-            ToolSchema(
-                name=REVISION_TOOL,
-                description="Typed answer",
-                input_schema=RevisionAnswer.model_json_schema(),
-            ),
-        ),
-        tool_choice=ToolChoice(name=REVISION_TOOL),
-        maximum_output_tokens=output_tokens,
+    """Render one revision draw: the packet, the library, the rubric, problems and past rounds."""
+    payload = authoring_payload(packet, library)
+    payload.update(
+        {
+            "current_rubric": current.body.model_dump(mode="json"),
+            "problems": [problem.model_dump(mode="json") for problem in cited],
+            "earlier_rounds": [
+                row.model_dump(
+                    mode="json", include={"round", "status", "remaining", "new", "failure"}
+                )
+                for row in earlier
+            ],
+        }
     )
+    return forced_request(
+        REVISION_PROMPT,
+        payload,
+        REVISION_TOOL,
+        RevisionAnswer.model_json_schema(),
+        output_tokens,
+    )
+
+
+class _Revise:
+    """The library version and design reviewer every revision round uses."""
+
+    def __init__(self, library: LibraryBinding | None, reviewer: DesignReviewer | None) -> None:
+        """Bind the curated library version and the optional reviewer."""
+        self.library, self.reviewer = library, reviewer
+
+
+def _feed_library(
+    project: ProjectStore,
+    settings: AuthorSettings,
+    packet: AuthoringPacket,
+    rubric: Rubric,
+    library: LibraryBinding,
+    problems: tuple[RubricProblem, ...],
+    targets: RevisionTargets,
+    identity: str,
+    code_revision: str,
+) -> tuple[ArtifactInput | None, LibraryBinding]:
+    """Feed rubric problems back into the library the rubric cites, through the curator.
+
+    Only problems attributable to the rubric are sent. A calibration miss contributes its saved
+    assessment as an example: negative when the reviewed label was pass (the behavior the
+    criterion detected was acceptable there), positive when it was fail.
+
+    Returns:
+        The saved curation (None when the rubric cites no library entry or no curator response
+        was obtained) and the library version revised rubrics are assembled from.
+    """
+    usage: JsonObject = {
+        row.criterion_id: list(row.library_refs) for row in rubric.body.criteria if row.library_refs
+    }
+    cited = [problem for problem in problems if problem.kind != "unjudged"]
+    if not usage or not cited:
+        return None, library
+    expected = {case.case_id: case.expected for case in targets.calibration}
+    evidence = [
+        CurationEvidence(
+            evidence_id=problem.problem_id,
+            kind="rubric_problem",
+            family_id=packet.family_id,
+            summary=problem.detail,
+            examples=tuple(
+                TraceExample(
+                    family_id=packet.family_id,
+                    locator=f"assessment:{source}",
+                    polarity="negative" if expected[problem.subject] == "pass" else "positive",
+                    note=problem.detail[:1200],
+                    evidence_id=problem.problem_id,
+                )
+                for source in problem.sources
+                if problem.kind == "calibration_miss" and problem.subject in expected
+            ),
+            hint={"kind": problem.kind, "subject": problem.subject},
+        )
+        for problem in cited
+    ]
+    curation = curate_library(
+        project, settings, library_id=library.library.library_id, base=library,
+        evidence=evidence, sources=(rubric_reference(project, rubric),),
+        actor_names=packet.coalition.actor_names(), identity=identity,
+        code_revision=code_revision, mode="problems", rubric_usage=usage,
+    )  # fmt: skip
+    store = project.artifacts
+    if not store.exists(identity + "-result"):
+        return None, library
+    reference = artifact_input(store.read(identity + "-result").manifest)
+    if curation.library is None:
+        return reference, library
+    return reference, LibraryBinding(
+        reference=curation.library, library=load_library(project, curation.library)
+    )
+
+
+def rubric_reference(project: ProjectStore, rubric: Rubric) -> ArtifactInput:
+    """Return the saved ``episode-rubric`` reference of one rubric.
+
+    Raises:
+        ValueError: The rubric was never saved.
+    """
+    artifact_id = stable_id("episode-rubric", {"rubric": rubric.identity})
+    if not project.artifacts.exists(artifact_id):
+        raise ValueError(f"rubric {rubric.identity} is not saved; save it before revising it")
+    return artifact_input(project.artifacts.read(artifact_id).manifest)
 
 
 def revision_protocol_sha256() -> Sha256:

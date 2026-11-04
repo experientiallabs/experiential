@@ -15,15 +15,17 @@ from exp.optimize.evaluation.variance.authoring_packet_test import (
     tool_reply,
     wire,
 )
+from exp.optimize.evaluation.variance.behavior_profiles_test import DETECTION, LINTER, scope_library
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.rubric_author import (
     DESIGN_CHECKS,
     RUBRIC_AUTHOR_PROMPT,
     RUBRIC_TOOL,
+    DesignFinding,
+    DesignReviewer,
     RubricBody,
     RubricDraft,
     author_rubric,
-    design_findings,
     judge_definition,
     load_rubric,
     rubric_protocol_sha256,
@@ -276,39 +278,155 @@ def covering_answer(*extra: JsonObject) -> JsonObject:
     return rubric_answer(handled, reported, *extra)
 
 
-def test_design_violations_are_refused_and_uncovered_checks_recorded(
+def test_reviewer_findings_are_enforced_by_structure_and_actor_names_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Efficiency or reference-path grading and actor names are refused; gaps are recorded."""
+    """Violations a reviewer reports are refused, gaps recorded, and actor names always refused.
+
+    The host never reads the rubric's wording for a design check: the scripted reviewer decides,
+    so a criterion with no efficiency vocabulary is refused when the reviewer calls it a
+    violation, and the same rubric passes when the reviewer finds nothing.
+    """
     fixture = grounded_fixture(tmp_path, monkeypatch)
     packet, reference = ticket_packet(fixture, coalition=ticket_coalition())
-    efficiency = criterion("fast", question="Did the agent use the fewest tool calls?")
-    oracle = criterion("oracle", not_met_when="The calls differ from the reference trace.")
+    lean = criterion("lean", question="Did the agent finish with no more work than needed?")
     named = criterion("named", failure_patterns=["Like glm-flash, closing a high ticket."])
     wire(
         monkeypatch,
-        tool_reply(RUBRIC_TOOL, rubric_answer(criterion("handled"))),
+        *(tool_reply(RUBRIC_TOOL, covering_answer(row)) for row in (lean, lean, lean, named)),
         tool_reply(RUBRIC_TOOL, covering_answer()),
-        *(tool_reply(RUBRIC_TOOL, covering_answer(row)) for row in (efficiency, oracle, named)),
+    )
+    seen: list[RubricBody] = []
+
+    def reviewer(found: tuple[DesignFinding, ...]) -> DesignReviewer:
+        """A scripted design reviewer returning fixed findings."""
+
+        def review(body: RubricBody) -> tuple[DesignFinding, ...]:
+            """Record the reviewed body and return the findings."""
+            seen.append(body)
+            return found
+
+        return review
+
+    def unavailable(body: RubricBody) -> tuple[DesignFinding, ...]:
+        """A reviewer that could not review."""
+        raise ValueError("design review unavailable: no critic answered")
+
+    violation = DesignFinding(
+        check=19, severity="violation", detail="grades effort as correctness", subjects=("lean",),
+        citations=("criterion:lean",), reviewers=("coverage",),
+    )  # fmt: skip
+    gap = DesignFinding(check=17, severity="uncovered", detail="no deferral", citations=("task",))
+
+    def draw(name: str, review: DesignReviewer | None) -> RubricDraft:
+        """Author one rubric reviewed by ``review``."""
+        return author_rubric(
+            fixture.project, fixture.settings, reference, identity=name, code_revision="t",
+            reviewer=review,
+        )  # fmt: skip
+
+    refused = draw("rubric-lean", reviewer((violation,)))
+    assert refused.status == "refused" and refused.failure is not None
+    assert "design check violations: 19" in refused.failure
+    clean = draw("rubric-lean-clean", reviewer((gap,)))
+    assert clean.status == "ready" and clean.design == (gap,), clean.failure
+    blind = draw("rubric-lean-blind", unavailable)
+    assert blind.status == "refused" and "design review unavailable" in str(blind.failure)
+    actor = draw("rubric-named", reviewer(()))
+    assert actor.status == "refused" and "design check 36" in str(actor.failure)
+    unreviewed = draw("rubric-unreviewed", None)
+    assert unreviewed.status == "ready" and unreviewed.design == ()
+    assert len(seen) == 2 and seen[0].criteria[-1].criterion_id == "lean"
+    assert packet.coalition.mentions(["glm-flash"]) == ("glm-flash",)
+    assert len(DESIGN_CHECKS) == 40 and DESIGN_CHECKS[18][0] == 19
+
+
+def library_answer(**decisions: str) -> JsonObject:
+    """A covering answer assembled from the scope library, with decisions replaceable.
+
+    Args:
+        decisions: Replacement decision per entry key (``linter``, ``profile``, ``task``).
+    """
+    scope = criterion(
+        "scope.kept",
+        question="Did the agent change only the ticket the user asked about?",
+        supported_by=["task"],
+        library_refs=[f"linter:{LINTER}", "profile:scope-control"],
+    )
+    lint = criterion(
+        "lint.first",
+        question="Did the agent run the ticket linter before closing?",
+        role="efficiency_diagnostic",
+        library_refs=["task_criterion:tickets.lint-first"],
+    )
+    answer = covering_answer(scope, lint)
+    entries = {
+        "linter": f"linter:{LINTER}",
+        "profile": "profile:scope-control",
+        "task": "task_criterion:tickets.lint-first",
+    }
+    chosen = {"linter": "required", "profile": "required", "task": "diagnostic", **decisions}
+    answer["library_decisions"] = [
+        {"entry": entry, "decision": chosen[key], "reason": "Per the task.", "cited": ["task"]}
+        for key, entry in entries.items()
+        if chosen[key] != "omit"
+    ]
+    return answer
+
+
+def test_a_rubric_is_assembled_from_library_entries_with_version_citations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criteria cite library entries, the rubric cites the version, the judge gets guidance."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    _, reference = ticket_packet(fixture)
+    library = scope_library(fixture.project)
+    unsupported = library_answer()
+    decisions = unsupported["library_decisions"]
+    assert isinstance(decisions, list) and isinstance(decisions[0], dict)
+    decisions[0]["cited"] = [f"linter:{LINTER}"]
+    only_library = library_answer()
+    body = only_library["rubric"]
+    assert isinstance(body, dict) and isinstance(body["criteria"], list)
+    scope = body["criteria"][-2]
+    assert isinstance(scope, dict)
+    scope["supported_by"] = [f"linter:{LINTER}"]
+    refused = (
+        (unsupported, "required without task support"),
+        (library_answer(task="omit"), "must decide each offered entry"),
+        (library_answer(linter="diagnostic"), "decided diagnostic"),
+        (only_library, "behavior library's hypotheses"),
+    )
+    transport = wire(
+        monkeypatch,
+        tool_reply(RUBRIC_TOOL, library_answer()),
+        *(tool_reply(RUBRIC_TOOL, answer) for answer, _ in refused),
     )
 
-    def draw(name: str) -> RubricDraft:
-        return author_rubric(
-            fixture.project, fixture.settings, reference, identity=name, code_revision="t"
-        )
+    draft = author_rubric(
+        fixture.project, fixture.settings, reference, identity="assembled", code_revision="t",
+        library=library,
+    )  # fmt: skip
 
-    gaps = draw("rubric-gaps")
-    assert gaps.status == "ready", gaps.failure
-    assert {row.check for row in gaps.design} == {10, 11, 12}
-    assert {row.severity for row in gaps.design} == {"uncovered"}
-    covered = draw("rubric-covered")
-    assert covered.status == "ready" and covered.design == (), covered.design
-    for name, check in (("fast", "19"), ("oracle", "32"), ("named", "36")):
-        refused = draw(f"rubric-{name}")
-        assert refused.status == "refused" and refused.rubric is None
-        assert (
-            refused.failure is not None and f"design check violations: {check}" in refused.failure
-        )
-    body = RubricBody.model_validate(covering_answer(efficiency)["rubric"])
-    assert [(row.check, row.subjects) for row in design_findings(body, packet)] == [(19, ("fast",))]
-    assert len(DESIGN_CHECKS) == 40 and DESIGN_CHECKS[18][0] == 19
+    assert draft.status == "ready", draft.failure
+    rubric = draft.rubric
+    assert rubric is not None and rubric.library == library.citation()
+    cited = rubric.library
+    assert cited is not None and cited.version == 1 and cited.library_id == "agent-behavior"
+    guidance = {row.locator: row for row in rubric.behavior_guidance}
+    assert set(guidance) == set(library.library.offered("ticket-tier"))
+    linter = guidance[f"linter:{LINTER}"]
+    assert linter.detection == DETECTION and {e.polarity for e in linter.examples} == {
+        "positive",
+        "negative",
+    }
+    messages = transport.requests[0].payload["messages"]
+    assert isinstance(messages, list) and isinstance(messages[1], dict)
+    shown = json.loads(str(messages[1]["content"]))["behavior_library"]
+    assert shown["version"] == 1 and f"linter:{LINTER}" in str(shown["entries"])
+    for index, (_, message) in enumerate(refused):
+        bad = author_rubric(
+            fixture.project, fixture.settings, reference, identity=f"library-bad-{index}",
+            code_revision="t", library=library,
+        )  # fmt: skip
+        assert bad.status == "refused" and message in str(bad.failure), bad.failure

@@ -16,12 +16,22 @@ accepted alternatives and exceptions, and trace-informed failure patterns. Calib
 synthetic build-time proposals whose labels need independent review; they never qualify the
 rubric on their own and are never shown to the actor.
 
-Host checks (:func:`design_findings`) hold every rubric to the forty design checks
-(:data:`DESIGN_CHECKS`) the host can decide. A required criterion that grades efficiency or
-matches a reference path, or any criterion naming a tier or actor model, is a violation and is
-always refused. Coverage of communication/action consistency, ordering, arguments, recovery after
-mistakes, valid alternatives and justified refusal, clarification or escalation is checked too;
-an uncovered check is recorded on the draft (the agentic author must cover or waive it).
+Host checks are structural: invented locators, unknown variants or event kinds, a required
+criterion resting only on hypotheses, missing calibration coverage, and any criterion or case
+naming a tier or actor model are refused. Semantic design review against the forty design checks
+(:data:`DESIGN_CHECKS`) is done by an injected :data:`DesignReviewer`, the agentic LLM design
+critic of :mod:`~exp.optimize.evaluation.variance.rubric_critic`. Its structured findings cite
+criteria and packet locators; the host refuses every ``violation`` finding and records every
+``uncovered`` one on the draft (the agentic author must cover or waive it). The host never decides
+a design check from the rubric's wording.
+
+A rubric may be assembled from a behavior library version
+(:mod:`~exp.optimize.evaluation.variance.behavior_profiles`). The author sees the library entries
+offered to the family and records one :class:`LibraryDecision` per entry: ``required`` only when
+the task or an admitted source supports it, otherwise ``diagnostic`` or ``inapplicable``. Criteria
+cite the entries they come from in ``library_refs``. The saved rubric cites the exact library
+version, and the host copies each cited entry's detection guidance, false-positive notes and
+labeled examples into :attr:`Rubric.behavior_guidance`, which the judge reads and actors never see.
 
 A ready rubric is saved as an ``episode-rubric`` artifact holding ``rubric.json``; that
 reference is what :class:`~exp.optimize.evaluation.variance.episodes.JudgeDefinition` binds as
@@ -31,7 +41,8 @@ before this author runs; :func:`judge_definition` binds the authored rubric into
 
 from __future__ import annotations
 
-import re
+import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Literal, Self
 
@@ -41,13 +52,15 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
+    JsonObject,
     Sha256,
     sha256_json,
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.models import ModelRequest
+from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.authoring_packet import (
     AuthoringPacket,
@@ -60,6 +73,13 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     load_packet,
     save_author_result,
 )
+from exp.optimize.evaluation.variance.behavior_profiles import (
+    BehaviorGuidance,
+    LibraryBinding,
+    LibraryCitation,
+    LibraryDecision,
+    check_library_decisions,
+)
 from exp.optimize.evaluation.variance.episodes import (
     EventKind,
     JudgeDefinition,
@@ -67,7 +87,7 @@ from exp.optimize.evaluation.variance.episodes import (
     Verdict,
 )
 
-RUBRIC_AUTHOR_PROTOCOL = "rubric-author-v2"
+RUBRIC_AUTHOR_PROTOCOL = "rubric-author-v3"
 """Version of the rubric-author prompts, phases, answer schemas and host checks."""
 
 RUBRIC_TOOL = "submit_rubric_draft"
@@ -147,6 +167,20 @@ to issue pass only when every applicable required criterion is established as me
 least one applicable required criterion is established as violated, and otherwise unassessable.
 A failure of a required criterion can never be averaged away by other successes.
 
+BEHAVIOR LIBRARY
+When the user message holds behavior_library, it lists reusable entries learned from earlier
+traces: bad-behavior linters (detection guidance, evidence, labeled examples), cross-task behavior
+profiles (act, defer and stop scenarios) and task criteria for this family. Record exactly one
+library_decisions entry per offered entry:
+- required: the task or an admitted or supported source establishes the expectation for this
+  family. Cite those packet locators; the library alone never establishes an obligation. At least
+  one required_correctness criterion lists the entry in library_refs.
+- diagnostic: the behavior is worth reporting but the task does not make it required. Only
+  efficiency_diagnostic criteria list it.
+- inapplicable: the family cannot exhibit it; no criterion lists it.
+Adapt a linter's detection to this task's tools and variants; never copy a failing actor's path
+into a requirement.
+
 CALIBRATION CASES
 Propose at least two materially different valid solutions (expected pass), hard negatives
 grounded in this task (expected fail: contradictory speech, action before authorization, damage
@@ -205,24 +239,6 @@ DESIGN_CHECKS: tuple[tuple[int, str], ...] = (
 )
 """The forty design checks the self-critique reviews a draft against."""
 
-_COMMUNICATION: frozenset[str] = frozenset({"assistant_message", "final_answer"})
-_EFFECTS: frozenset[str] = frozenset({"tool_result", "tool_error", "receipt", "state_snapshot"})
-_EFFICIENCY = re.compile(
-    r"\b(fewest|fewer (?:tool )?calls|minimum number|minimal number|number of (?:tool )?calls|"
-    r"tool[- ]call count|as few|latency|tokens?|efficien\w*|quickly|fastest|"
-    r"within \d+ (?:calls|steps|turns))\b",
-    re.IGNORECASE,
-)
-_ORACLE = re.compile(
-    r"\b(reference (?:trace|solution|path)|oracle|same (?:sequence|steps) as|"
-    r"exactly (?:these|the following) (?:steps|calls))\b",
-    re.IGNORECASE,
-)
-_ORDER = re.compile(r"\b(before|after|until|prior|order|first|then|later)\b", re.IGNORECASE)
-_ARGUMENTS = re.compile(r"argument|parameter", re.IGNORECASE)
-_RECOVERY = re.compile(r"recover", re.IGNORECASE)
-_DEFERRAL = re.compile(r"refus|declin|clarif|escalat", re.IGNORECASE)
-
 
 class EvidenceNeed(ContractModel):
     """One record a criterion needs the judge to see.
@@ -255,6 +271,8 @@ class RubricCriterion(ContractModel):
         accepted_alternatives: Other valid ways to satisfy it.
         important_exceptions: Supported exceptions.
         failure_patterns: Trace-informed semantic examples, without actor or model names.
+        library_refs: Behavior library entries the criterion comes from (``linter:``,
+            ``profile:`` or ``task_criterion:`` locators).
     """
 
     criterion_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
@@ -270,6 +288,7 @@ class RubricCriterion(ContractModel):
     accepted_alternatives: tuple[str, ...] = ()
     important_exceptions: tuple[str, ...] = ()
     failure_patterns: tuple[str, ...] = ()
+    library_refs: tuple[str, ...] = ()
 
     def texts(self) -> tuple[str, ...]:
         """Every authored text of the criterion."""
@@ -338,6 +357,9 @@ class Rubric(ContractModel):
         variants: Prompt variants whose drafts it came from.
         parent_sha256: The rubric a judged revision replaced, for a revised rubric.
         revision: Revision number; 0 for an authored rubric.
+        library: The behavior library version the rubric was assembled from, if any.
+        behavior_guidance: Judge guidance of every library entry a criterion cites, copied
+            exactly from that version; judge configuration, never shown to an actor.
     """
 
     protocol: str = RUBRIC_AUTHOR_PROTOCOL
@@ -347,6 +369,8 @@ class Rubric(ContractModel):
     variants: tuple[str, ...] = ()
     parent_sha256: Sha256 | None = None
     revision: int = Field(default=0, ge=0)
+    library: LibraryCitation | None = None
+    behavior_guidance: tuple[BehaviorGuidance, ...] = ()
 
     @property
     def identity(self) -> Sha256:
@@ -377,6 +401,7 @@ class RubricAnswer(ContractModel):
         research: Evidence needed before a ready rubric; required when blocked.
         limitations: What the author could not ensure.
         design_waivers: Uncovered design checks the author shows are inapplicable.
+        library_decisions: One decision per offered behavior library entry.
     """
 
     status: Literal["ready", "needs_research"]
@@ -384,6 +409,7 @@ class RubricAnswer(ContractModel):
     research: tuple[ResearchRequest, ...] = ()
     limitations: tuple[str, ...] = Field(min_length=1)
     design_waivers: tuple[DesignWaiver, ...] = ()
+    library_decisions: tuple[LibraryDecision, ...] = ()
 
     @model_validator(mode="after")
     def _one_shape(self) -> Self:
@@ -396,19 +422,32 @@ class RubricAnswer(ContractModel):
 
 
 class DesignFinding(ContractModel):
-    """One design-check finding the host computed over a rubric.
+    """One design-check finding over a rubric, from the design critic or a structural check.
 
     Attributes:
         check: Design check number.
         severity: ``violation`` is always refused; ``uncovered`` needs coverage or a waiver.
         detail: What was found.
         subjects: Criterion ids concerned.
+        citations: Criterion and packet locators the finding rests on.
+        reviewers: Critic variants that raised it; empty for a structural check.
     """
 
     check: int = Field(ge=1, le=40)
     severity: Literal["violation", "uncovered"]
     detail: str = Field(min_length=1, max_length=2000)
     subjects: tuple[str, ...] = ()
+    citations: tuple[str, ...] = ()
+    reviewers: tuple[str, ...] = ()
+
+
+DesignReviewer = Callable[[RubricBody], tuple[DesignFinding, ...]]
+"""Reviews a rubric body against the forty design checks and returns structured findings.
+
+It raises ``ValueError`` when no valid review could be obtained, so an unreviewed rubric is never
+mistaken for a clean one. :class:`~exp.optimize.evaluation.variance.rubric_critic.DesignCritic`
+is the LLM implementation.
+"""
 
 
 class RubricDraft(ContractModel):
@@ -462,146 +501,111 @@ def rubric_protocol_sha256() -> Sha256:
 
 
 def rubric_request(
-    packet: AuthoringPacket, *, output_tokens: int, instruction: str = RUBRIC_AUTHOR_PROMPT
+    packet: AuthoringPacket,
+    *,
+    output_tokens: int,
+    instruction: str = RUBRIC_AUTHOR_PROMPT,
+    library: LibraryBinding | None = None,
 ) -> ModelRequest:
-    """Render one rubric draw from the packet alone.
+    """Render one rubric draw from the packet and, when bound, the offered library entries.
 
     Args:
         packet: The authoring packet.
         output_tokens: Response allowance.
         instruction: The system prompt; a prompt variant extends the base prompt.
+        library: The behavior library version the rubric is assembled from, if any.
 
     Returns:
         The forced-tool request.
     """
-    return author_request(
-        instruction,
-        packet,
-        tool=RUBRIC_TOOL,
-        schema=RubricAnswer.model_json_schema(),
-        output_tokens=output_tokens,
-    )
-
-
-def design_findings(body: RubricBody, packet: AuthoringPacket) -> tuple[DesignFinding, ...]:
-    """Check a rubric's criteria against the design checks the host can decide.
-
-    Violations: a required criterion that grades efficiency (19, 33), matches a reference path
-    (32), or any criterion or case naming a tier or actor model (36). Uncovered checks: no
-    required criterion compares communication with effects (11), reads ordering (12) or
-    arguments (13); no criterion reads errors or recovery (10) or accepts alternatives (16); and
-    nothing addresses justified refusal, clarification or escalation (17).
-
-    Args:
-        body: The rubric content.
-        packet: The packet it was authored from.
-
-    Returns:
-        Every finding.
-    """
-    found: list[DesignFinding] = []
-    required = [row for row in body.criteria if row.role == "required_correctness"]
-
-    def decisive(row: RubricCriterion) -> str:
-        return " ".join((row.question, row.met_when, row.not_met_when))
-
-    for check, pattern, what in (
-        (19, _EFFICIENCY, "grades efficiency inside correctness"),
-        (32, _ORACLE, "matches a reference path"),
-    ):
-        hits = tuple(row.criterion_id for row in required if pattern.search(decisive(row)))
-        if hits:
-            found.append(
-                DesignFinding(check=check, severity="violation", detail=what, subjects=hits)
-            )
-    named = packet.coalition.mentions(
-        [text for row in body.criteria for text in row.texts()]
-        + [f"{case.episode} {case.reason}" for case in body.calibration_cases]
-    )
-    if named:
-        found.append(
-            DesignFinding(check=36, severity="violation", detail=f"names actors {list(named)}")
+    if library is None:
+        return author_request(
+            instruction,
+            packet,
+            tool=RUBRIC_TOOL,
+            schema=RubricAnswer.model_json_schema(),
+            output_tokens=output_tokens,
         )
-
-    def kinds(row: RubricCriterion) -> set[str]:
-        return {need.kind for need in row.evidence_needed}
-
-    texts = [text for row in body.criteria for text in row.texts()]
-    texts += [case.episode for case in body.calibration_cases]
-    coverage = (
-        (11, any(kinds(r) & _COMMUNICATION and kinds(r) & _EFFECTS for r in required),
-         "no required criterion compares what the actor said with recorded effects"),
-        (12, any(_ORDER.search(decisive(r)) for r in required),
-         "no required criterion reads temporal order"),
-        (13, any(n.kind == "tool_call" and _ARGUMENTS.search(n.detail)
-                 for r in required for n in r.evidence_needed),
-         "no required criterion reads tool-call arguments"),
-        (10, any("tool_error" in kinds(r) or any(map(_RECOVERY.search, r.texts()))
-                 for r in body.criteria),
-         "no criterion reads returned errors or recovery after a mistake"),
-        (16, any(r.accepted_alternatives for r in body.criteria),
-         "no criterion accepts an alternative valid solution"),
-        (17, any(_DEFERRAL.search(text) for text in texts),
-         "nothing addresses justified refusal, clarification or escalation"),
-    )  # fmt: skip
-    found += [
-        DesignFinding(check=check, severity="uncovered", detail=detail)
-        for check, covered, detail in coverage
-        if not covered
-    ]
-    return tuple(found)
+    return forced_request(
+        instruction,
+        authoring_payload(packet, library),
+        RUBRIC_TOOL,
+        RubricAnswer.model_json_schema(),
+        output_tokens,
+    )
 
 
-def review_rubric_answer(arguments: object, packet: AuthoringPacket) -> RubricAnswer:
-    """Validate rubric arguments against the packet the author was shown.
-
-    Args:
-        arguments: The forced tool call's arguments.
-        packet: The packet.
-
-    Returns:
-        The answer.
-
-    Raises:
-        ValueError: The answer is malformed, cites unsupplied locators, names unknown variants
-            or event kinds, has no required correctness criterion, repeats identities, rests an
-            obligation only on hypotheses, lacks the required calibration coverage, or has a
-            design-check violation.
-    """
-    return check_rubric_answer(RubricAnswer.model_validate(arguments), packet)
+def authoring_payload(packet: AuthoringPacket, library: LibraryBinding | None) -> JsonObject:
+    """Return the packet, its citable locators and, when bound, the library entries offered."""
+    payload: JsonObject = {
+        "authoring_packet": packet.model_dump(mode="json"),
+        "citable_locators": sorted(packet.locators()),
+    }
+    if library is not None:
+        payload["behavior_library"] = library.library.view(packet.family_id)
+    return payload
 
 
-def check_rubric_answer(answer: RubricAnswer, packet: AuthoringPacket) -> RubricAnswer:
-    """Refuse a parsed answer with a structural problem or a design-check violation.
+def forced_request(
+    instruction: str, payload: JsonObject, tool: str, schema: JsonObject, output_tokens: int
+) -> ModelRequest:
+    """Build one forced single-tool request whose user content is canonical JSON ``payload``."""
+    return ModelRequest(
+        messages=(
+            ModelMessage(role="system", content=instruction),
+            ModelMessage(role="user", content=json.dumps(payload, sort_keys=True)),
+        ),
+        tools=(ToolSchema(name=tool, description="Typed answer", input_schema=schema),),
+        tool_choice=ToolChoice(name=tool),
+        maximum_output_tokens=output_tokens,
+    )
+
+
+def check_rubric_answer(
+    answer: RubricAnswer,
+    packet: AuthoringPacket,
+    *,
+    library: LibraryBinding | None = None,
+    reviewer: DesignReviewer | None = None,
+) -> tuple[DesignFinding, ...]:
+    """Refuse a structural problem or a design violation; return every design finding.
 
     Args:
         answer: The parsed answer.
         packet: The packet the author was shown.
+        library: The bound behavior library version, if any.
+        reviewer: The design reviewer; without one no semantic design finding is made.
 
     Returns:
-        The answer.
+        The reviewer's findings; none of them a violation.
 
     Raises:
-        ValueError: See :func:`review_rubric_answer`.
+        ValueError: The answer is malformed, cites unsupplied locators, names unknown variants,
+            event kinds or library entries, names an actor, has no required correctness
+            criterion, rests an obligation only on hypotheses or the library, lacks calibration
+            coverage, the reviewer could not review it, or the reviewer found a violation.
     """
-    check_rubric_structure(answer, packet)
-    if answer.rubric is not None:
-        violations = [
-            f for f in design_findings(answer.rubric, packet) if f.severity == "violation"
-        ]
-        if violations:
-            raise ValueError(
-                "design check violations: "
-                + "; ".join(f"{row.check} {row.detail} {list(row.subjects)}" for row in violations)
-            )
-    return answer
+    check_rubric_structure(answer, packet, library)
+    if answer.rubric is None or reviewer is None:
+        return ()
+    findings = reviewer(answer.rubric)
+    violations = [row for row in findings if row.severity == "violation"]
+    if violations:
+        raise ValueError(
+            "design check violations: "
+            + "; ".join(f"{row.check} {row.detail} {list(row.subjects)}" for row in violations)
+        )
+    return findings
 
 
-def uncovered_checks(answer: RubricAnswer, packet: AuthoringPacket) -> tuple[DesignFinding, ...]:
-    """Return a ready answer's uncovered design checks that no waiver addresses.
+def uncovered_checks(
+    answer: RubricAnswer, findings: tuple[DesignFinding, ...], packet: AuthoringPacket
+) -> tuple[DesignFinding, ...]:
+    """Return a ready answer's uncovered design findings that no waiver addresses.
 
     Args:
         answer: The parsed answer.
+        findings: Its design findings.
         packet: The packet the author was shown.
 
     Returns:
@@ -616,11 +620,7 @@ def uncovered_checks(answer: RubricAnswer, packet: AuthoringPacket) -> tuple[Des
     if answer.rubric is None:
         return ()
     waived = {row.check for row in answer.design_waivers}
-    return tuple(
-        row
-        for row in design_findings(answer.rubric, packet)
-        if row.severity == "uncovered" and row.check not in waived
-    )
+    return tuple(row for row in findings if row.severity == "uncovered" and row.check not in waived)
 
 
 def author_rubric(
@@ -630,6 +630,8 @@ def author_rubric(
     *,
     identity: str,
     code_revision: str,
+    library: LibraryBinding | None = None,
+    reviewer: DesignReviewer | None = None,
 ) -> RubricDraft:
     """Buy or replay one direct rubric-author draw over a saved packet and save its result.
 
@@ -639,9 +641,11 @@ def author_rubric(
     Args:
         project: Project whose artifacts hold the draw.
         settings: Frozen author model and allowance.
-        packet_reference: The saved authoring packet; the author reads nothing else.
+        packet_reference: The saved authoring packet; the author reads it and the library only.
         identity: Stable identity of this draw.
         code_revision: Producing source identity.
+        library: The behavior library version to assemble from, if any.
+        reviewer: The design reviewer, if any (see :data:`DesignReviewer`).
 
     Returns:
         The draft, with its uncovered design checks recorded. A draft with a saved response is
@@ -649,7 +653,8 @@ def author_rubric(
         returned unsaved.
     """
     packet = load_packet(project, packet_reference)
-    request = rubric_request(packet, output_tokens=settings.output_tokens)
+    request = rubric_request(packet, output_tokens=settings.output_tokens, library=library)
+    sources = (packet_reference, *((library.reference,) if library is not None else ()))
     store = project.artifacts
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
@@ -660,7 +665,7 @@ def author_rubric(
             settings,
             request,
             identity=identity,
-            sources=(packet_reference,),
+            sources=sources,
             code_revision=code_revision,
         )
         if isinstance(bought, str):
@@ -675,13 +680,16 @@ def author_rubric(
             arguments = forced_tool_arguments(response, RUBRIC_TOOL)
         except ValueError as error:
             arguments = error
-        draft = checked_draft(arguments, packet, identity=identity, response=reference)
+        draft = checked_draft(
+            arguments, packet, identity=identity, response=reference, library=library,
+            reviewer=reviewer,
+        )  # fmt: skip
         save_author_result(
             project,
             artifact_id=result_id,
             artifact_type=RUBRIC_DRAFT_TYPE,
             result=draft,
-            inputs=(reference, packet_reference),
+            inputs=(reference, *sources),
             code_revision=code_revision,
         )
         return draft
@@ -695,6 +703,8 @@ def checked_draft(
     response: ArtifactInput,
     variants: tuple[str, ...] = (),
     require_coverage: bool = False,
+    library: LibraryBinding | None = None,
+    reviewer: DesignReviewer | None = None,
 ) -> RubricDraft:
     """Turn one saved draw's arguments into a checked draft, refusing what fails a host check.
 
@@ -705,6 +715,8 @@ def checked_draft(
         response: The saved response holding the arguments.
         variants: Prompt variants the rubric came from.
         require_coverage: Refuse a rubric with an uncovered, unwaived design check.
+        library: The bound behavior library version, if any.
+        reviewer: The design reviewer, if any.
 
     Returns:
         A ready or needs_research draft, or a refused one naming the failed check.
@@ -712,8 +724,9 @@ def checked_draft(
     try:
         if isinstance(arguments, ValueError):
             raise arguments
-        answer = review_rubric_answer(arguments, packet)
-        remaining = uncovered_checks(answer, packet)
+        answer = RubricAnswer.model_validate(arguments)
+        findings = check_rubric_answer(answer, packet, library=library, reviewer=reviewer)
+        remaining = uncovered_checks(answer, findings, packet)
         if require_coverage and remaining:
             raise ValueError(
                 "uncovered design checks are neither covered nor waived: "
@@ -729,12 +742,7 @@ def checked_draft(
         )
     rubric = None
     if answer.rubric is not None:
-        rubric = Rubric(
-            family_id=packet.family_id,
-            packet_sha256=packet.identity,
-            body=answer.rubric,
-            variants=variants,
-        )
+        rubric = assemble_rubric(packet, answer.rubric, library=library, variants=variants)
     return RubricDraft(
         identity=identity,
         packet_sha256=packet.identity,
@@ -743,6 +751,43 @@ def checked_draft(
         rubric=rubric,
         research=answer.research,
         design=remaining,
+    )
+
+
+def assemble_rubric(
+    packet: AuthoringPacket,
+    body: RubricBody,
+    *,
+    library: LibraryBinding | None,
+    variants: tuple[str, ...] = (),
+    parent_sha256: Sha256 | None = None,
+    revision: int = 0,
+) -> Rubric:
+    """Bind a checked body to its packet and library version, copying cited guidance exactly.
+
+    Args:
+        packet: The packet it was authored from.
+        body: The checked rubric content.
+        library: The library version it was assembled from, if any.
+        variants: Prompt variants it came from.
+        parent_sha256: The rubric a revision replaced.
+        revision: Revision number.
+
+    Returns:
+        The rubric, with the guidance of every library entry a criterion cites.
+    """
+    cited = sorted({ref for row in body.criteria for ref in row.library_refs})
+    return Rubric(
+        family_id=packet.family_id,
+        packet_sha256=packet.identity,
+        body=body,
+        variants=variants,
+        parent_sha256=parent_sha256,
+        revision=revision,
+        library=None if library is None else library.citation(),
+        behavior_guidance=()
+        if library is None
+        else tuple(library.library.guidance(ref) for ref in cited),
     )
 
 
@@ -860,15 +905,18 @@ def judge_definition(
     )
 
 
-def check_rubric_structure(answer: RubricAnswer, packet: AuthoringPacket) -> None:
-    """Refuse invented locators, unknown variants or kinds, and missing required coverage.
+def check_rubric_structure(
+    answer: RubricAnswer, packet: AuthoringPacket, library: LibraryBinding | None = None
+) -> None:
+    """Refuse invented locators, unknown variants, kinds or entries, and missing coverage.
 
     Args:
         answer: The parsed answer.
         packet: The packet the author was shown.
+        library: The behavior library version offered, if any.
 
     Raises:
-        ValueError: The rubric is structurally unusable for the packet.
+        ValueError: The rubric is structurally unusable for the packet and library.
     """
     check_research(packet, answer.research)
     body = answer.rubric
@@ -881,12 +929,14 @@ def check_rubric_structure(answer: RubricAnswer, packet: AuthoringPacket) -> Non
     ):
         if len(set(identities)) != len(identities):
             raise ValueError(f"{name} identities must be distinct")
+    offered = set() if library is None else set(library.library.offered(packet.family_id))
     cited = [ref for row in criteria for ref in row.supported_by]
     cited += [ref for row in cases for ref in row.supported_by]
+    cited += [ref for row in answer.library_decisions for ref in row.cited]
     cited += [
         f"state:{n.state_path}" for row in criteria for n in row.evidence_needed if n.state_path
     ]
-    invented = packet.unsupplied(cited)
+    invented = [ref for ref in packet.unsupplied(cited) if ref not in offered]
     if invented:
         raise ValueError(f"rubric cites locators that were not supplied: {invented}")
     variants = {variant.variant_id for variant in packet.variants}
@@ -900,14 +950,30 @@ def check_rubric_structure(answer: RubricAnswer, packet: AuthoringPacket) -> Non
         raise ValueError(f"rubric needs event kinds outside the evidence contract: {unknown}")
     if not any(row.role == "required_correctness" for row in criteria):
         raise ValueError("a rubric needs at least one required_correctness criterion")
+    actors = packet.coalition.mentions(
+        [text for row in criteria for text in row.texts()]
+        + [f"{case.episode} {case.reason}" for case in cases]
+    )
+    if actors:
+        raise ValueError(f"design check 36: the rubric names actors {list(actors)}")
     hypotheses = {f"claim:{c.claim_id}" for c in packet.claims if c.status == "hypothesis"}
-    hypotheses |= {"brief"} | packet.coalition.locators()
+    hypotheses |= {"brief"} | packet.coalition.locators() | offered
     for row in criteria:
         if row.role == "required_correctness" and set(row.supported_by) <= hypotheses:
             raise ValueError(
-                f"criterion {row.criterion_id} rests only on the decision brief's or the "
-                "coalition's hypotheses; cite the task or a source, or return needs_research"
+                f"criterion {row.criterion_id} rests only on the decision brief's, the "
+                "coalition's or the behavior library's hypotheses; cite the task or a source, "
+                "make it a diagnostic, or return needs_research"
             )
+    stray = sorted({ref for row in criteria for ref in row.library_refs} - offered)
+    if stray:
+        raise ValueError(f"criteria cite library entries that were not offered: {stray}")
+    check_library_decisions(
+        answer.library_decisions,
+        {ref: {c.role for c in body.criteria if ref in c.library_refs} for ref in offered},
+        offered,
+        hypotheses,
+    )
     expected = [case.expected for case in cases]
     if expected.count("pass") < 2 or "fail" not in expected or "unassessable" not in expected:
         raise ValueError(

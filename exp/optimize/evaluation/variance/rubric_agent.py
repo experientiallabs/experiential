@@ -9,15 +9,17 @@ included, and nothing else:
   ``requirements-first``, ``failure-patterns-first`` and ``alternatives-first``. Each variant
   drafts independently from the packet; none sees another's draft;
 - **phases**: ``plan`` -> ``draft`` -> ``critique`` -> ``final``. The author plans requirements
-  against the sources and coalition, drafts, critiques its draft against the forty design checks
-  beside the host's own :func:`~exp.optimize.evaluation.variance.rubric_author.design_findings`
-  (authoritative, fed back to the author), and returns a final rubric. The final rubric is
-  refused unless it passes every host check and covers or waives, with cited reasons, every
-  uncovered design check;
+  against the sources, the coalition and, when bound, the behavior library; drafts; critiques its
+  draft against the forty design checks beside the authoritative findings of the host's
+  structural checks and the independent LLM design critic
+  (:class:`~exp.optimize.evaluation.variance.rubric_critic.DesignCritic`, enabled by
+  :attr:`RubricAuthoringProfile.critic`); and returns a final rubric. The final rubric is
+  refused unless it passes every host check, has no critic violation and covers or waives, with
+  cited reasons, every uncovered design check;
 - **reconciliation**: with several variants, one reconciliation draw merges at least two ready
   drafts and records every disagreement between them. The host detects disagreements on status,
-  variant binding, required evidence kinds and design coverage (:func:`host_disagreements`); a
-  merge that omits any of them is refused as a silent resolution.
+  variant binding, required evidence kinds, library decisions and design coverage
+  (:func:`host_disagreements`); a merge that omits any of them is refused as a silent resolution.
 
 Every draw is bought once and replayed exactly by the shared author-response owner, and the whole
 result is saved as an ``agentic-rubric`` artifact. Its :attr:`AgenticRubric.draft` is an ordinary
@@ -28,7 +30,6 @@ its variant's prompt texts, and :func:`rubric_agent_protocol_sha256` pins them a
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Literal, Self
@@ -44,9 +45,8 @@ from exp.common.core.artifacts import (
     sha256_json,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.common.models import ModelRequest
 from exp.common.project import ProjectStore, artifact_input
-from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.authoring_packet import (
     AuthoringPacket,
@@ -55,22 +55,30 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     forced_tool_arguments,
     load_packet,
 )
+from exp.optimize.evaluation.variance.behavior_profiles import LibraryBinding
 from exp.optimize.evaluation.variance.rubric_author import (
     DESIGN_CHECKS,
     RUBRIC_AUTHOR_PROMPT,
     RUBRIC_TOOL,
     DesignFinding,
+    DesignReviewer,
     RubricAnswer,
     RubricDraft,
+    authoring_payload,
     check_rubric_answer,
     check_rubric_structure,
     checked_draft,
-    design_findings,
+    forced_request,
     rubric_protocol_sha256,
     rubric_request,
 )
+from exp.optimize.evaluation.variance.rubric_critic import (
+    DesignCritic,
+    DesignCriticProfile,
+    critic_protocol_sha256,
+)
 
-RUBRIC_AGENT_PROTOCOL = "rubric-agent-v1"
+RUBRIC_AGENT_PROTOCOL = "rubric-agent-v2"
 """Version of the prompt variants, phases, reconciliation and their host checks."""
 
 PLAN_TOOL = "submit_rubric_plan"
@@ -121,7 +129,8 @@ accounts for, the valid alternatives and recoveries you will keep valid, and ope
 Write the rubric from your plan in prior.plan. Call submit_rubric_draft.""",
     "critique": """PHASE self-critique
 Do not rewrite the rubric. Review prior.draft against every check in design_checks and against
-prior.host_findings, which the host computed and which are authoritative. For each check you
+prior.host_findings, which the host's structural checks and the independent design critic
+computed and which are authoritative. For each check you
 assess say satisfied, violated or not_applicable and cite criterion ids. List the concrete
 revisions the final rubric needs. Call submit_rubric_critique.""",
     "final": """PHASE final
@@ -262,6 +271,8 @@ class RubricAuthoringProfile(ContractModel):
     Attributes:
         variants: Prompt variants, each drafting independently; several are reconciled.
         agentic: Plan, draft, self-critique and final draws instead of one direct draw each.
+        critic: The LLM design critic reviewing every drafted rubric; None for structural
+            host checks only.
     """
 
     variants: tuple[PromptVariantId, ...] = Field(
@@ -270,6 +281,7 @@ class RubricAuthoringProfile(ContractModel):
         max_length=3,
     )
     agentic: bool = True
+    critic: DesignCriticProfile | None = None
 
     @model_validator(mode="after")
     def _distinct(self) -> Self:
@@ -277,6 +289,12 @@ class RubricAuthoringProfile(ContractModel):
         if len(set(self.variants)) != len(self.variants):
             raise ValueError("rubric prompt variants must be distinct")
         return self
+
+    def draws(self) -> int:
+        """Return the most draws one agentic authoring makes, critic reviews included."""
+        reviewed = len(self.variants) * (2 if self.agentic else 1) + 1
+        critic = 0 if self.critic is None else self.critic.draws() * reviewed
+        return len(self.variants) * (4 if self.agentic else 1) + 1 + critic
 
 
 class AgenticDraft(ContractModel):
@@ -344,6 +362,7 @@ def rubric_agent_protocol_sha256() -> Sha256:
         {
             "protocol": RUBRIC_AGENT_PROTOCOL,
             "rubric_author": rubric_protocol_sha256(),
+            "critic": critic_protocol_sha256(),
             "variants": {variant: variant_sha256(variant) for variant in PROMPT_VARIANTS},
             "reconcile": RECONCILE_PROMPT,
             "schemas": [
@@ -361,8 +380,9 @@ def phase_request(
     prior: JsonObject,
     *,
     output_tokens: int,
+    library: LibraryBinding | None = None,
 ) -> ModelRequest:
-    """Render one phase draw: the packet, the forty design checks and the earlier phases.
+    """Render one phase draw: the packet, the library, the design checks and earlier phases.
 
     Args:
         packet: The authoring packet.
@@ -370,6 +390,7 @@ def phase_request(
         phase: The phase.
         prior: The earlier phases' answers and the host's findings.
         output_tokens: Response allowance.
+        library: The behavior library version offered, if any.
 
     Returns:
         The forced-tool request.
@@ -380,14 +401,11 @@ def phase_request(
         "critique": (CRITIQUE_TOOL, RubricCritique),
         "final": (RUBRIC_TOOL, RubricAnswer),
     }[phase]
-    payload: JsonObject = {
-        "authoring_packet": packet.model_dump(mode="json"),
-        "citable_locators": sorted(packet.locators()),
-        "design_checks": [{"check": number, "requirement": text} for number, text in DESIGN_CHECKS],
-        "phase": phase,
-        "prior": prior,
-    }
-    return _request(
+    payload = authoring_payload(packet, library)
+    payload["design_checks"] = [{"check": n, "requirement": text} for n, text in DESIGN_CHECKS]
+    payload["phase"] = phase
+    payload["prior"] = prior
+    return forced_request(
         variant_prompt(variant, phase), payload, tool, model.model_json_schema(), output_tokens
     )
 
@@ -400,6 +418,7 @@ def author_rubric_agentic(
     identity: str,
     code_revision: str,
     profile: RubricAuthoringProfile | None = None,
+    library: LibraryBinding | None = None,
 ) -> AgenticRubric:
     """Author, or replay, a rubric with several independent prompt variants and phases.
 
@@ -415,6 +434,7 @@ def author_rubric_agentic(
         identity: Stable identity of the result.
         code_revision: Producing source identity.
         profile: Prompt variants and phases; every variant through every phase by default.
+        library: The behavior library version the rubric is assembled from, if any.
 
     Returns:
         The result, saved as an ``agentic-rubric`` artifact when any draw was answered.
@@ -426,7 +446,14 @@ def author_rubric_agentic(
         result_id = identity + "-result"
         if store.exists(result_id):
             return AgenticRubric.model_validate_json(store.read_bytes(result_id, "agentic.json"))
+        reviewer = None
+        if profile.critic is not None:
+            reviewer = DesignCritic(
+                project, settings, packet, packet_reference, identity=f"{identity}-critic",
+                code_revision=code_revision, library=library, profile=profile.critic,
+            )  # fmt: skip
         draws = _Draws(project, settings, packet, packet_reference, code_revision)
+        draws.library, draws.reviewer = library, reviewer
         members = tuple(
             draws.member(variant, f"{identity}-{variant}", agentic=profile.agentic)
             for variant in profile.variants
@@ -447,7 +474,14 @@ def author_rubric_agentic(
                     created_at=datetime.now(UTC),
                     code_revision=code_revision,
                     inputs=tuple(
-                        sorted({*responses, packet_reference}, key=lambda ref: ref.artifact_id)
+                        sorted(
+                            {
+                                *responses,
+                                packet_reference,
+                                *([library.reference] if library else []),
+                            },
+                            key=lambda ref: ref.artifact_id,
+                        )
                     ),
                 ),
                 files={"agentic.json": result},
@@ -480,8 +514,9 @@ def host_disagreements(
 
     Returns:
         Disagreements on status, on which variants a required criterion binds, on the event
-        kinds required criteria need, and on which design checks stay uncovered; each
-        ``unresolved`` until the reconciliation records its own resolution.
+        kinds required criteria need, on each library entry's decision, and on which design
+        checks each final draft left uncovered; each ``unresolved`` until the reconciliation
+        records its own resolution.
     """
     rows: list[DraftDisagreement] = []
 
@@ -524,10 +559,17 @@ def host_disagreements(
             for name, body in ready
         },
     )  # fmt: skip
-    uncovered = {
-        name: {f.check for f in design_findings(body, packet) if f.severity == "uncovered"}
-        for name, body in ready
-    }
+    answers = {m.variant: m.phases[-1].answer or {} for m in members if m.draft.rubric}
+    entries = sorted({str(row["entry"]) for a in answers.values() for row in _decisions(a)})
+    for entry in entries:
+        add(
+            f"library:{entry}",
+            {
+                name: next((str(r["decision"]) for r in _decisions(a) if r["entry"] == entry), "")
+                for name, a in answers.items()
+            },
+        )
+    uncovered = {m.variant: {f.check for f in m.draft.design} for m in members if m.draft.rubric}
     for check in sorted(set().union(*uncovered.values()) if uncovered else ()):
         add(
             f"design_check:{check}",
@@ -553,6 +595,8 @@ class _Draws:
         """Bind the frozen author settings and the saved packet."""
         self.project, self.settings, self.packet = project, settings, packet
         self.reference, self.code_revision = reference, code_revision
+        self.library: LibraryBinding | None = None
+        self.reviewer: DesignReviewer | None = None
 
     def buy(
         self, request: ModelRequest, identity: str, tool: str
@@ -566,7 +610,7 @@ class _Draws:
             self.settings,
             request,
             identity=identity,
-            sources=(self.reference,),
+            sources=(self.reference, *((self.library.reference,) if self.library else ())),
             code_revision=self.code_revision,
         )
         if isinstance(bought, str):
@@ -604,14 +648,16 @@ class _Draws:
                 self.packet,
                 output_tokens=self.settings.output_tokens,
                 instruction=variant_prompt(variant),
+                library=self.library,
             )
             return self._final(request, identity, "direct", variant, phases, done, unavailable)
         prior: JsonObject = {}
         stages: tuple[_Stage, ...] = ("plan", "draft", "critique")
         for phase in stages:
             request = phase_request(
-                self.packet, variant, phase, prior, output_tokens=self.settings.output_tokens
-            )
+                self.packet, variant, phase, prior, output_tokens=self.settings.output_tokens,
+                library=self.library,
+            )  # fmt: skip
             tool = {"plan": PLAN_TOOL, "draft": RUBRIC_TOOL, "critique": CRITIQUE_TOOL}[phase]
             bought = self.buy(request, f"{identity}-{phase}", tool)
             if isinstance(bought, str):
@@ -631,8 +677,9 @@ class _Draws:
                     )
                 )
         request = phase_request(
-            self.packet, variant, "final", prior, output_tokens=self.settings.output_tokens
-        )
+            self.packet, variant, "final", prior, output_tokens=self.settings.output_tokens,
+            library=self.library,
+        )  # fmt: skip
         return self._final(request, identity, "final", variant, phases, done, unavailable)
 
     def _final(
@@ -658,6 +705,8 @@ class _Draws:
             response=response,
             variants=(variant,),
             require_coverage=phase == "final",
+            library=self.library,
+            reviewer=self.reviewer,
         )
         answer = None if draft.status == "refused" else _parsed(arguments)
         phases.append(
@@ -703,13 +752,18 @@ class _Draws:
             return PhaseRecord(phase=phase, response=response, failure=bounded_reason(error))
         findings: list[DesignFinding] = []
         try:
-            check_rubric_structure(answer, self.packet)
+            check_rubric_structure(answer, self.packet, self.library)
         except ValueError as error:
             findings.append(
                 DesignFinding(check=31, severity="violation", detail=bounded_reason(error))
             )
-        if answer.rubric is not None:
-            findings += design_findings(answer.rubric, self.packet)
+        if answer.rubric is not None and self.reviewer is not None:
+            try:
+                findings += self.reviewer(answer.rubric)
+            except ValueError as error:
+                findings.append(
+                    DesignFinding(check=31, severity="violation", detail=bounded_reason(error))
+                )
         prior["draft"] = answer.model_dump(mode="json")
         prior["host_findings"] = [row.model_dump(mode="json") for row in findings]
         return PhaseRecord(
@@ -756,17 +810,18 @@ class _Draws:
                     failure=failure,
                 )
             )
-        payload: JsonObject = {
-            "authoring_packet": self.packet.model_dump(mode="json"),
-            "citable_locators": sorted(self.packet.locators()),
-            "drafts": {
-                m.variant: m.draft.rubric.body.model_dump(mode="json")
-                for m in ready
-                if m.draft.rubric is not None
-            },
-            "host_disagreements": [row.model_dump(mode="json") for row in detected],
-        }
-        request = _request(
+        payload = authoring_payload(self.packet, self.library)
+        payload.update(
+            {
+                "drafts": {
+                    m.variant: m.draft.rubric.body.model_dump(mode="json")
+                    for m in ready
+                    if m.draft.rubric is not None
+                },
+                "host_disagreements": [row.model_dump(mode="json") for row in detected],
+            }
+        )
+        request = forced_request(
             RECONCILE_PROMPT,
             payload,
             RECONCILE_TOOL,
@@ -785,7 +840,7 @@ class _Draws:
             if isinstance(arguments, ValueError):
                 raise arguments
             answer = ReconciliationAnswer.model_validate(arguments)
-            check_rubric_answer(answer, self.packet)
+            check_rubric_answer(answer, self.packet, library=self.library, reviewer=self.reviewer)
             recorded = {row.subject for row in answer.disagreements}
             silent = sorted({row.subject for row in detected} - recorded)
             if silent:
@@ -814,6 +869,8 @@ class _Draws:
             identity=identity,
             response=response,
             variants=tuple(m.variant for m in ready),
+            library=self.library,
+            reviewer=self.reviewer,
         )
         return AgenticRubric(
             profile=profile,
@@ -832,16 +889,7 @@ def _parsed(arguments: object) -> JsonObject | None:
         return None
 
 
-def _request(
-    instruction: str, payload: JsonObject, tool: str, schema: JsonObject, output_tokens: int
-) -> ModelRequest:
-    """Build one forced single-tool request whose user content is canonical JSON data."""
-    return ModelRequest(
-        messages=(
-            ModelMessage(role="system", content=instruction),
-            ModelMessage(role="user", content=json.dumps(payload, sort_keys=True)),
-        ),
-        tools=(ToolSchema(name=tool, description="Typed answer", input_schema=schema),),
-        tool_choice=ToolChoice(name=tool),
-        maximum_output_tokens=output_tokens,
-    )
+def _decisions(answer: JsonObject) -> list[JsonObject]:
+    """Return the library decisions of a parsed rubric answer."""
+    rows = answer.get("library_decisions")
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []

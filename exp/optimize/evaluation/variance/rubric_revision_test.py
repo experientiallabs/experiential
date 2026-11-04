@@ -13,6 +13,13 @@ from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue, sha2
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.authoring_packet_test import ticket_packet, tool_reply
+from exp.optimize.evaluation.variance.behavior_curation import CURATE_TOOL, CURATION_PLAN_TOOL
+from exp.optimize.evaluation.variance.behavior_profiles import load_library
+from exp.optimize.evaluation.variance.behavior_profiles_test import (
+    DETECTION,
+    LINTER,
+    scope_library,
+)
 from exp.optimize.evaluation.variance.episodes import (
     EpisodeEvent,
     EpisodeEvidence,
@@ -28,7 +35,11 @@ from exp.optimize.evaluation.variance.rubric_author import (
     load_rubric,
     save_rubric,
 )
-from exp.optimize.evaluation.variance.rubric_author_test import criterion, rubric_answer
+from exp.optimize.evaluation.variance.rubric_author_test import (
+    criterion,
+    library_answer,
+    rubric_answer,
+)
 from exp.optimize.evaluation.variance.rubric_revision import (
     REVISION_TOOL,
     CalibrationEpisode,
@@ -320,3 +331,147 @@ def test_a_revision_that_never_resolves_its_problems_stops_diagnostic_at_the_rou
             project, settings, judge, packet, TARGETS, identity="never-stable",
             code_revision="t", max_rounds=3,
         )  # fmt: skip
+
+
+class LinterJudge(RubricJudge):
+    """Judge with the bound rubric's library guidance, as the judge prompt receives it.
+
+    The scope criterion fires on every escalation until the linter's guidance carries a
+    false-positive note, so the escalate calibration case is misjudged under the first library
+    version. Closing is always a failure.
+    """
+
+    def __init__(self, inner: ScriptedJsonTransport) -> None:
+        """Bind the scripted transport and record every guidance the judge was shown."""
+        super().__init__(inner)
+        self.guidance: list[JsonValue] = []
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Assess from the bound rubric and its guidance, or delegate any other request."""
+        choice = payload.get("tool_choice")
+        function = choice.get("function") if isinstance(choice, dict) else None
+        if not isinstance(function, dict) or function.get("name") != "assess_episode":
+            return self.inner.post(
+                url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+            )
+        messages = payload["messages"]
+        assert isinstance(messages, list) and isinstance(messages[1], dict)
+        content = json.loads(str(messages[1]["content"]))
+        guidance = content["rubric"]["behavior_guidance"]
+        self.guidance.append(guidance)
+        narrowed = any(row["false_positive_notes"] for row in guidance)
+        criteria = [str(row["criterion_id"]) for row in content["rubric_criteria"]]
+        events = content["episode_evidence"]["events"]
+        closed = any(e["kind"] == "tool_call" and e["content"]["name"] == "close" for e in events)
+        decisive = str(events[1]["event_id"])
+        failing = {"handled"} if closed else set() if narrowed else {"scope.kept"}
+        return _call(
+            "assess_episode",
+            {
+                "verdict": "fail" if failing else "pass",
+                "criterion_findings": [
+                    {
+                        "criterion_id": name,
+                        "status": "not_met" if name in failing else "met",
+                        "event_refs": [decisive],
+                        "reason": f"{name} at {decisive}.",
+                    }
+                    for name in criteria
+                ],
+                "reason": "Scripted.",
+                "decisive_refs": [decisive],
+            },
+        )
+
+
+def test_a_misfiring_linter_is_narrowed_in_the_library_and_rebinds_the_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A calibration miss on a library criterion narrows the linter in a new library version.
+
+    The revised rubric keeps its body but cites the new version, so its judge guidance and its
+    judge definition change; the judge reads the new false-positive note and the miss resolves.
+    """
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    _, packet = ticket_packet(fixture)
+    library = scope_library(fixture.project)
+    answer = library_answer()
+    problem = "calibration_miss:escalate-high"
+    note = "Escalating the named ticket is the requested handling, not a change of scope."
+    router = LinterJudge(
+        ScriptedJsonTransport(
+            (
+                tool_reply(RUBRIC_TOOL, answer),
+                tool_reply(
+                    CURATION_PLAN_TOOL,
+                    {
+                        "groups": [
+                            {"evidence": [problem], "behavior": "Linter fires on escalation.",
+                             "scope": "cross_task", "matches": f"linter:{LINTER}",
+                             "reason": "The escalation was requested."},
+                        ]
+                    },
+                ),
+                tool_reply(
+                    CURATE_TOOL,
+                    {
+                        "operations": [
+                            {"operation": "add_false_positive", "evidence": [problem],
+                             "rationale": "Misfired on requested handling.", "target": LINTER,
+                             "note": note},
+                        ]
+                    },
+                ),
+                tool_reply(
+                    REVISION_TOOL,
+                    {**answer, "resolutions": [{"problem_id": problem, "change": "Narrowed."}]},
+                ),
+            )
+        )
+    )  # fmt: skip
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: router
+    )
+    project, settings = fixture.project, fixture.settings
+    draft = author_rubric(
+        project, settings, packet, identity="lib-rubric", code_revision="t", library=library
+    )
+    assert draft.status == "ready", draft.failure
+    profile = judge_profile(
+        model_alias=settings.model_alias,
+        model=settings.model,
+        maximum_output_tokens=settings.output_tokens,
+    )
+    rubric = save_rubric(project, draft, code_revision="t")
+    definition = judge_definition(project, profile, rubric, task_sha256=TASK, world_sha256=WORLD)
+    judge = EpisodeJudge(definition=definition, settings=settings)
+
+    revision = revise_until_stable(
+        project, settings, judge, packet, TARGETS, identity="narrow", code_revision="t",
+        library=library,
+    )  # fmt: skip
+
+    assert [row.problem_id for row in revision.problems] == [problem]
+    assert revision.status == "revised", revision.rounds
+    assert revision.library_curation is not None and revision.library is not None
+    narrowed = load_library(project, revision.library)
+    assert narrowed.version == 2 and narrowed.parent_sha256 == library.library.identity
+    linter = narrowed.linter(LINTER)
+    assert linter.false_positive_notes == (note,) and linter.revision == 2
+    misfire = [e for e in linter.examples if e.evidence_id == problem]
+    assert [e.polarity for e in misfire] == ["negative"]
+    assert misfire[0].locator.startswith("assessment:")
+    revised = load_rubric(project, revision.final.rubric)
+    assert revised.library is not None and revised.library.version == 2
+    assert revised.body == load_rubric(project, rubric).body
+    assert revision.final.identity != judge.identity
+    first, last = router.guidance[0], router.guidance[-1]
+    assert isinstance(first, list) and isinstance(last, list)
+    assert DETECTION in json.dumps(first) and note in json.dumps(last) and note not in str(first)

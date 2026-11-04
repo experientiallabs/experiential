@@ -14,6 +14,7 @@ from exp.optimize.evaluation.variance.authoring_packet_test import (
     tool_reply,
     wire,
 )
+from exp.optimize.evaluation.variance.behavior_profiles_test import scope_library
 from exp.optimize.evaluation.variance.rubric_agent import (
     CRITIQUE_TOOL,
     PLAN_TOOL,
@@ -28,8 +29,11 @@ from exp.optimize.evaluation.variance.rubric_author import RUBRIC_TOOL, load_rub
 from exp.optimize.evaluation.variance.rubric_author_test import (
     covering_answer,
     criterion,
+    library_answer,
     rubric_answer,
 )
+from exp.optimize.evaluation.variance.rubric_critic import CRITIC_TOOL, DesignCriticProfile
+from exp.optimize.evaluation.variance.rubric_critic_test import review, uncovered, violation
 from exp.optimize.evaluation.variance.tests.grounded_world_test import grounded_fixture
 
 PLAN: JsonObject = {
@@ -57,6 +61,7 @@ CRITIQUE: JsonObject = {
     "revisions": ["Make the call-count criterion an efficiency diagnostic."],
 }
 FAST = criterion("fast", question="Did the agent use the fewest tool calls?")
+CRITIC = DesignCriticProfile(variants=("coverage",), repair=False)
 
 
 def _system(request: JsonValue) -> str:
@@ -80,17 +85,19 @@ def _user(request: JsonValue) -> JsonObject:
 def test_a_variant_plans_drafts_critiques_and_finalizes_with_its_prompt_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The host's self-critique catches a design violation in the draft; the final fixes it."""
+    """The design critic catches a violation in the draft; the final fixes it."""
     fixture = grounded_fixture(tmp_path, monkeypatch)
     _, reference = ticket_packet(fixture, coalition=ticket_coalition())
     transport = wire(
         monkeypatch,
         tool_reply(PLAN_TOOL, PLAN),
         tool_reply(RUBRIC_TOOL, covering_answer(FAST)),
+        tool_reply(CRITIC_TOOL, violation(19, "fast")),
         tool_reply(CRITIQUE_TOOL, CRITIQUE),
         tool_reply(RUBRIC_TOOL, covering_answer(criterion("fast", role="efficiency_diagnostic"))),
+        tool_reply(CRITIC_TOOL, review()),
     )
-    profile = RubricAuthoringProfile(variants=("failure-patterns-first",))
+    profile = RubricAuthoringProfile(variants=("failure-patterns-first",), critic=CRITIC)
 
     result = author_rubric_agentic(
         fixture.project, fixture.settings, reference, identity="agentic", code_revision="t",
@@ -101,7 +108,7 @@ def test_a_variant_plans_drafts_critiques_and_finalizes_with_its_prompt_pinned(
         profile=profile,
     )  # fmt: skip
 
-    assert replay == result and len(transport.requests) == 4
+    assert replay == result and len(transport.requests) == 6
     assert result.draft.status == "ready", result.draft.failure
     (member,) = result.members
     assert member.variant == "failure-patterns-first"
@@ -111,15 +118,16 @@ def test_a_variant_plans_drafts_critiques_and_finalizes_with_its_prompt_pinned(
     assert (19, "violation") in draft_findings
     requests = [request.payload for request in transport.requests]
     assert "VARIANT failure-patterns-first/v1" in _system(requests[0])
-    assert "PHASE self-critique" in _system(requests[2])
-    critique_prior = _user(requests[2])["prior"]
+    assert "VARIANT coverage/v1" in _system(requests[2])
+    assert "PHASE self-critique" in _system(requests[3])
+    critique_prior = _user(requests[3])["prior"]
     assert isinstance(critique_prior, dict) and isinstance(critique_prior["host_findings"], list)
     assert {"check": 19} in [
         {"check": row["check"]} for row in critique_prior["host_findings"] if isinstance(row, dict)
     ]
     checks = _user(requests[0])["design_checks"]
     assert isinstance(checks, list) and len(checks) == 40
-    final_prior = _user(requests[3])["prior"]
+    final_prior = _user(requests[4])["prior"]
     assert isinstance(final_prior, dict) and final_prior["critique"] == CRITIQUE
     assert result.draft.rubric is not None
     assert result.draft.rubric.variants == ("failure-patterns-first",)
@@ -139,21 +147,28 @@ def test_a_final_that_keeps_a_violation_or_an_unwaived_gap_is_refused(
         {"check": check, "reason": "Not exercised by this task.", "cited": ["task"]}
         for check in (10, 11, 12)
     ]
-    finals = (covering_answer(FAST), rubric_answer(criterion("handled")), waived)
+    gaps = uncovered(10, 11, 12)
+    finals = (
+        (covering_answer(FAST), ()),
+        (rubric_answer(criterion("handled")), (tool_reply(CRITIC_TOOL, gaps),)),
+        (waived, (tool_reply(CRITIC_TOOL, gaps),)),
+    )
     wire(
         monkeypatch,
         *(
             reply
-            for final in finals
+            for final, reviewed in finals
             for reply in (
                 tool_reply(PLAN_TOOL, PLAN),
                 tool_reply(RUBRIC_TOOL, covering_answer(FAST)),
+                tool_reply(CRITIC_TOOL, violation(19, "fast")),
                 tool_reply(CRITIQUE_TOOL, CRITIQUE),
                 tool_reply(RUBRIC_TOOL, final),
+                *reviewed,
             )
         ),
     )
-    profile = RubricAuthoringProfile(variants=("requirements-first",))
+    profile = RubricAuthoringProfile(variants=("requirements-first",), critic=CRITIC)
     results = [
         author_rubric_agentic(
             fixture.project,
@@ -230,3 +245,54 @@ def test_reconciliation_records_every_disagreement_and_refuses_a_silent_merge(
     assert "silently resolved disagreements ['variant:routine']" in refused.draft.failure
     assert [row.subject for row in refused.disagreements] == ["variant:routine"]
     assert refused.members[0].phases[0].phase == "direct"
+
+
+def test_library_decisions_that_differ_between_variants_must_be_reconciled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drafts deciding one library entry differently produce a host disagreement to record."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    _, reference = ticket_packet(fixture)
+    library = scope_library(fixture.project)
+    without = library_answer(task="inapplicable")
+    body = without["rubric"]
+    assert isinstance(body, dict) and isinstance(body["criteria"], list)
+    body["criteria"] = [
+        row
+        for row in body["criteria"]
+        if isinstance(row, dict) and row["criterion_id"] != "lint.first"
+    ]
+    subject = "library:task_criterion:tickets.lint-first"
+    merged = {
+        **library_answer(),
+        "disagreements": [
+            {
+                "subject": subject,
+                "positions": {
+                    "requirements-first": "diagnostic",
+                    "alternatives-first": "inapplicable",
+                },
+                "resolution": "merged",
+                "rationale": "The task's sources mention the linter; keep it diagnostic.",
+            }
+        ],
+    }
+    wire(
+        monkeypatch,
+        tool_reply(RUBRIC_TOOL, library_answer()),
+        tool_reply(RUBRIC_TOOL, without),
+        tool_reply(RECONCILE_TOOL, merged),
+    )
+    profile = RubricAuthoringProfile(
+        variants=("requirements-first", "alternatives-first"), agentic=False
+    )
+
+    result = author_rubric_agentic(
+        fixture.project, fixture.settings, reference, identity="library-merge",
+        code_revision="t", profile=profile, library=library,
+    )  # fmt: skip
+
+    assert result.draft.status == "ready", result.draft.failure
+    assert [row.subject for row in result.disagreements] == [subject]
+    assert result.draft.rubric is not None and result.draft.rubric.library == library.citation()
+    assert profile.draws() == 3
