@@ -1,18 +1,45 @@
-"""Retain request-only terminal writes, including paid prework, until they commit."""
+"""Retain request-only terminal writes, including paid prework, until they commit.
+
+A write the ledger refuses with a deterministic contract error
+(:class:`~exp.runtime.gateway.ledger_errors.GatewayLedgerError`: the request is
+unknown, owned by another organization or ledger, or already terminal with
+another outcome) can never commit, so it is finalized and dropped with a
+warning instead of being replayed forever. Every other failure stays retained
+and fences only its own organization's new work.
+"""
 
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass, field
 from inspect import signature
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
+from exp.runtime.gateway.ledger_errors import (
+    AccountingRecoverySupersededError,
+    AccountingRecoveryUnresolvedTerminalError,
+    GatewayLedgerError,
+)
 from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
     accounting_recovering_error,
 )
 from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import SyncWriteLedger
+
+_logger = logging.getLogger(__name__)
+
+
+def _permanently_refused(error: Exception) -> bool:
+    """Whether a terminal write failed a deterministic ledger contract and cannot commit.
+
+    Recovery-owner outcomes are excluded: their owner must keep the waiver or
+    liability until it independently verifies the durable result.
+    """
+    return isinstance(error, GatewayLedgerError) and not isinstance(
+        error, (AccountingRecoverySupersededError, AccountingRecoveryUnresolvedTerminalError)
+    )
 
 
 @dataclass
@@ -69,9 +96,17 @@ class RequestSettlements:
         with self._lock:
             return bool(self._pending)
 
-    def require_clear(self) -> None:
-        """Refuse new paid work while this registry retains a failed meter write."""
-        if self.pending:
+    def require_clear(self, organization_id: str) -> None:
+        """Refuse an organization's new paid work while it owns a retained failed write.
+
+        Another organization's retained write never refuses this one.
+        """
+        with self._lock:
+            pending = any(
+                settlement.retained and settlement.authorization.organization_id == organization_id
+                for settlement in self._pending.values()
+            )
+        if pending:
             raise NativeBridgeError(accounting_recovering_error())
 
     def finish(
@@ -107,10 +142,17 @@ class RequestSettlements:
                     certify_no_effects=settlement.certify_no_effects,
                     web_search_requests=settlement.web_search_requests,
                 )
-            except Exception:  # noqa: BLE001 - failed ownership must survive any ledger fault.
-                with self._lock:
-                    settlement.retained = True
-                raise
+            except Exception as error:  # noqa: BLE001 - failed ownership must survive any ledger fault.
+                if not _permanently_refused(error):
+                    with self._lock:
+                        settlement.retained = True
+                    raise
+                _logger.warning(
+                    "abandoning a request terminal write the ledger permanently refused: %s",
+                    type(error).__name__,
+                    extra={"request_id": settlement.authorization.request_id},
+                )
+                committed = False
             settlement.committed = committed is True
             with self._lock:
                 if self._pending.get(settlement.authorization.request_id) is settlement:

@@ -176,8 +176,7 @@ class NativeAttemptAccounting:
         self._admission_dead_rungs_skipped = 0
         self._admission_parameter_coercions = 0
         self._admission_lead_rungs_skipped = 0
-        # Count bypasses by bound, rate, fresh-session and tenant-share limits,
-        # plus forced dispatches when no other rung can serve.
+        # Bound, rate, fresh-session and tenant-share sheds; forced dispatches (no rung left).
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
         self._rung_saturation_refusals = 0
@@ -213,12 +212,13 @@ class NativeAttemptAccounting:
             )
         return not pending and not self.request_settlements.pending
 
-    def require_clear(self) -> None:
-        """Refuse new work while this control plane owns a failed accounting write."""
-        self.request_settlements.require_clear()
+    def require_clear(self, organization_id: str) -> None:
+        """Refuse new work while this organization, never another, owns a failed write."""
+        self.request_settlements.require_clear(organization_id)
         with self._lock:
             pending = any(
-                entry.settlement_write_failed or entry.abandon_write_failed
+                (entry.settlement_write_failed or entry.abandon_write_failed)
+                and entry.authorization.organization_id == organization_id
                 for entry in self._inflight.values()
             )
         if pending:
