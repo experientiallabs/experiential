@@ -10,10 +10,11 @@ pipeline runs with no stand-in over a grounded world in
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -32,7 +33,9 @@ from exp.optimize.evaluation.rules.stage import (
     rulebook_files,
 )
 from exp.optimize.evaluation.variance import family as family_module
+from exp.optimize.evaluation.variance import family_search as family_search_module
 from exp.optimize.evaluation.variance import family_stages as stages_module
+from exp.optimize.evaluation.variance import variant_search as search_module
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, run_actor_critic
 from exp.optimize.evaluation.variance.actor_critic_test import (
     _done,
@@ -47,7 +50,12 @@ from exp.optimize.evaluation.variance.admission import VariantJudging
 from exp.optimize.evaluation.variance.admission_test import bound_judging, unfrozen_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
 from exp.optimize.evaluation.variance.briefing_review import DEFAULT_REVIEW_VARIANTS, REVIEW_TOOL
-from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
+from exp.optimize.evaluation.variance.contracts import (
+    DecisionState,
+    Scenario,
+    ScenarioSet,
+    StatePart,
+)
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
 from exp.optimize.evaluation.variance.contrast_test import _outcome
 from exp.optimize.evaluation.variance.decision_measure import (
@@ -55,6 +63,8 @@ from exp.optimize.evaluation.variance.decision_measure import (
     DecisionMeasure,
     DecisionMeasureSpec,
     JointVerdict,
+    StateEvidence,
+    StateMeasure,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import (
@@ -68,6 +78,18 @@ from exp.optimize.evaluation.variance.grader import EpisodeView
 from exp.optimize.evaluation.variance.grader_test import _SNAPSHOT, _Decider, _evidence
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgeCoverage
 from exp.optimize.evaluation.variance.judged_test import JudgeRouter
+from exp.optimize.evaluation.variance.nudge_ladder import (
+    LadderRound,
+    NudgeLadder,
+    NudgeLadderSpec,
+    NudgeRung,
+)
+from exp.optimize.evaluation.variance.nudges import (
+    NudgeReview,
+    ProposedNudge,
+    ladder_decision,
+    rung_scenario,
+)
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     TrainingRecords,
@@ -75,6 +97,13 @@ from exp.optimize.evaluation.variance.records import (
     confirmation_job,
 )
 from exp.optimize.evaluation.variance.rewards import PointDecision
+from exp.optimize.evaluation.variance.variant_search import (
+    LadderMeasurer,
+    Measurer,
+    SearchRound,
+    VariantSearch,
+    VariantSearchSpec,
+)
 from exp.optimize.evaluation.variance.variants import CoherenceCheck, VariantCheckpoint
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse
@@ -947,3 +976,234 @@ def test_the_joint_measure_runs_by_default_under_the_family_authors_before_confi
     assert family_decisions(
         setup.project, [measured, blocked.model_copy(update={"decision_variance": "no states"})]
     ) == {"point-0": PointDecision(point_id="point-0", joint_score=0.5)}
+
+
+class _Measured:
+    """A stand-in joint measure that admits every set and makes ``seven`` the hardest state."""
+
+    def __init__(self) -> None:
+        """Start with no measured set."""
+        self.sets: list[list[str]] = []
+
+    def __call__(self, project: ProjectStore, spec: DecisionMeasureSpec, **kwargs: object) -> tuple:
+        """Save a measure whose states' free choices pick their correct option less for seven."""
+        del spec
+        scenarios = cast(tuple[Scenario, ...], kwargs["scenarios"])
+        decision = kwargs["decision"]
+        assert isinstance(decision, DecisionState)
+        self.sets.append([s.scenario_id for s in scenarios])
+        free = ArtifactInput(artifact_id="free-study", sha256="4" * 64)
+        states = tuple(
+            StateMeasure(
+                state_id=s.scenario_id,
+                free=free,
+                choices=(),
+                reviews=(),
+                evidence=StateEvidence(
+                    state_id=s.scenario_id,
+                    correct_option=s.correct_option,
+                    choices=(s.correct_option,) * (1 if s.scenario_id == "seven" else 3)
+                    + ("delete-1" if s.correct_option == "delete-2" else "delete-2",) * 2,
+                ),
+            )
+            for s in scenarios
+        )
+        identity = f"fixture-measure-{len(self.sets)}"
+        measure = DecisionMeasure(
+            identity=identity, decision=decision, states=states, verdict=_verdict(True)
+        )
+        saved = project.artifacts.write_json(
+            artifact_id=identity,
+            artifact_type=MEASURE_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+            ),
+            files={"measure.json": measure},
+        )
+        return artifact_input(saved), measure, None
+
+
+def test_a_searched_set_is_contrasted_and_an_admitted_family_ladders_its_hardest_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The search's admitted set replaces the draw; the ladder's rungs become their own tasks."""
+    setup = _setup(tmp_path, monkeypatch)
+    project, stages, job = setup.project, setup.stages, setup.job
+    measured = _Measured()
+    monkeypatch.setattr(family_module, "measure_family", measured)
+    monkeypatch.setattr(search_module, "measure_family", measured)
+    asked: list[list[str]] = []
+    frozen: dict[str, VariantJudging] = {}
+
+    def judges(state: DecisionState, scenarios: Sequence[Scenario]) -> dict[str, VariantJudging]:
+        """Bind each set once, the way the pipeline authors one chain per set."""
+        del state
+        asked.append([s.scenario_id for s in scenarios])
+        for s in scenarios:
+            if s.scenario_id not in frozen:
+                frozen[s.scenario_id] = bound_judging(
+                    project,
+                    stages.checkpoint(s.scenario_id),
+                    job.configuration,
+                    variant=s.scenario_id,
+                )
+        return {s.scenario_id: frozen[s.scenario_id] for s in scenarios}
+
+    found = [Scenario.model_validate(_scenario(n, r, o)) for n, r, o in _SEARCHED]
+
+    def search(
+        project: ProjectStore, spec: VariantSearchSpec, *args: object, **kwargs: object
+    ) -> tuple[ArtifactInput, VariantSearch]:
+        """Measure one admitted round through the family's measurer and save the search."""
+        identity = kwargs["identity"]
+        measure = cast(Measurer, kwargs["measure"])
+        assert isinstance(identity, str)
+        chosen = ScenarioSet(scenarios=tuple(found), limitations=("Searched.",))
+        result = measure(chosen, 0)
+        assert not isinstance(result, str), result
+        row = SearchRound(
+            round=0,
+            stance=spec.stances[0],
+            transcript=result[0],
+            scenarios=chosen,
+            measure=result[0],
+            verdict=result[1].verdict,
+            accepted=True,
+        )
+        record = VariantSearch(
+            identity=identity, rounds=(row,), accepted_round=0, scenarios=chosen, measure=result[0]
+        )
+        saved = project.artifacts.write_json(
+            artifact_id=identity,
+            artifact_type="variant-search",
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+            ),
+            files={"search.json": record},
+        )
+        return artifact_input(saved), record
+
+    def ladder(
+        project: ProjectStore,
+        spec: NudgeLadderSpec,
+        decision: DecisionState,
+        base: Scenario,
+        **kwargs: object,
+    ) -> tuple[ArtifactInput, NudgeLadder]:
+        """Measure the base with one passing nudge and admit it as the strong rung."""
+        laddered = ladder_decision(decision, base, str(kwargs["instruction"]), ["Check the rows."])
+        axis = laddered.instruction_axis
+        assert axis is not None
+        value = next(v for v in axis.values if v.value_id == "nudge-0")
+        rung = rung_scenario(base, value, f"{base.scenario_id}-nudge-0")
+        measure = cast(LadderMeasurer, kwargs["measure"])
+        result = measure(laddered, ScenarioSet(scenarios=(base, rung), limitations=("Nudged.",)))
+        assert not isinstance(result, str), result
+        nudge = ProposedNudge(
+            strength="strong", text="Check the rows.", source="user", rationale="Points at rows."
+        )
+        rungs = (
+            NudgeRung(
+                position=0,
+                strength="strong",
+                scenario=rung,
+                nudge=nudge,
+                review=NudgeReview(leak=(), realism=()),
+                admitted=True,
+            ),
+            NudgeRung(position=1, strength="none", scenario=base, admitted=True),
+        )
+        identity = str(kwargs["identity"])
+        record = NudgeLadder(
+            identity=identity,
+            base=base.scenario_id,
+            rounds=(
+                LadderRound(
+                    round=0,
+                    stance=spec.author_stances[0],
+                    transcript=result[0],
+                    decision=laddered,
+                    measure=result[0],
+                    rungs=rungs,
+                ),
+            ),
+            chosen_round=0,
+            rungs=rungs,
+        )
+        saved = project.artifacts.write_json(
+            artifact_id=identity,
+            artifact_type="nudge-ladder",
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+            ),
+            files={"ladder.json": record},
+        )
+        return artifact_input(saved), record
+
+    monkeypatch.setattr(family_search_module, "search_variants", search)
+    monkeypatch.setattr(family_search_module, "build_nudge_ladder", ladder)
+    settings = setup.spec.decision_author
+    spec = setup.spec.model_copy(
+        update={
+            "judging": None,
+            "measure_decisions": True,
+            "search": VariantSearchSpec(author=settings),
+            "ladder": NudgeLadderSpec(
+                author=settings, leak_reviewer=settings, realism_reviewer=settings
+            ),
+        }
+    )
+
+    report = run_decision_family(
+        project,
+        spec,
+        exposure=setup.exposure,
+        report=setup.report,
+        point=0,
+        code_revision="test",
+        actions=_actions,
+        judging=judges,
+    )
+
+    assert report.search is not None and report.scenarios is not None
+    assert report.scenarios.accepted and report.scenarios.scenarios is not None
+    assert [s.scenario_id for s in report.scenarios.scenarios.scenarios] == ["six", "seven"]
+    assert asked[0] == ["six", "seven"] and ["seven", "seven-nudge-0"] in asked
+    assert measured.sets == [["six", "seven"], ["six", "seven"], ["seven", "seven-nudge-0"]]
+    assert stages.dispatches.count("selection:six") == 1
+    assert isinstance(report.ladder, ArtifactInput)
+    assert [(r.scenario_id, r.strength, r.position) for r in report.rungs] == [
+        ("seven-nudge-0", "strong", 0),
+        ("seven", "none", 1),
+    ]
+    assert report.rungs[0].nudge == "Check the rows." and report.rungs[-1].nudge is None
+    assert all(r.variant.selection is not None for r in report.rungs)
+    assert report.rungs[0].judging == frozen["seven-nudge-0"]
+    assert report.confirmation is not None
+    with pytest.raises(ValueError, match="measure_decisions"):
+        spec.model_copy(update={"measure_decisions": False}).model_validate(
+            {**spec.model_dump(mode="json"), "measure_decisions": False}
+        )
+    assert setup.spec.draws_identity(setup.report, 0, "test") != spec.draws_identity(
+        setup.report, 0, "test"
+    )
+    unset = spec.model_copy(update={"search": None, "ladder": None, "judging": setup.spec.judging})
+    assert unset.draws_identity(setup.report, 0, "test") == setup.spec.model_copy(
+        update={"measure_decisions": True}
+    ).draws_identity(setup.report, 0, "test")
+
+    again = run_decision_family(
+        project,
+        spec,
+        exposure=setup.exposure,
+        report=setup.report,
+        point=0,
+        code_revision="test",
+        actions=_actions,
+        judging=judges,
+    )
+    assert again == report and len(measured.sets) == 3
+
+
+_SEARCHED = (("six", 6, "delete-1"), ("seven", 7, "delete-2"))
+"""The admitted searched set: the same two row counts the scenario author would draw."""

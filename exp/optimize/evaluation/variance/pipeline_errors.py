@@ -13,8 +13,10 @@
   attempts are tagged with the error bank over the whole attempt (:func:`tag_tier_errors`, one
   ``observations`` unit per attempt) and over each step (``step`` view). The attempt record
   becomes the coalition's mistake patterns (:func:`coalition_patterns`); the step record ranks
-  each attempt's actor-critic points (:func:`attempt_error_points`), recorded beside the TraceML
-  labels for review. Which points the selectors choose stays their judgment.
+  each attempt's actor-critic points (:func:`attempt_error_points`), saved as an
+  ``error-points`` artifact (:func:`save_error_points`) that error mining registers as each
+  tier's ``error_points`` selector and critic reference, read with ``read_error_points``. Which
+  points the selectors choose stays their judgment.
 
 Every tag is bought through the decision tagging seam and its cache, so a rerun replays.
 """
@@ -25,9 +27,16 @@ import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    JsonValue,
+    sha256_json,
+    stable_id,
+)
 from exp.common.models import load_model_catalog
-from exp.common.project import ArtifactStore, ProjectStore
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.model_costs import (
     CostComponent,
     decision_cost,
@@ -35,6 +44,7 @@ from exp.optimize.evaluation.executable.model_costs import (
 )
 from exp.optimize.evaluation.variance.build_records import VarianceBuildPlan, VarianceBuildReport
 from exp.optimize.evaluation.variance.coalition import BehaviorPattern
+from exp.optimize.evaluation.variance.evidence import ERROR_POINTS_TYPE, ReferenceSource
 from exp.optimize.evaluation.variance.pipeline_inputs import admitted_transport
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
@@ -256,6 +266,53 @@ def attempt_error_points(
         for trace, points in ranked.items()
         if points
     }
+
+
+def save_error_points(
+    store: ArtifactStore, reference: ArtifactInput, *, code_revision: str, limit: int = 3
+) -> ArtifactInput:
+    """Save each attempt's error-ranked points as an ``error-points`` reference artifact.
+
+    Attempt traces are named ``<tier>/attempt:<n>``; the record keys each by ``n``, the index the
+    evidence packet uses, so a selector reads attempt ``n``'s points as ``errors:<n>``.
+
+    Args:
+        store: Project artifacts.
+        reference: The tier's saved ``error-steps`` record.
+        code_revision: Producing source identity.
+        limit: Most points kept per attempt.
+
+    Returns:
+        The saved artifact, adopted when the identical record is already saved.
+    """
+    ranked = attempt_error_points(store, reference, limit=limit)
+    attempts: list[JsonValue] = []
+    for trace, points in sorted(ranked.items()):
+        index = trace.rsplit(":", 1)[-1]
+        if index.isdigit():
+            attempts.append({"attempt": int(index), "trace_id": trace, "points": points})
+    record: JsonObject = {"steps": reference.model_dump(mode="json"), "attempts": attempts}
+    identity = stable_id(ERROR_POINTS_TYPE, {"record": sha256_json(record)})
+    if not store.exists(identity):
+        store.write_json(
+            artifact_id=identity,
+            artifact_type=ERROR_POINTS_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+                inputs=(reference,),
+            ),
+            files={"points.json": record},
+        )
+    return artifact_input(store.read(identity).manifest)
+
+
+def error_point_reference(artifact: ArtifactInput) -> ReferenceSource:
+    """Register a tier's saved error points as its selectors' and critics' reference."""
+    return ReferenceSource(
+        kind="error_points", name="error-points", artifact=artifact, file="points.json"
+    )
 
 
 def coalition_patterns(

@@ -59,7 +59,12 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
-from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
+from exp.optimize.evaluation.variance.contracts import (
+    DecisionOption,
+    DecisionState,
+    Scenario,
+    StatePart,
+)
 from exp.optimize.evaluation.variance.contrast import (
     OptionContrast,
     WitnessResult,
@@ -616,7 +621,21 @@ def slot_evidence(project: ProjectStore, slot: JudgedSlot, judge: str) -> Episod
     raise ValueError(f"episode {slot.episode.episode_id} has no saved evidence")
 
 
-def decision_document(decision: DecisionState) -> JsonObject:
+class DecisionOptions(ContractModel):
+    """The options of a decision at a point that has no authored decision state.
+
+    Attributes:
+        decision: The decision the actor faced at the point.
+        options: The competing actions, two or more, compared by identity.
+        evidence_refs: Locators of the continuation events the options were derived from.
+    """
+
+    decision: str = Field(min_length=1, max_length=600)
+    options: tuple[DecisionOption, ...] = Field(min_length=2, max_length=6)
+    evidence_refs: tuple[str, ...] = Field(min_length=1)
+
+
+def decision_document(decision: DecisionState | DecisionOptions) -> JsonObject:
     """Render a decision and its declared options, with their concrete actions and calls."""
     return {
         "decision": decision.decision,

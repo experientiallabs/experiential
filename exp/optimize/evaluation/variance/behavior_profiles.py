@@ -52,7 +52,7 @@ from exp.common.core.artifacts import (
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.variance.episodes import EventKind
 
-BEHAVIOR_LIBRARY_PROTOCOL = "behavior-library-v1"
+BEHAVIOR_LIBRARY_PROTOCOL = "behavior-library-v2"
 """Version of the library contract, its operations and their host rules."""
 
 LIBRARY_TYPE = "behavior-library"
@@ -553,7 +553,8 @@ def check_library_decisions(
     """Require one decision per offered entry, matched by the roles of the criteria citing it.
 
     A ``required`` entry needs a required correctness criterion citing it and task support; a
-    ``diagnostic`` one only diagnostic criteria; an ``inapplicable`` one no criterion.
+    ``diagnostic`` one only diagnostic criteria, and only ``behavior_diagnostic`` ones for a
+    bad-behavior linter (``linter:``); an ``inapplicable`` one no criterion.
 
     Args:
         decisions: The author's decisions.
@@ -573,9 +574,14 @@ def check_library_decisions(
         )
     for row in decisions:
         found = roles.get(row.entry, set())
+        allowed = (
+            {"behavior_diagnostic"}
+            if row.entry.startswith("linter:")
+            else {"behavior_diagnostic", "efficiency_diagnostic"}
+        )
         matches = {
             "required": "required_correctness" in found,
-            "diagnostic": found == {"efficiency_diagnostic"},
+            "diagnostic": bool(found) and found <= allowed,
             "inapplicable": not found,
         }[row.decision]
         if not matches:

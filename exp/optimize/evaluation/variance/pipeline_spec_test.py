@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.optimize.evaluation.variance.pipeline import plan_decision_variance
 from exp.optimize.evaluation.variance.pipeline_spec import (
     COUNCIL_ACTORS,
     STAGES,
@@ -132,3 +133,49 @@ def test_the_library_design_critic_and_decision_variance_are_on_by_default(
     assert measure is not None and measure.classifier == measure.reviewer == settings
     off = authoring.model_copy(update={"decision_variance": False})
     assert off.decision_measure() is None
+
+
+def test_search_ladder_and_point_decisions_are_on_by_default_on_the_authoring_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The search, the ladder and the option proposer reuse the open-weight authoring roles."""
+    run = wired(tmp_path, monkeypatch)
+    base = make_spec(run.fixture, run.rubric, run.bank)
+    settings = run.fixture.settings
+    authoring = base.authoring.model_copy(update={"decision_variance": True})
+    search, ladder = authoring.search_spec(), authoring.ladder_spec()
+    assert search is not None and search.author == authoring.scenario_author
+    assert search.maximum_rounds == authoring.search_rounds == 3
+    assert ladder is not None and ladder.author == authoring.scenario_author
+    assert ladder.leak_reviewer == ladder.realism_reviewer == authoring.rubric_author
+    assert ladder.strengths == ("strong", "medium", "weak") and ladder.maximum_rounds == 2
+    off = authoring.model_copy(update={"decision_variance": False})
+    assert off.search_spec() is None and off.ladder_spec() is None
+    assert authoring.model_copy(update={"nudge_ladder": False}).ladder_spec() is None
+    options = base.point_options()
+    assert options is not None and options.proposer == base.authoring.decision_author == settings
+    assert options.classifier == base.authoring.scenario_author
+    quiet = base.records.model_copy(update={"point_decisions": False})
+    assert base.model_copy(update={"records": quiet}).point_options() is None
+
+    spec = base.model_copy(update={"authoring": authoring})
+    plan = plan_decision_variance(run.project, spec, code_revision="test", executors=run.executors)
+    families = next(row for row in plan.stages if row.stage == "families")
+    records = next(row for row in plan.stages if row.stage == "records")
+    assert any(line.startswith("Variant search: up to 3 rounds") for line in families.lines)
+    assert any(line.startswith("Nudge ladder: up to 2 rounds") for line in families.lines)
+    assert any(line.startswith("Point decisions:") for line in records.lines)
+    bare = plan_decision_variance(
+        run.project,
+        spec.model_copy(
+            update={
+                "authoring": authoring.model_copy(
+                    update={"variant_search": False, "nudge_ladder": False}
+                )
+            }
+        ),
+        code_revision="test",
+        executors=run.executors,
+    )
+    priced = next(row for row in bare.stages if row.stage == "families")
+    assert sum(row.attempts for row in families.costs) > sum(row.attempts for row in priced.costs)

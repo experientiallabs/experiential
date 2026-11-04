@@ -75,6 +75,7 @@ from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENAR
 from exp.optimize.evaluation.variance.behavior_labeling import LABEL_TOOL
 from exp.optimize.evaluation.variance.build_records import EXPOSURE_TYPE, VarianceBuildSpec
 from exp.optimize.evaluation.variance.contracts import OptionCall
+from exp.optimize.evaluation.variance.decision_measure import CHOICE_TOOL
 from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
@@ -118,6 +119,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     TraceMLSettings,
     VariantQualification,
 )
+from exp.optimize.evaluation.variance.point_options import OPTIONS_TOOL
 from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.role_prompts import (
     DRAFT_TOOL_NAME,
@@ -550,7 +552,82 @@ def unrevised(request: JsonObject) -> bool:
     return all(isinstance(row, dict) and row["criterion_id"] != "tier.checked" for row in criteria)
 
 
+def _contents(payload: JsonObject) -> list[JsonValue]:
+    """Every JSON message content of a request, parsed."""
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    parsed: list[JsonValue] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str) and content.startswith("{"):
+            try:
+                parsed.append(json.loads(content))
+            except json.JSONDecodeError:
+                continue
+    return parsed
+
+
+def _deep(value: JsonValue, key: str) -> JsonValue:
+    """The first value under ``key`` anywhere in a JSON value, depth first."""
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        value = list(value.values())
+    for item in value if isinstance(value, list) else ():
+        found = _deep(item, key)
+        if found is not None:
+            return found
+    return None
+
+
+def options_answer(payload: JsonObject) -> JsonObject:
+    """Derived point options citing the first and last continuation events the draw may read."""
+    locators = _deep(_contents(payload), "locators")
+    assert isinstance(locators, list)
+    events = sorted(str(ref) for ref in locators if "/event:" in str(ref))
+    assert events, "the point's continuations carry no scored event"
+    return {
+        "decision": "How to handle the ticket.",
+        "options": [
+            {
+                "option_id": "escalate",
+                "action": "Escalate the ticket",
+                "evidence_refs": [events[0]],
+            },
+            {"option_id": "close", "action": "Close the ticket", "evidence_refs": [events[-1]]},
+        ],
+    }
+
+
+def choice_answer(payload: JsonObject) -> JsonObject:
+    """Classify an episode's first scored actor event as its first derived option."""
+    episode = _deep(_contents(payload), "episode")
+    assert isinstance(episode, dict) and isinstance(episode["events"], list)
+    actor = [
+        row["event_id"]
+        for row in episode["events"]
+        if isinstance(row, dict) and row["owner"] == "actor" and row["scope"] == "scored"
+    ]
+    if not actor:
+        return {
+            "option_id": "unclear",
+            "action_event": "",
+            "evidence_refs": [episode["events"][0]["event_id"]],
+            "rationale": "No scored actor event.",
+        }
+    labels = _deep(payload["tools"], "enum")
+    assert isinstance(labels, list)
+    return {
+        "option_id": labels[0],
+        "action_event": actor[0],
+        "evidence_refs": [actor[0]],
+        "rationale": "The first scored actor call.",
+    }
+
+
 ANSWERS: dict[str, Answer] = {
+    OPTIONS_TOOL: options_answer,
+    CHOICE_TOOL: choice_answer,
     REVISION_TOOL: revision_answer,
     "choose_points": lambda _: selector_answer(),
     "estimate_points": lambda _: critic_answer(),
@@ -567,6 +644,9 @@ ANSWERS: dict[str, Answer] = {
     CRITIC_TOOL: lambda _: design_review(),
 }
 """Every non-judge role's answer, by the forced tool it must call."""
+
+_ROLE_DRAWS = ("You derive the decision an agent", "You classify one finished episode")
+"""Openings of the records stage's option proposer and choice classifier, which never search."""
 
 PACKET_TOOLS = frozenset(
     {REVISION_TOOL, WORLD_PLAN_TOOL, WORLD_TOOL, RUBRIC_PLAN_TOOL, RUBRIC_TOOL, CRITIQUE_TOOL}
@@ -608,6 +688,10 @@ def _draft_answer(payload: JsonObject) -> JsonObject:
             properties = schema.get("properties") if isinstance(schema, dict) else None
             if isinstance(properties, dict) and "points" in properties:
                 return selector_answer()
+            if isinstance(properties, dict) and "options" in properties:
+                return options_answer(payload)
+            if isinstance(properties, dict) and "option_id" in properties:
+                return choice_answer(payload)
             return critic_answer()
     raise AssertionError("an agentic investigate turn offered no draft tool")
 
@@ -1376,7 +1460,12 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
         )
         assert saved.group_tier is not None and saved.group_tier.label == tier.tier
         assert saved.spec.initial.study.checkpoint == rules.job.study.checkpoint
-        assert [ref.artifact for ref in saved.spec.references] == [labels[tier.tier]]
+        # The tier's labels and its error-ranked attempt points are both registered references.
+        assert [ref.artifact for ref in saved.spec.references] == [
+            labels[tier.tier],
+            traceml.error_points[tier.tier],
+        ]
+        assert [ref.kind for ref in saved.spec.references] == ["traceml_labels", "error_points"]
         assert saved.spec.initial.actor_alias == tier.tier
         # Selectors and critics search the scoped world-learning index, never held-out traces.
         assert tier.retrieval is not None and saved.spec.retrieval == tier.retrieval
@@ -1805,8 +1894,14 @@ def test_agentic_roles_authored_rubric_and_learned_rules(
     # Agentic roles plan, read, draft and self check; their opening offers world-learning search.
     tools = [tool for tool, _ in run.wire.requests]
     assert {PLAN_TOOL.name, FREE_CHOICE, "choose_points", "estimate_points"} <= set(tools)
-    plans = [payload for tool, payload in run.wire.requests if tool == PLAN_TOOL.name]
-    assert all("world-learning-retrieval" in json.dumps(payload) for payload in plans)
+    plans = [
+        payload
+        for tool, payload in run.wire.requests
+        if tool == PLAN_TOOL.name and not any(n in json.dumps(payload) for n in _ROLE_DRAWS)
+    ]
+    assert plans and all("world-learning-retrieval" in json.dumps(p) for p in plans)
+    # The records stage derived options at every continued point and classified its choices.
+    assert {OPTIONS_TOOL, CHOICE_TOOL} <= set(tools)
     # The agentic judge planned, checked and self checked before every assessment.
     assert run.wire.judged
     assert {

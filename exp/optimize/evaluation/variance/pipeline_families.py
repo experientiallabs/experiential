@@ -26,10 +26,10 @@ contrasts run afresh. A family is admitted exactly when its computed eligibility
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, stable_id
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json, stable_id
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
@@ -43,7 +43,7 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     build_authoring_packet,
     save_packet,
 )
-from exp.optimize.evaluation.variance.authors import DecisionContext, ScenarioDraft, option_calls
+from exp.optimize.evaluation.variance.authors import DecisionContext, option_calls
 from exp.optimize.evaluation.variance.behavior_curation import curate_library
 from exp.optimize.evaluation.variance.behavior_labeling import label_behaviors
 from exp.optimize.evaluation.variance.behavior_profiles import (
@@ -77,6 +77,7 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     rubric_draws,
     world_sources,
 )
+from exp.optimize.evaluation.variance.pipeline_ladder import search_ladder_costs
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
     CostLine,
@@ -177,7 +178,9 @@ class _Point:
         profile: The episode-judge profile fixed in error mining.
         coalition_reports: Every tier's report, for the coalition.
         judged_groups: Every tier's judged group, for the coalition.
-        authored: The authored chain, once built.
+        authored: The authored chain of the family's final scenario set, once built.
+        chains: Every authored chain, by the digest of the decision and scenario set it was
+            authored for: the family's set, each searched round's set and each ladder round.
     """
 
     context: StageContext
@@ -189,20 +192,38 @@ class _Point:
     coalition_reports: tuple[ActorCriticReport, ...]
     judged_groups: dict[str, JudgedStudy]
     authored: _Authored | None = None
+    chains: dict[str, _Authored] = field(default_factory=dict)
 
-    def judge(self, state: DecisionState, scenario: Scenario) -> VariantJudging:
-        """Return one scenario's frozen judge, authoring the whole chain on the first call.
+    def judge(
+        self, state: DecisionState, scenarios: Sequence[Scenario]
+    ) -> dict[str, VariantJudging]:
+        """Return every scenario's frozen judge, authoring one chain per scenario set.
+
+        A search round's set and a ladder round's rungs each get their own packet, world,
+        rubric, freeze and judges, so every rung of one measured ladder round shares one rubric.
+        Every owner replays, so asking again for a set never buys anything twice.
 
         Args:
-            state: The family's decision state.
-            scenario: The scenario.
+            state: The decision state declaring the set.
+            scenarios: Every scenario of the set.
 
         Returns:
-            Its frozen judge binding.
+            Each scenario's frozen judge binding.
         """
-        if self.authored is None:
-            self.authored = self.author(state, _scenarios(self.context.project, self.draws))
-        return self.authored.judging[scenario.scenario_id]
+        chain = self.chain(state, scenarios)
+        return {scenario.scenario_id: chain.judging[scenario.scenario_id] for scenario in scenarios}
+
+    def chain(self, state: DecisionState, scenarios: Sequence[Scenario]) -> _Authored:
+        """Return the authored chain of one scenario set, authoring or replaying it once."""
+        key = sha256_json(
+            {
+                "decision": state.model_dump(mode="json"),
+                "scenarios": [scenario.model_dump(mode="json") for scenario in scenarios],
+            }
+        )
+        if key not in self.chains:
+            self.chains[key] = self.author(state, tuple(scenarios))
+        return self.chains[key]
 
     def author(self, state: DecisionState, scenarios: tuple[Scenario, ...]) -> _Authored:
         """Run, or replay, the packet, both authors, the review, the freeze and the judges.
@@ -437,6 +458,7 @@ class _FamiliesStage:
         revised = revision_draws(authoring)
         confirmation = variants * options * authoring.confirmation_repeats
         costs: list[CostComponent] = []
+        search_lines: tuple[str, ...] = ()
         for alias in mining.actors:
             episode = tier_job(project, mining.job, alias, 1)
             passes = 2 if authoring.revision_rounds else 1
@@ -471,6 +493,11 @@ class _FamiliesStage:
                     per_family.extend(
                         row.scaled(draws) for row in evaluation_costs(project, settings)
                     )
+            extra, extra_judged, search_lines = search_ladder_costs(
+                project, authoring, episode, options
+            )
+            per_family.extend(extra)
+            judged += extra_judged
             per_family.extend(judge_costs(project, spec, judged))
             costs.extend(row.scaled(authoring.families_per_tier) for row in per_family)
         lines = (
@@ -507,6 +534,7 @@ class _FamiliesStage:
                 else "off; admission uses selection and confirmation only."
             ),
         )
+        lines += search_lines
         if authoring.fresh_briefing:
             lines += (
                 f"Fresh briefings: each reviewed for leaks under {len(DEFAULT_REVIEW_VARIANTS)} "
@@ -597,6 +625,8 @@ def _family(point: _Point) -> FamilyOutcome:
         dispositions=authoring.dispositions,
         decision_variance=authoring.decision_measure(),
         measure_decisions=authoring.decision_variance,
+        search=authoring.search_spec(),
+        ladder=authoring.ladder_spec(),
     )
     point.draws = family_spec.draws_identity(point.report, point.point, revision)
     family = run_decision_family(
@@ -609,15 +639,18 @@ def _family(point: _Point) -> FamilyOutcome:
         actions=None if authoring.actions else option_calls,
         judging=point.judge,
     )
-    if family.judging and point.authored is None:
+    if family.judging:
         point.authored = _replayed(point, family)
+    first = family
     revisions: dict[str, ArtifactInput] = {}
     if point.authored is not None and authoring.revision_rounds:
         revised = _revise(point, family, revisions)
         if revised is not None:
+            # The re-registration contrasts one scenario draw under the revised judges; the
+            # search and the ladder belong to the first registration and stay recorded there.
             family = run_decision_family(
                 project,
-                family_spec.model_copy(update={"judging": revised}),
+                family_spec.model_copy(update={"judging": revised, "search": None, "ladder": None}),
                 exposure=exposure,
                 report=point.report,
                 point=point.point,
@@ -639,6 +672,8 @@ def _family(point: _Point) -> FamilyOutcome:
         admitted=family.eligibility.eligible,
         reasons=tuple(family.eligibility.reasons),
         failure=family.failure,
+        search=first.search,
+        ladder=first.ladder if isinstance(first.ladder, ArtifactInput) else None,
     )
 
 
@@ -664,7 +699,7 @@ def _replayed(point: _Point, family: FamilyReport) -> _Authored | None:
         return None
     if family.scenarios.scenarios is None:
         return None
-    return point.author(family.decision.answer.state, family.scenarios.scenarios.scenarios)
+    return point.chain(family.decision.answer.state, family.scenarios.scenarios.scenarios)
 
 
 def _revise(
@@ -743,16 +778,6 @@ def _evidence(project: ProjectStore, assessment: ArtifactInput) -> EpisodeEviden
                 project.artifacts.read_bytes(reference.artifact_id, "evidence.json")
             )
     raise ValueError(f"assessment {assessment.artifact_id} cites no saved episode evidence")
-
-
-def _scenarios(project: ProjectStore, draws: str) -> tuple[Scenario, ...]:
-    """Read the family's saved scenario draw."""
-    draft = ScenarioDraft.model_validate_json(
-        project.artifacts.read_bytes(draws + "-scenarios-result", "draft.json")
-    )
-    if draft.scenarios is None:
-        raise ValueError("the family has no parsed scenario set")
-    return draft.scenarios.scenarios
 
 
 FAMILIES_STAGE = _FamiliesStage()

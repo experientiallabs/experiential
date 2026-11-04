@@ -12,6 +12,15 @@ does not is exported as diagnostic, awarding no reward, with its refusals or fai
 Without qualification every export is diagnostic. When enabled and two families are admitted,
 the cross-talk probe measures whether exemplars from the first family's best judged attempts
 move the second family's judged scores.
+
+Version 2 selector records score every selector draw: with ``records.point_decisions`` (the
+default) every continued point of each tier's run gets options derived from its judged
+continuations by the agentic option proposer and each continuation's choice classified
+(:mod:`~exp.optimize.evaluation.variance.point_options`); a point a family was measured from
+also carries that family's joint score, which decides its value. The nudge ladders of admitted
+families become one curriculum (:func:`~exp.optimize.evaluation.variance.nudge_ladder.
+nudge_curriculum`): admitted rungs from strong to weak, every un-nudged target last, which a
+training schedule reads (``TrainingScheduleSpec.curriculum``).
 """
 
 from __future__ import annotations
@@ -35,7 +44,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.executable.controls import ControlWitnessSpec, witness_controls
-from exp.optimize.evaluation.executable.costs import job_costs
+from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.executable.qualification import (
@@ -55,6 +64,7 @@ from exp.optimize.evaluation.variance.family import (
     family_decisions,
     family_executable_task,
 )
+from exp.optimize.evaluation.variance.nudge_ladder import load_ladder, nudge_curriculum
 from exp.optimize.evaluation.variance.pipeline_spec import (
     CostLine,
     DecisionVarianceSpec,
@@ -74,6 +84,7 @@ from exp.optimize.evaluation.variance.pipeline_stages import (
     load_report,
     tier_job,
 )
+from exp.optimize.evaluation.variance.point_options import point_decisions
 from exp.optimize.evaluation.variance.records import selector_records
 
 __all__ = ["RECORDS_STAGE"]
@@ -109,6 +120,25 @@ class _RecordsStage:
             f"their confirmed variants ({exports}).",
         ]
         costs: list[CostComponent] = []
+        options = spec.point_options()
+        if options is not None:
+            points = spec.mining.selector_draws * spec.mining.points
+            per_point = options.profile.budget.model_calls * options.draws_per_point(
+                spec.mining.continuations
+            )
+            for _ in spec.mining.actors:
+                for settings in (options.proposer, options.classifier):
+                    costs.extend(
+                        row.scaled(points * per_point)
+                        for row in evaluation_costs(project, settings)
+                    )
+            lines.append(
+                f"Point decisions: every continued point (up to {points} per tier) gets options "
+                f"from {len(options.stances)} proposer stances and a reconcile on "
+                f"{options.proposer.model_alias}, and each of its {spec.mining.continuations} "
+                f"judged continuations is classified on {options.classifier.model_alias}, so the "
+                "version 2 selector records score every draw."
+            )
         if qualify:
             variants = spec.authoring.families_per_tier * (spec.authoring.maximum_variants + 1)
             for alias in spec.mining.actors:
@@ -149,6 +179,8 @@ class _RecordsStage:
             if report.records is not None:
                 training[key] = _save(context, "training", key, report.records, (row.report,))
         selectors: dict[str, ArtifactInput] = {}
+        derived: dict[str, tuple[ArtifactInput, ...]] = {}
+        options = spec.point_options()
         for tier in mining.tiers:
             # Version 2 selector records score each pick by its family's joint decision measure;
             # every family of the tier counts, admitted or not, so a refused point scores zero.
@@ -157,12 +189,13 @@ class _RecordsStage:
                 for row in families.families
                 if row.tier == tier.tier and row.report is not None
             ]
-            records = selector_records(
-                project,
-                load_report(project, tier.report),
-                judge=tier.judge.identity,
-                decisions=family_decisions(project, measured),
-            )
+            run = load_report(project, tier.report)
+            decisions = family_decisions(project, measured)
+            if options is not None:
+                decisions, derived[tier.tier] = point_decisions(
+                    project, options, run, code_revision=context.code_revision, families=decisions
+                )
+            records = selector_records(project, run, judge=tier.judge.identity, decisions=decisions)
             selectors[tier.tier] = _save(context, "selectors", tier.tier, records, (tier.report,))
         exports: list[HarborExport] = []
         if spec.records.harbor:
@@ -171,12 +204,17 @@ class _RecordsStage:
         crosstalk, skipped = None, None
         if spec.records.crosstalk:
             crosstalk, skipped = _crosstalk(context, admitted, reports)
+        curriculum = nudge_curriculum(
+            [load_ladder(project, row.ladder) for row in admitted if row.ladder is not None]
+        )
         outputs = RecordsOutputs(
             training=training,
             selectors=selectors,
             harbor=tuple(exports),
             crosstalk=crosstalk,
             crosstalk_skipped=skipped,
+            curriculum=curriculum,
+            point_options=derived,
         )
         summary: JsonObject = {
             "admitted": len(admitted),
@@ -185,6 +223,11 @@ class _RecordsStage:
             "qualified": [row.path for row in exports if not row.diagnostic],
             "crosstalk": None if crosstalk is None else crosstalk.artifact_id,
             "crosstalk_skipped": skipped,
+            "curriculum": [
+                {"scenario_id": stage.scenario_id, "strength": stage.strength}
+                for stage in curriculum
+            ],
+            "point_options": {tier: len(refs) for tier, refs in derived.items()},
         }
         refs = (
             *training.values(),
@@ -192,6 +235,8 @@ class _RecordsStage:
             crosstalk,
             *(row.task for row in exports),
             *(row.qualification for row in exports),
+            *(ref for refs in derived.values() for ref in refs),
+            *(row.ladder for row in admitted),
         )
         return StageRun(outputs, refs, summary)
 

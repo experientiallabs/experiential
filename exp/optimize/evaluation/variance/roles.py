@@ -103,7 +103,7 @@ only supplied locators.
     + AUDIT_CHECKLIST
 )
 
-ROLE_PROTOCOL = "variance-roles-v4"
+ROLE_PROTOCOL = "variance-roles-v5"
 """Version of the role prompts and answer schemas; change it whenever either changes."""
 
 FORCED_PROFILE = EvidenceToolProfile()

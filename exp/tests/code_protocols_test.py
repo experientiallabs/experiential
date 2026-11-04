@@ -278,7 +278,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v4",
+        "variance-roles-v5",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -290,7 +290,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "d6819ef386e9c92a10d4ebe7b0e12ed062ee23075fa15aebeeb60876b1b4437d",
+        "6a6ceb49cde775e5ea4083015f97fea81ab1d2e3e64e5b65500711b01da9c3aa",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -402,9 +402,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rubric_author:RUBRIC_AUTHOR_PROTOCOL",
-        "rubric-author-v3",
+        "rubric-author-v4",
         ("exp.optimize.evaluation.variance.rubric_author",),
-        "c7bbe10120be6926a491b38e13a25120f232bcce78ce0176e4265dcdb0fb3027",
+        "3c8e830b11ef86d1f50a71b2a12f15b5c3b2d626b92bec4fad94f6b9b799794d",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rubric_agent:RUBRIC_AGENT_PROTOCOL",
@@ -426,9 +426,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.behavior_profiles:BEHAVIOR_LIBRARY_PROTOCOL",
-        "behavior-library-v1",
+        "behavior-library-v2",
         ("exp.optimize.evaluation.variance.behavior_profiles",),
-        "97760edaf68a86fa7f3c170291332ca74fc2eabf05a0206f7eb5c78364e47e61",
+        "d84d486a42dff4809f1f090a7ce97b000074fdc6806c6a2d20dfd3f486a2a689",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.behavior_labeling:LABELING_PROTOCOL",
@@ -510,7 +510,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.variance.decision_measure:DECISION_MEASURE_PROTOCOL",
         "decision-measure-v1",
         ("exp.optimize.evaluation.variance.decision_measure",),
-        "3a602b024d562bc6abb223efd2a0bb0cb23bef9b0a3e1c927bf0a546eff43608",
+        "258d1b77a601a3d37484f637c5df1c2371011fa98b9dc78fb08123550bc1fdea",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.family_stages:ROLE_DRAWS_PROTOCOL",
@@ -525,13 +525,19 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.family_stages:check_clarity",
             "exp.optimize.evaluation.variance.family_stages:review_clarity",
         ),
-        "1e06e787f2ddb998b3f9b03add80d89cc377dd48c3fb7d2c4c77d57d490dc49e",
+        "4f5dc6d65df9534670205d41d3002819c0c530627bc15e71adcff08fc2ea0c3a",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.variant_search:VARIANT_SEARCH_PROTOCOL",
-        "variant-search-v1",
+        "variant-search-v2",
         ("exp.optimize.evaluation.variance.variant_search",),
-        "2cffc91161200de4836a4955aa3fb8bb34132ecda1aff2521cc5d8848170df4b",
+        "b256fc8fc11f49f7b635ce539fa76645b24f40d48ff018841df755c1471e3f7d",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.point_options:POINT_OPTIONS_PROTOCOL",
+        "point-options-v1",
+        ("exp.optimize.evaluation.variance.point_options",),
+        "6a0765dffc7c4456236d35b8a3e3ac52641dc24bfeae0b1286531e45e7b132ab",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.nudges:NUDGE_PROTOCOL",
@@ -543,13 +549,13 @@ PROTOCOLS = (
         "exp.optimize.evaluation.variance.nudge_ladder:NUDGE_LADDER_PROTOCOL",
         "nudge-ladder-v1",
         ("exp.optimize.evaluation.variance.nudge_ladder",),
-        "e51356c8b55223a158bedc2abed884ab15f24d1014b26cecc153beba64bacf1a",
+        "1c8b8cd305abd6499349434f9382aee5e48fbc2aedcfafad5344ab275489a443",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.schedule:SCHEDULE_PROTOCOL",
         "variance-schedule-v1",
         ("exp.optimize.evaluation.variance.schedule",),
-        "16a87116b7f8e7b8a0bef66d709c85f08f5bc95f6b29bac2965cb63edbb95d2a",
+        "6333e5a57fba4669354ed5fad67afa5d000ca1336ed71b2d5c9cb8029636679b",
     ),
     Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",

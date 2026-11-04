@@ -29,7 +29,8 @@ records) and registers each new frozen model revision it produces back here
   :mod:`~exp.optimize.evaluation.variance.nudge_ladder`) orders the admitted rungs of nudge
   ladders from strong to weak with every un-nudged target last, and :func:`curriculum_tier` gives
   the strength tier a rollout count has reached, so training fades nudges and can compare the
-  nudged and un-nudged arms.
+  nudged and un-nudged arms. A schedule given a :class:`CurriculumPlan` (the records stage's
+  curriculum) names the current tier's rungs in every rollout plan.
 
 Every decision (a plan, a completion with its measured metrics, a registered revision) is saved
 as an immutable event artifact chained to the one before it, so the schedule resumes from the
@@ -72,6 +73,9 @@ from exp.optimize.evaluation.variance.judged import (
     EpisodeJudge,
     judge_study,
     slot_rewards,
+)
+from exp.optimize.evaluation.variance.nudge_ladder import (
+    CurriculumPlan as CurriculumPlan,
 )
 from exp.optimize.evaluation.variance.nudge_ladder import (
     CurriculumStage as CurriculumStage,
@@ -165,6 +169,8 @@ class TrainingScheduleSpec(ContractModel):
             version; version 1 by default.
         admission: Judge-coverage limits the selector records must meet.
         rewarm_on_revision: Whether a new revision restarts warm-up.
+        curriculum: Nudge curriculum each rollout plan names the current tier of, or None;
+            left out of the identity while None.
     """
 
     protocol: Literal["variance-schedule-v1"] = SCHEDULE_PROTOCOL
@@ -176,6 +182,7 @@ class TrainingScheduleSpec(ContractModel):
     objective: AnySelectorObjective = SelectorObjective()
     admission: FamilyAdmissionPolicy = FamilyAdmissionPolicy()
     rewarm_on_revision: bool = False
+    curriculum: CurriculumPlan | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _one_revision_per_role(self) -> Self:
@@ -254,6 +261,7 @@ class RolloutPlan(ContractModel):
         episode_judge: The frozen judge labelling every episode.
         revisions: Revision identity of every role the rollout runs under.
         reason: Why this rollout was planned this way.
+        curriculum: The current nudge-curriculum tier's rungs, when the schedule has one.
     """
 
     rollout: int = Field(ge=0)
@@ -264,6 +272,7 @@ class RolloutPlan(ContractModel):
     episode_judge: EpisodeJudge
     revisions: dict[str, Sha256]
     reason: str = Field(min_length=1, max_length=2000)
+    curriculum: tuple[CurriculumStage, ...] = Field(default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
@@ -773,6 +782,9 @@ def _decide(spec: TrainingScheduleSpec, state: ScheduleState) -> RolloutPlan:
             }
         )
         job = registration.initial
+    stages = () if spec.curriculum is None else spec.curriculum.tier(state.planned)
+    if stages:
+        reason += f"; curriculum tier {stages[0].strength} ({len(stages)} rungs)"
     return RolloutPlan(
         rollout=state.planned,
         epoch=state.epoch,
@@ -782,6 +794,7 @@ def _decide(spec: TrainingScheduleSpec, state: ScheduleState) -> RolloutPlan:
         episode_judge=spec.base.episode_judge,
         revisions=state.revisions,
         reason=reason[:2000],
+        curriculum=stages,
     )
 
 

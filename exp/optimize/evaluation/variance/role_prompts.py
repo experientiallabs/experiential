@@ -255,6 +255,12 @@ EVIDENCE_TOOLS: tuple[ToolSchema, ...] = (
         input_schema=_schema({"attempt": _INT, "step": _INT}, ("attempt", "step")),
     ),
     ToolSchema(
+        name="read_error_points",
+        description="Read one attempt's points ranked by the error tags of the steps decided "
+        "there, when error points were registered.",
+        input_schema=_schema({"attempt": _INT}, ("attempt",)),
+    ),
+    ToolSchema(
         name="search_world_traces",
         description="Search world-learning traces (never held out) for observed outcomes of an "
         "action in a situation; give tool_name and arguments, or a message.",

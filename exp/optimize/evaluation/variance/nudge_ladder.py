@@ -505,6 +505,25 @@ def build_nudge_ladder(
         return artifact_input(manifest), ladder
 
 
+def load_ladder(project: ProjectStore, reference: ArtifactInput) -> NudgeLadder:
+    """Read a saved nudge ladder, refusing any other artifact.
+
+    Args:
+        project: Project holding it.
+        reference: The ``nudge-ladder`` artifact.
+
+    Returns:
+        The ladder.
+
+    Raises:
+        ValueError: The reference is not the saved ladder it pins.
+    """
+    stored = project.artifacts.read(reference.artifact_id)
+    if artifact_input(stored.manifest) != reference or stored.manifest.artifact_type != LADDER_TYPE:
+        raise ValueError(f"artifact {reference.artifact_id} is not the pinned nudge ladder")
+    return NudgeLadder.model_validate_json(stored.payloads["ladder.json"])
+
+
 class CurriculumStage(ContractModel):
     """One admitted nudge-ladder rung, as a training stage.
 
@@ -524,6 +543,22 @@ class CurriculumStage(ContractModel):
     def nudged(self) -> bool:
         """Whether the stage carries a nudge."""
         return self.strength != "none"
+
+
+class CurriculumPlan(ContractModel):
+    """A nudge curriculum a training schedule follows, one strength tier at a time.
+
+    Attributes:
+        stages: The ordered curriculum, from :func:`nudge_curriculum`.
+        rollouts_per_tier: Rollouts each nudged strength tier lasts before the next.
+    """
+
+    stages: tuple[CurriculumStage, ...] = Field(min_length=1)
+    rollouts_per_tier: int = Field(default=4, ge=1, le=1000, strict=True)
+
+    def tier(self, completed: int) -> tuple[CurriculumStage, ...]:
+        """Return the stages of the tier ``completed`` rollouts have reached."""
+        return curriculum_tier(self.stages, completed, self.rollouts_per_tier)
 
 
 def nudge_curriculum(

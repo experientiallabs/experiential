@@ -10,7 +10,9 @@ saved actor-critic run over a mining-probe task:
    invariants and criteria
    (:func:`~exp.optimize.evaluation.variance.authors.author_decision_state`).
 3. **Scenarios.** One forced scenario draw varies it; a set with any structural problem stops the
-   family.
+   family. With ``search`` set, a measured variant search
+   (:func:`~exp.optimize.evaluation.variance.family_search.searched_scenarios`) replaces the draw
+   and only a set the joint measure admits goes on.
 4. **Variants.** Each scenario becomes a coherent variant checkpoint, proven to restore to its
    edited state. A variant forked before the decision is replayed to it by imposing the original
    trajectory's recorded calls in the edited world; a replay that diverges is kept as
@@ -38,7 +40,10 @@ saved actor-critic run over a mining-probe task:
    on choice shift, consequence and clarity; the measure is on by default, under the spec's
    ``decision_variance`` settings or else the family's own open-weight authors, and a family it
    blocks names the ``decision_variance`` eligibility condition. Its joint score is the version 2
-   selector value of the family's point.
+   selector value of the family's point. With ``ladder`` set, an admitted family then builds a
+   nudge ladder over its hardest state
+   (:func:`~exp.optimize.evaluation.variance.family_search.family_ladder`); every curriculum rung
+   becomes its own task recording its strength and position, the last always un-nudged.
 9. **Coverage.** The judge's coverage of each confirmed variant is recorded. When a criterion
    grader is supplied, its probabilistic grades are calibration evidence only.
 10. **Eligibility.** Every condition in :mod:`~exp.optimize.evaluation.variance.records`, including
@@ -58,29 +63,23 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
-    JsonObject,
     sha256_json,
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ProjectStore
 from exp.common.tasks.facts import InstanceFacts
-from exp.optimize.evaluation.continuations.job import (
-    ContinuationJob,
-    load_continuation_runtime,
-    preflight_continuation_job,
-)
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import restore_continuation_world
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
-from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageReport, load_rulebook
+from exp.optimize.evaluation.rules.stage import RulesStageReport, load_rulebook
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.admission import (
     FamilyAdmissionPolicy,
@@ -102,7 +101,6 @@ from exp.optimize.evaluation.variance.contracts import (
     ActorView,
     DecisionState,
     EstimationPoint,
-    Scenario,
     ScenarioLimits,
     StatePart,
     message_texts,
@@ -116,6 +114,12 @@ from exp.optimize.evaluation.variance.decision_measure import (
     measure_family,
 )
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning, ExposurePlan
+from exp.optimize.evaluation.variance.family_context import (
+    estimation_point,
+    rules_stage_report,
+    save_context,
+    saved_before,
+)
 from exp.optimize.evaluation.variance.family_export import (
     export_family_harbor as export_family_harbor,
 )
@@ -123,6 +127,15 @@ from exp.optimize.evaluation.variance.family_export import (
     family_executable_task as family_executable_task,
 )
 from exp.optimize.evaluation.variance.family_export import variant_job as variant_job
+from exp.optimize.evaluation.variance.family_search import (
+    FamilyBinder,
+    FamilyInputs,
+    RungTask,
+    SetJudges,
+    family_ladder,
+    ladder_base,
+    searched_scenarios,
+)
 from exp.optimize.evaluation.variance.family_stages import (
     FamilyVariant,
     confirm_variant,
@@ -131,18 +144,19 @@ from exp.optimize.evaluation.variance.family_stages import (
 )
 from exp.optimize.evaluation.variance.grader import GradeReport, GraderSettings
 from exp.optimize.evaluation.variance.judged import JudgeCoverage
+from exp.optimize.evaluation.variance.nudge_ladder import NudgeLadderSpec
 from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     AuditFinding,
     TrainingEligibility,
     TrainingRecords,
     audit_finding,
-    bound_job,
     relied_rules,
     training_eligibility,
     training_records,
 )
 from exp.optimize.evaluation.variance.rewards import PointDecision
+from exp.optimize.evaluation.variance.variant_search import VariantSearchSpec
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.decisions import DecisionsTraceTagger
@@ -153,8 +167,10 @@ FAMILY_REPORT_TYPE = "decision-family-report"
 OptionActions = Callable[[DecisionState], Mapping[str, ToolCall]]
 """Maps an authored decision state to the concrete forced first action of every option."""
 
-VariantJudges = Callable[[DecisionState, Scenario], VariantJudging]
-"""Gives one authored scenario its frozen judge, world freeze and compatibility review."""
+VariantJudges = SetJudges
+"""Gives every scenario of one set its frozen judge, world freeze and compatibility review; the
+family asks once per scenario set (its authored set, each search round's set and each measured
+ladder round), before any of the set's contrasts."""
 
 
 class DecisionFamilySpec(ContractModel):
@@ -192,6 +208,11 @@ class DecisionFamilySpec(ContractModel):
             ``decision_variance`` settings it runs under the family's own authors: the scenario
             author classifies choices and the decision author reviews clarity. False skips it
             and keeps the identity families had before the measure existed.
+        search: Variant search settings: the scenarios come from measured search rounds instead
+            of one draw, and only an admitted set goes on. Needs the measure; unkeyed while None.
+        ladder: Nudge ladder settings: an admitted family builds a ladder over its hardest
+            state and records every curriculum rung as its own task. Needs the measure; unkeyed
+            while None.
     """
 
     decision_author: AuthorSettings
@@ -213,6 +234,15 @@ class DecisionFamilySpec(ContractModel):
     dispositions: tuple[AuditDisposition, ...] = ()
     decision_variance: DecisionMeasureSpec | None = None
     measure_decisions: bool = True
+    search: VariantSearchSpec | None = None
+    ladder: NudgeLadderSpec | None = None
+
+    @model_validator(mode="after")
+    def _measured(self) -> DecisionFamilySpec:
+        """Require the joint measure for a variant search or a nudge ladder."""
+        if (self.search is not None or self.ladder is not None) and not self.measure_decisions:
+            raise ValueError("a variant search or a nudge ladder needs measure_decisions")
+        return self
 
     @property
     def measure_spec(self) -> DecisionMeasureSpec | None:
@@ -233,6 +263,7 @@ class DecisionFamilySpec(ContractModel):
         """
         unset = {"fresh_briefing"} if not self.fresh_briefing else set()
         unset |= {"decision_variance"} if self.decision_variance is None else set()
+        unset |= {name for name in ("search", "ladder") if getattr(self, name) is None}
         return {
             "dispositions",
             "measure_decisions",
@@ -311,6 +342,9 @@ class FamilyReport(ContractModel):
         records: Training records, only when every condition holds.
         failure: Why the family stopped early, when it did.
         decision_variance: The saved joint decision-variance measure, or why it could not run.
+        search: The saved variant search the scenarios came from, when one ran.
+        ladder: The saved nudge ladder, or why it could not be built, when one was attempted.
+        rungs: One task per curriculum rung of the ladder, strongest first, the un-nudged last.
     """
 
     spec: DecisionFamilySpec
@@ -335,6 +369,9 @@ class FamilyReport(ContractModel):
     records: TrainingRecords | None = None
     failure: str | None = None
     decision_variance: ArtifactInput | str | None = None
+    search: ArtifactInput | None = None
+    ladder: ArtifactInput | str | None = None
+    rungs: tuple[RungTask, ...] = ()
 
 
 def run_decision_family(
@@ -360,9 +397,9 @@ def run_decision_family(
         code_revision: Producing source identity.
         actions: Function giving every option's concrete forced action, used when the spec has
             no mapping. Its result is saved, so a replay never calls it.
-        judging: Function giving every scenario its frozen judge binding, used when the spec has
-            no mapping. It is called before the scenario's first contrast and its result is
-            saved, so a replay never calls it.
+        judging: Function giving every scenario of a set its frozen judge binding, used when the
+            spec has no mapping. It is called before the set's first contrast and its result is
+            saved, so a replay of the family report never calls it.
         grader: Calibration criterion grader over confirmation episodes; never an eligibility
             input.
 
@@ -386,8 +423,8 @@ def run_decision_family(
     checkpoint_ref = rows[point].checkpoint
     checkpoint = load_continuation_checkpoint(store, checkpoint_ref)
     exposure.require_lineage(checkpoint.task.lineage_group_id, "mining_probes")
-    estimation = _estimation_point(report, point)
-    stage = _rules_stage(project, spec.rules_stage)
+    estimation = estimation_point(report, point)
+    stage = rules_stage_report(project, spec.rules_stage)
     identity = spec.identity(report, point, code_revision)
     draws = spec.draws_identity(report, point, code_revision)
     job = spec.job or report.spec.initial
@@ -401,13 +438,13 @@ def run_decision_family(
             point=estimation,
             checkpoint=checkpoint_ref,
             prefix=checkpoint.actor.messages,
-            before=_saved_before(project, draws, job, checkpoint_ref),
+            before=saved_before(project, draws, job, checkpoint_ref),
             rules=relevant_rules(book, tools),
             questions=relevant_questions(book, tools),
             tools=checkpoint.task.tools,
             instruction_variation=spec.instruction_variation,
         )
-        context_ref = _save_context(
+        context_ref = save_context(
             project, draws, context, (stage.rulebook, spec.rules_stage), code_revision
         )
         sources = (context_ref, spec.rules_stage, stage.rulebook, report.group)
@@ -567,25 +604,49 @@ def _continue(
     limits = ScenarioLimits(
         tools=frozenset(tool.name for tool in context.tools), remaining_calls=remaining
     )
-    view = (
-        ActorView(
-            instruction=checkpoint.task.instruction,
-            observed=message_texts(checkpoint.actor.messages),
+    seen = ActorView(
+        instruction=checkpoint.task.instruction, observed=message_texts(checkpoint.actor.messages)
+    )
+    view = seen if spec.fresh_briefing else None
+    sources = (base.context, *(() if decision.response is None else (decision.response,)))
+    study = load_study(project.artifacts, report.group)
+    picked = next(row for row in study.branches if row.index == report.picked)
+    boundaries = (study.spec.checkpoint, *picked.checkpoints)
+    binder = FamilyBinder(project, base.job, spec.judging, judges)
+    inputs: FamilyInputs | None = None
+    if spec.search is not None and spec.measure_spec is not None:
+        try:
+            resolved = dict(spec.actions or (actions(state) if actions is not None else {}))
+        except (ValueError, KeyError, TypeError) as error:
+            return _finish(family, base, findings, relied, failure=f"option actions: {error}")
+        inputs = _inputs(spec, base, boundaries, resolved)
+        searched, _, scenarios = searched_scenarios(
+            project,
+            spec.search,
+            spec.measure_spec,
+            decision=state,
+            before=context.before,
+            limits=limits,
+            view=view,
+            binder=binder,
+            inputs=inputs,
+            identity=draws + "-search",
+            sources=sources,
+            code_revision=code_revision,
         )
-        if spec.fresh_briefing
-        else None
-    )
-    scenarios = author_scenarios(
-        project,
-        spec.scenario_author,
-        state,
-        context.before,
-        limits,
-        identity=draws + "-scenarios",
-        code_revision=code_revision,
-        sources=(base.context, *(() if decision.response is None else (decision.response,))),
-        view=view,
-    )
+        base = base.model_copy(update={"search": searched})
+    else:
+        scenarios = author_scenarios(
+            project,
+            spec.scenario_author,
+            state,
+            context.before,
+            limits,
+            identity=draws + "-scenarios",
+            code_revision=code_revision,
+            sources=sources,
+            view=view,
+        )
     base = base.model_copy(update={"scenarios": scenarios})
     findings.extend(
         audit_finding("scenario", problem.model_dump(mode="json")) for problem in scenarios.problems
@@ -594,18 +655,19 @@ def _continue(
         reason = scenarios.failure or f"{len(scenarios.problems)} structural problems"
         return _finish(family, base, findings, relied, failure=f"scenarios: {reason}")
     try:
-        mapping = dict(spec.actions or (actions(state) if actions is not None else {}))
+        mapping = (
+            dict(inputs.actions)
+            if inputs is not None
+            else dict(spec.actions or (actions(state) if actions is not None else {}))
+        )
     except (ValueError, KeyError, TypeError) as error:
         return _finish(family, base, findings, relied, failure=f"option actions: {error}")
+    inputs = inputs or _inputs(spec, base, boundaries, mapping)
     base = base.model_copy(update={"actions": mapping})
     try:
         judging = dict(
             spec.judging
-            or (
-                {s.scenario_id: judges(state, s) for s in scenarios.scenarios.scenarios}
-                if judges is not None
-                else {}
-            )
+            or (judges(state, scenarios.scenarios.scenarios) if judges is not None else {})
         )
     except (ValueError, KeyError, TypeError) as error:
         return _finish(family, base, findings, relied, failure=f"variant judges: {error}")
@@ -621,9 +683,6 @@ def _continue(
         return _finish(family, base, findings, relied, failure=f"frozen start: {error}")
     jobs = {sid: variant_job(base.job, start) for sid, start in starts.items()}
     frozen = {sid: start[0] for sid, start in starts.items() if start is not None}
-    study = load_study(project.artifacts, report.group)
-    picked = next(row for row in study.branches if row.index == report.picked)
-    boundaries = (study.spec.checkpoint, *picked.checkpoints)
     variants = [
         run_variant(
             project,
@@ -679,6 +738,30 @@ def _continue(
         )
         admitted = measure is not None and measure.verdict.admitted
         base = base.model_copy(update={"decision_variance": measured_ref or why})
+        if admitted and measure is not None and spec.ladder is not None:
+            target = ladder_base(measure, scenarios.scenarios.scenarios)
+            built = (
+                "no measured state to ladder"
+                if target is None
+                else family_ladder(
+                    project,
+                    spec.ladder,
+                    measure_spec,
+                    decision=state,
+                    base=target,
+                    instruction=checkpoint.task.instruction,
+                    view=seen,
+                    before=context.before,
+                    binder=binder,
+                    inputs=inputs,
+                    identity=draws + "-ladder",
+                    sources=(*sources, *(() if measured_ref is None else (measured_ref,))),
+                    code_revision=code_revision,
+                )
+            )
+            ladder = built if isinstance(built, str) else built[0]
+            rungs = () if isinstance(built, str) else built[2]
+            base = base.model_copy(update={"ladder": ladder, "rungs": rungs})
     if selection.qualifies and admitted:
         variants = [
             confirm_variant(
@@ -724,6 +807,23 @@ def _continue(
         contrasted=contrasted,
         failure=grading_failure,
         measure=measure if measure is not None else base.decision_variance,
+    )
+
+
+def _inputs(
+    spec: DecisionFamilySpec,
+    base: FamilyReport,
+    boundaries: tuple[ArtifactInput, ...],
+    actions: Mapping[str, ToolCall],
+) -> FamilyInputs:
+    """Return what the measured search and ladder share with the family's own variants."""
+    return FamilyInputs(
+        base=base.checkpoint,
+        boundaries=boundaries,
+        actions=dict(actions),
+        repeats=spec.repeats,
+        facts=spec.facts,
+        required_state=frozenset(spec.required_state),
     )
 
 
@@ -831,133 +931,11 @@ def family_decisions(
     return found
 
 
-def _estimation_point(report: ActorCriticReport, point: int) -> EstimationPoint:
-    """Return the first judge's estimation point at the chosen step.
-
-    Args:
-        report: The actor-critic run.
-        point: The chosen point.
-
-    Returns:
-        The judge's point.
-
-    Raises:
-        ValueError: No usable judge selection chose the point.
-    """
-    for draw in report.judges:
-        if draw.selection is None:
-            continue
-        for chosen in draw.selection.points:
-            if chosen.step == point:
-                return chosen
-    raise ValueError(f"no judge selection chose point {point}")
-
-
-def _rules_stage(project: ProjectStore, reference: ArtifactInput) -> RulesStageReport:
-    """Read the pinned rules stage report.
-
-    Args:
-        project: Project holding it.
-        reference: The ``rules-stage-report`` artifact.
-
-    Returns:
-        The report.
-
-    Raises:
-        ValueError: The reference is not the saved stage report it pins.
-    """
-    stored = project.artifacts.read(reference.artifact_id)
-    if artifact_input(stored.manifest) != reference or stored.manifest.artifact_type != (
-        REPORT_TYPE
-    ):
-        raise ValueError(
-            f"artifact {reference.artifact_id} is not the pinned rules stage report; pass the "
-            "reference of a saved run_rules_stage result"
-        )
-    return RulesStageReport.model_validate_json(stored.payloads["report.json"])
-
-
-def _saved_before(
-    project: ProjectStore, draws: str, job: ContinuationJob, checkpoint: ArtifactInput
-) -> JsonObject:
-    """Return the evaluator state before the step, from the saved context or by probing once.
-
-    Probing restores the point's world through the job's explicitly selected runtime and reads
-    its private evaluator projection; no model is called.
-
-    Args:
-        project: Project holding the checkpoint.
-        draws: Identity the saved context derives from.
-        job: Frozen job selecting the runtime.
-        checkpoint: The point's checkpoint.
-
-    Returns:
-        The before-state.
-    """
-    store = project.artifacts
-    if store.exists(draws + "-context"):
-        saved = DecisionContext.model_validate_json(
-            store.read_bytes(draws + "-context", "context.json")
-        )
-        return dict(saved.before)
-    bound = bound_job(job, checkpoint)
-    preflight_continuation_job(project, bound)
-    original = load_continuation_checkpoint(store, checkpoint)
-    with (
-        load_continuation_runtime(project, bound) as runtime,
-        restore_continuation_world(runtime.world, original.world_task, original.world) as world,
-    ):
-        return dict(runtime.probe(world.checkpoint()))
-
-
-def _save_context(
-    project: ProjectStore,
-    draws: str,
-    context: DecisionContext,
-    inputs: tuple[ArtifactInput, ...],
-    code_revision: str,
-) -> ArtifactInput:
-    """Save the decision context once, refusing a different one under the same identity.
-
-    Args:
-        project: Project receiving it.
-        draws: Identity the context derives from.
-        context: What the decision-state author is shown.
-        inputs: Saved artifacts it was rendered from, besides the checkpoint.
-        code_revision: Producing source identity.
-
-    Returns:
-        The context artifact.
-
-    Raises:
-        ValueError: A different context is saved under the same identity.
-    """
-    store, artifact_id = project.artifacts, draws + "-context"
-    if store.exists(artifact_id):
-        saved = DecisionContext.model_validate_json(store.read_bytes(artifact_id, "context.json"))
-        if saved != context:
-            raise ValueError("saved decision context differs from the one rendered now")
-        return artifact_input(store.read(artifact_id).manifest)
-    return artifact_input(
-        store.write_json(
-            artifact_id=artifact_id,
-            artifact_type="decision-context",
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=datetime.now(UTC),
-                code_revision=code_revision,
-                inputs=tuple(
-                    sorted({context.checkpoint, *inputs}, key=lambda ref: ref.artifact_id)
-                ),
-            ),
-            files={"context.json": context},
-        )
-    )
-
-
 def _dependencies(result: FamilyReport, report: ActorCriticReport) -> tuple[ArtifactInput, ...]:
     """Collect every saved artifact the family report rests on."""
     refs = {result.checkpoint, result.context, report.group, result.spec.rules_stage}
+    refs |= {ref for ref in (result.search, result.ladder) if isinstance(ref, ArtifactInput)}
+    refs |= {ref for row in result.rungs if (ref := row.variant.decision_checkpoint) is not None}
     refs |= {row.judge.definition.rubric for row in (result.judging or {}).values()}
     refs |= {
         row.world_freeze for row in (result.judging or {}).values() if row.world_freeze is not None

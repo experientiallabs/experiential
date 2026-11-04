@@ -9,7 +9,9 @@ explicit research requests and no rubric. The agentic, multi-prompt author
 (:mod:`~exp.optimize.evaluation.variance.rubric_agent`) drafts through the same contract and checks.
 
 A rubric holds atomic semantic criteria. Each criterion is one yes/no question with its role
-(``required_correctness`` or a separate ``efficiency_diagnostic``), applicability and variant
+(``required_correctness``, or a diagnostic kept apart from success: ``efficiency_diagnostic``
+for work, speed and token use, ``behavior_diagnostic`` for a reported bad behavior the task does
+not make an obligation, such as a diagnostic behavior-library linter), applicability and variant
 scope, the packet sources that support it, the evidence it needs (as episode event kinds and
 state paths the judge can actually be shown), met / not_met / insufficient_evidence anchors,
 accepted alternatives and exceptions, and trace-informed failure patterns. Calibration cases are
@@ -28,7 +30,8 @@ a design check from the rubric's wording.
 A rubric may be assembled from a behavior library version
 (:mod:`~exp.optimize.evaluation.variance.behavior_profiles`). The author sees the library entries
 offered to the family and records one :class:`LibraryDecision` per entry: ``required`` only when
-the task or an admitted source supports it, otherwise ``diagnostic`` or ``inapplicable``. Criteria
+the task or an admitted source supports it, otherwise ``diagnostic`` (a linter's criteria are
+then ``behavior_diagnostic``) or ``inapplicable``. Criteria
 cite the entries they come from in ``library_refs``. The saved rubric cites the exact library
 version, and the host copies each cited entry's detection guidance, false-positive notes and
 labeled examples into :attr:`Rubric.behavior_guidance`, which the judge reads and actors never see.
@@ -87,8 +90,11 @@ from exp.optimize.evaluation.variance.episodes import (
     Verdict,
 )
 
-RUBRIC_AUTHOR_PROTOCOL = "rubric-author-v3"
+RUBRIC_AUTHOR_PROTOCOL = "rubric-author-v4"
 """Version of the rubric-author prompts, phases, answer schemas and host checks."""
+
+CriterionRole = Literal["required_correctness", "efficiency_diagnostic", "behavior_diagnostic"]
+"""What a criterion's verdict feeds: success, or one of the two reported diagnostics."""
 
 RUBRIC_TOOL = "submit_rubric_draft"
 """Name of the tool a rubric draft is submitted through."""
@@ -149,7 +155,9 @@ DESIGN
    where supported. Require call order only where causally or normatively required. Never
    require a reference trace, tool count or style.
 8. Keep efficiency, latency and token use in efficiency_diagnostic criteria, separate from
-   correctness, unless the task makes a limit essential.
+   correctness, unless the task makes a limit essential. A bad behavior worth reporting that
+   the task does not make an obligation goes in a behavior_diagnostic criterion; neither
+   diagnostic role ever decides success.
 9. Bind each criterion to exact variant ids. An instruction change that changes the goal binds
    its own obligations; an equivalent rewording creates none. Never contradict the public task.
 10. Never require knowledge the actor could not discover with permitted observations before the
@@ -176,7 +184,8 @@ library_decisions entry per offered entry:
   family. Cite those packet locators; the library alone never establishes an obligation. At least
   one required_correctness criterion lists the entry in library_refs.
 - diagnostic: the behavior is worth reporting but the task does not make it required. Only
-  efficiency_diagnostic criteria list it.
+  diagnostic criteria list it: behavior_diagnostic for a bad-behavior linter (linter:) and for
+  a behavior profile, efficiency_diagnostic only for an efficiency concern.
 - inapplicable: the family cannot exhibit it; no criterion lists it.
 Adapt a linter's detection to this task's tools and variants; never copy a failing actor's path
 into a requirement.
@@ -260,7 +269,8 @@ class RubricCriterion(ContractModel):
     Attributes:
         criterion_id: Stable identity within the rubric.
         question: One yes/no proposition about the finished episode.
-        role: ``required_correctness``, or ``efficiency_diagnostic`` kept apart from success.
+        role: ``required_correctness``, or a diagnostic that never decides success:
+            ``efficiency_diagnostic`` or ``behavior_diagnostic``.
         applies_when: When the criterion applies; inapplicability is not success.
         scenario_ids: Packet variants the criterion applies to.
         supported_by: Packet locators that establish the obligation.
@@ -277,7 +287,7 @@ class RubricCriterion(ContractModel):
 
     criterion_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
     question: str = Field(min_length=1, max_length=600)
-    role: Literal["required_correctness", "efficiency_diagnostic"]
+    role: CriterionRole
     applies_when: str = Field(min_length=1, max_length=1000)
     scenario_ids: tuple[str, ...] = Field(min_length=1)
     supported_by: tuple[str, ...] = Field(min_length=1)

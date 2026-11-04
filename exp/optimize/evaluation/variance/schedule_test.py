@@ -17,6 +17,8 @@ from exp.optimize.evaluation.variance import schedule
 from exp.optimize.evaluation.variance.actor_critic import run_actor_critic
 from exp.optimize.evaluation.variance.rewards import SelectorObjective
 from exp.optimize.evaluation.variance.schedule import (
+    CurriculumPlan,
+    CurriculumStage,
     PlateauRule,
     RevisionRegistration,
     RolloutMetrics,
@@ -284,3 +286,33 @@ def test_real_rollouts_record_measured_metrics_and_replay_without_calls(
     assert schedule_state(project, spec) == state
     assert preview_rollout_plan(project, spec).kind == "steady_roles"
     assert judged_calls == 3
+
+
+def test_a_nudge_curriculum_names_the_current_tier_in_every_rollout_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strong rungs come first, then the un-nudged targets; no curriculum keeps the identity."""
+    stages = (
+        CurriculumStage(
+            ladder="ladder-a", scenario_id="seven-nudge-0", position=0, strength="strong"
+        ),
+        CurriculumStage(ladder="ladder-a", scenario_id="seven", position=1, strength="none"),
+    )
+    project, plain = _schedule(tmp_path, monkeypatch)
+    spec = plain.model_copy(
+        update={"curriculum": CurriculumPlan(stages=stages, rollouts_per_tier=2)}
+    )
+    _scripted_metrics(monkeypatch)
+
+    plans = [_step(project, spec) for _ in range(4)]
+
+    assert [[s.scenario_id for s in plan.curriculum] for plan in plans] == [
+        ["seven-nudge-0"],
+        ["seven-nudge-0"],
+        ["seven"],
+        ["seven"],
+    ]
+    assert "curriculum tier strong" in plans[0].reason
+    assert spec.identity != plain.identity
+    assert "curriculum" not in plain.model_dump(mode="json")
+    assert preview_rollout_plan(project, plain).curriculum == ()

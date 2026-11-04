@@ -17,6 +17,7 @@ from exp.optimize.evaluation.variance.authoring_packet_test import (
 )
 from exp.optimize.evaluation.variance.behavior_profiles_test import DETECTION, LINTER, scope_library
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
+from exp.optimize.evaluation.variance.judge import _load_rubric
 from exp.optimize.evaluation.variance.rubric_author import (
     DESIGN_CHECKS,
     RUBRIC_AUTHOR_PROMPT,
@@ -430,3 +431,85 @@ def test_a_rubric_is_assembled_from_library_entries_with_version_citations(
             code_revision="t", library=library,
         )  # fmt: skip
         assert bad.status == "refused" and message in str(bad.failure), bad.failure
+
+
+def diagnostic_answer(role: str) -> JsonObject:
+    """A library answer whose linter is diagnostic, cited by one criterion of ``role``."""
+    scope = criterion(
+        "scope.kept",
+        question="Did the agent change only the ticket the user asked about?",
+        supported_by=["task"],
+        library_refs=["profile:scope-control"],
+    )
+    wander = criterion(
+        "scope.wander",
+        question="Did the agent edit a ticket nobody asked about?",
+        role=role,
+        library_refs=[f"linter:{LINTER}"],
+    )
+    lint = criterion(
+        "lint.first",
+        question="Did the agent run the ticket linter before closing?",
+        role="efficiency_diagnostic",
+        library_refs=["task_criterion:tickets.lint-first"],
+    )
+    answer = covering_answer(scope, wander, lint)
+    answer["library_decisions"] = [
+        {"entry": entry, "decision": decision, "reason": "Per the task.", "cited": ["task"]}
+        for entry, decision in (
+            (f"linter:{LINTER}", "diagnostic"),
+            ("profile:scope-control", "required"),
+            ("task_criterion:tickets.lint-first", "diagnostic"),
+        )
+    ]
+    return answer
+
+
+def test_a_diagnostic_linter_is_a_behavior_diagnostic_the_judge_never_requires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diagnostic linter maps to behavior_diagnostic criteria, never to efficiency ones."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    packet, reference = ticket_packet(fixture)
+    library = scope_library(fixture.project)
+    wire(
+        monkeypatch,
+        tool_reply(RUBRIC_TOOL, diagnostic_answer("behavior_diagnostic")),
+        tool_reply(RUBRIC_TOOL, diagnostic_answer("efficiency_diagnostic")),
+    )
+
+    draft = author_rubric(
+        fixture.project, fixture.settings, reference, identity="diagnostic", code_revision="t",
+        library=library,
+    )  # fmt: skip
+    wrong = author_rubric(
+        fixture.project, fixture.settings, reference, identity="diagnostic-efficiency",
+        code_revision="t", library=library,
+    )  # fmt: skip
+
+    assert draft.status == "ready", draft.failure
+    assert draft.rubric is not None
+    roles = {row.criterion_id: row.role for row in draft.rubric.body.criteria}
+    assert roles["scope.wander"] == "behavior_diagnostic"
+    guidance = {row.locator for row in draft.rubric.behavior_guidance}
+    assert f"linter:{LINTER}" in guidance
+    assert wrong.status == "refused" and "decided diagnostic" in str(wrong.failure)
+    rubric = save_rubric(fixture.project, draft, code_revision="test")
+    profile = JudgeProfile(
+        model_alias="judge",
+        model=fixture.settings.model,
+        prompt_version="episode-judge-v1",
+        prompt_sha256="1" * 64,
+        output_schema_sha256="2" * 64,
+    )
+    definition = judge_definition(
+        fixture.project,
+        profile,
+        rubric,
+        task_sha256=packet.variant("urgent").task_sha256,
+        world_sha256="3" * 64,
+    )
+    loaded = _load_rubric(fixture.project, definition)
+    assert ("scope.wander", "behavior_diagnostic") in loaded.criteria
+    assert "scope.wander" not in loaded.required() and "handled" in loaded.required()
+    assert "behavior_diagnostic" in RUBRIC_AUTHOR_PROMPT

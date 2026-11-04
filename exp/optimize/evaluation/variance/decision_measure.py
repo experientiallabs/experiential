@@ -63,6 +63,7 @@ from exp.optimize.evaluation.variance.family_stages import (
     CLARITY_STANCES,
     MEASURE_PROFILE,
     ClarityReview,
+    DecisionOptions,
     FamilyVariant,
     clarity_prompts_sha256,
     decision_document,
@@ -482,7 +483,7 @@ class DecisionMeasure(ContractModel):
     verdict: JointVerdict
 
 
-def _choice_schema(decision: DecisionState) -> ToolSchema:
+def _choice_schema(decision: DecisionState | DecisionOptions) -> ToolSchema:
     """Return the classifier's forced answer tool for this decision's options."""
     labels: list[JsonValue] = [option.option_id for option in decision.options]
     return ToolSchema(
@@ -508,7 +509,7 @@ def _choice_schema(decision: DecisionState) -> ToolSchema:
 
 
 def check_choice(
-    arguments: JsonObject, decision: DecisionState, evidence: EpisodeEvidence
+    arguments: JsonObject, decision: DecisionState | DecisionOptions, evidence: EpisodeEvidence
 ) -> str | None:
     """Validate one classification against the decision and the episode's events.
 
@@ -547,7 +548,7 @@ def check_choice(
 def classify_episode(
     project: ProjectStore,
     spec: DecisionMeasureSpec,
-    decision: DecisionState,
+    decision: DecisionState | DecisionOptions,
     evidence: EpisodeEvidence,
     *,
     position: int,
@@ -633,7 +634,7 @@ def classify_episode(
 def classify_free_study(
     project: ProjectStore,
     spec: DecisionMeasureSpec,
-    decision: DecisionState,
+    decision: DecisionState | DecisionOptions,
     reference: ArtifactInput,
     *,
     offset: int,

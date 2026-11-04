@@ -33,8 +33,9 @@ it completes, so an interrupted search resumes, and the finished search is saved
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 from pydantic import Field, model_validator
 
@@ -84,7 +85,7 @@ from exp.optimize.evaluation.variance.family_stages import (
 )
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 
-VARIANT_SEARCH_PROTOCOL = "variant-search-v1"
+VARIANT_SEARCH_PROTOCOL = "variant-search-v2"
 """Version of the search author's prompts, the round loop and its feedback."""
 
 SEARCH_TYPE = "variant-search"
@@ -125,6 +126,27 @@ success did not differ, or move states apart where the choices did not change.""
 
 Measurer = Callable[[ScenarioSet, int], tuple[ArtifactInput, DecisionMeasure] | str]
 """Measures one structurally sound set in one round: the saved measure, or why it could not."""
+
+
+class BoundVariant(NamedTuple):
+    """What one scenario's witness, contrasts and free continuations run under.
+
+    Attributes:
+        job: The frozen job, already rebound to the frozen runtime when a freeze is bound.
+        judge: The scenario's frozen episode judge.
+        frozen: The world freeze's saved start, or None when no freeze is bound.
+    """
+
+    job: ContinuationJob
+    judge: EpisodeJudge
+    frozen: ArtifactInput | None = None
+
+
+Binder = Callable[[DecisionState, Sequence[Scenario]], Mapping[str, BoundVariant]]
+"""Binds every scenario of one set, under the decision that declares it, before any contrast.
+
+A binder sees the whole set at once, so a caller can author one frozen world, rubric and judge for
+exactly that set; it raises ``ValueError`` or ``KeyError`` when a scenario cannot be bound."""
 
 LadderMeasurer = Callable[[DecisionState, ScenarioSet], tuple[ArtifactInput, DecisionMeasure] | str]
 """Measures a set under the given decision: the saved measure, or why it could not."""
@@ -478,7 +500,7 @@ def variant_measurer(
     spec: DecisionMeasureSpec,
     *,
     decision: DecisionState,
-    bind: Callable[[Scenario], tuple[ContinuationJob, EpisodeJudge]],
+    bind: Binder,
     base: ArtifactInput,
     boundaries: tuple[ArtifactInput, ...],
     actions: Mapping[str, ToolCall],
@@ -493,7 +515,7 @@ def variant_measurer(
         project: Project holding every saved step.
         spec: The frozen measurement settings.
         decision: The decision state being varied.
-        bind: Gives each scenario its frozen job and episode judge, fixed before its contrasts.
+        bind: Binds every scenario of a set (frozen job, judge and start) before its contrasts.
         base: The decision's checkpoint in the picked trajectory.
         boundaries: Every saved boundary of the picked attempt, start first.
         actions: Concrete forced first action of every option.
@@ -524,7 +546,7 @@ def ladder_measurer(
     project: ProjectStore,
     spec: DecisionMeasureSpec,
     *,
-    bind: Callable[[Scenario], tuple[ContinuationJob, EpisodeJudge]],
+    bind: Binder,
     base: ArtifactInput,
     boundaries: tuple[ArtifactInput, ...],
     actions: Mapping[str, ToolCall],
@@ -536,14 +558,15 @@ def ladder_measurer(
     """Compose the measurer of a set under the decision it is given, as a nudge ladder needs.
 
     Each scenario becomes a variant whose witness and selection contrast run under the frozen
-    job and judge ``bind`` gives it (the same judge and rubric for every rung), and the contrasted
-    variants are measured together by
-    :func:`~exp.optimize.evaluation.variance.decision_measure.measure_family`.
+    job, judge and world-freeze start ``bind`` gives the whole set (one rubric for every rung of a
+    ladder), and the contrasted variants are measured together by
+    :func:`~exp.optimize.evaluation.variance.decision_measure.measure_family`. A set ``bind``
+    refuses is reported as the reason it could not be measured.
 
     Args:
         project: Project holding every saved step.
         spec: The frozen measurement settings.
-        bind: Gives each scenario its frozen job and episode judge, fixed before its contrasts.
+        bind: Binds every scenario of a set (frozen job, judge and start) before its contrasts.
         base: The decision's checkpoint in the picked trajectory.
         boundaries: Every saved boundary of the picked attempt, start first.
         actions: Concrete forced first action of every option.
@@ -560,11 +583,17 @@ def ladder_measurer(
         decision: DecisionState, scenarios: ScenarioSet
     ) -> tuple[ArtifactInput, DecisionMeasure] | str:
         """Run every family stage up to selection for one set and measure it."""
-        bound = {s.scenario_id: bind(s) for s in scenarios.scenarios}
+        try:
+            bound = dict(bind(decision, scenarios.scenarios))
+            missing = sorted({s.scenario_id for s in scenarios.scenarios} - set(bound))
+            if missing:
+                raise KeyError(f"no binding for scenarios {missing}")
+        except (ValueError, KeyError) as error:
+            return f"binding: {failure_reason(error)}"
         variants = [
             run_variant(
                 project,
-                job=bound[scenario.scenario_id][0],
+                job=bound[scenario.scenario_id].job,
                 base=base,
                 boundaries=boundaries,
                 decision=decision,
@@ -572,9 +601,10 @@ def ladder_measurer(
                 actions=actions,
                 facts=facts,
                 repeats=repeats,
-                judge=bound[scenario.scenario_id][1],
+                judge=bound[scenario.scenario_id].judge,
                 code_revision=code_revision,
                 required_state=required_state,
+                frozen=bound[scenario.scenario_id].frozen,
             )
             for scenario in scenarios.scenarios
         ]
@@ -584,8 +614,8 @@ def ladder_measurer(
             decision=decision,
             scenarios=scenarios.scenarios,
             variants=variants,
-            jobs={sid: pair[0] for sid, pair in bound.items()},
-            judges={sid: pair[1] for sid, pair in bound.items()},
+            jobs={sid: row.job for sid, row in bound.items()},
+            judges={sid: row.judge for sid, row in bound.items()},
             code_revision=code_revision,
         )
         if reference is None or result is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,7 +11,12 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, stable_id
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.variance.contracts import ScenarioLimits, ScenarioSet
+from exp.optimize.evaluation.variance.contracts import (
+    DecisionState,
+    Scenario,
+    ScenarioLimits,
+    ScenarioSet,
+)
 from exp.optimize.evaluation.variance.decision_measure import (
     MEASURE_TYPE,
     DecisionMeasure,
@@ -25,11 +31,13 @@ from exp.optimize.evaluation.variance.decision_measure_test import (
     reply,
     role_fixture,
     scenario,
+    spec,
 )
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
 from exp.optimize.evaluation.variance.variant_search import (
     SEARCH_TYPE,
     VariantSearchSpec,
+    ladder_measurer,
     measure_feedback,
     search_variants,
 )
@@ -234,3 +242,36 @@ def test_feedback_lists_each_state_and_specs_refuse_unknown_stances(
     assert isinstance(feedback["deficits"], list) and feedback["deficits"]
     with pytest.raises(ValueError, match="distinct members"):
         VariantSearchSpec(author=settings, stances=("guess",))
+
+
+def test_a_set_the_binder_refuses_is_reported_and_nothing_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A binder sees the whole set first; a refused or partial binding measures nothing."""
+    project, settings, transport = role_fixture(tmp_path, monkeypatch, [])
+    seen: list[list[str]] = []
+
+    def partial(decision: DecisionState, scenarios: Sequence[Scenario]) -> dict:
+        """Bind nothing, recording the set it was asked for."""
+        del decision
+        seen.append([s.scenario_id for s in scenarios])
+        return {}
+
+    measure = ladder_measurer(
+        project,
+        spec(settings),
+        bind=partial,
+        base=ArtifactInput(artifact_id="base", sha256="0" * 64),
+        boundaries=(),
+        actions={},
+        facts=None,
+        repeats=1,
+        code_revision="test",
+    )
+    chosen = ScenarioSet.model_validate(_set())
+
+    result = measure(decision(), chosen)
+
+    assert isinstance(result, str) and result.startswith("binding: ")
+    assert "gold" in result and seen == [["gold", "basic"]]
+    assert transport.requests == []

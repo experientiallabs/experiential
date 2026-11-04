@@ -34,7 +34,6 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
-    Sha256,
     sha256_json,
     stable_id,
 )
@@ -56,10 +55,24 @@ from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
 from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
+from exp.optimize.evaluation.variance.nudge_ladder import CurriculumStage, NudgeLadderSpec
+from exp.optimize.evaluation.variance.nudges import NudgeStrength
+from exp.optimize.evaluation.variance.pipeline_plan import STAGES as STAGES
+from exp.optimize.evaluation.variance.pipeline_plan import CostLine as CostLine
+from exp.optimize.evaluation.variance.pipeline_plan import PipelineApproval as PipelineApproval
+from exp.optimize.evaluation.variance.pipeline_plan import PipelinePlan as PipelinePlan
+from exp.optimize.evaluation.variance.pipeline_plan import PipelineReport as PipelineReport
+from exp.optimize.evaluation.variance.pipeline_plan import StageName as StageName
+from exp.optimize.evaluation.variance.pipeline_plan import StagePlan as StagePlan
+from exp.optimize.evaluation.variance.pipeline_plan import StageRecord as StageRecord
+from exp.optimize.evaluation.variance.pipeline_plan import StageResult as StageResult
+from exp.optimize.evaluation.variance.pipeline_plan import StageUsage as StageUsage
+from exp.optimize.evaluation.variance.point_options import PointOptionsSpec
 from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.rubric_agent import RubricAuthoringProfile
 from exp.optimize.evaluation.variance.rubric_critic import DesignCriticProfile
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
+from exp.optimize.evaluation.variance.variant_search import VariantSearchSpec
 from exp.optimize.evaluation.variance.world_agent import DEFAULT_PROMPT_SETS
 from exp.simulation.mining.error_tags import TaskErrorRank
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
@@ -85,19 +98,6 @@ STAGE_TYPE = "decision-variance-stage"
 
 RUN_TYPE = "decision-variance-run"
 """Artifact type of the run registration saved before any stage."""
-
-StageName = Literal["variance-build", "rules", "traceml", "error-mining", "families", "records"]
-"""One stage of the pipeline."""
-
-STAGES: tuple[StageName, ...] = (
-    "variance-build",
-    "rules",
-    "traceml",
-    "error-mining",
-    "families",
-    "records",
-)
-"""Every stage, in execution order; each depends on every stage before it."""
 
 COUNCIL_ACTORS: tuple[str, ...] = (
     "gemma-4-26b-a4b-it",
@@ -312,6 +312,20 @@ class AuthoringSettings(ContractModel):
         decision_classifier: Open-weight choice classifier; None uses ``scenario_author``.
         decision_reviewer: Open-weight clarity reviewer; None uses ``rubric_author``.
         decision_free_repeats: Free continuations per measured state checkpoint.
+        variant_search: Search each family's scenario set over measured rounds
+            (:func:`~exp.optimize.evaluation.variance.variant_search.search_variants`) in place
+            of one scenario draw, accepting only a set the joint measure admits. Needs
+            ``decision_variance``.
+        search_author: Open-weight search author; None uses ``scenario_author``.
+        search_rounds: Most search rounds per family.
+        nudge_ladder: Build a nudge ladder over each admitted family's hardest state
+            (:func:`~exp.optimize.evaluation.variance.nudge_ladder.build_nudge_ladder`); its
+            admitted rungs become their own tasks and its last rung is un-nudged. Needs
+            ``decision_variance``.
+        nudge_author: Open-weight nudge author; None uses ``scenario_author``.
+        nudge_reviewer: Open-weight leak and realism reviewer; None uses ``rubric_author``.
+        ladder_rounds: Most nudge-author rounds per ladder.
+        ladder_strengths: Nudge strengths, strongest first; the un-nudged rung always follows.
         families_per_tier: Highest-ranked points of each tier's run turned into families.
         maximum_variants: Most scenarios one family may author; more is refused before any
             world is authored, so the up-front price stays an upper bound.
@@ -346,6 +360,14 @@ class AuthoringSettings(ContractModel):
     decision_classifier: AuthorSettings | None = None
     decision_reviewer: AuthorSettings | None = None
     decision_free_repeats: int = Field(default=8, ge=2, le=100, strict=True)
+    variant_search: bool = True
+    search_author: AuthorSettings | None = None
+    search_rounds: int = Field(default=3, ge=1, le=8, strict=True)
+    nudge_ladder: bool = True
+    nudge_author: AuthorSettings | None = None
+    nudge_reviewer: AuthorSettings | None = None
+    ladder_rounds: int = Field(default=2, ge=1, le=8, strict=True)
+    ladder_strengths: tuple[NudgeStrength, ...] = ("strong", "medium", "weak")
     families_per_tier: int = Field(default=1, ge=1, le=8, strict=True)
     maximum_variants: int = Field(default=4, ge=2, le=16, strict=True)
     repeats: int = Field(default=8, ge=1, le=100, strict=True)
@@ -373,6 +395,27 @@ class AuthoringSettings(ContractModel):
             classifier=self.decision_classifier or self.scenario_author,
             reviewer=self.decision_reviewer or self.rubric_author,
             free_repeats=self.decision_free_repeats,
+        )
+
+    def search_spec(self) -> VariantSearchSpec | None:
+        """Return the variant search settings, or None when the search or the measure is off."""
+        if not (self.variant_search and self.decision_variance):
+            return None
+        return VariantSearchSpec(
+            author=self.search_author or self.scenario_author, maximum_rounds=self.search_rounds
+        )
+
+    def ladder_spec(self) -> NudgeLadderSpec | None:
+        """Return the nudge ladder settings, or None when the ladder or the measure is off."""
+        if not (self.nudge_ladder and self.decision_variance):
+            return None
+        reviewer = self.nudge_reviewer or self.rubric_author
+        return NudgeLadderSpec(
+            author=self.nudge_author or self.scenario_author,
+            leak_reviewer=reviewer,
+            realism_reviewer=reviewer,
+            strengths=self.ladder_strengths,
+            maximum_rounds=self.ladder_rounds,
         )
 
 
@@ -408,6 +451,12 @@ class RecordsSettings(ContractModel):
         qualification: Qualify each exported variant first, or None to export every variant
             as diagnostic. A variant that does not qualify is exported as diagnostic with its
             refusals or failure recorded.
+        point_decisions: Derive every continued point's options from its judged continuations
+            and classify them (:mod:`~exp.optimize.evaluation.variance.point_options`), so the
+            version 2 selector records score every selector draw, not only picks that reached
+            a family.
+        option_proposer: Open-weight option proposer; None uses ``authoring.decision_author``.
+        option_classifier: Open-weight choice classifier; None uses the family measure's.
     """
 
     intent: str = Field(min_length=1, max_length=400)
@@ -417,6 +466,9 @@ class RecordsSettings(ContractModel):
     crosstalk_top_k: int = Field(default=2, ge=1, le=16, strict=True)
     crosstalk_repeats: int = Field(default=4, ge=1, le=64, strict=True)
     qualification: VariantQualification | None = None
+    point_decisions: bool = True
+    option_proposer: AuthorSettings | None = None
+    option_classifier: AuthorSettings | None = None
 
 
 class DecisionVarianceSpec(ContractModel):
@@ -462,6 +514,18 @@ class DecisionVarianceSpec(ContractModel):
             return self.authoring.model_dump(mode="json")
         return self.records.model_dump(mode="json")
 
+    def point_options(self) -> PointOptionsSpec | None:
+        """Return the option proposer and classifier of the records stage, or None when off."""
+        if not self.records.point_decisions:
+            return None
+        authoring = self.authoring
+        return PointOptionsSpec(
+            proposer=self.records.option_proposer or authoring.decision_author,
+            classifier=self.records.option_classifier
+            or authoring.decision_classifier
+            or authoring.scenario_author,
+        )
+
 
 def stage_identity(
     stage: StageName,
@@ -493,190 +557,6 @@ def stage_identity(
             "code": code_revision,
         },
     )
-
-
-class CostLine(ContractModel):
-    """One priced (or explicitly unpriced) component of a stage's upper bound.
-
-    Attributes:
-        name: Role or dependency.
-        attempts: Most physical requests.
-        usd: Known-rate upper bound, or None when it is unpriced.
-    """
-
-    name: str
-    attempts: int = Field(ge=0)
-    usd: float | None = Field(default=None, ge=0)
-
-
-class StagePlan(ContractModel):
-    """One stage before it runs.
-
-    Attributes:
-        stage: The stage.
-        identity: Its identity.
-        saved: Whether its record already exists, so it replays with no call.
-        costs: Upper-bound cost inventory; empty when saved.
-        lines: What the stage will do, for the operator.
-    """
-
-    stage: StageName
-    identity: str
-    saved: bool
-    costs: tuple[CostLine, ...] = ()
-    lines: tuple[str, ...] = ()
-
-    @property
-    def known_usd(self) -> float:
-        """Sum of the priced components."""
-        return sum(row.usd for row in self.costs if row.usd is not None)
-
-    @property
-    def unpriced(self) -> tuple[CostLine, ...]:
-        """Components without a known price."""
-        return tuple(row for row in self.costs if row.usd is None and row.attempts > 0)
-
-
-class PipelinePlan(ContractModel):
-    """Every stage's identity, saved status and upper-bound price, before any call.
-
-    Attributes:
-        spec_sha256: Digest of the registration.
-        code_revision: Producing source identity.
-        stages: One plan per stage, in order.
-    """
-
-    spec_sha256: Sha256
-    code_revision: str
-    stages: tuple[StagePlan, ...]
-
-    @property
-    def digest(self) -> Sha256:
-        """Digest a consent binds: every identity and every bound."""
-        return sha256_json(self)
-
-    @property
-    def known_usd(self) -> float:
-        """Priced upper bound of every unsaved stage."""
-        return sum(row.known_usd for row in self.stages if not row.saved)
-
-    @property
-    def unpriced(self) -> tuple[CostLine, ...]:
-        """Unpriced components of every unsaved stage."""
-        return tuple(line for row in self.stages if not row.saved for line in row.unpriced)
-
-    @property
-    def complete(self) -> bool:
-        """Whether every stage is saved, so a run replays without consent or calls."""
-        return all(row.saved for row in self.stages)
-
-
-class PipelineApproval(ContractModel):
-    """Explicit consent to one exact plan, given once for every stage.
-
-    Attributes:
-        plan_sha256: The consented plan's digest.
-        ceiling_usd: Dollar ceiling across every stage; the plan's priced bound by default.
-        unpriced_allowed: Whether unpriced components were shown and accepted.
-    """
-
-    plan_sha256: Sha256
-    ceiling_usd: float = Field(ge=0)
-    unpriced_allowed: bool = False
-
-    @classmethod
-    def for_plan(cls, plan: PipelinePlan, ceiling_usd: float | None = None) -> PipelineApproval:
-        """Consent to a plan at its priced bound or an explicit ceiling.
-
-        Args:
-            plan: The plan shown to the operator.
-            ceiling_usd: Explicit ceiling, or None for the plan's priced bound.
-
-        Returns:
-            The approval.
-        """
-        return cls(
-            plan_sha256=plan.digest,
-            ceiling_usd=plan.known_usd if ceiling_usd is None else ceiling_usd,
-            unpriced_allowed=bool(plan.unpriced),
-        )
-
-
-class StageUsage(ContractModel):
-    """What one stage actually used, measured while it ran.
-
-    Attributes:
-        physical_attempts: Provider attempts the admitted transports recorded.
-        accounted_usd: Spend the operation ceiling accounted, when one was installed.
-        settled_usd: Spend settled from returned usage, when a ceiling was installed.
-    """
-
-    physical_attempts: int = Field(default=0, ge=0)
-    accounted_usd: float | None = None
-    settled_usd: float | None = None
-
-
-class StageRecord(ContractModel):
-    """One finished stage, saved once and replayed without calls.
-
-    Attributes:
-        stage: The stage.
-        identity: Its identity.
-        upstream: Records of every earlier stage, in order.
-        outputs: The stage's typed outputs as JSON.
-        references: Every saved artifact the outputs cite.
-        usage: Measured usage of the run that produced it.
-        summary: Short operator summary.
-    """
-
-    stage: StageName
-    identity: str
-    upstream: tuple[ArtifactInput, ...] = ()
-    outputs: JsonObject
-    references: tuple[ArtifactInput, ...] = ()
-    usage: StageUsage = StageUsage()
-    summary: JsonObject = Field(default_factory=dict)
-
-
-class StageResult(ContractModel):
-    """One stage in a report.
-
-    Attributes:
-        stage: The stage.
-        identity: Its identity.
-        record: The saved record.
-        replayed: Whether the record already existed, so no call was made.
-        usage: Its measured usage.
-        summary: Its operator summary.
-    """
-
-    stage: StageName
-    identity: str
-    record: ArtifactInput
-    replayed: bool
-    usage: StageUsage
-    summary: JsonObject = Field(default_factory=dict)
-
-
-class PipelineReport(ContractModel):
-    """The complete run: every stage's record, replay status and measured usage.
-
-    Attributes:
-        run: The saved run registration.
-        plan: The plan the run executed under.
-        stages: One result per finished stage, in order.
-        stopped: Why the run stopped before the last stage, when it did.
-    """
-
-    run: ArtifactInput
-    plan: PipelinePlan
-    stages: tuple[StageResult, ...]
-    stopped: str | None = None
-
-    @property
-    def complete(self) -> bool:
-        """Whether every stage finished."""
-        return self.stopped is None and len(self.stages) == len(STAGES)
 
 
 @dataclass(frozen=True)
@@ -778,12 +658,15 @@ class TraceMLOutputs(ContractModel):
         labels: Each tier's saved ``traceml-labels`` artifact.
         errors: Each tier's saved ``error-tags`` over its whole attempts, when tagged.
         error_steps: Each tier's saved ``error-steps`` over its attempts' steps, when tagged.
+        error_points: Each tier's saved ``error-points``: every attempt's points ranked by its
+            step error tags, registered as that tier's selector and critic reference.
     """
 
     groups: dict[str, ArtifactInput] = Field(default_factory=dict)
     labels: dict[str, ArtifactInput] = Field(default_factory=dict)
     errors: dict[str, ArtifactInput] = Field(default_factory=dict)
     error_steps: dict[str, ArtifactInput] = Field(default_factory=dict)
+    error_points: dict[str, ArtifactInput] = Field(default_factory=dict)
 
 
 class TierMining(ContractModel):
@@ -838,6 +721,8 @@ class FamilyOutcome(ContractModel):
         admitted: Whether the final family is eligible for training records.
         reasons: Failed eligibility conditions of the final family.
         failure: Why the family stopped before admission, when it did.
+        search: The saved variant search of the first registration, when one ran.
+        ladder: The saved nudge ladder of the first registration, when one was built.
     """
 
     tier: str
@@ -852,6 +737,8 @@ class FamilyOutcome(ContractModel):
     admitted: bool = False
     reasons: tuple[str, ...] = ()
     failure: str | None = None
+    search: ArtifactInput | None = None
+    ladder: ArtifactInput | None = None
 
 
 class FamiliesOutputs(ContractModel):
@@ -900,6 +787,9 @@ class RecordsOutputs(ContractModel):
         harbor: Every Harbor export.
         crosstalk: Saved cross-talk result, when the probe ran.
         crosstalk_skipped: Why the probe did not run, when it was enabled.
+        curriculum: The nudge curriculum of every admitted family's ladder: admitted rungs
+            from strong to weak, every un-nudged target last; a training schedule reads it.
+        point_options: Saved derived options of every continued point, per tier.
     """
 
     training: dict[str, ArtifactInput] = Field(default_factory=dict)
@@ -907,6 +797,8 @@ class RecordsOutputs(ContractModel):
     harbor: tuple[HarborExport, ...] = ()
     crosstalk: ArtifactInput | None = None
     crosstalk_skipped: str | None = None
+    curriculum: tuple[CurriculumStage, ...] = ()
+    point_options: dict[str, tuple[ArtifactInput, ...]] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)

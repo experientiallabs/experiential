@@ -29,6 +29,8 @@ tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`
 - ``reference:<name>``: one registered reference; a rule book also exposes ``rule:<id>`` and
   ``contract:<tool>`` entries, and a ``traceml-labels`` artifact registered as
   ``traceml_labels`` exposes ``labels:<n>/step:<i>`` for every row naming an attempt and step;
+  an ``error-points`` artifact registered as ``error_points`` exposes ``errors:<n>`` (attempt
+  ``n``'s points ranked by the error tags of the steps decided there) and ``errors:<n>/point:<k>``;
 - ``world:<k>``: the complete saved world checkpoint at point ``k`` (domain state, events, clocks),
   read by JSON pointer through the tools and never placed in the forced packet;
 - ``environment``: the public task, the harness settings and the world kind; ``tool:<name>``: one
@@ -74,6 +76,7 @@ ReferenceKind = Literal[
     "reference_solution",
     "grader_rubric",
     "traceml_labels",
+    "error_points",
 ]
 """Reference or specification material a run may register beside the verifier."""
 
@@ -84,11 +87,18 @@ REFERENCE_KINDS: tuple[ReferenceKind, ...] = (
     "reference_solution",
     "grader_rubric",
     "traceml_labels",
+    "error_points",
 )
 """Every reference kind, in the order unavailable kinds are named."""
 
 TRACEML_LABELS_TYPE = "traceml-labels"
 """Artifact type a ``traceml_labels`` reference must have; its producer is not imported here."""
+
+ERROR_POINTS_TYPE = "error-points"
+"""Artifact type an ``error_points`` reference must have; its producer is not imported here."""
+
+_TYPED = {"traceml_labels": TRACEML_LABELS_TYPE, "error_points": ERROR_POINTS_TYPE}
+"""Reference kinds that must come from one artifact type."""
 
 ALWAYS_UNAVAILABLE: tuple[JsonObject, ...] = (
     {
@@ -118,8 +128,9 @@ class ReferenceSource(ContractModel):
     """One registered reference or specification file the roles may read.
 
     Attributes:
-        kind: What the material is; a ``rule_book`` file must hold a ``RuleBook`` and a
-            ``traceml_labels`` artifact must have the ``traceml-labels`` artifact type.
+        kind: What the material is; a ``rule_book`` file must hold a ``RuleBook``, a
+            ``traceml_labels`` artifact must have the ``traceml-labels`` artifact type and an
+            ``error_points`` artifact the ``error-points`` type.
         name: Locator suffix, so the material is cited as ``reference:<name>``.
         artifact: Pinned saved artifact holding the material.
         file: JSON data file inside that artifact.
@@ -198,8 +209,9 @@ def load_references(
         manifest = store.read(source.artifact.artifact_id).manifest
         if artifact_input(manifest) != source.artifact:
             raise ValueError(f"reference {source.name} changed since registration")
-        if source.kind == "traceml_labels" and manifest.artifact_type != TRACEML_LABELS_TYPE:
-            raise ValueError(f"reference {source.name} is not a {TRACEML_LABELS_TYPE} artifact")
+        expected = _TYPED.get(source.kind)
+        if expected is not None and manifest.artifact_type != expected:
+            raise ValueError(f"reference {source.name} is not a {expected} artifact")
         raw = store.read_bytes(source.artifact.artifact_id, source.file)
         if source.kind == "rule_book":
             content: JsonValue = RuleBook.model_validate_json(raw).model_dump(mode="json")
@@ -408,6 +420,8 @@ def evidence_packet(
                 documents[f"rule:{rule.rule_id}"] = rule.model_dump(mode="json")
             for tool, contract in book.contracts.items():
                 documents[f"contract:{tool}"] = contract.model_dump(mode="json")
+        if source.kind == "error_points":
+            documents.update(_error_points(loaded.content))
         if source.kind == "traceml_labels":
             for suffix, rows in _step_labels(loaded.content).items():
                 previous = documents.get(f"labels:{suffix}")
@@ -508,6 +522,33 @@ def _step_labels(content: JsonValue) -> dict[str, list[JsonValue]]:
                     if head.isdigit() and step.isdigit():
                         entry: JsonObject = {"trace_id": trace.get("trace_id"), "record": kind}
                         indexed.setdefault(f"{head}/step:{step}", []).append({**entry, "row": row})
+    return indexed
+
+
+def _error_points(content: JsonValue) -> dict[str, JsonValue]:
+    """Index an ``error-points`` record by attempt and point.
+
+    The record holds ``attempts``, each with an ``attempt`` index and its ranked ``points``, each
+    point naming its ``point`` index; malformed rows stay readable through the whole reference.
+
+    Args:
+        content: A registered ``error-points`` file.
+
+    Returns:
+        ``errors:<n>`` with attempt ``n``'s ranked points and ``errors:<n>/point:<k>`` per point.
+    """
+    rows = content.get("attempts") if isinstance(content, dict) else None
+    indexed: dict[str, JsonValue] = {}
+    for row in rows if isinstance(rows, list) else []:
+        attempt = row.get("attempt") if isinstance(row, dict) else None
+        points = row.get("points") if isinstance(row, dict) else None
+        if not isinstance(attempt, int) or not isinstance(points, list):
+            continue
+        indexed[f"errors:{attempt}"] = points
+        for point in points:
+            step = point.get("point") if isinstance(point, dict) else None
+            if isinstance(step, int):
+                indexed[f"errors:{attempt}/point:{step}"] = point
     return indexed
 
 
@@ -824,6 +865,10 @@ def execute_evidence_tool(
             if not any(key.startswith("labels:") for key in documents):
                 return "refused", "no traceml-labels reference was registered; labels not supplied"
             locator = f"labels:{_integer(arguments['attempt'])}/step:{_integer(arguments['step'])}"
+        elif call.name == "read_error_points":
+            if not any(key.startswith("errors:") for key in documents):
+                return "refused", "no error-points reference was registered; not supplied"
+            locator = f"errors:{_integer(arguments['attempt'])}"
         elif call.name in ("read_world_state", "read_reference"):
             root = (
                 f"world:{_integer(arguments['point'])}"

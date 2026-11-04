@@ -14,8 +14,10 @@ from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObjec
 from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.variance.evidence import (
+    ERROR_POINTS_TYPE,
     ReferenceSource,
     TraceSearchSpec,
+    _error_points,
     _step_labels,
     divergence_points,
     execute_evidence_tool,
@@ -174,3 +176,55 @@ def test_retrieval_reaches_only_world_learning_traces_and_refuses_held_out(
     plain_ref = artifact_input(unscoped.read(plain.index.rag_id).manifest)
     with pytest.raises(ValueError, match="registered scope"):
         open_trace_search(unscoped, spec.model_copy(update={"index": plain_ref}), _plan(_ROLES))
+
+
+_ERROR_POINTS: JsonObject = {
+    "steps": {"artifact_id": "error-steps", "sha256": "e" * 64},
+    "attempts": [
+        {
+            "attempt": 1,
+            "trace_id": "fast/attempt:1",
+            "points": [
+                {"point": 2, "score": 1.5, "fired": ["E1"], "locators": ["attempt:1/step:2"]},
+                {"point": 0, "score": 0.5, "fired": ["E2"], "locators": ["attempt:1/step:1"]},
+            ],
+        },
+        {"attempt": "bad", "points": []},
+    ],
+}
+
+
+def test_error_points_are_an_optional_reference_read_by_attempt(tmp_path: Path) -> None:
+    """Error points load only from an error-points artifact and read per attempt and point."""
+    store = _store(tmp_path, "errors")
+    saved = store.write_json(
+        artifact_id="points-fixture",
+        artifact_type=ERROR_POINTS_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+        ),
+        files={"points.json": _ERROR_POINTS},
+    )
+    source = ReferenceSource(
+        kind="error_points", name="error-points", artifact=artifact_input(saved), file="points.json"
+    )
+    (loaded,) = load_references(store, (source,))
+    indexed = _error_points(loaded.content)
+    assert sorted(indexed) == ["errors:1", "errors:1/point:0", "errors:1/point:2"]
+
+    def run(documents: dict, attempt: int) -> tuple[str, object]:
+        """Read one attempt's error points from the documents."""
+        call = ToolCall(call_id="c", name="read_error_points", arguments={"attempt": attempt})
+        return execute_evidence_tool(documents, call, maximum_bytes=10_000)
+
+    status, content = run(indexed, 1)
+    assert status == "ok" and content == {"locator": "errors:1", "content": indexed["errors:1"]}
+    ranked = indexed["errors:1"]
+    assert isinstance(ranked, list)
+    assert [row.get("point") for row in ranked if isinstance(row, dict)] == [2, 0]
+    assert run(indexed, 3) == ("refused", "locator errors:3 was not supplied")
+    assert run({}, 1) == ("refused", "no error-points reference was registered; not supplied")
+
+    wrong = source.model_copy(update={"artifact": _labels_artifact(store, "traceml-labels")})
+    with pytest.raises(ValueError, match="not a error-points artifact"):
+        load_references(store, (wrong,))

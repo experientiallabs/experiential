@@ -78,9 +78,11 @@ from exp.optimize.evaluation.variance.pipeline_errors import (
     attempt_error_points,
     build_lines,
     cluster_namer,
+    error_point_reference,
     error_tag_costs,
     naming_costs,
     probe_line,
+    save_error_points,
     tag_tier_errors,
     tier_error_bank,
 )
@@ -473,6 +475,7 @@ class _TraceMLStage:
         labels: dict[str, ArtifactInput] = {}
         errors: dict[str, ArtifactInput] = {}
         error_steps: dict[str, ArtifactInput] = {}
+        error_points: dict[str, ArtifactInput] = {}
         points: JsonObject = {}
         error_bank = tier_error_bank(spec)
         limit = job.maximum_model_calls * spec.traceml.steps_per_call
@@ -525,14 +528,27 @@ class _TraceMLStage:
                     concurrency=spec.traceml.concurrency,
                 )
                 points[alias] = attempt_error_points(project.artifacts, error_steps[alias])
+                error_points[alias] = save_error_points(
+                    project.artifacts, error_steps[alias], code_revision=revision
+                )
         outputs = TraceMLOutputs(
-            groups=groups, labels=labels, errors=errors, error_steps=error_steps
+            groups=groups,
+            labels=labels,
+            errors=errors,
+            error_steps=error_steps,
+            error_points=error_points,
         )
         summary: JsonObject = {
             "labels": {alias: ref.artifact_id for alias, ref in labels.items()},
             "error_points": points,
         }
-        saved = (*groups.values(), *labels.values(), *errors.values(), *error_steps.values())
+        saved = (
+            *groups.values(),
+            *labels.values(),
+            *errors.values(),
+            *error_steps.values(),
+            *error_points.values(),
+        )
         return StageRun(outputs, saved, summary)
 
 
@@ -605,7 +621,8 @@ class _MiningStage:
         build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
         exposure = load_exposure_plan(project, build.exposure)
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
-        labels = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs).labels
+        traceml = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs)
+        labels, ranked = traceml.labels, traceml.error_points
         profile = mining_profile(spec)
         start = load_continuation_checkpoint(project.artifacts, rules.job.study.checkpoint)
         probe = probe_line(build, start.task.task_id)
@@ -620,7 +637,15 @@ class _MiningStage:
         for alias in spec.mining.actors:
             tier = self._tier(
                 context,
-                _Tier(exposure, rules.job, profile, rubric, alias, labels.get(alias)),
+                _Tier(
+                    exposure,
+                    rules.job,
+                    profile,
+                    rubric,
+                    alias,
+                    labels.get(alias),
+                    ranked.get(alias),
+                ),
                 build,
                 embedder,
             )
@@ -677,13 +702,20 @@ class _MiningStage:
         judge = EpisodeJudge(definition=definition, settings=mining.judge)
         labels = tier_inputs.labels
         references = (
-            ()
-            if labels is None
-            else (
-                ReferenceSource(
-                    kind="traceml_labels", name="traceml", artifact=labels, file="labels.json"
-                ),
-            )
+            *(
+                ()
+                if labels is None
+                else (
+                    ReferenceSource(
+                        kind="traceml_labels", name="traceml", artifact=labels, file="labels.json"
+                    ),
+                )
+            ),
+            *(
+                ()
+                if tier_inputs.error_points is None
+                else (error_point_reference(tier_inputs.error_points),)
+            ),
         )
         retrieval = (
             trace_search(project, build, start.task.task_id, mining.retrieval_top_k)
@@ -755,6 +787,7 @@ class _Tier:
         rubric: The mining-probe task's rubric.
         alias: The tier's actor alias.
         labels: The tier's TraceML labels, when labelled.
+        error_points: The tier's error-ranked attempt points, when its attempts were tagged.
     """
 
     exposure: ExposurePlan
@@ -763,6 +796,7 @@ class _Tier:
     rubric: ArtifactInput
     alias: str
     labels: ArtifactInput | None
+    error_points: ArtifactInput | None = None
 
 
 def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:
