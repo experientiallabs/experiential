@@ -40,6 +40,27 @@ CARELESS_CLOSE = """def transition(state, args, facts):
 """
 """A close program that silently closes a ticket whose lock state is missing."""
 
+READ = """def transition(state, args, facts):
+    return {"ticket": "T-1", "status": state["tickets"]["status"]}
+"""
+"""A read program showing only the handling status."""
+
+CHECK = """def transition(state, args, facts):
+    ticket = state["tickets"]
+    if ticket["lock"] == "held":
+        raise ToolError({"error": "ticket is held by another agent"})
+    return {"severity": ticket["severity"], "lock": ticket["lock"]}
+"""
+"""An SLA program showing the tier and lock, failing on a held ticket."""
+
+ESCALATE = """def transition(state, args, facts):
+    ticket = state["tickets"]
+    ticket["status"] = "escalated"
+    ticket["outcome"] = "right" if ticket["severity"] == "high" else "wrong"
+    return {"status": "escalated"}
+"""
+"""An escalation program resolving a high tier ticket."""
+
 
 def ticket(**update: JsonValue) -> JsonObject:
     """The fixture ticket domain with fields replaced."""
@@ -108,20 +129,55 @@ def world_answer(
                 "state_path": "/tickets/status",
             },
         ],
-        "programs": [{"tool": "close", "source": close}],
+        "programs": [
+            {"tool": "read_ticket", "source": READ},
+            {"tool": "check_sla", "source": CHECK},
+            {"tool": "escalate", "source": ESCALATE},
+            {"tool": "close", "source": close},
+        ],
         "fixtures": [
             {
                 "episode_id": "fixture-held",
                 "initial_state": {"tickets": ticket(severity="low", lock="held")},
                 "steps": [
                     {
+                        "tool": "check_sla",
+                        "arguments": {},
+                        "reply": {"error": "ticket is held by another agent"},
+                        "is_error": True,
+                    },
+                    {
                         "tool": "close",
                         "arguments": {},
                         "reply": {"error": "ticket is held by another agent"},
                         "is_error": True,
-                    }
+                    },
                 ],
-            }
+            },
+            {
+                "episode_id": "fixture-escalate",
+                "initial_state": {"tickets": ticket(severity="high")},
+                "steps": [
+                    {
+                        "tool": "read_ticket",
+                        "arguments": {},
+                        "reply": {"ticket": "T-1", "status": "open"},
+                    },
+                    {
+                        "tool": "check_sla",
+                        "arguments": {},
+                        "reply": {"severity": "high", "lock": "none"},
+                    },
+                    {
+                        "tool": "escalate",
+                        "arguments": {},
+                        "reply": {"status": "escalated"},
+                        "state_after": {
+                            "tickets": ticket(severity="high", status="escalated", outcome="right")
+                        },
+                    },
+                ],
+            },
         ],
     }
     world.update(update)
@@ -187,7 +243,7 @@ def test_a_ready_world_is_validated_saved_replayed_and_bound_to_the_runtime(
     assert draft.status == "ready", draft.failure
     assert replay == draft and len(transport.requests) == 1
     assert draft.validation is not None
-    assert [row.status for row in draft.validation.programs] == ["accepted"]
+    assert {row.status for row in draft.validation.programs} == {"accepted"}
     assert draft.world is not None
     definition = world_runtime_definition(packet, draft.world, "routine", base=fixture.definition)
     assert definition.initial_state == packet.variant("routine").state

@@ -6,10 +6,14 @@ one. It checks the simulator, never an actor:
 - **Properties.** The world's replay fixtures are executed through its programs and every
   property the rules stage derives from the rule book is checked on the resulting transitions.
   A supported rule the world's own fixtures violate rejects the world.
-- **Boundary workloads.** The rules stage's boundary workloads are generated from every
-  variant's initial state and executed through the gated tool's program; their triage keeps a
-  contradiction of an unwitnessed rule diagnostic. A workload of a predicted tool stays
-  unexecuted unless an observed transition is supplied.
+- **Executed rule challenges.** The rules stage's boundary workloads are generated from every
+  variant's initial state and executed by
+  :func:`~exp.optimize.evaluation.rules.challenges.run_challenges`: with a host runtime, in the
+  served world itself (the world's programs for covered tools, the grounded model under the rule
+  book otherwise); without one, through the programs only, leaving a predicted tool's workload
+  unexecuted unless an observed transition is supplied. A contradicted rule without an
+  independent witness keeps the family diagnostic; a contradicted independently witnessed rule
+  is a world defect.
 - **Authorization and state gaps.** Every precondition of a state-writing tool is load-bearing.
   Each variant runs the tool once in its own state, and once more with each read the
   precondition makes deleted. A supported error or refusal, or an explicit ``OutOfDomain``
@@ -17,9 +21,13 @@ one. It checks the simulator, never an actor:
   undetermined rejects the world. A predicted tool whose supported precondition cannot be
   decided in a variant rejects that variant. A precondition without a supported predicate is an
   unsupported decision boundary: the family stays diagnostic, never trainable.
-- **Restoration.** Each surviving variant is started through the existing grounded runtime,
-  saved as a continuation checkpoint and proven to restore to its exact initial state with
-  :func:`~exp.optimize.evaluation.variance.variants.verify_restoration`.
+- **Restoration.** Each surviving variant is started in its served runtime (the grounded
+  definition with the world's validated programs bound), saved as a continuation checkpoint and
+  proven to restore through that runtime's own restore path to its exact initial state and
+  image. A resume start carries the world-model history of the packet checkpoint, or for a
+  variant that edits that state, of the start
+  :func:`~exp.optimize.evaluation.variance.variants.build_variant_checkpoint` forks before the
+  edited value is revealed.
 
 :func:`review_compatibility` compares a world and a rubric, each authored independently from the
 same packet, against that packet: does the world initialize every variant the rubric scores, can
@@ -39,35 +47,50 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    JsonValue,
     Sha256,
     sha256_json,
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
+from exp.common.tasks.facts import InstanceFacts
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
     continuation_runtime,
+    restores_exactly,
+    simulated_image,
+    with_simulated_image,
+)
+from exp.optimize.evaluation.rules.challenges import (
+    ChallengeCase,
+    ChallengeReport,
+    ChallengeRun,
+    ProgramChallenges,
+    RuleChallenge,
+    challenge_world,
+    program_transition,
 )
 from exp.optimize.evaluation.rules.stage import load_rulebook
 from exp.optimize.evaluation.variance.authoring_packet import AuthoringPacket, load_packet
-from exp.optimize.evaluation.variance.contracts import resolve_pointer
+from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, resolve_pointer
 from exp.optimize.evaluation.variance.rubric_author import Rubric
-from exp.optimize.evaluation.variance.variants import grounded_state, verify_restoration
+from exp.optimize.evaluation.variance.variants import build_variant_checkpoint
 from exp.optimize.evaluation.variance.world_author import (
+    VariantInitialization,
     WorldSpec,
     load_world_draft,
+    world_coverage,
     world_runtime_definition,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
-from exp.runtime.environments.world_contracts import ToolEffectPolicy
-from exp.runtime.environments.worlds import ExecutableWorldRuntime
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint, ToolEffectPolicy
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     load_continuation_checkpoint,
     persist_continuation_checkpoint,
 )
-from exp.simulation.induction.contracts import ProgramOutcome, TransitionProgram
+from exp.simulation.induction.contracts import ProgramOutcome
 from exp.simulation.induction.sandbox import ProgramSandbox
 from exp.simulation.rules.model import Predicate, Rule, RuleBook, Transition, evaluate
 from exp.simulation.rules.properties import (
@@ -78,9 +101,9 @@ from exp.simulation.rules.properties import (
     is_refusal,
     properties_from,
 )
-from exp.simulation.rules.workloads import Triage, Workload, boundary_workloads, triage
+from exp.simulation.rules.workloads import boundary_workloads
 
-WORLD_FREEZE_PROTOCOL = "world-freeze-v1"
+WORLD_FREEZE_PROTOCOL = "world-freeze-v2"
 """Version of the freeze checks and compatibility review; change it whenever either changes."""
 
 FREEZE_TYPE = "world-freeze"
@@ -134,20 +157,23 @@ class GateProbe(ContractModel):
     detail: str
 
 
-class WorkloadRun(ContractModel):
-    """One boundary workload of one variant and what executing it showed.
+class ResumeTrajectory(ContractModel):
+    """The saved trajectory an edited resume variant forks from.
 
     Attributes:
-        variant_id: Variant whose initial state the workload edits.
-        workload: The rules stage's workload.
-        executed: Whether the gated program ran or an observed transition was supplied.
-        triage: The rules stage's triage, when executed.
+        branch_checkpoints: Every saved boundary of the trajectory in order, start first; the
+            packet checkpoint is boundary ``decision.step``.
+        decision: The decision state the variants vary.
+        scenarios: The scenarios realizing the packet's variants, by ``scenario_id``.
+        facts: Instance facts supplied to the world model, if any.
+        maximum_model_calls: The actor's call allowance, when known.
     """
 
-    variant_id: str
-    workload: Workload
-    executed: bool
-    triage: Triage | None = None
+    branch_checkpoints: tuple[ArtifactInput, ...]
+    decision: DecisionState
+    scenarios: tuple[Scenario, ...]
+    facts: InstanceFacts | None = None
+    maximum_model_calls: int | None = None
 
 
 class VariantFreeze(ContractModel):
@@ -184,7 +210,9 @@ class WorldFreeze(ContractModel):
         world: The saved world draft.
         world_sha256: Digest of the authored world.
         properties: Property results over the fixture replays and executed workloads.
-        workloads: Every boundary workload per variant.
+        workloads: Every boundary workload per variant, as executed and triaged.
+        challenge_rules: Status of every challenged rule after execution.
+        challenges: The saved challenge report, with the rule book its execution updated.
         probes: Every authorization probe.
         diagnostic_rules: Rules whose boundaries keep the family diagnostic.
         problems: World-level defects; any rejects every variant.
@@ -198,7 +226,9 @@ class WorldFreeze(ContractModel):
     world: ArtifactInput
     world_sha256: Sha256
     properties: PropertyReport
-    workloads: tuple[WorkloadRun, ...]
+    workloads: tuple[ChallengeRun, ...]
+    challenge_rules: tuple[RuleChallenge, ...] = ()
+    challenges: ArtifactInput | None = None
     probes: tuple[GateProbe, ...]
     diagnostic_rules: tuple[str, ...]
     problems: tuple[str, ...]
@@ -359,6 +389,7 @@ def freeze_world(
     examples: Mapping[str, JsonObject] | None = None,
     observed: Mapping[str, Transition] | None = None,
     refusal: RefusalCriteria = DEFAULT_REFUSAL,
+    trajectory: ResumeTrajectory | None = None,
 ) -> WorldFreeze:
     """Freeze one ready authored world, or record exactly why its variants cannot qualify.
 
@@ -368,14 +399,17 @@ def freeze_world(
         world_reference: The saved ready world draft authored from it.
         sandbox: Bounded executor for the world's programs.
         code_revision: Producing source identity.
-        base: Host-owned grounded runtime definition for the task; without it restoration
-            is not proven and every variant stays diagnostic.
+        base: Host-owned grounded runtime definition for the task; the world's programs are
+            bound into it. Without it restoration is not proven, workloads of predicted tools
+            are not executed and every variant stays diagnostic.
         actor: Chat actor whose initial context starts fresh-briefing variants; resume
             variants keep the packet checkpoint's actor.
         examples: Example arguments per tool; defaults to the first fixture call of the tool.
         observed: Observed transitions keyed ``<variant_id>:<workload_id>`` for workloads of
-            predicted tools.
+            predicted tools, used only without ``base``.
         refusal: How a refused action is recognized.
+        trajectory: The saved trajectory edited resume variants fork from; without it a resume
+            variant whose state differs from the packet checkpoint's cannot be started.
 
     Returns:
         The freeze, also saved as a ``world-freeze`` artifact and replayed from it.
@@ -402,6 +436,7 @@ def freeze_world(
             "examples": dict(examples or {}),
             "observed": {k: v.model_dump(mode="json") for k, v in sorted((observed or {}).items())},
             "refusal": refusal.model_dump(mode="json"),
+            "trajectory": None if trajectory is None else trajectory.model_dump(mode="json"),
             "code": code_revision,
         },
     )
@@ -414,8 +449,18 @@ def freeze_world(
         checks = _Checks(world, book, sandbox, _examples(world, examples), refusal)
         checks.fixtures()
         for row in world.initializations:
-            checks.workloads(row.variant_id, row.state, observed or {})
             checks.gates(row.variant_id, row.state)
+        coverage = world_coverage(packet, world)
+        definitions = {
+            row.variant_id: world_runtime_definition(
+                packet, world, row.variant_id, base=base, coverage=coverage
+            )
+            for row in world.initializations
+            if base is not None
+        }
+        challenges = _challenge(
+            project, packet, world, checks, definitions, observed or {}, code_revision
+        )
         properties = check_transitions(properties_from(book), checks.located, refusal)
         supported = {rule.rule_id for rule in book.rules if rule.status == "supported"}
         for result in properties.results:
@@ -425,24 +470,26 @@ def freeze_world(
                     f"the world's own fixtures violate supported rule {result.rule_id} at "
                     f"{fixture[0]}"
                 )
-        contradicted = {
-            run.workload.rule_id
-            for run in checks.runs
-            if run.triage is not None and run.triage.needs_witness
-        }
-        diagnostic = sorted(contradicted | checks.unsupported)
+        for rule_id in challenges.world_defects:
+            checks.problems.append(
+                f"the world contradicts independently witnessed rule {rule_id} in an executed "
+                "boundary challenge"
+            )
+        diagnostic = sorted(set(challenges.diagnostic) | checks.unsupported)
         variants = tuple(
             _freeze_variant(
                 project,
                 packet,
                 packet_reference,
-                world,
-                row.variant_id,
+                row,
                 checks,
+                challenges,
                 diagnostic,
-                base=base,
+                definitions.get(row.variant_id),
                 actor=actor,
+                trajectory=trajectory,
                 code_revision=code_revision,
+                unsupported=world.unsupported,
             )
             for row in world.initializations
         )
@@ -452,7 +499,9 @@ def freeze_world(
             world=world_reference,
             world_sha256=world.identity,
             properties=properties,
-            workloads=tuple(checks.runs),
+            workloads=challenges.runs,
+            challenge_rules=challenges.rules,
+            challenges=artifact_input(store.read(challenges.identity + "-result").manifest),
             probes=tuple(checks.probes),
             diagnostic_rules=tuple(diagnostic),
             problems=tuple(checks.problems),
@@ -460,6 +509,7 @@ def freeze_world(
             trainable=not checks.problems and any(v.status == "frozen" for v in variants),
         )
         inputs = {packet_reference, world_reference, packet.rule_book}
+        inputs.add(artifact_input(store.read(challenges.identity + "-result").manifest))
         inputs |= {row.checkpoint for row in variants if row.checkpoint is not None}
         store.write_json(
             artifact_id=result_id,
@@ -500,7 +550,6 @@ class _Checks:
         self.programs = {program.tool: program for program in world.programs}
         self.policies = {policy.name: policy for policy in world.manifest().tools}
         self.located: list[tuple[str, Transition]] = []
-        self.runs: list[WorkloadRun] = []
         self.probes: list[GateProbe] = []
         self.problems: list[str] = []
         self.unsupported: set[str] = set()
@@ -520,30 +569,10 @@ class _Checks:
         Returns:
             The outcome (None for a predicted tool) and the transition of a reply or error.
         """
-        program: TransitionProgram | None = self.programs.get(tool)
-        policy = self.policies.get(tool)
+        program, policy = self.programs.get(tool), self.policies.get(tool)
         if program is None or policy is None:
             return None, None
-        visible = {
-            name: deepcopy(state[name]) for name in sorted(policy.domains()) if name in state
-        }
-        outcome = self.sandbox.run(program, visible, arguments, {})
-        if outcome.status not in ("reply", "error_reply"):
-            return outcome, None
-        after = deepcopy(state)
-        for name in policy.writes:
-            if outcome.state is not None and name in outcome.state:
-                after[name] = deepcopy(outcome.state[name])
-        observation = outcome.reply
-        transition = Transition(
-            before=deepcopy(state),
-            after=after,
-            action={"name": tool, "arguments": deepcopy(arguments)},
-            observation=observation,
-        )
-        if outcome.status == "error_reply" and is_refusal(transition, self.refusal) is not True:
-            transition = transition.model_copy(update={"observation": {"error": observation}})
-        return outcome, transition
+        return program_transition(program, policy, self.sandbox, state, arguments, self.refusal)
 
     def fixtures(self) -> None:
         """Replay every fixture through the programs and keep each executed transition."""
@@ -555,35 +584,6 @@ class _Checks:
                     break
                 self.located.append((f"fixture:{episode.episode_id}:{index}", transition))
                 state = transition.after
-
-    def workloads(
-        self, variant_id: str, state: JsonObject, observed: Mapping[str, Transition]
-    ) -> None:
-        """Generate and execute every boundary workload of one variant and triage it.
-
-        Args:
-            variant_id: The variant.
-            state: Its initial state.
-            observed: Supplied transitions for workloads of predicted tools.
-        """
-        for workload in boundary_workloads(self.book, state, examples=self.examples):
-            tool = str(workload.action["name"])
-            arguments = workload.action.get("arguments")
-            _, transition = self.run(
-                tool, workload.state, arguments if isinstance(arguments, dict) else {}
-            )
-            key = f"{variant_id}:{workload.workload_id}"
-            transition = transition or observed.get(key)
-            if transition is None:
-                self.runs.append(
-                    WorkloadRun(variant_id=variant_id, workload=workload, executed=False)
-                )
-                continue
-            self.located.append((f"workload:{key}", transition))
-            (found,) = triage((workload,), {workload.workload_id: transition}, self.refusal)
-            self.runs.append(
-                WorkloadRun(variant_id=variant_id, workload=workload, executed=True, triage=found)
-            )
 
     def gates(self, variant_id: str, state: JsonObject) -> None:
         """Probe every load-bearing precondition of a state-writing tool in one variant.
@@ -707,18 +707,67 @@ def _resolve(
     )
 
 
+def _challenge(
+    project: ProjectStore,
+    packet: AuthoringPacket,
+    world: WorldSpec,
+    checks: _Checks,
+    definitions: Mapping[str, GroundedRuntimeDefinition],
+    observed: Mapping[str, Transition],
+    code_revision: str,
+) -> ChallengeReport:
+    """Execute every variant's boundary workloads in the served world, or through its programs.
+
+    Args:
+        project: Project receiving the challenge results.
+        packet: The packet, whose rule book the workloads challenge.
+        world: The authored world.
+        checks: Executed checks; executed workload transitions join their located transitions.
+        definitions: Served runtime definition per variant; empty without a host runtime.
+        observed: Supplied transitions for predicted tools, used without a host runtime.
+        code_revision: Producing source identity.
+
+    Returns:
+        The saved, replayable challenge report.
+    """
+    cases = tuple(
+        ChallengeCase(scope=row.variant_id, workload=workload)
+        for row in world.initializations
+        for workload in boundary_workloads(checks.book, row.state, examples=checks.examples)
+    )
+    report = challenge_world(
+        project,
+        book=checks.book,
+        rulebook=packet.rule_book,
+        cases=cases,
+        definition=next(iter(definitions.values()), None),
+        programs=ProgramChallenges(
+            world.programs,
+            world.manifest().tools,
+            checks.sandbox,
+            observed=observed,
+            refusal=checks.refusal,
+        ),
+        code_revision=code_revision,
+    )
+    checks.located.extend((f"workload:{key}", step) for key, step in report.observed().items())
+    return report
+
+
 def _freeze_variant(
     project: ProjectStore,
     packet: AuthoringPacket,
     packet_reference: ArtifactInput,
-    world: WorldSpec,
-    variant_id: str,
+    row: VariantInitialization,
     checks: _Checks,
+    challenges: ChallengeReport,
     diagnostic: list[str],
+    definition: GroundedRuntimeDefinition | None,
     *,
-    base: GroundedRuntimeDefinition | None,
     actor: ChatAgentRuntime | None,
+    trajectory: ResumeTrajectory | None,
     code_revision: str,
+    unsupported: tuple[str, ...],
 ) -> VariantFreeze:
     """Decide one variant's status and prove its start restores, when it can be started.
 
@@ -726,31 +775,34 @@ def _freeze_variant(
         project: Project receiving the checkpoint.
         packet: The packet.
         packet_reference: Its saved artifact.
-        world: The authored world.
-        variant_id: The variant.
+        row: The variant's initialization.
         checks: Results of the executed checks.
+        challenges: The executed boundary challenges.
         diagnostic: Rules keeping the family diagnostic.
-        base: Host-owned grounded runtime definition, if any.
+        definition: The variant's served runtime definition, without a host runtime None.
         actor: Chat actor for fresh-briefing starts, if any.
+        trajectory: The saved trajectory edited resume variants fork from, if any.
         code_revision: Producing source identity.
+        unsupported: Behaviors the world declares unsupported.
 
     Returns:
         The variant's freeze record.
     """
+    variant_id = row.variant_id
     problems = [*checks.problems, *checks.variant_problems.get(variant_id, [])]
     diagnostics = [*checks.variant_diagnostics.get(variant_id, [])]
     diagnostics += [
         f"rule {rule_id} has an unsupported decision boundary" for rule_id in diagnostic
     ]
     unexecuted = [
-        run.workload.workload_id
-        for run in checks.runs
-        if run.variant_id == variant_id and not run.executed
+        run.case.workload.workload_id
+        for run in challenges.runs
+        if run.case.scope == variant_id and run.status != "executed"
     ]
     if unexecuted:
         diagnostics.append(f"boundary workloads {unexecuted} were not executed")
-    if world.unsupported:
-        diagnostics.append(f"the world declares unsupported behaviors {list(world.unsupported)}")
+    if unsupported:
+        diagnostics.append(f"the world declares unsupported behaviors {list(unsupported)}")
     if problems:
         return VariantFreeze(
             variant_id=variant_id,
@@ -758,16 +810,14 @@ def _freeze_variant(
             problems=tuple(problems),
             diagnostics=tuple(diagnostics),
         )
-    if base is None:
+    if definition is None:
         diagnostics.append("no runtime definition was supplied, so restoration is unproven")
         return VariantFreeze(
             variant_id=variant_id, status="diagnostic", diagnostics=tuple(diagnostics)
         )
-    row = world.initialization(variant_id)
-    definition = world_runtime_definition(packet, world, variant_id, base=base)
     try:
         reference = _start(
-            project, packet, packet_reference, definition, row.mode, actor, code_revision
+            project, packet, packet_reference, definition, row, actor, trajectory, code_revision
         )
     except ValueError as error:
         problems.append(f"the variant could not be started: {error}")
@@ -778,16 +828,7 @@ def _freeze_variant(
             problems=tuple(problems),
             diagnostics=tuple(diagnostics),
         )
-    with continuation_runtime(project, definition.model_dump(mode="json")) as runtime:
-        executable = runtime.world if isinstance(runtime.world, ExecutableWorldRuntime) else None
-        restored = executable is not None and verify_restoration(
-            project, reference, runtime=executable, expected_state_sha256=sha256_json(row.state)
-        )
-    restored = (
-        restored
-        and grounded_state(load_continuation_checkpoint(project.artifacts, reference).world)
-        == row.state
-    )
+    restored = restores_exactly(project, definition, reference, row.state)
     if not restored:
         problems.append("the frozen start does not restore to its exact initial state")
     status: Literal["frozen", "diagnostic", "rejected"] = (
@@ -809,21 +850,33 @@ def _start(
     packet: AuthoringPacket,
     packet_reference: ArtifactInput,
     definition: GroundedRuntimeDefinition,
-    mode: Literal["resume", "fresh_briefing"],
+    row: VariantInitialization,
     actor: ChatAgentRuntime | None,
+    trajectory: ResumeTrajectory | None,
     code_revision: str,
 ) -> ArtifactInput:
-    """Open the variant's world, pair it with its actor context and save the checkpoint.
+    """Open the variant's served world, pair it with its actor context and save the checkpoint.
+
+    A resume start keeps the source checkpoint's actor and its world-model history, so the
+    served world conditions on the same prefix the actor saw. A fresh briefing starts both anew.
 
     Raises:
-        ValueError: A resume variant's packet checkpoint belongs to another task, or a fresh
-            briefing has no actor to start it.
+        ValueError: A resume source belongs to another task, holds no grounded history or
+            another state, or cannot be built; or a fresh briefing has no actor to start it.
     """
-    if mode == "resume":
-        source = load_continuation_checkpoint(project.artifacts, packet.checkpoint)
+    history: list[JsonValue] = []
+    sources = (packet_reference,)
+    if row.mode == "resume":
+        origin = _resume_source(project, packet, row, trajectory, code_revision)
+        source = load_continuation_checkpoint(project.artifacts, origin)
         if source.task != definition.task:
             raise ValueError("the packet checkpoint's actor belongs to another task")
-        context = source.actor
+        if not isinstance(source.world, ExecutableCheckpoint):
+            raise ValueError("a resume start needs a simulated checkpoint carrying its history")
+        state, history = simulated_image(source.world)
+        if state != row.state and history:
+            raise ValueError("the resume source's simulated state is not the variant's state")
+        context, sources = source.actor, (packet_reference, origin)
     elif actor is None:
         raise ValueError("a fresh briefing variant needs a chat actor to start it")
     else:
@@ -832,15 +885,69 @@ def _start(
         continuation_runtime(project, definition.model_dump(mode="json")) as runtime,
         runtime.world.open(definition.task) as session,
     ):
-        start = ContinuationCheckpoint(
-            task=definition.task,
-            actor=context,
-            world=session.checkpoint(),
-            sources=(packet_reference,),
-        )
+        fresh = session.checkpoint()
+    if history and isinstance(fresh, ExecutableCheckpoint):
+        fresh = with_simulated_image(fresh, row.state, history)
+    start = ContinuationCheckpoint(
+        task=definition.task,
+        actor=context,
+        world=fresh,
+        sources=sources,
+    )
     return persist_continuation_checkpoint(
         project.artifacts, start, created_at=datetime.now(UTC), code_revision=code_revision
     )
+
+
+def _resume_source(
+    project: ProjectStore,
+    packet: AuthoringPacket,
+    row: VariantInitialization,
+    trajectory: ResumeTrajectory | None,
+    code_revision: str,
+) -> ArtifactInput:
+    """Return the checkpoint a resume variant continues: the packet's, or an edited fork of it.
+
+    A checkpoint with no world-model history retains nothing an edit could contradict, so
+    without a trajectory its actor resumes directly in the edited state.
+
+    Raises:
+        ValueError: The variant edits the checkpoint's state and no trajectory, scenario or
+            coherent edited start exists.
+    """
+    world = load_continuation_checkpoint(project.artifacts, packet.checkpoint).world
+    if isinstance(world, ExecutableCheckpoint):
+        state, history = simulated_image(world)
+        if state == row.state or (trajectory is None and not history):
+            return packet.checkpoint
+    scenario = next(
+        (
+            s
+            for s in (trajectory.scenarios if trajectory else ())
+            if s.scenario_id == row.variant_id
+        ),
+        None,
+    )
+    if trajectory is None or scenario is None:
+        raise ValueError(
+            f"resume variant {row.variant_id} edits the packet checkpoint's state; pass its "
+            "trajectory and scenario so the start forks before the edited value is revealed"
+        )
+    built = build_variant_checkpoint(
+        project,
+        base=packet.checkpoint,
+        branch_checkpoints=trajectory.branch_checkpoints,
+        decision=trajectory.decision,
+        scenario=scenario,
+        facts=trajectory.facts,
+        code_revision=code_revision,
+        maximum_model_calls=trajectory.maximum_model_calls,
+    )
+    if built.reference is None:
+        raise ValueError("the edited resume start is incoherent: " + "; ".join(built.problems))
+    if built.edited_state_sha256 != sha256_json(row.state):
+        raise ValueError("the edited resume start differs from the variant's initialization")
+    return built.reference
 
 
 def _examples(world: WorldSpec, supplied: Mapping[str, JsonObject] | None) -> dict[str, JsonObject]:

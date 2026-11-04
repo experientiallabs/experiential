@@ -13,8 +13,12 @@ One run follows a fixed sequence over saved, replayable owners:
 6. **Rule book.** The rendered Markdown files and ``rules.json`` are saved as one
    ``rule-book`` artifact whose inputs are the extraction responses it was learned from.
 7. **Challenges.** Properties derived from the rules are checked on supplied simulated
-   sessions, boundary workloads are generated from a supplied base state, and observed
-   workload transitions, when supplied, are triaged. Executing workloads is out of scope.
+   sessions and boundary workloads are generated from a supplied base state. Observed workload
+   transitions, when supplied, are triaged. With an explicit ``challenge`` executor the workloads
+   are instead executed in that bound world by
+   :func:`~exp.optimize.evaluation.rules.challenges.run_challenges`, which saves every executed
+   case, updates each challenged rule's status with its executed witnesses and replays without
+   executing or calling anything.
 
 Draw identities depend only on what extraction reads (the author settings, the traces, their
 sources, the extraction protocol and the code revision), so a later run that adds witnesses,
@@ -51,6 +55,12 @@ from exp.common.project import ArtifactAlreadyExistsError, ProjectStore
 from exp.common.project.manifests import artifact_input
 from exp.common.traces import Trace
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.challenges import (
+    ChallengeCase,
+    ChallengeExecutor,
+    ChallengeReport,
+    run_challenges,
+)
 from exp.optimize.evaluation.rules.extraction import (
     ExtractionDraw,
     extract_rules_in_parallel,
@@ -189,6 +199,7 @@ class RulesStageReport(ContractModel):
         families_must_stay_diagnostic: Rule ids without a supporting witness that a challenge
             contradicted (a property violation on a session or a contradicting workload), in
             book order. Any environment family built on them stays diagnostic.
+        challenges: The executed challenges, when a challenge executor was supplied.
     """
 
     spec: RulesStageSpec
@@ -209,6 +220,7 @@ class RulesStageReport(ContractModel):
     workloads: tuple[Workload, ...]
     triage: tuple[Triage, ...]
     families_must_stay_diagnostic: tuple[str, ...]
+    challenges: ChallengeReport | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def run_rules_stage(
@@ -221,6 +233,7 @@ def run_rules_stage(
     witnesses: Mapping[str, Sequence[Witness]] | None = None,
     sessions: Sequence[WorkflowEvidence | ArtifactInput] = (),
     observed: Mapping[str, Transition] | None = None,
+    challenge: ChallengeExecutor | None = None,
 ) -> RulesStageReport:
     """Run, or replay, the learned-rules stage over world-learning traces.
 
@@ -235,6 +248,8 @@ def run_rules_stage(
             artifacts holding ``evidence.json``.
         observed: Observed transition per executed workload id, for triage. Workload ids are
             ``<rule_id>/<n>`` as listed in an earlier report's ``workloads``.
+        challenge: Explicit bound world to execute every boundary workload in, instead of
+            supplying observed transitions; its identity joins the run identity.
 
     Returns:
         The report, also saved as a ``rules-stage-report`` artifact.
@@ -242,8 +257,9 @@ def run_rules_stage(
     Raises:
         ValueError: No trace is supplied, a trace is not reserved for world learning, trace
             identities repeat, a witness names an unknown rule, a session reference is not the
-            saved artifact it pins, or observed transitions are supplied without a registered
-            base state or for unknown workloads.
+            saved artifact it pins, observed transitions or a challenge executor are supplied
+            without a registered base state, both are supplied, or observed transitions name
+            unknown workloads.
         FileLockTimeout: Another process is running the same stage or extraction.
     """
     if not traces:
@@ -253,18 +269,24 @@ def run_rules_stage(
     if len(set(ids)) != len(ids):
         raise ValueError("the rules stage needs distinct traces; a trace ID repeats")
     spec = RulesStageSpec.model_validate_json(spec.model_dump_json())
-    if observed and spec.base_state is None:
+    if (observed or challenge is not None) and spec.base_state is None:
         raise ValueError(
-            "observed workload transitions need a registered base_state; register the base "
-            "state the workloads were generated from"
+            "observed or executed workload transitions need a registered base_state; register "
+            "the base state the workloads are generated from"
+        )
+    if observed and challenge is not None:
+        raise ValueError(
+            "supply either observed workload transitions or a challenge executor, not both"
         )
     store = project.artifacts
     combined = _combine_witnesses(spec.witnesses, witnesses or {})
     loaded = tuple(_load_session(project, session) for session in sessions)
     extraction_identity = spec.extraction_identity(traces, code_revision)
+    fields: JsonObject = {} if challenge is None else {"challenge": challenge.identity}
     identity = stable_id(
         "rules-stage",
         {
+            **fields,
             "spec": spec.identity(code_revision),
             "extraction": extraction_identity,
             "witnesses": {
@@ -306,6 +328,27 @@ def run_rules_stage(
             draw.response for draw in draws if draw.rules is not None and draw.response is not None
         )
         rulebook = _save_rulebook(project, book, responses, extraction_identity, code_revision)
+        workloads: tuple[Workload, ...] = ()
+        if spec.base_state is not None:
+            workloads = boundary_workloads(
+                book,
+                spec.base_state,
+                examples=spec.examples,
+                observed_values=spec.observed_values,
+                epsilon=spec.epsilon,
+            )
+        executed = None
+        if challenge is not None:
+            executed = run_challenges(
+                project,
+                book=book,
+                rulebook=rulebook,
+                cases=tuple(ChallengeCase(workload=workload) for workload in workloads),
+                executor=challenge,
+                code_revision=code_revision,
+                refusal=spec.refusal,
+            )
+            observed = executed.observed()
         report = _report(
             spec,
             identity,
@@ -315,9 +358,12 @@ def run_rules_stage(
             book,
             rulebook,
             loaded,
+            workloads,
             observed or {},
-        )
+        ).model_copy(update={"challenges": executed})
         dependencies = {rulebook, *responses, *spec.sources}
+        if executed is not None:
+            dependencies.add(artifact_input(store.read(executed.identity + "-result").manifest))
         dependencies |= {reference for reference, _ in loaded if reference is not None}
         store.write_json(
             artifact_id=result_id,
@@ -510,6 +556,7 @@ def _report(
     book: RuleBook,
     rulebook: ArtifactInput,
     loaded: tuple[tuple[ArtifactInput | None, WorkflowEvidence], ...],
+    workloads: tuple[Workload, ...],
     observed: Mapping[str, Transition],
 ) -> RulesStageReport:
     """Challenge the rule book and assemble the report.
@@ -523,7 +570,8 @@ def _report(
         book: The merged rule book.
         rulebook: Its saved artifact.
         loaded: Resolved simulated sessions.
-        observed: Observed transitions per workload id.
+        workloads: Boundary workloads generated from the registered base state.
+        observed: Observed or executed transitions per workload id.
 
     Returns:
         The report.
@@ -537,15 +585,6 @@ def _report(
             located for _, evidence in loaded for located in transitions_from_workflow(evidence)
         )
         properties = check_transitions(properties_from(book), transitions, spec.refusal)
-    workloads: tuple[Workload, ...] = ()
-    if spec.base_state is not None:
-        workloads = boundary_workloads(
-            book,
-            spec.base_state,
-            examples=spec.examples,
-            observed_values=spec.observed_values,
-            epsilon=spec.epsilon,
-        )
     triaged = triage(workloads, observed, spec.refusal) if observed else ()
     witnessed = {
         rule.rule_id for rule in book.rules if any(witness.supports for witness in rule.witnesses)

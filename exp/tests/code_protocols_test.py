@@ -353,9 +353,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_author:WORLD_AUTHOR_PROTOCOL",
-        "world-author-v1",
+        "world-author-v2",
         ("exp.optimize.evaluation.variance.world_author",),
-        "2a3833c66fff963d453044afed21d85931444df3675fd39548696c2aa5867445",
+        "4d63486c44ab69e41af3fffc9a78f3799c6b865ff4fbb5d3905186586dfe4275",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rubric_author:RUBRIC_AUTHOR_PROTOCOL",
@@ -377,9 +377,21 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_freeze:WORLD_FREEZE_PROTOCOL",
-        "world-freeze-v1",
+        "world-freeze-v2",
         ("exp.optimize.evaluation.variance.world_freeze",),
-        "a0c92da5a0e548c2bfe4e307269578800c63c8437c8fba019dd85ee679ffc59f",
+        "0e42d6387d21786ca5031bcb3ccc942f74864d1eea3f743334a1fa229222fb53",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.world_agent:WORLD_AGENT_PROTOCOL",
+        "world-agent-v1",
+        ("exp.optimize.evaluation.variance.world_agent",),
+        "2ba701ac22dc1654602e6ba4feffd0518834ba977907f97accaea63397a027ec",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.challenges:CHALLENGE_PROTOCOL",
+        "rule-challenges-v1",
+        ("exp.optimize.evaluation.rules.challenges",),
+        "f6fd09c20d5584d8009ae756762d3d307d4ade09ce8ff8ad83d4d6a038449e1c",
     ),
     Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",

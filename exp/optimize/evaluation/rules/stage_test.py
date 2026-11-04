@@ -13,6 +13,7 @@ from exp.common.project import ProjectStore
 from exp.common.project.manifests import artifact_input
 from exp.common.traces import Trace
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.challenges import ChallengeCase
 from exp.optimize.evaluation.rules.extraction_test import (
     RoutedTransport,
     _answer,
@@ -341,4 +342,84 @@ def test_witnesses_lift_diagnostic_status_without_redrawing(
             traces=traces,
             code_revision="test",
             witnesses={"precondition.refund.0000000000000000": (witness,)},
+        )
+
+
+class _PermitAll:
+    """A bound world that permits every refund, counting what it executes.
+
+    Attributes:
+        executed: Case keys executed so far.
+    """
+
+    identity = "1" * 64
+
+    def __init__(self) -> None:
+        """Start with nothing executed."""
+        self.executed: list[str] = []
+
+    def execute(self, case: ChallengeCase) -> Transition | str | None:
+        """Permit the case's refund without any state change."""
+        self.executed.append(case.key)
+        return Transition(
+            before=case.workload.state,
+            after=case.workload.state,
+            action=case.workload.action,
+            observation={"ok": True},
+        )
+
+
+def test_an_explicit_challenge_executor_runs_every_workload_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Executed workloads are triaged, contradict the limit and replay without executing."""
+    project, settings = _setup(tmp_path, monkeypatch)
+    traces = _traces("alpha", "beta")
+    transport = RoutedTransport({name: _tool_reply(_answer(name)) for name in ("alpha", "beta")})
+    _wire(monkeypatch, transport)
+    plan = _plan(("alpha", "beta"))
+    world = _PermitAll()
+
+    report = run_rules_stage(
+        project,
+        _spec(settings),
+        exposure=plan,
+        traces=traces,
+        code_revision="test",
+        challenge=world,
+    )
+    replay = run_rules_stage(
+        project,
+        _spec(settings),
+        exposure=plan,
+        traces=traces,
+        code_revision="test",
+        challenge=world,
+    )
+
+    assert replay == report and len(world.executed) == 3
+    (rule_id,) = report.diagnostic
+    assert report.challenges is not None
+    (row,) = report.challenges.rules
+    assert (row.prior, row.status) == ("supported", "contradicted")
+    assert row.contradicting == (f"{rule_id}/2",)
+    assert [item.verdict for item in report.triage] == [
+        "consistent_with_rule",
+        "consistent_with_rule",
+        "contradicts_rule",
+    ]
+    assert report.families_must_stay_diagnostic == (rule_id,)
+    plain = run_rules_stage(
+        project, _spec(settings), exposure=plan, traces=traces, code_revision="test"
+    )
+    assert plain.challenges is None and "challenges" not in plain.model_dump(mode="json")
+    with pytest.raises(ValueError, match="not both"):
+        run_rules_stage(
+            project,
+            _spec(settings),
+            exposure=plan,
+            traces=traces,
+            code_revision="test",
+            observed={f"{rule_id}/2": _observed_permit(41)},
+            challenge=world,
         )

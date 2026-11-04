@@ -10,7 +10,6 @@ from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_js
 from exp.common.models import BillingSource, ModelSnapshot, ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
-from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable.grounded_test import _record_spec
 from exp.optimize.evaluation.executable.induced import continuation_runtime
 from exp.optimize.evaluation.fidelity.runner_test import source_project
@@ -157,7 +156,7 @@ def test_closing_the_runtime_stops_the_program_worker_on_every_exit_path(
             super().__init__(limits)
             opened.append(self)
 
-    monkeypatch.setattr(induced_runtime, "ProgramSandbox", RecordedSandbox)
+    monkeypatch.setattr(grounded_runtime, "ProgramSandbox", RecordedSandbox)
     spec = _record_spec(project, fidelity)
     coverage = _saved_induction(project, spec.manifest)
     configuration = {

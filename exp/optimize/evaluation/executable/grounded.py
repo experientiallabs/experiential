@@ -15,6 +15,13 @@ judged against it.
 A tag retrieval binding is pinned likewise: the definition names one saved
 ``tag-retrieval-binding`` artifact, the runtime verifies its manifest and type, and the grounded
 world ranks the task's retrieval by its policy when the binding lists the task.
+
+Validated transition programs compose the same way: the definition may carry one
+:class:`~exp.simulation.induction.contracts.InducedCoverage`. Covered tools then run as exact code
+in a :class:`~exp.simulation.induction.sandbox.ProgramSandbox` inside their validated domain;
+every other call, and every call outside a program's domain, is predicted by the grounded model
+under the bound rule book. The coverage is part of the definition, so every identity derived from
+it, including the world digest a judge binds, covers the programs.
 """
 
 import json
@@ -29,7 +36,9 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    JsonValue,
     Sha256,
+    canonical_json_bytes,
     sha256_json,
 )
 from exp.common.models import ModelCatalog, ModelRequest, ReasoningEffort, load_model_catalog
@@ -44,8 +53,12 @@ from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
 from exp.optimize.evaluation.variance.build_records import load_tag_retrieval_binding
-from exp.runtime.environments.world_contracts import ExecutableCheckpoint, WorldManifest
-from exp.runtime.environments.worlds import ExecutableWorldRuntime
+from exp.runtime.environments.world_contracts import (
+    ExecutableCheckpoint,
+    NativeImage,
+    WorldManifest,
+)
+from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldBackendFactory
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
 from exp.runtime.models.providers.admitted_transport import (
@@ -57,8 +70,11 @@ from exp.runtime.models.reasoning_view import reasoning_catalog
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
-from exp.simulation.continuations import WorldCheckpoint
+from exp.simulation.continuations import WorldCheckpoint, load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
+from exp.simulation.induction.backend import InducedWorldFactory
+from exp.simulation.induction.contracts import InducedCoverage
+from exp.simulation.induction.sandbox import ProgramSandbox
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
@@ -73,6 +89,8 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
 )
+
+_PREDICTOR_PART = "predictor.json"
 
 
 class GroundedRuntimeDefinition(ContractModel):
@@ -108,6 +126,10 @@ class GroundedRuntimeDefinition(ContractModel):
             task, retrieval ranks by its tag policy and records the policy as evidence; a task it
             does not list retrieves by cosine similarity. Absent, the definition and every
             derived identity are unchanged.
+        programs: Optional validated transition programs, validated under exactly this
+            manifest. Covered tools run as exact sandboxed code inside their validated domain;
+            everything else goes to the grounded model and its rule-book check. Absent, the
+            definition and every derived identity are unchanged.
     """
 
     task: TaskCase
@@ -134,10 +156,16 @@ class GroundedRuntimeDefinition(ContractModel):
     tag_retrieval: ArtifactInput | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    programs: InducedCoverage | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _starting_facts_only(self) -> Self:
         """Refuse facts an executable episode cannot honor or that shadow native receipts."""
+        if self.programs is not None and self.programs.manifest != self.manifest:
+            raise ValueError(
+                "transition programs were validated under another world manifest; re-validate "
+                "them under this runtime's manifest"
+            )
         if self.facts is None:
             return self
         for fact in self.facts.facts.facts:
@@ -181,6 +209,92 @@ def simulated_probe(state: JsonObject, paths: Mapping[str, str]) -> JsonObject:
         except ValueError:
             continue
     return values
+
+
+def simulated_image(checkpoint: ExecutableCheckpoint) -> tuple[JsonObject, list[JsonValue]]:
+    """Decode the simulated state and world-model history of one grounded checkpoint.
+
+    Args:
+        checkpoint: A checkpoint of the grounded world, with or without transition programs.
+
+    Returns:
+        ``(state, history)`` held by the grounded predictor's image.
+
+    Raises:
+        ValueError: The image holds no well-formed grounded predictor part.
+    """
+    payload = checkpoint.image.parts.get(_PREDICTOR_PART)
+    wire = None if payload is None else json.loads(payload)
+    if (
+        not isinstance(wire, dict)
+        or not isinstance(wire.get("state"), dict)
+        or not isinstance(wire.get("history"), list)
+    ):
+        raise ValueError("the checkpoint holds no grounded simulator state and history")
+    return wire["state"], wire["history"]
+
+
+def with_simulated_image(
+    checkpoint: ExecutableCheckpoint, state: JsonObject, history: list[JsonValue]
+) -> ExecutableCheckpoint:
+    """Return a checkpoint of the same runtime holding another state and world-model history.
+
+    Every other image part (such as the transition programs' partition) and every kernel field
+    is kept, and the domain digests are recomputed, so the runtime's own restore verifies it.
+
+    Args:
+        checkpoint: A checkpoint taken by the runtime that will restore the result.
+        state: Complete simulated state.
+        history: Predictor history the restored world conditions on.
+
+    Returns:
+        The rewritten checkpoint.
+    """
+    parts = {
+        **checkpoint.image.parts,
+        _PREDICTOR_PART: canonical_json_bytes({"state": state, "history": history}),
+    }
+    domains = {key: sha256_json(value) for key, value in state.items()}
+    return checkpoint.model_copy(update={"image": NativeImage(parts=parts, domains=domains)})
+
+
+def restores_exactly(
+    project: ProjectStore,
+    definition: GroundedRuntimeDefinition,
+    reference: ArtifactInput,
+    state: JsonObject,
+) -> bool:
+    """Prove a saved start holds one state and restores exactly in its runtime.
+
+    The checkpoint's simulated state must equal ``state`` and its domain digests; the runtime of
+    ``definition`` (its programs included) must restore it through its own restore path and
+    recapture the identical image, world-model history included, and clock.
+
+    Args:
+        project: Project holding the checkpoint.
+        definition: The runtime the start was taken in.
+        reference: The saved continuation checkpoint.
+        state: The exact simulated state it must hold.
+
+    Returns:
+        Whether every comparison held.
+    """
+    try:
+        checkpoint = load_continuation_checkpoint(project.artifacts, reference)
+        world = checkpoint.world
+        if not isinstance(world, ExecutableCheckpoint):
+            return False
+        held, _ = simulated_image(world)
+        if held != state or world.image.domains != {k: sha256_json(v) for k, v in held.items()}:
+            return False
+        with continuation_runtime(project, definition.model_dump(mode="json")) as runtime:
+            if not isinstance(runtime.world, ExecutableWorldRuntime):
+                return False
+            with runtime.world.restore(checkpoint.world_task, world) as restored:
+                recaptured = restored.checkpoint()
+        return recaptured.image == world.image and recaptured.clock == world.clock
+    except ValueError:
+        return False
 
 
 def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> ContinuationRuntime:
@@ -448,7 +562,7 @@ def _runtime(
             files={"event.json": event},
         )
 
-    factory = GroundedWorldFactory(
+    grounded_factory = GroundedWorldFactory(
         GroundedTransitionEngine(
             runtime,
             spec.task,
@@ -467,6 +581,19 @@ def _runtime(
         maximum_reasks=spec.maximum_reasks,
         rule_book=rule_book,
     )
+    factory: WorldBackendFactory = grounded_factory
+    sandbox = None
+    if spec.programs is not None:
+        sandbox = ProgramSandbox(spec.programs.limits)
+        starting = (
+            None if spec.facts is None else spec.facts.facts.conditioning(spec.facts.first_version)
+        )
+        factory = InducedWorldFactory(
+            spec.programs,
+            grounded_factory,
+            sandbox,
+            facts={} if starting is None else {fact.key: fact.value for fact in starting.facts},
+        )
 
     def probe(checkpoint: WorldCheckpoint) -> JsonObject:
         """Omit missing private probe fields without discarding valid actor observations."""
@@ -474,11 +601,9 @@ def _runtime(
             raise ValueError("simulated projection requires its executable checkpoint")
         if checkpoint.backend_sha256 != sha256_json(factory.definition):
             raise ValueError("probe checkpoint differs from the frozen simulator")
-        wire = json.loads(checkpoint.image.parts["predictor.json"])
-        return simulated_probe(wire["state"], spec.probe_paths)
+        return simulated_probe(simulated_image(checkpoint)[0], spec.probe_paths)
 
-    return ContinuationRuntime(
-        ExecutableWorldRuntime(spec.manifest, factory, owner="simulated", seed=spec.seed),
-        probe,
-        spec.probe_sha256,
-    )
+    world = ExecutableWorldRuntime(spec.manifest, factory, owner="simulated", seed=spec.seed)
+    if sandbox is None:
+        return ContinuationRuntime(world, probe, spec.probe_sha256)
+    return ContinuationRuntime(world, probe, spec.probe_sha256, sandbox.close)

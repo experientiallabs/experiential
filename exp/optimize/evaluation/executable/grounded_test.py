@@ -35,13 +35,22 @@ from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec
 from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.optimize.evaluation.variance.build_records import BINDING_TYPE, save_artifact
-from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
+from exp.optimize.evaluation.variance.tests.grounded_world_test import grounded_fixture
+from exp.runtime.environments.world_contracts import (
+    ExecutableCheckpoint,
+    StateDomain,
+    ToolEffectPolicy,
+    WorldManifest,
+)
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
+from exp.simulation.induction.contracts import InductionEpisode, InductionStep, TransitionProgram
+from exp.simulation.induction.sandbox import ProgramSandbox
+from exp.simulation.induction.validation import validate_programs
 from exp.simulation.retrieval import RAGLineageBinding, load_rag_index, persist_trace_rag
 from exp.simulation.retrieval.tags import (
     RAGIndexTags,
@@ -935,3 +944,77 @@ def test_bound_tag_retrieval_ranks_the_executable_world_and_records_its_policy(
     )
     with restore_continuation_world(tagged.world, base.task, checkpoints["treatment"]) as world:
         assert world.checkpoint() == checkpoints["treatment"]
+
+
+def test_bound_programs_serve_covered_tools_and_the_model_answers_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A covered tool runs as code, an uncovered one is predicted; the digest binds programs."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    manifest = WorldManifest(
+        domains=(
+            StateDomain(name="tickets", owner="simulated"),
+            StateDomain(name="desk", owner="simulated"),
+        ),
+        tools=(
+            ToolEffectPolicy(name="read_ticket", reads=("desk",)),
+            ToolEffectPolicy(name="check_sla", reads=("tickets",)),
+            ToolEffectPolicy(name="escalate", reads=("tickets",), writes=("tickets",)),
+            ToolEffectPolicy(name="close", reads=("tickets",), writes=("tickets",)),
+        ),
+    )
+    program = TransitionProgram(
+        tool="read_ticket",
+        source=(
+            "def transition(state, args, facts):\n"
+            "    return {'ticket': 'T-1', 'status': state['desk']['status']}\n"
+        ),
+    )
+    initial = {**fixture.definition.initial_state, "desk": {"status": "open"}}
+    episode = InductionEpisode(
+        episode_id="desk",
+        initial_state={"desk": {"status": "open"}},
+        steps=(
+            InductionStep(
+                tool="read_ticket", arguments={}, reply={"ticket": "T-1", "status": "open"}
+            ),
+        ),
+    )
+    with ProgramSandbox() as sandbox:
+        coverage = validate_programs((program,), (episode,), manifest, sandbox).coverage
+    assert coverage.induced_tools == ("read_ticket",)
+    plain = GroundedRuntimeDefinition.model_validate(
+        {
+            **fixture.definition.model_dump(mode="json"),
+            "manifest": manifest.model_dump(mode="json"),
+            "initial_state": initial,
+        }
+    )
+    served = GroundedRuntimeDefinition.model_validate(
+        {**plain.model_dump(mode="json"), "programs": coverage.model_dump(mode="json")}
+    )
+    assert "programs" not in plain.model_dump(mode="json")
+    assert sha256_json(served) != sha256_json(plain)
+
+    with (
+        continuation_runtime(fixture.project, served.model_dump(mode="json")) as runtime,
+        runtime.world.open(served.task) as world,
+    ):
+        read = world.execute(ToolCall(name="read_ticket", call_id="read", arguments={}))
+        assert fixture.predictor.requests == []
+        sla = world.execute(ToolCall(name="check_sla", call_id="sla", arguments={}))
+        saved = world.checkpoint()
+    assert (read.metadata["transition"], json.loads(read.content)["status"]) == (
+        "induced",
+        "open",
+    )
+    assert sla.metadata["transition"] == "predicted" and len(fixture.predictor.requests) == 1
+    assert json.loads(sla.content) == {"severity": "high", "lock": "none"}
+    assert isinstance(saved, ExecutableCheckpoint) and "induced.json" in saved.image.parts
+    with pytest.raises(ValueError, match="another world manifest"):
+        GroundedRuntimeDefinition.model_validate(
+            {
+                **fixture.definition.model_dump(mode="json"),
+                "programs": coverage.model_dump(mode="json"),
+            }
+        )

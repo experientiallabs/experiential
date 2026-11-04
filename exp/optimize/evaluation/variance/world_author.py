@@ -25,7 +25,13 @@ tool, enforces a rule the evidence does not support, leaves a probe or hook unre
 whose programs the existing induction validation does not accept on the packet's source episodes
 plus the author's own replay fixtures. :func:`world_runtime_definition` then binds a ready world
 into a :class:`~exp.optimize.evaluation.executable.grounded.GroundedRuntimeDefinition` for one
-variant. Whether an actor's episode in that world succeeds is never decided here.
+variant, programs included: covered tools are served by their validated programs and every other
+call by the grounded model under the rule book. Whether an actor's episode in that world succeeds
+is never decided here.
+
+This module is the single forced draw and the host checks every world answer passes;
+:mod:`~exp.optimize.evaluation.variance.world_agent` runs the agentic author (several prompt sets,
+each planning, drafting and repairing from these checks' concrete failures) over the same checks.
 """
 
 from __future__ import annotations
@@ -62,6 +68,7 @@ from exp.optimize.evaluation.variance.episodes import EventKind
 from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.simulation.induction import runner
 from exp.simulation.induction.contracts import (
+    InducedCoverage,
     InductionEpisode,
     TransitionProgram,
     ValidationReport,
@@ -69,7 +76,7 @@ from exp.simulation.induction.contracts import (
 from exp.simulation.induction.sandbox import ProgramSandbox
 from exp.simulation.induction.validation import validate_programs
 
-WORLD_AUTHOR_PROTOCOL = "world-author-v1"
+WORLD_AUTHOR_PROTOCOL = "world-author-v2"
 """Version of the world-author prompt, answer schema and host checks."""
 
 WORLD_TOOL = "submit_world_draft"
@@ -387,6 +394,19 @@ def world_request(packet: AuthoringPacket, *, output_tokens: int) -> ModelReques
     )
 
 
+class WorldReviewError(ValueError):
+    """A world answer failed a host check; carries the program validation when it ran.
+
+    Attributes:
+        report: Induction validation of the answer's programs, when validation ran.
+    """
+
+    def __init__(self, message: str, report: ValidationReport | None = None) -> None:
+        """Keep the failure and the validation report a repair round quotes."""
+        super().__init__(message)
+        self.report = report
+
+
 def review_world_answer(
     arguments: object, packet: AuthoringPacket, sandbox: ProgramSandbox
 ) -> tuple[WorldAnswer, ValidationReport | None]:
@@ -403,7 +423,8 @@ def review_world_answer(
     Raises:
         ValueError: The answer is malformed, cites unsupplied locators, misses or invents a
             variant or tool, enforces an unsupported rule, leaves a probe or hook unresolvable,
-            breaks a resume state, or has a program the induction validation does not accept.
+            breaks a resume state, or has a program the induction validation does not accept
+            or that the served runtime would never run.
     """
     answer = WorldAnswer.model_validate(arguments)
     check_research(packet, answer.research)
@@ -446,7 +467,19 @@ def review_world_answer(
             + ")"
             for row in rejected
         )
-        raise ValueError(f"induction validation did not accept every program: {reasons}")
+        raise WorldReviewError(
+            f"induction validation did not accept every program: {reasons}", report
+        )
+    unserved = sorted(
+        {program.tool for program in world.programs} - set(report.coverage.induced_tools)
+    )
+    if unserved:
+        raise WorldReviewError(
+            f"programs for {unserved} are valid but would never be served: a tool without a "
+            "program touches their state domains, so the grounded model owns them; give every "
+            "tool touching those domains a program, or drop these programs",
+            report,
+        )
     return answer, report
 
 
@@ -563,34 +596,74 @@ def world_draft_reference(project: ProjectStore, draft: WorldDraft) -> ArtifactI
     return artifact_input(project.artifacts.read(draft.identity + "-result").manifest)
 
 
+def world_coverage(packet: AuthoringPacket, world: WorldSpec) -> InducedCoverage | None:
+    """Validate a ready world's programs and return the coverage the served runtime runs.
+
+    Validation replays the packet's source episodes and the world's fixtures under the world's
+    manifest in a default-limit sandbox, exactly as authoring did, so the coverage (and every
+    digest of a definition that binds it) depends only on the packet and the world.
+
+    Args:
+        packet: The packet the world was authored from.
+        world: The ready world.
+
+    Returns:
+        The coverage, or None when the world has no programs.
+
+    Raises:
+        ValueError: A program is not accepted or would not be served.
+    """
+    if not world.programs:
+        return None
+    with ProgramSandbox() as sandbox:
+        report = validate_programs(
+            world.programs, (*packet.observed_episodes, *world.fixtures), world.manifest(), sandbox
+        )
+    served = set(report.coverage.induced_tools)
+    rejected = sorted({program.tool for program in world.programs} - served)
+    if rejected:
+        raise ValueError(f"the world's programs for {rejected} are not served; re-author them")
+    return report.coverage
+
+
 def world_runtime_definition(
     packet: AuthoringPacket,
     world: WorldSpec,
     variant_id: str,
     *,
     base: GroundedRuntimeDefinition,
+    coverage: InducedCoverage | None = None,
 ) -> GroundedRuntimeDefinition:
-    """Bind one variant of a ready world into the grounded runtime definition.
+    """Bind one variant of a ready world, programs included, into the grounded runtime.
 
     The host keeps its world model, catalog, allowance and deadline; the world supplies the
-    manifest, initial state and probes, the packet supplies the rule book and the variant's
-    exact public instruction.
+    manifest, initial state, probes and validated programs, the packet supplies the rule book and
+    the variant's exact public instruction. Covered tools are served by their programs; every
+    other call, and every call outside a program's validated domain, by the grounded model under
+    the rule book. The programs are part of the definition, so its digest covers them.
 
     Args:
         packet: The packet the world was authored from.
         world: The ready world.
         variant_id: Which variant to start.
         base: Host-owned grounded runtime definition for the same task.
+        coverage: The world's coverage from :func:`world_coverage`, to validate it once for
+            several variants; computed when omitted.
 
     Returns:
         The validated definition.
 
     Raises:
-        ValueError: The base runs another task, or the binding fails a definition check.
+        ValueError: The base runs another task, the coverage is not the world's, or the binding
+            fails a definition check.
         KeyError: The world does not initialize that variant.
     """
     if base.task.task_id != packet.task.task_id:
         raise ValueError("the base runtime runs another task than the packet's")
+    if coverage is None:
+        coverage = world_coverage(packet, world)
+    elif set(coverage.programs) != set(world.programs) or coverage.manifest != world.manifest():
+        raise ValueError("the supplied coverage is not this world's validated programs")
     row = world.initialization(variant_id)
     instruction = packet.variant(variant_id).instruction
     if row.briefing is not None:
@@ -607,6 +680,9 @@ def world_runtime_definition(
             "rule_book": packet.rule_book.model_dump(mode="json"),
         }
     )
+    configuration.pop("programs", None)
+    if coverage is not None:
+        configuration["programs"] = coverage.model_dump(mode="json")
     return GroundedRuntimeDefinition.model_validate(configuration)
 
 
