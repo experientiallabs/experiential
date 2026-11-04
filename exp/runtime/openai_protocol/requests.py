@@ -107,6 +107,7 @@ from exp.runtime.openai_protocol.tool_call_extra_content import thought_signatur
 from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
+from exp.runtime.openai_protocol.vendor_private_fields import drop_vendor_private_fields
 from exp.runtime.openai_protocol.web_search import (
     chat_web_search,
     responses_web_search,
@@ -269,6 +270,9 @@ def decode_chat(
     (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown
     nested field stays rejected. The Vercel AI SDK's camelCase ``promptCacheKey`` is
     folded onto ``prompt_cache_key`` first, so it decodes as the documented wire field.
+    Underscore-prefixed top-level fields are private to an intermediate hop
+    rather than gateway controls, so they are dropped with disclosure instead
+    of rejected.
 
     Args:
         payload: Parsed JSON request body.
@@ -281,7 +285,9 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
+    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
+    payload, vendor_private_disclosures = drop_vendor_private_fields(payload)
+    payload, alias_disclosures = repair_chat(payload, alias_disclosures)
     breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
     payload = cache_payload = breakpoints.marked  # Breakpoints ride the cache_control path.
     payload = drop_opencode_cache_control(payload)
@@ -350,6 +356,7 @@ def decode_chat(
                 *alias_disclosures,
                 *cap_disclosures,
                 *breakpoints.disclosures,
+                *vendor_private_disclosures,
                 *cache_disclosures,
                 *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
