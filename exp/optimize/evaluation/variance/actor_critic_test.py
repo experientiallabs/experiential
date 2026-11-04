@@ -3,19 +3,34 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject
-from exp.common.models import load_model_catalog
-from exp.common.project import ProjectStore
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
+from exp.common.models import BillingSource, ModelSnapshot, load_model_catalog
+from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates_test import _reply
-from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec, run_actor_critic
-from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role
+from exp.optimize.evaluation.variance.actor_critic import (
+    ActorCriticSpec,
+    ActorTier,
+    PointResult,
+    policy_groups,
+    run_actor_critic,
+)
+from exp.optimize.evaluation.variance.evidence import ReferenceSource
+from exp.optimize.evaluation.variance.evidence_tools import (
+    AnalysisTranscript,
+    EvidenceBudget,
+    EvidenceToolProfile,
+)
+from exp.optimize.evaluation.variance.evidence_tools_test import price_judge
+from exp.optimize.evaluation.variance.exposure import EstimateMeaning, ExposurePlan, Role
+from exp.optimize.evaluation.variance.rewards import PointOutcome, group_advantages
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -238,3 +253,253 @@ def test_a_task_outside_the_mining_probes_is_refused_before_any_call(
             )
 
     assert actor_transport.requests == [] and role_transport.requests == []
+
+
+class _ReactiveActor(ScriptedJsonTransport):
+    """Answer each actor request from its conversation: edit once, then finish.
+
+    The very first conversation finishes at once, so one attempt saves no tool turn.
+    """
+
+    def _answer(self) -> JsonHttpResponse:
+        """Finish after a tool result (or on the first request), otherwise delete a row."""
+        messages = self.requests[-1].payload.get("messages")
+        assert isinstance(messages, list) and isinstance(messages[-1], dict)
+        if len(self.requests) == 1 or messages[-1].get("role") == "tool":
+            return _done()
+        return _edit(2)
+
+
+def _with_usage(reply: JsonHttpResponse, prompt: int, completion: int) -> JsonHttpResponse:
+    """Add provider-reported token usage to one scripted reply."""
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion}
+    return JsonHttpResponse(status_code=200, body={**reply.body, "usage": usage})
+
+
+def _estimates(steps: list[int]) -> JsonObject:
+    """One critic answer estimating every given point."""
+    return {
+        "estimates": [
+            {"step": s, "probability": 0.5, "rationale": "r", "evidence_refs": ["group"]}
+            for s in steps
+        ],
+        "limitations": ["Simulated grades only."],
+    }
+
+
+def _settings(
+    project: ProjectStore, job: ContinuationJob, digest: str | None = None
+) -> AuthorSettings:
+    """Frozen judge-alias settings for selector and critic draws."""
+    catalog = RuntimeModelCatalog(load_model_catalog(project.model_catalog_path), environment={})
+    return AuthorSettings(
+        model_alias="judge",
+        model=catalog.snapshot("judge")[0],
+        catalog_sha256=digest or job.catalog_sha256,
+        output_tokens=1024,
+        deadline=job.deadline,
+    )
+
+
+def test_the_error_mining_defaults_run_and_record_populations_and_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G16/J8/C8/K4/M8 runs at small scale, recording eligibility, unique points and spend."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    settings = _settings(project, job)
+    spec = ActorCriticSpec.error_mining(
+        job, selector=settings, critic=settings, group_physical_attempts=40
+    )
+    assert (len(spec.judges), len(spec.critics), spec.points, spec.continuations) == (8, 8, 4, 8)
+    assert spec.initial.study.repeats == 16 and spec.protocol == "error-mining-v1"
+    assert spec.selector_profile.mode == "forced_response"
+    selections = [[_point(0), _point(1)]] * 4 + [[_point(1)]] * 4
+    roles = [
+        _with_usage(_tool_reply("choose_points", {"points": p, "limitations": ["x"]}), 1000, 100)
+        for p in selections
+    ] + [_with_usage(_tool_reply("estimate_points", _estimates([0, 1])), 2000, 200)] * 8
+    actor = _ReactiveActor()
+    role_transport = ScriptedJsonTransport(tuple(roles))
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor
+    )
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: role_transport
+    )
+
+    report = run_actor_critic(
+        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    )
+
+    assert report.pick is not None and report.counts is not None
+    assert "not an unconditional draw" in report.pick.rule
+    assert report.pick.population == tuple(range(16))
+    assert report.pick.ineligible == {0: "no saved tool turn"}
+    assert report.pick.eligible == tuple(range(1, 16))
+    assert report.picked == next(i for i in report.pick.order if i in report.pick.eligible)
+    counts = report.counts
+    assert (counts.attempts_planned, counts.attempts_eligible) == (16, 15)
+    assert (counts.selector_answers, counts.critic_answers) == (8, 8)
+    assert (counts.points_selected, counts.points_distinct) == (12, 2)
+    assert counts.selections_per_point == {0: 4, 1: 8}
+    assert (counts.continuations_planned, counts.continuations_recorded) == (16, 16)
+    assert counts.continuations_graded + counts.continuations_unknown == 16
+    assert report.usage["selectors"].input_tokens == 8 * 1000
+    assert report.usage["critics"].output_tokens == 8 * 200
+    assert report.usage["selectors"].unpriced_calls == 8
+    assert report.usage["group"].calls == 31
+    assert report.usage["continuations"].calls == 8 * 2 + 8
+    assert report.group_cost is not None and report.group_cost.physical_attempts == 31
+    assert all(row.cost is not None for row in report.points)
+    assert {row.tier for row in report.points} == {report.group_tier}
+    assert len(policy_groups(report.points)) == 2
+    assert all(draw.transcript is not None for draw in (*report.judges, *report.critics))
+    assert len(role_transport.requests) == 16
+
+
+def test_tool_reading_selectors_persist_transcripts_and_never_reach_the_actor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Registered references and tool results reach roles only; unavailable kinds are named."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    digest = price_judge(project)
+    job = job.model_copy(update={"catalog_sha256": digest})
+    marker = "PRIVATE-RUBRIC-MARKER"
+    rubric = project.artifacts.write_json(
+        artifact_id="rubric-reference",
+        artifact_type="reference-fixture",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+        ),
+        files={"rubric.json": {"criterion": marker}},
+    )
+    reference = ReferenceSource(
+        kind="grader_rubric", name="rubric", artifact=artifact_input(rubric), file="rubric.json"
+    )
+    profile = EvidenceToolProfile(
+        mode="read_only_tools", budget=EvidenceBudget(model_calls=3, tool_calls=2)
+    )
+    base = _spec(project, job)
+    settings = _settings(project, job, digest)
+    spec = base.model_copy(
+        update={
+            "judges": (settings,),
+            "critics": (settings,),
+            "selector_profile": profile,
+            "references": (reference,),
+            "actor_tier": "small",
+        }
+    )
+    spec = ActorCriticSpec.model_validate(spec.model_dump())
+    reads = _with_usage(
+        _reply(
+            "judge-v1",
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "read-1",
+                        "function": {
+                            "name": "read_evidence",
+                            "arguments": json.dumps({"locator": "reference:rubric"}),
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "id": "read-2",
+                        "function": {
+                            "name": "read_trace_step",
+                            "arguments": json.dumps({"attempt": 0, "step": 1}),
+                        },
+                    },
+                ],
+            },
+            "tool_calls",
+        ),
+        500,
+        50,
+    )
+    answer: JsonObject = {"points": [_point(0), _point(1)], "limitations": ["x"]}
+    roles = [
+        reads,
+        _with_usage(_tool_reply("choose_points", answer), 900, 90),
+        _with_usage(_tool_reply("estimate_points", _estimates([0, 1])), 900, 90),
+    ]
+    group = [reply for row in (2, 3, 4) for reply in (_edit(row), _done())]
+    continuations = [_edit(2), _done(), _edit(3), _done(), _done(), _done()]
+    actor_transport, role_transport = _wire(monkeypatch, group + continuations, roles)
+
+    report = run_actor_critic(
+        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    )
+
+    selector = report.judges[0]
+    assert selector.selection is not None and selector.transcript is not None
+    transcript = AnalysisTranscript.model_validate_json(
+        project.artifacts.read_bytes(selector.transcript.artifact_id, "transcript.json")
+    )
+    assert [t.status for t in transcript.tools] == ["ok", "ok"]
+    assert transcript.calls[-1].forced_answer and transcript.answer == answer
+    assert selector.usage is not None and selector.usage.input_tokens == 1400
+    opening = json.dumps(role_transport.requests[0].payload)
+    assert "reference:rubric" in opening and "reference_solution" in opening
+    assert marker not in opening
+    assert marker in json.dumps(role_transport.requests[1].payload)
+    critic_request = json.dumps(role_transport.requests[2].payload)
+    assert marker in critic_request and "not registered for this run" in critic_request
+    assert all(marker not in json.dumps(r.payload) for r in actor_transport.requests)
+    assert all("evidence_inventory" not in json.dumps(r.payload) for r in actor_transport.requests)
+    assert report.group_tier is not None and report.group_tier.label == "small"
+
+
+def test_groups_from_different_tiers_are_never_pooled() -> None:
+    """Each tier and point is its own policy group; a missing or repeated tier is refused."""
+    model = ModelSnapshot(
+        provider="openai-compatible",
+        model_id="m",
+        billing_source=BillingSource.CUSTOMER_MANAGED,
+        capabilities_sha256="0" * 64,
+        connection_sha256="0" * 64,
+    )
+    small = ActorTier(label="small", actor_model=model, profile_sha256="1" * 64)
+    large = ActorTier(label="large", actor_model=model, profile_sha256="2" * 64)
+    checkpoint = ArtifactInput(artifact_id="c", sha256="3" * 64)
+    meaning = EstimateMeaning(
+        checkpoint=checkpoint,
+        actor_model=model,
+        harness_sha256="h",
+        system_prompt_sha256="s",
+        maximum_model_calls=4,
+        remaining_calls=3,
+        temperature=0.0,
+        output_tokens=1,
+        reasoning_effort=None,
+        world_sha256="w",
+        verifier_sha256="v",
+        probe_sha256="p",
+    )
+
+    def row(tier: ActorTier | None, rewards: tuple[float, ...]) -> PointResult:
+        """One point result under a tier."""
+        return PointResult(
+            point=1,
+            checkpoint=checkpoint,
+            meaning=meaning,
+            study=None,
+            outcome=PointOutcome(point_id="point-1", step=1, successes=1, failures=1),
+            group=group_advantages("point-1", rewards),
+            failure=None,
+            tier=tier,
+        )
+
+    groups = policy_groups((row(small, (1.0, 0.0)), row(large, (1.0, 1.0))))
+    assert set(groups) == {("1" * 64, 1), ("2" * 64, 1)}
+    assert groups[("1" * 64, 1)].advantages == (1.0, -1.0)
+    with pytest.raises(ValueError, match="never pool"):
+        policy_groups((row(small, (1.0,)), row(small, (0.0,))))
+    with pytest.raises(ValueError, match="no recorded tier"):
+        policy_groups((row(None, (1.0,)),))
+    renamed = small.model_copy(update={"label": "other"})
+    with pytest.raises(ValueError, match="two different tier labels"):
+        policy_groups((row(small, (1.0,)), row(renamed, (1.0,)).model_copy(update={"point": 2})))
