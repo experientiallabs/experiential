@@ -341,13 +341,19 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v4",
+        "variance-authors-v5",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "79e500540e9484a9f7f55bf6af77bd692d6c1b5a7aeaeda2286fb947ad8cd2f6",
+        "b4003f5afbac0deef6afc9822126db9595f405013151ef4a779437658a7f0407",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.briefing_review:BRIEFING_REVIEW_PROTOCOL",
+        "briefing-leak-review-v1",
+        ("exp.optimize.evaluation.variance.briefing_review",),
+        "c1ea4d4614799e0c54e1fd142e9b2f2aac38a5faf5999a751b8b2695c54425ff",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.grader:GRADER_PROTOCOL",
@@ -450,21 +456,15 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",
-        "traceml-v1",
+        "traceml-v2",
         ("exp.simulation.mining.traceml",),
-        "5faf94af60adf9d1cb65f8f4fc1558cd202bd9f4213e07b18121214142daac81",
+        "25eea63defef2d529aa32b332a423a68ba1f630cb1b1b8f0dca5a99a6707f6c8",
     ),
     Protocol(
-        "exp.simulation.mining.error_tags:ERROR_TAGS_PROTOCOL",
-        "error-tags-v1",
-        ("exp.simulation.mining.error_tags",),
-        "b592705beb4cb34fee35664aa3e50aaae4a1da20d622c33c47393c7f46e7ee66",
-    ),
-    Protocol(
-        "exp.simulation.mining.tag_clusters:TAG_CLUSTERS_PROTOCOL",
-        "tag-clusters-v1",
-        ("exp.simulation.mining.tag_clusters", "exp.simulation.mining.tag_cluster_names"),
-        "66f5d43c569f052817ac2fab344cb98396623a2998508b869234f648858153d3",
+        "exp.simulation.mining.traceml_moves:TRACEML_MOVES_PROTOCOL",
+        "traceml-moves-v1",
+        ("exp.simulation.mining.traceml_moves",),
+        "4296775ff791ab1b25923f40e44af886abf33d1a1c1758f3f4faf42983262808",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.crosstalk:CROSSTALK_PROTOCOL",

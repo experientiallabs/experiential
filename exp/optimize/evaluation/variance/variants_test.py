@@ -350,8 +350,12 @@ def test_edits_stated_by_public_context_or_instance_facts_are_refused_unpersiste
     assert _checkpoint_count(project) == before
 
 
-def test_clock_dependent_edits_are_flagged_for_review(tmp_path: Path) -> None:
-    """A due time is persisted but marked for an explicit clock decision."""
+def test_a_key_spelling_alone_is_not_flagged_for_clock_review(tmp_path: Path) -> None:
+    """An edited due time with no pending event or outage needs no clock review.
+
+    The removed check flagged any edited key containing words such as time or deadline; only
+    recorded pending events and outages now mark a fork for review.
+    """
     project = ProjectStore(tmp_path, "case")
     boundaries, _ = _trajectory(project, _task("escalate"))
 
@@ -366,9 +370,8 @@ def test_clock_dependent_edits_are_flagged_for_review(tmp_path: Path) -> None:
         maximum_model_calls=6,
     )
 
-    assert variant.reference is not None
-    assert [check.name for check in variant.needs_review] == ["clock_and_events"]
-    assert "due_time" in variant.needs_review[0].detail
+    assert variant.reference is not None and variant.needs_review == ()
+    assert _status("clock_and_events", variant) == "passed"
 
 
 def test_a_base_outside_the_trajectory_or_an_undeclared_edit_is_refused(tmp_path: Path) -> None:
@@ -509,8 +512,15 @@ def test_a_fresh_briefing_starts_a_new_task_in_the_same_world_with_the_same_budg
     assert frozen["conversation"] != source["conversation"]
 
 
-def test_a_leaking_briefing_or_a_resumed_instruction_change_is_refused(tmp_path: Path) -> None:
-    """The intended action and unobserved facts stay out; a resumed prefix keeps its task."""
+def test_an_unentitled_briefing_or_a_resumed_instruction_change_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Entitled paths are checked at the fork; a resumed prefix keeps its task.
+
+    The briefing text itself is not scanned here: what it gives away was judged by the model leak
+    reviewer when the scenario was authored. A variant at the decision drops nothing that reviewer
+    read, so its briefing view passes.
+    """
     project = ProjectStore(tmp_path, "case")
     boundaries, _ = _trajectory(project, _task("escalate"))
     before = _checkpoint_count(project)
@@ -528,15 +538,24 @@ def test_a_leaking_briefing_or_a_resumed_instruction_change_is_refused(tmp_path:
             maximum_model_calls=6,
         )
 
-    leaky = build(_report("Close the ticket; its priority is low."))
+    briefed = _report("Earlier a note was queued.")
+    assert briefed.briefing is not None
+    unentitled = briefed.model_copy(
+        update={
+            "briefing": briefed.briefing.model_copy(update={"entitled_paths": ("/tickets/secret",)})
+        }
+    )
+    refused = build(unentitled)
     resumed = build(_report("", fresh=False))
 
-    assert leaky.reference is None and _status("initialization", leaky) == "failed"
-    detail = next(check.detail for check in leaky.checks if check.name == "initialization")
-    assert "intended option's action" in detail and "which was not observed" in detail
+    assert refused.reference is None and _status("initialization", refused) == "failed"
+    detail = next(check.detail for check in refused.checks if check.name == "initialization")
+    assert "entitled path /tickets/secret is absent or edited" in detail
     assert resumed.reference is None
     assert any("start it by fresh_briefing" in row for row in resumed.problems)
     assert _checkpoint_count(project) == before
+    built = build(briefed)
+    assert built.reference is not None and _status("briefing_view", built) == "passed"
 
 
 def test_a_variant_whose_required_state_is_not_held_is_refused(tmp_path: Path) -> None:

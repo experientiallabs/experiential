@@ -10,7 +10,9 @@ own owner, which saves and replays its work:
   then bound, with the build's scoped world model and tag binding, into the mining job's
   grounded runtime, and a new start is captured there before any probe.
 - ``traceml``: every tier's group of attempts (run or replayed by its continuation owner) is
-  labelled by :func:`~exp.simulation.mining.traceml.label_traces` and saved per tier.
+  labelled by :func:`~exp.simulation.mining.traceml.label_traces`, its pivots and returns judged
+  by the move judge under every move variant (each draw saved and replayed by the author-response
+  owner), and saved per tier.
 - ``error-mining``: the mining-probe task's rubric (the spec's, or authored by the agentic
   rubric author over a whole-task packet), then one
   :func:`~exp.optimize.evaluation.variance.actor_critic.run_actor_critic` per tier, its episode
@@ -29,7 +31,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
-from exp.common.models import load_model_catalog
+from exp.common.core.locks import CoordinationLock
+from exp.common.models import ModelRequest, ModelResponse, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
@@ -44,6 +47,7 @@ from exp.optimize.evaluation.executable.grounded import (
     continuation_runtime,
 )
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
+from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.rules.challenges import RuntimeChallenges
 from exp.optimize.evaluation.rules.stage import RulesStageReport, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
@@ -90,7 +94,9 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
 from exp.optimize.evaluation.variance.rubric_author import judge_definition
 from exp.optimize.evaluation.variance.schedule import complete_rollout, next_rollout_plan
 from exp.runtime.agents.chat import ChatAgentRuntime
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     load_continuation_checkpoint,
@@ -104,6 +110,7 @@ from exp.simulation.mining.traceml import (
     traceml_bank,
     trajectory_from_workflow_steps,
 )
+from exp.simulation.mining.traceml_moves import MoveJudge, MoveJudgeError
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 
 __all__ = ["BUILD_STAGE", "MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
@@ -369,13 +376,20 @@ class _TraceMLStage:
         steps *= settings.steps_per_call
         bank = traceml_bank(settings.bank_root)
         calls = steps * math.ceil(len(bank.questions) / 32)
+        judged = move_draws(spec)
+        assert settings.move_judge is not None
         for alias in spec.mining.actors:
             costs.extend(job_costs(project, group_job(project, spec, spec.mining.job, alias)))
             costs.append(decision_cost(project, settings.decision_alias, calls))
+            costs.extend(
+                row.scaled(judged) for row in evaluation_costs(project, settings.move_judge)
+            )
         lines = (
             f"TraceML: {len(spec.mining.actors)} tier groups of G={spec.mining.attempts}, up to "
             f"{steps} steps each labelled with {bank.bank_id} on {settings.decision_alias}; "
             "labels are registered as each tier's selector and critic reference.",
+            f"TraceML moves: each attempt's windows judged under {len(settings.move_variants)} "
+            f"stances on {settings.move_judge.model_alias}, up to {judged} draws per tier.",
         )
         return cost_lines(tuple(costs)), lines
 
@@ -390,6 +404,8 @@ class _TraceMLStage:
         groups: dict[str, ArtifactInput] = {}
         labels: dict[str, ArtifactInput] = {}
         limit = job.maximum_model_calls * spec.traceml.steps_per_call
+        judge_settings = spec.traceml.move_judge
+        assert judge_settings is not None
         for alias in spec.mining.actors:
             reference, study = run_group(project, group_job(project, spec, job, alias), revision)
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
@@ -416,6 +432,11 @@ class _TraceMLStage:
                 tagger=tagger,
                 bank=bank,
                 trace_concurrency=spec.traceml.concurrency,
+                move_judge=_move_judge(context, reference),
+                move_variants=spec.traceml.move_variants,
+                move_window=spec.traceml.move_window,
+                move_output_tokens=judge_settings.output_tokens,
+                move_repairs=spec.traceml.move_repairs,
             )
             groups[alias] = reference
             labels[alias] = persist_traceml_labels(
@@ -683,6 +704,54 @@ def _world(
 def _runtime_allowance(project: ProjectStore, job: ContinuationJob) -> tuple[CostComponent, ...]:
     """The bound world's lifetime provider allowance, without an actor."""
     return job_costs(project, job)[1:]
+
+
+def move_draws(spec: DecisionVarianceSpec) -> int:
+    """Most move-judge draws one tier's group may buy: every window, stance and repair."""
+    settings = spec.traceml
+    steps = spec.mining.job.maximum_model_calls * settings.steps_per_call
+    per_attempt = math.ceil(steps / settings.move_window.focal_steps)
+    stances = len(settings.move_variants) * (1 + settings.move_repairs)
+    return spec.mining.attempts * per_attempt * stances
+
+
+def _move_judge(context: StageContext, group: ArtifactInput) -> MoveJudge:
+    """Bind the move judge to the author-response owner, which saves and replays every draw.
+
+    Args:
+        context: The stage context, holding the project, settings and code revision.
+        group: The tier's saved group, pinned as every draw's source.
+
+    Returns:
+        A judge that buys or replays one draw under its identity's lock.
+    """
+    project, revision = context.project, context.code_revision
+    settings = context.spec.traceml.move_judge
+    assert settings is not None
+    store = project.artifacts
+
+    def judge(request: ModelRequest, *, identity: str) -> ModelResponse:
+        """Buy or replay one move draw, reporting any refusal as a judge error."""
+        try:
+            with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
+                _, response = author_response(
+                    project,
+                    settings,
+                    request,
+                    identity=identity,
+                    sources=(group,),
+                    code_revision=revision,
+                )
+        except (
+            ValueError,
+            ProviderTransportError,
+            DispatchCapExhaustedError,
+            TimeoutError,
+        ) as error:
+            raise MoveJudgeError(f"{type(error).__name__}: {error}") from error
+        return response
+
+    return judge
 
 
 def _tagger(context: StageContext) -> TraceTagger:

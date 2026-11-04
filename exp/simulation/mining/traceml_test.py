@@ -11,7 +11,15 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject, SourceIdentity
-from exp.common.models import BillingSource, ModelSnapshot
+from exp.common.models import (
+    AssistantAction,
+    BillingSource,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    OperationEconomics,
+    ToolCall,
+)
 from exp.common.project import ProjectStore
 from exp.common.project.paths import ProjectPaths
 from exp.common.traces import Trace, TraceSource, TraceSpan
@@ -34,6 +42,13 @@ from exp.simulation.mining.traceml import (
     traceml_bank,
     trajectory_from_trace,
     trajectory_from_workflow_steps,
+)
+from exp.simulation.mining.traceml_moves import (
+    DEFAULT_MOVE_VARIANTS,
+    MOVE_TOOL,
+    MOVE_VARIANTS,
+    MoveJudgeError,
+    MoveWindowSpec,
 )
 
 _SNAPSHOT = ModelSnapshot(
@@ -152,11 +167,85 @@ def _tagger(decide: _Scripted, cache: DecisionCache | None = None) -> DecisionsT
     return DecisionsTraceTagger(decide, _SNAPSHOT, cache=cache, maximum_concurrency=2)
 
 
+Claim = tuple[str, str, str | None]
+"""One scripted move: kind, step locator, return target locator (None for a pivot)."""
+
+
+@dataclass
+class _Judge:
+    """A move judge answering from scripted claims per variant, saving responses by identity.
+
+    Attributes:
+        claims: Moves each variant claims, keyed by variant; a variant missing here claims none.
+        broken: Variants whose first draw cites a step outside the window.
+        refuse: Variants whose draws cannot be bought.
+        requests: Every request actually answered (a saved identity replays without one).
+        saved: Responses by draw identity.
+    """
+
+    claims: dict[str, list[Claim]] = field(default_factory=dict)
+    broken: frozenset[str] = frozenset()
+    refuse: frozenset[str] = frozenset()
+    requests: list[ModelRequest] = field(default_factory=list)
+    saved: dict[str, ModelResponse] = field(default_factory=dict)
+
+    def __call__(self, request: ModelRequest, *, identity: str) -> ModelResponse:
+        """Replay a saved draw or answer the window from the scripted claims."""
+        if identity in self.saved:
+            return self.saved[identity]
+        system = request.messages[0].content or ""
+        variant = next(name for name, text in MOVE_VARIANTS.items() if text in system)
+        if variant in self.refuse:
+            raise MoveJudgeError("scripted outage")
+        self.requests.append(request)
+        payload = json.loads(request.messages[1].content or "{}")
+        focal = payload["focal_locators"]
+        repair = "previous_draft_problems" in payload
+        moves: list[JsonValue] = [
+            {
+                "kind": kind,
+                "step": step,
+                "evidence": ["attempt:0/step:99"]
+                if variant in self.broken and not repair
+                else [step],
+                "returns_to": target,
+                "rationale": f"{kind} judged by {variant}",
+            }
+            for kind, step, target in self.claims.get(variant, [])
+            if step in focal
+        ]
+        answer: JsonObject = {"judged_steps": focal, "moves": moves, "limitations": ["fixture"]}
+        response = ModelResponse(
+            output=AssistantAction(
+                tool_calls=(ToolCall(call_id="moves", name=MOVE_TOOL, arguments=answer),)
+            ),
+            model=_SNAPSHOT,
+            economics=OperationEconomics(),
+        )
+        self.saved[identity] = response
+        return response
+
+
+_RESEARCH_MOVES: list[Claim] = [
+    ("pivot", "attempt:0/step:5", None),
+    ("return", "attempt:0/step:7", "attempt:0/step:3"),
+    ("return", "attempt:0/step:8", "attempt:0/step:2"),
+]
+"""What every stance judges in :func:`_research`: the pivot after the failed test, two returns."""
+
+
+def _unanimous(claims: list[Claim]) -> _Judge:
+    """A judge whose every variant claims the same moves."""
+    return _Judge(claims={variant: list(claims) for variant in DEFAULT_MOVE_VARIANTS})
+
+
 def test_steps_are_labelled_through_the_decisions_tagger_one_row_per_step(tmp_path: Path) -> None:
     """Every step is one step-view unit; a rerun replays the decision cache and buys nothing."""
     cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
     decide = _Scripted()
-    labels = label_traces([_research()], tagger=_tagger(decide, cache), bank=_bank())
+    labels = label_traces(
+        [_research()], tagger=_tagger(decide, cache), bank=_bank(), move_judge=None
+    )
 
     trace = labels.traces[0]
     assert labels.view == STEP_VIEW
@@ -176,46 +265,160 @@ def test_steps_are_labelled_through_the_decisions_tagger_one_row_per_step(tmp_pa
     assert all("FOCAL STEP" in str(request.state) for request in decide.requests)
 
     replay = _Scripted()
-    again = label_traces([_research()], tagger=_tagger(replay, cache), bank=_bank())
+    again = label_traces(
+        [_research()], tagger=_tagger(replay, cache), bank=_bank(), move_judge=None
+    )
     assert replay.requests == []
     assert again == labels
 
 
-def test_pivots_follow_evidence_and_returns_resume_earlier_state_or_approach() -> None:
-    """The failed test triggers a pivot; the second edit and the revert are returns."""
-    labels = label_traces([_research()], tagger=_tagger(_Scripted()), bank=_bank())
+def test_moves_are_judged_per_window_and_variant_kept_by_majority_and_replayed() -> None:
+    """Every stance judges every window; agreed moves are kept with each stance's rationale."""
+    judge = _unanimous(_RESEARCH_MOVES)
+    labels = label_traces(
+        [_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=judge
+    )
     trace = labels.traces[0]
 
+    assert len(judge.requests) == len(DEFAULT_MOVE_VARIANTS)
+    assert trace.coverage.moves == "judged" and labels.move_variants == DEFAULT_MOVE_VARIANTS
     assert [move.step for move in trace.pivots] == [4]
     pivot = trace.pivots[0]
     assert pivot.boundary == 4 and pivot.locator == "attempt:0/step:5"
-    assert pivot.triggers == (
-        "previous_step_failed",
-        "previous_step_evaluated",
-        "new_tool_and_target",
-        "regressed:test->explore",
-    )
+    assert pivot.support == pivot.judged == 3 and not pivot.uncertain
+    assert pivot.triggers[0] == "evidence-first: pivot judged by evidence-first"
     returns = {move.step: move for move in trace.returns}
-    assert returns[6].triggers == ("approach_resumed:2",) and returns[6].returns_to == 2
-    assert returns[7].triggers == ("state_restored:1",) and returns[7].returns_to == 1
+    assert returns[6].returns_to == 2 and returns[7].returns_to == 1
+    request = json.loads(judge.requests[0].messages[1].content or "{}")
+    focal = request["focal_steps"]
+    assert focal[3]["status"] == "failed" and focal[3]["labels"]["dominant"] == "test"
+    assert focal[7]["state"] == {
+        "recorded": True,
+        "changed": True,
+        "same_state_as_after": ["initial", "attempt:0/step:1", "attempt:0/step:2"],
+    }
+
+    again = label_traces([_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=judge)
+    assert again == labels and len(judge.requests) == len(DEFAULT_MOVE_VARIANTS)
 
 
-def test_retrying_the_same_target_after_a_failure_is_not_a_pivot() -> None:
-    """Recovery on one target never counts as a strategy change."""
+def test_a_pivot_on_the_same_tool_and_target_is_judged() -> None:
+    """The removed rules treated any step on the previous target as a retry, never a pivot.
+
+    Here the agent edits the same file after a failed test, but abandons patching the parser for
+    rewriting the config loader. Every stance judges that a pivot, and it is kept.
+    """
     steps = [
+        _step("edit", {"path": "a.py", "change": "patch the parser"}),
         _step("run_tests", {"target": "all"}, status="failure"),
-        _step("run_tests", {"target": "all"}),
+        _step("edit", {"path": "a.py", "change": "rewrite the config loader instead"}),
     ]
-    trajectory = trajectory_from_workflow_steps("retry", "kimi-k3", steps, task="Run tests.")
-    labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank())
-    assert labels.traces[0].pivots == ()
+    trajectory = trajectory_from_workflow_steps(
+        "same-target", "kimi-k3", steps, task="Fix the build.", locator_prefix="attempt:0/step"
+    )
+    judge = _unanimous([("pivot", "attempt:0/step:3", None)])
+    labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=judge)
+    (pivot,) = labels.traces[0].pivots
+    assert pivot.step == 2 and pivot.support == 3
+    # The removed rules keyed a step's target by tool and its "path" argument: equal here.
+    assert trajectory.steps[0].tool == trajectory.steps[2].tool == "edit"
+    first, last = trajectory.steps[0].arguments, trajectory.steps[2].arguments
+    assert isinstance(first, dict) and isinstance(last, dict) and first["path"] == last["path"]
+
+
+def test_a_minority_claim_is_contested_and_a_failed_stance_marks_moves_uncertain() -> None:
+    """One of three stances claiming a move is not enough; an outage leaves moves uncertain."""
+    split = _Judge(
+        claims={
+            "evidence-first": [("pivot", "attempt:0/step:5", None)],
+            "state-first": [
+                ("pivot", "attempt:0/step:5", None),
+                ("pivot", "attempt:0/step:2", None),
+            ],
+            "intent-first": [("pivot", "attempt:0/step:2", None)],
+        }
+    )
+    trace = label_traces(
+        [_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=split
+    ).traces[0]
+    assert [move.step for move in trace.pivots] == [1, 4]
+    assert all(move.support == 2 and move.uncertain for move in trace.pivots)
+
+    lone = _Judge(claims={"intent-first": [("pivot", "attempt:0/step:5", None)]})
+    trace = label_traces(
+        [_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=lone
+    ).traces[0]
+    assert trace.pivots == () and [move.step for move in trace.contested] == [4]
+
+    outage = _Judge(
+        claims={variant: [("pivot", "attempt:0/step:5", None)] for variant in MOVE_VARIANTS},
+        refuse=frozenset({"intent-first"}),
+    )
+    trace = label_traces(
+        [_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=outage
+    ).traces[0]
+    assert trace.coverage.moves == "judged"
+    (pivot,) = trace.pivots
+    assert pivot.support == pivot.judged == 2 and pivot.uncertain
+    failed = [row for row in trace.judgments if row.answer is None]
+    assert [row.variant for row in failed] == ["intent-first"]
+    assert failed[0].failure is not None and "scripted outage" in failed[0].failure
+
+
+def test_a_miscited_judgment_is_repaired_and_long_trajectories_are_windowed() -> None:
+    """A citation outside the window is shown back once; each window is judged on its own."""
+    judge = _Judge(
+        claims={variant: list(_RESEARCH_MOVES) for variant in MOVE_VARIANTS},
+        broken=frozenset({"state-first"}),
+    )
+    trace = label_traces(
+        [_research()],
+        tagger=_tagger(_Scripted()),
+        bank=_bank(),
+        move_judge=judge,
+        move_window=MoveWindowSpec(focal_steps=5, context_steps=2),
+    ).traces[0]
+    assert [(row.window, row.variant, row.repairs) for row in trace.judgments] == [
+        (0, "evidence-first", 0),
+        (0, "state-first", 1),
+        (0, "intent-first", 0),
+        (1, "evidence-first", 0),
+        (1, "state-first", 1),
+        (1, "intent-first", 0),
+    ]
+    assert [move.step for move in trace.pivots] == [4]
+    assert [move.step for move in trace.returns] == [6, 7]
+    assert len(judge.requests) == 8
+    repair = json.loads(judge.requests[2].messages[1].content or "{}")
+    assert "unshown or later steps" in repair["previous_draft_problems"][0]
+    second = json.loads(judge.requests[4].messages[1].content or "{}")
+    assert [row["locator"] for row in second["context_steps"]] == [
+        "attempt:0/step:4",
+        "attempt:0/step:5",
+    ]
+
+
+def test_without_a_judge_moves_are_recorded_as_not_judged() -> None:
+    """Labels are kept and no rule fills in the moves."""
+    labels = label_traces([_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=None)
+    trace = labels.traces[0]
+    assert trace.pivots == trace.returns == trace.judgments == ()
+    assert trace.coverage.moves == "not_judged" and labels.moves_protocol is None
+    with pytest.raises(ValueError, match="move variants"):
+        label_traces(
+            [_research()],
+            tagger=_tagger(_Scripted()),
+            bank=_bank(),
+            move_judge=None,
+            move_variants=("rules",),
+        )
 
 
 def test_uncertain_steps_are_kept_and_counted() -> None:
     """A step answered inside the ambiguity band is kept, flagged and counted, never dropped."""
     steps = [_step("search", {"query": "x"}), _step("ponder", {"about": "y"})]
     trajectory = trajectory_from_workflow_steps("unsure", "gemma-4-26b-a4b-it", steps)
-    labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank())
+    labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=None)
 
     step = labels.traces[0].steps[1]
     assert step.uncertain and set(step.uncertain_labels) == set(ACTION_LABELS)
@@ -229,7 +432,10 @@ def test_a_refused_trace_and_an_empty_trace_are_recorded_in_the_coverage_manifes
     )
     empty = TraceTrajectory(trace_id="empty", tier="glm-5.3-flash")
     labels = label_traces(
-        [_research(), refused, empty], tagger=_tagger(_Scripted(refuse="poison")), bank=_bank()
+        [_research(), refused, empty],
+        tagger=_tagger(_Scripted(refuse="poison")),
+        bank=_bank(),
+        move_judge=None,
     )
 
     coverage = labels.coverage
@@ -247,7 +453,10 @@ def test_tiers_are_compared_with_human_as_the_reference() -> None:
         "human-0", "human", [_step("search", {"query": str(n)}) for n in range(3)]
     )
     labels = label_traces(
-        [_research("mimo-v2.6-pro"), explorer], tagger=_tagger(_Scripted()), bank=_bank()
+        [_research("mimo-v2.6-pro"), explorer],
+        tagger=_tagger(_Scripted()),
+        bank=_bank(),
+        move_judge=_unanimous([("pivot", "attempt:0/step:5", None)]),
     )
 
     comparison = labels.tiers
@@ -262,9 +471,14 @@ def test_tiers_are_compared_with_human_as_the_reference() -> None:
 
 def test_candidate_points_rank_moves_and_respect_the_offered_pool() -> None:
     """Points are the boundaries before pivots and returns, strongest first."""
-    trace = label_traces([_research()], tagger=_tagger(_Scripted()), bank=_bank()).traces[0]
+    judge = _unanimous(_RESEARCH_MOVES)
+    judge.claims["evidence-first"] = _RESEARCH_MOVES[:2]
+    trace = label_traces(
+        [_research()], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=judge
+    ).traces[0]
 
     assert candidate_points(trace) == (4, 6, 7)
+    assert candidate_points(trace, include_uncertain=False) == (4, 6)
     assert candidate_points(trace, offered={0, 1, 6, 7}) == (6, 7)
     assert candidate_points(trace, limit=1) == (4,)
 
@@ -272,7 +486,12 @@ def test_candidate_points_rank_moves_and_respect_the_offered_pool() -> None:
 def test_the_labels_artifact_round_trips_and_is_idempotent(tmp_path: Path) -> None:
     """The saved record carries labels, probabilities, moves and locators."""
     project = ProjectStore(tmp_path, "case")
-    labels = label_traces([_research()], tagger=_tagger(_Scripted()), bank=_bank())
+    labels = label_traces(
+        [_research()],
+        tagger=_tagger(_Scripted()),
+        bank=_bank(),
+        move_judge=_unanimous(_RESEARCH_MOVES),
+    )
 
     reference = persist_traceml_labels(project.artifacts, labels, code_revision="test")
     assert persist_traceml_labels(project.artifacts, labels, code_revision="test") == reference
@@ -352,6 +571,8 @@ def test_a_canonical_trace_becomes_tool_and_message_steps() -> None:
     units = step_units(trajectory)
     assert units[1].trace_id == "human-trace::span:2"
     assert "<result>" in units[1].text and "Which month" in _focal(units[1].text)
-    labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank(strategy=False))
+    labels = label_traces(
+        [trajectory], tagger=_tagger(_Scripted()), bank=_bank(strategy=False), move_judge=None
+    )
     assert [step.dominant for step in labels.traces[0].steps] == ["explore", "ask"]
     assert labels.traces[0].steps[0].strategy == {}

@@ -8,14 +8,13 @@ concurrency) over a **step view**: one unit per step showing the task, a few ear
 focal step, with row identity ``<trace_id>::<locator>``. The local ``traceml-action-v1`` bank
 carries ``action.<label>`` per label and optionally the soft :data:`STRATEGY_QUESTIONS`.
 
-Pivots and returns are derived deterministically from labels plus tool and state evidence
-(:func:`derive_moves`). A **pivot** is a strategy change after evidence: the previous step failed
-or evaluated something (or the step reacts to its result), and the step leaves the recent line of
-work (new tool and target, a backward move through gather, reason, act, or the soft
-``strategy.changes_approach``); retrying one target is recovery, never a pivot. A **return** goes
-back to an earlier world state or to a target last used before a pivot (or fires the soft
-``strategy.returns_to_earlier`` on a tool used before the last pivot). Uncertain steps stay in
-every count and mark their moves uncertain; a refused trace is recorded in the coverage manifest.
+Pivots and returns are judged by a model over windows of labelled steps with their tool and
+state evidence (:mod:`~exp.simulation.mining.traceml_moves`), under several prompt variants
+combined by strict majority; no rule over tool names or label ranks decides them. Every judgment
+is kept in the record, and each draw is saved by the injected judge and replayed with no call.
+Without a judge the labels are kept and the coverage records the moves as not judged. Uncertain
+steps stay in every count and mark their moves uncertain; a refused trace is recorded in the
+coverage manifest.
 
 The ``traceml-labels`` artifact (:func:`persist_traceml_labels`) holds per trace the step labels
 with probabilities, pivots, returns and locators, the coverage manifest and per-tier comparisons,
@@ -59,12 +58,25 @@ from exp.simulation.mining.dispatch import dispatch_tagging
 from exp.simulation.mining.questions import QuestionBank, QuestionBankError, resolve_question_bank
 from exp.simulation.mining.tag_selection import DEFAULT_AMBIGUITY_BAND, DEFAULT_FIRE_THRESHOLD
 from exp.simulation.mining.tagging import TagMatrix, TraceTagger, TraceTaggingError
+from exp.simulation.mining.traceml_moves import (
+    DEFAULT_MOVE_REPAIRS,
+    DEFAULT_MOVE_VARIANTS,
+    MOVE_VARIANTS,
+    TRACEML_MOVES_PROTOCOL,
+    MoveJudge,
+    MoveJudgment,
+    MoveWindowSpec,
+    StrategyMove,
+    aggregate_moves,
+    judge_window,
+    windows,
+)
 from exp.simulation.mining.views import TraceViewName, TraceViewSpec, Unit, condense
 
 logger = logging.getLogger(__name__)
 
-TRACEML_PROTOCOL = "traceml-v1"
-"""Version of step rendering, label reading and move derivation; bump when any changes."""
+TRACEML_PROTOCOL = "traceml-v2"
+"""Version of step rendering, label reading and move judgment; bump when any changes."""
 
 TRACEML_BANK_ID = "traceml-action-v1"
 """Identity of the local step-level action bank."""
@@ -88,16 +100,7 @@ STRATEGY_QUESTIONS = (
     "strategy.returns_to_earlier",
     "strategy.reacts_to_evidence",
 )
-"""Optional soft strategy propositions read by move derivation when the bank carries them."""
-
-_MODE_RANK: dict[str, int] = dict(explore=0, read=0, hypothesize=1, test=1, implement=2, verify=2)
-"""Position of a label in the gather, reason, act progression; other labels have no rank."""
-
-_TARGET_KEYS = tuple("path file file_path filename url query id name target command sheet".split())
-"""Argument keys whose value names what a tool call works on, in preference order."""
-
-_EVIDENCE = ("previous_step_failed", "previous_step_evaluated", "reacts_to_evidence")
-"""Pivot evidence trigger names, in the order they are checked."""
+"""Optional soft strategy propositions shown to the move judge when the bank carries them."""
 
 _CONDENSE = TraceViewSpec()
 """Shared condensing controls; only the list preview size is read."""
@@ -224,28 +227,6 @@ class StepLabel(ContractModel):
     uncertain_labels: tuple[ActionLabel, ...] = ()
 
 
-class StrategyMove(ContractModel):
-    """One derived pivot or return.
-
-    Attributes:
-        kind: ``pivot`` or ``return``.
-        step: Step index the move is made at.
-        locator: That step's citation.
-        boundary: Checkpoint index before the move, the candidate estimation point.
-        triggers: The evidence that derived the move, in a fixed order.
-        returns_to: For a return, the earlier step whose state or approach was resumed.
-        uncertain: A step involved in the derivation had an uncertain label.
-    """
-
-    kind: Literal["pivot", "return"]
-    step: int = Field(ge=0)
-    locator: str
-    boundary: int = Field(ge=0)
-    triggers: tuple[str, ...] = Field(min_length=1)
-    returns_to: int | None = None
-    uncertain: bool = False
-
-
 class TraceCoverage(ContractModel):
     """How completely one trajectory was labelled.
 
@@ -255,6 +236,8 @@ class TraceCoverage(ContractModel):
         labelled_steps: Steps with a label row.
         uncertain_steps: Labelled steps marked uncertain; they stay in every count.
         reason: Why tagging failed, for a failed trajectory.
+        moves: ``judged`` (every window has a usable judgment), ``partial`` (some window has
+            none), ``failed`` (no window has one) or ``not_judged`` (no judge, or no labels).
     """
 
     status: Literal["labelled", "empty", "failed"]
@@ -262,6 +245,7 @@ class TraceCoverage(ContractModel):
     labelled_steps: int = Field(default=0, ge=0)
     uncertain_steps: int = Field(default=0, ge=0)
     reason: str | None = Field(default=None, max_length=2000)
+    moves: Literal["judged", "partial", "failed", "not_judged"] = "not_judged"
 
 
 class TraceLabels(ContractModel):
@@ -271,8 +255,10 @@ class TraceLabels(ContractModel):
         trace_id: Trajectory identity.
         tier: Producer tier.
         steps: One label per labelled step, in step order.
-        pivots: Derived pivots in step order.
-        returns: Derived returns in step order.
+        pivots: Judged pivots kept by majority, in step order.
+        returns: Judged returns kept by majority, in step order.
+        contested: Moves only a minority of judgments claimed, in step order.
+        judgments: Every window judgment under every variant, failures included.
         coverage: Labelling coverage of this trajectory.
     """
 
@@ -281,6 +267,8 @@ class TraceLabels(ContractModel):
     steps: tuple[StepLabel, ...] = ()
     pivots: tuple[StrategyMove, ...] = ()
     returns: tuple[StrategyMove, ...] = ()
+    contested: tuple[StrategyMove, ...] = ()
+    judgments: tuple[MoveJudgment, ...] = ()
     coverage: TraceCoverage
 
 
@@ -372,6 +360,9 @@ class TraceMLLabels(ContractModel):
         view_spec: Step rendering controls.
         threshold: Probability strictly above which a label fires.
         ambiguity_band: Closed band in which a probability is uncertain.
+        moves_protocol: Move judgment protocol, or None when moves were not judged.
+        move_variants: Prompt variants every window was judged under.
+        move_window: Window controls of the move judgment.
         traces: One record per submitted trajectory, in submission order.
         coverage: Run coverage manifest.
         tiers: Per-tier comparison over labelled trajectories.
@@ -385,6 +376,9 @@ class TraceMLLabels(ContractModel):
     view_spec: StepViewSpec = StepViewSpec()
     threshold: float = Field(gt=0.0, lt=1.0)
     ambiguity_band: tuple[float, float]
+    moves_protocol: str | None = None
+    move_variants: tuple[str, ...] = ()
+    move_window: MoveWindowSpec = MoveWindowSpec()
     traces: tuple[TraceLabels, ...]
     coverage: CoverageManifest
     tiers: TierComparison
@@ -555,12 +549,18 @@ def label_traces(
     threshold: float = DEFAULT_FIRE_THRESHOLD,
     ambiguity_band: tuple[float, float] = DEFAULT_AMBIGUITY_BAND,
     trace_concurrency: int = 1,
+    move_judge: MoveJudge | None,
+    move_variants: tuple[str, ...] = DEFAULT_MOVE_VARIANTS,
+    move_window: MoveWindowSpec | None = None,
+    move_output_tokens: int = 4096,
+    move_repairs: int = DEFAULT_MOVE_REPAIRS,
 ) -> TraceMLLabels:
-    """Label every step of every trajectory, derive moves and compare tiers.
+    """Label every step of every trajectory, judge its moves and compare tiers.
 
     Each trajectory is one ``tagger.tag`` pass (bounded concurrency and cache replay live in the
     tagger); ``trace_concurrency`` runs that many passes at once. A refused pass is recorded as a
-    failed trajectory in the coverage manifest and the others are kept.
+    failed trajectory in the coverage manifest and the others are kept. Each labelled trajectory's
+    windows are then judged under every move variant through ``move_judge``.
 
     Args:
         trajectories: Trajectories with distinct identities.
@@ -570,10 +570,16 @@ def label_traces(
         threshold: Probability strictly above which a label fires.
         ambiguity_band: Closed band reported as uncertain.
         trace_concurrency: Trajectories tagged at once.
+        move_judge: Buys or replays move judgments; None records the moves as not judged.
+        move_variants: Reading stances every window is judged under.
+        move_window: Window controls; defaults apply when omitted.
+        move_output_tokens: Response allowance of a move draw.
+        move_repairs: Revisions a move judge may make after failing its citation checks.
 
     Raises:
         QuestionBankError: The bank lacks an action column.
-        ValueError: Trajectory identities repeat or the band is malformed.
+        ValueError: Trajectory identities repeat, the band is malformed or a move variant is
+            unknown.
     """
     require_traceml_bank(bank)
     low, high = ambiguity_band
@@ -583,9 +589,13 @@ def label_traces(
     if len(set(identities)) != len(identities):
         raise ValueError("traceml trajectories must have distinct trace ids")
     spec = spec or StepViewSpec()
+    window = move_window or MoveWindowSpec()
+    unknown = sorted(set(move_variants) - set(MOVE_VARIANTS))
+    if unknown or not move_variants:
+        raise ValueError(f"move variants must be a non-empty subset of {sorted(MOVE_VARIANTS)}")
 
     def label_one(trajectory: TraceTrajectory) -> TraceLabels:
-        """Tag one trajectory and derive its moves, recording a refusal as coverage."""
+        """Tag one trajectory and judge its moves, recording a refusal as coverage."""
         units = step_units(trajectory, spec)
         empty = TraceCoverage(status="empty")
         base = TraceLabels(trace_id=trajectory.trace_id, tier=trajectory.tier, coverage=empty)
@@ -599,14 +609,42 @@ def label_traces(
             logger.warning("traceml tagging of %s failed: %s", trajectory.trace_id, reason)
             failed = TraceCoverage(status="failed", planned_steps=len(units), reason=reason)
             return base.model_copy(update={"coverage": failed})
-        pivots, returns = derive_moves(trajectory, steps, threshold=threshold)
+        judge = move_judge
+        judgments = (
+            ()
+            if judge is None
+            else tuple(
+                judge_window(
+                    judge,
+                    trajectory,
+                    steps,
+                    position,
+                    focal,
+                    variant=variant,
+                    spec=window,
+                    output_tokens=move_output_tokens,
+                    repairs=move_repairs,
+                )
+                for position, focal in enumerate(windows(len(steps), window))
+                for variant in move_variants
+            )
+        )
+        pivots, returns, contested = aggregate_moves(trajectory, steps, judgments)
         coverage = TraceCoverage(
             status="labelled",
             planned_steps=len(units),
             labelled_steps=len(steps),
             uncertain_steps=sum(step.uncertain for step in steps),
+            moves=_moves_status(judgments),
         )
-        update = {"steps": steps, "pivots": pivots, "returns": returns, "coverage": coverage}
+        update = {
+            "steps": steps,
+            "pivots": pivots,
+            "returns": returns,
+            "contested": contested,
+            "judgments": judgments,
+            "coverage": coverage,
+        }
         return base.model_copy(update=update)
 
     labelled = dispatch_tagging(trajectories, label_one, maximum_concurrency=trace_concurrency)
@@ -617,84 +655,12 @@ def label_traces(
         view_spec=spec,
         threshold=threshold,
         ambiguity_band=ambiguity_band,
+        moves_protocol=None if move_judge is None else TRACEML_MOVES_PROTOCOL,
+        move_variants=() if move_judge is None else move_variants,
+        move_window=window,
         traces=labelled,
         coverage=coverage_manifest(labelled),
         tiers=compare_tiers(labelled),
-    )
-
-
-def derive_moves(
-    trajectory: TraceTrajectory,
-    steps: Sequence[StepLabel],
-    *,
-    threshold: float = DEFAULT_FIRE_THRESHOLD,
-    window: int = 3,
-) -> tuple[tuple[StrategyMove, ...], tuple[StrategyMove, ...]]:
-    """Derive pivots and returns from step labels plus tool and state evidence.
-
-    The fixed rules are in the module docstring; ``steps`` are ``trajectory``'s labels in order.
-
-    Args:
-        trajectory: The labelled trajectory, supplying tools, targets and states.
-        steps: Its step labels in order.
-        threshold: Probability strictly above which a soft strategy signal fires.
-        window: Earlier steps that define the recent line of work.
-    """
-    raw = {step.index: step for step in trajectory.steps}
-    pivots: list[StrategyMove] = []
-    returns: list[StrategyMove] = []
-    last_pivot: int | None = None
-    for position, label in enumerate(steps):
-        step = raw[label.index]
-        target = _target(step)
-        previous = steps[position - 1] if position else None
-        recent = steps[max(0, position - window) : position]
-        recent_tools = {row.tool for row in recent if row.tool is not None}
-        recent_targets = {_target(raw[row.index]) for row in recent} - {None}
-        soft = label.strategy
-        if previous is not None:
-            reacts = soft.get("strategy.reacts_to_evidence", 0.0) > threshold
-            evaluated = previous.dominant in {"test", "verify"}
-            signals = (previous.failed, evaluated, reacts)
-            evidence = [name for name, hit in zip(_EVIDENCE, signals, strict=True) if hit]
-            change: list[str] = []
-            retry = target is not None and target == _target(raw[previous.index])
-            if not retry:
-                if step.tool and step.tool not in recent_tools and target not in recent_targets:
-                    change.append("new_tool_and_target")
-                rank, prior = _MODE_RANK.get(label.dominant), _MODE_RANK.get(previous.dominant)
-                if rank is not None and prior is not None and rank < prior:
-                    change.append(f"regressed:{previous.dominant}->{label.dominant}")
-                if soft.get("strategy.changes_approach", 0.0) > threshold:
-                    change.append("changes_approach")
-            if evidence and change:
-                uncertain = label.uncertain or previous.uncertain
-                pivots.append(_move("pivot", label, (*evidence, *change), uncertain, None))
-                last_pivot = label.index
-        returned = _return(trajectory, steps, position, threshold, last_pivot)
-        if returned is not None:
-            triggers, earlier = returned
-            uncertain = label.uncertain or any(r.index == earlier and r.uncertain for r in steps)
-            returns.append(_move("return", label, triggers, uncertain, earlier))
-    return tuple(pivots), tuple(returns)
-
-
-def _move(
-    kind: Literal["pivot", "return"],
-    label: StepLabel,
-    triggers: tuple[str, ...],
-    uncertain: bool,
-    returns_to: int | None,
-) -> StrategyMove:
-    """Build one move at a labelled step."""
-    return StrategyMove(
-        kind=kind,
-        step=label.index,
-        locator=label.locator,
-        boundary=label.boundary,
-        triggers=triggers,
-        returns_to=returns_to,
-        uncertain=uncertain,
     )
 
 
@@ -708,8 +674,9 @@ def candidate_points(
     """Return checkpoint indices at pivots and returns, strongest first.
 
     A move at a step with boundary ``k`` is decided at actor-critic point ``k`` (point 0 is the
-    start). Points rank by the triggers of their moves, summed, then by index; pass the pool's
-    continuable points as ``offered`` to keep only points a selector may choose.
+    start). Points rank by the triggers of their moves (one per agreeing judgment), summed, then
+    by index; pass the pool's continuable points as ``offered`` to keep only points a selector
+    may choose.
 
     Args:
         labels: One trajectory's TraceML record.
@@ -890,65 +857,16 @@ def _read_steps(
     return tuple(labels)
 
 
-def _return(
-    trajectory: TraceTrajectory,
-    steps: Sequence[StepLabel],
-    position: int,
-    threshold: float,
-    last_pivot: int | None,
-) -> tuple[tuple[str, ...], int | None] | None:
-    """Return a return's triggers and the earlier step it resumed (None for the start), or None.
-
-    State return: the step changes the state back to one seen earlier (the latest such boundary is
-    cited). Approach return: the step's target was last used before the most recent pivot, with
-    another target in between. Soft return: ``strategy.returns_to_earlier`` fires on a tool used
-    before the last pivot.
-    """
-    raw = trajectory.steps
-    label = steps[position]
-    step = raw[label.index]
-    triggers: list[str] = []
-    earlier: int | None = None
-    states = [trajectory.initial_state_sha256]
-    for row in raw:
-        states.append(row.state_after_sha256 or states[-1])
-    after = step.state_after_sha256
-    before = states[step.index]
-    if after is not None and after != before:
-        for k in range(step.index - 1, -1, -1):
-            if states[k] == after:
-                triggers.append(f"state_restored:{'initial' if k == 0 else k - 1}")
-                earlier = k - 1 if k else None
-                break
-    target = _target(step)
-    if last_pivot is None:
-        return (tuple(triggers), earlier) if triggers else None
-    uses = [row.index for row in raw[: step.index] if target and _target(row) == target]
-    between = raw[uses[-1] + 1 : step.index] if uses else ()
-    if uses and uses[-1] < last_pivot and any(_target(row) != target for row in between):
-        triggers.append(f"approach_resumed:{uses[-1]}")
-        earlier = uses[-1] if earlier is None else earlier
-    soft = label.strategy.get("strategy.returns_to_earlier", 0.0) > threshold
-    tools = [row.index for row in raw[:last_pivot] if step.tool and row.tool == step.tool]
-    if soft and tools:
-        triggers.append("returns_to_earlier")
-        earlier = tools[-1] if earlier is None else earlier
-    if not triggers:
-        return None
-    return tuple(triggers), earlier
-
-
-def _target(step: TraceStep) -> str | None:
-    """Return what a tool step works on: its tool and primary argument, or its whole arguments."""
-    if step.tool is None:
-        return None
-    arguments = step.arguments
-    if isinstance(arguments, dict):
-        for key in _TARGET_KEYS:
-            value = arguments.get(key)
-            if isinstance(value, (str, int)) and not isinstance(value, bool):
-                return f"{step.tool}:{key}={value}"
-    return f"{step.tool}:{sha256_json(arguments)[:16]}"
+def _moves_status(
+    judgments: Sequence[MoveJudgment],
+) -> Literal["judged", "partial", "failed", "not_judged"]:
+    """Summarize whether every judged window has a usable judgment."""
+    if not judgments:
+        return "not_judged"
+    covered = {row.window for row in judgments if row.answer is not None}
+    if not covered:
+        return "failed"
+    return "judged" if covered == {row.window for row in judgments} else "partial"
 
 
 def _error_shaped(value: JsonValue) -> bool:

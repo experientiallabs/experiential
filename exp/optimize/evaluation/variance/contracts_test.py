@@ -22,7 +22,7 @@ from exp.optimize.evaluation.variance.contracts import (
     VariationAxis,
     WitnessStep,
     apply_edits,
-    briefing_leaks,
+    briefing_problems,
     check_scenarios,
     resolve_pointer,
 )
@@ -289,48 +289,39 @@ def test_a_changed_instruction_needs_a_fresh_briefing_bound_to_its_criteria() ->
     assert any("without the actor's view" in reason for reason in blind)
 
 
-def test_a_fresh_briefing_that_leaks_or_imports_knowledge_is_refused() -> None:
-    """The intended action, edited values and unobserved facts never reach a briefing."""
-    decision = _decision(**_AXIS, relevant_paths=["/policy/refundable", "/policy/fixed"])
-    leaky = _briefed("credit", "credit", "You should issue store credit for this order.")
-    assert any(
-        "intended option's action" in reason
-        for reason in briefing_leaks(_BEFORE, decision, leaky, _VIEW)
-    )
+def test_only_entitled_paths_are_checked_in_code() -> None:
+    """Entitled paths must exist, stay unedited and show observed values; the text is not scanned.
+
+    A briefing that names the intended action word for word passes these gates: whether its text
+    leaks is judged by the model leak reviewer, never by matching words here.
+    """
+    decision = _decision(**_AXIS)
     secret = _BEFORE | {"order": {"amount": 420, "code": "Z9"}}
-    hidden = _briefed("credit", "credit", "Your voucher code is Z9.")
-    unobserved = briefing_leaks(
-        secret, decision.model_copy(update={"relevant_paths": ("/order/code",)}), hidden, _VIEW
-    )
-    assert any("which was not observed" in reason for reason in unobserved)
     entitled = _briefed("credit", "credit", "Cancelling.")
-    entitled = entitled.model_copy(
+    assert entitled.briefing is not None
+    unobservable = entitled.model_copy(
         update={"briefing": entitled.briefing.model_copy(update={"entitled_paths": ("/order",)})}
-        if entitled.briefing
-        else {}
     )
-    assert any(
-        "was not observable" in reason
-        for reason in briefing_leaks(secret, decision, entitled, _VIEW)
+    assert briefing_problems(secret, unobservable, _VIEW) == [
+        "entitled path /order was not observable at the start"
+    ]
+    edited = entitled.model_copy(
+        update={
+            "briefing": entitled.briefing.model_copy(
+                update={"entitled_paths": ("/policy/refundable", "/missing")}
+            ),
+            "edits": (StateEdit(path="/policy/refundable", value=False),),
+        }
     )
-    edited = _scenario(
-        "locked",
-        False,
-        "credit",
-        initialization="fresh_briefing",
-        briefing={
-            "text": "Policy says refundable is 'false' now; amount 420.",
-            "entitled_paths": [],
-        },
+    assert briefing_problems(_BEFORE, edited, _VIEW) == [
+        "entitled path /policy/refundable is absent or edited, so it cannot be briefed",
+        "entitled path /missing is absent or edited, so it cannot be briefed",
+    ]
+    verbatim = _briefed("credit", "credit", "You should issue store credit for this order.")
+    assert briefing_problems(_BEFORE, verbatim, _VIEW) == []
+    assert (
+        _reasons(_scenario("open", True, "refund"), verbatim, decision=decision, view=_VIEW) == []
     )
-    numeric = _decision(
-        axes=[{"path": "/order/amount", "values": [420, 99], "effect": "e"}],
-        relevant_paths=["/order/amount"],
-    )
-    stale = edited.model_copy(update={"edits": (StateEdit(path="/order/amount", value=99),)})
-    found = briefing_leaks(_BEFORE, numeric, stale, _VIEW)
-    assert "briefing states the old value at edited path /order/amount" in found
-    assert briefing_leaks(_BEFORE, _decision(), _scenario("a", True, "refund"), _VIEW) == []
 
 
 def test_a_frozen_state_names_every_part_and_what_is_not_restorable() -> None:

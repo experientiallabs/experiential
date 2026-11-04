@@ -15,8 +15,10 @@ mechanically before it can become an environment:
 - instruction variation is its own declared axis: a goal or consent change cites what
   authorizes it and binds the criteria that apply under it, and a changed instruction cannot
   resume a prefix whose first message stated the original, so it needs a fresh briefing;
-- a fresh briefing is leak-checked: it may not state the intended option's action, a value at an
-  edited path, or a decision-relevant value the actor had not observed at its start;
+- a fresh briefing's entitled paths exist, are not edited and show values the actor had
+  observed at its start. Whether the briefing text leaks the intended option, an edited value or
+  unobserved knowledge is a question about meaning, judged by the model leak reviewer
+  (:mod:`~exp.optimize.evaluation.variance.briefing_review`), never by word matching here;
 - correct choices are option identities from a declared set, so "refund" and "issue refund"
   cannot pass as different decisions;
 - every deciding fact is revealed by a witness of permitted tool calls that fits in the actor's
@@ -87,6 +89,9 @@ BASELINE_STATE: frozenset[StatePart] = frozenset(
 
 InitializationMode = Literal["resume", "fresh_briefing"]
 """How the actor starts a variant: the retained prefix, or an authored new task."""
+
+MAXIMUM_SCENARIOS = 8
+"""Most variants one scenario set may author."""
 
 InstructionKind = Literal["original", "reworded", "goal_change", "consent_change"]
 """What an instruction value does to the actor's obligations."""
@@ -479,7 +484,7 @@ class ScenarioSet(ContractModel):
         limitations: What the author could not ensure.
     """
 
-    scenarios: tuple[Scenario, ...] = Field(min_length=2, max_length=8)
+    scenarios: tuple[Scenario, ...] = Field(min_length=2, max_length=MAXIMUM_SCENARIOS)
     limitations: tuple[str, ...] = Field(min_length=1)
 
 
@@ -712,61 +717,26 @@ def instruction_problems(decision: DecisionState, scenario: Scenario) -> list[st
     return found
 
 
-def briefing_leaks(
-    before: JsonObject,
-    decision: DecisionState,
-    scenario: Scenario,
-    view: ActorView,
-) -> list[str]:
-    """Find what a fresh briefing leaks or imports beyond what the actor was entitled to know.
+def briefing_problems(before: JsonObject, scenario: Scenario, view: ActorView) -> list[str]:
+    """Find the structural problems of a fresh briefing's entitled paths.
 
-    A briefing leaks when it states a phrase of the intended option's action that no other
-    option and neither instruction share, or a string or number at an edited path (the old one
-    contradicts the variant, the new one must be discovered by the witness). It imports
-    unobserved knowledge when it states a string or number at a decision-relevant or deciding
-    path that no observed text shows, or declares an entitled path that was not observable or
-    is edited. Matching is lexical: a paraphrase that never repeats the words is not detected,
-    and booleans or nulls are not scanned in the briefing text.
+    Each entitled path must exist in the edited state, must not overlap an edited path, and every
+    scalar under it must appear in some text the actor had observed. These are the only briefing
+    checks made in code; what the briefing text itself gives away is judged by the leak reviewer.
 
     Args:
         before: World state just before the decision's step.
-        decision: The decision state.
         scenario: A fresh-briefing variant.
         view: What the actor had seen at the variant's start.
 
     Returns:
-        Every leak found; empty when none was.
+        Every problem found; empty when none was.
     """
     if scenario.briefing is None:
         return []
-    text = scenario.briefing.text
     edited = apply_edits(before, scenario.edits)
-    axis = decision.instruction_axis
-    value = None if axis is None else axis.value(scenario.instruction)
-    told = _shingles(view.instruction) | _shingles(value.instruction if value else "")
-    found: list[str] = []
-    for option in decision.options:
-        if option.option_id != scenario.correct_option:
-            continue
-        others = set().union(
-            *(_shingles(o.action) for o in decision.options if o.option_id != option.option_id)
-        )
-        leaked = sorted((_shingles(option.action) - others - told) & _shingles(text))
-        if leaked:
-            found.append(f"briefing states the intended option's action ({leaked[0]!r})")
     edits = {edit.path for edit in scenario.edits}
-    for path in sorted(edits):
-        for state, label in ((before, "old"), (edited, "edited")):
-            if any(mentions(text, item) for item in _scannable(state, path)):
-                found.append(f"briefing states the {label} value at edited path {path}")
-    for path in sorted({*decision.relevant_paths, *scenario.deciding_paths} - edits):
-        hidden = [
-            item
-            for item in _scannable(edited, path)
-            if mentions(text, item) and not any(mentions(seen, item) for seen in view.observed)
-        ]
-        if hidden:
-            found.append(f"briefing states {path} value {hidden[0]!r}, which was not observed")
+    found: list[str] = []
     for path in scenario.briefing.entitled_paths:
         exists, held = resolve_pointer(edited, path)
         if not exists or any(_overlaps(path, edit) for edit in edits):
@@ -873,24 +843,6 @@ def json_keys(value: JsonValue) -> set[str]:
     return set()
 
 
-def _scannable(state: JsonObject, path: str) -> list[JsonValue]:
-    """Return the strings and numbers at or under a path, which a briefing scan looks for."""
-    exists, value = resolve_pointer(state, path)
-    return [
-        item
-        for item in (list(json_scalars(value)) if exists else [])
-        if isinstance(item, (str, int, float)) and not isinstance(item, bool)
-    ]
-
-
-def _shingles(text: str) -> set[str]:
-    """Return the three-word phrases of a text, or the whole text when it is shorter."""
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    if len(words) < 3:
-        return {" ".join(words)} if words else set()
-    return {" ".join(words[index : index + 3]) for index in range(len(words) - 2)}
-
-
 def _scenario_problems(
     before: JsonObject,
     decision: DecisionState,
@@ -941,7 +893,7 @@ def _scenario_problems(
             _problem(scenario, "a fresh briefing cannot be leak-checked without the actor's view")
         )
     elif view is not None:
-        leaks = briefing_leaks(before, decision, scenario, view)
+        leaks = briefing_problems(before, scenario, view)
         found.extend(_problem(scenario, reason) for reason in leaks)
     for path in scenario.deciding_paths:
         exists, _ = resolve_pointer(edited, path)

@@ -24,8 +24,8 @@ none fails:
   edited value appears in it.
 - **instance_facts**: no instance fact names an edited path (keys compared as path tokens, either
   containing the other), and no fact names the edited field with an old value.
-- **clock_and_events**: edits touching a key that mentions time, clock, deadline, scheduled or
-  pending, and forks with pending events or outages, are marked for explicit review.
+- **clock_and_events**: forks with pending events or outages are marked for explicit review. An
+  edited key's spelling is not read as evidence that it is time-dependent.
 - **retained_messages** and **retained_world_history**: the conversation and the predictor
   history kept at the fork mention no edited value.
 - **replay_stability**: the turns the actor replays did not themselves change an edited path, so
@@ -34,8 +34,14 @@ none fails:
   axis (a changed instruction needs a fresh briefing). A ``resume`` variant keeps the coherent
   prefix and its remaining calls; a ``fresh_briefing`` variant starts at the fork on a new public
   task (the instruction value plus the briefing in its initial context) with the same remaining
-  calls and no replay, its world restored under the original environment task. The briefing is
-  leak-checked against the actor's real view at the fork: the retained messages and task prompt.
+  calls and no replay, its world restored under the original environment task. The briefing's
+  entitled paths are checked structurally against the actor's real view at the fork (the retained
+  messages and task prompt): each exists, is not edited and shows observed values. What the
+  briefing text gives away was judged by the model leak reviewer when the scenario was authored,
+  against the view at the decision.
+- **briefing_view**: when a fresh-briefing variant forks before the decision, the actor's view at
+  the fork is narrower than the view the leak reviewer read, so a fact observed only between the
+  fork and the decision could have passed review. Such a variant is marked for explicit review.
 - **complete_state**: :func:`freeze_state` records what the variant checkpoint actually holds for
   every :data:`~exp.optimize.evaluation.variance.contracts.StatePart`; the baseline parts, files
   or facts the caller requires, and the facts when supplied must all be held.
@@ -82,9 +88,8 @@ from exp.optimize.evaluation.variance.contracts import (
     Scenario,
     StatePart,
     apply_edits,
-    briefing_leaks,
+    briefing_problems,
     instruction_problems,
-    json_keys,
     json_scalars,
     message_texts,
     resolve_pointer,
@@ -112,13 +117,13 @@ CheckName = Literal[
     "retained_world_history",
     "replay_stability",
     "initialization",
+    "briefing_view",
     "complete_state",
     "reachability",
 ]
 """Every coherence check a variant records."""
 
 _PREDICTOR_PART = "predictor.json"
-_CLOCK_WORDS = ("time", "clock", "deadline", "scheduled", "pending")
 
 
 class CoherenceCheck(ContractModel):
@@ -272,7 +277,7 @@ def build_variant_checkpoint(
         return run.fail("edits", "edits add a simulated domain; edit inside existing domains")
     run.check("edits", "passed", f"{len(paths)} declared axes applied at boundary {fork}")
 
-    run.add(_clock_check(forked.world, paths, edited))
+    run.add(_clock_check(forked.world))
     retained = revealing_texts(message_texts(forked.actor.messages), values, keys)
     run.check(
         "retained_messages",
@@ -296,6 +301,16 @@ def build_variant_checkpoint(
         run.check("initialization", "failed", started)
     else:
         run.check("initialization", "passed", f"{scenario.initialization} start is coherent")
+    if scenario.briefing is not None:
+        unseen = len(loaded[-1].actor.messages) - len(forked.actor.messages)
+        run.check(
+            "briefing_view",
+            "review" if unseen else "passed",
+            f"the fork drops {unseen} messages the leak reviewer read at the decision; confirm "
+            "the briefing states nothing only they show"
+            if unseen
+            else "the leak reviewer read exactly the actor's view at the fork",
+        )
     run.add(_reachability_check(forked, run.replay_turns, maximum_model_calls))
     if run.problems or isinstance(started, str):
         return run.result()
@@ -473,7 +488,7 @@ def _initialize(
     view = ActorView(
         instruction=forked.task.instruction, observed=message_texts(forked.actor.messages)
     )
-    problems.extend(briefing_leaks(state, decision, scenario, view))
+    problems.extend(briefing_problems(state, scenario, view))
     tail, opening = task_messages(forked.task), start.actor.messages
     leading = opening[: len(opening) - len(tail)]
     if len(opening) < len(tail) or opening[len(leading) :] != tail:
@@ -843,32 +858,26 @@ def _facts_check(
     )
 
 
-def _clock_check(
-    world: WorldCheckpoint, paths: tuple[str, ...], edited: JsonObject
-) -> CoherenceCheck:
-    """Mark clock-dependent edits and pending events for explicit review.
+def _clock_check(world: WorldCheckpoint) -> CoherenceCheck:
+    """Mark forks with pending events or outages for explicit review.
+
+    Both are recorded world state scheduled or degraded under the old values, so an edit may
+    contradict them. Whether an edited value is itself time-dependent is not guessed from its
+    key's spelling: the decision-state author declares what the retained history fixes as
+    invariants, and the witness and replay execute the edited world.
 
     Args:
         world: The fork's world.
-        paths: Edited paths.
-        edited: The edited state, whose keys under each path are also inspected.
 
     Returns:
-        Review when an edited key mentions time or scheduling or events are pending.
+        Review when events are pending or tools are under an outage.
     """
-    keys: set[str] = set()
-    for path in paths:
-        keys.update(path.split("/")[1:])
-        keys |= json_keys(resolve_pointer(edited, path)[1])
-    timed = sorted(key for key in keys if any(word in key.lower() for word in _CLOCK_WORDS))
     worlds = (
         (world,) if isinstance(world, ExecutableCheckpoint) else (world.native, world.candidate)
     )
     pending = [event.event_id for row in worlds if row is not None for event in row.pending]
     outages = sorted({tool for row in worlds if row is not None for tool in row.degraded})
     notes = []
-    if timed:
-        notes.append(f"edits touch clock-dependent keys {timed}")
     if pending:
         notes.append(f"events {pending} are pending and were scheduled under the old state")
     if outages:
@@ -880,9 +889,7 @@ def _clock_check(
             detail="; ".join(notes) + "; confirm they agree with the edited state",
         )
     return CoherenceCheck(
-        name="clock_and_events",
-        status="passed",
-        detail="no clock-dependent key edited and no event pending",
+        name="clock_and_events", status="passed", detail="no event pending and no outage"
     )
 
 

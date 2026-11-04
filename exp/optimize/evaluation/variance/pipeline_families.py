@@ -43,9 +43,13 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     save_packet,
 )
 from exp.optimize.evaluation.variance.authors import DecisionContext, ScenarioDraft, option_calls
+from exp.optimize.evaluation.variance.briefing_review import (
+    DEFAULT_REVIEW_REPAIRS,
+    DEFAULT_REVIEW_VARIANTS,
+)
 from exp.optimize.evaluation.variance.build_records import load_exposure_plan
 from exp.optimize.evaluation.variance.coalition import mining_coalition
-from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario
+from exp.optimize.evaluation.variance.contracts import MAXIMUM_SCENARIOS, DecisionState, Scenario
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence, JudgeProfile
 from exp.optimize.evaluation.variance.family import (
     DecisionFamilySpec,
@@ -108,6 +112,11 @@ __all__ = ["FAMILIES_STAGE"]
 
 MAXIMUM_OPTIONS = 6
 """Most options a decision state may have; prices a family whose actions are authored."""
+
+
+def briefing_review_draws() -> int:
+    """Most leak-review draws one scenario draw may buy: every scenario, stance and repair."""
+    return MAXIMUM_SCENARIOS * len(DEFAULT_REVIEW_VARIANTS) * (1 + DEFAULT_REVIEW_REPAIRS)
 
 
 @dataclass
@@ -352,10 +361,11 @@ class _FamiliesStage:
         for alias in mining.actors:
             episode = tier_job(project, mining.job, alias, 1)
             passes = 2 if authoring.revision_rounds else 1
+            reviews = briefing_review_draws() if authoring.fresh_briefing else 0
             per_family: list[CostComponent] = []
             for settings, draws in (
                 (authoring.decision_author, passes),
-                (authoring.scenario_author, passes),
+                (authoring.scenario_author, passes * (1 + reviews)),
                 (authoring.world_author, world_draws),
                 (authoring.rubric_author, rubric_draws(authoring.rubric_profile) + revision_draws),
             ):
@@ -378,6 +388,12 @@ class _FamiliesStage:
             f"revision up to {authoring.revision_rounds} rounds, then one re-registration under "
             "revised judges.",
         )
+        if authoring.fresh_briefing:
+            lines += (
+                f"Fresh briefings: each reviewed for leaks under {len(DEFAULT_REVIEW_VARIANTS)} "
+                f"reading stances on the scenario author model, up to {briefing_review_draws()} "
+                "review draws per scenario draw.",
+            )
         return cost_lines(tuple(costs)), lines
 
     def run(self, context: StageContext) -> StageRun:

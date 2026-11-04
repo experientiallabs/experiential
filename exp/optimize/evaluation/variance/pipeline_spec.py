@@ -55,6 +55,12 @@ from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.rubric_agent import RubricAuthoringProfile
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
 from exp.optimize.evaluation.variance.world_agent import DEFAULT_PROMPT_SETS
+from exp.simulation.mining.traceml_moves import (
+    DEFAULT_MOVE_REPAIRS,
+    DEFAULT_MOVE_VARIANTS,
+    MOVE_VARIANTS,
+    MoveWindowSpec,
+)
 from exp.simulation.retrieval.scope import CorpusScope
 
 if TYPE_CHECKING:
@@ -140,6 +146,11 @@ class TraceMLSettings(ContractModel):
         steps_per_call: Most labelled steps one actor model call may produce; an attempt with
             more is refused, so the up-front price stays an upper bound.
         deadline_hours: Deadline of the tagger's provider calls.
+        move_judge: Frozen model and allowance of the pivot and return judge; required when the
+            stage is enabled, because no rule stands in for the judgment.
+        move_variants: Reading stances every step window is judged under.
+        move_window: How each attempt is cut into judged windows.
+        move_repairs: Revisions a move judge may make after failing its citation checks.
     """
 
     enabled: bool = True
@@ -148,6 +159,20 @@ class TraceMLSettings(ContractModel):
     concurrency: int = Field(default=4, ge=1, le=64, strict=True)
     steps_per_call: int = Field(default=4, ge=1, le=64, strict=True)
     deadline_hours: int = Field(default=6, ge=1, le=72, strict=True)
+    move_judge: AuthorSettings | None = None
+    move_variants: tuple[str, ...] = Field(default=DEFAULT_MOVE_VARIANTS, min_length=1)
+    move_window: MoveWindowSpec = MoveWindowSpec()
+    move_repairs: int = Field(default=DEFAULT_MOVE_REPAIRS, ge=0, le=3, strict=True)
+
+    @model_validator(mode="after")
+    def _judged(self) -> Self:
+        """Require a move judge and known stances whenever the stage runs."""
+        if self.enabled and self.move_judge is None:
+            raise ValueError("an enabled traceml stage needs a move_judge for pivots and returns")
+        unknown = sorted(set(self.move_variants) - set(MOVE_VARIANTS))
+        if unknown:
+            raise ValueError(f"unknown traceml move variants {unknown}")
+        return self
 
 
 class MiningSettings(ContractModel):
@@ -324,7 +349,7 @@ class DecisionVarianceSpec(ContractModel):
     Attributes:
         build: Variance-build settings.
         rules: Rules-stage settings.
-        traceml: TraceML settings.
+        traceml: TraceML settings; an enabled stage names its move judge.
         mining: Error-mining settings.
         authoring: Family settings.
         records: Records settings.
@@ -333,7 +358,7 @@ class DecisionVarianceSpec(ContractModel):
 
     build: BuildSettings
     rules: RulesSettings
-    traceml: TraceMLSettings = TraceMLSettings()
+    traceml: TraceMLSettings
     mining: MiningSettings
     authoring: AuthoringSettings
     records: RecordsSettings

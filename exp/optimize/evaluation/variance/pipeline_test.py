@@ -151,7 +151,8 @@ from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.admission import EvaluationSpecification, persist_specification
 from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.mining.decisions import DecisionsTraceTagger
-from exp.simulation.mining.traceml import ACTION_LABELS, TRACEML_BANK_ID
+from exp.simulation.mining.traceml import ACTION_LABELS, TRACEML_BANK_ID, load_traceml_labels
+from exp.simulation.mining.traceml_moves import MOVE_TOOL
 from exp.simulation.retrieval import CorpusScope, RAGLineageBinding, persist_trace_rag
 from exp.simulation.rules.contracts_test import call, result
 from exp.simulation.rules.model import RuleBook
@@ -465,6 +466,26 @@ CHECKED = criterion("tier.checked", question="Was the ticket's tier read before 
 """The criterion a revision adds, which resolves the problem."""
 
 
+def moves_answer(window: JsonObject) -> JsonObject:
+    """Judge a TraceML window: every step after a failed one is a pivot citing that failure."""
+    context, shown, focal = window["context_steps"], window["focal_steps"], window["focal_locators"]
+    assert isinstance(context, list) and isinstance(shown, list) and isinstance(focal, list)
+    steps = [*context, *shown]
+    moves: list[JsonValue] = []
+    for before, step in zip(steps, steps[1:], strict=False):
+        assert isinstance(before, dict) and isinstance(step, dict)
+        if step["locator"] in focal and before["status"] == "failed":
+            moves.append(
+                {
+                    "kind": "pivot",
+                    "step": step["locator"],
+                    "evidence": [before["locator"]],
+                    "rationale": "The agent changed course after the failed step.",
+                }
+            )
+    return {"judged_steps": focal, "moves": moves, "limitations": ["Scripted fixture judge."]}
+
+
 def revision_answer(payload: JsonObject) -> JsonObject:
     """A revised rubric adding the tier-check criterion and resolving every cited problem."""
     cited = _user(payload)["problems"]
@@ -498,6 +519,7 @@ ANSWERS: dict[str, Answer] = {
     RUBRIC_TOOL: lambda _: covering_answer(),
     CRITIQUE_TOOL: lambda _: RUBRIC_CRITIQUE,
     EXTRACTION_TOOL: extraction_answer,
+    MOVE_TOOL: lambda payload: moves_answer(_user(payload)),
 }
 """Every non-judge role's answer, by the forced tool it must call."""
 
@@ -1070,7 +1092,9 @@ def make_spec(
     return DecisionVarianceSpec(
         build=BuildSettings(spec=VarianceBuildSpec()),
         rules=RulesSettings(spec=rules, maximum_traces=4),
-        traceml=TraceMLSettings(decision_alias="judge", bank_root=bank, steps_per_call=2),
+        traceml=TraceMLSettings(
+            decision_alias="judge", bank_root=bank, steps_per_call=2, move_judge=settings
+        ),
         mining=mining,
         authoring=AuthoringSettings(
             decision_author=settings,
@@ -1254,6 +1278,11 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
     assert rules.job.study.checkpoint != run.fixture.job.study.checkpoint
     labels = _outputs(run, report, 2, TraceMLOutputs).labels
     assert set(labels) == {"actor", TIER_B}
+    for reference in labels.values():
+        saved = load_traceml_labels(project.artifacts, reference)
+        assert saved.moves_protocol is not None
+        assert all(trace.coverage.moves == "judged" for trace in saved.traces)
+    assert any(tool == MOVE_TOOL for tool, _ in run.wire.requests)
     build = _outputs(run, report, 0, BuildOutputs)
     mining = _outputs(run, report, 3, MiningOutputs)
     assert mining.profile.prompt_version == JUDGE_PROMPT_VERSION

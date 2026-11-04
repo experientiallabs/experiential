@@ -19,8 +19,11 @@ why.
   :class:`~exp.optimize.evaluation.variance.contracts.ScenarioSet`, choosing per scenario a
   ``resume`` or ``fresh_briefing`` start. Every set is checked with
   :func:`~exp.optimize.evaluation.variance.contracts.check_scenarios`, against the actor's view at
-  the start when one is supplied (without it a fresh briefing is refused); a set with any problem
-  is kept with its problems and is never accepted.
+  the start when one is supplied (without it a fresh briefing is refused). A structurally sound
+  set's fresh briefings then go to the model leak reviewer
+  (:mod:`~exp.optimize.evaluation.variance.briefing_review`), under several reading stances, whose
+  findings and unusable reviews become problems too. A set with any problem is kept with its
+  problems and reviews and is never accepted.
 
 Both prompts carry the eval-audit checklist. Neither role's answer qualifies an environment on its
 own: executed witnesses and competing-action continuations from the same checkpoint do that.
@@ -46,6 +49,15 @@ from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolCal
 from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
+from exp.optimize.evaluation.variance.briefing_review import (
+    DEFAULT_REVIEW_REPAIRS,
+    DEFAULT_REVIEW_VARIANTS,
+    BriefingReview,
+    BriefingReviewContext,
+    briefing_review_sha256,
+    review_briefing,
+    review_problems,
+)
 from exp.optimize.evaluation.variance.coalition import CoalitionEvidence
 from exp.optimize.evaluation.variance.contracts import (
     ActorView,
@@ -62,7 +74,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
 
-AUTHORS_PROTOCOL = "variance-authors-v4"
+AUTHORS_PROTOCOL = "variance-authors-v5"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"
@@ -269,15 +281,18 @@ class ScenarioDraft(ContractModel):
         identity: Stable identity of the draw.
         response: Saved provider response, when one exists.
         scenarios: The parsed set, when the answer matched the schema.
-        problems: Every problem :func:`check_scenarios` found; any problem blocks acceptance.
+        problems: Every problem :func:`check_scenarios` or the leak reviewer found; any problem
+            blocks acceptance.
         failure: Why no set could be parsed, when none could.
         accepted: True only for a parsed set with no problems.
+        reviews: Every leak review of the set's fresh briefings, findings and failures included.
     """
 
     identity: str = Field(min_length=1)
     response: ArtifactInput | None = None
     scenarios: ScenarioSet | None = None
     problems: tuple[ScenarioProblem, ...] = ()
+    reviews: tuple[BriefingReview, ...] = ()
     failure: str | None = None
     accepted: bool = False
 
@@ -295,11 +310,13 @@ def authors_protocol_sha256() -> str:
     """Return the identity of the author prompts and their answer schemas.
 
     Returns:
-        SHA-256 over the protocol version, both prompts and both answer schemas.
+        SHA-256 over the protocol version, both prompts, both answer schemas and the briefing
+        leak reviewer.
     """
     return sha256_json(
         {
             "protocol": AUTHORS_PROTOCOL,
+            "briefing_review": briefing_review_sha256(),
             "decision_state": DECISION_STATE_PROMPT,
             "scenarios": SCENARIO_PROMPT,
             "decision_state_schema": DecisionStateAnswer.model_json_schema(),
@@ -611,10 +628,15 @@ def author_scenarios(
     code_revision: str,
     sources: tuple[ArtifactInput, ...] = (),
     view: ActorView | None = None,
+    reviewer: AuthorSettings | None = None,
+    review_variants: tuple[str, ...] = DEFAULT_REVIEW_VARIANTS,
+    review_repairs: int = DEFAULT_REVIEW_REPAIRS,
 ) -> ScenarioDraft:
-    """Buy or replay one scenario draw, check it and save it with every problem it has.
+    """Buy or replay one scenario draw, check it, leak-review its briefings and save it.
 
-    The draw takes its own lock named by ``identity``; the caller must not hold that lock.
+    The draw takes its own lock named by ``identity``; the caller must not hold that lock. Leak
+    reviews run only for a set with no structural problem, one per fresh-briefing scenario and
+    variant, under draw identities derived from ``identity``.
 
     Args:
         project: Project whose artifacts hold the draw.
@@ -626,6 +648,9 @@ def author_scenarios(
         code_revision: Producing source identity.
         sources: Saved artifacts the decision state and before-state came from.
         view: What the actor had seen at the start; without it a fresh briefing is refused.
+        reviewer: Frozen leak-reviewer model and allowance; None reviews with ``settings``.
+        review_variants: Reading stances every fresh briefing is reviewed under.
+        review_repairs: Revisions a reviewer may make after failing its citation checks.
 
     Returns:
         The draft, accepted only when the set parsed and has no problems. A draft with a saved
@@ -650,15 +675,79 @@ def author_scenarios(
         except ValueError as error:
             draft = ScenarioDraft(identity=identity, response=reference, failure=_reason(error))
         else:
+            reviews: tuple[BriefingReview, ...] = ()
+            if not problems and view is not None:
+                reviews, found = _review_briefings(
+                    project,
+                    reviewer or settings,
+                    (decision, before, view, scenarios),
+                    identity=identity,
+                    code_revision=code_revision,
+                    sources=(*sources, reference),
+                    variants=review_variants,
+                    repairs=review_repairs,
+                )
+                problems = (*problems, *found)
             draft = ScenarioDraft(
                 identity=identity,
                 response=reference,
                 scenarios=scenarios,
                 problems=problems,
                 accepted=not problems,
+                reviews=reviews,
             )
         _save(project, result_id, "scenario-draft", draft, reference, code_revision)
         return draft
+
+
+def _review_briefings(
+    project: ProjectStore,
+    settings: AuthorSettings,
+    subject: tuple[DecisionState, JsonObject, ActorView, ScenarioSet],
+    *,
+    identity: str,
+    code_revision: str,
+    sources: tuple[ArtifactInput, ...],
+    variants: tuple[str, ...],
+    repairs: int,
+) -> tuple[tuple[BriefingReview, ...], tuple[ScenarioProblem, ...]]:
+    """Leak-review every fresh briefing of a structurally sound set.
+
+    Args:
+        project: Project whose artifacts hold the draws.
+        settings: Frozen reviewer model and allowance.
+        subject: The decision state, before-state, actor view and authored set.
+        identity: The scenario draw's identity, prefixing every review draw.
+        code_revision: Producing source identity.
+        sources: Saved artifacts the set was authored from, its response among them.
+        variants: Reading stances.
+        repairs: Revisions allowed per variant.
+
+    Returns:
+        Every review, and one problem per finding or unusable review.
+    """
+    decision, before, view, scenarios = subject
+    reviews: list[BriefingReview] = []
+    problems: list[ScenarioProblem] = []
+    for scenario in scenarios.scenarios:
+        if scenario.briefing is None:
+            continue
+        found = review_briefing(
+            project,
+            settings,
+            BriefingReviewContext(scenario=scenario, decision=decision, view=view, before=before),
+            identity=f"{identity}-leak-{scenario.scenario_id}",
+            code_revision=code_revision,
+            sources=sources,
+            variants=variants,
+            repairs=repairs,
+        )
+        reviews.extend(found)
+        problems.extend(
+            ScenarioProblem(scenario_id=scenario.scenario_id, reason=reason)
+            for reason in review_problems(found)
+        )
+    return tuple(reviews), tuple(problems)
 
 
 def _buy(

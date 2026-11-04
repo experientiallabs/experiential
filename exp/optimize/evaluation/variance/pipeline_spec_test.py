@@ -14,6 +14,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     MiningSettings,
     PipelinePlan,
     StagePlan,
+    TraceMLSettings,
     stage_identity,
 )
 from exp.optimize.evaluation.variance.pipeline_test import make_spec, wired
@@ -93,3 +94,20 @@ def test_a_plan_totals_only_unsaved_stages_and_keeps_unpriced_lines_visible() ->
     )
     assert plan.known_usd == 1.5 and not plan.complete
     assert [row.name for row in plan.unpriced] == ["actor"]
+
+
+def test_an_enabled_traceml_stage_names_its_move_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No rule stands in for the pivot and return judgment, so the judge is required."""
+    run = wired(tmp_path, monkeypatch)
+    settings = run.fixture.settings
+    with pytest.raises(ValueError, match="move_judge"):
+        TraceMLSettings()
+    with pytest.raises(ValueError, match="unknown traceml move variants"):
+        TraceMLSettings(move_judge=settings, move_variants=("tool-change-rules",))
+    assert TraceMLSettings(enabled=False).move_judge is None
+    narrowed = TraceMLSettings(move_judge=settings, move_variants=("evidence-first",))
+    spec = make_spec(run.fixture, run.rubric, run.bank)
+    changed = spec.model_copy(update={"traceml": narrowed})
+    assert spec.slice("traceml") != changed.slice("traceml")
