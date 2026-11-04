@@ -30,8 +30,21 @@ family, from its judged confirmation episodes under each variant's frozen judge:
 assessment, with group-relative advantages read back from those assessments; the imposed first
 action is experiment-owned and never trainable as actor tokens. Discovery critic records are kept
 only when the error-mining run's episode judge is every confirmed variant's judge (otherwise
-``critics_refused`` says why), and point-selector screening scores are kept, both marked
-non-trainable: they were scored under the discovery run, not the variant's fresh predictions.
+``critics_refused`` says why) and stay non-trainable: they were scored under the discovery run, not
+the variant's fresh predictions. Point-selector screening scores are kept for analysis.
+
+Point-selector training records (:func:`selector_records`, objective
+:data:`~exp.optimize.evaluation.variance.rewards.SELECTOR_OBJECTIVE`) reference each saved selector
+draw (its request settings, final response and full analysis transcript) and every judged slot of
+the points it chose. Each draw's reward is the decision relevance of its picks under the run's
+frozen episode judge, and the ``J`` draws of one run are one group for group-relative advantages.
+A draw is trainable only when the run's judge coverage passes the admission policy, every judged
+study was made by the expected selector judge (within a family: the error-mining judge is every
+confirmed variant's judge) and the group has at least two rewarded draws.
+
+This repository produces these records and never runs an optimizer or updates any weights: an
+external trainer consumes them and registers the revision it produces
+(:mod:`~exp.optimize.evaluation.variance.schedule`).
 
 Fresh confirmation draws come from :func:`confirmation_job`, and their episodes are rendered for
 an optional calibration grader by :func:`confirmation_episodes`.
@@ -56,13 +69,30 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, CriticDraw
+from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, coverage_problems
 from exp.optimize.evaluation.variance.authors import DecisionStateAnswer
+from exp.optimize.evaluation.variance.contracts import JudgeSelection
 from exp.optimize.evaluation.variance.contrast import FlipVerdict, OptionContrast
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning
 from exp.optimize.evaluation.variance.grader import EpisodeView
-from exp.optimize.evaluation.variance.judged import JudgeCoverage, JudgedSlot, slot_rewards
-from exp.optimize.evaluation.variance.rewards import JudgeScore, group_advantages
+from exp.optimize.evaluation.variance.judged import (
+    JUDGED_STUDY_TYPE,
+    JudgeCoverage,
+    JudgedSlot,
+    JudgedStudy,
+    slot_coverage,
+    slot_rewards,
+)
+from exp.optimize.evaluation.variance.rewards import (
+    JudgeScore,
+    PointOutcome,
+    SelectorObjective,
+    SelectorScore,
+    group_advantages,
+    selector_score,
+)
 
 FindingSource = Literal[
     "actor_critic", "decision_state", "scenario", "variant_review", "replay_divergence"
@@ -579,18 +609,238 @@ class ContinuationGroup(ContractModel):
     imposed_action_trainable: Literal[False] = False
 
 
-class JudgeScreening(ContractModel):
-    """One point-selector draw's screening score, kept for analysis and never trained on.
+class SelectorPoint(ContractModel):
+    """One chosen point whose continuations ran, with every judged slot behind its outcome.
+
+    Attributes:
+        point: Point number within the picked attempt.
+        checkpoint: The paired actor/world checkpoint the continuations started from.
+        judged: Saved ``judged-continuation-study`` of the point's continuations.
+        slots: Each continuation's saved assessment or gap, in branch order.
+        outcome: Judged counts read back from those assessments.
+    """
+
+    point: int = Field(ge=0)
+    checkpoint: ArtifactInput
+    judged: ArtifactInput
+    slots: tuple[JudgedSlot, ...]
+    outcome: PointOutcome
+
+
+class SelectorRecord(ContractModel):
+    """One saved point-selector draw, its objective reward and group-relative advantage.
 
     Attributes:
         draw: Selector draw index.
-        score: The screening score.
-        trainable: Always False.
+        settings: Frozen request settings of the draw, including its model snapshot.
+        response: Saved final response, or None when the draw produced none.
+        transcript: Saved analysis transcript holding every request, tool result and the answer.
+        selection: The validated selection, or None when the answer was refused.
+        points: Chosen points whose continuations ran (see :attr:`SelectorRecords.points`).
+        score: The objective score, or None when the draw has no saved answer to train on.
+        advantage: Group-relative advantage across the run's draws; None when unrewarded.
+        trainable: Whether an external trainer may use this draw; computed, never asserted.
+        refused: Why it may not, when it may not.
+    """
+
+    draw: int = Field(ge=0)
+    settings: AuthorSettings
+    response: ArtifactInput | None
+    transcript: ArtifactInput | None
+    selection: JudgeSelection | None
+    points: tuple[int, ...]
+    score: SelectorScore | None
+    advantage: float | None
+    trainable: bool
+    refused: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _computed(self) -> Self:
+        """Require trainability to follow from its reasons and a rewarded, saved answer."""
+        if self.trainable != (not self.refused):
+            raise ValueError("a selector record is trainable exactly when nothing refuses it")
+        if self.trainable and (self.advantage is None or self.transcript is None):
+            raise ValueError("a trainable selector record needs a saved answer and an advantage")
+        return self
+
+
+class SelectorRecords(ContractModel):
+    """Every point-selector draw of one error-mining run, as one group-relative training group.
+
+    Attributes:
+        objective: The frozen selector objective.
+        judge: Selector judge identity the records were checked against.
+        group: Group identity: the saved group of attempts and the picked attempt.
+        coverage: The judge's coverage of every continuation from every chosen point.
+        points: Chosen points whose continuations ran, in point order.
+        draws: One record per selector draw, in draw order.
+        refused: Why no draw of this group is trainable, when none is.
+        optimizer: Always ``external``: these are records only; no optimizer runs here.
+    """
+
+    objective: SelectorObjective
+    judge: Sha256
+    group: str
+    coverage: JudgeCoverage
+    points: tuple[SelectorPoint, ...]
+    draws: tuple[SelectorRecord, ...]
+    refused: tuple[str, ...]
+    optimizer: Literal["external"] = "external"
+
+    @property
+    def mean_reward(self) -> float | None:
+        """Mean reward over rewarded draws, or None when none was rewarded."""
+        rewards = [d.score.reward for d in self.draws if d.score and d.score.reward is not None]
+        return sum(rewards) / len(rewards) if rewards else None
+
+
+def load_judged_study(project: ProjectStore, reference: ArtifactInput) -> JudgedStudy:
+    """Load a saved judged continuation study, refusing a changed or mistyped artifact.
+
+    Args:
+        project: Project holding the study.
+        reference: Its saved reference.
+
+    Returns:
+        The judged study.
+
+    Raises:
+        ValueError: The artifact differs from its reference or is not a judged study.
+    """
+    stored = project.artifacts.read(reference.artifact_id)
+    if artifact_input(stored.manifest) != reference:
+        raise ValueError(f"judged study {reference.artifact_id} differs from its reference")
+    if stored.manifest.artifact_type != JUDGED_STUDY_TYPE:
+        raise ValueError(f"{reference.artifact_id} is not a {JUDGED_STUDY_TYPE}")
+    return JudgedStudy.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "judged.json")
+    )
+
+
+def selector_records(
+    project: ProjectStore,
+    report: ActorCriticReport,
+    *,
+    judge: str,
+    objective: SelectorObjective | None = None,
+    admission: FamilyAdmissionPolicy | None = None,
+    refusals: Sequence[str] = (),
+) -> SelectorRecords:
+    """Build every selector draw's training record from the run's saved judged continuations.
+
+    Args:
+        project: Project holding the run's judged studies and assessments.
+        report: The saved actor-critic run.
+        judge: Selector judge identity every judged study must carry.
+        objective: The selector objective, or None for its defaults.
+        admission: Coverage limits the run's judging must meet, or None for the defaults.
+        refusals: Further group-level reasons the caller found, such as a judge mismatch.
+
+    Returns:
+        The records; reading saved artifacts only, never calling a model.
+    """
+    objective = objective or SelectorObjective()
+    problems = list(refusals)
+    mining = report.spec.episode_judge.identity
+    if mining != judge:
+        problems.append(f"the run's episode judge {mining[:12]} is not the selector judge")
+    coverage = JudgeCoverage(judge=mining)
+    points: list[SelectorPoint] = []
+    for row in report.points:
+        if row.failure is not None or row.study is None or row.judged is None:
+            continue
+        judged = load_judged_study(project, row.judged)
+        if judged.judge != mining or judged.study != row.study:
+            problems.append(f"point {row.point} was judged by another judge or for another study")
+            continue
+        rewards = slot_rewards(project, judged.branches, mining)
+        labels = [reward for reward in rewards if reward is not None]
+        coverage = coverage.plus(slot_coverage(project, judged.branches, mining))
+        passes = int(sum(labels))
+        outcome = PointOutcome(
+            point_id=f"point-{row.point}",
+            step=row.point,
+            successes=passes,
+            failures=len(labels) - passes,
+            unknown=len(rewards) - len(labels),
+        )
+        points.append(
+            SelectorPoint(
+                point=row.point,
+                checkpoint=row.checkpoint,
+                judged=row.judged,
+                slots=judged.branches,
+                outcome=outcome,
+            )
+        )
+    problems.extend(coverage_problems(coverage, admission or FamilyAdmissionPolicy())[0])
+    outcomes = {point.outcome.point_id: point.outcome for point in points}
+    scores: list[SelectorScore | None] = []
+    for draw in report.judges:
+        if draw.response is None or draw.transcript is None:
+            scores.append(None)
+            continue
+        picks = () if draw.selection is None else draw.selection.points
+        scores.append(selector_score([f"point-{p.step}" for p in picks], outcomes, objective))
+    group = f"{report.group.artifact_id}:{report.picked}"
+    rewards = [None if score is None else score.reward for score in scores]
+    if sum(reward is not None for reward in rewards) < 2:
+        problems.append("fewer than two selector draws were rewarded, so the group is empty")
+    advantages = group_advantages(group, rewards).advantages
+    draws = []
+    for draw, score, advantage in zip(report.judges, scores, advantages, strict=True):
+        reasons = list(problems)
+        if score is None:
+            reasons.append("the draw has no saved answer")
+        elif score.reward is None:
+            reasons.append("no pick of the draw was scored")
+        chosen = set() if draw.selection is None else {p.step for p in draw.selection.points}
+        draws.append(
+            SelectorRecord(
+                draw=draw.draw,
+                settings=report.spec.judges[draw.draw],
+                response=draw.response,
+                transcript=draw.transcript,
+                selection=draw.selection,
+                points=tuple(point.point for point in points if point.point in chosen),
+                score=score,
+                advantage=advantage,
+                trainable=not reasons,
+                refused=tuple(reasons),
+            )
+        )
+    return SelectorRecords(
+        objective=objective,
+        judge=judge,
+        group=group,
+        coverage=coverage,
+        points=tuple(points),
+        draws=tuple(draws),
+        refused=tuple(problems),
+    )
+
+
+class JudgeScreening(ContractModel):
+    """One point-selector draw's screening score, with its selector training record.
+
+    Attributes:
+        draw: Selector draw index.
+        score: The screening score; analysis only, never a training reward.
+        selector: The draw's selector-objective record, when built.
+        trainable: Whether the draw's selector record is trainable; computed from it.
     """
 
     draw: int = Field(ge=0)
     score: JudgeScore
-    trainable: Literal[False] = False
+    selector: SelectorRecord | None = None
+    trainable: bool = False
+
+    @model_validator(mode="after")
+    def _computed(self) -> Self:
+        """Derive trainability from the selector record, so it cannot be asserted."""
+        if self.trainable != (self.selector is not None and self.selector.trainable):
+            raise ValueError("a screening entry is trainable exactly when its selector record is")
+        return self
 
 
 class TrainingRecords(ContractModel):
@@ -602,8 +852,9 @@ class TrainingRecords(ContractModel):
             the error-mining run's episode judge is not every confirmed variant's judge.
         critics_refused: Why discovery critic records were refused, when they were.
         groups: Judged continuation groups per actor tier, each by variant then option.
-        judges: Point-selector screening scores; none of them is trainable.
+        judges: Point-selector screening scores, each with its selector record.
         coverage: The judge coverage of every confirmed variant behind the groups.
+        selectors: Point-selector training records of the error-mining run.
     """
 
     policy: str
@@ -612,6 +863,7 @@ class TrainingRecords(ContractModel):
     groups: dict[str, tuple[ContinuationGroup, ...]]
     judges: tuple[JudgeScreening, ...]
     coverage: dict[str, JudgeCoverage] = Field(default_factory=dict)
+    selectors: SelectorRecords | None = None
 
 
 def training_records(
@@ -621,6 +873,8 @@ def training_records(
     confirmed: Mapping[str, tuple[OptionContrast, EstimateMeaning]],
     *,
     tiers: Mapping[str, str] | None = None,
+    objective: SelectorObjective | None = None,
+    admission: FamilyAdmissionPolicy | None = None,
 ) -> TrainingRecords | tuple[str, ...]:
     """Build the records of an eligible family from its judged confirmations, or say why not.
 
@@ -630,6 +884,8 @@ def training_records(
         report: The actor-critic run the family was built from.
         confirmed: Confirmation contrast and its meaning per confirmed variant.
         tiers: Tier label per actor model identity, when tiers are recorded.
+        objective: Point-selector objective, or None for its defaults.
+        admission: Coverage limits the run's selector judging must meet, or None for defaults.
 
     Returns:
         The records, or the failed eligibility conditions.
@@ -670,17 +926,32 @@ def training_records(
         if foreign
         else None
     )
+    selectors = selector_records(
+        project,
+        report,
+        judge=mining,
+        objective=objective,
+        admission=admission,
+        refusals=(refused,) if refused else (),
+    )
+    by_draw = {record.draw: record for record in selectors.draws}
     return TrainingRecords(
         policy=policy,
         critics=() if refused else _discovery_critics(report),
         critics_refused=refused,
         groups={tier: tuple(items) for tier, items in sorted(groups.items())},
         judges=tuple(
-            JudgeScreening(draw=draw.draw, score=draw.score)
+            JudgeScreening(
+                draw=draw.draw,
+                score=draw.score,
+                selector=by_draw.get(draw.draw),
+                trainable=draw.draw in by_draw and by_draw[draw.draw].trainable,
+            )
             for draw in report.judges
             if draw.score is not None
         ),
         coverage={scenario: contrast.coverage for scenario, (contrast, _) in confirmed.items()},
+        selectors=selectors,
     )
 
 

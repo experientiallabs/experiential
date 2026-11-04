@@ -8,10 +8,13 @@ import pytest
 
 from exp.optimize.evaluation.variance.rewards import (
     PointOutcome,
+    SelectorObjective,
     critic_score,
     decision_drops,
+    decision_variance,
     group_advantages,
     judge_score,
+    selector_score,
 )
 
 
@@ -108,3 +111,54 @@ def test_decision_drops_bracket_the_losing_decision() -> None:
 
     assert drops == {"early": pytest.approx(0.25), "mid": pytest.approx(0.75)}
     assert max(drops, key=lambda point: drops[point]) == "mid"
+
+
+def test_decision_variance_is_four_p_one_minus_p_over_judged_labels_only() -> None:
+    """Unknown outcomes leave the rate, and too few judged labels leave the point unscored."""
+    assert decision_variance(_point("a", 0, 4, 4, unknown=8), 4) == pytest.approx(1.0)
+    assert decision_variance(_point("b", 0, 6, 2), 4) == pytest.approx(0.75)
+    assert decision_variance(_point("c", 0, 8, 0), 4) == 0.0
+    assert decision_variance(_point("d", 0, 2, 1, unknown=5), 4) is None
+    assert decision_variance(_point("e", 0, 0, 0, unknown=8), 1) is None
+
+
+def test_selector_reward_is_mean_variance_of_scored_picks_minus_penalties() -> None:
+    """Scored picks average their variance; duplicate and unusable picks cost a share each."""
+    outcomes = {
+        "split": _point("split", 1, 4, 4),
+        "lean": _point("lean", 2, 6, 2),
+        "sure": _point("sure", 3, 8, 0),
+        "thin": _point("thin", 4, 1, 1, unknown=6),
+    }
+    objective = SelectorObjective(minimum_scored=4, duplicate_penalty=0.2, unusable_penalty=0.4)
+
+    clean = selector_score(["split", "lean", "thin"], outcomes, objective)
+    assert clean.reward == pytest.approx(0.875) and clean.unscored == ("thin",)
+    assert clean.variances == {"split": 1.0, "lean": 0.75} and clean.penalty == 0.0
+
+    messy = selector_score(["split", "split", "gone", "sure"], outcomes, objective)
+    assert messy.duplicates == 1 and messy.unusable == ("gone",)
+    assert messy.relevance == pytest.approx(0.5)
+    assert messy.penalty == pytest.approx((0.2 + 0.4) / 4)
+    assert messy.reward == pytest.approx(0.5 - 0.15)
+
+    refused = selector_score([], outcomes, objective)
+    assert refused.reward == pytest.approx(-0.4) and refused.status == "scored"
+    nothing = selector_score(["thin"], outcomes, objective)
+    assert nothing.status == "unscored" and nothing.reward is None
+
+
+def test_selector_draws_of_one_run_form_one_group() -> None:
+    """Group-relative advantages rank the draws; an unrewarded draw keeps no advantage."""
+    outcomes = {"a": _point("a", 1, 4, 4), "b": _point("b", 2, 8, 0)}
+    objective = SelectorObjective(minimum_scored=1)
+    rewards = [
+        selector_score(picks, outcomes, objective).reward
+        for picks in (["a"], ["b"], ["a", "b"], ["missing"])
+    ]
+    assert rewards == pytest.approx([1.0, 0.0, 0.5, -0.25])
+    advantages = group_advantages("run", [*rewards, None]).advantages
+    assert advantages[-1] is None
+    graded = [value for value in advantages if value is not None]
+    assert sum(graded) == pytest.approx(0.0)
+    assert graded[0] > graded[2] > graded[1] > graded[3]

@@ -5,21 +5,26 @@ spend consent, execution and replay all run through the public command.
 """
 
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+from rich.console import Console
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.cli.evaluation.variance_actions import (
     ActorCriticAction,
     RulesStageAction,
     VarianceBuildAction,
+    VarianceScheduleAction,
     actor_critic_costs,
     actor_critic_lines,
+    handle_variance_schedule,
     rules_stage_identity,
 )
 from exp.common.project import ProjectStore, artifact_input
@@ -39,11 +44,19 @@ from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageSpec
 from exp.optimize.evaluation.rules.stage_test import _plan, _spec, _traces
 from exp.optimize.evaluation.variance import actor_critic_test as critic_fixture
 from exp.optimize.evaluation.variance import build_test as build_fixture
+from exp.optimize.evaluation.variance import schedule_test as schedule_fixture
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as VARIANCE_REPORT_TYPE
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceBudget, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.schedule import (
+    RevisionRegistration,
+    TrainingScheduleSpec,
+    TransitionRule,
+    schedule_state,
+)
+from exp.runtime.models.spend_ceiling import operation_spend_scope
 
 _TRACES = ("alpha", "beta")
 
@@ -404,3 +417,137 @@ def test_variance_build_runs_over_the_catalog_alias_then_replays_without_consent
     assert len(wire.states) == calls
     assert project.artifacts.list_ids(artifact_type=VARIANCE_REPORT_TYPE) == (report_id,)
     assert replay.output[replay.output.index("{") :] == result.output[result.output.index("{") :]
+
+
+def _schedule_context(
+    root: Path, *, dry_run: bool = False, yes: bool = True
+) -> tuple[ContinuationContext, StringIO]:
+    """A direct handler context over the project at ``root``."""
+    output = StringIO()
+    context = ContinuationContext(
+        store=ProjectStore(root, "case"),
+        console=Console(file=output, width=200),
+        revision="test",
+        root=root,
+        project="case",
+        spec_path=root / "operation.json",
+        yes=yes,
+        non_interactive=True,
+        dry_run=dry_run,
+        operation="operation-fixture",
+        spend=UNPRICED_SPEND,
+    )
+    return context, output
+
+
+def _schedule_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ProjectStore, TrainingScheduleSpec, Path, Path]:
+    """Write a one-warm-up schedule spec and the mining-probe exposure file."""
+    project, spec = schedule_fixture._schedule(
+        tmp_path, monkeypatch, steady_draws=1, transition=TransitionRule(warmup_rollouts=1)
+    )
+    exposure = critic_fixture._exposure(project, spec.base.initial, "mining_probes")
+    return (
+        project,
+        spec,
+        _write(tmp_path / "schedule.json", spec),
+        _write(tmp_path / "exposure.json", exposure),
+    )
+
+
+def test_variance_schedule_status_and_dry_run_plan_save_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status folds saved events and a dry-run plan previews without saving or calling."""
+    project, spec, path, exposure = _schedule_files(tmp_path, monkeypatch)
+    monkeypatch.setattr("exp.cli.evaluation.variance_actions.run_actor_critic", _forbid)
+    context, output = _schedule_context(tmp_path, dry_run=True)
+
+    handle_variance_schedule(context, VarianceScheduleAction(operation="status", spec=path))
+    handle_variance_schedule(
+        context,
+        VarianceScheduleAction(operation="plan", spec=path, execute=True, exposure=exposure),
+    )
+
+    text = output.getvalue()
+    assert '"phase": "warmup"' in text and '"kind": "warmup"' in text
+    assert '"selector_draws": 2' in text and "no provider calls" in text
+    assert not project.artifacts.exists(spec.identity)
+    with pytest.raises(ValidationError, match="exposure"):
+        VarianceScheduleAction(operation="status", spec=path, execute=True)
+    with pytest.raises(ValidationError, match="revision file"):
+        VarianceScheduleAction(operation="register-revision", spec=path)
+
+
+def test_variance_schedule_declined_consent_runs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decision is saved, but a declined estimate buys nothing and completes nothing."""
+    project, spec, path, exposure = _schedule_files(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "exp.cli.evaluation.continuation_context.require_spend_consent", lambda *a, **k: False
+    )
+    monkeypatch.setattr("exp.cli.evaluation.variance_actions.run_actor_critic", _forbid)
+    context, _ = _schedule_context(tmp_path)
+
+    handle_variance_schedule(
+        context,
+        VarianceScheduleAction(operation="plan", spec=path, execute=True, exposure=exposure),
+    )
+
+    state = schedule_state(project, spec)
+    assert state.pending is not None and state.completed == ()
+    assert not project.artifacts.list_ids(artifact_type="actor-critic-report")
+
+
+def test_variance_schedule_executes_role_and_actor_rollouts_and_registers_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consented role and actor-only rollouts run and are recorded; a revision opens epoch 1."""
+    project, spec, path, exposure = _schedule_files(tmp_path, monkeypatch)
+    context, output = _schedule_context(tmp_path)
+    plan = VarianceScheduleAction(operation="plan", spec=path, execute=True, exposure=exposure)
+    group = [
+        reply for row in (2, 3, 4) for reply in (critic_fixture._edit(row), critic_fixture._done())
+    ]
+    suffixes = [
+        critic_fixture._edit(2),
+        critic_fixture._done(),
+        critic_fixture._edit(3),
+        critic_fixture._done(),
+        critic_fixture._done(),
+        critic_fixture._done(),
+    ]
+    choose = critic_fixture._tool_reply(
+        "choose_points",
+        {"points": [critic_fixture._point(0), critic_fixture._point(1)], "limitations": ["x"]},
+    )
+    estimate = critic_fixture._tool_reply("estimate_points", critic_fixture._estimates([0, 1]))
+    for actor, roles in (
+        (group + suffixes, [choose, choose, estimate]),
+        (group + suffixes, [choose, estimate]),
+        (group, []),
+    ):
+        critic_fixture._wire(monkeypatch, actor, roles)
+        with operation_spend_scope():
+            handle_variance_schedule(context, plan)
+
+    state = schedule_state(project, spec)
+    assert [row.plan.kind for row in state.completed] == ["warmup", "steady_roles", "actor_only"]
+    assert state.completed[2].metrics.actor_scored == 3
+    assert '"training": "records only' in output.getvalue()
+
+    selector = spec.base.judges[0]
+    trained = selector.model_copy(
+        update={"model": selector.model.model_copy(update={"model_id": "selector-r1"})}
+    )
+    revision = _write(
+        tmp_path / "revision.json",
+        RevisionRegistration(role="selector", settings=trained, source="external-trainer"),
+    )
+    register = VarianceScheduleAction(operation="register-revision", spec=path, revision=revision)
+    handle_variance_schedule(_schedule_context(tmp_path, dry_run=True)[0], register)
+    assert schedule_state(project, spec).epoch == 0
+    handle_variance_schedule(context, register)
+    assert schedule_state(project, spec).epoch == 1

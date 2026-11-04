@@ -15,6 +15,16 @@ arithmetic over those measurements, so a reward can be recomputed exactly from s
   with two equal points and eight continuations each it is still positive about a fifth of the
   time. Whether a point is a decision is established only by running competing actions from the
   same checkpoint.
+- **Point selector** training reward (objective :data:`SELECTOR_OBJECTIVE`) is how
+  decision-relevant the draw's chosen points proved under the judged continuations: the mean, over
+  its scored points, of the judged outcome variance ``4 * p * (1 - p)`` (``p`` the judged success
+  rate there; a point with fewer than :attr:`SelectorObjective.minimum_scored` judged pass or fail
+  continuations is unscored and left out), minus a configured penalty for each duplicate or
+  unusable pick as a share of the draw's picks. The ``J`` draws over one picked trajectory form one
+  group and are normalized together with :func:`group_advantages`. A point is relevant here when
+  the frozen actor's continuations from it split, which the selector can be rewarded for finding;
+  that is still not proof that a competing action decides the outcome. This module and the
+  records built from it never run an optimizer: an external trainer consumes them.
 - **Continuation groups** are normalized within each point, so continuations from one point form
   their own group and are never compared with continuations from another starting state.
 """
@@ -176,6 +186,130 @@ def judge_score(outcomes: Sequence[PointOutcome]) -> JudgeScore:
         observed_variance=observed,
         noise_variance=noise,
         scored_points=len(scored),
+    )
+
+
+SELECTOR_OBJECTIVE = "selector-decision-variance-v1"
+"""Version of the point-selector training objective; bump when :func:`selector_score` changes."""
+
+
+class SelectorObjective(ContractModel):
+    """The frozen point-selector training objective.
+
+    Attributes:
+        version: Objective version.
+        minimum_scored: Fewest judged pass or fail continuations a point needs to be scored.
+        duplicate_penalty: Reward removed per repeated pick, as a share of the draw's picks.
+        unusable_penalty: Reward removed per pick with no continuations (not offered, or its
+            continuations could not run), as a share of the draw's picks. A draw with a saved
+            answer but no usable selection counts every pick as unusable.
+    """
+
+    version: Literal["selector-decision-variance-v1"] = SELECTOR_OBJECTIVE
+    minimum_scored: int = Field(default=4, ge=1, le=100, strict=True)
+    duplicate_penalty: float = Field(default=0.25, ge=0.0, le=1.0)
+    unusable_penalty: float = Field(default=0.25, ge=0.0, le=1.0)
+
+
+class SelectorScore(ContractModel):
+    """One point-selector draw scored under :class:`SelectorObjective`.
+
+    Attributes:
+        objective: The objective version.
+        status: ``scored`` when the reward is defined, else ``unscored``.
+        reward: Mean judged outcome variance over scored points minus the penalty; None when no
+            pick was scored and none was penalized.
+        relevance: Mean judged outcome variance over scored points, or None when none scored.
+        variances: ``4 * p * (1 - p)`` per scored point identity.
+        unscored: Picks whose continuations ran but have too few judged labels.
+        unusable: Picks with no continuations.
+        duplicates: Repeated picks.
+        penalty: Total reward removed for duplicate and unusable picks.
+    """
+
+    objective: str = SELECTOR_OBJECTIVE
+    status: Literal["scored", "unscored"]
+    reward: float | None
+    relevance: float | None
+    variances: dict[str, float]
+    unscored: tuple[str, ...]
+    unusable: tuple[str, ...]
+    duplicates: int = Field(ge=0)
+    penalty: float = Field(ge=0.0)
+
+
+def decision_variance(outcome: PointOutcome, minimum_scored: int) -> float | None:
+    """Return the judged outcome variance ``4 * p * (1 - p)`` of one point, in [0, 1].
+
+    Args:
+        outcome: The point's judged counts; unknown outcomes are excluded from ``p``.
+        minimum_scored: Fewest judged pass or fail continuations needed.
+
+    Returns:
+        The variance, or None when fewer than ``minimum_scored`` continuations were judged.
+    """
+    rate = outcome.rate
+    if rate is None or outcome.graded < minimum_scored:
+        return None
+    return 4.0 * rate * (1.0 - rate)
+
+
+def selector_score(
+    picks: Sequence[str],
+    outcomes: Mapping[str, PointOutcome],
+    objective: SelectorObjective,
+) -> SelectorScore:
+    """Score one point-selector draw by how decision-relevant its picks proved.
+
+    Args:
+        picks: Point identities the draw chose, in answer order, repeats kept. An empty sequence
+            stands for a draw whose saved answer gave no usable selection.
+        outcomes: Judged outcomes of every point whose continuations ran; a pick absent here is
+            unusable.
+        objective: The frozen objective.
+
+    Returns:
+        The draw's score.
+    """
+    seen: set[str] = set()
+    duplicates = 0
+    unusable: list[str] = []
+    unscored: list[str] = []
+    variances: dict[str, float] = {}
+    for pick in picks:
+        if pick in seen:
+            duplicates += 1
+            continue
+        seen.add(pick)
+        outcome = outcomes.get(pick)
+        if outcome is None:
+            unusable.append(pick)
+            continue
+        variance = decision_variance(outcome, objective.minimum_scored)
+        if variance is None:
+            unscored.append(pick)
+        else:
+            variances[pick] = variance
+    if not picks:
+        penalty = objective.unusable_penalty
+    else:
+        penalty = (
+            duplicates * objective.duplicate_penalty + len(unusable) * objective.unusable_penalty
+        ) / len(picks)
+    relevance = sum(variances.values()) / len(variances) if variances else None
+    if relevance is None and penalty == 0.0:
+        reward = None
+    else:
+        reward = (relevance or 0.0) - penalty
+    return SelectorScore(
+        status="unscored" if reward is None else "scored",
+        reward=reward,
+        relevance=relevance,
+        variances=variances,
+        unscored=tuple(unscored),
+        unusable=tuple(unusable),
+        duplicates=duplicates,
+        penalty=penalty,
     )
 
 

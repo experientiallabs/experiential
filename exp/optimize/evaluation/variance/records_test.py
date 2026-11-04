@@ -11,7 +11,13 @@ from exp.common.core.artifacts import ArtifactInput
 from exp.common.models import BillingSource, ModelSnapshot, ToolCall
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel_test import write_catalog
-from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, ActorCriticSpec
+from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.variance import actor_critic_test as mining
+from exp.optimize.evaluation.variance.actor_critic import (
+    ActorCriticReport,
+    ActorCriticSpec,
+    run_actor_critic,
+)
 from exp.optimize.evaluation.variance.contrast import (
     FlipVerdict,
     OptionContrast,
@@ -29,14 +35,22 @@ from exp.optimize.evaluation.variance.records import (
     AuditDisposition,
     AuditFinding,
     EligibilityCondition,
+    JudgeScreening,
     TrainingEligibility,
     TrainingRecords,
     audit_finding,
     pending_findings,
     policy_key,
+    selector_records,
     training_eligibility,
     training_records,
     unreproduced,
+)
+from exp.optimize.evaluation.variance.rewards import (
+    JudgeScore,
+    SelectorObjective,
+    group_advantages,
+    selector_score,
 )
 
 _SNAPSHOT = ModelSnapshot(
@@ -307,6 +321,8 @@ def test_exported_advantages_are_read_from_the_saved_verdicts_and_follow_a_flip(
         )
         discovery = ActorCriticReport.model_construct(
             spec=ActorCriticSpec.model_construct(episode_judge=judge),
+            group=ArtifactInput(artifact_id="group", sha256="0" * 64),
+            picked=0,
             points=(),
             critics=(),
             judges=(),
@@ -322,8 +338,104 @@ def test_exported_advantages_are_read_from_the_saved_verdicts_and_follow_a_flip(
         refused = training_records(project, eligible, foreign, {"x": (contrast, _meaning())})
         assert isinstance(refused, TrainingRecords) and refused.critics == ()
         assert refused.critics_refused is not None and "variants ['x']" in refused.critics_refused
+        assert records.selectors is not None and records.selectors.optimizer == "external"
+        assert refused.selectors is not None
+        assert refused.critics_refused in refused.selectors.refused
         group = records.groups["untiered"][0]
         assert group.episodes == tuple(cell.slot for cell in option.cells)
         assert not group.imposed_action_trainable and group.judge == judge.identity
         exported.append(group.advantages)
     assert exported[0] == (1.0, -1.0, None) and exported[1] == (-1.0, 1.0, None)
+
+
+def _mining_run(
+    root: Path, monkeypatch: pytest.MonkeyPatch, verdict: mining.Verdict
+) -> tuple[ProjectStore, ActorCriticReport]:
+    """Run a scripted error-mining run whose two selectors choose overlapping points."""
+    project, job, _ = job_fixture(root, monkeypatch)
+    spec = mining._spec(project, job, judges=2)
+    group = [reply for row in (2, 3, 4) for reply in (mining._edit(row), mining._done())]
+    continuations = [
+        mining._edit(2),
+        mining._done(),
+        mining._edit(3),
+        mining._done(),
+        mining._done(),
+        mining._done(),
+    ]
+    roles = [
+        mining._tool_reply("choose_points", {"points": [mining._point(0)], "limitations": ["x"]}),
+        mining._tool_reply(
+            "choose_points",
+            {"points": [mining._point(0), mining._point(1)], "limitations": ["x"]},
+        ),
+        mining._tool_reply("estimate_points", mining._estimates([0, 1])),
+    ]
+    mining._wire(monkeypatch, group + continuations, roles, verdict)
+    exposure = mining._exposure(project, job, "mining_probes")
+    return project, run_actor_critic(project, spec, exposure=exposure, code_revision="test")
+
+
+def test_selector_records_reward_decision_relevance_and_reference_saved_draws(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each draw's reward is read back from judged slots, normalized across the run's draws."""
+    project, report = _mining_run(tmp_path, monkeypatch, mining.deletes_row(2))
+    objective = SelectorObjective(minimum_scored=2)
+    judge = report.spec.episode_judge.identity
+
+    records = selector_records(project, report, judge=judge, objective=objective)
+
+    assert records.refused == () and records.optimizer == "external"
+    assert [point.point for point in records.points] == [0, 1]
+    outcomes = {point.outcome.point_id: point.outcome for point in records.points}
+    for point, row in zip(records.points, report.points, strict=True):
+        assert point.judged == row.judged and len(point.slots) == 2
+        assert point.outcome == row.outcome
+    expected = [
+        selector_score(picks, outcomes, objective).reward
+        for picks in (["point-0"], ["point-0", "point-1"])
+    ]
+    assert [draw.score.reward for draw in records.draws if draw.score] == expected
+    assert tuple(draw.advantage for draw in records.draws) == (
+        group_advantages(records.group, expected).advantages
+    )
+    for draw, saved in zip(records.draws, report.judges, strict=True):
+        assert draw.trainable and draw.refused == ()
+        assert draw.transcript == saved.transcript and draw.response == saved.response
+        assert draw.settings == report.spec.judges[draw.draw]
+    assert records.draws[0].points == (0,) and records.draws[1].points == (0, 1)
+    assert records.coverage.planned == 4 and records.coverage.scored == 4
+
+    other = selector_records(project, report, judge="0" * 64, objective=objective)
+    assert not any(draw.trainable for draw in other.draws)
+    assert "is not the selector judge" in other.refused[0]
+    thin = selector_records(project, report, judge=judge, objective=SelectorObjective())
+    assert all(draw.score and draw.score.reward is None for draw in thin.draws)
+    assert any("fewer than two" in reason for reason in thin.refused)
+
+
+def test_selector_records_are_refused_when_judge_coverage_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unscored continuations fail the coverage policy, so no selector draw is trainable."""
+    project, report = _mining_run(tmp_path, monkeypatch, lambda evidence: "malformed")
+
+    records = selector_records(
+        project,
+        report,
+        judge=report.spec.episode_judge.identity,
+        objective=SelectorObjective(minimum_scored=1),
+    )
+
+    assert records.coverage.malformed == 4
+    assert any("operationally unscored" in reason for reason in records.refused)
+    assert not any(draw.trainable for draw in records.draws)
+
+
+def test_screening_trainability_is_computed_from_its_selector_record() -> None:
+    """A screening entry cannot claim trainability its selector record does not have."""
+    score = JudgeScore(reward=0.1, observed_variance=0.2, noise_variance=0.1, scored_points=2)
+    assert not JudgeScreening(draw=0, score=score).trainable
+    with pytest.raises(ValidationError, match="exactly when"):
+        JudgeScreening(draw=0, score=score, trainable=True)

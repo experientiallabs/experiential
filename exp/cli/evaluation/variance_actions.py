@@ -1,4 +1,4 @@
-"""The ``variance-build``, ``rules-stage`` and ``actor-critic`` continuation actions.
+"""The ``variance-build``, ``rules-stage``, ``actor-critic`` and ``variance-schedule`` actions.
 
 Every stage belongs to its optimize owner (:mod:`exp.optimize.evaluation.variance.build`,
 :mod:`exp.optimize.evaluation.rules.stage` and
@@ -6,12 +6,20 @@ Every stage belongs to its optimize owner (:mod:`exp.optimize.evaluation.varianc
 (and, for the later two, the exposure plan file the variance build writes), print a
 credential-free summary with a conservative cost estimate, ask spend consent once and run or
 replay the stage. A saved report replays without consent or calls.
+
+``variance-schedule`` reads and advances a persisted training schedule
+(:mod:`exp.optimize.evaluation.variance.schedule`): ``status`` folds the saved decisions,
+``plan`` saves (or returns the pending) next rollout decision and, with ``execute``, prices it,
+asks spend consent once and runs or replays it before recording its result, and
+``register-revision`` records a new frozen role revision produced by an external trainer. No
+operation trains a model.
 """
 
 import math
 from pathlib import Path
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.cli.evaluation.learning_summary import save_details
@@ -42,6 +50,19 @@ from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.schedule import (
+    RevisionRegistration,
+    RolloutPlan,
+    ScheduleState,
+    TrainingScheduleSpec,
+    complete_rollout,
+    next_rollout_plan,
+    preview_rollout_plan,
+    register_revision,
+    run_actor_rollout,
+    saved_actor_rollout,
+    schedule_state,
+)
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
@@ -86,6 +107,35 @@ class ActorCriticAction(ContractModel):
 
     spec: Path
     exposure: Path
+
+
+class VarianceScheduleAction(ContractModel):
+    """One read or step of a persisted training schedule.
+
+    Attributes:
+        operation: ``status``, ``plan`` or ``register-revision``.
+        spec: ``TrainingScheduleSpec`` JSON file.
+        execute: With ``plan``, run or replay the planned rollout after spend consent and record
+            its result.
+        exposure: ``ExposurePlan`` JSON file, required to execute; the task must be a mining
+            probe.
+        revision: ``RevisionRegistration`` JSON file, required for ``register-revision``.
+    """
+
+    operation: Literal["status", "plan", "register-revision"]
+    spec: Path
+    execute: bool = False
+    exposure: Path | None = None
+    revision: Path | None = None
+
+    @model_validator(mode="after")
+    def _inputs(self) -> Self:
+        """Require exactly the files the operation reads."""
+        if (self.operation == "register-revision") != (self.revision is not None):
+            raise ValueError("register-revision needs exactly a revision file")
+        if self.execute and (self.operation != "plan" or self.exposure is None):
+            raise ValueError("execute applies only to plan and needs an exposure file")
+        return self
 
 
 def handle_variance_build(context: ContinuationContext, action: VarianceBuildAction) -> None:
@@ -258,6 +308,138 @@ def handle_actor_critic(context: ContinuationContext, action: ActorCriticAction)
         return
     report = run_actor_critic(store, spec, exposure=exposure, code_revision=revision)
     console.print_json(data=actor_critic_summary(report))
+
+
+def handle_variance_schedule(context: ContinuationContext, action: VarianceScheduleAction) -> None:
+    """Show, plan, execute or register a revision of one persisted training schedule.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        action: The operation and its files.
+
+    Returns:
+        None. The state or plan, any consent question and the result are printed.
+    """
+    store, console, revision = context.store, context.console, context.revision
+    spec = TrainingScheduleSpec.model_validate_json(action.spec.read_bytes())
+    if action.operation == "status":
+        console.print_json(data=schedule_summary(schedule_state(store, spec)))
+        return
+    if action.operation == "register-revision":
+        assert action.revision is not None
+        registration = RevisionRegistration.model_validate_json(action.revision.read_bytes())
+        if context.dry_run:
+            console.print(f"Dry run: {registration.role} revision validated; nothing saved.")
+            return
+        state = register_revision(store, spec, registration, code_revision=revision)
+        console.print_json(data=schedule_summary(state))
+        return
+    if context.dry_run:
+        plan = preview_rollout_plan(store, spec)
+    else:
+        plan = next_rollout_plan(store, spec, code_revision=revision)
+    console.print_json(data=plan_summary(plan))
+    if not action.execute:
+        if context.dry_run:
+            console.print("Dry run: the plan was not saved and nothing ran.")
+        return
+    assert action.exposure is not None
+    exposure = ExposurePlan.model_validate_json(action.exposure.read_bytes())
+    start = load_continuation_checkpoint(store.artifacts, plan.actor_job.study.checkpoint)
+    exposure.require_lineage(start.task.lineage_group_id, "mining_probes")
+    if plan.spec is not None:
+        saved = store.artifacts.exists(plan.spec.identity(revision) + "-result")
+        components = actor_critic_costs(store, plan.spec)
+    else:
+        saved = saved_actor_rollout(store, plan, code_revision=revision) is not None
+        components = actor_rollout_costs(store, plan)
+    if not saved:
+        preflight_continuation_job(store, plan.actor_job)
+        review_components(console, components)
+    if context.dry_run:
+        console.print("Dry run: plan, exposure and group job validated; no provider calls.")
+        return
+    if not saved and not _consent(context, "variance-schedule", plan, components):
+        return
+    if plan.spec is not None:
+        run_actor_critic(store, plan.spec, exposure=exposure, code_revision=revision)
+        identity = plan.spec.identity(revision) + "-result"
+        result = artifact_input(store.artifacts.read(identity).manifest)
+    else:
+        result = run_actor_rollout(store, plan, code_revision=revision)
+    state = complete_rollout(store, spec, result, code_revision=revision)
+    console.print_json(data=schedule_summary(state))
+
+
+def actor_rollout_costs(project: ProjectStore, plan: RolloutPlan) -> tuple[CostComponent, ...]:
+    """Price an upper bound for an actor-only rollout: the group job and judging every attempt.
+
+    Args:
+        project: Project whose catalog prices the roles.
+        plan: The actor-only plan.
+
+    Returns:
+        The group job's inventory and the episode judge's, at its evidence-tool budget plus one
+        request per attempt.
+    """
+    judge = plan.episode_judge
+    calls = (judge.definition.profile.evidence_tool_budget + 1) * plan.actor_job.study.repeats
+    return (
+        *job_costs(project, plan.actor_job),
+        *(row.scaled(calls) for row in evaluation_costs(project, judge.settings)),
+    )
+
+
+def plan_summary(plan: RolloutPlan) -> dict[str, object]:
+    """Summarize one rollout plan for the terminal.
+
+    Args:
+        plan: The plan.
+
+    Returns:
+        Rollout, epoch, kind, draw counts, revisions and the reason.
+    """
+    return {
+        "rollout": plan.rollout,
+        "epoch": plan.epoch,
+        "kind": plan.kind,
+        "selector_draws": 0 if plan.spec is None else len(plan.spec.judges),
+        "critic_draws": 0 if plan.spec is None else len(plan.spec.critics),
+        "attempts": plan.actor_job.study.repeats,
+        "revisions": dict(sorted(plan.revisions.items())),
+        "reason": plan.reason,
+    }
+
+
+def schedule_summary(state: ScheduleState) -> dict[str, object]:
+    """Summarize a folded schedule for the terminal.
+
+    Args:
+        state: The folded schedule.
+
+    Returns:
+        Phase, epoch, revisions, the pending plan and every completed rollout's metrics.
+    """
+    return {
+        "schedule": state.schedule,
+        "events": state.events,
+        "epoch": state.epoch,
+        "phase": state.phase,
+        "revisions": dict(sorted(state.revisions.items())),
+        "pending": None if state.pending is None else plan_summary(state.pending),
+        "planned": state.planned,
+        "completed": [
+            {
+                "rollout": row.plan.rollout,
+                "epoch": row.plan.epoch,
+                "kind": row.plan.kind,
+                "result": row.result.artifact_id,
+                **row.metrics.model_dump(mode="json"),
+            }
+            for row in state.completed
+        ],
+        "training": "records only; an external trainer registers each new revision",
+    }
 
 
 def select_traces(
@@ -484,7 +666,7 @@ def actor_critic_summary(report: ActorCriticReport) -> dict[str, object]:
 def _consent(
     context: ContinuationContext,
     action: str,
-    spec: VarianceBuildSpec | RulesStageSpec | ActorCriticSpec,
+    spec: VarianceBuildSpec | RulesStageSpec | ActorCriticSpec | RolloutPlan,
     components: tuple[CostComponent, ...],
     traces: tuple[Trace, ...] = (),
 ) -> bool:
