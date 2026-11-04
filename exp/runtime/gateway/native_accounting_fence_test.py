@@ -308,10 +308,10 @@ def test_recovering_many_organizations_leaves_no_fence_entries() -> None:
     organizations = [f"organization-{index}" for index in range(40)]
     for index, organization in enumerate(organizations):
         entry = _admit_org(accounting, f"r-{index}", organization)
-        ledger.request_errors.append(RuntimeError("ledger write lost"))
-        assert not accounting.finish_request_quietly(entry.authorization, failure)
         _admit_org(accounting, f"s-{index}", organization)
         attempt = _start(accounting, ordinal=0, request_id=f"s-{index}")
+        ledger.request_errors.append(RuntimeError("ledger write lost"))
+        assert not accounting.finish_request_quietly(entry.authorization, failure)
         _fail_next_attempt_write(accounting, RuntimeError("ledger write lost"))
         with pytest.raises(NativeBridgeError):
             _settle(
