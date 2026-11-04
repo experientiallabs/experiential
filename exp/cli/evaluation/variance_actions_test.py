@@ -18,6 +18,8 @@ from exp.cli.evaluation.variance_actions import (
     ActorCriticAction,
     RulesStageAction,
     VarianceBuildAction,
+    actor_critic_costs,
+    actor_critic_lines,
     rules_stage_identity,
 )
 from exp.common.project import ProjectStore, artifact_input
@@ -25,6 +27,7 @@ from exp.common.release_revision import installed_execution_revision
 from exp.common.traces.ingest.dataset import persist_trace_dataset
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.executable.costs import job_costs
 from exp.optimize.evaluation.rules.extraction_test import (
     RoutedTransport,
     _answer,
@@ -39,6 +42,7 @@ from exp.optimize.evaluation.variance import build_test as build_fixture
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as VARIANCE_REPORT_TYPE
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
+from exp.optimize.evaluation.variance.evidence_tools import EvidenceBudget, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 
 _TRACES = ("alpha", "beta")
@@ -192,8 +196,38 @@ def test_actor_critic_dry_run_prints_the_summary_and_makes_no_call(
     assert result.exit_code == 0, result.output
     assert "G=3 attempts, J=1 judges, C=1 critics, up to K=2 points" in result.output
     assert "M=2 continuations" in result.output and "physical attempts" in result.output
+    assert "Upper bound" in result.output
     assert not actor.requests and not roles.requests
     assert not project.artifacts.list_ids(artifact_type="actor-critic-report")
+
+
+def test_actor_critic_cost_scales_role_draws_by_their_model_call_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each selector and critic row prices every model call its evidence-tool budget allows."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    base = critic_fixture._spec(project, job, judges=2)
+    tools = EvidenceToolProfile(
+        mode="read_only_tools", budget=EvidenceBudget(model_calls=3, tool_calls=4)
+    )
+    spec = base.model_copy(update={"selector_profile": tools, "critic_profile": tools})
+    forced, scaled = actor_critic_costs(project, base), actor_critic_costs(project, spec)
+    group = len(job_costs(project, base.initial))
+    roles = len(base.judges) + len(base.critics)
+    role_attempts = base.judges[0].maximum_physical_attempts
+
+    assert len(forced) == len(scaled)
+    assert [row.attempts for row in forced[group : group + roles]] == [role_attempts] * roles
+    assert [row.attempts for row in scaled[group : group + roles]] == [3 * role_attempts] * roles
+    assert forced[group + roles :] == scaled[group + roles :]
+    suffix = forced[group + roles]
+    assert suffix.attempts == base.continuation_physical_attempts * len(base.judges) * base.points
+    summary = " ".join(actor_critic_lines(spec))
+    assert (
+        "Upper bound (error-mining-v1): 2 selector draws x 3 model calls "
+        "(read_only_tools, 4 tool calls)" in summary
+    )
+    assert "1 critic draws x 3 model calls" in summary and "4 suffix jobs of 2" in summary
 
 
 def test_actor_critic_refused_consent_stops_before_any_provider(

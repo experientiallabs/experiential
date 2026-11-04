@@ -5,11 +5,16 @@ from __future__ import annotations
 import pytest
 
 from exp.common.core.artifacts import ArtifactInput
+from exp.common.models import BillingSource, ModelSnapshot
+from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.episodes import (
+    JUDGE_INPUT_BYTES,
     CriterionFinding,
     EpisodeAssessment,
     EpisodeEvent,
     EpisodeEvidence,
+    JudgeDefinition,
+    JudgeProfile,
     episode_reward,
 )
 
@@ -96,3 +101,47 @@ def test_citations_must_exist_in_the_judged_evidence() -> None:
     with pytest.raises(ValueError, match="does not judge"):
         _assessment(evidence).check_citations(other)
     assert ArtifactInput(artifact_id="x", sha256=_SHA).artifact_id == "x"
+
+
+def _profile(**changes: object) -> JudgeProfile:
+    """A judge profile with frozen placeholder digests."""
+    base: dict[str, object] = {
+        "model_alias": "judge",
+        "model": ModelSnapshot(
+            billing_source=BillingSource.CUSTOMER_MANAGED,
+            provider="openai",
+            model_id="judge-model",
+            capabilities_sha256="6" * 64,
+            connection_sha256="7" * 64,
+        ),
+        "prompt_version": "episode-judge-v1",
+        "prompt_sha256": "1" * 64,
+        "output_schema_sha256": "2" * 64,
+    }
+    return JudgeProfile.model_validate({**base, **changes})
+
+
+def test_profile_input_budget_defaults_to_the_author_request_default() -> None:
+    """The profile freezes the request ceiling, defaulting to the shared author default."""
+    default = AuthorSettings.model_fields["maximum_input_bytes"].default
+    assert JUDGE_INPUT_BYTES == default == _profile().maximum_input_bytes
+    assert _profile(maximum_input_bytes=4096).identity != _profile().identity
+    with pytest.raises(ValueError, match="maximum_input_bytes"):
+        _profile(maximum_input_bytes=10)
+
+
+def test_definition_requires_a_content_digest_for_the_rubric() -> None:
+    """A malformed or manifest-digest rubric_sha256 is refused."""
+    rubric = ArtifactInput(artifact_id="rubric-a", sha256="4" * 64)
+    base: dict[str, object] = {
+        "profile": _profile(),
+        "rubric": rubric,
+        "rubric_sha256": "5" * 64,
+        "task_sha256": _SHA,
+        "world_sha256": _SHA,
+    }
+    assert JudgeDefinition.model_validate(base).rubric_sha256 == "5" * 64
+    with pytest.raises(ValueError, match="rubric_sha256"):
+        JudgeDefinition.model_validate({**base, "rubric_sha256": "not-a-digest"})
+    with pytest.raises(ValueError, match="file content"):
+        JudgeDefinition.model_validate({**base, "rubric_sha256": rubric.sha256})

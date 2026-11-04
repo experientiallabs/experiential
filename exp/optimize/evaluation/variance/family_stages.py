@@ -27,7 +27,7 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
 from exp.common.tasks.facts import InstanceFacts
 from exp.optimize.evaluation.continuations.job import ContinuationJob
-from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario
+from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
 from exp.optimize.evaluation.variance.contrast import (
     OptionContrast,
     WitnessResult,
@@ -108,6 +108,7 @@ def run_variant(
     facts: InstanceFacts | None,
     repeats: int,
     code_revision: str,
+    required_state: frozenset[StatePart] = frozenset(),
 ) -> FamilyVariant:
     """Build, prove, replay, witness and contrast one scenario's variant, stopping at a gap.
 
@@ -122,6 +123,8 @@ def run_variant(
         facts: Instance facts the world model was given, if any.
         repeats: Pairs per selection contrast.
         code_revision: Producing source identity.
+        required_state: State parts the variant must hold beyond the baseline, such as
+            ``files``.
 
     Returns:
         The variant with every stage it reached.
@@ -135,6 +138,7 @@ def run_variant(
         facts=facts,
         code_revision=code_revision,
         maximum_model_calls=job.maximum_model_calls,
+        required_state=required_state,
     )
     row = FamilyVariant(scenario_id=scenario.scenario_id, variant=variant)
     reference = variant.reference

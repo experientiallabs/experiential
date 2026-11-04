@@ -30,7 +30,13 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonValue, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactInput,
+    ContractModel,
+    JsonValue,
+    Sha256,
+    sha256_json,
+)
 from exp.common.models import ModelSnapshot
 
 EVENT_CONTRACT_VERSION = "episode-events-v1"
@@ -63,6 +69,9 @@ EventOwner = Literal["actor", "user", "simulator", "world", "harness", "experime
 EventScope = Literal["context", "scored"]
 """Whether the scored actor is responsible for an event or it only supplies context."""
 
+JUDGE_INPUT_BYTES = 128000
+"""Default judge request ceiling; equal to the shared author-request default."""
+
 
 class JudgeProfile(ContractModel):
     """The judging model and its frozen request settings, fixed before any rubric exists.
@@ -78,6 +87,8 @@ class JudgeProfile(ContractModel):
         reasoning_effort: Requested reasoning effort, or None for the model default.
         evidence_tool_budget: Bounded read-only evidence-tool calls the judge may make before
             answering; 0 means the whole evidence is rendered into one request.
+        maximum_input_bytes: Whole serialized request ceiling per judge request. The default
+            equals the shared author-request default; changing it is a new profile.
     """
 
     model_alias: str = Field(min_length=1)
@@ -89,6 +100,7 @@ class JudgeProfile(ContractModel):
     maximum_output_tokens: int = Field(default=4096, ge=1, le=65536)
     reasoning_effort: str | None = None
     evidence_tool_budget: int = Field(default=0, ge=0, le=64)
+    maximum_input_bytes: int = Field(default=JUDGE_INPUT_BYTES, ge=512, le=512000)
 
     @property
     def identity(self) -> str:
@@ -102,7 +114,7 @@ class JudgeDefinition(ContractModel):
     Attributes:
         profile: The frozen judging profile.
         rubric: Saved rubric artifact the judge applies.
-        rubric_sha256: Digest of the rubric content.
+        rubric_sha256: Digest of the rubric file content (not the artifact manifest digest).
         event_contract: Version of the episode event contract.
         task_sha256: Digest of the exact task (instruction and initialization) being judged.
         world_sha256: Digest of the exact frozen world definition.
@@ -110,10 +122,19 @@ class JudgeDefinition(ContractModel):
 
     profile: JudgeProfile
     rubric: ArtifactInput
-    rubric_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rubric_sha256: Sha256
     event_contract: str = EVENT_CONTRACT_VERSION
-    task_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    world_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_sha256: Sha256
+    world_sha256: Sha256
+
+    @model_validator(mode="after")
+    def _rubric_content_digest(self) -> JudgeDefinition:
+        """Refuse a rubric digest that is really the rubric artifact's manifest digest."""
+        if self.rubric_sha256 == self.rubric.sha256:
+            raise ValueError(
+                "rubric_sha256 must digest the rubric file content, not the rubric artifact"
+            )
+        return self
 
     @property
     def identity(self) -> str:

@@ -84,13 +84,33 @@ re-asked with the broken rules as feedback and never committed. Durable sessions
 ## Screening: judges, critics and continuations
 
 `run_actor_critic` (`variance/actor_critic.py`, CLI action `actor-critic`) runs G attempts of a
-mining-probe task, picks one trajectory by seed, lets J judges choose up to K points and C critics
-estimate the success probability at each, then runs M continuations per point. Judges and critics
-read a privileged packet (every attempt, its grade, the group rate and the verifier) and both carry
-the eval-audit checklist. Critics are scored by squared error against measured rates; a critic with
-nothing graded is unscored. The judges' spread score is a screening heuristic only and never a
-training reward. Every measured rate records its `EstimateMeaning` (actor, harness, budget,
-sampling, world, verifier).
+mining-probe task, picks one trajectory by seed, lets J point selectors (`judges`) choose up to K
+points and C critics estimate the success probability at each, then runs M continuations per
+point. Point selectors, critics and the final episode judge are separate roles even when they
+share a model. Judges and critics read a privileged packet (every attempt, its grade, the group
+rate and the verifier) and both carry the eval-audit checklist. Critics are scored by squared
+error against measured rates; a critic with nothing graded is unscored. The judges' spread score
+is a screening heuristic only and never a training reward. Every measured rate records its
+`EstimateMeaning` (actor, harness, budget, sampling, world, verifier).
+
+Error mining is a versioned experiment (`protocol: "error-mining-v1"`).
+`ActorCriticSpec.error_mining` registers the reference counts G=16, J=8, C=8, K=4, M=8; every
+count, model setting, budget, seed, `references` entry and `actor_tier` stays an explicit field.
+The pick is a seeded uniform choice over the eligible population only (completed attempts with
+checkpoints and enough remaining calls); the report records the rule, seed digest, order and why
+each other attempt was ineligible, plus planned and actual populations and measured usage per
+role draw. The evidence packet addresses trace steps, actor outputs, grader evidence, checkpoint
+prefixes and registered references by locator and names every reference kind that is
+unavailable.
+
+`selector_profile` and `critic_profile` are `EvidenceToolProfile`s (`variance/evidence_tools.py`):
+`forced_response` (the default: one model call, no tools) or `read_only_tools`, which serves
+those locators from frozen documents under an `EvidenceBudget` per draw (model calls, tool calls,
+input and output tokens, wall clock, dollars). Nothing is executed and nothing reaches the actor.
+`run_analysis` saves every request, tool result and answer as an `AnalysisTranscript` that
+replays without calls. The CLI cost inventory is an upper bound: each selector and critic row is
+priced at `budget.model_calls` requests at the role's attempt ceiling, the group at its own
+ceiling and `J * K` suffix jobs of M continuations at the continuation ceiling.
 
 ## Decision families
 
@@ -99,11 +119,12 @@ sampling, world, verifier).
 1. Decision-state and scenario authors (`variance/authors.py`): options executable as competing
    actions, variation axes with permitted values grounded in rules or observations, invariants,
    single-proposition criteria. Scenario sets must pass `check_scenarios` (option identities,
-   permitted values, invariants compared before and after, distinct states, frozen instruction,
-   an observation witness for every deciding fact within the remaining calls).
+   permitted values, invariants compared before and after, distinct (state, obligation)
+   identities, the instruction axis, briefing leaks, an observation witness for every deciding
+   fact within the remaining calls).
 2. Coherent variants (`variance/variants.py`): fork before the first turn that revealed an edited
    fact, edit grounded world state there, check public context, instance facts and clock or pending
-   events, and prove restoration.
+   events, freeze every restorable state part and prove restoration.
 3. Executed witnesses and option contrasts (`variance/contrast.py`): the witness calls must show
    every deciding value without stating the answer; each option is forced from the same checkpoint
    through the preregistered action-contrast experiments.
@@ -113,10 +134,74 @@ sampling, world, verifier).
    (`variance/grader.py`), which separates insufficient evidence, ambiguous criteria, disagreement,
    pass, fail and plain uncertainty.
 
+**Initialization modes.** A scenario starts by `resume` (the coherent actor-visible prefix and its
+remaining calls) or `fresh_briefing` (an authored `FreshBriefing` at the fork, with the same
+remaining calls, restored under the original environment task). A briefing is leak-checked
+against an `ActorView` of what the actor had seen: it may not state the intended option's action,
+old or new values at edited paths, or decision-relevant values the actor never observed. Without
+a view a briefed scenario is refused. In a family, `DecisionFamilySpec.fresh_briefing` passes the
+point's `ActorView` to the scenario author and its checks, and `required_state` names state parts
+(for example `files`) that every variant checkpoint must hold beyond the baseline; both leave the
+draws identity unchanged while unset.
+
+**Instruction axis.** Instruction variation is its own declared axis
+(`DecisionState.instruction_axis`), separate from state axes and enabled by
+`instruction_variation`. Each value is `original`, `reworded`, `goal_change` or `consent_change`. A rewording is `equivalent_to` another value and changes no obligation,
+so a variant differing only by rewording is refused as decision variance; goal and consent
+changes cite their authorization and bind their own criteria. Any non-original instruction must
+start by `fresh_briefing`, since a resumed prefix already stated the original.
+
 `TrainingEligibility` (`variance/records.py`) is computed, never asserted, and lists every failed
 condition; training records exist only for eligible families. `export_family_harbor` packages a
 confirmed variant for Harbor, diagnostic unless the family is eligible and an executable
 qualification is supplied.
+
+## Authoring and freezing worlds
+
+`build_authoring_packet` (`variance/authoring_packet.py`) binds, for one decision family, the
+original trace and evidence sources (checked against the exposure plan, so no final-evaluation
+lineage reaches an author), the saved rule book with each rule's status, contradictions and open
+questions, the exact task digest (`variant_task_sha256` over task, instruction and state) of every
+variant, the pre-decision checkpoint and the decision brief, whose claims stay hypotheses. It is
+the only input of both authors.
+
+- `author_world` (`variance/world_author.py`) returns a `WorldSpec`: grounded runtime fields, rule
+  bindings, tool contracts, per-variant initializations, evidence hooks and induced transition
+  programs in the `transition(state, args, facts)` ABI, which induction validation must accept.
+- `author_rubric` (`variance/rubric_author.py`) returns a `Rubric` of atomic criteria with
+  applicability, source support, evidence needs, anchors, valid alternatives and a role
+  (`required_correctness` or `efficiency_diagnostic`); calibration cases are build-time controls,
+  never shown to the judge. `save_rubric` stores it as an `episode-rubric`, and
+  `judge_definition` binds it to a `JudgeProfile` configured before authoring.
+
+Each author is one forced draw on the shared author-response owner, bought once and replayed. It
+never reads the other author's output, and it answers either ready or `needs_research` with
+explicit research requests and no invented artifacts.
+
+`freeze_world` (`variance/world_freeze.py`) checks the simulator, never an actor. It runs the
+draft's fixtures and the rules stage's boundary workloads, probes every load-bearing precondition
+of a state-writing tool (a silent write under missing or failing authorization rejects the world),
+and records a `VariantFreeze` per variant: `frozen` (may qualify), `diagnostic` (an unsupported
+boundary) or `rejected`, with the start checkpoint proven to restore exactly.
+`review_compatibility` records every disagreement between the world and the rubric without
+reconciling them.
+
+## Judge and evidence contracts
+
+`JudgeProfile` (`variance/episodes.py`) fixes the judge model alias and snapshot, prompt version
+and digest, output-schema digest, temperature, output allowance, reasoning effort,
+`evidence_tool_budget` and `maximum_input_bytes` (default 128000, the shared author default).
+`JudgeDefinition` adds the rubric artifact, `rubric_sha256` (the digest of the rubric file's
+content, refused when it equals the artifact's manifest digest), the event contract
+(`episode-events-v1`), the task digest and the world digest. Any change is a new definition and
+new labels.
+
+`EpisodeEvidence` is ordered and append-only. Each `EpisodeEvent` names its kind, its owner
+(`actor`, `user`, `simulator`, `world`, `harness` or `experiment`) and its scope: `context` events
+(the inherited prefix) come before every `scored` event. `variance/episode_evidence.py` builds it
+from a continuation branch, an action-contrast cell (the imposed action is scored and owned by
+`experiment`) or a Harbor trial ledger, listing missing replies, unanswered calls and interrupted
+branches.
 
 ## Milestone comparison
 

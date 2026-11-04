@@ -246,13 +246,8 @@ def handle_actor_critic(context: ContinuationContext, action: ActorCriticAction)
     saved = store.artifacts.exists(spec.identity(revision) + "-result")
     if not saved:
         preflight_continuation_job(store, spec.initial)
-    judges, critics, points = len(spec.judges), len(spec.critics), spec.points
-    console.print(
-        f"Actor-critic: G={spec.initial.study.repeats} attempts, J={judges} judges, "
-        f"C={critics} critics, up to K={points} points per judge, M={spec.continuations} "
-        f"continuations per point (at most {judges * points} points). No training.",
-        markup=False,
-    )
+    for line in actor_critic_lines(spec):
+        console.print(line, markup=False)
     components = actor_critic_costs(store, spec)
     if not saved:
         review_components(console, components)
@@ -338,26 +333,70 @@ def rules_stage_identity(spec: RulesStageSpec, traces: tuple[Trace, ...], revisi
 
 
 def actor_critic_costs(project: ProjectStore, spec: ActorCriticSpec) -> tuple[CostComponent, ...]:
-    """Price the group job, every judge and critic draw, and every possible point's suffix.
+    """Price an upper bound for the group job, every role draw and every possible point's suffix.
 
-    Each judge may choose ``K`` distinct points, so up to ``J * K`` points each run one suffix
-    job at the continuation attempt ceiling.
+    The group job of ``G`` attempts runs under its own physical attempt ceiling. Each of the
+    ``J`` point-selector and ``C`` critic draws may make up to its evidence-tool budget's
+    ``model_calls`` requests, each at the role's attempt ceiling, so every role row is scaled by
+    that count. Each selector may choose ``K`` distinct points, so up to ``J * K`` points each run
+    one suffix job of ``M`` continuations at the continuation attempt ceiling. Saved work that
+    replays, unchosen points and draws that answer early make the real cost lower.
 
     Args:
         project: Project whose catalog prices the roles.
         spec: The registration.
 
     Returns:
-        The complete conservative inventory.
+        The complete upper-bound inventory.
     """
     suffix = spec.initial.model_copy(
-        update={"maximum_physical_attempts": spec.continuation_physical_attempts}
+        update={
+            "maximum_physical_attempts": spec.continuation_physical_attempts,
+            "study": spec.initial.study.model_copy(update={"repeats": spec.continuations}),
+        }
     )
+    selector_calls = spec.selector_profile.budget.model_calls
+    critic_calls = spec.critic_profile.budget.model_calls
     count = len(spec.judges) * spec.points
     return (
         *job_costs(project, spec.initial),
-        *(row for role in (*spec.judges, *spec.critics) for row in evaluation_costs(project, role)),
+        *(
+            row.scaled(selector_calls)
+            for role in spec.judges
+            for row in evaluation_costs(project, role)
+        ),
+        *(
+            row.scaled(critic_calls)
+            for role in spec.critics
+            for row in evaluation_costs(project, role)
+        ),
         *(row.scaled(count) for row in job_costs(project, suffix)),
+    )
+
+
+def actor_critic_lines(spec: ActorCriticSpec) -> tuple[str, ...]:
+    """Describe the error-mining counts and the draw multipliers the cost bound uses.
+
+    Args:
+        spec: The registration.
+
+    Returns:
+        Summary lines for the terminal.
+    """
+    judges, critics, points = len(spec.judges), len(spec.critics), spec.points
+    selector, critic = spec.selector_profile.budget, spec.critic_profile.budget
+    return (
+        f"Actor-critic: G={spec.initial.study.repeats} attempts, "
+        f"J={judges} judges, C={critics} critics, up to K={points} points per judge, "
+        f"M={spec.continuations} continuations per point (at most {judges * points} points). "
+        "No training.",
+        f"Upper bound ({spec.protocol}): {judges} selector draws x {selector.model_calls} "
+        "model calls "
+        f"({spec.selector_profile.mode}, {selector.tool_calls} tool calls), {critics} critic "
+        f"draws x {critic.model_calls} model calls ({spec.critic_profile.mode}, "
+        f"{critic.tool_calls} tool calls), {judges * points} suffix jobs of "
+        f"{spec.continuations} continuations under {spec.continuation_physical_attempts} "
+        "physical attempts each. Saved draws replay without a call.",
     )
 
 

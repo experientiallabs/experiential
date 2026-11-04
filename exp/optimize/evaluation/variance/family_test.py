@@ -43,7 +43,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
     _wire,
 )
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
-from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario
+from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
 from exp.optimize.evaluation.variance.contrast_test import _outcome
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
@@ -123,7 +123,7 @@ def _scenario(scenario_id: str, rows: int, option: str) -> JsonObject:
     }
 
 
-def _roles() -> list[JsonHttpResponse]:
+def _roles(scenarios: list[JsonObject] | None = None) -> list[JsonHttpResponse]:
     """Judge, critic, decision-state author and scenario author replies, in call order."""
     estimate = {"probability": 0.5, "rationale": "Base rate.", "evidence_refs": ["group"]}
     return [
@@ -152,10 +152,8 @@ def _roles() -> list[JsonHttpResponse]:
         _tool_reply(
             SCENARIO_TOOL,
             {
-                "scenarios": [
-                    _scenario("six", 6, "delete-1"),
-                    _scenario("seven", 7, "delete-2"),
-                ],
+                "scenarios": scenarios
+                or [_scenario("six", 6, "delete-1"), _scenario("seven", 7, "delete-2")],
                 "limitations": ["Two variants."],
             },
         ),
@@ -216,6 +214,7 @@ class _Stages:
         dispatches: Every first-time stage execution, by stage name.
         witnesses: Witnesses already produced, by scenario.
         contrasts: Contrasts already produced, by stage key.
+        required: State parts each variant build was asked to hold, by scenario.
     """
 
     report: ActorCriticReport
@@ -223,6 +222,7 @@ class _Stages:
     dispatches: list[str] = field(default_factory=list)
     witnesses: dict[str, WitnessResult] = field(default_factory=dict)
     contrasts: dict[str, OptionContrast] = field(default_factory=dict)
+    required: dict[str, frozenset[StatePart]] = field(default_factory=dict)
 
     def checkpoint(self, scenario_id: str) -> ArtifactInput:
         """Return the distinct, loadable checkpoint standing in for one variant."""
@@ -239,6 +239,7 @@ class _Stages:
         facts: InstanceFacts | None,
         code_revision: str,
         maximum_model_calls: int | None = None,
+        required_state: frozenset[StatePart] = frozenset(),
     ) -> VariantCheckpoint:
         """Return a persisted variant with no fork before the decision; seven needs review.
 
@@ -251,11 +252,13 @@ class _Stages:
             facts: Unused instance facts.
             code_revision: Unused revision.
             maximum_model_calls: Unused allowance.
+            required_state: Recorded state parts the variant must hold.
 
         Returns:
             The stand-in variant.
         """
         del project, decision, facts, code_revision, maximum_model_calls
+        self.required[scenario.scenario_id] = required_state
         assert branch_checkpoints[0] == base
         reference = self.checkpoint(scenario.scenario_id)
         checks = (CoherenceCheck(name="trajectory", status="passed", detail="one boundary"),)
@@ -464,13 +467,14 @@ def _setup(
     monkeypatch: pytest.MonkeyPatch,
     *,
     confirm: dict[str, tuple[int, int]] | None = None,
+    scenarios: list[JsonObject] | None = None,
 ) -> _Setup:
     """Run the actor-critic stage for real and wire stand-ins for the executed owners."""
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     actor_spec = _spec(project, job)
     group = [reply for row in (2, 3, 4) for reply in (_edit(row), _done())]
     continuations = [_edit(2), _done(), _edit(3), _done(), _done(), _done()]
-    _, roles = _wire(monkeypatch, group + continuations, _roles())
+    _, roles = _wire(monkeypatch, group + continuations, _roles(scenarios))
     exposure = _exposure(project, job, "mining_probes")
     report = run_actor_critic(project, actor_spec, exposure=exposure, code_revision="test")
     stages = _Stages(report=report, confirm=confirm or {})
@@ -673,3 +677,47 @@ def test_ambiguous_rubric_criteria_block_eligibility_and_go_back_to_authoring(
     assert report.ambiguous_criteria == ("rows",)
     assert [c.name for c in report.eligibility.conditions if not c.holds] == ["rubric_unambiguous"]
     assert report.records is None
+
+
+def test_fresh_briefing_scenarios_flow_through_the_family_with_required_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With fresh briefings enabled the author's view admits a briefed scenario; else refused."""
+    briefed = {
+        **_scenario("seven", 7, "delete-2"),
+        "initialization": "fresh_briefing",
+        "briefing": {"text": "Pick up the workbook task from where it stands."},
+    }
+    scenarios = [_scenario("six", 6, "delete-1"), briefed]
+    setup = _setup(tmp_path, monkeypatch, scenarios=scenarios)
+    spec = setup.spec.model_copy(update={"fresh_briefing": True, "required_state": ("files",)})
+
+    report = setup.run(spec)
+
+    assert report.scenarios is not None and report.scenarios.accepted, report.scenarios
+    assert report.scenarios.scenarios is not None
+    starts = [s.initialization for s in report.scenarios.scenarios.scenarios]
+    assert starts == ["resume", "fresh_briefing"]
+    assert setup.stages.required == {"six": frozenset({"files"}), "seven": frozenset({"files"})}
+    assert spec.draws_identity(setup.report, 0, "test") != setup.spec.draws_identity(
+        setup.report, 0, "test"
+    )
+
+
+def test_a_fresh_briefing_without_the_actor_view_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec that does not enable fresh briefings gives the checks no view, so they refuse."""
+    briefed = {
+        **_scenario("seven", 7, "delete-2"),
+        "initialization": "fresh_briefing",
+        "briefing": {"text": "Pick up the workbook task from where it stands."},
+    }
+    setup = _setup(tmp_path, monkeypatch, scenarios=[_scenario("six", 6, "delete-1"), briefed])
+
+    report = setup.run()
+
+    assert report.scenarios is not None and not report.scenarios.accepted
+    assert any("actor's view" in p.reason for p in report.scenarios.problems)
+    assert report.failure is not None and report.failure.startswith("scenarios:")
+    assert setup.stages.required == {}

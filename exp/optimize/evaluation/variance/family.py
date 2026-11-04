@@ -83,9 +83,12 @@ from exp.optimize.evaluation.variance.authors import (
     relevant_rules,
 )
 from exp.optimize.evaluation.variance.contracts import (
+    ActorView,
     DecisionState,
     EstimationPoint,
     ScenarioLimits,
+    StatePart,
+    message_texts,
 )
 from exp.optimize.evaluation.variance.contrast import FlipVerdict, family_flip
 from exp.optimize.evaluation.variance.coverage import uncovered_tools
@@ -135,7 +138,13 @@ class DecisionFamilySpec(ContractModel):
         confirmation_seed: Seed named in every confirmation draw's selector; a new seed draws a
             new confirmation.
         facts: Instance facts the world model was given for the task, if any.
-        instruction_variation: Whether scenarios may replace the task instruction.
+        instruction_variation: Whether scenarios may replace the task instruction. A changed
+            instruction must start by ``fresh_briefing``, so it also needs ``fresh_briefing``.
+        fresh_briefing: Whether scenarios may start the actor on an authored fresh briefing.
+            The scenario author and its checks then receive the actor's view at the point, so
+            briefings are leak-checked against what the actor had seen.
+        required_state: State parts every variant must hold beyond the baseline, such as
+            ``files``; a variant that cannot restore one is refused.
         grading: Rubric grading controls.
         tiers: Tier label per actor model identity, when tiers are recorded.
         dispositions: Recorded dispositions of audit findings. They never re-key a draw.
@@ -151,9 +160,20 @@ class DecisionFamilySpec(ContractModel):
     confirmation_seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
     facts: InstanceFacts | None = None
     instruction_variation: bool = False
+    fresh_briefing: bool = False
+    required_state: tuple[StatePart, ...] = Field(default=(), max_length=8)
     grading: GraderSettings = GraderSettings()
     tiers: dict[str, str] = Field(default_factory=dict)
     dispositions: tuple[AuditDisposition, ...] = ()
+
+    def _unkeyed(self) -> set[str]:
+        """Fields left out of the draws identity: dispositions, and new fields at their defaults.
+
+        Leaving ``fresh_briefing`` and ``required_state`` out while unset keeps every family saved
+        before they existed replaying under its identity.
+        """
+        unset = {"fresh_briefing"} if not self.fresh_briefing else set()
+        return {"dispositions", *unset, *(() if self.required_state else ("required_state",))}
 
     def draws_identity(self, report: ActorCriticReport, point: int, code_revision: str) -> str:
         """Bind everything the draws read, leaving dispositions out so they never re-key one.
@@ -169,7 +189,7 @@ class DecisionFamilySpec(ContractModel):
         return stable_id(
             "decision-family-draws",
             {
-                "spec": sha256_json(self.model_dump(mode="json", exclude={"dispositions"})),
+                "spec": sha256_json(self.model_dump(mode="json", exclude=self._unkeyed())),
                 "report": sha256_json(report),
                 "point": point,
                 "authors": authors_protocol_sha256(),
@@ -537,6 +557,14 @@ def _continue(
     limits = ScenarioLimits(
         tools=frozenset(tool.name for tool in context.tools), remaining_calls=remaining
     )
+    view = (
+        ActorView(
+            instruction=checkpoint.task.instruction,
+            observed=message_texts(checkpoint.actor.messages),
+        )
+        if spec.fresh_briefing
+        else None
+    )
     scenarios = author_scenarios(
         project,
         spec.scenario_author,
@@ -546,6 +574,7 @@ def _continue(
         identity=draws + "-scenarios",
         code_revision=code_revision,
         sources=(base.context, *(() if decision.response is None else (decision.response,))),
+        view=view,
     )
     base = base.model_copy(update={"scenarios": scenarios})
     findings.extend(
@@ -574,6 +603,7 @@ def _continue(
             facts=spec.facts,
             repeats=spec.repeats,
             code_revision=code_revision,
+            required_state=frozenset(spec.required_state),
         )
         for scenario in scenarios.scenarios.scenarios
     ]
