@@ -21,11 +21,12 @@ from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
+from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.fidelity.retrieval_binding import rag_index_embedder_alias
 from exp.optimize.evaluation.induction.episodes import trace_episode
-from exp.optimize.evaluation.rules.stage import load_rulebook
+from exp.optimize.evaluation.rules.stage import RulesStageSpec, load_rulebook
 from exp.optimize.evaluation.variance.authoring_packet import (
     SourceRef,
     build_authoring_packet,
@@ -38,6 +39,7 @@ from exp.optimize.evaluation.variance.build_records import (
 from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.pipeline_spec import (
+    AuthoringSettings,
     BuildOutputs,
     DecisionVarianceSpec,
     RulesOutputs,
@@ -60,8 +62,26 @@ from exp.simulation.retrieval.embedding import RAGEmbedderBinding, default_rag_e
 
 
 def rubric_draws(profile: RubricAuthoringProfile) -> int:
-    """Return the most draws one agentic rubric authoring makes under ``profile``."""
-    return len(profile.variants) * (4 if profile.agentic else 1) + 1
+    """Return the most draws one agentic rubric authoring makes, design critic reviews included."""
+    return profile.draws()
+
+
+def library_draws(authoring: AuthoringSettings) -> int:
+    """Return the most labeling and curation draws one family's library update makes.
+
+    Each labeler variant labels and may repair once; the curator plans, proposes operations and
+    may repair once.
+    """
+    if authoring.library_id is None:
+        return 0
+    return 2 * len(authoring.labeler_variants) + 3
+
+
+def revision_draws(authoring: AuthoringSettings) -> int:
+    """Return the most reviser and design-critic draws of one family's rubric revision."""
+    critic = authoring.rubric_profile.critic
+    per_round = 1 + (0 if critic is None else critic.draws())
+    return authoring.revision_rounds * per_round
 
 
 def local_id(value: str) -> str:
@@ -116,6 +136,45 @@ def observed_episodes(
         if episode is not None:
             episodes.append(episode)
     return tuple(episodes)
+
+
+def rules_costs(
+    project: ProjectStore, spec: RulesStageSpec, traces: int
+) -> tuple[tuple[CostComponent, ...], str]:
+    """Price a rules stage's draws and describe them.
+
+    Agentic research buys one bounded draw per trace, variant and round, then one weighing per
+    merged rule and one condensation. The rule count is known only after research, so the
+    weighings are listed with their per-rule bound and left unpriced in the total.
+
+    Args:
+        project: Project whose catalog prices the author.
+        spec: The registration.
+        traces: World-learning traces read, at most.
+
+    Returns:
+        The cost components and one line describing them.
+    """
+    author = spec.author
+    per_call = evaluation_costs(project, author)
+    if spec.profile == "single_draw":
+        line = f"{traces} extraction draws with {author.model_alias}"
+        return tuple(row.scaled(traces) for row in per_call), line
+    research = traces * spec.draws_per_trace * spec.rounds * spec.research.budget.model_calls
+    condensation = spec.condensation.budget.model_calls
+    weighing = spec.weighing.budget.model_calls
+    known = [row.scaled(research + condensation) for row in per_call]
+    each = sum(row.usd or 0.0 for row in per_call) * weighing
+    priced = all(row.usd is not None for row in per_call)
+    known.append(CostComponent(f"{author.model_alias} weighing (per merged rule)", weighing, None))
+    line = (
+        f"{traces * spec.draws_per_trace * spec.rounds} research draws (up to {research} calls), "
+        f"one weighing draw per merged rule (up to {weighing} calls, "
+        + (f"${each:.6f}" if priced else "unpriced")
+        + f" each; the rule count is known after research) and one condensation draw (up to "
+        f"{condensation} calls) with {author.model_alias}"
+    )
+    return tuple(known), line
 
 
 def trace_search(

@@ -45,6 +45,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
 from exp.optimize.evaluation.variance.admission import VariantJudging
 from exp.optimize.evaluation.variance.admission_test import bound_judging, unfrozen_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
+from exp.optimize.evaluation.variance.briefing_review import DEFAULT_REVIEW_VARIANTS, REVIEW_TOOL
 from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
 from exp.optimize.evaluation.variance.contrast_test import _outcome
@@ -160,6 +161,13 @@ def _roles(scenarios: list[JsonObject] | None = None) -> list[JsonHttpResponse]:
                 or [_scenario("six", 6, "delete-1"), _scenario("seven", 7, "delete-2")],
                 "limitations": ["Two variants."],
             },
+        ),
+        # Every fresh briefing is leak-reviewed under each reading stance; these reviews are clean.
+        *(
+            _tool_reply(REVIEW_TOOL, {"verdict": "clean", "limitations": ["Fixture review."]})
+            for scenario in scenarios or ()
+            if scenario.get("initialization") == "fresh_briefing"
+            for _ in DEFAULT_REVIEW_VARIANTS
         ),
     ]
 

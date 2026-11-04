@@ -299,6 +299,38 @@ runs the rubric prompt variants independently, critiques each draft against the 
 checks (authoritative and fed back), and reconciles at least two ready drafts; a merge that drops
 any disagreement `host_disagreements` found is refused as a silent resolution.
 
+### Behavior library, labeling, curation and the design critic
+
+Rubrics start from a versioned behavior library (`variance/behavior_profiles.py`) instead of
+rediscovering the same behaviors per family. A version holds bad-behavior linters (detection
+guidance, the evidence a finding needs, labeled positive and negative examples with locators,
+false-positive notes), cross-task behavior profiles and task-scoped criteria; each version is its
+own `behavior-library` artifact citing its parent and the evidence behind every change. In the
+pipeline the library is on by default (`authoring.library_id`, `agent-behavior`). For every
+family, before its rubric is authored:
+
+1. **Labeling** (`variance/behavior_labeling.py`, `label_behaviors`): the labeler prompt variants
+   (`authoring.labeler_variants`) read the family's development packet, never final-evaluation
+   rows, and propose behaviors with exact locators; a refused answer gets one repair draw.
+2. **Curation** (`variance/behavior_curation.py`, `curate_library`): when labels exist, the
+   curator (`authoring.curator_variant`) plans, then proposes typed operations (merge, add
+   evidence, split, narrow, reject) that the host applies by structure into the next version.
+   The family binds the version its own curation produced, so a resumed family never picks up a
+   version a later family saved.
+3. **Authoring and revision**: `author_rubric_agentic` and `revise_until_stable` receive that
+   version. The rubric records one decision per offered entry, cites the version, and copies the
+   judge guidance and examples into `behavior_guidance`, which the judge reads and actors never
+   see. Before authoring, every actor-visible text of the family (the task, instruction values
+   and briefings) passes `refuse_actor_exposure`, so no judge-only guidance reaches an actor.
+
+The design critic (`variance/rubric_critic.py`, `DesignCriticProfile`) is on by default
+(`authoring.rubric_profile.critic`): several critic variants review every drafted and revised
+rubric against the design checks with forced, cited verdicts, and the host refuses every
+violation. The plan prices labeling (two draws per labeler variant), curation (three draws),
+authoring including critic reviews (`RubricAuthoringProfile.draws`) and one reviser plus critic
+review per revision round. Judged criteria have three roles: `required_correctness` decides
+success; `efficiency_diagnostic` and `behavior_diagnostic` are reported and never decide it.
+
 `variance/rubric_revision.py` revises a rubric from judging. `judged_problems` collects
 judge-reported rubric problems, calibration misses, coverage gaps attributable to the rubric and
 compatibility disagreements (an unjudged target blocks acceptance but is never sent as a rubric
@@ -447,13 +479,27 @@ Legacy modes that keep their mechanical contract and are never used for decision
 `exp/simulation/mining/traceml.py` labels every step of a trajectory (a tool call with its result,
 or a visible message) against the `ActionLabel` taxonomy through the existing decision tagging
 seam, over the `step` view: one unit per step (`step_units`) with the task, a few earlier steps
-and the focal step, row identity `<trace_id>::<locator>`. `derive_moves` derives pivots (a
-strategy change after evidence; retrying one target is recovery) and returns (back to an earlier
-state or a target used before a pivot) from labels plus tool and state evidence. Uncertain steps
+and the focal step, row identity `<trace_id>::<locator>`. Pivots (a strategy change prompted by
+evidence) and returns (back to an earlier state or an approach left before a strategy change) are
+judged by a model (`exp/simulation/mining/traceml_moves.py`): each window of labelled steps, with
+its calls, results, labels and mechanical state evidence, is judged under several reading stances
+with forced, cited answers; code checks only coverage and citations, and a move is kept by strict
+majority of the usable judgments (minority claims are recorded as contested). The pipeline's
+`traceml.move_judge` is required whenever the stage runs, and every draw is saved and replayed.
+With `traceml.error_bank`, each tier's attempts are also error tagged as wholes (the coalition's
+mistake patterns) and step by step (error-ranked points, recorded for review). Uncertain steps
 stay in every count and refused traces are listed in the coverage manifest. The saved
 `traceml-labels` artifact (`persist_traceml_labels`) carries labels, moves, coverage and per-tier
 comparisons; selectors, critics and rubric authors may read it, and `candidate_points` maps moves
 to actor-critic checkpoint indices.
+
+## Fresh briefings
+
+A fresh briefing's entitled paths are checked in code (they exist, are not edited and show values
+the actor observed). Whether the briefing text leaks the intended option, an edited value or
+unobserved knowledge is judged by the model leak reviewer (`variance/briefing_review.py`) under
+three reading stances, with findings that quote the briefing and cite the actor's view; any
+finding or unusable review refuses the scenario set.
 
 ## Cross-talk probe
 
@@ -514,6 +560,20 @@ What the stages read beyond their own owners lives in `variance/pipeline_inputs.
   task's initial context), the world-learning sources, the rule book and the observed episodes,
   with a brief that proposes no option or axis and a single baseline variant. A registered rubric
   overrides it.
+- **Error tags, clusters and probes** (`variance/pipeline_errors.py`). The build stage binds an
+  admitted naming client for `build.naming_alias` when the build names its tag clusters, prices
+  the plan's naming calls, and lists the error-tag view plan, the cluster admission and, once
+  saved, the admissions and selected probes in the plan. Error mining refuses a job whose task
+  the build did not select as a probe. With `traceml.error_bank`, the coalition's mistake
+  patterns come from each tier's attempt error tags, one pattern per tier and proposition.
+- **Rules research search.** With `mining.retrieval`, the rules stage's research draws query
+  the same world-learning search the selectors use. The plan prices research, weighing (per
+  merged rule, listed as unpriced until research ends) and condensation draws.
+- **Decision variance.** On by default (`authoring.decision_variance`): each family measures
+  every confirmed variant's choice shift, consequence and clarity from judged free continuations
+  (`decision_free_repeats`), with an open-weight classifier (`decision_classifier`, default the
+  scenario author) and clarity reviewer (`decision_reviewer`, default the rubric author), and
+  admission requires the joint verdict.
 - **Option actions.** The decision-state author gives each option its executable first call
   (`DecisionOption.call`). When `authoring.actions` is empty the family forces those calls
   (`option_calls`); an option without a call becomes the family's recorded failure. Explicit

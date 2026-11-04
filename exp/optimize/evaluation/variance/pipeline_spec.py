@@ -45,7 +45,10 @@ from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, VariantJudging
+from exp.optimize.evaluation.variance.behavior_curation import CuratorVariant
+from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
+from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
@@ -53,8 +56,11 @@ from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.rubric_agent import RubricAuthoringProfile
+from exp.optimize.evaluation.variance.rubric_critic import DesignCriticProfile
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
 from exp.optimize.evaluation.variance.world_agent import DEFAULT_PROMPT_SETS
+from exp.simulation.mining.error_tags import TaskErrorRank
+from exp.simulation.mining.tag_cluster_names import ClusterNamer
 from exp.simulation.mining.traceml_moves import (
     DEFAULT_MOVE_REPAIRS,
     DEFAULT_MOVE_VARIANTS,
@@ -109,9 +115,22 @@ class BuildSettings(ContractModel):
 
     Attributes:
         spec: The variance build: exposure split before tagging, banks, tag rules and policy.
+        naming_alias: Catalog alias of the admitted model that names the tag clusters; required
+            when ``spec.cluster_naming`` is set.
+        naming_deadline_hours: Hours the naming calls may run, from the stage start.
     """
 
     spec: VarianceBuildSpec
+    naming_alias: str | None = Field(default=None, min_length=1)
+    naming_deadline_hours: int = Field(default=6, ge=1, le=72, strict=True)
+
+    @model_validator(mode="after")
+    def _namer(self) -> Self:
+        """Require a naming model whenever the build names its clusters."""
+        named = self.spec.cluster_naming is not None and self.spec.clustering is not None
+        if named and self.naming_alias is None:
+            raise ValueError("cluster naming needs build.naming_alias, an admitted naming model")
+        return self
 
 
 class RulesSettings(ContractModel):
@@ -151,6 +170,10 @@ class TraceMLSettings(ContractModel):
         move_variants: Reading stances every step window is judged under.
         move_window: How each attempt is cut into judged windows.
         move_repairs: Revisions a move judge may make after failing its citation checks.
+        error_bank: Local error bank (read from ``bank_root``) each tier's attempts are tagged
+            with, as wholes for the coalition's mistake patterns and step by step for error-ranked
+            points; None tags no attempt errors.
+        error_families: Families of the error bank to ask; all when empty.
     """
 
     enabled: bool = True
@@ -163,6 +186,8 @@ class TraceMLSettings(ContractModel):
     move_variants: tuple[str, ...] = Field(default=DEFAULT_MOVE_VARIANTS, min_length=1)
     move_window: MoveWindowSpec = MoveWindowSpec()
     move_repairs: int = Field(default=DEFAULT_MOVE_REPAIRS, ge=0, le=3, strict=True)
+    error_bank: str | None = Field(default=None, min_length=1)
+    error_families: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _judged(self) -> Self:
@@ -254,7 +279,17 @@ class AuthoringSettings(ContractModel):
             calls, and a family whose option has no call records that as its failure.
         world_prompt_sets: World-author prompt sets, each a separate trajectory.
         world_repairs: Repair rounds per world-author trajectory.
-        rubric_profile: Rubric-author prompt variants and phases.
+        rubric_profile: Rubric-author prompt variants and phases. Its LLM design critic is on by
+            default and reviews every drafted and revised rubric.
+        library_id: Behavior library each family labels its development coalition into, curates
+            and authors and revises its rubric from; None authors without a library.
+        labeler_variants: Labeler prompt variants run over each family's packet.
+        curator_variant: Curator prompt variant that turns labels into the next library version.
+        decision_variance: Measure each confirmed variant's decision variance (choice shift,
+            consequence, clarity) from judged free continuations and require it for admission.
+        decision_classifier: Open-weight choice classifier; None uses ``scenario_author``.
+        decision_reviewer: Open-weight clarity reviewer; None uses ``rubric_author``.
+        decision_free_repeats: Free continuations per measured state checkpoint.
         families_per_tier: Highest-ranked points of each tier's run turned into families.
         maximum_variants: Most scenarios one family may author; more is refused before any
             world is authored, so the up-front price stays an upper bound.
@@ -279,7 +314,16 @@ class AuthoringSettings(ContractModel):
     actions: dict[str, ToolCall] = Field(default_factory=dict)
     world_prompt_sets: tuple[str, ...] = Field(default=DEFAULT_PROMPT_SETS, min_length=1)
     world_repairs: int = Field(default=2, ge=0, le=8, strict=True)
-    rubric_profile: RubricAuthoringProfile = RubricAuthoringProfile()
+    rubric_profile: RubricAuthoringProfile = RubricAuthoringProfile(critic=DesignCriticProfile())
+    library_id: str | None = Field(default="agent-behavior", pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    labeler_variants: tuple[LabelerVariant, ...] = Field(
+        default=("mistakes-first", "recoveries-first", "user-friction-first"), min_length=1
+    )
+    curator_variant: CuratorVariant = "consolidate-first"
+    decision_variance: bool = True
+    decision_classifier: AuthorSettings | None = None
+    decision_reviewer: AuthorSettings | None = None
+    decision_free_repeats: int = Field(default=8, ge=2, le=100, strict=True)
     families_per_tier: int = Field(default=1, ge=1, le=8, strict=True)
     maximum_variants: int = Field(default=4, ge=2, le=16, strict=True)
     repeats: int = Field(default=8, ge=1, le=100, strict=True)
@@ -298,6 +342,16 @@ class AuthoringSettings(ContractModel):
         if len(self.actions) == 1:
             raise ValueError("give two or more option actions, or none to derive them")
         return self
+
+    def decision_measure(self) -> DecisionMeasureSpec | None:
+        """Return the family's decision-variance measurement, or None when it is off."""
+        if not self.decision_variance:
+            return None
+        return DecisionMeasureSpec(
+            classifier=self.decision_classifier or self.scenario_author,
+            reviewer=self.decision_reviewer or self.rubric_author,
+            free_repeats=self.decision_free_repeats,
+        )
 
 
 class VariantQualification(ContractModel):
@@ -610,12 +664,14 @@ class StageDependencies:
     Attributes:
         build_tagger: Tagger for the variance build, or None for its admitted default.
         build_constructor: Admitted world-model constructor, when the build reconstructs.
+        build_namer: Cluster naming model, or None for the admitted ``build.naming_alias``.
         traceml_tagger: Tagger for TraceML labels, or None for the admitted decision tagger.
         harbor_root: Directory receiving Harbor exports, or None for the project runtime
             directory.
     """
 
     build_tagger: DecisionsTraceTagger | None = None
+    build_namer: ClusterNamer | None = None
     build_constructor: Constructor | None = None
     traceml_tagger: TraceTagger | None = None
     harbor_root: Path | None = None
@@ -654,6 +710,8 @@ class BuildOutputs(ContractModel):
         rules_traces: World-learning traces for the rules stage, in order.
         index: Scoped, fit-only retrieval index over world-learning traces, when one was saved.
         retrieval_scope: The scope that index was built with.
+        selected_probes: Probe tasks the build selected for error mining, most error-laden first.
+        probe_ranking: Every probe task ranked by its source traces' error tags.
     """
 
     report: ArtifactInput
@@ -664,6 +722,8 @@ class BuildOutputs(ContractModel):
     retrieval_scope: CorpusScope | None = None
     trace_dataset: ArtifactInput
     rules_traces: tuple[str, ...] = Field(min_length=1)
+    selected_probes: tuple[str, ...] = ()
+    probe_ranking: tuple[TaskErrorRank, ...] = ()
 
 
 class RulesOutputs(ContractModel):
@@ -689,10 +749,14 @@ class TraceMLOutputs(ContractModel):
     Attributes:
         groups: Each tier's saved group of attempts.
         labels: Each tier's saved ``traceml-labels`` artifact.
+        errors: Each tier's saved ``error-tags`` over its whole attempts, when tagged.
+        error_steps: Each tier's saved ``error-steps`` over its attempts' steps, when tagged.
     """
 
     groups: dict[str, ArtifactInput] = Field(default_factory=dict)
     labels: dict[str, ArtifactInput] = Field(default_factory=dict)
+    errors: dict[str, ArtifactInput] = Field(default_factory=dict)
+    error_steps: dict[str, ArtifactInput] = Field(default_factory=dict)
 
 
 class TierMining(ContractModel):

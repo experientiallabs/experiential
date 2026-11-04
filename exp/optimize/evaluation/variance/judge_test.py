@@ -604,3 +604,13 @@ def test_an_agentic_judge_with_its_reads_spent_is_forced_through_the_phases(
     assert "unread" in str(_sent(transport, 3)["messages"])
     assert assessment.status == "malformed"
     assert assessment.failure is not None and "without reading scored events" in assessment.failure
+
+
+def test_behavior_diagnostics_are_a_role_of_their_own_and_guidance_is_described() -> None:
+    """Library-cited behavior criteria are diagnostics, never success, and the prompt says so."""
+    from exp.optimize.evaluation.variance import judge as judge_module
+    from exp.optimize.evaluation.variance.judge_prompt import JUDGE_PROMPT
+
+    assert "behavior_diagnostic" in judge_module._ROLES
+    assert judge_module._REQUIRED == "required_correctness"
+    assert "behavior_guidance" in JUDGE_PROMPT and "behavior_diagnostic" in JUDGE_PROMPT

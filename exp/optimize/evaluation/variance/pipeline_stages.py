@@ -65,10 +65,24 @@ from exp.optimize.evaluation.variance.build_records import (
 )
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
-from exp.optimize.evaluation.variance.evidence import ReferenceSource
+from exp.optimize.evaluation.variance.evidence import (
+    ReferenceSource,
+    TraceSearch,
+    open_trace_search,
+)
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
+from exp.optimize.evaluation.variance.pipeline_errors import (
+    attempt_error_points,
+    build_lines,
+    cluster_namer,
+    error_tag_costs,
+    naming_costs,
+    probe_line,
+    tag_tier_errors,
+    tier_error_bank,
+)
 from exp.optimize.evaluation.variance.pipeline_inputs import (
     admitted_transport,
     mining_rubric,
@@ -76,6 +90,7 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     retrieval_embedder,
     rubric_author_sha256,
     rubric_draws,
+    rules_costs,
     trace_search,
     world_learning_traces,
 )
@@ -200,21 +215,27 @@ class _BuildStage:
         lines = (
             f"Variance build: traces by role {roles}; exposure fixed before tagging; "
             f"{plan.decision_calls} decision calls; final_evaluation is never tagged.",
+            *build_lines(project, spec, plan),
         )
         if plan.saved:
             return (), (*lines, "The variance build report is saved; it replays.")
         costs = variance_build_costs(project, plan, spec.build.spec.decision_alias)
-        return cost_lines(costs), lines
+        return cost_lines((*costs, *naming_costs(project, spec, plan))), lines
 
     def run(self, context: StageContext) -> StageRun:
         """Run or replay the variance build."""
         project, spec = context.project, context.spec.build.spec
+        namer = context.dependencies.build_namer
+        if namer is None and spec.cluster_naming is not None:
+            plan = plan_variance_build(project, spec, code_revision=context.code_revision)
+            namer = None if plan.saved else cluster_namer(context, plan)
         report = run_variance_build(
             project,
             spec,
             code_revision=context.code_revision,
             tagger=context.dependencies.build_tagger,
             constructor=context.dependencies.build_constructor,
+            namer=namer,
         )
         saved = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
         outputs = BuildOutputs(
@@ -226,12 +247,18 @@ class _BuildStage:
             rules_traces=report.rules_stage_traces,
             index=report.index,
             retrieval_scope=report.retrieval_scope,
+            selected_probes=report.selected_probes,
+            probe_ranking=report.probe_ranking,
         )
         summary: JsonObject = {
             "exposure": report.exposure.artifact_id,
             "world_model": report.world_model.artifact_id,
             "rules_traces": len(report.rules_stage_traces),
             "probes": len(report.probes),
+            "selected_probes": list(report.selected_probes),
+            "cluster_admitted": None
+            if report.admission is None
+            else len(report.admission.admitted),
         }
         refs = (saved, report.exposure, report.world_model, report.tag_retrieval, report.index)
         return StageRun(outputs, refs, summary)
@@ -251,14 +278,13 @@ class _RulesStage:
         """Price one extraction draw per world-learning trace, up to the trace cap."""
         del code_revision
         settings = spec.rules
-        traces = settings.maximum_traces
-        costs = tuple(row.scaled(traces) for row in evaluation_costs(project, settings.spec.author))
+        costs, draws = rules_costs(project, settings.spec, settings.maximum_traces)
         challenge = settings.challenge and settings.spec.base_state is not None
+        bound = "bound into" if settings.bind_rule_book else "kept out of"
         lines = (
-            f"Rules stage: up to {traces} extraction draws with {settings.spec.author.model_alias}"
-            f", boundary workloads {'executed in the bound world' if challenge else 'not run'}; "
-            f"the rule book is {'bound into' if settings.bind_rule_book else 'kept out of'} the "
-            "mining runtime before any probe.",
+            f"Rules stage: up to {draws}; boundary workloads "
+            f"{'executed in the bound world' if challenge else 'not run'}; the rule book is "
+            f"{bound} the mining runtime before any probe.",
         )
         if challenge:
             costs += _runtime_allowance(project, spec.mining.job)
@@ -277,6 +303,7 @@ class _RulesStage:
             )
         world = _world(spec.mining.job, build, None)
         challenge = spec.rules.challenge and spec.rules.spec.base_state is not None
+        search = _rules_search(context, build, exposure)
         if challenge:
             with RuntimeChallenges(project, world, refusal=spec.rules.spec.refusal) as executor:
                 report = run_rules_stage(
@@ -286,10 +313,16 @@ class _RulesStage:
                     traces=traces,
                     code_revision=revision,
                     challenge=executor,
+                    search=search,
                 )
         else:
             report = run_rules_stage(
-                project, spec.rules.spec, exposure=exposure, traces=traces, code_revision=revision
+                project,
+                spec.rules.spec,
+                exposure=exposure,
+                traces=traces,
+                code_revision=revision,
+                search=search,
             )
         saved = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
         job = spec.mining.job
@@ -361,7 +394,11 @@ class _TraceMLStage:
         del project
         if not spec.traceml.enabled:
             return {}
-        return {"bank": sha256_json(traceml_bank(spec.traceml.bank_root))}
+        errors = tier_error_bank(spec)
+        return {
+            "bank": sha256_json(traceml_bank(spec.traceml.bank_root)),
+            **({} if errors is None else {"error_bank": sha256_json(errors)}),
+        }
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
@@ -384,12 +421,20 @@ class _TraceMLStage:
             costs.extend(
                 row.scaled(judged) for row in evaluation_costs(project, settings.move_judge)
             )
+        costs.extend(error_tag_costs(project, spec))
         lines = (
             f"TraceML: {len(spec.mining.actors)} tier groups of G={spec.mining.attempts}, up to "
             f"{steps} steps each labelled with {bank.bank_id} on {settings.decision_alias}; "
             "labels are registered as each tier's selector and critic reference.",
             f"TraceML moves: each attempt's windows judged under {len(settings.move_variants)} "
             f"stances on {settings.move_judge.model_alias}, up to {judged} draws per tier.",
+            "TraceML errors: "
+            + (
+                "off."
+                if settings.error_bank is None
+                else f"each attempt tagged with {settings.error_bank} as a whole (the "
+                "coalition's mistake patterns) and step by step (error-ranked points)."
+            ),
         )
         return cost_lines(tuple(costs)), lines
 
@@ -403,6 +448,10 @@ class _TraceMLStage:
         tagger = context.dependencies.traceml_tagger or _tagger(context)
         groups: dict[str, ArtifactInput] = {}
         labels: dict[str, ArtifactInput] = {}
+        errors: dict[str, ArtifactInput] = {}
+        error_steps: dict[str, ArtifactInput] = {}
+        points: JsonObject = {}
+        error_bank = tier_error_bank(spec)
         limit = job.maximum_model_calls * spec.traceml.steps_per_call
         judge_settings = spec.traceml.move_judge
         assert judge_settings is not None
@@ -442,9 +491,26 @@ class _TraceMLStage:
             labels[alias] = persist_traceml_labels(
                 project.artifacts, labelled, code_revision=revision, inputs=(reference,)
             )
-        outputs = TraceMLOutputs(groups=groups, labels=labels)
-        summary: JsonObject = {"labels": {alias: ref.artifact_id for alias, ref in labels.items()}}
-        return StageRun(outputs, (*groups.values(), *labels.values()), summary)
+            if error_bank is not None:
+                errors[alias], error_steps[alias] = tag_tier_errors(
+                    project.artifacts,
+                    error_bank,
+                    trajectories,
+                    tagger,
+                    code_revision=revision,
+                    inputs=(reference,),
+                    concurrency=spec.traceml.concurrency,
+                )
+                points[alias] = attempt_error_points(project.artifacts, error_steps[alias])
+        outputs = TraceMLOutputs(
+            groups=groups, labels=labels, errors=errors, error_steps=error_steps
+        )
+        summary: JsonObject = {
+            "labels": {alias: ref.artifact_id for alias, ref in labels.items()},
+            "error_points": points,
+        }
+        saved = (*groups.values(), *labels.values(), *errors.values(), *error_steps.values())
+        return StageRun(outputs, saved, summary)
 
 
 class _MiningStage:
@@ -518,6 +584,8 @@ class _MiningStage:
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
         labels = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs).labels
         profile = mining_profile(spec)
+        start = load_continuation_checkpoint(project.artifacts, rules.job.study.checkpoint)
+        probe = probe_line(build, start.task.task_id)
         rubric, packet = spec.mining.rubric, None
         if rubric is None:
             rubric, packet = mining_rubric(context, build, rules)
@@ -540,6 +608,7 @@ class _MiningStage:
         )
         summary: JsonObject = {
             "judge_profile": profile.prompt_version,
+            "probe": probe,
             "rubric": rubric.artifact_id,
             "rubric_authored": packet is not None,
             "tiers": {
@@ -699,6 +768,21 @@ def _world(
             "rule_book": rulebook,
         }
     )
+
+
+def _rules_search(
+    context: StageContext, build: BuildOutputs, exposure: ExposurePlan
+) -> TraceSearch | None:
+    """Bind the pipeline's world-learning search for rules research, when mining searches."""
+    project, spec = context.project, context.spec
+    if not spec.mining.retrieval:
+        return None
+    start = load_continuation_checkpoint(project.artifacts, spec.mining.job.study.checkpoint)
+    registered = trace_search(project, build, start.task.task_id, spec.mining.retrieval_top_k)
+    if registered is None or build.index is None:
+        return None
+    embedder = retrieval_embedder(context, build.index)
+    return open_trace_search(project.artifacts, registered, exposure, embedder)
 
 
 def _runtime_allowance(project: ProjectStore, job: ContinuationJob) -> tuple[CostComponent, ...]:

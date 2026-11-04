@@ -4,7 +4,7 @@ A judge profile selects exactly one prompt set by its ``prompt_version``; the pr
 set's digest and its schema digest, so the choice is part of the judge definition's identity and
 one definition always runs one frozen prompt. :data:`JUDGE_PROMPT_SETS` holds:
 
-- ``episode-judge-prompt-v1`` (single pass): :data:`JUDGE_PROMPT` alone. The judge answers in one
+- ``episode-judge-prompt-v2`` (single pass): :data:`JUDGE_PROMPT` alone. The judge answers in one
   request, reading ranges first only when the evidence exceeds its input budget.
 - the agentic sets: :data:`JUDGE_PROMPT` plus :data:`AGENTIC_JUDGE_PROTOCOL` and one stance. The
   judge plans which evidence each criterion needs (:data:`PLAN_SCHEMA`), reads ranges, records a
@@ -40,7 +40,7 @@ from exp.optimize.evaluation.variance.episodes import (
     Verdict,
 )
 
-JUDGE_PROMPT_VERSION = "episode-judge-prompt-v1"
+JUDGE_PROMPT_VERSION = "episode-judge-prompt-v2"
 """Version label of :data:`JUDGE_PROMPT` and its schemas; change it whenever either changes."""
 
 ASSESS_TOOL = "assess_episode"
@@ -59,7 +59,12 @@ INPUT
 The user message is one JSON object.
 - judge_binding: trusted task, world, rubric, event-contract and evidence identities.
 - rubric: the trusted private rubric and its admitted policy sources. rubric_criteria lists every
-  criterion you must find, with its role (required_correctness or efficiency_diagnostic).
+  criterion you must find, with its role: required_correctness decides success;
+  efficiency_diagnostic and behavior_diagnostic are reported but never decide it.
+  behavior_guidance, when present, is the trusted judge guidance of every behavior-library entry a
+  criterion cites: how to detect the behavior, what evidence it needs, labeled positive and
+  negative examples and known false positives. Apply it to the criteria that cite it; it is never
+  shown to the actor and never adds a criterion of its own.
 - assessment_scope: which event ids are context only, which are scored, and which scored events
   the experiment imposed instead of the actor choosing them.
 - episode_evidence: the ordered, harness-owned event log, whether it is complete, and what the
@@ -232,13 +237,13 @@ Each tool result names the next phase. Reads are limited to reads_allowed across
 """Phase protocol appended to :data:`JUDGE_PROMPT` by every agentic prompt set."""
 
 JUDGE_STANCES: dict[str, str] = {
-    "episode-judge-agentic-chronological-v1": """Read the scored events in order, from the scored
+    "episode-judge-agentic-chronological-v2": """Read the scored events in order, from the scored
 start to the end, before settling any criterion, so that ordering, consent and recovery are judged
 as they happened.""",
-    "episode-judge-agentic-criterion-walk-v1": """Take the criteria one at a time. For each, find
+    "episode-judge-agentic-criterion-walk-v2": """Take the criteria one at a time. For each, find
 every event that bears on it, including events far from where the agent claims to address it, and
 decide it before moving to the next.""",
-    "episode-judge-agentic-disconfirming-v1": """Once you lean towards a verdict, look for the
+    "episode-judge-agentic-disconfirming-v2": """Once you lean towards a verdict, look for the
 events that would refute it (an unrecovered error behind a claimed success, an earlier prohibited
 effect, or a legitimate alternative behind an apparent omission) and read them before deciding.""",
 }
@@ -343,7 +348,7 @@ JUDGE_PROMPT_SETS: dict[str, JudgePromptSet] = {
 }
 """Every judge prompt set a profile may select, keyed by prompt version."""
 
-DEFAULT_AGENTIC_JUDGE = "episode-judge-agentic-chronological-v1"
+DEFAULT_AGENTIC_JUDGE = "episode-judge-agentic-chronological-v2"
 """The agentic prompt set orchestration selects unless it chooses another."""
 
 

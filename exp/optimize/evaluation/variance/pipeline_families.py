@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, stable_id
+from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
@@ -43,6 +44,14 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     save_packet,
 )
 from exp.optimize.evaluation.variance.authors import DecisionContext, ScenarioDraft, option_calls
+from exp.optimize.evaluation.variance.behavior_curation import curate_library
+from exp.optimize.evaluation.variance.behavior_labeling import label_behaviors
+from exp.optimize.evaluation.variance.behavior_profiles import (
+    LibraryBinding,
+    library_head,
+    load_library,
+    refuse_actor_exposure,
+)
 from exp.optimize.evaluation.variance.briefing_review import (
     DEFAULT_REVIEW_REPAIRS,
     DEFAULT_REVIEW_VARIANTS,
@@ -59,9 +68,12 @@ from exp.optimize.evaluation.variance.family import (
 from exp.optimize.evaluation.variance.judge import EVIDENCE_TYPE, load_assessment
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedStudy
+from exp.optimize.evaluation.variance.pipeline_errors import coalition_patterns, tier_error_bank
 from exp.optimize.evaluation.variance.pipeline_inputs import (
+    library_draws,
     local_id,
     observed_episodes,
+    revision_draws,
     rubric_draws,
     world_sources,
 )
@@ -105,6 +117,7 @@ from exp.optimize.evaluation.variance.world_freeze import (
     review_compatibility,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
+from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.induction.sandbox import ProgramSandbox
 
@@ -134,6 +147,7 @@ class _Authored:
         freeze_ref: Its saved reference.
         identity: Prefix of every author and reviser draw, binding the family's draws and the
             packet, so a packet that changes with another tier's coalition is authored afresh.
+        library: The behavior library version the rubric was authored from, if any.
         judging: Frozen judge binding per variant.
     """
 
@@ -146,6 +160,7 @@ class _Authored:
     freeze: WorldFreeze
     freeze_ref: ArtifactInput
     identity: str
+    library: LibraryBinding | None = None
     judging: dict[str, VariantJudging] = field(default_factory=dict)
 
 
@@ -214,6 +229,9 @@ class _Point:
         packet = self.packet(state, scenarios)
         packet_ref = save_packet(project, packet, code_revision=revision)
         prefix = stable_id("family-authoring", {"draws": self.draws, "packet": packet_ref.sha256})
+        library = self.library(packet_ref, prefix)
+        if library is not None:
+            refuse_actor_exposure(library.library, actor_texts(packet, scenarios))
         base = GroundedRuntimeDefinition.model_validate(self.tier.job.configuration)
         with ProgramSandbox() as sandbox:
             world_run = author_world_agentic(
@@ -233,6 +251,7 @@ class _Point:
                 identity=prefix + "-rubric",
                 code_revision=revision,
                 profile=authoring.rubric_profile,
+                library=library,
             )
             if world_run.draft is None:
                 raise ValueError("the world author returned no ready draft")
@@ -258,13 +277,66 @@ class _Point:
             )
         freeze_ref = artifact_input(project.artifacts.read(freeze.identity + "-result").manifest)
         authored = _Authored(
-            packet, packet_ref, world, world_run.draft, rubric, review, freeze, freeze_ref, prefix
-        )
+            packet, packet_ref, world, world_run.draft, rubric, review, freeze, freeze_ref, prefix,
+            library=library,
+        )  # fmt: skip
         for scenario in scenarios:
             authored.judging[scenario.scenario_id] = self.binding(
                 authored, scenario.scenario_id, rubric, review, base
             )
         return authored
+
+    def library(self, packet_ref: ArtifactInput, prefix: str) -> LibraryBinding | None:
+        """Label the family's development coalition, curate the library and bind the result.
+
+        The labels and the curation replay from their saved results, so a resumed family binds
+        the version its own curation produced, never a version a later family saved.
+
+        Args:
+            packet_ref: The family's saved authoring packet.
+            prefix: The family's authoring identity.
+
+        Returns:
+            The library version to author from, or None when the library is off.
+        """
+        context = self.context
+        project, authoring = context.project, context.spec.authoring
+        library_id = authoring.library_id
+        if library_id is None:
+            return None
+        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        base = library_head(project, library_id)
+        labels = label_behaviors(
+            project,
+            authoring.rubric_author,
+            packet_ref,
+            exposure=load_exposure_plan(project, build.exposure),
+            library=base,
+            identity=prefix + "-labels",
+            code_revision=context.code_revision,
+            variants=authoring.labeler_variants,
+        )
+        if not labels.labels:
+            return base
+        run_id = prefix + "-labels-result"
+        sources = (artifact_input(project.artifacts.read(run_id).manifest),)
+        curation = curate_library(
+            project,
+            authoring.rubric_author,
+            library_id=library_id,
+            base=base,
+            evidence=labels.labels,
+            sources=sources,
+            actor_names=actor_names(project, context.spec),
+            identity=prefix + "-curation",
+            code_revision=context.code_revision,
+            variant=authoring.curator_variant,
+        )
+        if curation.library is None:
+            return base
+        return LibraryBinding(
+            reference=curation.library, library=load_library(project, curation.library)
+        )
 
     def binding(
         self,
@@ -295,7 +367,13 @@ class _Point:
         project = context.project
         build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
-        labels = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs).labels
+        traceml = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs)
+        labels, bank = traceml.labels, tier_error_bank(context.spec)
+        patterns = (
+            ()
+            if bank is None or not traceml.errors
+            else coalition_patterns(project.artifacts, traceml.errors, bank)
+        )
         saved = DecisionContext.model_validate_json(
             project.artifacts.read_bytes(self.draws + "-context", "context.json")
         )
@@ -310,6 +388,7 @@ class _Point:
             self.coalition_reports,
             judged_groups=self.judged_groups,
             judge=self.tier.judge.identity,
+            patterns=patterns,
             step_labels=labels.get(self.tier.tier),
         )
         return build_authoring_packet(
@@ -355,7 +434,7 @@ class _FamiliesStage:
         options = len(authoring.actions) or MAXIMUM_OPTIONS
         cells = variants * (options * (authoring.repeats + authoring.confirmation_repeats) + 1)
         world_draws = len(authoring.world_prompt_sets) * (2 + authoring.world_repairs)
-        revision_draws = authoring.revision_rounds
+        revised = revision_draws(authoring)
         confirmation = variants * options * authoring.confirmation_repeats
         costs: list[CostComponent] = []
         for alias in mining.actors:
@@ -367,13 +446,31 @@ class _FamiliesStage:
                 (authoring.decision_author, passes),
                 (authoring.scenario_author, passes * (1 + reviews)),
                 (authoring.world_author, world_draws),
-                (authoring.rubric_author, rubric_draws(authoring.rubric_profile) + revision_draws),
+                (
+                    authoring.rubric_author,
+                    rubric_draws(authoring.rubric_profile) + revised + library_draws(authoring),
+                ),
             ):
                 per_family.extend(row.scaled(draws) for row in evaluation_costs(project, settings))
             per_family.extend(
                 row.scaled(variants + passes * cells) for row in job_costs(project, episode)
             )
             judged = passes * cells + authoring.revision_rounds * confirmation
+            measure = authoring.decision_measure()
+            if measure is not None:
+                free = variants * measure.free_repeats
+                per_family.extend(row.scaled(free) for row in job_costs(project, episode))
+                judged += free
+                classify = free * measure.classifier_profile.budget.model_calls
+                review = (
+                    variants
+                    * len(measure.reviewer_stances)
+                    * measure.reviewer_profile.budget.model_calls
+                )
+                for settings, draws in ((measure.classifier, classify), (measure.reviewer, review)):
+                    per_family.extend(
+                        row.scaled(draws) for row in evaluation_costs(project, settings)
+                    )
             per_family.extend(judge_costs(project, spec, judged))
             costs.extend(row.scaled(authoring.families_per_tier) for row in per_family)
         lines = (
@@ -381,12 +478,34 @@ class _FamiliesStage:
             f"{authoring.maximum_variants} scenarios plus a baseline and "
             f"{len(authoring.actions) or f'up to {MAXIMUM_OPTIONS} authored'} options; "
             f"world author {len(authoring.world_prompt_sets)} prompt sets, rubric author "
-            f"{len(authoring.rubric_profile.variants)} variants, independent of each other.",
+            f"{len(authoring.rubric_profile.variants)} variants, independent of each other; "
+            + (
+                "design critic "
+                f"{len(authoring.rubric_profile.critic.variants)} variants on every rubric"
+                if authoring.rubric_profile.critic is not None
+                else "no design critic"
+            )
+            + "; "
+            + (
+                f"behavior library {authoring.library_id}: {len(authoring.labeler_variants)} "
+                f"labeler variants and the {authoring.curator_variant} curator per family "
+                "before the rubric is authored from it."
+                if authoring.library_id is not None
+                else "no behavior library."
+            ),
             f"Each variant: world freeze with challenges, judged selection ({authoring.repeats}"
             f" pairs) and fresh confirmation ({authoring.confirmation_repeats} pairs) at up to "
             f"{judge_model_calls(mining_profile(spec))} judge draws per episode; rubric "
             f"revision up to {authoring.revision_rounds} rounds, then one re-registration under "
             "revised judges.",
+            "Decision variance: "
+            + (
+                f"{authoring.decision_free_repeats} judged free continuations per variant, each "
+                "choice classified by an open-weight classifier and every state reviewed for "
+                "clarity; admission requires the joint verdict."
+                if authoring.decision_variance
+                else "off; admission uses selection and confirmation only."
+            ),
         )
         if authoring.fresh_briefing:
             lines += (
@@ -476,6 +595,7 @@ def _family(point: _Point) -> FamilyOutcome:
         admission=authoring.admission,
         tiers={point.report.spec.initial.study.actor_model.model_id: point.tier.tier},
         dispositions=authoring.dispositions,
+        decision_variance=authoring.decision_measure(),
     )
     point.draws = family_spec.draws_identity(point.report, point.point, revision)
     family = run_decision_family(
@@ -518,6 +638,22 @@ def _family(point: _Point) -> FamilyOutcome:
         admitted=family.eligibility.eligible,
         reasons=tuple(family.eligibility.reasons),
         failure=family.failure,
+    )
+
+
+def actor_names(project: ProjectStore, spec: DecisionVarianceSpec) -> frozenset[str]:
+    """Every tier label and actor model identity no library entry may mention."""
+    catalog = RuntimeModelCatalog(load_model_catalog(project.model_catalog_path), environment={})
+    models = {catalog.snapshot(alias)[0].model_id for alias in spec.mining.actors}
+    return frozenset({*spec.mining.actors, *models})
+
+
+def actor_texts(packet: AuthoringPacket, scenarios: tuple[Scenario, ...]) -> tuple[str, ...]:
+    """Every actor-visible text of a family: the task, instruction values and briefings."""
+    return (
+        packet.task.instruction,
+        *(scenario.instruction for scenario in scenarios if scenario.instruction is not None),
+        *(scenario.briefing.text for scenario in scenarios if scenario.briefing is not None),
     )
 
 
@@ -573,6 +709,8 @@ def _revise(
             code_revision=revision,
             max_rounds=spec.authoring.revision_rounds,
             compatibility=_reviewer(authored),
+            library=authored.library,
+            critic=spec.authoring.rubric_profile.critic,
         )
         revisions[row.scenario_id] = artifact_input(
             project.artifacts.read(identity + "-result").manifest

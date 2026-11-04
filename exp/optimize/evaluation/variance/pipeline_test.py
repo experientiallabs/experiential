@@ -53,6 +53,7 @@ from exp.optimize.evaluation.executable.qualification import load_executable_qua
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.optimize.evaluation.rules.extraction import EXTRACTION_TOOL
+from exp.optimize.evaluation.rules.research_test import ROLE_MARKERS, AgentScript, default_reads
 from exp.optimize.evaluation.rules.stage import (
     REPORT_TYPE,
     RulesStageReport,
@@ -71,8 +72,10 @@ from exp.optimize.evaluation.variance.authoring_packet import (
 )
 from exp.optimize.evaluation.variance.authoring_packet_test import save_book, tool_reply
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
+from exp.optimize.evaluation.variance.behavior_labeling import LABEL_TOOL
 from exp.optimize.evaluation.variance.build_records import EXPOSURE_TYPE, VarianceBuildSpec
 from exp.optimize.evaluation.variance.contracts import OptionCall
+from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import FamilyReport
@@ -130,6 +133,8 @@ from exp.optimize.evaluation.variance.rubric_agent import (
 )
 from exp.optimize.evaluation.variance.rubric_author import RUBRIC_TOOL, author_rubric, save_rubric
 from exp.optimize.evaluation.variance.rubric_author_test import covering_answer, criterion
+from exp.optimize.evaluation.variance.rubric_critic import CRITIC_TOOL
+from exp.optimize.evaluation.variance.rubric_critic_test import review as design_review
 from exp.optimize.evaluation.variance.rubric_revision import REVISION_TOOL, load_revision
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec, schedule_state
 from exp.optimize.evaluation.variance.tests.grounded_world_test import (
@@ -151,6 +156,7 @@ from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.admission import EvaluationSpecification, persist_specification
 from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.mining.decisions import DecisionsTraceTagger
+from exp.simulation.mining.error_tags import ERROR_BANK_ID
 from exp.simulation.mining.traceml import ACTION_LABELS, TRACEML_BANK_ID, load_traceml_labels
 from exp.simulation.mining.traceml_moves import MOVE_TOOL
 from exp.simulation.retrieval import CorpusScope, RAGLineageBinding, persist_trace_rag
@@ -385,6 +391,43 @@ def extraction_answer(payload: JsonObject) -> JsonObject:
     return {"trace_id": view["trace_id"], "rules": rules, "limitations": ["One trajectory."]}
 
 
+def rules_answer(role: str, opening: JsonObject) -> JsonObject:
+    """Answer the rules agents: ticket research, supported weighings and a short memory."""
+    if role == "research":
+        return extraction_answer({"messages": [{"content": json.dumps(opening)}]})
+    if role == "weighing":
+        rule = opening["rule"]
+        assert isinstance(rule, dict) and isinstance(rule["evidence"], list)
+        return {
+            "rule_id": rule["rule_id"],
+            "status": "supported",
+            "rationale": "The saved ticket trajectories observe it.",
+            "supporting": rule["evidence"][:1],
+        }
+    return {"summary": "check_sla answers only for an unheld ticket.", "entries": []}
+
+
+def rules_reads(role: str, opening: JsonObject) -> tuple[str, JsonObject]:
+    """One harmless read per rules agent role."""
+    if role == "research":
+        return "search_related_steps", {"tool_name": "check_sla", "top_k": 2}
+    return default_reads(role, opening)
+
+
+RULES_AGENT = AgentScript(rules_answer, reads=rules_reads)
+"""The scripted research, weighing and condensation agents of the rules stage."""
+
+
+def rules_agent_role(payload: JsonObject) -> str | None:
+    """The rules agent role a request belongs to, from the start of its system prompt."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages or not isinstance(messages[0], dict):
+        return None
+    system = str(messages[0].get("content") or "")
+    role = next((name for mark, name in ROLE_MARKERS.items() if system.startswith(mark)), None)
+    return None if role == "extraction" else role
+
+
 def scenario_answer() -> JsonObject:
     """The scenario author's answer: the urgent and routine tiers."""
     scenarios = (tier_scenario("urgent", "high"), tier_scenario("routine", "low"))
@@ -520,6 +563,8 @@ ANSWERS: dict[str, Answer] = {
     CRITIQUE_TOOL: lambda _: RUBRIC_CRITIQUE,
     EXTRACTION_TOOL: extraction_answer,
     MOVE_TOOL: lambda payload: moves_answer(_user(payload)),
+    LABEL_TOOL: lambda _: {"labels": [], "notes": "No behavior beyond the library."},
+    CRITIC_TOOL: lambda _: design_review(),
 }
 """Every non-judge role's answer, by the forced tool it must call."""
 
@@ -649,12 +694,16 @@ class Wire(JsonHttpTransport):
         payload: JsonObject,
         timeout_seconds: float,
     ) -> JsonHttpResponse:
-        """Judge an episode from the policy, or answer the forced role tool.
+        """Judge an episode from the policy, run a rules agent, or answer the forced role tool.
 
         Raises:
             Interrupted: At the configured judge request.
         """
         del url, headers, timeout_seconds
+        rules_role = rules_agent_role(payload)
+        if rules_role is not None:
+            self.requests.append((f"rules:{rules_role}", payload))
+            return self.priced(RULES_AGENT._reply(payload))
         choice = payload.get("tool_choice")
         function = choice.get("function") if isinstance(choice, dict) else None
         tool = str(function.get("name")) if isinstance(function, dict) else FREE_CHOICE
@@ -881,8 +930,10 @@ def fixture_rules_stage(
     exposure: ExposurePlan,
     traces: tuple[Trace, ...],
     code_revision: str,
+    search: TraceSearch | None = None,
 ) -> RulesStageReport:
     """The rules owner's stand-in: the saved ticket rule book, after the owner's exposure check."""
+    del search
     exposure.require((trace.trace_id for trace in traces), "world_learning")
     rulebook, book = save_book(project)
     report = _report(spec, book, rulebook)
@@ -937,7 +988,19 @@ def write_bank(root: Path) -> Path:
     (banks / f"{TRACEML_BANK_ID}.toml").write_text(
         f'bank_id = "{TRACEML_BANK_ID}"\nversion = 1\n{questions}'
     )
+    errors = "".join(
+        f'\n[[questions]]\nquestion_id = "{question}"\nfamily = "error"\n'
+        f'text = "Did the agent commit {question}?"\n'
+        for question in (FIRED_ERROR, "error.destructive_action")
+    )
+    (banks / f"{ERROR_BANK_ID}.toml").write_text(
+        f'bank_id = "{ERROR_BANK_ID}"\nversion = 1\n{errors}'
+    )
     return banks
+
+
+FIRED_ERROR = "error.unverified_success_claim"
+"""The error proposition the scripted tagger finds in every attempt and step."""
 
 
 def step_tagger(project: ProjectStore) -> DecisionsTraceTagger:
@@ -950,7 +1013,10 @@ def step_tagger(project: ProjectStore) -> DecisionsTraceTagger:
         questions = request.questions
         return {
             "answers": {
-                question: {"type": "noul", "noul": 0.9 if question == "action.read" else 0.05}
+                question: {
+                    "type": "noul",
+                    "noul": 0.9 if question in ("action.read", FIRED_ERROR) else 0.05,
+                }
                 for question in questions
             },
             "usage": {"cost": 0.0},
@@ -1093,7 +1159,11 @@ def make_spec(
         build=BuildSettings(spec=VarianceBuildSpec()),
         rules=RulesSettings(spec=rules, maximum_traces=4),
         traceml=TraceMLSettings(
-            decision_alias="judge", bank_root=bank, steps_per_call=2, move_judge=settings
+            decision_alias="judge",
+            bank_root=bank,
+            steps_per_call=2,
+            move_judge=settings,
+            error_bank=ERROR_BANK_ID,
         ),
         mining=mining,
         authoring=AuthoringSettings(
@@ -1107,6 +1177,9 @@ def make_spec(
             repeats=6,
             confirmation_repeats=6,
             dispositions=dispositions,
+            # The decision-variance measurement's free continuations and agentic classifier and
+            # reviewer have their own offline tests; this run keeps it off to stay small.
+            decision_variance=False,
         ),
         records=RecordsSettings(
             intent="Escalate or close a support ticket as its service tier requires.",
@@ -1283,6 +1356,8 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
         assert saved.moves_protocol is not None
         assert all(trace.coverage.moves == "judged" for trace in saved.traces)
     assert any(tool == MOVE_TOOL for tool, _ in run.wire.requests)
+    traceml = _outputs(run, report, 2, TraceMLOutputs)
+    assert set(traceml.errors) == set(traceml.error_steps) == {"actor", TIER_B}
     build = _outputs(run, report, 0, BuildOutputs)
     mining = _outputs(run, report, 3, MiningOutputs)
     assert mining.profile.prompt_version == JUDGE_PROMPT_VERSION
@@ -1307,7 +1382,10 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
         assert row.failure is None, row.failure
         assert None not in (row.packet, row.world, row.rubric, row.freeze)
         assert row.packet is not None
-        episodes = load_packet(project, row.packet).observed_episodes
+        packet = load_packet(project, row.packet)
+        patterns = {pattern.pattern_id for pattern in packet.coalition.patterns}
+        assert patterns == {f"actor.{FIRED_ERROR}", f"{TIER_B}.{FIRED_ERROR}"}
+        episodes = packet.observed_episodes
         assert [episode.episode_id for episode in episodes] == ["trace-1", "trace-2"]
         assert [step.tool for step in episodes[1].steps] == ["read_ticket", "check_sla", "close"]
         assert set(row.judging) == {"urgent", "routine"}
@@ -1686,8 +1764,11 @@ def test_agentic_roles_authored_rubric_and_learned_rules(
     stage = RulesStageReport.model_validate_json(
         project.artifacts.read_bytes(rules.report.artifact_id, "report.json")
     )
-    assert len(stage.draws) == 2 and all(draw.rules is not None for draw in stage.draws)
-    assert sum(tool == EXTRACTION_TOOL for tool, _ in run.wire.requests) == 2
+    # Rules are researched agentically per trace, weighed, then condensed into a memory.
+    assert len(stage.research) == 2 and stage.memory is not None
+    roles = {tool for tool, _ in run.wire.requests if tool.startswith("rules:")}
+    assert roles >= {"rules:research", "rules:weighing", "rules:condensation"}
+    assert not any(tool == EXTRACTION_TOOL for tool, _ in run.wire.requests)
     book = load_rulebook(project, rules.rulebook)
     assert set(book.contracts) == {"read_ticket", "check_sla", "escalate", "close"}
     (boundary,) = [rule for rule in book.rules if rule.predicate is not None]

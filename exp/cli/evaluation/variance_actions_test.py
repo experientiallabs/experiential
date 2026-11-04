@@ -35,13 +35,12 @@ from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.executable.costs import job_costs
 from exp.optimize.evaluation.rules.extraction_test import (
     RoutedTransport,
-    _answer,
     _setup,
-    _tool_reply,
     _wire,
 )
+from exp.optimize.evaluation.rules.research_test import AgentScript
 from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageSpec
-from exp.optimize.evaluation.rules.stage_test import _plan, _spec, _traces
+from exp.optimize.evaluation.rules.stage_test import _answers, _plan, _spec, _traces
 from exp.optimize.evaluation.variance import actor_critic_test as critic_fixture
 from exp.optimize.evaluation.variance import build_test as build_fixture
 from exp.optimize.evaluation.variance import schedule_test as schedule_fixture
@@ -126,7 +125,10 @@ def test_rules_stage_dry_run_prints_the_summary_and_makes_no_call(
     result = CliRunner().invoke(app, _command(tmp_path, request, "--dry-run"))
 
     assert result.exit_code == 0, result.output
-    assert "Rules stage: 2 traces, 2 extraction draws with judge, 3 at once" in result.output
+    output = " ".join(result.output.split())
+    assert "Rules stage: 2 traces; 2 research draws (up to 12 calls)" in output
+    assert "one weighing draw per merged rule (up to 6 calls" in output
+    assert "one condensation draw (up to 6 calls) with judge; 3 at once" in output
     assert "physical attempts" in result.output
     assert not transport.requests
     assert not project.artifacts.list_ids(artifact_type=REPORT_TYPE)
@@ -154,14 +156,17 @@ def test_rules_stage_runs_then_replays_without_consent(
 ) -> None:
     """A consented run saves the rule book; the saved report replays with no new spend."""
     project, spec, request = _rules_fixture(tmp_path, monkeypatch)
-    transport = RoutedTransport({name: _tool_reply(_answer(name)) for name in _TRACES})
+    transport = AgentScript(_answers)
     _wire(monkeypatch, transport)
     runner = CliRunner()
 
     result = runner.invoke(app, _command(tmp_path, request, "--yes", "--non-interactive"))
 
     assert result.exit_code == 0, result.output
-    assert len(transport.requests) == 2
+    roles = transport.roles()
+    assert {"research", "condensation"} <= set(roles)
+    assert "extraction" not in roles
+    bought = len(transport.requests)
     assert '"rule_counts"' in result.output and '"requires_witness"' in result.output
     (report_id,) = project.artifacts.list_ids(artifact_type=REPORT_TYPE)
     identity = rules_stage_identity(spec, _traces(*_TRACES), installed_execution_revision())
@@ -171,7 +176,7 @@ def test_rules_stage_runs_then_replays_without_consent(
     replay = runner.invoke(app, _command(tmp_path, request, "--non-interactive"))
 
     assert replay.exit_code == 0, replay.output
-    assert len(transport.requests) == 2
+    assert len(transport.requests) == bought
     assert replay.output[replay.output.index("{") :] == result.output[result.output.index("{") :]
 
 

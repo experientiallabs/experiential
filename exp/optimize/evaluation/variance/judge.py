@@ -33,8 +33,9 @@ task success.
 
 The rubric artifact holds exactly one JSON file whose digest is the definition's ``rubric_sha256``,
 the ``episode-rubric`` shape the rubric author saves: an object whose ``body`` holds a ``criteria``
-list, each entry with a ``criterion_id`` and a ``role`` (``required_correctness`` or
-``efficiency_diagnostic``). The rubric is rendered to the judge as trusted configuration, except its
+list, each entry with a ``criterion_id`` and a ``role``: ``required_correctness``, or the
+diagnostic ``efficiency_diagnostic`` or ``behavior_diagnostic``, which never decide success. The
+rubric is rendered to the judge as trusted configuration, except its
 calibration cases: those are build-time controls, never examples for the judge to imitate.
 """
 
@@ -88,13 +89,13 @@ from exp.optimize.evaluation.variance.judge_prompt import (
     judge_schema_sha256,
 )
 
-JUDGE_PROTOCOL = "episode-judge-v2"
+JUDGE_PROTOCOL = "episode-judge-v3"
 """Version of the judge's rendering, reading and validation; bump it whenever they change."""
 
 EVIDENCE_TYPE = "episode-evidence"
 ASSESSMENT_TYPE = "episode-assessment"
 _REQUIRED = "required_correctness"
-_ROLES = frozenset({_REQUIRED, "efficiency_diagnostic"})
+_ROLES = frozenset({_REQUIRED, "efficiency_diagnostic", "behavior_diagnostic"})
 
 
 class _Rubric(ContractModel):

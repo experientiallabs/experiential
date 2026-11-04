@@ -9,6 +9,7 @@ import pytest
 from exp.optimize.evaluation.variance.pipeline_spec import (
     COUNCIL_ACTORS,
     STAGES,
+    AuthoringSettings,
     CostLine,
     DecisionVarianceSpec,
     MiningSettings,
@@ -111,3 +112,23 @@ def test_an_enabled_traceml_stage_names_its_move_judge(
     spec = make_spec(run.fixture, run.rubric, run.bank)
     changed = spec.model_copy(update={"traceml": narrowed})
     assert spec.slice("traceml") != changed.slice("traceml")
+
+
+def test_the_library_design_critic_and_decision_variance_are_on_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain authoring registration labels, curates, critiques and measures every family."""
+    run = wired(tmp_path, monkeypatch)
+    settings = run.fixture.settings
+    authoring = AuthoringSettings(
+        decision_author=settings,
+        scenario_author=settings,
+        world_author=settings,
+        rubric_author=settings,
+    )
+    assert authoring.library_id is not None and authoring.labeler_variants
+    assert authoring.rubric_profile.critic is not None
+    measure = authoring.decision_measure()
+    assert measure is not None and measure.classifier == measure.reviewer == settings
+    off = authoring.model_copy(update={"decision_variance": False})
+    assert off.decision_measure() is None

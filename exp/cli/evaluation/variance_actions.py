@@ -51,6 +51,7 @@ from exp.optimize.evaluation.variance.build_records import (
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
+from exp.optimize.evaluation.variance.pipeline_inputs import rules_costs
 from exp.optimize.evaluation.variance.schedule import (
     RevisionRegistration,
     RolloutPlan,
@@ -260,14 +261,13 @@ def handle_rules_stage(context: ContinuationContext, action: RulesStageAction) -
     exposure.require(action.traces, "world_learning")
     traces = select_traces(store, action.traces, action.dataset)
     saved = store.artifacts.exists(rules_stage_identity(spec, traces, revision) + "-result")
-    author = spec.author
+    components, draws = rules_costs(store, spec, len(traces))
     console.print(
-        f"Rules stage: {len(traces)} traces, {len(traces)} extraction draws with "
-        f"{author.model_alias}, {spec.concurrency} at once; maximum author HTTP attempts: "
-        f"{len(traces) * author.maximum_physical_attempts}. Saved draws replay without a call.",
+        f"Rules stage: {len(traces)} traces; {draws}; {spec.concurrency} at once; at most "
+        f"{spec.author.maximum_physical_attempts} author HTTP attempts per call. Saved draws "
+        "replay without a call.",
         markup=False,
     )
-    components = tuple(row.scaled(len(traces)) for row in evaluation_costs(store, author))
     if not saved:
         review_components(console, components)
     if context.dry_run:
