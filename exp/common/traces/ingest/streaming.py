@@ -14,6 +14,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from exp.common.core.artifacts import JsonObject, SourceIdentity
 from exp.common.traces import Trace
+from exp.common.traces.ingest.agent_sessions import AGENT_SESSIONS_VENDOR, AgentSessionReader
 from exp.common.traces.ingest.braintrust import BRAINTRUST_SOURCE
 from exp.common.traces.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.common.traces.ingest.environment_capture import (
@@ -158,6 +159,9 @@ class NormalizedSource:
 
     def file(self, path: Path) -> None:
         """Parse a stable private snapshot and group interleaved records on disk."""
+        if self.source_format == AGENT_SESSIONS_VENDOR:
+            self._agent_sessions(path)
+            return
         archive = JsonArchive(path, self.directory, self.database, self.source_format)
         self.source = archive.source
         self.issues.extend(archive.issues)
@@ -202,6 +206,22 @@ class NormalizedSource:
             and not self.issues
         ):
             self._environment_profile()
+        self.finish()
+
+    def _agent_sessions(self, path: Path) -> None:
+        """Stage session-grouped observations read one session file at a time."""
+        try:
+            reader = AgentSessionReader.open(path)
+        except VendorTraceFormatError as exc:
+            raise ValueError(str(exc)) from exc
+        self.source = reader.source
+        for observation in reader.observations():
+            self._append(
+                observation.source_trace_id,
+                observation.ordinal,
+                _OBSERVATION.dump_json(observation),
+            )
+        self.issues.extend(reader.issues)
         self.finish()
 
     def _environment_profile(self) -> None:

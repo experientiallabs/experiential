@@ -34,12 +34,16 @@ _SIGNATURE_FIELDS = frozenset(
         "span_id",
         "attributes",
         "role",
+        "sessionId",
+        "message",
+        "cwd",
+        "projectPath",
     }
 )
 
 
 def detect_trace_source(path: Path) -> str | None:
-    """Recognize an unambiguous chat, native capture, or OpenTelemetry JSON export.
+    """Recognize an unambiguous chat, agent session, native capture, or OpenTelemetry export.
 
     The streaming scan retains only field shapes, never complete conversations or the
     corpus. Unknown, mixed, and malformed files need an explicit source choice. The
@@ -78,6 +82,9 @@ def detect_trace_source(path: Path) -> str | None:
                     records[parent][field] = event
                     if field == "role" and event == "string" and value in _CHAT_ROLES:
                         records[parent]["chat_role"] = "string"
+                if parent in records and field == "type" and event == "string":
+                    if value == "session":
+                        records[parent]["session_header"] = "string"
                 if field == "protocol" and event == "string" and value == "chat_completions":
                     record = parent.removesuffix(".request") if parent != "request" else ""
                     if parent == "request" or parent.endswith(".request"):
@@ -116,6 +123,12 @@ def _attribute_convention(prefix: str, event: str, key: str) -> str | None:
 def _record_sources(prefix: str, fields: dict[str, str]) -> set[str]:
     """Recognize supported record signatures without inspecting message or tool content."""
     matches: set[str] = set()
+    if prefix == "" and (
+        (fields.get("sessionId") == "string" and fields.get("message") == "start_map")
+        or ("session_header" in fields and fields.get("cwd") == "string")
+        or (fields.get("messages") == "start_array" and fields.get("projectPath") == "string")
+    ):
+        return {"agent-sessions"}
     if any(fields.get(key) == "start_array" for key in ("messages", "conversation")) or (
         prefix == "item" and "chat_role" in fields
     ):

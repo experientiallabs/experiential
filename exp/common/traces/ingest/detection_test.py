@@ -29,6 +29,10 @@ from exp.common.traces.ingest.phoenix import PHOENIX_SOURCE
         ({"unknown": [{"messages": []}]}, None),
         ({"data": []}, None),
         ([{"messages": []}, {"resourceSpans": []}], None),
+        ({"sessionId": "s", "type": "user", "message": {"role": "user"}}, "agent-sessions"),
+        ({"type": "session", "id": "s", "cwd": "/w", "version": 3}, "agent-sessions"),
+        ({"id": "s", "projectPath": "/p", "messages": [{"role": "user"}]}, "agent-sessions"),
+        ({"sessionId": "s", "messages": [{"role": "user"}]}, "chat-json"),
     ],
 )
 def test_structural_detection(tmp_path: Path, payload: JsonValue, expected: str | None) -> None:

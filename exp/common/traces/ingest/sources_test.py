@@ -145,6 +145,7 @@ def _chat_json_export(path: Path) -> Path:
 def test_declared_sources_are_the_supported_set() -> None:
     """The declared source names are exactly the supported normalizers, sorted."""
     assert CANONICAL_TRACE_SOURCES == (
+        "agent-sessions",
         "braintrust",
         "chat-json",
         "experiential",

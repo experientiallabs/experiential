@@ -16,6 +16,7 @@ grounding from that saved evidence. Each source is declared, never guessed:
 | `phoenix` | Phoenix and OpenInference spans, native nested, flat dotted, or OTLP JSON. |
 | `chat-json` | OpenAI-style chat conversations, one object, an array, or bare message arrays. |
 | `experiential` | Completed native JSON Chat Completions capture exports. |
+| `agent-sessions` | Coding-agent session JSONL: Claude Code, pi, or one-record-per-session exports. |
 | `gateway` | Retained native captures in a local SQLite database, with required `--identity ID`. |
 
 Every file source accepts JSON or JSONL. A malformed JSONL line is never skipped silently: it is
@@ -44,6 +45,63 @@ The file-source table is explicit, so an undeclared name fails closed rather tha
 File parsing, normalization, provenance and persistence live in `exp/common/traces/ingest/` and
 do not import runtime or simulation code. Gateway capture and protocol adapters live in
 `exp/runtime/gateway/ingest/`; the CLI selects the adapter for `--source gateway`.
+
+## Coding-agent session files
+
+`--source agent-sessions` imports the session files coding agents write, as published by Hugging
+Face "agent traces" datasets. Three JSONL wire formats are recognized per file:
+
+- Claude Code transcripts (`user`, `assistant`, and bookkeeping records sharing a `sessionId`, with
+  `text`, `thinking`, `tool_use`, and `tool_result` content blocks). Several sessions may share one
+  file. Records that repeat one `message.id` are one model turn.
+- pi sessions (a `session` header, then `message`, `model_change`, and extension entries linked by
+  `id` and `parentId`). When every entry is linked, only the active branch, the path from the last
+  message to the root, is read; otherwise entries are read in file order.
+- One-record-per-session exports (`{id, createdAt, projectPath, source, messages}`) whose tool
+  calls are flat messages with `toolName` and `toolCallId`. Their timestamps are often fuzzed, so
+  message order is used and spans record `exp.source.time.synthetic`.
+
+Codex rollout files (`session_meta`, `response_item`, `event_msg`) are not yet recognized; such a
+file is reported as an unrecognized session file.
+
+Each session becomes one trace. The task is the first typed user prompt; harness-injected text such
+as command wrappers, environment context, and `AGENTS.md` preambles is not a task. System and
+injected messages before that prompt form `initial_context.instruction_messages`. The working
+directory, branch, titles, and counts of skipped bookkeeping records are trace metadata in
+`exp.trace.metadata`, never request context. Every assistant turn is a model span over a prefix of
+the shared message history; thinking text is omitted. Tool results pair with their calls by
+recorded call ID and carry `gen_ai.tool.is_error`. The tool list holds declared definitions when
+the session records them (pi `teich-available-tools` entries) and otherwise a schema inferred from
+the recorded arguments, labelled as inferred. Model identity resolves only when the session records
+both provider and model; Claude Code and export sessions keep `gen_ai.request.model` only. A session
+whose last assistant turn failed has a failure outcome, one with only earlier failed turns has an
+`unknown` outcome, and any other session has no outcome.
+
+Subagent (sidechain) transcripts are separate traces. They share their parent session's
+conversation ID, so lineage grouping keeps a session and its subagents in the same partition.
+Trace identity derives from the dataset label (the caller's `source_id`, otherwise the directory
+holding the file), the file name, and the session key, so a file imports with the same trace IDs
+alone or as part of its directory.
+
+Every string is redacted before it enters a trace: the shared credential patterns, private-key
+blocks, provider token prefixes (GitHub, Hugging Face, Google, Stripe, AWS), JSON web tokens,
+authorization headers, credential assignments such as `.env` lines, and account names in
+`/home/NAME`, `/Users/NAME`, and `C:\Users\NAME` paths. Each trace records the policy name and its
+replacement counts in `exp.trace.metadata.redaction`. Redaction is pattern based and best effort.
+Session files are read as data only.
+
+The Python loader also accepts a directory and reads its `*.jsonl` files recursively; other files,
+and JSONL files that are not sessions, become normalization issues:
+
+```python
+from pathlib import Path
+from exp.common.traces.ingest import load_trace_source
+
+result = load_trace_source("agent-sessions", Path("datasets/claude-code-sessions"))
+```
+
+`exp build --traces` takes one file, so pass one session file there or import a directory from
+Python.
 
 ## Stored evidence
 

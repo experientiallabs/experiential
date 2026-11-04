@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from exp.common.traces.ingest.agent_sessions import load_agent_sessions
 from exp.common.traces.ingest.braintrust import BRAINTRUST_SOURCE
 from exp.common.traces.ingest.chat_json import CHAT_JSON_SOURCE
 from exp.common.traces.ingest.experiential import EXPERIENTIAL_SOURCE
@@ -52,6 +53,7 @@ class _TraceFileLoader(Protocol):
 
 
 _LOADERS: dict[str, _TraceFileLoader] = {
+    "agent-sessions": load_agent_sessions,
     "braintrust": BRAINTRUST_SOURCE.load,
     "chat-json": CHAT_JSON_SOURCE.load,
     "experiential": EXPERIENTIAL_SOURCE.load,
