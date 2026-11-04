@@ -302,12 +302,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v1",
+        "variance-authors-v2",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
         ),
-        "5f86a894779aad29f005bdb075b6dd92c566ee6bfefb2ab273bc76e18a3c2c80",
+        "985bab5784972ad4c56b4ec1ca9374f894e6b6475febc53156f4e10f63e937c3",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.grader:GRADER_PROTOCOL",

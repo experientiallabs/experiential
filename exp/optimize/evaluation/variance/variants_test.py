@@ -21,9 +21,13 @@ from exp.common.tasks.facts import FactProvenance, FactValidation, InstanceFact,
 from exp.optimize.evaluation.continuations.job import execute_continuation_job
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.variance.contracts import (
+    BASELINE_STATE,
     Criterion,
     DecisionOption,
     DecisionState,
+    FreshBriefing,
+    InstructionAxis,
+    InstructionValue,
     Scenario,
     StateEdit,
     VariationAxis,
@@ -32,6 +36,7 @@ from exp.optimize.evaluation.variance.contracts import (
 from exp.optimize.evaluation.variance.variants import (
     VariantCheckpoint,
     build_variant_checkpoint,
+    freeze_state,
     verify_restoration,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime, ChatCheckpoint
@@ -39,6 +44,7 @@ from exp.runtime.agents.chat_test import _Model, _response
 from exp.runtime.environments.tests.world_conformance_test import _task
 from exp.runtime.environments.world_contracts import (
     ExecutableCheckpoint,
+    NativeImage,
     StateDomain,
     ToolEffectPolicy,
     WorldManifest,
@@ -416,3 +422,166 @@ def test_native_world_state_is_refused_for_a_new_initialization(
     assert variant.reference is None and variant.fork_turn == 1
     assert _status("world_state", variant) == "failed"
     assert "new initialization" in variant.problems[0]
+
+
+_REPORT = "Report on the ticket, but change nothing."
+
+
+def _instructed(step: int) -> DecisionState:
+    """The priority decision with an authorized report-only instruction value."""
+    return _decision(step, "/tickets/priority", ("low", "high")).model_copy(
+        update={
+            "instruction_axis": InstructionAxis(
+                values=(
+                    InstructionValue(
+                        value_id="original",
+                        instruction="Operate the environment.",
+                        kind="original",
+                        obligations="Handle the ticket.",
+                    ),
+                    InstructionValue(
+                        value_id="report",
+                        instruction=_REPORT,
+                        kind="consent_change",
+                        obligations="Report on the ticket and change nothing.",
+                        authorized_by=("point:3",),
+                        criteria=("right",),
+                    ),
+                ),
+                effect="Without consent to act, only a report is right.",
+            )
+        }
+    )
+
+
+def _report(text: str, *, fresh: bool = True) -> Scenario:
+    """An instruction-only variant: no state edit, the report-only instruction."""
+    return Scenario(
+        scenario_id="report",
+        instruction=_REPORT,
+        initialization="fresh_briefing" if fresh else "resume",
+        briefing=FreshBriefing(text=text, entitled_paths=("/tickets/status",)) if fresh else None,
+        correct_option="close",
+        deciding_paths=("/tickets/priority",),
+        witness=(WitnessStep(tool="escalate", arguments={}, reveals=("/tickets/priority",)),),
+        rationale="Without consent to act the ticket is only reported.",
+        criteria=("right",),
+    )
+
+
+def test_a_fresh_briefing_starts_a_new_task_in_the_same_world_with_the_same_budget(
+    tmp_path: Path,
+) -> None:
+    """An instruction-only variant shares the world state and replaces only the actor's start."""
+    project = ProjectStore(tmp_path, "case")
+    task = _task("escalate")
+    boundaries, runtime = _trajectory(project, task)
+    text = "Earlier a note was queued and the ticket status was open."
+
+    variant = build_variant_checkpoint(
+        project,
+        base=boundaries[3],
+        branch_checkpoints=boundaries,
+        decision=_instructed(3),
+        scenario=_report(text),
+        facts=None,
+        code_revision="test",
+        maximum_model_calls=6,
+    )
+
+    assert variant.problems == () and variant.reference is not None
+    assert variant.initialization == "fresh_briefing" and variant.replay_turns == 0
+    assert _status("initialization", variant) == "passed"
+    saved = load_continuation_checkpoint(project.artifacts, variant.reference)
+    fork = load_continuation_checkpoint(project.artifacts, boundaries[3])
+    assert saved.task.instruction == _REPORT and saved.task.initial_context["briefing"] == text
+    assert saved.world_task == task and saved.actor.calls == fork.actor.calls
+    fresh = ChatAgentRuntime(maximum_model_calls=6).initial_checkpoint(saved.task)
+    assert saved.actor.messages == fresh.messages
+    assert isinstance(saved.world, ExecutableCheckpoint)
+    assert isinstance(fork.world, ExecutableCheckpoint)
+    assert saved.world.image == fork.world.image
+    assert verify_restoration(project, variant.reference, runtime=runtime)
+    assert variant.frozen is not None and variant.frozen.unrestorable(BASELINE_STATE) == ()
+    source = {row.part: row.sha256 for row in freeze_state(fork, None).parts}
+    frozen = {row.part: row.sha256 for row in variant.frozen.parts}
+    assert frozen["domain_state"] == source["domain_state"]
+    assert frozen["conversation"] != source["conversation"]
+
+
+def test_a_leaking_briefing_or_a_resumed_instruction_change_is_refused(tmp_path: Path) -> None:
+    """The intended action and unobserved facts stay out; a resumed prefix keeps its task."""
+    project = ProjectStore(tmp_path, "case")
+    boundaries, _ = _trajectory(project, _task("escalate"))
+    before = _checkpoint_count(project)
+
+    def build(scenario: Scenario) -> VariantCheckpoint:
+        """Build one variant at the decision."""
+        return build_variant_checkpoint(
+            project,
+            base=boundaries[3],
+            branch_checkpoints=boundaries,
+            decision=_instructed(3),
+            scenario=scenario,
+            facts=None,
+            code_revision="test",
+            maximum_model_calls=6,
+        )
+
+    leaky = build(_report("Close the ticket; its priority is low."))
+    resumed = build(_report("", fresh=False))
+
+    assert leaky.reference is None and _status("initialization", leaky) == "failed"
+    detail = next(check.detail for check in leaky.checks if check.name == "initialization")
+    assert "intended option's action" in detail and "which was not observed" in detail
+    assert resumed.reference is None
+    assert any("start it by fresh_briefing" in row for row in resumed.problems)
+    assert _checkpoint_count(project) == before
+
+
+def test_a_variant_whose_required_state_is_not_held_is_refused(tmp_path: Path) -> None:
+    """Every part is recorded; a required part the checkpoint lacks blocks persistence."""
+    project = ProjectStore(tmp_path, "case")
+    boundaries, _ = _trajectory(project, _task("escalate"))
+    before = _checkpoint_count(project)
+    fact = InstanceFact(
+        key="queues/default",
+        value="support",
+        visibility="conditioning",
+        provenance=FactProvenance(
+            adapter="fixture",
+            source="fixture",
+            validation=FactValidation(status="validated", method="fixture"),
+            state_version=0,
+        ),
+    )
+
+    refused = build_variant_checkpoint(
+        project,
+        base=boundaries[3],
+        branch_checkpoints=boundaries,
+        decision=_decision(3, "/tickets/priority", ("low", "high")),
+        scenario=_scenario("/tickets/priority", "high"),
+        facts=InstanceFacts(facts=(fact,)),
+        code_revision="test",
+        required_state=frozenset({"files"}),
+    )
+
+    assert refused.reference is None and _status("complete_state", refused) == "failed"
+    assert refused.problems == ("complete_state: files is absent: the checkpoint holds none",)
+    assert refused.frozen is not None
+    status = {row.part: row.status for row in refused.frozen.parts}
+    assert status["conditioning_facts"] == "held" and status["clock"] == "held"
+    assert _checkpoint_count(project) == before
+    start = load_continuation_checkpoint(project.artifacts, boundaries[3])
+    assert isinstance(start.world, ExecutableCheckpoint)
+    outside = start.model_copy(
+        update={
+            "world": start.world.model_copy(
+                update={"image": NativeImage(parts={}, domains=start.world.image.domains)}
+            )
+        }
+    )
+    assert freeze_state(outside, None).unrestorable(BASELINE_STATE) == (
+        "domain_state is external: ['simulated'] hold no image bytes",
+    )

@@ -8,7 +8,11 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.optimize.evaluation.continuations.job import execute_continuation_job
-from exp.optimize.evaluation.variance.contracts import DecisionState, VariationAxis
+from exp.optimize.evaluation.variance.contracts import (
+    BASELINE_STATE,
+    DecisionState,
+    VariationAxis,
+)
 from exp.optimize.evaluation.variance.contrast import run_observation_witness
 from exp.optimize.evaluation.variance.replay import replay_to_decision
 from exp.optimize.evaluation.variance.tests.grounded_world_test import (
@@ -82,6 +86,7 @@ def test_a_variant_forked_before_the_reveal_replays_to_the_decision(
 
     assert replay.status == "replayed" and replay.problems == ()
     assert replay.checkpoint is not None and len(replay.calls) == 1
+    assert replay.frozen is not None and replay.frozen.unrestorable(BASELINE_STATE) == ()
     assert len(fixture.actor.requests) == actor_calls
     call = replay.calls[0]
     assert call.call.call_id == "actor-0" and call.intervention is not None
@@ -147,6 +152,22 @@ def test_a_recorded_call_the_edited_world_refuses_diverges(
         "turn 1 call actor-0: the edited world returned an error observation",
     )
     assert replay.calls[0].observation is not None and replay.calls[0].observation.is_error
+    assert replay.calls[0].original is not None
+    assert replay.calls[0].original != replay.calls[0].observation.content
+    assert replay.frozen is None
+    predictions = len(fixture.predictor.requests)
+    fixture.job.runtime_file.unlink()
+
+    again = replay_to_decision(
+        fixture.project,
+        variant=variant,
+        branch_checkpoints=boundaries,
+        scenario=tier_scenario("held", "low", lock="held"),
+        job=fixture.job,
+        code_revision="test",
+    )
+
+    assert again == replay and len(fixture.predictor.requests) == predictions
 
 
 def test_a_recorded_message_stating_a_replaced_value_diverges_before_any_call(

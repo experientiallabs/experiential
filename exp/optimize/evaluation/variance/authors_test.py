@@ -238,11 +238,35 @@ def test_the_request_carries_the_point_rules_tools_and_requirements() -> None:
         "discoverable through the permitted tools",
         "only a guess",
         "downstream consequences",
-        "Never vary the instruction",
+        "Instruction variation is its own axis",
+        "authorized_by",
         "guess_required",
     ):
         assert phrase in system
     assert len(authors_protocol_sha256()) == 64
+
+
+def _axis(original: str = "Please refund order o-1.", ref: str = "prefix:0") -> JsonObject:
+    """An instruction axis with the original task and an authorized explanation-only change."""
+    return {
+        "values": [
+            {
+                "value_id": "original",
+                "instruction": original,
+                "kind": "original",
+                "obligations": "Refund when the window allows it.",
+            },
+            {
+                "value_id": "explain",
+                "instruction": "Explain whether order o-1 can be refunded; do not refund it.",
+                "kind": "consent_change",
+                "obligations": "Explain truthfully and move no money.",
+                "authorized_by": [ref],
+                "criteria": ["decision.correct"],
+            },
+        ],
+        "effect": "Without consent to act, only an explanation is right.",
+    }
 
 
 def test_a_decision_state_must_stay_grounded_in_what_was_shown() -> None:
@@ -258,7 +282,7 @@ def test_a_decision_state_must_stay_grounded_in_what_was_shown() -> None:
         (_answer(_state(relevant_paths=["/policy"])), "not inside any decision-relevant"),
         (_answer(revealed_by=["delete_everything"]), "unknown tools"),
         (_answer(refs=["question:0"]), "only a guess"),
-        (_answer(_state(vary_instruction=True)), "not declared variable"),
+        (_answer(_state(instruction_axis=_axis())), "not declared variable"),
         (_answer(path="/clock"), "exactly once"),
     )
     for answer, message in cases:
@@ -270,7 +294,18 @@ def test_a_decision_state_must_stay_grounded_in_what_was_shown() -> None:
     with pytest.raises(ValueError, match="observed before-state value"):
         validate_decision_state(_answer(excluded), context)
     allowed = _context(ArtifactInput(artifact_id="c", sha256="0" * 64), instruction=True)
-    assert validate_decision_state(_answer(_state(vary_instruction=True)), allowed).state
+    assert validate_decision_state(_answer(_state(instruction_axis=_axis())), allowed).state
+    with pytest.raises(ValueError, match="not supplied"):
+        validate_decision_state(_answer(_state(instruction_axis=_axis(ref="rule:x"))), allowed)
+    told = allowed.model_copy(update={"task_instruction": "Please refund order o-1."})
+    with pytest.raises(ValueError, match="original value is not the task's instruction"):
+        validate_decision_state(_answer(_state(instruction_axis=_axis("Refund o-1."))), told)
+    with pytest.raises(ValueError, match="authorizes it"):
+        unauthorized = _axis()
+        values = unauthorized["values"]
+        assert isinstance(values, list) and isinstance(values[1], dict)
+        values[1]["authorized_by"] = []
+        validate_decision_state(_answer(_state(instruction_axis=unauthorized)), allowed)
 
 
 def test_a_decision_state_draw_is_saved_and_replayed_and_a_refusal_is_kept(

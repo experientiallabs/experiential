@@ -12,12 +12,15 @@ why.
   axis, which permitted tools reveal it and which rules or observed values ground its permitted
   values. The answer is refused when it cites a locator it was not given, points at state that is
   absent, varies a path outside the decision-relevant paths, leaves an axis ungrounded or
-  undiscoverable, or varies the instruction without permission.
+  undiscoverable, declares an instruction axis without permission, or declares one whose
+  original value is not the task's instruction.
 - The **scenario author** reads that decision state, the same before-state and the actor's
   :class:`~exp.optimize.evaluation.variance.contracts.ScenarioLimits`, and returns a
-  :class:`~exp.optimize.evaluation.variance.contracts.ScenarioSet`. Every set is checked with
-  :func:`~exp.optimize.evaluation.variance.contracts.check_scenarios`; a set with any problem is
-  kept with its problems and is never accepted.
+  :class:`~exp.optimize.evaluation.variance.contracts.ScenarioSet`, choosing per scenario a
+  ``resume`` or ``fresh_briefing`` start. Every set is checked with
+  :func:`~exp.optimize.evaluation.variance.contracts.check_scenarios`, against the actor's view at
+  the start when one is supplied (without it a fresh briefing is refused); a set with any problem
+  is kept with its problems and is never accepted.
 
 Both prompts carry the eval-audit checklist. Neither role's answer qualifies an environment on its
 own: executed witnesses and competing-action continuations from the same checkpoint do that.
@@ -44,6 +47,7 @@ from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
 from exp.optimize.evaluation.variance.contracts import (
+    ActorView,
     DecisionState,
     EstimationPoint,
     ScenarioLimits,
@@ -57,7 +61,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
 
-AUTHORS_PROTOCOL = "variance-authors-v1"
+AUTHORS_PROTOCOL = "variance-authors-v2"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"
@@ -90,9 +94,14 @@ Return a decision state that a scenario author will vary. Requirements, all of t
   say so with a decision_space_too_narrow audit entry rather than shrinking the decision.
 - Invariants are state paths no variant may change: identity, history and facts the retained
   conversation already showed. An axis may not contain or sit inside an invariant.
-- Never vary the instruction. Set vary_instruction to true only when instruction variation is
-  declared allowed in the input, and only when the decision truly depends on what the actor is
-  told.
+- Instruction variation is its own axis, separate from the state axes. Leave
+  instruction_axis null unless instruction variation is declared allowed in the input and the
+  right decision truly depends on what the actor is told. When you declare it, give exactly one
+  original value whose instruction is the task's instruction verbatim. A reworded value says the
+  same thing in other words, names the value it is equivalent_to and binds no criteria: it
+  changes no obligation. A goal_change or consent_change value changes what the actor is asked
+  or permitted to do; it cites the locators that authorize that change in authorized_by and lists
+  the criteria that apply under it. State its obligations concretely.
 - Criteria are single yes/no propositions about the finished episode, each checkable from the
   episode alone, one fact per criterion. Grade efficiency in its own criterion, never folded
   into correctness.
@@ -113,15 +122,26 @@ it has left. The agent under test never sees any of this.
 
 Return two to eight scenarios. Requirements, all of them mandatory:
 - Edit only declared variation axes, each at most once, with only its permitted values. Never
-  touch an invariant, directly or by replacing a parent.
-- Across the set, at least two different options must be correct, and no two variants may leave
-  the world in the same state.
+  touch an invariant, directly or by replacing a parent. edits may be empty only for the
+  unedited world or an instruction-only variant.
+- Across the set, at least two different options must be correct, and no two variants may share
+  both world state and instruction obligations. An instruction-only variant may keep another
+  variant's state when its instruction changes obligations; an equivalent rewording never makes
+  a variant distinct.
 - correct_option names an option_id of the decision state. deciding_paths are the edited-state
   paths whose values make that option correct, and the rationale says why.
 - Every scenario includes a witness: the permitted tool calls, made before the decision, whose
   observations reveal every deciding path. The witness uses only the listed tools and fits in the
   remaining calls. A scenario whose right choice could only be guessed is not allowed.
-- Leave instruction null unless the decision state sets vary_instruction.
+- Leave instruction null unless the decision state declares an instruction_axis; otherwise set
+  it to the exact text of one declared instruction value, and list only criteria that value
+  binds when it binds any.
+- initialization is resume (the actor keeps the conversation so far and its remaining calls) or
+  fresh_briefing (the actor starts on a new task). A changed instruction needs fresh_briefing,
+  because the retained conversation already states the original. A fresh briefing explains only
+  facts the actor had observed in actor_view, lists their paths in entitled_paths, never names
+  the intended option's action, never states an edited value and never states a
+  decision-relevant value the actor had not seen. Without actor_view, use resume only.
 - A scenario must never require working around the sandbox or its permissions, and must never
   leak the right option in a field the actor can read without deciding.
 - criteria lists the decision state's criterion ids that apply to the variant.
@@ -175,6 +195,8 @@ class DecisionContext(ContractModel):
         questions: Open questions that bear on the decision.
         tools: Tools the actor may call.
         instruction_variation: Whether scenarios may replace the task instruction.
+        task_instruction: The public task instruction, which an instruction axis's original
+            value must repeat exactly; None when it is not supplied.
     """
 
     point: EstimationPoint
@@ -185,6 +207,7 @@ class DecisionContext(ContractModel):
     questions: tuple[ResearchQuestion, ...] = ()
     tools: tuple[ToolSchema, ...] = Field(min_length=1)
     instruction_variation: bool = False
+    task_instruction: str | None = None
 
     def refs(self) -> frozenset[str]:
         """Return every fixed locator an answer may cite, excluding ``state:`` pointers."""
@@ -323,6 +346,7 @@ def decision_state_request(context: DecisionContext, *, output_tokens: int) -> M
         ],
         "tools": [tool.model_dump(mode="json") for tool in context.tools],
         "instruction_variation_allowed": context.instruction_variation,
+        "task_instruction": context.task_instruction,
         "citable_locators": sorted(context.refs()),
     }
     return _request(
@@ -347,17 +371,22 @@ def validate_decision_state(arguments: object, context: DecisionContext) -> Deci
     Raises:
         ValueError: The answer is malformed, describes another step, cites an unsupplied locator
             or absent state, varies a path outside the relevant paths, leaves an axis ungrounded
-            or undiscoverable, excludes the observed value of an axis, or varies the instruction
-            without permission.
+            or undiscoverable, excludes the observed value of an axis, declares an instruction axis
+            without permission, or declares one whose original is not the task's instruction.
     """
     answer = DecisionStateAnswer.model_validate(arguments)
     state, before = answer.state, context.before
     if state.step != context.point.step:
         raise ValueError(f"decision state describes step {state.step}, not {context.point.step}")
-    if state.vary_instruction and not context.instruction_variation:
+    axis = state.instruction_axis
+    if axis is not None and not context.instruction_variation:
         raise ValueError("decision state varies the instruction, which is not declared variable")
+    original = None if axis is None else axis.value(None)
+    if original is not None and context.task_instruction not in (None, original.instruction):
+        raise ValueError("the instruction axis's original value is not the task's instruction")
     cited = (
         *state.evidence_refs,
+        *(ref for value in (axis.values if axis else ()) for ref in value.authorized_by),
         *(ref for flag in state.audit for ref in flag.evidence_refs),
         *(ref for grounding in answer.grounding for ref in grounding.refs),
     )
@@ -457,7 +486,12 @@ def author_decision_state(
 
 
 def scenario_request(
-    decision: DecisionState, before: JsonObject, limits: ScenarioLimits, *, output_tokens: int
+    decision: DecisionState,
+    before: JsonObject,
+    limits: ScenarioLimits,
+    *,
+    output_tokens: int,
+    view: ActorView | None = None,
 ) -> ModelRequest:
     """Render one scenario draw.
 
@@ -466,6 +500,7 @@ def scenario_request(
         before: World state just before the decision's step.
         limits: Tools and remaining calls available to the actor.
         output_tokens: Response allowance.
+        view: What the actor had seen at the start, for fresh briefings; None offers none.
 
     Returns:
         The forced-tool request.
@@ -474,6 +509,7 @@ def scenario_request(
         "decision_state": decision.model_dump(mode="json"),
         "before_state": before,
         "limits": {"tools": sorted(limits.tools), "remaining_calls": limits.remaining_calls},
+        "actor_view": None if view is None else view.model_dump(mode="json"),
     }
     return _request(
         SCENARIO_PROMPT,
@@ -485,7 +521,11 @@ def scenario_request(
 
 
 def review_scenarios(
-    arguments: object, decision: DecisionState, before: JsonObject, limits: ScenarioLimits
+    arguments: object,
+    decision: DecisionState,
+    before: JsonObject,
+    limits: ScenarioLimits,
+    view: ActorView | None = None,
 ) -> tuple[ScenarioSet, tuple[ScenarioProblem, ...]]:
     """Parse scenario tool arguments and find every structural problem, refusing nothing silently.
 
@@ -494,6 +534,7 @@ def review_scenarios(
         decision: The decision state the set varies.
         before: World state just before the decision's step.
         limits: Tools and remaining calls available to the actor.
+        view: What the actor had seen at the start, needed to accept a fresh briefing.
 
     Returns:
         The parsed set and every problem :func:`check_scenarios` found.
@@ -502,7 +543,7 @@ def review_scenarios(
         ValueError: The arguments do not match the scenario-set schema.
     """
     scenarios = ScenarioSet.model_validate(arguments)
-    return scenarios, check_scenarios(before, decision, scenarios, limits)
+    return scenarios, check_scenarios(before, decision, scenarios, limits, view)
 
 
 def author_scenarios(
@@ -515,6 +556,7 @@ def author_scenarios(
     identity: str,
     code_revision: str,
     sources: tuple[ArtifactInput, ...] = (),
+    view: ActorView | None = None,
 ) -> ScenarioDraft:
     """Buy or replay one scenario draw, check it and save it with every problem it has.
 
@@ -529,12 +571,15 @@ def author_scenarios(
         identity: Stable identity of this draw.
         code_revision: Producing source identity.
         sources: Saved artifacts the decision state and before-state came from.
+        view: What the actor had seen at the start; without it a fresh briefing is refused.
 
     Returns:
         The draft, accepted only when the set parsed and has no problems. A draft with a saved
         response is also saved as a ``scenario-draft`` artifact and replayed from it.
     """
-    request = scenario_request(decision, before, limits, output_tokens=settings.output_tokens)
+    request = scenario_request(
+        decision, before, limits, output_tokens=settings.output_tokens, view=view
+    )
     store = project.artifacts
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
@@ -546,7 +591,7 @@ def author_scenarios(
         reference, response = bought
         try:
             scenarios, problems = review_scenarios(
-                _tool_arguments(response, SCENARIO_TOOL), decision, before, limits
+                _tool_arguments(response, SCENARIO_TOOL), decision, before, limits, view
             )
         except ValueError as error:
             draft = ScenarioDraft(identity=identity, response=reference, failure=_reason(error))

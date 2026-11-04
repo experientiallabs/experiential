@@ -30,6 +30,15 @@ none fails:
   history kept at the fork mention no edited value.
 - **replay_stability**: the turns the actor replays did not themselves change an edited path, so
   the edits still describe the decision's before-state.
+- **initialization**: the instruction value and start mode agree with the decision's instruction
+  axis (a changed instruction needs a fresh briefing). A ``resume`` variant keeps the coherent
+  prefix and its remaining calls; a ``fresh_briefing`` variant starts at the fork on a new public
+  task (the instruction value plus the briefing in its initial context) with the same remaining
+  calls and no replay, its world restored under the original environment task. The briefing is
+  leak-checked against the actor's real view at the fork: the retained messages and task prompt.
+- **complete_state**: :func:`freeze_state` records what the variant checkpoint actually holds for
+  every :data:`~exp.optimize.evaluation.variance.contracts.StatePart`; the baseline parts, files
+  or facts the caller requires, and the facts when supplied must all be held.
 - **reachability**: the replay fits the actor's call allowance when one is supplied; otherwise it
   is marked for review. The replay length is always reported; reaching the decision again is
   :func:`~exp.optimize.evaluation.variance.replay.replay_to_decision`, which forces the original
@@ -45,8 +54,6 @@ values can refuse a fork that a field-aware check would allow.
 from __future__ import annotations
 
 import json
-import re
-from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -59,18 +66,31 @@ from exp.common.core.artifacts import (
     JsonValue,
     Sha256,
     canonical_json_bytes,
+    sha256_bytes,
     sha256_json,
 )
-from exp.common.models import ModelMessage
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
 from exp.common.tasks.facts import InstanceFacts
 from exp.optimize.evaluation.variance.contracts import (
+    BASELINE_STATE,
+    ActorView,
     DecisionState,
+    FrozenPart,
+    FrozenState,
+    InitializationMode,
     Scenario,
+    StatePart,
     apply_edits,
+    briefing_leaks,
+    instruction_problems,
+    json_keys,
+    json_scalars,
+    message_texts,
     resolve_pointer,
+    revealing_texts,
 )
+from exp.runtime.agents.chat import ChatCheckpoint, task_messages
 from exp.runtime.environments.world_artifacts import WorldCheckpoint
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint, NativeImage
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
@@ -91,6 +111,8 @@ CheckName = Literal[
     "retained_messages",
     "retained_world_history",
     "replay_stability",
+    "initialization",
+    "complete_state",
     "reachability",
 ]
 """Every coherence check a variant records."""
@@ -129,6 +151,8 @@ class VariantCheckpoint(ContractModel):
         edited_state_sha256: Digest of the edited simulated state stored in the variant.
         checks: Every check made, in order.
         problems: The details of every failed check; empty when the variant was persisted.
+        initialization: How the actor starts the variant.
+        frozen: What the variant checkpoint holds of the restorable state, once built.
     """
 
     scenario_id: str
@@ -141,6 +165,8 @@ class VariantCheckpoint(ContractModel):
     edited_state_sha256: Sha256 | None
     checks: tuple[CoherenceCheck, ...]
     problems: tuple[str, ...]
+    initialization: InitializationMode = "resume"
+    frozen: FrozenState | None = None
 
     @property
     def needs_review(self) -> tuple[CoherenceCheck, ...]:
@@ -158,6 +184,7 @@ def build_variant_checkpoint(
     facts: InstanceFacts | None,
     code_revision: str,
     maximum_model_calls: int | None = None,
+    required_state: frozenset[StatePart] = frozenset(),
 ) -> VariantCheckpoint:
     """Fork a saved trajectory before any observation of the edited state and apply a scenario.
 
@@ -171,12 +198,14 @@ def build_variant_checkpoint(
         facts: Instance facts supplied to the world model for this task, if any.
         code_revision: Producing implementation identity.
         maximum_model_calls: The actor's call allowance, when known, to check the replay fits.
+        required_state: State parts required beyond the baseline, such as ``files``.
 
     Returns:
         The variant with every check; ``reference`` is None and ``problems`` lists the failed
         checks when the variant cannot be built coherently. Nothing is persisted then.
     """
     run = _Run(scenario_id=scenario.scenario_id, base=base)
+    run.initialization = scenario.initialization
     if decision.step >= len(branch_checkpoints) or branch_checkpoints[decision.step] != base:
         return run.fail(
             "trajectory",
@@ -208,7 +237,8 @@ def build_variant_checkpoint(
         )
     fork = decision.step if revealing is None else revealing - 1
     run.fork, run.fork_turn = branch_checkpoints[fork], fork
-    run.revealing_turn, run.replay_turns = revealing, decision.step - fork
+    fresh = scenario.initialization == "fresh_briefing"
+    run.revealing_turn, run.replay_turns = revealing, 0 if fresh else decision.step - fork
     run.check(
         "fork_placement",
         "passed",
@@ -259,20 +289,33 @@ def build_variant_checkpoint(
         if seen
         else f"{len(history)} retained world turns show no edited value",
     )
-    run.add(_replay_check(states[fork : decision.step + 1], paths, fork))
+    if not fresh:
+        run.add(_replay_check(states[fork : decision.step + 1], paths, fork))
+    started = _initialize(loaded[0], forked, decision, scenario, state)
+    if isinstance(started, str):
+        run.check("initialization", "failed", started)
+    else:
+        run.check("initialization", "passed", f"{scenario.initialization} start is coherent")
     run.add(_reachability_check(forked, run.replay_turns, maximum_model_calls))
-    if run.problems:
+    if run.problems or isinstance(started, str):
         return run.result()
-
+    task, actor = started
     variant = ContinuationCheckpoint(
-        task=forked.task,
-        environment_task=forked.environment_task,
-        actor=forked.actor,
+        task=task,
+        environment_task=forked.environment_task if task == forked.task else forked.world_task,
+        actor=actor,
         world=_with_state(forked.world, edited, history),
         sources=(*forked.sources, branch_checkpoints[fork])
         if branch_checkpoints[fork] not in forked.sources
         else forked.sources,
     )
+    run.frozen = freeze_state(variant, facts)
+    declared: frozenset[StatePart] = frozenset({"conditioning_facts"} if facts else ())
+    required = BASELINE_STATE | required_state | declared
+    missing = run.frozen.unrestorable(required)
+    if missing:
+        return run.fail("complete_state", "; ".join(missing))
+    run.check("complete_state", "passed", f"{len(required)} required state parts are held")
     run.reference = persist_continuation_checkpoint(
         project.artifacts,
         variant,
@@ -331,6 +374,128 @@ def verify_restoration(
         return False
 
 
+def freeze_state(checkpoint: ContinuationCheckpoint, facts: InstanceFacts | None) -> FrozenState:
+    """Record what a checkpoint actually holds of every part of the restorable state.
+
+    Args:
+        checkpoint: A variant or decision checkpoint.
+        facts: Instance facts conditioning the world model, when supplied.
+
+    Returns:
+        One entry per state part: ``absent`` when it holds none (a world with no executable row
+        holds no kernel state), ``external`` for native domains whose image has no bytes.
+    """
+    world = checkpoint.world
+    mixed = None if isinstance(world, ExecutableCheckpoint) else world
+    rows: list[ExecutableCheckpoint] = (
+        [r for r in (world.native, world.candidate) if r]
+        if not isinstance(world, ExecutableCheckpoint)
+        else [world]
+    )
+    policy = None if mixed is None else mixed.policy_sha256
+    actor, tools = checkpoint.actor, [t.model_dump(mode="json") for t in checkpoint.task.tools]
+    files = {
+        f"{r.owner}/{name}": sha256_bytes(data)
+        for r in rows
+        for name, data in r.image.parts.items()
+        if name != _PREDICTOR_PART
+    }
+    outside = sorted({r.owner for r in rows if r.image.domains and not r.image.parts})
+    held: dict[StatePart, tuple[JsonValue, str]] = {
+        "domain_state": ([[r.owner, dict(r.image.domains)] for r in rows], "domain digests"),
+        "files": (files, f"file parts {sorted(files)}"),
+        "identity_permissions": (
+            [[r.manifest_sha256, r.backend_sha256, dict(r.ownership), policy] for r in rows],
+            "manifest, backend, domain ownership and routing policy",
+        ),
+        "clock": ([r.clock for r in rows], f"logical time {[r.clock for r in rows]}"),
+        "pending_events": (
+            [[[e.model_dump(mode="json") for e in r.pending], dict(r.degraded)] for r in rows],
+            f"{sum(len(r.pending) for r in rows)} pending events, with outages",
+        ),
+        "scheduler_random": (
+            [[r.next_event, r.seed, r.draws] for r in rows],
+            "event counter, seed and draws; a simulator model's future draws are not state",
+        ),
+        "event_cursor": (
+            [[r.steps, [e.model_dump(mode="json") for e in r.fired]] for r in rows]
+            + ([] if mixed is None or not rows else [[mixed.sequence, mixed.shadow_halted]]),
+            f"steps {[r.steps for r in rows]} with every fired event",
+        ),
+        "conditioning_facts": (
+            None if facts is None else facts.model_dump(mode="json"),
+            "instance facts by digest",
+        ),
+        "tool_session": ([actor.runtime_sha256, actor.calls, tools], f"{actor.calls} calls spent"),
+        "conversation": (
+            [m.model_dump(mode="json") for m in actor.messages],
+            f"{len(actor.messages)} actor-visible messages",
+        ),
+    }
+    parts: list[FrozenPart] = []
+    for part, (value, detail) in held.items():
+        if part == "domain_state" and outside:
+            row = FrozenPart(part=part, status="external", detail=f"{outside} hold no image bytes")
+        elif value is None or value == {} or value == []:
+            row = FrozenPart(part=part, status="absent", detail="the checkpoint holds none")
+        else:
+            row = FrozenPart(part=part, status="held", sha256=sha256_json(value), detail=detail)
+        parts.append(row)
+    return FrozenState(parts=tuple(parts))
+
+
+def _initialize(
+    start: ContinuationCheckpoint,
+    forked: ContinuationCheckpoint,
+    decision: DecisionState,
+    scenario: Scenario,
+    state: JsonObject,
+) -> tuple[TaskCase, ChatCheckpoint] | str:
+    """Return a variant's public task and actor start, or why its initialization is incoherent.
+
+    Args:
+        start: The trajectory's first boundary, whose conversation is the task prompt.
+        forked: The fork boundary.
+        decision: The decision state with its instruction axis.
+        scenario: The variant.
+        state: Simulated state at the fork, before the edits.
+
+    Returns:
+        The task and actor checkpoint, or the reasons there are none.
+    """
+    problems = instruction_problems(decision, scenario)
+    axis = decision.instruction_axis
+    value = None if axis is None else axis.value(scenario.instruction)
+    if value and value.kind == "original" and value.instruction != forked.task.instruction:
+        problems.append("the instruction axis's original value is not the task's instruction")
+    if scenario.briefing is None:
+        return "; ".join(problems) if problems else (forked.task, forked.actor)
+    view = ActorView(
+        instruction=forked.task.instruction, observed=message_texts(forked.actor.messages)
+    )
+    problems.extend(briefing_leaks(state, decision, scenario, view))
+    tail, opening = task_messages(forked.task), start.actor.messages
+    leading = opening[: len(opening) - len(tail)]
+    if len(opening) < len(tail) or opening[len(leading) :] != tail:
+        problems.append("the start conversation is not the chat task prompt a briefing replaces")
+    if "briefing" in forked.task.initial_context:
+        problems.append("the task's initial context already has a briefing entry")
+    if problems:
+        return "; ".join(problems)
+    task = forked.task.model_copy(
+        update={
+            "instruction": forked.task.instruction if value is None else value.instruction,
+            "initial_context": {**forked.task.initial_context, "briefing": scenario.briefing.text},
+        }
+    )
+    return task, ChatCheckpoint(
+        task_sha256=sha256_json(task),
+        runtime_sha256=forked.actor.runtime_sha256,
+        messages=(*leading, *task_messages(task)),
+        calls=forked.actor.calls,
+    )
+
+
 class _Run:
     """Accumulates checks and the fork placement while one variant is built."""
 
@@ -349,6 +514,8 @@ class _Run:
         self.replay_turns: int | None = None
         self.reference: ArtifactInput | None = None
         self.edited_state_sha256: Sha256 | None = None
+        self.initialization: InitializationMode = "resume"
+        self.frozen: FrozenState | None = None
 
     @property
     def problems(self) -> tuple[str, ...]:
@@ -402,6 +569,8 @@ class _Run:
             edited_state_sha256=self.edited_state_sha256,
             checks=tuple(self.checks),
             problems=self.problems,
+            initialization=self.initialization,
+            frozen=self.frozen,
         )
 
 
@@ -522,18 +691,6 @@ def _watched_values(scenario: Scenario, states: list[JsonObject | None]) -> tupl
     return tuple(unique.values())
 
 
-def json_scalars(value: JsonValue) -> Iterator[JsonValue]:
-    """Yield every scalar inside a JSON value."""
-    if isinstance(value, dict):
-        for item in value.values():
-            yield from json_scalars(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from json_scalars(item)
-    else:
-        yield value
-
-
 def _field_name(path: str) -> str | None:
     """Return the last non-index token of a pointer, the field name an observation would use."""
     for raw in reversed(path.split("/")[1:]):
@@ -541,22 +698,6 @@ def _field_name(path: str) -> str | None:
         if token and not token.isdigit():
             return token
     return None
-
-
-def message_texts(messages: Iterable[ModelMessage]) -> tuple[str, ...]:
-    """Return every actor-visible text of some messages: content and tool-call arguments."""
-    texts: list[str] = []
-    for message in messages:
-        if message.content is not None:
-            texts.append(message.content)
-        if message.assistant_action is not None:
-            if message.assistant_action.content is not None:
-                texts.append(message.assistant_action.content)
-            texts.extend(
-                json.dumps(call.arguments, sort_keys=True)
-                for call in message.assistant_action.tool_calls
-            )
-    return tuple(texts)
 
 
 def _history_texts(history: list[JsonValue], world: WorldCheckpoint) -> tuple[str, ...]:
@@ -591,59 +732,6 @@ def _first_revealing_turn(
         if revealing_texts(message_texts(messages), values, keys):
             return turn
     return None
-
-
-def revealing_texts(
-    texts: Iterable[str], values: tuple[JsonValue, ...], keys: frozenset[str]
-) -> list[str]:
-    """Return which watched values or field names appear in some texts.
-
-    Strings and numbers match as whole tokens, case-insensitively for strings; booleans and null
-    match their JSON spelling. A field name matches only as a key of a JSON object in the text.
-
-    Args:
-        texts: Texts to scan.
-        values: Watched scalars.
-        keys: Watched field names.
-
-    Returns:
-        Sorted descriptions of what was found.
-    """
-    found: set[str] = set()
-    for text in texts:
-        for value in values:
-            needle = (
-                value
-                if isinstance(value, str)
-                else json.dumps(value)
-                if not isinstance(value, float) or not value.is_integer()
-                else str(int(value))
-            )
-            if needle.strip() and re.search(
-                rf"(?<![\w.]){re.escape(needle.strip())}(?![\w])", text, flags=re.IGNORECASE
-            ):
-                found.add(f"value {json.dumps(value)}")
-        try:
-            parsed = json.loads(text)
-        except ValueError:
-            continue
-        found.update(f"key {key!r}" for key in keys if key in _json_keys(parsed))
-    return sorted(found)
-
-
-def _json_keys(value: JsonValue) -> set[str]:
-    """Return every object key anywhere inside a JSON value."""
-    if isinstance(value, dict):
-        keys = {str(key) for key in value}
-        for item in value.values():
-            keys |= _json_keys(item)
-        return keys
-    if isinstance(value, list):
-        keys: set[str] = set()
-        for item in value:
-            keys |= _json_keys(item)
-        return keys
-    return set()
 
 
 def _undeclared_edits(decision: DecisionState, scenario: Scenario) -> list[str]:
@@ -768,7 +856,7 @@ def _clock_check(
     keys: set[str] = set()
     for path in paths:
         keys.update(path.split("/")[1:])
-        keys |= _json_keys(resolve_pointer(edited, path)[1])
+        keys |= json_keys(resolve_pointer(edited, path)[1])
     timed = sorted(key for key in keys if any(word in key.lower() for word in _CLOCK_WORDS))
     worlds = (
         (world,) if isinstance(world, ExecutableCheckpoint) else (world.native, world.candidate)

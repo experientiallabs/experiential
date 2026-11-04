@@ -22,7 +22,12 @@ when any of these holds:
 - the actor's own recorded text in a replayed turn (assistant content or tool-call arguments)
   states a value the scenario's edits replaced, so its recorded calls depend on the original fact;
 - the replayed calls changed an edited path, so the edits no longer describe the decision's
-  before-state.
+  before-state;
+- the replayed decision checkpoint does not hold every baseline part of the restorable state
+  (:func:`~exp.optimize.evaluation.variance.variants.freeze_state`).
+
+A diverged replay is saved and replayed as a finding, never coerced into alignment: no recorded
+call is altered, no observation is overwritten with the original and no state is patched.
 
 Dependence the actor never wrote down (a call chosen because of an old value it did not repeat)
 cannot be detected from the recorded messages; the result's scope says so.
@@ -53,14 +58,20 @@ from exp.optimize.evaluation.continuations.intervention import (
     preflight_intervention,
 )
 from exp.optimize.evaluation.continuations.job import ContinuationJob
-from exp.optimize.evaluation.variance.contracts import Scenario, resolve_pointer
+from exp.optimize.evaluation.variance.contracts import (
+    BASELINE_STATE,
+    FrozenState,
+    Scenario,
+    json_scalars,
+    message_texts,
+    resolve_pointer,
+    revealing_texts,
+)
 from exp.optimize.evaluation.variance.records import bound_job
 from exp.optimize.evaluation.variance.variants import (
     VariantCheckpoint,
+    freeze_state,
     grounded_state,
-    json_scalars,
-    message_texts,
-    revealing_texts,
 )
 from exp.runtime.environments.interface import Observation
 from exp.simulation.continuations import (
@@ -109,6 +120,8 @@ class DecisionReplay(ContractModel):
             the replay diverged.
         calls: Every recorded call in order, as far as the replay got.
         problems: Why the replay diverged; empty when it did not.
+        frozen: What the replayed decision checkpoint holds of the restorable state, once built;
+            instance facts are bound by the world, not this replay, so they are not recorded.
         scope: What the replay does and does not establish.
     """
 
@@ -120,6 +133,7 @@ class DecisionReplay(ContractModel):
     checkpoint: ArtifactInput | None = None
     calls: tuple[ReplayedCall, ...] = ()
     problems: tuple[str, ...] = ()
+    frozen: FrozenState | None = None
     scope: str = (
         "recorded actor calls imposed in the edited world, not a fresh actor draw; observations "
         "are the edited world's; dependence on a replaced fact the actor never wrote down is not "
@@ -318,19 +332,24 @@ def _replay(
                 message if seen is None else message.model_copy(update={"content": seen.content})
             )
     decision = loaded[-1]
-    checkpoint = persist_continuation_checkpoint(
-        store,
-        ContinuationCheckpoint(
-            task=decision.task,
-            environment_task=decision.environment_task,
-            actor=decision.actor.model_copy(update={"messages": tuple(rebuilt)}),
-            world=final.world,
-            sources=tuple(
-                sorted({reference, current, boundaries[-1]}, key=lambda ref: ref.artifact_id)
-            ),
+    replayed = ContinuationCheckpoint(
+        task=decision.task,
+        environment_task=decision.environment_task,
+        actor=decision.actor.model_copy(update={"messages": tuple(rebuilt)}),
+        world=final.world,
+        sources=tuple(
+            sorted({reference, current, boundaries[-1]}, key=lambda ref: ref.artifact_id)
         ),
-        created_at=datetime.now(UTC),
-        code_revision=code_revision,
+    )
+    frozen = freeze_state(replayed, None)
+    result = result.model_copy(update={"frozen": frozen})
+    missing = frozen.unrestorable(BASELINE_STATE)
+    if missing:
+        return result.model_copy(
+            update={"problems": ("incomplete decision state: " + "; ".join(missing),)}
+        )
+    checkpoint = persist_continuation_checkpoint(
+        store, replayed, created_at=datetime.now(UTC), code_revision=code_revision
     )
     return result.model_copy(update={"status": "replayed", "checkpoint": checkpoint})
 
