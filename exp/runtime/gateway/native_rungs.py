@@ -22,7 +22,9 @@ self-hosted vLLM rung and served without them on a strict one.
 
 A replayed tool call whose argument text encodes no JSON object reaches each
 rung in the form its wire carries (``history_tool_arguments``); a rung that
-sends the object stand-in discloses it.
+sends the object stand-in discloses it. OpenAI's ``original`` image detail
+likewise rides OpenAI's own API and is sent, disclosed, as ``high`` elsewhere
+(``image_detail``).
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ from exp.runtime.models.providers.generation_parameter_validation import bounded
 from exp.runtime.models.providers.history_tool_arguments import (
     history_tool_argument_disclosures,
 )
+from exp.runtime.models.providers.image_detail import original_image_detail_disclosures
 from exp.runtime.models.providers.logprobs import (
     capture_logprobs_eligible,
     require_chat_logprobs,
@@ -116,6 +119,7 @@ class RungDispatch:
     reserved_output_tokens: int
     sampling_disclosures: tuple[str, ...] = ()
     history_argument_disclosures: tuple[str, ...] = ()
+    image_detail_disclosures: tuple[str, ...] = ()
 
     @property
     def disclosures(self) -> tuple[str, ...]:
@@ -128,6 +132,7 @@ class RungDispatch:
                 self.developer_disclosure,
                 *self.sampling_disclosures,
                 *self.history_argument_disclosures,
+                *self.image_detail_disclosures,
             )
             if disclosure is not None
         )
@@ -299,6 +304,7 @@ def build_rung_dispatch(
         reserved_output_tokens=output_bound,
         sampling_disclosures=sampling_disclosures,
         history_argument_disclosures=history_tool_argument_disclosures(profile, rung_request),
+        image_detail_disclosures=original_image_detail_disclosures(profile, rung_request),
     )
 
 
