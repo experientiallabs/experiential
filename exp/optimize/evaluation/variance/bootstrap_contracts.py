@@ -90,6 +90,9 @@ REFUSAL_TYPE = "start-bootstrap-refusal"
 RECORDED_STATE = "state.json"
 """File of a recorded environment state snapshot artifact."""
 
+MAX_REVEAL_PROBES = 16
+"""Finite number of fresh simulator lifetimes an authored start may reveal."""
+
 PROVENANCE_STATEMENTS: dict[Provenance, str] = {
     "observed": "Observed start: the recorded environment state, restored exactly.",
     "reconstructed": (
@@ -171,7 +174,7 @@ class FamilyInput(ContractModel):
         state_domains: Names of the family's shared state domains as its reviewers named them.
             They are descriptive: the bootstrap decides executable ownership, and every
             bootstrapped domain is simulated. When given, every start declares exactly these.
-        corpus: The family's scoped corpus; a trace-scoped corpus must hold every member.
+        corpus: The family's retrieval corpus, which may select a subset of family members.
         rule_book: The family's frozen ``rule-book``; with it no rules are learned here.
         rule_memory: The family's frozen rule memory set and recall policy, kept exactly.
         rules_report: The ``rules-stage-report`` that produced ``rule_book``, when saved; the
@@ -196,9 +199,12 @@ class FamilyInput(ContractModel):
     def _scoped(self) -> Self:
         """Require scoped members, memory only beside its book, and a runtime bound to both."""
         if self.corpus is not None and self.corpus.kind == "trace":
-            outside = sorted(set(self.member_traces) - set(self.corpus.ids))
+            outside = sorted(set(self.corpus.ids) - set(self.member_traces))
             if outside:
-                raise ValueError(f"member traces outside the family's scoped corpus: {outside}")
+                raise ValueError(f"retrieval traces outside the family members: {outside}")
+        outside_rules = sorted(set(self.rules_traces) - set(self.member_traces))
+        if outside_rules:
+            raise ValueError(f"rules traces outside the family members: {outside_rules}")
         if self.rule_memory is not None and self.rule_book is None:
             raise ValueError("a frozen rule memory comes with its frozen rule book")
         if self.rules_report is not None and self.rule_book is None:
@@ -352,11 +358,10 @@ class JobTemplate(ContractModel):
     maximum_output_tokens: int = Field(default=1024, gt=0)
 
 
-class BootstrapSpec(ContractModel):
-    """One registered bootstrap batch.
+class BootstrapSettings(ContractModel):
+    """Bootstrap role and execution settings before family tasks are selected.
 
     Attributes:
-        families: Selected environment families, each with its selected tasks.
         rules: Rules registration a family without frozen rules learns its rules and memory
             with; required only then.
         author: Start author settings.
@@ -378,7 +383,6 @@ class BootstrapSpec(ContractModel):
         concurrency: Tasks bootstrapped at once; not part of any identity.
     """
 
-    families: tuple[BootstrapFamily, ...] = Field(min_length=1)
     rules: RulesStageSpec | None = None
     author: AuthorSettings
     reviewer: AuthorSettings | None = None
@@ -398,7 +402,7 @@ class BootstrapSpec(ContractModel):
 
     @model_validator(mode="after")
     def _closed(self) -> Self:
-        """Refuse unknown stances, repeated identities and families with no way to get rules."""
+        """Require distinct known prompt stances for every bootstrap role."""
         for chosen, known in (
             (self.author_variants, AUTHOR_VARIANTS),
             (self.review_variants, REVIEW_VARIANTS),
@@ -408,6 +412,26 @@ class BootstrapSpec(ContractModel):
             unknown = sorted(set(chosen) - set(known))
             if unknown or len(set(chosen)) != len(chosen):
                 raise ValueError(f"prompt variants must be distinct known stances: {unknown}")
+        return self
+
+    def role(self, name: Literal["reviewer", "researcher"]) -> AuthorSettings:
+        """Return a role's settings, falling back to the author's."""
+        settings = self.reviewer if name == "reviewer" else self.researcher
+        return settings or self.author
+
+
+class BootstrapSpec(BootstrapSettings):
+    """One registered batch with exact selected families and their tasks.
+
+    Attributes:
+        families: Selected environment families, each with its selected tasks.
+    """
+
+    families: tuple[BootstrapFamily, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _families_closed(self) -> Self:
+        """Require distinct family and task identities and available family knowledge."""
         families = [row.family.family_id for row in self.families]
         if len(set(families)) != len(families):
             raise ValueError("family identities repeat")
@@ -417,11 +441,6 @@ class BootstrapSpec(ContractModel):
         if self.rules is None and not all(row.family.frozen for row in self.families):
             raise ValueError("a family without frozen rules needs the spec's rules registration")
         return self
-
-    def role(self, name: Literal["reviewer", "researcher"]) -> AuthorSettings:
-        """Return a role's settings, falling back to the author's."""
-        settings = self.reviewer if name == "reviewer" else self.researcher
-        return settings or self.author
 
 
 class FactClaim(ContractModel):
@@ -484,7 +503,7 @@ class StartDraft(ContractModel):
     replay_trace: str | None = None
     prefix_steps: int = Field(default=0, ge=0, le=64)
     facts: tuple[FactClaim, ...] = Field(min_length=1)
-    reveal_probes: tuple[RevealProbe, ...] = ()
+    reveal_probes: tuple[RevealProbe, ...] = Field(default=(), max_length=MAX_REVEAL_PROBES)
     limitations: tuple[str, ...] = ()
 
 

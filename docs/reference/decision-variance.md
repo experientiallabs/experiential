@@ -213,6 +213,24 @@ The RULES stage verifies and reuses the family's frozen report, book and memory 
 extraction or challenge. Bootstrap preparation has its own governed cost plan before those
 registrations exist; the subsequent six-stage plan uses the resulting exact jobs.
 
+`BootstrapPreparationSpec` (`variance/bootstrap_plan.py`) combines `BuildSettings`,
+`BootstrapSettings` and finite `BootstrapLimits`, without an initial job. Planning selects from
+the completed build and local question banks; after review, it uses exact compatible-family
+placements. Saved simulators can supply frozen knowledge for additional tasks.
+
+```python
+plan = plan_bootstrap_preparation(project, preparation, code_revision=revision)
+# After explicit consent to this exact plan and all disclosed unpriced requests:
+approval = BootstrapApproval(plan_sha256=plan.digest, ceiling_usd=plan.known_usd,
+                             unpriced_attempts=plan.unpriced_attempts)
+prepared = run_bootstrap_preparation(project, preparation, code_revision=revision,
+                                    approval=approval)
+```
+
+Use `prepared.bindings` in `MiningSettings.bootstrap`. Refused and failed tasks remain explicit;
+only registered tasks yield bindings. Preparation uses the shared operation spend ceiling and
+bounded role/reveal budgets. Unknown prices stay unpriced; a known-dollar subtotal is not a total.
+
 ## Paired behavioral differences
 
 Register `mining.behaviors` with a `BehaviorDifferenceSpec`

@@ -9,7 +9,7 @@ dispatch ledgers enforce the attempt limits.
 
 from pathlib import Path
 
-from exp.common.core.artifacts import JsonObject, Sha256, sha256_bytes
+from exp.common.core.artifacts import ArtifactInput, JsonObject, Sha256, sha256_bytes
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
@@ -131,34 +131,53 @@ def _grounded_costs(
     project: ProjectStore, spec: grounded_runtime.GroundedRuntimeDefinition
 ) -> tuple[CostComponent, ...]:
     """Include predictor, query embedding and every enabled recall/reader route."""
+    aliases = (
+        *((spec.memory.recall.jev_alias,) if spec.memory is not None else ()),
+        *((spec.prediction_reading.reader_alias,) if spec.prediction_reading is not None else ()),
+        *((spec.rule_memory.recall.jev_alias,) if spec.rule_memory is not None else ()),
+    )
+    return grounded_allowance_costs(
+        project,
+        spec.world_model,
+        attempts=spec.maximum_physical_attempts,
+        output_tokens=spec.maximum_output_tokens,
+        decision_aliases=aliases,
+    )
+
+
+def grounded_allowance_costs(
+    project: ProjectStore,
+    world_model: ArtifactInput,
+    *,
+    attempts: int,
+    output_tokens: int,
+    decision_aliases: tuple[str, ...] = (),
+) -> tuple[CostComponent, ...]:
+    """Price a grounded runtime allowance before its task or initial state is authored.
+
+    Args:
+        project: Project whose catalog and saved world identify every priced route.
+        world_model: Frozen world artifact, including its embedding route.
+        attempts: Finite lifetime physical-request ceiling of each served world.
+        output_tokens: Per-prediction output allowance.
+        decision_aliases: Every enabled memory recall and prediction-reading route.
+
+    Returns:
+        Predictor, query-embedding and decision costs at the same lifetime allowance. Summing
+        all routes at that ceiling is conservative without assuming their request mixture.
+
+    Raises:
+        ValueError: A lifetime or output allowance is not positive.
+    """
+    if attempts < 1 or output_tokens < 1:
+        raise ValueError("grounded runtime planning needs positive request and output allowances")
     catalog = load_model_catalog(project.model_catalog_path)
-    world = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
-    components = [
-        model_cost(
-            project, world.model_alias, spec.maximum_physical_attempts, spec.maximum_output_tokens
-        )
-    ]
+    world = load_grounded_world_model_artifact(project.artifacts, world_model)
+    components = [model_cost(project, world.model_alias, attempts, output_tokens)]
     embedder = index_embedder_alias(project, catalog, world)
     if embedder is not None:
-        components.append(model_cost(project, embedder, spec.maximum_physical_attempts, 0))
-    if spec.memory is not None:
-        components.append(
-            decision_cost(project, spec.memory.recall.jev_alias, spec.maximum_physical_attempts)
-        )
-    if spec.prediction_reading is not None:
-        components.append(
-            decision_cost(
-                project, spec.prediction_reading.reader_alias, spec.maximum_physical_attempts
-            )
-        )
-    if spec.rule_memory is not None:
-        components.append(
-            decision_cost(
-                project, spec.rule_memory.recall.jev_alias, spec.maximum_physical_attempts
-            )
-        )
-    # All roles share one ledger. Summing each role at that ceiling overestimates the mixture,
-    # but cannot omit an expensive role or assume a favorable allocation of requests.
+        components.append(model_cost(project, embedder, attempts, 0))
+    components.extend(decision_cost(project, alias, attempts) for alias in decision_aliases)
     return tuple(components)
 
 
