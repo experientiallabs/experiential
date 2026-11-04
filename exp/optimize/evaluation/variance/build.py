@@ -127,7 +127,10 @@ from exp.simulation.mining.tag_selection import (
 from exp.simulation.mining.tagging import (
     DecisionCache,
     TagMatrix,
+    TagRow,
     TraceTaggingError,
+    distinct_units,
+    tagged_view,
 )
 from exp.simulation.mining.views import Unit, observations_view, task_view
 from exp.simulation.retrieval.build import persist_trace_rag
@@ -622,48 +625,48 @@ def _tag(
 def _tag_units(
     tagger: DecisionsTraceTagger, units: tuple[Unit, ...], bank: QuestionBank
 ) -> tuple[TagMatrix, tuple[tuple[str, str], ...]]:
-    """Tag units in one pass; when it fails, find each failing trace and keep the rest.
-
-    A failed pass is retried in bounded parallel units. Committed decisions replay from the cache.
-    A decision whose outcome is unknown is refused by the cache, so finding the failing traces
-    buys nothing the first pass did not already attempt or would not have bought. A spend or
-    admission refusal is not a tagging failure and stops the run.
+    """Tag independent units, keeping input failures apart from fatal refusals.
 
     Args:
-        tagger: The decision tagger, with a cache.
-        units: Rendered units of one view.
+        tagger: Decision client with its concurrency bound.
+        units: Rendered traces of one view.
         bank: Questions to ask.
 
     Returns:
-        The matrix of every unit that was answered, and each failed trace with its error.
-
-    Raises:
-        TraceTaggingError: There are no units, or every unit failed.
+        Tagged rows and recoverable failures; fatal refusals propagate unchanged.
     """
-    if not units:
-        raise TraceTaggingError(f"no trace to tag with bank {bank.bank_id}; check the exposure")
-    try:
-        return tagger.tag(units, bank), ()
-    except (TraceTaggingError, ProviderTransportError):
-        pass
+    view = tagged_view(units)
+    decided = distinct_units(units)
 
-    def recover(unit: Unit) -> tuple[Unit, str | None]:
-        """Replay or finish one unit, preserving fatal budget and storage refusals."""
+    def answer(unit: Unit) -> TagRow | str:
+        """Return one row or a recoverable failure, preserving fatal refusals."""
         try:
-            tagger.tag([unit], bank)
+            return tagger.tag([unit], bank).rows[0]
         except (TraceTaggingError, ProviderTransportError) as exc:
-            return unit, str(exc)
-        return unit, None
+            return str(exc)
 
-    outcomes = dispatch_tagging(units, recover, maximum_concurrency=tagger.maximum_concurrency)
-    kept = [unit for unit, error in outcomes if error is None]
-    failed = [(unit.trace_id, error) for unit, error in outcomes if error is not None]
-    if not kept:
+    outcomes = dispatch_tagging(decided, answer, maximum_concurrency=tagger.maximum_concurrency)
+    by_hash = {unit.unit_hash: result for unit, result in zip(decided, outcomes, strict=True)}
+    rows: dict[str, TagRow] = {}
+    failed: list[tuple[str, str]] = []
+    for unit in units:
+        result = by_hash[unit.unit_hash]
+        if isinstance(result, str):
+            failed.append((unit.trace_id, result))
+        else:
+            rows.setdefault(unit.trace_id, result.model_copy(update={"trace_id": unit.trace_id}))
+    if not rows:
         raise TraceTaggingError(
             f"every {units[0].view} unit failed tagging with bank {bank.bank_id}, for example "
             f"trace {failed[0][0]}: {failed[0][1]}"
         )
-    return tagger.tag(kept, bank), tuple(failed)
+    return TagMatrix(
+        bank_id=bank.bank_id,
+        bank_version=bank.version,
+        question_ids=bank.question_ids(),
+        view=view,
+        rows=tuple(rows.values()),
+    ), tuple(failed)
 
 
 def _bind(

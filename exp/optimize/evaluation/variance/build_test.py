@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,6 +32,7 @@ from exp.common.models import (
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.project.errors import ArtifactStoreError
 from exp.common.project.paths import ProjectPaths
+from exp.common.project.request_budget import validate_provider_response
 from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.variance.build import (
@@ -76,7 +77,7 @@ from exp.simulation.mining.tag_clusters import (
     load_tag_clustering,
 )
 from exp.simulation.mining.tag_selection import TagRule
-from exp.simulation.mining.tagging import DecisionCache, TagMatrix, TraceTaggingError
+from exp.simulation.mining.tagging import DecisionCache, TraceTaggingError
 from exp.simulation.mining.views import Unit, observations_view, task_view
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
@@ -570,9 +571,7 @@ def test_unsafe_input_is_quarantined_without_losing_valid_rows(tmp_path: Path) -
     assert len(cache.records.list_ids()) == 1
 
 
-def test_recovery_keeps_remaining_calls_bounded_and_parallel(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_recovery_keeps_remaining_calls_bounded_and_parallel(tmp_path: Path) -> None:
     """A failed initial pass must not turn uncached recovery calls into serial work."""
     bank = _recovery_bank()
     units = (Unit("bad", "observations", "bad"),) + tuple(
@@ -604,18 +603,6 @@ def test_recovery_keeps_remaining_calls_bounded_and_parallel(
 
     cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
     tagger = DecisionsTraceTagger(decide, NAMER, cache=cache, maximum_concurrency=2)
-    original_tag = tagger.tag
-    initial = True
-
-    def tag(items: Sequence[Unit], questions: QuestionBank) -> TagMatrix:
-        """Make the first pass fail before testing real per-unit recovery."""
-        nonlocal initial
-        if initial:
-            initial = False
-            raise TraceTaggingError("initial pass failed")
-        return original_tag(items, questions)
-
-    monkeypatch.setattr(tagger, "tag", tag)
     matrix, failed = _tag_units(tagger, units, bank)
 
     assert [row.trace_id for row in matrix.rows] == [unit.trace_id for unit in units[1:]]
@@ -652,3 +639,60 @@ def test_artifact_refusals_abort_tagging_and_recovery(
         _tag_units(tagger, units, _recovery_bank())
 
     assert caught.value is refusal
+
+
+def test_unsafe_input_cannot_mask_a_parallel_provider_output_refusal(tmp_path: Path) -> None:
+    """A quarantined source must not downgrade another worker's authoritative refusal."""
+    units = (
+        Unit("unsafe-input", "observations", "password: synthetic-placeholder"),
+        Unit("unsafe-output", "observations", "output"),
+        Unit("safe", "observations", "safe"),
+    )
+    calls: list[str] = []
+
+    def decide(request: DecisionRequest) -> JsonObject:
+        """Exercise the real output boundary while another input is quarantined."""
+        state = request.state
+        assert isinstance(state, str)
+        calls.append(state)
+        if state == "output":
+            validate_provider_response(json.dumps({"password": "synthetic-placeholder"}))
+        return _answers(state, request.questions, drop=None)
+
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    tagger = DecisionsTraceTagger(decide, NAMER, cache=cache, maximum_concurrency=2)
+
+    with pytest.raises(ArtifactStoreError, match="secret boundary"):
+        _tag_units(tagger, units, _recovery_bank())
+
+    assert units[0].text not in calls
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_unit_outcomes_preserve_order_deduplication_and_call_count(
+    tmp_path: Path, cached: bool
+) -> None:
+    """Combine rows without repurchasing identical content or uncached valid answers."""
+    units = (
+        Unit("second", "observations", "same"),
+        Unit("first", "observations", "same"),
+        Unit("third", "observations", "different"),
+        Unit("second", "observations", "same"),
+    )
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    decide = FakeDecisions()
+    tagger = DecisionsTraceTagger(
+        decide, NAMER, cache=cache if cached else None, maximum_concurrency=2
+    )
+    bank = _recovery_bank()
+
+    matrix, failed = _tag_units(tagger, units, bank)
+
+    assert [row.trace_id for row in matrix.rows] == ["second", "first", "third"]
+    assert matrix.rows[0].values == matrix.rows[1].values
+    assert matrix.rows[0].unit_hash == units[0].unit_hash
+    assert matrix.question_ids == bank.question_ids()
+    assert matrix.bank_id == bank.bank_id and matrix.bank_version == bank.version
+    assert matrix.view == "observations"
+    assert sorted(decide.states) == ["different", "same"]
+    assert failed == ()
