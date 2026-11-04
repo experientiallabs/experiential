@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import typer
+
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.ingest.persistence import read_ingested_traces
@@ -55,3 +57,32 @@ def project_for_build(root: Path, proposed: ProjectConfig) -> ProjectStore:
     if existing.model_copy(update={"build": None, **pointers}) != proposed:
         raise ValueError("project configuration already exists with different build configuration")
     return store
+
+
+_DIRECTORY_SOURCES = frozenset({"agent-sessions"})
+"""Canonical sources whose loader reads a directory of session files."""
+
+
+def resolve_trace_path(trace_file: Path, *, source: str | None = None) -> Path:
+    """Validate one explicit local trace selection without opening its content.
+
+    Args:
+        trace_file: User-selected local trace export, or a directory of session files for a
+            source that reads directories.
+        source: Declared canonical source; ``agent-sessions`` accepts a directory.
+
+    Returns:
+        The validated path.
+
+    Raises:
+        typer.BadParameter: The path is absent, or is a directory for a file-only source.
+    """
+    if not trace_file.exists():
+        raise typer.BadParameter(f"trace file not found: {trace_file}")
+    if trace_file.is_dir() and source in _DIRECTORY_SOURCES:
+        return trace_file
+    if not trace_file.is_file():
+        raise typer.BadParameter(
+            f"--traces must name a trace export, not a directory: {trace_file}"
+        )
+    return trace_file

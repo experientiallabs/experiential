@@ -18,7 +18,7 @@ from exp.cli.build.checkpoints import (
     save_grounded_checkpoint,
 )
 from exp.cli.build.providers import configure_build_providers
-from exp.cli.build.source import load_stored_build_import, project_for_build
+from exp.cli.build.source import load_stored_build_import, project_for_build, resolve_trace_path
 from exp.cli.build.stops import paid_work_stops, require_learning_consent, rerun_command
 from exp.cli.build.summary import render_completed_build
 from exp.cli.build.traces import load_build_traces
@@ -330,7 +330,7 @@ def build(
                 source, normalized = load_stored_build_import(root, project, import_id)
             else:
                 assert trace_file is not None
-                path = _resolve_trace_file(trace_file)
+                path = resolve_trace_path(trace_file, source=source)
                 normalized, import_id = load_build_traces(
                     project, root=root, path=path, source=source, identity=identity, dry_run=dry_run
                 )
@@ -880,27 +880,6 @@ def _lineage_bindings(completed: ProjectBuild) -> tuple[RAGLineageBinding, ...]:
             for trace_id in group.source_trace_ids
         )
     return tuple(sorted(result, key=lambda item: item.trace_id))
-
-
-def _resolve_trace_file(trace_file: Path) -> Path:
-    """Validate one explicit local trace-file selection without opening its content.
-
-    Args:
-        trace_file: User-selected local trace export.
-
-    Returns:
-        The validated file path.
-
-    Raises:
-        typer.BadParameter: The path is absent or is not a regular file.
-    """
-    if not trace_file.exists():
-        raise typer.BadParameter(f"trace file not found: {trace_file}")
-    if not trace_file.is_file():
-        raise typer.BadParameter(
-            f"--traces must name a trace export, not a directory: {trace_file}"
-        )
-    return trace_file
 
 
 def _capture_local_build_telemetry(
