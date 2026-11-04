@@ -206,7 +206,7 @@ pub(crate) async fn serve_images(
                 .await
             {
                 // Never hand out images the ledger did not record.
-                return error_response(&PublicError::internal());
+                return error_response(&guard.settlement_error());
             }
             let response_headers = served_headers(&admission, served.depth, client_request_id);
             json_response(StatusCode::OK, &served.body, &response_headers)
@@ -332,7 +332,7 @@ async fn run_ladder(
                     .settle("failed", None, &[], Some(&boundary), !possible)
                     .await
                 {
-                    return Err(PublicError::internal());
+                    return Err(guard.settlement_error());
                 }
                 if possible {
                     current_depth = Some(depth);

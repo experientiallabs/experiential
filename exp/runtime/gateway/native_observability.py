@@ -212,6 +212,7 @@ class NativeObservabilityMixin:
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
             "accounting_healthy": self._accounting.accounting_healthy,
+            "accounting_fenced_organizations": len(self._accounting.fenced_organizations()),
             "observation_recording_dropped": (
                 0 if self._guardrails is None else self._guardrails.observation_recording_dropped
             ),
@@ -233,14 +234,16 @@ class NativeObservabilityMixin:
         return json.dumps({"text": text}, separators=(",", ":"))
 
     def readiness(self, argument: str) -> str:
-        """Return whether bridge settlement and composition accounting stay healthy.
+        """Return whether this instance's composition accounting can still land writes.
 
-        This instance's retained writes and infrastructure failures fail closed.
+        Only a process-wide failure (the composition's durable writer or store
+        cannot commit) fails readiness closed. One organization's retained terminal
+        writes fence only that organization's admission, never the worker.
         A host composing several instances owns process readiness separately.
         """
         del argument
         try:
-            if not self._components.accounting_healthy or not self._accounting.accounting_healthy:
+            if not self._components.accounting_healthy:
                 return "false"
         except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
             return "false"

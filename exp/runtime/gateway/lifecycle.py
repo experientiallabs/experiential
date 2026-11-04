@@ -458,10 +458,10 @@ class LocalGatewayComponents:
     def accounting_healthy(self) -> bool:
         """Return whether the shared group-commit writer can still land writes.
 
-        The native bridge's readiness callback reads this composition health
-        surface; per-settlement losses latch in the bridge's own registry.
+        The native bridge's readiness callback reads this writer-wide surface;
+        per-settlement losses fence only their organization in the registry.
         """
-        return not self.write_ledger.closed
+        return self.write_ledger.writable()
 
     @property
     def readiness(self) -> tuple[ExecutionSnapshot, ...]:

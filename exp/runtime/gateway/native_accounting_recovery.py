@@ -12,7 +12,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from exp.common.core.artifacts import JsonObject
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.native_execution import InflightRequest
 
 _SWEEP_BATCH = 16
 _SWEEP_GRACE_SECONDS = 5.0
@@ -72,6 +74,36 @@ def recover_until_stopped(accounting: NativeAttemptAccounting, interval_seconds:
             time.sleep(min(interval_seconds, 0.1))
 
 
+def settle_swept(
+    accounting: NativeAttemptAccounting,
+    request_id: str,
+    entry: InflightRequest,
+    settlement: JsonObject,
+) -> bool:
+    """Replay owned evidence, skipping busy requests and stale sweep selections.
+
+    Args:
+        accounting: The registry owning the retained settlement.
+        request_id: The retained request's id.
+        entry: The in-flight request the sweep selected.
+        settlement: The retained settlement payload the sweep selected.
+
+    Returns:
+        Whether the retained settlement landed.
+    """
+    if not entry.execution_lock.acquire(blocking=False):
+        return False
+    try:
+        if accounting.entry(request_id) is not entry or entry.pending_settlement != settlement:
+            return False
+        accounting._commit_settlement(request_id, entry, settlement)
+        return True
+    except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
+        return False
+    finally:
+        entry.execution_lock.release()
+
+
 def recover_expired(accounting: NativeAttemptAccounting) -> None:
     """Recover retained settlements and close abandoned requests.
 
@@ -108,7 +140,7 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
         if settlement is None:
             continue
         try:
-            finished = accounting._settle_swept(request_id, entry, settlement)
+            finished = settle_swept(accounting, request_id, entry, settlement)
         except Exception as error:  # noqa: BLE001 - one poison item cannot stop later work.
             _logger.warning("retained gateway recovery failed: %s", type(error).__name__)
             continue

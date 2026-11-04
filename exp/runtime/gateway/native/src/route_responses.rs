@@ -542,7 +542,7 @@ async fn respond_from_responses_events(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return error_response(&PublicError::internal());
+        return error_response(&guard.settlement_error());
     }
     let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
