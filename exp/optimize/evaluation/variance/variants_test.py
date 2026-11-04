@@ -604,3 +604,60 @@ def test_a_variant_whose_required_state_is_not_held_is_refused(tmp_path: Path) -
     assert freeze_state(outside, None).unrestorable(BASELINE_STATE) == (
         "domain_state is external: ['simulated'] hold no image bytes",
     )
+
+
+_NUDGE = "The requester mentioned the ticket priority changed this morning."
+
+
+def _nudged(step: int) -> DecisionState:
+    """The priority decision with a nudge value that keeps the original's obligations."""
+    instructed = _instructed(step)
+    assert instructed.instruction_axis is not None
+    nudge = InstructionValue(
+        value_id="nudge-0",
+        instruction=f"Operate the environment.\n\n{_NUDGE}",
+        kind="nudge",
+        equivalent_to="original",
+        obligations="Handle the ticket.",
+        nudge=_NUDGE,
+    )
+    axis = instructed.instruction_axis.model_copy(
+        update={"values": (*instructed.instruction_axis.values, nudge)}
+    )
+    return instructed.model_copy(update={"instruction_axis": axis})
+
+
+def test_a_resumed_nudge_is_appended_as_one_user_message_at_the_decision(
+    tmp_path: Path,
+) -> None:
+    """A nudge keeps the task, prefix and budget, and adds its message as the last user turn."""
+    project = ProjectStore(tmp_path, "case")
+    boundaries, _ = _trajectory(project, _task("escalate"))
+    nudged = _report("", fresh=False).model_copy(
+        update={
+            "scenario_id": "nudged",
+            "instruction": f"Operate the environment.\n\n{_NUDGE}",
+            "criteria": ("right",),
+        }
+    )
+
+    variant = build_variant_checkpoint(
+        project,
+        base=boundaries[3],
+        branch_checkpoints=boundaries,
+        decision=_nudged(3),
+        scenario=nudged,
+        facts=None,
+        code_revision="test",
+        maximum_model_calls=6,
+    )
+
+    assert variant.problems == () and variant.reference is not None
+    assert variant.initialization == "resume" and variant.replay_turns == 0
+    saved = load_continuation_checkpoint(project.artifacts, variant.reference)
+    fork = load_continuation_checkpoint(project.artifacts, boundaries[3])
+    assert saved.task == fork.task and saved.actor.calls == fork.actor.calls
+    assert saved.actor.messages[:-1] == fork.actor.messages
+    assert saved.actor.messages[-1].role == "user"
+    assert saved.actor.messages[-1].content == _NUDGE
+    assert ChatAgentRuntime(maximum_model_calls=6).remaining_calls(saved.actor) > 0

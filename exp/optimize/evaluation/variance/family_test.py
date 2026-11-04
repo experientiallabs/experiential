@@ -31,6 +31,7 @@ from exp.optimize.evaluation.rules.stage import (
     RulesStageSpec,
     rulebook_files,
 )
+from exp.optimize.evaluation.variance import family as family_module
 from exp.optimize.evaluation.variance import family_stages as stages_module
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, run_actor_critic
 from exp.optimize.evaluation.variance.actor_critic_test import (
@@ -49,11 +50,18 @@ from exp.optimize.evaluation.variance.briefing_review import DEFAULT_REVIEW_VARI
 from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario, StatePart
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
 from exp.optimize.evaluation.variance.contrast_test import _outcome
+from exp.optimize.evaluation.variance.decision_measure import (
+    MEASURE_TYPE,
+    DecisionMeasure,
+    DecisionMeasureSpec,
+    JointVerdict,
+)
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.family import (
     DecisionFamilySpec,
     FamilyReport,
     export_family_harbor,
+    family_decisions,
     run_decision_family,
 )
 from exp.optimize.evaluation.variance.grader import EpisodeView
@@ -66,6 +74,7 @@ from exp.optimize.evaluation.variance.records import (
     audit_finding,
     confirmation_job,
 )
+from exp.optimize.evaluation.variance.rewards import PointDecision
 from exp.optimize.evaluation.variance.variants import CoherenceCheck, VariantCheckpoint
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse
@@ -524,6 +533,7 @@ def _setup(
         confirmation_repeats=8,
         judging=_frozen(project, stages, job, identities),
         tiers={report.spec.initial.study.actor_model.model_id: "strong"},
+        measure_decisions=False,
     )
     decider = _Decider(lambda question, text: 0.9)
     return _Setup(project, spec, report, exposure, roles, stages, decider, job)
@@ -845,3 +855,95 @@ def test_a_fresh_briefing_without_the_actor_view_is_refused(
     assert any("actor's view" in p.reason for p in report.scenarios.problems)
     assert report.failure is not None and report.failure.startswith("scenarios:")
     assert setup.stages.required == {}
+
+
+def _verdict(admitted: bool) -> JointVerdict:
+    """A joint verdict that admits with score 0.5 or refuses for lack of a choice shift."""
+    return JointVerdict(
+        states=(),
+        choice_shift=admitted,
+        consequence=admitted,
+        clarity=admitted,
+        flip=admitted,
+        admitted=admitted,
+        score=0.5 if admitted else 0.0,
+        deficits=() if admitted else ("choices do not change across states",),
+    )
+
+
+def _fake_measure(admitted: bool, seen: list) -> object:
+    """Return a stand-in for the joint measure that records its settings and answers a verdict."""
+    reference = ArtifactInput(artifact_id="fixture-measure", sha256="5" * 64)
+
+    def measure(project: ProjectStore, spec: DecisionMeasureSpec, **kwargs: object) -> tuple:
+        """Record the settings and scenarios, then return the scripted verdict."""
+        scenarios = kwargs["scenarios"]
+        assert isinstance(scenarios, tuple)
+        seen.append((spec, [s.scenario_id for s in scenarios if isinstance(s, Scenario)]))
+        decision = kwargs["decision"]
+        assert isinstance(decision, DecisionState)
+        result = DecisionMeasure(
+            identity="m", decision=decision, states=(), verdict=_verdict(admitted)
+        )
+        return reference, result, None
+
+    return measure
+
+
+def test_the_joint_measure_runs_by_default_under_the_family_authors_before_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no settings the measure uses the authors; a refusal blocks confirmation by name."""
+    setup = _setup(tmp_path, monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(family_module, "measure_family", _fake_measure(False, seen))
+    default = setup.spec.model_copy(update={"measure_decisions": True})
+
+    blocked = setup.run(default)
+
+    assert default.measure_spec == DecisionMeasureSpec(
+        classifier=default.scenario_author, reviewer=default.decision_author
+    )
+    assert seen == [(default.measure_spec, ["six", "seven"])]
+    assert blocked.selection is not None and blocked.selection.qualifies
+    assert blocked.confirmation is None and blocked.records is None
+    assert isinstance(blocked.decision_variance, ArtifactInput)
+    reasons = blocked.eligibility.reasons
+    assert "decision_variance: choices do not change across states" in reasons
+    assert any(r.startswith("fresh_confirmation: not run: the decision_variance") for r in reasons)
+    assert "confirmation:six" not in setup.stages.dispatches
+    assert default.draws_identity(setup.report, 0, "test") == setup.spec.draws_identity(
+        setup.report, 0, "test"
+    )
+    assert default.identity(setup.report, 0, "test") != setup.spec.identity(setup.report, 0, "test")
+
+    monkeypatch.setattr(family_module, "measure_family", _fake_measure(True, seen))
+    admitted = setup.run(
+        default.model_copy(update={"dispositions": _disposed(setup, blocked).dispositions})
+    )
+    condition = next(c for c in admitted.eligibility.conditions if c.name == "decision_variance")
+    assert condition.holds and condition.detail == "admitted, joint score 0.500"
+    assert admitted.confirmation is not None and "confirmation:six" in setup.stages.dispatches
+    assert admitted.eligibility.eligible, admitted.eligibility.reasons
+    assert isinstance(admitted.records, TrainingRecords) and admitted.records.selectors
+    assert admitted.records.selectors.objective.version == "selector-decision-variance-v2"
+    assert any(
+        draw.score and draw.score.variances == {"point-0": 0.5}
+        for draw in admitted.records.selectors.draws
+    )
+    assert blocked.decision.answer is not None
+    measure = DecisionMeasure(
+        identity="m", decision=blocked.decision.answer.state, states=(), verdict=_verdict(True)
+    )
+    saved = setup.project.artifacts.write_json(
+        artifact_id="family-measure",
+        artifact_type=MEASURE_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+        ),
+        files={"measure.json": measure},
+    )
+    measured = admitted.model_copy(update={"decision_variance": artifact_input(saved)})
+    assert family_decisions(
+        setup.project, [measured, blocked.model_copy(update={"decision_variance": "no states"})]
+    ) == {"point-0": PointDecision(point_id="point-0", joint_score=0.5)}

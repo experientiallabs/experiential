@@ -22,6 +22,10 @@ review that it is decidable from observable facts).
 3. **Feedback.** Structural problems or the measure's deficits, with per-state choice counts,
    consequences and clarity issues (:func:`measure_feedback`), become the next round's documents.
 
+:func:`ladder_measurer` composes the same stages for a set measured under a decision it is
+given, which the nudge ladder (:mod:`~exp.optimize.evaluation.variance.nudge_ladder`) needs
+because its nudge values are declared only once the author has proposed them.
+
 The search stops at the first admitted round or after ``maximum_rounds``. Every round is saved as
 it completes, so an interrupted search resumes, and the finished search is saved as a
 ``variant-search`` artifact that replays without model calls or measurements.
@@ -121,6 +125,9 @@ success did not differ, or move states apart where the choices did not change.""
 
 Measurer = Callable[[ScenarioSet, int], tuple[ArtifactInput, DecisionMeasure] | str]
 """Measures one structurally sound set in one round: the saved measure, or why it could not."""
+
+LadderMeasurer = Callable[[DecisionState, ScenarioSet], tuple[ArtifactInput, DecisionMeasure] | str]
+"""Measures a set under the given decision: the saved measure, or why it could not."""
 
 
 def search_prompts_sha256() -> str:
@@ -498,10 +505,61 @@ def variant_measurer(
     Returns:
         A measurer for :func:`search_variants`.
     """
+    measure = ladder_measurer(
+        project,
+        spec,
+        bind=bind,
+        base=base,
+        boundaries=boundaries,
+        actions=actions,
+        facts=facts,
+        repeats=repeats,
+        code_revision=code_revision,
+        required_state=required_state,
+    )
+    return lambda scenarios, number: measure(decision, scenarios)
 
-    def measure(scenarios: ScenarioSet, number: int) -> tuple[ArtifactInput, DecisionMeasure] | str:
-        """Run every family stage up to selection for one round's set and measure it."""
-        del number
+
+def ladder_measurer(
+    project: ProjectStore,
+    spec: DecisionMeasureSpec,
+    *,
+    bind: Callable[[Scenario], tuple[ContinuationJob, EpisodeJudge]],
+    base: ArtifactInput,
+    boundaries: tuple[ArtifactInput, ...],
+    actions: Mapping[str, ToolCall],
+    facts: InstanceFacts | None,
+    repeats: int,
+    code_revision: str,
+    required_state: frozenset[StatePart] = frozenset(),
+) -> LadderMeasurer:
+    """Compose the measurer of a set under the decision it is given, as a nudge ladder needs.
+
+    Each scenario becomes a variant whose witness and selection contrast run under the frozen
+    job and judge ``bind`` gives it (the same judge and rubric for every rung), and the contrasted
+    variants are measured together by
+    :func:`~exp.optimize.evaluation.variance.decision_measure.measure_family`.
+
+    Args:
+        project: Project holding every saved step.
+        spec: The frozen measurement settings.
+        bind: Gives each scenario its frozen job and episode judge, fixed before its contrasts.
+        base: The decision's checkpoint in the picked trajectory.
+        boundaries: Every saved boundary of the picked attempt, start first.
+        actions: Concrete forced first action of every option.
+        facts: Instance facts the world model was given, if any.
+        repeats: Pairs per selection contrast.
+        code_revision: Producing source identity.
+        required_state: State parts every variant must hold beyond the baseline.
+
+    Returns:
+        A measurer for :func:`build_nudge_ladder`.
+    """
+
+    def measure(
+        decision: DecisionState, scenarios: ScenarioSet
+    ) -> tuple[ArtifactInput, DecisionMeasure] | str:
+        """Run every family stage up to selection for one set and measure it."""
         bound = {s.scenario_id: bind(s) for s in scenarios.scenarios}
         variants = [
             run_variant(

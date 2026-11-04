@@ -6,6 +6,10 @@ from saved evidence rather than asserted by a caller:
 - **family_flip**: the family qualified on its selection contrasts
   (:func:`~exp.optimize.evaluation.variance.contrast.family_flip`), whose cells are labelled only
   by each variant's frozen episode judge.
+- **decision_variance**: when the registration requires it, the joint decision-variance measure
+  (:mod:`~exp.optimize.evaluation.variance.decision_measure`) admitted the family: choices shift
+  across states, the choice changes success and every state is clear. A family it blocks names
+  this condition, and its confirmation is reported as not run because of it.
 - **fresh_confirmation**: every variant that qualified on selection was contrasted again with
   independently drawn samples that took no part in selection, labelled by the same frozen judge,
   and the confirmation reproduced its separated winner.
@@ -33,28 +37,26 @@ only when the error-mining run's episode judge is every confirmed variant's judg
 ``critics_refused`` says why) and stay non-trainable: they were scored under the discovery run, not
 the variant's fresh predictions. Point-selector screening scores are kept for analysis.
 
-Point-selector training records (:func:`selector_records`, objective
-:data:`~exp.optimize.evaluation.variance.rewards.SELECTOR_OBJECTIVE`) reference each saved selector
-draw (its request settings, final response and full analysis transcript) and every judged slot of
-the points it chose. Each draw's reward is the decision relevance of its picks under the run's
-frozen episode judge, and the ``J`` draws of one run are one group for group-relative advantages.
+Point-selector training records (:func:`selector_records`) reference each saved selector draw
+(request settings, final response, full analysis transcript) and every judged slot of the points
+it chose. Each draw's reward is its picks' decision relevance under the run's frozen episode
+judge, scored by :func:`~exp.optimize.evaluation.variance.rewards.score_selector` under version 2
+by default (each pick's classified choices or family joint score from ``decisions``) or version 1
+(judged outcome variance). The ``J`` draws of one run are one group for group-relative advantages.
 A draw is trainable only when the run's judge coverage passes the admission policy, every judged
 study was made by the expected selector judge (within a family: the error-mining judge is every
 confirmed variant's judge) and the group has at least two rewarded draws.
 
-This repository produces these records and never runs an optimizer or updates any weights: an
-external trainer consumes them and registers the revision it produces
-(:mod:`~exp.optimize.evaluation.variance.schedule`).
-
-Fresh confirmation draws come from :func:`confirmation_job`, and their episodes are rendered for
-an optional calibration grader by :func:`confirmation_episodes`.
+No optimizer runs here: an external trainer consumes these records and registers its revision
+(:mod:`~exp.optimize.evaluation.variance.schedule`). Fresh confirmation draws come from
+:func:`confirmation_job`; :func:`confirmation_episodes` renders them for a calibration grader.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Literal, Self
+from typing import Literal, Self, get_args
 
 from pydantic import Field, model_validator
 
@@ -86,12 +88,15 @@ from exp.optimize.evaluation.variance.judged import (
     slot_rewards,
 )
 from exp.optimize.evaluation.variance.rewards import (
+    DEFAULT_SELECTOR_OBJECTIVE,
     JudgeScore,
+    PointDecision,
     PointOutcome,
     SelectorObjective,
+    SelectorObjectiveV2,
     SelectorScore,
     group_advantages,
-    selector_score,
+    score_selector,
 )
 
 FindingSource = Literal[
@@ -104,6 +109,7 @@ Resolution = Literal["fixed", "accepted_with_reason", "not_applicable"]
 
 ConditionName = Literal[
     "family_flip",
+    "decision_variance",
     "fresh_confirmation",
     "audit_dispositions",
     "critic_scores",
@@ -118,21 +124,11 @@ ConditionName = Literal[
 ]
 """Every condition training eligibility checks."""
 
-CONDITIONS: tuple[ConditionName, ...] = (
-    "family_flip",
-    "fresh_confirmation",
-    "audit_dispositions",
-    "critic_scores",
-    "tool_coverage",
-    "rule_witnesses",
-    "policy_consistency",
-    "judge_coverage",
-    "rubric_problems",
-    "rubric_compatibility",
-    "world_freeze",
-    "world_provenance",
-)
+CONDITIONS: tuple[ConditionName, ...] = get_args(ConditionName)
 """The conditions in the order they are reported."""
+
+AnySelectorObjective = SelectorObjective | SelectorObjectiveV2
+"""A point-selector objective of either version, told apart by its version literal."""
 
 UNTIERED = "untiered"
 """Stratum of continuation groups whose actor has no recorded tier."""
@@ -411,14 +407,7 @@ def policy_key(meaning: EstimateMeaning) -> str:
 
 
 def unscored_critics(critics: Sequence[CriticDraw]) -> tuple[int, ...]:
-    """Return the draws whose estimates exist but earned no reward.
-
-    Args:
-        critics: Every critic draw of the run.
-
-    Returns:
-        Draw indices with an assessment and no scored reward.
-    """
+    """Return the indices of critic draws with an assessment but no scored reward."""
     return tuple(
         draw.draw
         for draw in critics
@@ -439,6 +428,7 @@ def training_eligibility(
     unwitnessed_rules: Sequence[str],
     meanings: Sequence[EstimateMeaning],
     judging: Mapping[str, dict[str, tuple[str, ...]]],
+    decision_variance: tuple[bool, str] | None = None,
 ) -> TrainingEligibility:
     """Compute every eligibility condition from saved evidence.
 
@@ -456,6 +446,8 @@ def training_eligibility(
         judging: Admission-policy problems per condition and confirmed scenario, from
             :func:`~exp.optimize.evaluation.variance.admission.judging_problems`; a condition
             absent here was not checked and fails.
+        decision_variance: Whether the joint decision-variance measure admitted the family and
+            what it found, or None when the registration does not require it.
 
     Returns:
         The eligibility with every condition.
@@ -468,6 +460,7 @@ def training_eligibility(
     missing = () if selection is None else unreproduced(selection, confirmation)
     qualified = selection is not None and selection.qualifies
     confirmed = qualified and confirmation is not None and not missing
+    blocked = qualified and decision_variance is not None and not decision_variance[0]
     rule_problems = [
         *(f"{rule} was contradicted without a witness" for rule in contradicted),
         *(f"{rule} has no supporting witness" for rule in unwitnessed),
@@ -483,10 +476,19 @@ def training_eligibility(
                 f"{list(selection.triage)}, undersampled {list(selection.undersampled)}",
             ),
             EligibilityCondition(
+                name="decision_variance",
+                holds=decision_variance is None or decision_variance[0],
+                detail="not required by this registration"
+                if decision_variance is None
+                else decision_variance[1][:4000] or "no detail recorded",
+            ),
+            EligibilityCondition(
                 name="fresh_confirmation",
                 holds=confirmed,
                 detail="selection did not qualify, so nothing was confirmed"
                 if not qualified
+                else "not run: the decision_variance condition blocked confirmation"
+                if blocked and confirmation is None
                 else "no confirmation contrast ran"
                 if confirmation is None
                 else f"confirmation did not reproduce the winner of {list(missing)}"
@@ -678,7 +680,7 @@ class SelectorRecords(ContractModel):
         optimizer: Always ``external``: these are records only; no optimizer runs here.
     """
 
-    objective: SelectorObjective
+    objective: AnySelectorObjective
     judge: Sha256
     group: str
     coverage: JudgeCoverage
@@ -722,9 +724,10 @@ def selector_records(
     report: ActorCriticReport,
     *,
     judge: str,
-    objective: SelectorObjective | None = None,
+    objective: SelectorObjective | SelectorObjectiveV2 = DEFAULT_SELECTOR_OBJECTIVE,
     admission: FamilyAdmissionPolicy | None = None,
     refusals: Sequence[str] = (),
+    decisions: Mapping[str, PointDecision] | None = None,
 ) -> SelectorRecords:
     """Build every selector draw's training record from the run's saved judged continuations.
 
@@ -732,14 +735,15 @@ def selector_records(
         project: Project holding the run's judged studies and assessments.
         report: The saved actor-critic run.
         judge: Selector judge identity every judged study must carry.
-        objective: The selector objective, or None for its defaults.
+        objective: The selector objective of either version; version 2 by default.
         admission: Coverage limits the run's judging must meet, or None for the defaults.
         refusals: Further group-level reasons the caller found, such as a judge mismatch.
+        decisions: Classified choices or family joint score by point identity
+            (``point-<step>``), read by version 2; a pick without one is unscored.
 
     Returns:
         The records; reading saved artifacts only, never calling a model.
     """
-    objective = objective or SelectorObjective()
     problems = list(refusals)
     mining = report.spec.episode_judge.identity
     if mining != judge:
@@ -781,7 +785,8 @@ def selector_records(
             scores.append(None)
             continue
         picks = () if draw.selection is None else draw.selection.points
-        scores.append(selector_score([f"point-{p.step}" for p in picks], outcomes, objective))
+        points_chosen = [f"point-{p.step}" for p in picks]
+        scores.append(score_selector(points_chosen, outcomes, objective, decisions))
     group = f"{report.group.artifact_id}:{report.picked}"
     rewards = [None if score is None else score.reward for score in scores]
     if sum(reward is not None for reward in rewards) < 2:
@@ -873,8 +878,9 @@ def training_records(
     confirmed: Mapping[str, tuple[OptionContrast, EstimateMeaning]],
     *,
     tiers: Mapping[str, str] | None = None,
-    objective: SelectorObjective | None = None,
+    objective: SelectorObjective | SelectorObjectiveV2 = DEFAULT_SELECTOR_OBJECTIVE,
     admission: FamilyAdmissionPolicy | None = None,
+    decisions: Mapping[str, PointDecision] | None = None,
 ) -> TrainingRecords | tuple[str, ...]:
     """Build the records of an eligible family from its judged confirmations, or say why not.
 
@@ -884,8 +890,9 @@ def training_records(
         report: The actor-critic run the family was built from.
         confirmed: Confirmation contrast and its meaning per confirmed variant.
         tiers: Tier label per actor model identity, when tiers are recorded.
-        objective: Point-selector objective, or None for its defaults.
+        objective: Point-selector objective of either version; version 2 by default.
         admission: Coverage limits the run's selector judging must meet, or None for defaults.
+        decisions: Classified choices or family joint score by point identity, for version 2.
 
     Returns:
         The records, or the failed eligibility conditions.
@@ -933,6 +940,7 @@ def training_records(
         objective=objective,
         admission=admission,
         refusals=(refused,) if refused else (),
+        decisions=decisions,
     )
     by_draw = {record.draw: record for record in selectors.draws}
     return TrainingRecords(

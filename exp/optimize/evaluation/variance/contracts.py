@@ -14,7 +14,10 @@ mechanically before it can become an environment:
   variant distinct, and a state-only decision (no instruction axis) cannot vary wording at all;
 - instruction variation is its own declared axis: a goal or consent change cites what
   authorizes it and binds the criteria that apply under it, and a changed instruction cannot
-  resume a prefix whose first message stated the original, so it needs a fresh briefing;
+  resume a prefix whose first message stated the original, so it needs a fresh briefing. An
+  instruction nudge keeps every obligation and the correct option of the value it nudges and only
+  adds what a user, ticket or system message might say; a resumed variant receives it as one
+  appended user message, so like a rewording it never establishes decision variance by itself;
 - a fresh briefing's entitled paths exist, are not edited and show values the actor had
   observed at its start. Whether the briefing text leaks the intended option, an edited value or
   unobserved knowledge is a question about meaning, judged by the model leak reviewer
@@ -93,8 +96,11 @@ InitializationMode = Literal["resume", "fresh_briefing"]
 MAXIMUM_SCENARIOS = 8
 """Most variants one scenario set may author."""
 
-InstructionKind = Literal["original", "reworded", "goal_change", "consent_change"]
+InstructionKind = Literal["original", "reworded", "goal_change", "consent_change", "nudge"]
 """What an instruction value does to the actor's obligations."""
+
+KEEPS_OBLIGATIONS: frozenset[InstructionKind] = frozenset({"reworded", "nudge"})
+"""Kinds that keep the obligations of the value they name in ``equivalent_to``."""
 
 
 class EstimationPoint(ContractModel):
@@ -244,12 +250,16 @@ class InstructionValue(ContractModel):
         instruction: The exact instruction text.
         kind: ``original`` is the task's own instruction; ``reworded`` says the same thing in
             other words and changes no obligation; ``goal_change`` and ``consent_change`` change
-            what the actor is asked or permitted to do.
-        equivalent_to: For a rewording, the value whose obligations it keeps; None otherwise.
+            what the actor is asked or permitted to do; ``nudge`` keeps every obligation and the
+            correct option and adds only ``nudge``, a message shifting the actor's attention.
+        equivalent_to: For a rewording or nudge, the value whose obligations it keeps; None
+            otherwise.
         obligations: What the actor must and must not do under this instruction.
         authorized_by: Supplied locators authorizing a goal or consent change; required for one.
         criteria: Criterion identities that apply under this instruction; required for a goal or
-            consent change, empty for a rewording, which inherits its equivalent's.
+            consent change, empty for a rewording or nudge, which inherits its equivalent's.
+        nudge: Exactly for a nudge, the added message: a resumed variant receives it as one user
+            message, and the instruction text must contain it for a fresh briefing.
     """
 
     value_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
@@ -259,16 +269,23 @@ class InstructionValue(ContractModel):
     obligations: str = Field(min_length=1, max_length=800)
     authorized_by: tuple[str, ...] = ()
     criteria: tuple[str, ...] = ()
+    nudge: str | None = Field(default=None, min_length=1, max_length=1200)
 
     @model_validator(mode="after")
     def _bound(self) -> Self:
-        """Tie rewordings to an equivalent and changes to an authorization and criteria."""
-        if (self.kind == "reworded") != (self.equivalent_to is not None):
-            raise ValueError("exactly a reworded instruction names the value it is equivalent to")
-        if self.kind == "reworded" and self.criteria:
+        """Tie rewordings and nudges to an equivalent, and changes to authorization and criteria."""
+        if (self.kind in KEEPS_OBLIGATIONS) != (self.equivalent_to is not None):
             raise ValueError(
-                "a rewording changes no obligation, so it binds no criteria of its own"
+                "exactly a reworded or nudged instruction names the value it is equivalent to"
             )
+        if self.kind in KEEPS_OBLIGATIONS and self.criteria:
+            raise ValueError(
+                "a rewording or nudge changes no obligation, so it binds no criteria of its own"
+            )
+        if (self.kind == "nudge") != (self.nudge is not None) or (
+            self.nudge is not None and self.nudge.strip() not in self.instruction
+        ):
+            raise ValueError("exactly a nudge carries its message, inside its instruction text")
         if self.kind in ("goal_change", "consent_change") and not (
             self.authorized_by and self.criteria
         ):
@@ -291,7 +308,7 @@ class InstructionAxis(ContractModel):
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:
-        """Require distinct values, one original and rewordings of non-rewordings."""
+        """Require distinct values, one original, and rewordings and nudges of other kinds."""
         ids = {value.value_id: value for value in self.values}
         if len(ids) != len(self.values):
             raise ValueError("instruction value identities must be distinct")
@@ -299,8 +316,13 @@ class InstructionAxis(ContractModel):
             raise ValueError("an instruction axis has exactly one original value")
         for value in self.values:
             target = ids.get(value.equivalent_to or "")
-            if value.kind == "reworded" and (target is None or target.kind == "reworded"):
-                raise ValueError(f"rewording {value.value_id} must reword a declared non-rewording")
+            if value.kind in KEEPS_OBLIGATIONS and (
+                target is None or target.kind in KEEPS_OBLIGATIONS
+            ):
+                raise ValueError(
+                    f"{value.kind} value {value.value_id} must keep the obligations of a declared "
+                    "value that is neither a rewording nor a nudge"
+                )
         if len({value.instruction.strip() for value in self.values}) != len(self.values):
             raise ValueError("instruction values must differ in text")
         return self
@@ -673,8 +695,8 @@ def check_scenarios(
             f"its world state and instruction are identical to scenario {other.scenario_id}"
             if axis is None or axis.value(other.instruction) == axis.value(scenario.instruction)
             else f"it differs from scenario {other.scenario_id} only by an equivalent rewording "
-            "of the instruction, which changes no obligation and cannot establish decision "
-            "variance"
+            "or nudge of the instruction, which changes no obligation and cannot establish "
+            "decision variance"
         )
         problems.append(_problem(scenario, reason))
     return tuple(problems)
@@ -702,7 +724,7 @@ def instruction_problems(decision: DecisionState, scenario: Scenario) -> list[st
     if value is None:
         return ["its instruction is not a declared instruction value"]
     found: list[str] = []
-    if value.kind != "original" and scenario.initialization == "resume":
+    if value.kind not in ("original", "nudge") and scenario.initialization == "resume":
         found.append(
             f"instruction value {value.value_id} changes the instruction the resumed prefix "
             "already stated; start it by fresh_briefing"

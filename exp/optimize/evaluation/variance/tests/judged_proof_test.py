@@ -964,6 +964,7 @@ def build(root: Path, monkeypatch: pytest.MonkeyPatch) -> Proof:
         repeats=6,
         confirmation_repeats=6,
         tiers={job.study.actor_model.model_id: "strong"},
+        measure_decisions=False,
     )
     wire.queue((DECISION_STATE_TOOL, decision_answer(0)), (SCENARIO_TOOL, scenario_answer()))
     first = run_family(project, spec, report, exposure)

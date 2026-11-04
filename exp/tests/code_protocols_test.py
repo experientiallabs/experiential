@@ -341,19 +341,19 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v5",
+        "variance-authors-v6",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "b4003f5afbac0deef6afc9822126db9595f405013151ef4a779437658a7f0407",
+        "f44886a6c2f74d0592dac07aa7dbf640736a08a3a49aa66c31aaf43898248a44",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.briefing_review:BRIEFING_REVIEW_PROTOCOL",
-        "briefing-leak-review-v1",
+        "briefing-leak-review-v2",
         ("exp.optimize.evaluation.variance.briefing_review",),
-        "c1ea4d4614799e0c54e1fd142e9b2f2aac38a5faf5999a751b8b2695c54425ff",
+        "24f25452817cdd31b12059bcab887fae42b13ea8174e0ab0ed01aa4d240130e6",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.grader:GRADER_PROTOCOL",
@@ -470,7 +470,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.rewards:selector_score",
             "exp.optimize.evaluation.variance.records:selector_records",
         ),
-        "24d4ef40e1f85b274af268a0816d3e249be7bc7e1a34fea40b4c01f7f8063903",
+        "69eecc5c147f4e5f0ebcc51284fed66801f779b2d75bda5fe2fa82ef273a2f80",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rewards:JOINT_OBJECTIVE",
@@ -531,13 +531,25 @@ PROTOCOLS = (
         "exp.optimize.evaluation.variance.variant_search:VARIANT_SEARCH_PROTOCOL",
         "variant-search-v1",
         ("exp.optimize.evaluation.variance.variant_search",),
-        "0c03da8008e99e1f86bf7d935774aafa8299c899c22ac1b7f6e20e58a0c51f80",
+        "2cffc91161200de4836a4955aa3fb8bb34132ecda1aff2521cc5d8848170df4b",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.nudges:NUDGE_PROTOCOL",
+        "instruction-nudge-v1",
+        ("exp.optimize.evaluation.variance.nudges",),
+        "ce4fdfcc62c88009420e3620495f3877dc7ac944df5e445bd133a3fa1e81a46b",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.nudge_ladder:NUDGE_LADDER_PROTOCOL",
+        "nudge-ladder-v1",
+        ("exp.optimize.evaluation.variance.nudge_ladder",),
+        "e51356c8b55223a158bedc2abed884ab15f24d1014b26cecc153beba64bacf1a",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.schedule:SCHEDULE_PROTOCOL",
         "variance-schedule-v1",
         ("exp.optimize.evaluation.variance.schedule",),
-        "0fc1f8f881d0af8ce0d5986c5f5714a85c880a01b740516d959f5066ac7b5533",
+        "16a87116b7f8e7b8a0bef66d709c85f08f5bc95f6b29bac2965cb63edbb95d2a",
     ),
     Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",

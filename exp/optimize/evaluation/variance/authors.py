@@ -74,7 +74,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
 
-AUTHORS_PROTOCOL = "variance-authors-v5"
+AUTHORS_PROTOCOL = "variance-authors-v6"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"

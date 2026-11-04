@@ -20,6 +20,17 @@ records) and registers each new frozen model revision it produces back here
   selector, critic). Registering a new revision starts a new epoch; rollouts planned in one epoch
   are recorded under it and never count toward, or mix records with, another epoch.
 
+- **Selector objective.** Either version is accepted. Version 2
+  (:class:`~exp.optimize.evaluation.variance.rewards.SelectorObjectiveV2`) reads each point's
+  classified choices or family joint score from a caller's :data:`PointDecisions` function of the
+  saved report; without one its picks are unscored. Version 1 stays the default here, so saved
+  schedules keep their identity.
+- **Nudge curriculum.** :func:`nudge_curriculum` (re-exported from
+  :mod:`~exp.optimize.evaluation.variance.nudge_ladder`) orders the admitted rungs of nudge
+  ladders from strong to weak with every un-nudged target last, and :func:`curriculum_tier` gives
+  the strength tier a rollout count has reached, so training fades nudges and can compare the
+  nudged and un-nudged arms.
+
 Every decision (a plan, a completion with its measured metrics, a registered revision) is saved
 as an immutable event artifact chained to the one before it, so the schedule resumes from the
 saved events and a replay reads them without calling any model. Each rollout re-keys the actor
@@ -28,7 +39,7 @@ job's study selector with the schedule and rollout number, so every rollout draw
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Literal, Self
 
@@ -62,12 +73,22 @@ from exp.optimize.evaluation.variance.judged import (
     judge_study,
     slot_rewards,
 )
+from exp.optimize.evaluation.variance.nudge_ladder import (
+    CurriculumStage as CurriculumStage,
+)
+from exp.optimize.evaluation.variance.nudge_ladder import (
+    curriculum_tier as curriculum_tier,
+)
+from exp.optimize.evaluation.variance.nudge_ladder import (
+    nudge_curriculum as nudge_curriculum,
+)
 from exp.optimize.evaluation.variance.records import (
+    AnySelectorObjective,
     SelectorRecords,
     load_judged_study,
     selector_records,
 )
-from exp.optimize.evaluation.variance.rewards import SelectorObjective
+from exp.optimize.evaluation.variance.rewards import PointDecision, SelectorObjective
 
 SCHEDULE_PROTOCOL = "variance-schedule-v1"
 """Version of the schedule's decision rules; bump when a plan for the same events changes."""
@@ -89,6 +110,9 @@ RolloutKind = Literal["warmup", "steady_roles", "actor_only"]
 
 Phase = Literal["warmup", "steady"]
 """Where the schedule is."""
+
+PointDecisions = Callable[[ActorCriticReport], Mapping[str, PointDecision]]
+"""Gives a role rollout's classified choices or family joint score by point identity."""
 
 
 class PlateauRule(ContractModel):
@@ -137,7 +161,8 @@ class TrainingScheduleSpec(ContractModel):
         steady_draws: Selector and critic draws of a steady-state role rollout.
         steady_every: Steady rollouts per role rollout; 2 runs roles on every other rollout.
         transition: When warm-up ends.
-        objective: The point-selector objective scored for every role rollout.
+        objective: The point-selector objective scored for every role rollout, of either
+            version; version 1 by default.
         admission: Judge-coverage limits the selector records must meet.
         rewarm_on_revision: Whether a new revision restarts warm-up.
     """
@@ -148,7 +173,7 @@ class TrainingScheduleSpec(ContractModel):
     steady_draws: int = Field(default=15, ge=1, le=16, strict=True)
     steady_every: int = Field(default=2, ge=1, le=100, strict=True)
     transition: TransitionRule = TransitionRule()
-    objective: SelectorObjective = SelectorObjective()
+    objective: AnySelectorObjective = SelectorObjective()
     admission: FamilyAdmissionPolicy = FamilyAdmissionPolicy()
     rewarm_on_revision: bool = False
 
@@ -449,6 +474,7 @@ def complete_rollout(
     result: ArtifactInput,
     *,
     code_revision: str,
+    decisions: PointDecisions | None = None,
 ) -> ScheduleState:
     """Record the pending rollout's saved result and what it measured.
 
@@ -458,6 +484,7 @@ def complete_rollout(
         result: The rollout's saved ``actor-critic-report`` (role rollout) or
             ``judged-continuation-study`` of its group job (actor-only rollout).
         code_revision: Producing source identity.
+        decisions: Point decisions of a role rollout, read by a version 2 objective.
 
     Returns:
         The state after the completion.
@@ -476,7 +503,7 @@ def complete_rollout(
         if plan.spec is None:
             metrics = actor_result_metrics(project, plan, result)
         else:
-            metrics = role_result_metrics(project, spec, plan, result)
+            metrics = role_result_metrics(project, spec, plan, result, decisions)
         reason = f"rollout {plan.rollout} ({plan.kind}) completed in epoch {plan.epoch}"
         return _save(
             project,
@@ -541,7 +568,11 @@ def register_revision(
 
 
 def epoch_selector_records(
-    project: ProjectStore, spec: TrainingScheduleSpec, state: ScheduleState, epoch: int
+    project: ProjectStore,
+    spec: TrainingScheduleSpec,
+    state: ScheduleState,
+    epoch: int,
+    decisions: PointDecisions | None = None,
 ) -> tuple[SelectorRecords, ...]:
     """Return the selector records of one epoch's role rollouts, never another epoch's.
 
@@ -550,19 +581,24 @@ def epoch_selector_records(
         spec: The schedule.
         state: The folded schedule.
         epoch: The epoch.
+        decisions: Point decisions of each report, read by a version 2 objective.
 
     Returns:
         One record group per completed role rollout of the epoch, in completion order.
     """
     return tuple(
-        _selectors(project, spec, _load_report(project, row.result))
+        _selectors(project, spec, _load_report(project, row.result), decisions)
         for row in state.epoch_rollouts(epoch)
         if row.plan.spec is not None
     )
 
 
 def role_result_metrics(
-    project: ProjectStore, spec: TrainingScheduleSpec, plan: RolloutPlan, result: ArtifactInput
+    project: ProjectStore,
+    spec: TrainingScheduleSpec,
+    plan: RolloutPlan,
+    result: ArtifactInput,
+    decisions: PointDecisions | None = None,
 ) -> RolloutMetrics:
     """Measure a role rollout from its saved actor-critic report, without any call.
 
@@ -571,6 +607,7 @@ def role_result_metrics(
         spec: The schedule.
         plan: The rollout's plan.
         result: The saved report.
+        decisions: Point decisions of the report, read by a version 2 objective.
 
     Returns:
         Critic Brier score, selector reward and trainable selector draws.
@@ -586,7 +623,7 @@ def role_result_metrics(
         for draw in report.critics
         if draw.score is not None and draw.score.reward is not None
     ]
-    selectors = _selectors(project, spec, report)
+    selectors = _selectors(project, spec, report, decisions)
     return RolloutMetrics(
         critic_brier=-sum(rewards) / len(rewards) if rewards else None,
         selector_reward=selectors.mean_reward,
@@ -831,7 +868,10 @@ def _rekeyed(job: ContinuationJob, schedule: str, rollout: int) -> ContinuationJ
 
 
 def _selectors(
-    project: ProjectStore, spec: TrainingScheduleSpec, report: ActorCriticReport
+    project: ProjectStore,
+    spec: TrainingScheduleSpec,
+    report: ActorCriticReport,
+    decisions: PointDecisions | None = None,
 ) -> SelectorRecords:
     """Build a role rollout's selector records under the schedule's objective."""
     return selector_records(
@@ -840,6 +880,7 @@ def _selectors(
         judge=report.spec.episode_judge.identity,
         objective=spec.objective,
         admission=spec.admission,
+        decisions=None if decisions is None else decisions(report),
     )
 
 

@@ -47,9 +47,13 @@ from exp.optimize.evaluation.variance.records import (
     unreproduced,
 )
 from exp.optimize.evaluation.variance.rewards import (
+    DEFAULT_SELECTOR_OBJECTIVE,
     JudgeScore,
+    PointDecision,
     SelectorObjective,
+    SelectorObjectiveV2,
     group_advantages,
+    score_selector,
     selector_score,
 )
 
@@ -439,3 +443,87 @@ def test_screening_trainability_is_computed_from_its_selector_record() -> None:
     assert not JudgeScreening(draw=0, score=score).trainable
     with pytest.raises(ValidationError, match="exactly when"):
         JudgeScreening(draw=0, score=score, trainable=True)
+
+
+def test_selector_records_default_to_version_two_and_read_point_decisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Version 2 scores picks by joint score or explained variance; without decisions, unscored."""
+    project, report = _mining_run(tmp_path, monkeypatch, mining.deletes_row(2))
+    judge = report.spec.episode_judge.identity
+    decisions = {
+        "point-0": PointDecision(point_id="point-0", joint_score=0.6),
+        "point-1": PointDecision(
+            point_id="point-1", choices=("a", "b", "a", "b"), rewards=(1.0, 0.0, 1.0, 0.0)
+        ),
+    }
+
+    bare = selector_records(project, report, judge=judge)
+    records = selector_records(project, report, judge=judge, decisions=decisions)
+
+    assert bare.objective == DEFAULT_SELECTOR_OBJECTIVE
+    assert isinstance(records.objective, SelectorObjectiveV2)
+    assert all(draw.score and draw.score.status == "unscored" for draw in bare.draws)
+    assert any("fewer than two" in reason for reason in bare.refused)
+    outcomes = {point.outcome.point_id: point.outcome for point in records.points}
+    expected = [
+        score_selector(picks, outcomes, DEFAULT_SELECTOR_OBJECTIVE, decisions).reward
+        for picks in (["point-0"], ["point-0", "point-1"])
+    ]
+    assert [draw.score.reward for draw in records.draws if draw.score] == expected
+    assert expected[0] == pytest.approx(0.6) and expected[1] == pytest.approx(0.675)
+    assert all(
+        draw.score and draw.score.objective == "selector-decision-variance-v2"
+        for draw in records.draws
+    )
+    assert all(draw.trainable for draw in records.draws)
+    legacy = selector_records(
+        project, report, judge=judge, objective=SelectorObjective(minimum_scored=2)
+    )
+    assert isinstance(legacy.objective, SelectorObjective)
+    assert legacy.model_validate_json(legacy.model_dump_json()) == legacy
+    assert records.model_validate_json(records.model_dump_json()) == records
+
+
+def test_a_family_blocked_by_the_joint_measure_names_the_decision_variance_condition() -> None:
+    """The decision_variance condition carries the deficits; confirmation says it was blocked."""
+    selection = _flip(
+        _verdict("x", "separated_matches", "a"), _verdict("y", "separated_matches", "b")
+    )
+
+    def eligibility(
+        measured: tuple[bool, str] | None, confirmation: FlipVerdict | None
+    ) -> TrainingEligibility:
+        """Compute eligibility for a qualifying family with every admission check passing."""
+        return training_eligibility(
+            selection=selection,
+            confirmation=confirmation,
+            findings=(),
+            dispositions=(),
+            critics=(),
+            uncovered_tools=(),
+            relied_rules=(),
+            contradicted_rules=(),
+            unwitnessed_rules=(),
+            meanings=(_meaning(),),
+            judging={
+                name: {}
+                for name in (
+                    "judge_coverage",
+                    "rubric_problems",
+                    "rubric_compatibility",
+                    "world_freeze",
+                    "world_provenance",
+                )
+            },
+            decision_variance=measured,
+        )
+
+    blocked = eligibility((False, "choices do not change across states"), None)
+    assert CONDITIONS[:3] == ("family_flip", "decision_variance", "fresh_confirmation")
+    assert blocked.reasons[0] == "decision_variance: choices do not change across states"
+    assert "blocked confirmation" in blocked.reasons[1]
+    assert eligibility((True, "admitted, joint score 0.400"), selection).eligible
+    assert eligibility(None, selection).eligible
+    unrequired = eligibility(None, selection).conditions[1]
+    assert unrequired.name == "decision_variance" and unrequired.detail.startswith("not required")

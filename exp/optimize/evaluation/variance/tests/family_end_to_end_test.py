@@ -248,6 +248,7 @@ def _run(
         repeats=4,
         confirmation_repeats=4,
         tiers={job.study.actor_model.model_id: "strong"},
+        measure_decisions=False,
     )
     unfrozen = run_decision_family(
         project,

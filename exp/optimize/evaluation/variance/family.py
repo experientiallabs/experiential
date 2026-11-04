@@ -33,8 +33,12 @@ saved actor-critic run over a mining-probe task:
    samples: the job's selector names the confirmation seed and the selection contrasts are cited as
    evidence, so every confirmation draw has a new identity and none of its samples took part in
    selection. Qualification stands only when every qualifying variant's confirmation reproduces
-   its separated, matching winner. With ``decision_variance`` registered, confirmation runs only
-   after :func:`~exp.optimize.evaluation.variance.decision_measure.measure_family` admits it.
+   its separated, matching winner. Confirmation runs only after
+   :func:`~exp.optimize.evaluation.variance.decision_measure.measure_family` admits the family
+   on choice shift, consequence and clarity; the measure is on by default, under the spec's
+   ``decision_variance`` settings or else the family's own open-weight authors, and a family it
+   blocks names the ``decision_variance`` eligibility condition. Its joint score is the version 2
+   selector value of the family's point.
 9. **Coverage.** The judge's coverage of each confirmed variant is recorded. When a criterion
    grader is supplied, its probabilistic grades are calibration evidence only.
 10. **Eligibility.** Every condition in :mod:`~exp.optimize.evaluation.variance.records`, including
@@ -50,10 +54,9 @@ redrawn, and adding audit dispositions makes a new report while every draw repla
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 
 from pydantic import Field
 
@@ -76,8 +79,6 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import restore_continuation_world
-from exp.optimize.evaluation.executable.package import export_executable_harbor
-from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageReport, load_rulebook
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
@@ -108,8 +109,20 @@ from exp.optimize.evaluation.variance.contracts import (
 )
 from exp.optimize.evaluation.variance.contrast import FlipVerdict, family_flip
 from exp.optimize.evaluation.variance.coverage import uncovered_tools
-from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec, measure_family
+from exp.optimize.evaluation.variance.decision_measure import (
+    DecisionMeasure,
+    DecisionMeasureSpec,
+    load_decision_measure,
+    measure_family,
+)
 from exp.optimize.evaluation.variance.exposure import EstimateMeaning, ExposurePlan
+from exp.optimize.evaluation.variance.family_export import (
+    export_family_harbor as export_family_harbor,
+)
+from exp.optimize.evaluation.variance.family_export import (
+    family_executable_task as family_executable_task,
+)
+from exp.optimize.evaluation.variance.family_export import variant_job as variant_job
 from exp.optimize.evaluation.variance.family_stages import (
     FamilyVariant,
     confirm_variant,
@@ -129,6 +142,7 @@ from exp.optimize.evaluation.variance.records import (
     training_eligibility,
     training_records,
 )
+from exp.optimize.evaluation.variance.rewards import PointDecision
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.decisions import DecisionsTraceTagger
@@ -172,8 +186,12 @@ class DecisionFamilySpec(ContractModel):
         grading: Calibration criterion-grading controls; never an eligibility input.
         tiers: Tier label per actor model identity, when tiers are recorded.
         dispositions: Recorded dispositions of audit findings. They never re-key a draw.
-        decision_variance: Joint decision-variance admission (choice shift, consequence,
-            clarity); when set, a family that fails it is not confirmed. Unkeyed while None.
+        decision_variance: Joint decision-variance measurement settings (choice shift,
+            consequence, clarity). Unkeyed while None.
+        measure_decisions: Whether the joint measure gates confirmation (the default). With no
+            ``decision_variance`` settings it runs under the family's own authors: the scenario
+            author classifies choices and the decision author reviews clarity. False skips it
+            and keeps the identity families had before the measure existed.
     """
 
     decision_author: AuthorSettings
@@ -194,16 +212,33 @@ class DecisionFamilySpec(ContractModel):
     tiers: dict[str, str] = Field(default_factory=dict)
     dispositions: tuple[AuditDisposition, ...] = ()
     decision_variance: DecisionMeasureSpec | None = None
+    measure_decisions: bool = True
+
+    @property
+    def measure_spec(self) -> DecisionMeasureSpec | None:
+        """The joint measure's settings, or None when the measure is switched off."""
+        if not self.measure_decisions:
+            return None
+        return self.decision_variance or DecisionMeasureSpec(
+            classifier=self.scenario_author, reviewer=self.decision_author
+        )
 
     def _unkeyed(self) -> set[str]:
-        """Fields left out of the draws identity: dispositions, and new fields at their defaults.
+        """Fields left out of the draws identity: dispositions, the measure switch, and new fields
+        at their defaults.
 
         Leaving ``fresh_briefing`` and ``required_state`` out while unset keeps every family saved
-        before they existed replaying under its identity.
+        before they existed replaying under its identity. The measure switch gates confirmation
+        only, so it keys the report (:meth:`identity`) and never re-buys an authored draw.
         """
         unset = {"fresh_briefing"} if not self.fresh_briefing else set()
         unset |= {"decision_variance"} if self.decision_variance is None else set()
-        return {"dispositions", *unset, *(() if self.required_state else ("required_state",))}
+        return {
+            "dispositions",
+            "measure_decisions",
+            *unset,
+            *(() if self.required_state else ("required_state",)),
+        }
 
     def draws_identity(self, report: ActorCriticReport, point: int, code_revision: str) -> str:
         """Bind everything the draws read, leaving dispositions out so they never re-key one.
@@ -245,6 +280,7 @@ class DecisionFamilySpec(ContractModel):
                 "dispositions": sha256_json(
                     [item.model_dump(mode="json") for item in self.dispositions]
                 ),
+                **({"measure_decisions": True} if self.measure_spec is not None else {}),
             },
         )
 
@@ -418,115 +454,6 @@ def run_decision_family(
         return result
 
 
-def export_family_harbor(
-    project: ProjectStore,
-    family_report: FamilyReport,
-    scenario_id: str,
-    destination: Path,
-    *,
-    name: str,
-    intent: str,
-    code_revision: str,
-    qualification: ArtifactInput | None = None,
-) -> Path:
-    """Package one variant's checkpoint as a Harbor environment that starts there.
-
-    The package starts at the variant's decision checkpoint, the replayed one when the variant
-    forks before the decision. It is diagnostic, awarding no reward, unless the family is
-    eligible, the variant's winner was confirmed on fresh samples, and an executable
-    qualification for the exact task (:func:`family_executable_task`) is supplied.
-
-    Args:
-        project: Project holding the family.
-        family_report: The saved family.
-        scenario_id: The variant to package.
-        destination: New package directory.
-        name: Harbor ``organization/name``.
-        intent: The capability the environment measures.
-        code_revision: Producing source identity.
-        qualification: Qualification report for the exact executable task, when it has one.
-
-    Returns:
-        The published package directory.
-
-    Raises:
-        ValueError: The scenario has no decision checkpoint in this family.
-    """
-    task = family_executable_task(family_report, scenario_id, intent=intent)
-    confirmed = family_report.confirmation is not None and any(
-        verdict.scenario_id == scenario_id and verdict.status == "separated_matches"
-        for verdict in family_report.confirmation.variants
-    )
-    qualified = family_report.eligibility.eligible and confirmed and qualification is not None
-    reference = persist_executable_task(
-        project, task, created_at=datetime.now(UTC), code_revision=code_revision
-    )
-    return export_executable_harbor(
-        project,
-        reference,
-        destination,
-        name=name,
-        qualification=qualification if qualified else None,
-        diagnostic=not qualified,
-    )
-
-
-def family_executable_task(
-    family_report: FamilyReport, scenario_id: str, *, intent: str
-) -> ExecutableTask:
-    """Return the executable task that starts at one variant's decision checkpoint.
-
-    It is the exact task :func:`export_family_harbor` packages, so a qualification for it can be
-    built before export.
-
-    Args:
-        family_report: The saved family.
-        scenario_id: The variant.
-        intent: The capability the environment measures.
-
-    Returns:
-        The task under the family's frozen job, rewarded only by the variant's frozen judge.
-
-    Raises:
-        ValueError: The scenario has no decision checkpoint or judge binding in this family.
-    """
-    rows = {row.scenario_id: row for row in family_report.variants}
-    row = rows.get(scenario_id)
-    checkpoint = None if row is None else row.decision_checkpoint
-    if checkpoint is None:
-        built = sorted(key for key, item in rows.items() if item.decision_checkpoint is not None)
-        raise ValueError(
-            f"scenario {scenario_id} has no persisted decision checkpoint; choose from {built}"
-        )
-    judging = (family_report.judging or {}).get(scenario_id)
-    if judging is None:
-        raise ValueError(f"scenario {scenario_id} has no frozen judge binding in this family")
-    job = family_report.job
-    if row is not None and row.frozen is not None:
-        if judging.runtime is None:
-            raise ValueError(f"frozen scenario {scenario_id} has no frozen runtime definition")
-        job = variant_job(job, (row.frozen, judging.runtime))
-    return ExecutableTask(intent=intent, job=bound_job(job, checkpoint), judge=judging.judge)
-
-
-def variant_job(
-    job: ContinuationJob, start: tuple[ArtifactInput, JsonObject] | None
-) -> ContinuationJob:
-    """Return the job a variant's witness and contrasts run under.
-
-    Args:
-        job: The family's frozen job.
-        start: The variant's frozen start checkpoint and runtime configuration, if frozen.
-
-    Returns:
-        The family job, or for a frozen variant the same job rebound to its frozen runtime
-        definition; the study checkpoint is rebound per contrast.
-    """
-    if start is None:
-        return job
-    return job.model_copy(update={"configuration": start[1]})
-
-
 @dataclass(frozen=True)
 class _Family:
     """What every stage of one family shares, and the eligibility computed from it.
@@ -555,6 +482,7 @@ class _Family:
         judging: Mapping[str, VariantJudging] | None = None,
         coverage: Mapping[str, JudgeCoverage] | None = None,
         starts: Mapping[str, tuple[ArtifactInput, ...]] | None = None,
+        measured: tuple[bool, str] | None = None,
     ) -> TrainingEligibility:
         """Compute eligibility from the family's evidence so far.
 
@@ -567,10 +495,13 @@ class _Family:
             judging: Frozen judge binding per scenario, once fixed.
             coverage: Judge coverage of each confirmed variant, once confirmed.
             starts: Starting checkpoint of each variant's selection and confirmation contrasts.
+            measured: Whether the joint measure admitted the family and what it found, once run.
 
         Returns:
             The computed eligibility.
         """
+        if measured is None and self.spec.measure_spec is not None:
+            measured = (False, "the family stopped before the joint decision-variance measure")
         meanings = tuple(row.meaning for row in self.report.points if row.failure is None)
         problems = (
             judging_problems(self.project, judging, coverage, self.spec.admission, starts)
@@ -589,6 +520,7 @@ class _Family:
             unwitnessed_rules=self.stage.diagnostic,
             meanings=(*meanings, *contrasted),
             judging=problems,
+            decision_variance=measured,
         )
 
 
@@ -731,12 +663,13 @@ def _continue(
     selection = family_flip(measured, scenarios.scenarios.scenarios)
     winners = {v.scenario_id for v in selection.variants if v.status == "separated_matches"}
     confirmation: FlipVerdict | None = None
-    admitted = spec.decision_variance is None
-    if spec.decision_variance is not None and selection.qualifies:
+    measure_spec, measure = spec.measure_spec, None
+    admitted = measure_spec is None
+    if measure_spec is not None and selection.qualifies:
         frozen_judges = {sid: binding.judge for sid, binding in judging.items()}
         measured_ref, measure, why = measure_family(
             project,
-            spec.decision_variance,
+            measure_spec,
             decision=state,
             scenarios=scenarios.scenarios.scenarios,
             variants=variants,
@@ -790,6 +723,7 @@ def _continue(
         confirmation=confirmation,
         contrasted=contrasted,
         failure=grading_failure,
+        measure=measure if measure is not None else base.decision_variance,
     )
 
 
@@ -803,6 +737,7 @@ def _finish(
     confirmation: FlipVerdict | None = None,
     contrasted: tuple[EstimateMeaning, ...] = (),
     failure: str | None = None,
+    measure: DecisionMeasure | ArtifactInput | str | None = None,
 ) -> FamilyReport:
     """Compute eligibility and, when every condition holds, the training records.
 
@@ -815,11 +750,23 @@ def _finish(
         confirmation: Confirmation verdict, when it ran.
         contrasted: Meanings of every variant contrast.
         failure: Why the family stopped early, when it did.
+        measure: The joint measure, or why it could not run, once selection was measured.
 
     Returns:
         The complete report.
     """
     unique = tuple({finding.finding_id: finding for finding in findings}.values())
+    measured, decisions = None, None
+    if isinstance(measure, DecisionMeasure):
+        verdict = measure.verdict
+        detail = f"admitted, joint score {verdict.score:.3f}" if verdict.admitted else ""
+        measured = (verdict.admitted, detail or "; ".join(verdict.deficits))
+        point = f"point-{base.point}"
+        decisions = {point: PointDecision(point_id=point, joint_score=verdict.score)}
+    elif isinstance(measure, str):
+        measured = (False, f"the joint measure could not run: {measure}")
+    elif selection is not None and not selection.qualifies:
+        measured = (False, "selection did not qualify, so decisions were not measured")
     starts = {
         row.scenario_id: tuple(
             contrast.checkpoint
@@ -829,7 +776,15 @@ def _finish(
         for row in base.variants
     }
     eligibility = family.eligibility(
-        selection, confirmation, unique, relied, contrasted, base.judging, base.coverage, starts
+        selection,
+        confirmation,
+        unique,
+        relied,
+        contrasted,
+        base.judging,
+        base.coverage,
+        starts,
+        measured if family.spec.measure_spec is not None else None,
     )
     confirmed = {
         row.scenario_id: (row.confirmation, row.meaning)
@@ -837,7 +792,12 @@ def _finish(
         if row.confirmation is not None and row.meaning is not None
     }
     built = training_records(
-        family.project, eligibility, family.report, confirmed, tiers=family.spec.tiers
+        family.project,
+        eligibility,
+        family.report,
+        confirmed,
+        tiers=family.spec.tiers,
+        decisions=decisions,
     )
     return base.model_copy(
         update={
@@ -847,6 +807,28 @@ def _finish(
             "failure": failure,
         }
     )
+
+
+def family_decisions(
+    project: ProjectStore, reports: Sequence[FamilyReport]
+) -> dict[str, PointDecision]:
+    """Return the version 2 selector evidence of every measured family's point.
+
+    Args:
+        project: Project holding the saved joint measures.
+        reports: Families of one error-mining run.
+
+    Returns:
+        Each measured point's joint score by ``point-<step>`` (0 when not admitted), for
+        :func:`~exp.optimize.evaluation.variance.records.selector_records`.
+    """
+    found: dict[str, PointDecision] = {}
+    for report in reports:
+        if isinstance(report.decision_variance, ArtifactInput):
+            score = load_decision_measure(project, report.decision_variance).verdict.score
+            point = f"point-{report.point}"
+            found[point] = PointDecision(point_id=point, joint_score=score)
+    return found
 
 
 def _estimation_point(report: ActorCriticReport, point: int) -> EstimationPoint:

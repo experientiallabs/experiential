@@ -34,7 +34,9 @@ none fails:
   axis (a changed instruction needs a fresh briefing). A ``resume`` variant keeps the coherent
   prefix and its remaining calls; a ``fresh_briefing`` variant starts at the fork on a new public
   task (the instruction value plus the briefing in its initial context) with the same remaining
-  calls and no replay, its world restored under the original environment task. The briefing's
+  calls and no replay, its world restored under the original environment task. A resumed
+  instruction nudge, which keeps every obligation, is appended to the prefix as one user message
+  and needs a fork at the decision, so no recorded turn replays after it. The briefing's
   entitled paths are checked structurally against the actor's real view at the fork (the retained
   messages and task prompt): each exists, is not edited and shows observed values. What the
   briefing text gives away was judged by the model leak reviewer when the scenario was authored,
@@ -75,6 +77,7 @@ from exp.common.core.artifacts import (
     sha256_bytes,
     sha256_json,
 )
+from exp.common.models import ModelMessage
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
 from exp.common.tasks.facts import InstanceFacts
@@ -296,7 +299,7 @@ def build_variant_checkpoint(
     )
     if not fresh:
         run.add(_replay_check(states[fork : decision.step + 1], paths, fork))
-    started = _initialize(loaded[0], forked, decision, scenario, state)
+    started = _initialize(loaded[0], forked, decision, scenario, state, run.replay_turns)
     if isinstance(started, str):
         run.check("initialization", "failed", started)
     else:
@@ -465,6 +468,7 @@ def _initialize(
     decision: DecisionState,
     scenario: Scenario,
     state: JsonObject,
+    replay_turns: int | None = 0,
 ) -> tuple[TaskCase, ChatCheckpoint] | str:
     """Return a variant's public task and actor start, or why its initialization is incoherent.
 
@@ -474,6 +478,7 @@ def _initialize(
         decision: The decision state with its instruction axis.
         scenario: The variant.
         state: Simulated state at the fork, before the edits.
+        replay_turns: Recorded turns replayed after the fork; a resumed nudge needs none.
 
     Returns:
         The task and actor checkpoint, or the reasons there are none.
@@ -483,6 +488,12 @@ def _initialize(
     value = None if axis is None else axis.value(scenario.instruction)
     if value and value.kind == "original" and value.instruction != forked.task.instruction:
         problems.append("the instruction axis's original value is not the task's instruction")
+    if scenario.briefing is None and value is not None and value.nudge is not None:
+        if replay_turns:
+            problems.append("a resumed nudge must fork at the decision, with no replayed turn")
+        nudged = (*forked.actor.messages, ModelMessage(role="user", content=value.nudge))
+        actor = forked.actor.model_copy(update={"messages": nudged})
+        return "; ".join(problems) if problems else (forked.task, actor)
     if scenario.briefing is None:
         return "; ".join(problems) if problems else (forked.task, forked.actor)
     view = ActorView(
