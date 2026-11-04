@@ -42,6 +42,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.briefing_review import (
     DEFAULT_NUDGE_VARIANTS,
@@ -56,6 +57,7 @@ from exp.optimize.evaluation.variance.contracts import (
 from exp.optimize.evaluation.variance.decision_measure import DecisionMeasure, StateVerdict
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
 from exp.optimize.evaluation.variance.family_stages import MEASURE_PROFILE, failure_reason
+from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.nudges import (
     NUDGE_AUTHOR_STANCES,
     REALISM_STANCES,
@@ -73,7 +75,7 @@ from exp.optimize.evaluation.variance.nudges import (
 from exp.optimize.evaluation.variance.rewards import ChoiceShift
 from exp.optimize.evaluation.variance.variant_search import LadderMeasurer
 
-NUDGE_LADDER_PROTOCOL = "nudge-ladder-v1"
+NUDGE_LADDER_PROTOCOL = "nudge-ladder-v2"
 """Version of the ladder's rounds, rung admission and curriculum."""
 
 LADDER_TYPE = "nudge-ladder"
@@ -532,12 +534,36 @@ class CurriculumStage(ContractModel):
         scenario_id: The rung's scenario, a task of its own.
         position: The rung's ladder position, from 0 (strongest).
         strength: Its nudge strength; ``none`` is the un-nudged target.
+        job: The qualified rung task's job (its checkpoint and frozen runtime), when bound; a
+            schedule's rollouts in this stage's tier run it. Left out while None.
+        judge: The qualified rung task's frozen judge, exactly when ``job`` is bound.
+        task: Exact persisted executable task when the stage is executable.
+        qualification: Reproducible qualification for that exact task.
     """
 
     ladder: str
     scenario_id: str
     position: int = Field(ge=0)
     strength: RungStrength
+    job: ContinuationJob | None = Field(default=None, exclude_if=lambda value: value is None)
+    judge: EpisodeJudge | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    task: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    qualification: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @model_validator(mode="after")
+    def _bound(self) -> CurriculumStage:
+        """Bind a task's job and judge together or not at all."""
+        bindings = (self.job, self.judge, self.task, self.qualification)
+        if any(value is not None for value in bindings) and any(
+            value is None for value in bindings
+        ):
+            raise ValueError(
+                "a curriculum stage binds its task, qualification, job and judge together"
+            )
+        return self
 
     @property
     def nudged(self) -> bool:

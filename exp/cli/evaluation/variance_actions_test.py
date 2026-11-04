@@ -24,6 +24,7 @@ from exp.cli.evaluation.variance_actions import (
     VarianceScheduleAction,
     actor_critic_lines,
     handle_variance_schedule,
+    point_option_costs,
     rules_stage_identity,
 )
 from exp.common.project import ProjectStore, artifact_input
@@ -54,6 +55,7 @@ from exp.optimize.evaluation.variance.judge_prompt import (
     judge_model_calls,
     judge_profile,
 )
+from exp.optimize.evaluation.variance.point_options import PointOptionsSpec
 from exp.optimize.evaluation.variance.schedule import (
     RevisionRegistration,
     TrainingScheduleSpec,
@@ -270,6 +272,23 @@ def test_actor_critic_cost_scales_role_draws_by_their_model_call_budget(
     assert judge_model_calls(agentic) == 2 + 4
     assert actor_critic_costs(project, deep)[-1].attempts == 6 * judge * judged
     assert f"{judged} episodes x 6 judge requests" in " ".join(actor_critic_lines(deep))
+
+
+def test_version_2_schedule_rollouts_price_every_point_option_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Options for J * K points, every stance, a reconcile and each continuation, per role."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    base = critic_fixture._spec(project, job, judges=2)
+    plain = TrainingScheduleSpec(name="plain", base=base)
+    assert point_option_costs(project, plain, base) == ()
+    options = PointOptionsSpec(proposer=base.judges[0], classifier=base.critics[0])
+    scored = plain.model_copy(update={"point_options": options})
+    rows = point_option_costs(project, scored, base)
+    draws = len(base.judges) * base.points * options.profile.budget.model_calls
+    draws *= len(options.stances) + 1 + base.continuations
+    attempts = base.judges[0].maximum_physical_attempts
+    assert [row.attempts for row in rows] == [draws * attempts, draws * attempts]
 
 
 def test_actor_critic_refused_consent_stops_before_any_provider(

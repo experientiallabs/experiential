@@ -1,5 +1,4 @@
 # Decision-variance environments
-
 This pipeline turns agent traffic into long-horizon environments whose difficulty comes from
 decisions that matter. A point in a trajectory counts as a decision only when competing actions
 taken from that exact checkpoint, continued under one frozen policy and budget, lead to measurably
@@ -7,7 +6,6 @@ different outcomes. A family of environments qualifies only when which action is
 across coherent variants of the world. Everything here is a Python API; three stages, and the
 whole pipeline (see [End-to-end pipeline](#end-to-end-pipeline)), are also `exp eval`
 continuation actions.
-
 ## Data roles
 
 `exp/optimize/evaluation/variance/exposure.py` fixes a role for every leakage lineage before any
@@ -318,7 +316,6 @@ contrast, or every pair is uncertain or refused, the saved report has no accepte
 This registration currently cannot be combined with `mining.schedule`; generate the behavioral
 evidence first and explicitly register it in a frozen schedule's base references.
 
-
 ## Screening: judges, critics and continuations
 
 `run_actor_critic` (`variance/actor_critic.py`, CLI action `actor-critic`) runs G attempts of a
@@ -421,7 +418,13 @@ mix epochs. Every plan, completion and revision is an immutable event chained to
 so the schedule resumes and replays from disk without a model call. A schedule given a nudge
 curriculum (`TrainingScheduleSpec.curriculum`, a `CurriculumPlan` over the records stage's
 curriculum) names the current strength tier's rungs in each plan, strongest first, until only the
-un-nudged targets remain; without one its identity and plans are unchanged.
+un-nudged targets remain; without one its identity and plans are unchanged. A stage bound to a
+qualified rung task is what its tier's rollouts run (`variance/schedule_rollouts.py`,
+`curriculum_rollout`): the group job keeps the tracked actor revision but starts at the rung's
+checkpoint under its frozen runtime, every episode is judged by the rung's frozen judge, and the
+tier's bound rungs rotate by rollout number. With `point_options` a version 2 objective scores
+each role rollout by point decisions derived from its judged continuations
+(`rollout_decisions`), which the `variance-schedule` action prices before consent.
 
 ## Decision families
 
@@ -930,8 +933,16 @@ What the stages read beyond their own owners lives in `variance/pipeline_inputs.
   `authoring.nudge_reviewer` (default the rubric author), all open-weight. Each search round's set
   and each ladder round's rungs get their own packet, world, rubric, freeze and judges, so every
   rung of one measured round shares one rubric. The plan prices every round at its ceiling
-  (`variance/pipeline_ladder.py`). A re-registration under revised judges contrasts one scenario
-  draw; the search and ladder of the first registration stay recorded on the family's outcome.
+  (`variance/pipeline_ladder.py`). A re-registration under revised judges reuses the first
+  registration's decision draw and scenario set (`DecisionFamilySpec.reuse`, a `RegisteredSet`:
+  the search's admitted set when one ran) and contrasts and measures that same set again under
+  the new judges; nothing is redrawn, so the plan prices the authors once and the joint measure
+  twice. The ladder's rungs are carried over with their first judges and measure, and the
+  outcome's `rungs_kept` records why: rungs are judged by the ladder round's own rubric, authored
+  from the ladder's packet, and a revision only revises the family set's rubrics, whose criteria
+  cite that set's variants, so no revised judge exists for a rung. A nudged rung resumes the
+  base's prefix with the nudge as one user message; its packet variant carries the `nudge`, so the
+  world author may initialize it by `resume` and the freeze appends the message to the actor.
   The records stage turns the ladders of admitted families into one curriculum
   (`RecordsOutputs.curriculum`, from `nudge_curriculum`): admitted rungs from strong to weak,
   every un-nudged target last. A `TrainingScheduleSpec` given that curriculum as a
@@ -949,6 +960,30 @@ and the variant's own frozen judge), executed once for feasibility, witnessed wi
 `witness_controls` and qualified with `qualify_executable_task`. A variant that qualifies is
 exported qualified; any other is exported as diagnostic with its refusals or failure in the
 stage's `HarborExport` row. Without qualification every export is diagnostic.
+
+**Curriculum rungs as tasks.** Every curriculum rung of an admitted family's ladder (each
+admitted nudged rung and always the un-nudged target) goes through the same qualification and
+export: `rung_executable_task` (`variance/family_export.py`) starts at the rung's replayed
+decision checkpoint under its frozen runtime and its own frozen judge, its feasibility run is
+priced in the records plan (up to `len(authoring.ladder_strengths) + 1` rungs per family), and
+`export_rung_harbor` records the rung's ladder, scenario, strength and position in the package
+binding (`curriculum`) and in `task.toml` metadata (`curriculum_strength`,
+`curriculum_position`), which package verification reproduces. Its `HarborExport` row carries
+`ladder`, `strength` and `position`. A rung export is qualified only when the family is
+eligible and the rung's own qualification passes.
+
+**Training schedules from records.** With `records.schedule` (default on) the records stage
+emits one `TrainingScheduleSpec` per tier (`RecordsOutputs.schedules`, a `TierSchedule` each):
+the mining stage's own schedule for that tier when it has one, else the tier's saved
+error-mining registration, with a `CurriculumPlan` over the tier's qualified curriculum rungs
+(`records.rollouts_per_tier` rollouts per strength tier). Each stage is bound to its qualified
+rung export's exact task (`CurriculumStage.job` and `judge`); diagnostic rungs stay out, and a
+tier without qualified rungs gets no curriculum. The schedule's objective is version 2
+(`SelectorObjectiveV2`) with the records stage's option settings as `point_options`. It is saved as a `variance-schedule`
+artifact under its identity and written to
+`<harbor root>/<records stage>/schedules/<tier>.json`, the spec file the `variance-schedule`
+action reads (`{"operation": "status", "spec": ".../schedules/<tier>.json"}`). Building it calls
+nothing, so the plan prices nothing for it.
 
 The CLI action reads `{"spec": "decision-variance.json"}`. By default it prints the stage plan:
 each stage's identity, whether it is saved, what it will do and its upper-bound cost inventory.

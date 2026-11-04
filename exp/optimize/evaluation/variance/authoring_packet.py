@@ -173,6 +173,8 @@ class PacketVariant(ContractModel):
         state_sha256: Digest of that state.
         task_sha256: Digest of the complete (task, instruction, state) identity.
         witness: Proposed legal observation calls that reveal the deciding facts.
+        nudge: Exactly for a nudged instruction, the added message; a resumed variant keeps its
+            prefix and receives it as one user message. Left out of the packet while None.
     """
 
     variant_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
@@ -187,6 +189,7 @@ class PacketVariant(ContractModel):
     state_sha256: Sha256
     task_sha256: Sha256
     witness: tuple[WitnessStep, ...] = ()
+    nudge: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class DecisionBrief(ContractModel):
@@ -673,6 +676,7 @@ def _variant(
         state_sha256=sha256_json(state),
         task_sha256=variant_task_sha256(task, instruction, state),
         witness=scenario.witness,
+        nudge=None if value is None else value.nudge,
     )
 
 

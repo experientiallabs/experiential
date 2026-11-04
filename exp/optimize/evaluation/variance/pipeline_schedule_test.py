@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.optimize.evaluation.variance.actor_critic_costs import point_option_costs
 from exp.optimize.evaluation.variance.pipeline_schedule import (
     require_scheduled_plan,
     scheduled_line,
@@ -12,6 +13,7 @@ from exp.optimize.evaluation.variance.pipeline_schedule import (
 from exp.optimize.evaluation.variance.pipeline_spec import StageContext, StagePlan
 from exp.optimize.evaluation.variance.pipeline_stages import MINING_STAGE
 from exp.optimize.evaluation.variance.pipeline_test import make_spec, wired
+from exp.optimize.evaluation.variance.point_options import PointOptionsSpec
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec, TransitionRule
 from exp.optimize.evaluation.variance.schedule_test import _schedule, _scripted_metrics, _step
 
@@ -37,6 +39,18 @@ def test_mining_prices_and_binds_the_scheduled_population(
     before = scheduled_preview(project, spec)
     assert before is not None
     costs, lines = MINING_STAGE.plan(project, spec, "test")
+    options = PointOptionsSpec(proposer=base.base.judges[0], classifier=base.base.critics[0])
+    option_schedule = schedule.model_copy(update={"point_options": options})
+    option_spec = spec.model_copy(
+        update={"mining": spec.mining.model_copy(update={"schedule": option_schedule})}
+    )
+    option_plan = scheduled_preview(project, option_spec)
+    assert option_plan is not None and option_plan.spec is not None
+    option_costs, _ = MINING_STAGE.plan(project, option_spec, "test")
+    expected = point_option_costs(project, option_schedule, option_plan.spec)
+    assert expected and sum(row.attempts for row in option_costs) == (
+        sum(row.attempts for row in costs) + sum(row.attempts for row in expected)
+    )
     context = StageContext(
         project=project,
         spec=spec,

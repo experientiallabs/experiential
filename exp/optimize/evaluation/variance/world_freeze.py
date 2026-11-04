@@ -53,6 +53,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
+from exp.common.models import ModelMessage
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks.facts import InstanceFacts
 from exp.optimize.evaluation.executable.grounded import (
@@ -858,7 +859,8 @@ def _start(
     """Open the variant's served world, pair it with its actor context and save the checkpoint.
 
     A resume start keeps the source checkpoint's actor and its world-model history, so the
-    served world conditions on the same prefix the actor saw. A fresh briefing starts both anew.
+    served world conditions on the same prefix the actor saw; a nudged one appends the nudge as
+    one user message. A fresh briefing starts both anew.
 
     Raises:
         ValueError: A resume source belongs to another task, holds no grounded history or
@@ -877,6 +879,9 @@ def _start(
         if state != row.state and history:
             raise ValueError("the resume source's simulated state is not the variant's state")
         context, sources = source.actor, (packet_reference, origin)
+        if (nudge := packet.variant(row.variant_id).nudge) is not None:
+            told = (*context.messages, ModelMessage(role="user", content=nudge))
+            context = context.model_copy(update={"messages": told})
     elif actor is None:
         raise ValueError("a fresh briefing variant needs a chat actor to start it")
     else:

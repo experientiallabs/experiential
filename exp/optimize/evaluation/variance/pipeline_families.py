@@ -20,8 +20,12 @@ The family then runs its witnesses and contrasts from the frozen starts and its 
 confirmation. When the confirmation's judging reports rubric problems, the bounded revision loop
 (:func:`~exp.optimize.evaluation.variance.rubric_revision.revise_until_stable`) re-judges the
 affected episodes under each revised rubric; an accepted revision is a new judge definition, so
-the family is registered again under the revised judges, a new experiment whose authors and
-contrasts run afresh. A family is admitted exactly when its computed eligibility holds.
+the family is registered again under the revised judges. The re-registration reuses the first
+registration's decision and scenario set (the variant search's admitted set when one ran,
+:class:`~exp.optimize.evaluation.variance.family_search.RegisteredSet`), so the same set is
+contrasted and measured again under the new judges instead of drawing a fresh one; the ladder's
+rungs are carried over with the reason they are not re-measured. A family is admitted exactly
+when its computed eligibility holds.
 """
 
 from __future__ import annotations
@@ -65,6 +69,7 @@ from exp.optimize.evaluation.variance.family import (
     FamilyReport,
     run_decision_family,
 )
+from exp.optimize.evaluation.variance.family_search import RUNGS_KEPT, RegisteredSet
 from exp.optimize.evaluation.variance.judge import EVIDENCE_TYPE, load_assessment
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedStudy
@@ -472,9 +477,11 @@ class _FamiliesStage:
             passes = 2 if authoring.revision_rounds else 1
             reviews = briefing_review_draws() if authoring.fresh_briefing else 0
             per_family: list[CostComponent] = []
+            # A re-registration reuses the first decision and scenario draws, so authors draw once;
+            # its contrasts and joint measure run again under the revised judges.
             for settings, draws in (
-                (authoring.decision_author, passes),
-                (authoring.scenario_author, passes * (1 + reviews)),
+                (authoring.decision_author, 1),
+                (authoring.scenario_author, 1 + reviews),
                 (authoring.world_author, world_draws),
                 (
                     authoring.rubric_author,
@@ -488,12 +495,13 @@ class _FamiliesStage:
             judged = passes * cells + authoring.revision_rounds * confirmation
             measure = authoring.decision_measure()
             if measure is not None:
-                free = variants * measure.free_repeats
+                free = passes * variants * measure.free_repeats
                 per_family.extend(row.scaled(free) for row in job_costs(project, episode))
                 judged += free
                 classify = free * measure.classifier_profile.budget.model_calls
                 review = (
-                    variants
+                    passes
+                    * variants
                     * len(measure.reviewer_stances)
                     * measure.reviewer_profile.budget.model_calls
                 )
@@ -531,8 +539,8 @@ class _FamiliesStage:
             f"Each variant: world freeze with challenges, judged selection ({authoring.repeats}"
             f" pairs) and fresh confirmation ({authoring.confirmation_repeats} pairs) at up to "
             f"{judge_model_calls(mining_profile(spec))} judge draws per episode; rubric "
-            f"revision up to {authoring.revision_rounds} rounds, then one re-registration under "
-            "revised judges.",
+            f"revision up to {authoring.revision_rounds} rounds, then one re-registration that "
+            "contrasts and measures the same scenario set again under revised judges.",
             "Decision variance: "
             + (
                 f"{authoring.decision_free_repeats} judged free continuations per variant, each "
@@ -652,14 +660,17 @@ def _family(point: _Point) -> FamilyOutcome:
         point.authored = _replayed(point, family)
     first = family
     revisions: dict[str, ArtifactInput] = {}
+    reuse: RegisteredSet | None = None
     if point.authored is not None and authoring.revision_rounds:
         revised = _revise(point, family, revisions)
+        reuse = None if revised is None else registered_set(project, first)
         if revised is not None:
-            # The re-registration contrasts one scenario draw under the revised judges; the
-            # search and the ladder belong to the first registration and stay recorded there.
+            # The re-registration measures the first registration's set again under the revised
+            # judges and carries its ladder over; a fresh draw would measure another set.
+            update = {"judging": revised, "search": None, "ladder": None, "reuse": reuse}
             family = run_decision_family(
                 project,
-                family_spec.model_copy(update={"judging": revised, "search": None, "ladder": None}),
+                family_spec.model_copy(update=update),
                 exposure=exposure,
                 report=point.report,
                 point=point.point,
@@ -683,6 +694,31 @@ def _family(point: _Point) -> FamilyOutcome:
         failure=family.failure,
         search=first.search,
         ladder=first.ladder if isinstance(first.ladder, ArtifactInput) else None,
+        rungs_kept=None if reuse is None else reuse.rungs_kept,
+    )
+
+
+def registered_set(project: ProjectStore, first: FamilyReport) -> RegisteredSet | None:
+    """Return the first registration's decision and set for its re-registration, when it has one.
+
+    Args:
+        project: Project holding the saved first registration.
+        first: The first registration's report.
+
+    Returns:
+        The reused set with its carried ladder, or None when the first registration has no
+        decision state or accepted scenario set to measure again.
+    """
+    if first.decision.answer is None or first.scenarios is None or not first.scenarios.accepted:
+        return None
+    return RegisteredSet(
+        source=artifact_input(project.artifacts.read(first.identity + "-result").manifest),
+        decision=first.decision,
+        scenarios=first.scenarios,
+        search=first.search,
+        ladder=first.ladder,
+        rungs=first.rungs,
+        rungs_kept=RUNGS_KEPT if first.rungs else None,
     )
 
 

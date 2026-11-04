@@ -30,7 +30,11 @@ records) and registers each new frozen model revision it produces back here
   ladders from strong to weak with every un-nudged target last, and :func:`curriculum_tier` gives
   the strength tier a rollout count has reached, so training fades nudges and can compare the
   nudged and un-nudged arms. A schedule given a :class:`CurriculumPlan` (the records stage's
-  curriculum) names the current tier's rungs in every rollout plan.
+  curriculum) names the current tier's rungs in every rollout plan, and a tier whose stages are
+  bound to qualified rung tasks runs them: the rollout's group job starts at the rung's
+  checkpoint under its frozen runtime and its episodes are judged by the rung's frozen judge
+  (:func:`~exp.optimize.evaluation.variance.schedule_rollouts.curriculum_rollout`). With
+  ``point_options`` a version 2 objective scores role rollouts by derived point decisions.
 
 Every decision (a plan, a completion with its measured metrics, a registered revision) is saved
 as an immutable event artifact chained to the one before it, so the schedule resumes from the
@@ -40,7 +44,7 @@ job's study selector with the schedule and rollout number, so every rollout draw
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Literal, Self
 
@@ -57,23 +61,12 @@ from exp.common.core.artifacts import (
 from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelSnapshot
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import (
-    ContinuationJob,
-    continuation_result_reference,
-    execute_continuation_job,
-    saved_continuation_job,
-)
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, ActorCriticSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy
-from exp.optimize.evaluation.variance.judged import (
-    JUDGED_LABELS_PROTOCOL,
-    JUDGED_STUDY_TYPE,
-    EpisodeJudge,
-    judge_study,
-    slot_rewards,
-)
+from exp.optimize.evaluation.variance.judged import EpisodeJudge, slot_rewards
 from exp.optimize.evaluation.variance.nudge_ladder import (
     CurriculumPlan as CurriculumPlan,
 )
@@ -86,15 +79,30 @@ from exp.optimize.evaluation.variance.nudge_ladder import (
 from exp.optimize.evaluation.variance.nudge_ladder import (
     nudge_curriculum as nudge_curriculum,
 )
+from exp.optimize.evaluation.variance.point_options import PointOptionsSpec
 from exp.optimize.evaluation.variance.records import (
     AnySelectorObjective,
     SelectorRecords,
     load_judged_study,
     selector_records,
 )
-from exp.optimize.evaluation.variance.rewards import PointDecision, SelectorObjective
+from exp.optimize.evaluation.variance.rewards import SelectorObjective
+from exp.optimize.evaluation.variance.schedule_rollouts import (
+    PointDecisions as PointDecisions,
+)
+from exp.optimize.evaluation.variance.schedule_rollouts import (
+    curriculum_rollout,
+    rollout_decisions,
+    validate_curriculum,
+)
+from exp.optimize.evaluation.variance.schedule_rollouts import (
+    run_actor_rollout as run_actor_rollout,
+)
+from exp.optimize.evaluation.variance.schedule_rollouts import (
+    saved_actor_rollout as saved_actor_rollout,
+)
 
-SCHEDULE_PROTOCOL = "variance-schedule-v1"
+SCHEDULE_PROTOCOL = "variance-schedule-v2"
 """Version of the schedule's decision rules; bump when a plan for the same events changes."""
 
 SCHEDULE_TYPE = "variance-schedule"
@@ -114,9 +122,6 @@ RolloutKind = Literal["warmup", "steady_roles", "actor_only"]
 
 Phase = Literal["warmup", "steady"]
 """Where the schedule is."""
-
-PointDecisions = Callable[[ActorCriticReport], Mapping[str, PointDecision]]
-"""Gives a role rollout's classified choices or family joint score by point identity."""
 
 
 class PlateauRule(ContractModel):
@@ -170,10 +175,12 @@ class TrainingScheduleSpec(ContractModel):
         admission: Judge-coverage limits the selector records must meet.
         rewarm_on_revision: Whether a new revision restarts warm-up.
         curriculum: Nudge curriculum each rollout plan names the current tier of, or None;
-            left out of the identity while None.
+            left out of the identity while None. Bound stages are what the tier's rollouts run.
+        point_options: Option proposer and classifier deriving each role rollout's point
+            decisions for a version 2 objective; left out of the identity while None.
     """
 
-    protocol: Literal["variance-schedule-v1"] = SCHEDULE_PROTOCOL
+    protocol: Literal["variance-schedule-v2"] = SCHEDULE_PROTOCOL
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
     base: ActorCriticSpec
     steady_draws: int = Field(default=15, ge=1, le=16, strict=True)
@@ -183,6 +190,9 @@ class TrainingScheduleSpec(ContractModel):
     admission: FamilyAdmissionPolicy = FamilyAdmissionPolicy()
     rewarm_on_revision: bool = False
     curriculum: CurriculumPlan | None = Field(default=None, exclude_if=lambda value: value is None)
+    point_options: PointOptionsSpec | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _one_revision_per_role(self) -> Self:
@@ -408,6 +418,8 @@ def schedule_state(project: ProjectStore, spec: TrainingScheduleSpec) -> Schedul
     Raises:
         ValueError: A saved spec or event belongs to another schedule or breaks the chain.
     """
+    if spec.curriculum is not None:
+        validate_curriculum(project, spec.curriculum.stages)
     identity, store = spec.identity, project.artifacts
     if store.exists(identity):
         saved = TrainingScheduleSpec.model_validate_json(store.read_bytes(identity, "spec.json"))
@@ -493,7 +505,8 @@ def complete_rollout(
         result: The rollout's saved ``actor-critic-report`` (role rollout) or
             ``judged-continuation-study`` of its group job (actor-only rollout).
         code_revision: Producing source identity.
-        decisions: Point decisions of a role rollout, read by a version 2 objective.
+        decisions: Point decisions of a role rollout, read by a version 2 objective; None
+            derives them with the spec's ``point_options``, buying unsaved option draws.
 
     Returns:
         The state after the completion.
@@ -501,6 +514,9 @@ def complete_rollout(
     Raises:
         ValueError: No rollout is pending, or the result is not the pending rollout's.
     """
+    decisions = decisions or rollout_decisions(
+        project, spec.point_options, code_revision=code_revision
+    )
     with _locked(project, spec, code_revision):
         state = schedule_state(project, spec)
         plan = state.pending
@@ -665,68 +681,6 @@ def actor_result_metrics(
     return RolloutMetrics(actor_scored=len(labels), actor_passes=int(sum(labels)))
 
 
-def saved_actor_rollout(
-    project: ProjectStore, plan: RolloutPlan, *, code_revision: str
-) -> ArtifactInput | None:
-    """Return an actor-only rollout's saved judged group study, when both steps are saved.
-
-    Args:
-        project: Project holding the work.
-        plan: The actor-only plan.
-        code_revision: Producing source identity.
-
-    Returns:
-        The saved judged study, or None when running it would still call a model.
-    """
-    if saved_continuation_job(project, plan.actor_job, code_revision=code_revision) is None:
-        return None
-    reference = continuation_result_reference(project, plan.actor_job, code_revision=code_revision)
-    identity = stable_id(
-        JUDGED_STUDY_TYPE,
-        {
-            "protocol": JUDGED_LABELS_PROTOCOL,
-            "judge": plan.episode_judge.identity,
-            "study": reference.model_dump(mode="json"),
-        },
-    )
-    store = project.artifacts
-    return artifact_input(store.read(identity).manifest) if store.exists(identity) else None
-
-
-def run_actor_rollout(
-    project: ProjectStore, plan: RolloutPlan, *, code_revision: str
-) -> ArtifactInput:
-    """Run, or replay, an actor-only rollout: the group job, then its judging.
-
-    This buys actor and judge calls for unsaved work; callers ask spend consent first.
-
-    Args:
-        project: Project holding the work.
-        plan: The actor-only plan.
-        code_revision: Producing source identity.
-
-    Returns:
-        The saved judged group study, to pass to :func:`complete_rollout`.
-
-    Raises:
-        ValueError: The plan is a role rollout.
-    """
-    if plan.spec is not None:
-        raise ValueError("a role rollout runs through run_actor_critic")
-    job = plan.actor_job
-    if saved_continuation_job(project, job, code_revision=code_revision) is None:
-        execute_continuation_job(project, job, code_revision=code_revision)
-    reference = continuation_result_reference(project, job, code_revision=code_revision)
-    judged, _ = judge_study(
-        project,
-        reference,
-        plan.episode_judge,
-        configuration=job.configuration,
-        code_revision=code_revision,
-    )
-    return judged
-
-
 def plateaued(values: Sequence[float], window: int, tolerance: float) -> bool:
     """Return whether the last ``window`` values' mean moved at most ``tolerance``.
 
@@ -769,6 +723,11 @@ def _decide(spec: TrainingScheduleSpec, state: ScheduleState) -> RolloutPlan:
             f"{spec.steady_draws} selector and critic draws" if roles else "actor only"
         )
     job = _rekeyed(state.models.actor, state.schedule, state.planned)
+    stages = () if spec.curriculum is None else spec.curriculum.tier(state.planned)
+    judge, bound = spec.base.episode_judge, curriculum_rollout(job, stages, state.planned)
+    if bound is not None:
+        job, judge, rung = bound
+        reason += f"; runs rung {rung.scenario_id} ({rung.strength})"
     registration = None
     if kind != "actor_only":
         seed = int(sha256_json({"schedule": state.schedule, "rollout": state.planned})[:8], 16)
@@ -776,13 +735,13 @@ def _decide(spec: TrainingScheduleSpec, state: ScheduleState) -> RolloutPlan:
             {
                 **spec.base.model_dump(mode="json"),
                 "initial": job.model_dump(mode="json"),
+                "episode_judge": judge.model_dump(mode="json"),
                 "judges": [state.models.selector.model_dump(mode="json")] * selectors,
                 "critics": [state.models.critic.model_dump(mode="json")] * critics,
                 "seed": seed,
             }
         )
         job = registration.initial
-    stages = () if spec.curriculum is None else spec.curriculum.tier(state.planned)
     if stages:
         reason += f"; curriculum tier {stages[0].strength} ({len(stages)} rungs)"
     return RolloutPlan(
@@ -791,7 +750,7 @@ def _decide(spec: TrainingScheduleSpec, state: ScheduleState) -> RolloutPlan:
         kind=kind,
         spec=registration,
         actor_job=job,
-        episode_judge=spec.base.episode_judge,
+        episode_judge=judge,
         revisions=state.revisions,
         reason=reason[:2000],
         curriculum=stages,
@@ -912,10 +871,24 @@ def _event_id(schedule: str, sequence: int) -> str:
     return f"{schedule}-event-{sequence:06d}"
 
 
-def _locked(
-    project: ProjectStore, spec: TrainingScheduleSpec, code_revision: str
-) -> CoordinationLock:
-    """Save the spec once and return the schedule's mutation lock."""
+def save_schedule(
+    project: ProjectStore,
+    spec: TrainingScheduleSpec,
+    *,
+    code_revision: str,
+    inputs: tuple[ArtifactInput, ...] = (),
+) -> ArtifactInput:
+    """Save a schedule's spec under its identity once, or adopt the saved one, calling nothing.
+
+    Args:
+        project: Project holding the schedule.
+        spec: The schedule.
+        code_revision: Producing source identity.
+        inputs: Saved artifacts the spec was built from.
+
+    Returns:
+        The saved ``variance-schedule`` reference.
+    """
     store, identity = project.artifacts, spec.identity
     if not store.exists(identity):
         store.write_json(
@@ -925,11 +898,21 @@ def _locked(
                 schema_version=1,
                 created_at=datetime.now(UTC),
                 code_revision=code_revision,
-                inputs=(),
+                inputs=tuple(sorted(set(inputs), key=lambda ref: ref.artifact_id)),
             ),
             files={"spec.json": spec},
         )
-    return CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0)
+    return artifact_input(store.read(identity).manifest)
+
+
+def _locked(
+    project: ProjectStore, spec: TrainingScheduleSpec, code_revision: str
+) -> CoordinationLock:
+    """Save the spec once and return the schedule's mutation lock."""
+    save_schedule(project, spec, code_revision=code_revision)
+    return CoordinationLock(
+        project.artifacts.project_directory / (spec.identity + ".lock"), timeout=0
+    )
 
 
 def _save(

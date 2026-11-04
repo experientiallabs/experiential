@@ -22,8 +22,11 @@ from exp.simulation.world_model.session_research import (
 )
 from exp.simulation.world_model.session_research_test import investigation_reply
 
+NOW = datetime.now(UTC)
+"""The fixed instant every research owner's clock reads, so no test races a deadline."""
+
 BINDING = SessionBinding(
-    deadline=datetime.now(UTC) + timedelta(hours=1),
+    deadline=NOW + timedelta(days=30),
     target_id="fixture@1",
     initialization_receipt_sha256="a" * 64,
     knowledge_sha256="b" * 64,
@@ -108,7 +111,7 @@ def research(
         artifacts=ArtifactStore(ProjectPaths(tmp_path, "research")),
         complete=complete,
         lock_path=tmp_path / (database + ".lock"),
-        clock=lambda: datetime.now(UTC),
+        clock=lambda: NOW,
         code_revision="fixture",
         selection=selector,
         prior={
@@ -293,7 +296,7 @@ def test_resumed_investigation_reuses_the_same_history(tmp_path: Path) -> None:
     resumed: list[JsonObject] = []
     retried: list[str] = []
     resumption = Resumption(
-        window=datetime.now(UTC) + timedelta(hours=3),
+        window=NOW + timedelta(days=31),
         retried=lambda stage, operation, logical: retried.append(operation),
     )
     owner = research(tmp_path, write_then_read(), recording(resumed), resumption=resumption)

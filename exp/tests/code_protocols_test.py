@@ -402,13 +402,13 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.authoring_packet",
             "exp.optimize.evaluation.variance.coalition",
         ),
-        "76aaeda7f516212796cd99d447864cbd0e3d64c4eef92b4ce14e054690c165de",
+        "2448351352aa1fc736472c3e7bf27cc67c50f298d8fb07afea62befbe17d9f07",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_author:WORLD_AUTHOR_PROTOCOL",
         "world-author-v2",
         ("exp.optimize.evaluation.variance.world_author",),
-        "4d63486c44ab69e41af3fffc9a78f3799c6b865ff4fbb5d3905186586dfe4275",
+        "20303596f7bb5357aee4c624b2b94b3a6c6d59c297686534bd891d03a88051cb",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rubric_author:RUBRIC_AUTHOR_PROTOCOL",
@@ -456,7 +456,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.variance.world_freeze:WORLD_FREEZE_PROTOCOL",
         "world-freeze-v2",
         ("exp.optimize.evaluation.variance.world_freeze",),
-        "0e42d6387d21786ca5031bcb3ccc942f74864d1eea3f743334a1fa229222fb53",
+        "85bf882a74c23f2191e70c3d2921a29b7eb42bda5e5a30af5dbb895d04b4eabe",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.world_agent:WORLD_AGENT_PROTOCOL",
@@ -557,15 +557,18 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.nudge_ladder:NUDGE_LADDER_PROTOCOL",
-        "nudge-ladder-v1",
+        "nudge-ladder-v2",
         ("exp.optimize.evaluation.variance.nudge_ladder",),
-        "1c8b8cd305abd6499349434f9382aee5e48fbc2aedcfafad5344ab275489a443",
+        "6e3e266e68273ee102b7711aff18abcb16752bf5a6712cb8133c431308e3648c",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.schedule:SCHEDULE_PROTOCOL",
-        "variance-schedule-v1",
-        ("exp.optimize.evaluation.variance.schedule",),
-        "6333e5a57fba4669354ed5fad67afa5d000ca1336ed71b2d5c9cb8029636679b",
+        "variance-schedule-v2",
+        (
+            "exp.optimize.evaluation.variance.schedule",
+            "exp.optimize.evaluation.variance.schedule_rollouts",
+        ),
+        "d80c51faffa155a2249785be154cf6a287702a6f0f8f260785af422ee1e62233",
     ),
     Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",

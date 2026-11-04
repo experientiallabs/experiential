@@ -5,6 +5,7 @@ from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
+from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
 
 
 def actor_critic_costs(project: ProjectStore, spec: ActorCriticSpec) -> tuple[CostComponent, ...]:
@@ -54,4 +55,35 @@ def actor_critic_costs(project: ProjectStore, spec: ActorCriticSpec) -> tuple[Co
         ),
         *(row.scaled(count) for row in job_costs(project, suffix)),
         *(row.scaled(judge_calls) for row in evaluation_costs(project, judge.settings)),
+    )
+
+
+def point_option_costs(
+    project: ProjectStore, schedule: TrainingScheduleSpec, registration: ActorCriticSpec
+) -> tuple[CostComponent, ...]:
+    """Price the option draws that score a version 2 role rollout's every possible point.
+
+    Completing the rollout derives each continued point's options and classifies its
+    continuations with the schedule's ``point_options``: up to ``J * K`` points, each buying
+    every proposer stance, one reconcile and one classifier draw per continuation, at the
+    profile's call budget. A schedule without option settings buys none.
+
+    Args:
+        project: Project whose catalog prices the roles.
+        schedule: The schedule.
+        registration: The role rollout's registration.
+
+    Returns:
+        The upper-bound inventory of the option draws.
+    """
+    options = schedule.point_options
+    if options is None:
+        return ()
+    points = len(registration.judges) * registration.points
+    draws = points * options.profile.budget.model_calls
+    draws *= options.draws_per_point(registration.continuations)
+    return tuple(
+        row.scaled(draws)
+        for settings in (options.proposer, options.classifier)
+        for row in evaluation_costs(project, settings)
     )

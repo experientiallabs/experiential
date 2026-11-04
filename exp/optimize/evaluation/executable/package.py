@@ -4,7 +4,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-from exp.common.core.artifacts import ArtifactInput
+from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import load_executable_task
@@ -24,6 +24,7 @@ def export_executable_harbor(
     name: str,
     qualification: ArtifactInput | None = None,
     diagnostic: bool = False,
+    curriculum: JsonObject | None = None,
 ) -> Path:
     """Use the common Harbor package with a private executable checkpoint backend.
 
@@ -34,6 +35,8 @@ def export_executable_harbor(
         name: Safe organization/name pair written into ``task.toml``.
         qualification: Qualification report for this exact task, when qualified.
         diagnostic: Allow an unqualified, explicitly diagnostic package.
+        curriculum: The nudge-curriculum rung the task is, when it is one: its ladder, scenario,
+            strength and position, recorded in the binding and in ``task.toml`` metadata.
 
     Returns:
         The published package directory.
@@ -78,12 +81,20 @@ def export_executable_harbor(
                     "reward_authority": "frozen LLM episode judge over the harness ledger",
                 }
             ),
+            **({} if curriculum is None else {"curriculum": curriculum}),
         },
         qualified=qualified,
         output_paths=task.output_paths,
         transport=task.harbor_transport,
         notice="Tools run in the declared executable or mixed world from a frozen checkpoint.",
         dense_reward=None if task.dense is None else task.dense.identity,
+        metadata=None
+        if curriculum is None
+        else {
+            f"curriculum_{key}": value
+            for key, value in curriculum.items()
+            if key in ("strength", "position") and isinstance(value, str | int)
+        },
     )
 
 
@@ -116,7 +127,17 @@ def verify_executable_package(project: ProjectStore, directory: Path) -> Artifac
             name=name,
             qualification=qualification,
             diagnostic=binding.get("qualification") == "diagnostic_only",
+            curriculum=_curriculum(binding.get("curriculum")),
         )
         if verify_harbor_export(expected) != binding:
             raise ValueError("package does not reproduce its trusted executable task profile")
     return task
+
+
+def _curriculum(value: JsonValue) -> JsonObject | None:
+    """Return a binding's recorded curriculum rung, or None when it records none."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("package curriculum metadata must be an object")
+    return value

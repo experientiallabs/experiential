@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
@@ -123,6 +124,7 @@ def write_harbor_package(
     transport: Literal["http", "unix-no-network"] = "http",
     dialogue: bool = True,
     dense_reward: str | None = None,
+    metadata: Mapping[str, str | int] | None = None,
 ) -> Path:
     """Write the shared Harbor client and isolated verifier package for one frozen backend.
 
@@ -142,12 +144,16 @@ def write_harbor_package(
         dense_reward: Identity of the frozen dense reward definition the backend judges each
             trial with, or None. It is recorded in the binding and task metadata; its tag
             definitions and grading instructions stay with the trusted backend.
+        metadata: Extra descriptive ``[metadata]`` entries of ``task.toml``, such as a
+            curriculum rung's strength and position; never a grading or runtime input.
 
     Returns:
         Published package with the complete digest-bound file inventory.
     """
     if transport not in ("http", "unix-no-network"):
         raise ValueError("unsupported Harbor transport")
+    if any(not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key) for key in metadata or {}):
+        raise ValueError("Harbor metadata keys must be lowercase bare TOML keys")
     preflight_harbor_destination(destination, name=name)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".harbor-export-", dir=destination.parent))
@@ -212,6 +218,7 @@ def write_harbor_package(
             f"diagnostic_only = {str(not qualified).lower()}\n"
             f'harbor_version = "{HARBOR_VERSION}"\n'
             + ("" if dense_reward is None else f'dense_reward = "{DENSE_REWARD_SCHEMA}"\n')
+            + "".join(f"{key} = {json.dumps(value)}\n" for key, value in (metadata or {}).items())
             + "\n"
             "[agent]\ntimeout_sec = 600\n\n"
             "[environment]\ncpus = 1\nmemory_mb = 512\n"

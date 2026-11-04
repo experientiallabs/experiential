@@ -58,7 +58,7 @@ from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, Evi
 from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.nudge_ladder import CurriculumStage, NudgeLadderSpec
-from exp.optimize.evaluation.variance.nudges import NudgeStrength
+from exp.optimize.evaluation.variance.nudges import NudgeStrength, RungStrength
 from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings
 from exp.optimize.evaluation.variance.pipeline_plan import STAGES as STAGES
 from exp.optimize.evaluation.variance.pipeline_plan import CostLine as CostLine
@@ -492,6 +492,10 @@ class RecordsSettings(ContractModel):
         dense: Optional frozen training-error vocabulary and bounded dense judge settings.
         option_proposer: Open-weight option proposer; None uses ``authoring.decision_author``.
         option_classifier: Open-weight choice classifier; None uses the family measure's.
+        schedule: Emit one training schedule per tier from its error-mining registration and
+            the nudge curriculum of its admitted families, saved and written as a spec file the
+            ``variance-schedule`` action starts from; it makes no model call.
+        rollouts_per_tier: Rollouts each nudged strength tier of an emitted schedule lasts.
     """
 
     intent: str = Field(min_length=1, max_length=400)
@@ -505,6 +509,8 @@ class RecordsSettings(ContractModel):
     point_decisions: bool = True
     option_proposer: AuthorSettings | None = None
     option_classifier: AuthorSettings | None = None
+    schedule: bool = True
+    rollouts_per_tier: int = Field(default=4, ge=1, le=1000, strict=True)
 
 
 class DecisionVarianceSpec(ContractModel):
@@ -764,6 +770,8 @@ class FamilyOutcome(ContractModel):
         failure: Why the family stopped before admission, when it did.
         search: The saved variant search of the first registration, when one ran.
         ladder: The saved nudge ladder of the first registration, when one was built.
+        rungs_kept: Why a re-registration carried the ladder's rungs over with their first
+            judges instead of re-measuring them, when it had rungs.
     """
 
     tier: str
@@ -780,6 +788,7 @@ class FamilyOutcome(ContractModel):
     failure: str | None = None
     search: ArtifactInput | None = None
     ladder: ArtifactInput | None = None
+    rungs_kept: str | None = None
 
 
 class FamiliesOutputs(ContractModel):
@@ -806,6 +815,9 @@ class HarborExport(ContractModel):
         qualification: The saved qualification report, passing or not, when one was saved.
         refusals: Unmet qualification requirements, when it did not qualify.
         failure: Why qualification could not run or complete, when it could not.
+        ladder: The saved nudge ladder, when the export is a curriculum rung.
+        strength: The rung's nudge strength (``none`` for the un-nudged target), when it is one.
+        position: The rung's ladder position from 0 (strongest), when it is one.
     """
 
     tier: str
@@ -816,6 +828,27 @@ class HarborExport(ContractModel):
     task: ArtifactInput | None = None
     qualification: ArtifactInput | None = None
     refusals: tuple[str, ...] = ()
+    failure: str | None = None
+    ladder: str | None = None
+    strength: RungStrength | None = None
+    position: int | None = Field(default=None, ge=0)
+
+
+class TierSchedule(ContractModel):
+    """The training schedule the records stage emits for one tier.
+
+    Attributes:
+        tier: The actor tier.
+        schedule: The saved ``variance-schedule`` spec, when one was built.
+        path: The spec file the ``variance-schedule`` action reads, when one was written.
+        stages: Curriculum stages the schedule carries; zero when the tier has no ladder.
+        failure: Why no schedule could be built, when none could.
+    """
+
+    tier: str
+    schedule: ArtifactInput | None = None
+    path: str | None = None
+    stages: int = Field(default=0, ge=0)
     failure: str | None = None
 
 
@@ -831,6 +864,7 @@ class RecordsOutputs(ContractModel):
         curriculum: The nudge curriculum of every admitted family's ladder: admitted rungs
             from strong to weak, every un-nudged target last; a training schedule reads it.
         point_options: Saved derived options of every continued point, per tier.
+        schedules: The training schedule emitted for each tier, when ``records.schedule``.
     """
 
     training: dict[str, ArtifactInput] = Field(default_factory=dict)
@@ -840,6 +874,7 @@ class RecordsOutputs(ContractModel):
     crosstalk_skipped: str | None = None
     curriculum: tuple[CurriculumStage, ...] = ()
     point_options: dict[str, tuple[ArtifactInput, ...]] = Field(default_factory=dict)
+    schedules: dict[str, TierSchedule] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)

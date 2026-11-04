@@ -40,7 +40,10 @@ from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticSpec,
     run_actor_critic,
 )
-from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
+from exp.optimize.evaluation.variance.actor_critic_costs import (
+    actor_critic_costs,
+    point_option_costs,
+)
 from exp.optimize.evaluation.variance.bootstrap_stage import PLAN_LINE, run_bootstrapped_rules
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
@@ -506,6 +509,8 @@ class _MiningStage:
             if planned is not None and planned.actor_job.actor_alias == alias:
                 assert planned.spec is not None
                 costs.extend(actor_critic_costs(project, planned.spec))
+                assert mining.schedule is not None
+                costs.extend(point_option_costs(project, mining.schedule, planned.spec))
                 if mining.behaviors is not None:
                     if not spec.traceml.enabled:
                         costs.extend(

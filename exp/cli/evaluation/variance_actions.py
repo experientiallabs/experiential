@@ -38,7 +38,10 @@ from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticSpec,
     run_actor_critic,
 )
-from exp.optimize.evaluation.variance.actor_critic_costs import actor_critic_costs
+from exp.optimize.evaluation.variance.actor_critic_costs import (
+    actor_critic_costs,
+    point_option_costs,
+)
 from exp.optimize.evaluation.variance.build import (
     plan_variance_build,
     run_variance_build,
@@ -353,7 +356,10 @@ def handle_variance_schedule(context: ContinuationContext, action: VarianceSched
     exposure.require_lineage(start.task.lineage_group_id, "mining_probes")
     if plan.spec is not None:
         saved = store.artifacts.exists(plan.spec.identity(revision) + "-result")
-        components = actor_critic_costs(store, plan.spec)
+        components = (
+            *actor_critic_costs(store, plan.spec),
+            *point_option_costs(store, spec, plan.spec),
+        )
     else:
         saved = saved_actor_rollout(store, plan, code_revision=revision) is not None
         components = actor_rollout_costs(store, plan)

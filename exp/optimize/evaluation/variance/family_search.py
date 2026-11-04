@@ -22,6 +22,11 @@ joint decision-variance measure under the family's frozen judges:
 Both stages bind scenario sets through one :class:`FamilyBinder`, which asks the caller's judge
 function for a whole set at a time, so a caller can author one frozen world, rubric and judge
 per set; a binding is fixed before any contrast of the set runs and is never re-asked.
+
+A family registered again under revised judges (``DecisionFamilySpec.reuse``) takes its earlier
+registration's decision and searched scenario set as a :class:`RegisteredSet` instead of drawing
+afresh, so the same set is contrasted and measured again under the new judges. Its ladder rungs
+are carried over with their first judges and measure, for the reason :data:`RUNGS_KEPT` records.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from exp.common.project import ProjectStore
 from exp.common.tasks.facts import InstanceFacts
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_start
-from exp.optimize.evaluation.variance.authors import ScenarioDraft
+from exp.optimize.evaluation.variance.authors import DecisionStateDraft, ScenarioDraft
 from exp.optimize.evaluation.variance.contracts import (
     ActorView,
     DecisionState,
@@ -255,6 +260,39 @@ class RungTask(ContractModel):
     variant: FamilyVariant
 
 
+RUNGS_KEPT = (
+    "ladder rungs are judged by their ladder round's own rubric, authored from the ladder's "
+    "packet; a rubric revision revises the family set's rubrics, whose criteria cite only that "
+    "set's variants, so no revised judge exists for a rung and the rungs keep the first "
+    "registration's judges, measure and admission; the ladder's base was the hardest state of "
+    "the first registration's measure"
+)
+"""Why a re-registration carries its ladder rungs over instead of re-measuring them."""
+
+
+class RegisteredSet(ContractModel):
+    """An earlier registration's decision and scenario set, re-measured under revised judges.
+
+    Attributes:
+        source: The earlier registration's saved family report.
+        decision: Its decision-state draw, reused instead of a fresh draw.
+        scenarios: Its accepted scenario set (its variant search's admitted set, when one ran),
+            contrasted and measured again under the new judges.
+        search: Its saved variant search, when one ran.
+        ladder: Its nudge ladder, or why none was built, carried over.
+        rungs: Its curriculum rung tasks, carried over with their first judges.
+        rungs_kept: Why the rungs were not re-measured, when there are any.
+    """
+
+    source: ArtifactInput
+    decision: DecisionStateDraft
+    scenarios: ScenarioDraft
+    search: ArtifactInput | None = None
+    ladder: ArtifactInput | str | None = None
+    rungs: tuple[RungTask, ...] = ()
+    rungs_kept: str | None = None
+
+
 def ladder_base(measure: DecisionMeasure, scenarios: Sequence[Scenario]) -> Scenario | None:
     """Return the measured state whose free agents least often chose its correct option.
 
@@ -389,8 +427,10 @@ def family_ladder(
 
 
 __all__ = [
+    "RUNGS_KEPT",
     "FamilyBinder",
     "FamilyInputs",
+    "RegisteredSet",
     "RungTask",
     "SetJudges",
     "family_ladder",

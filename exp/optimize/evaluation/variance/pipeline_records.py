@@ -21,6 +21,17 @@ also carries that family's joint score, which decides its value. The nudge ladde
 families become one curriculum (:func:`~exp.optimize.evaluation.variance.nudge_ladder.
 nudge_curriculum`): admitted rungs from strong to weak, every un-nudged target last, which a
 training schedule reads (``TrainingScheduleSpec.curriculum``).
+
+Every curriculum rung of an admitted family's ladder (each admitted nudged rung and always the
+un-nudged target) is a task of its own and goes through the same qualification and export as a
+confirmed variant: its exact executable task starts at the rung's replayed decision checkpoint
+under the rung's own frozen judge, and its package and ``HarborExport`` row record its ladder,
+strength and position. With ``records.schedule`` (the default) the stage also emits one
+:class:`~exp.optimize.evaluation.variance.schedule.TrainingScheduleSpec` per tier: the tier's
+error-mining registration (or the mining stage's own schedule for that tier) with a
+:class:`~exp.optimize.evaluation.variance.schedule.CurriculumPlan` over the tier's admitted
+ladders, saved as a ``variance-schedule`` artifact and written as the spec file the
+``variance-schedule`` action starts from. Building it calls nothing.
 """
 
 from __future__ import annotations
@@ -51,7 +62,11 @@ from exp.optimize.evaluation.executable.qualification import (
     load_executable_qualification,
     qualify_executable_task,
 )
-from exp.optimize.evaluation.executable.task import persist_executable_task
+from exp.optimize.evaluation.executable.task import (
+    ExecutableTask,
+    load_executable_task,
+    persist_executable_task,
+)
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_start
 from exp.optimize.evaluation.variance.crosstalk import (
     CrosstalkProbeSpec,
@@ -64,7 +79,13 @@ from exp.optimize.evaluation.variance.family import (
     family_decisions,
     family_executable_task,
 )
-from exp.optimize.evaluation.variance.nudge_ladder import load_ladder, nudge_curriculum
+from exp.optimize.evaluation.variance.family_export import export_rung_harbor, rung_executable_task
+from exp.optimize.evaluation.variance.family_search import RungTask
+from exp.optimize.evaluation.variance.nudge_ladder import (
+    CurriculumPlan,
+    load_ladder,
+    nudge_curriculum,
+)
 from exp.optimize.evaluation.variance.pipeline_dense import attach_family_dense, dense_costs
 from exp.optimize.evaluation.variance.pipeline_spec import (
     CostLine,
@@ -76,6 +97,8 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     RecordsOutputs,
     StageContext,
     StageRun,
+    TierMining,
+    TierSchedule,
     cost_lines,
     family_key,
 )
@@ -87,6 +110,8 @@ from exp.optimize.evaluation.variance.pipeline_stages import (
 )
 from exp.optimize.evaluation.variance.point_options import point_decisions
 from exp.optimize.evaluation.variance.records import selector_records
+from exp.optimize.evaluation.variance.rewards import SelectorObjectiveV2
+from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec, save_schedule
 
 __all__ = ["RECORDS_STAGE"]
 
@@ -166,14 +191,24 @@ class _RecordsStage:
                 f"{options.classifier.model_alias} for version 2 selector records."
             )
         if qualify:
-            variants = spec.authoring.families_per_tier * (spec.authoring.maximum_variants + 1)
+            ladder = spec.authoring.ladder_spec()
+            rungs = 0 if ladder is None else len(ladder.strengths) + 1
+            per_family = spec.authoring.maximum_variants + 1 + rungs
+            variants = spec.authoring.families_per_tier * per_family
             for alias in spec.mining.actors:
                 feasibility = group_job(project, spec, spec.mining.registered, alias)
                 costs.extend(row.scaled(variants) for row in job_costs(project, feasibility))
             lines.append(
-                f"Qualification: one feasibility run per exported variant, up to {variants} per "
-                f"tier, and {len(records.qualification.controls)} witnessed controls each; "
-                "qualification itself makes no model call."
+                f"Qualification: one feasibility run per exported variant and curriculum rung "
+                f"(up to {rungs} rungs per family), up to {variants} per tier, and "
+                f"{len(records.qualification.controls)} witnessed controls each; qualification "
+                "itself makes no model call."
+            )
+        if records.schedule:
+            lines.append(
+                "Training schedules: one per tier from its error-mining registration and the "
+                f"nudge curriculum of its admitted families ({records.rollouts_per_tier} rollouts "
+                "per strength tier), saved for the variance-schedule action; no model call."
             )
         if not records.crosstalk:
             return cost_lines(tuple(costs)), tuple(lines)
@@ -232,12 +267,19 @@ class _RecordsStage:
         exports: list[HarborExport] = []
         if spec.records.harbor:
             for row in admitted:
-                exports.extend(_export(context, row, reports[family_key(row.tier, row.point)]))
+                report = reports[family_key(row.tier, row.point)]
+                exports.extend(_export(context, row, report))
+                exports.extend(_export_rungs(context, row, report))
         crosstalk, skipped = None, None
         if spec.records.crosstalk:
             crosstalk, skipped = _crosstalk(context, admitted, reports)
         curriculum = nudge_curriculum(
             [load_ladder(project, row.ladder) for row in admitted if row.ladder is not None]
+        )
+        schedules = (
+            {tier.tier: _schedule(context, tier, admitted, exports) for tier in mining.tiers}
+            if spec.records.schedule
+            else {}
         )
         outputs = RecordsOutputs(
             training=training,
@@ -247,6 +289,7 @@ class _RecordsStage:
             crosstalk_skipped=skipped,
             curriculum=curriculum,
             point_options=derived,
+            schedules=schedules,
         )
         summary: JsonObject = {
             "admitted": len(admitted),
@@ -260,6 +303,8 @@ class _RecordsStage:
                 for stage in curriculum
             ],
             "point_options": {tier: len(refs) for tier, refs in derived.items()},
+            "rungs": [row.path for row in exports if row.strength is not None],
+            "schedules": {tier: row.path or row.failure for tier, row in schedules.items()},
         }
         refs = (
             *training.values(),
@@ -269,6 +314,7 @@ class _RecordsStage:
             *(row.qualification for row in exports),
             *(ref for refs in derived.values() for ref in refs),
             *(row.ladder for row in admitted),
+            *(row.schedule for row in schedules.values()),
         )
         return StageRun(outputs, refs, summary)
 
@@ -340,7 +386,13 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
             tier=row.tier, point=row.point, scenario_id=scenario, path=str(destination)
         )
         if context.spec.records.qualification is not None:
-            export = _qualify(context, report, export)
+            task = family_executable_task(
+                report,
+                scenario,
+                intent=context.spec.records.intent,
+                dense=context.spec.records.dense,
+            )
+            export = _qualify(context, task, export)
         if not destination.exists():
             export_family_harbor(
                 context.project,
@@ -357,17 +409,169 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
     return exports
 
 
-def _qualify(context: StageContext, report: FamilyReport, export: HarborExport) -> HarborExport:
-    """Qualify one variant's exact executable task, recording every refusal or failure.
-
-    The task is the one :func:`export_family_harbor` packages, rewarded only by the variant's
-    frozen judge. Its feasibility run executes, or replays, once; the declared controls are
-    witnessed against the independent specification and the result is saved, passing or not.
+def _export_rungs(
+    context: StageContext, row: FamilyOutcome, report: FamilyReport
+) -> list[HarborExport]:
+    """Qualify and export every curriculum rung of one admitted family's ladder.
 
     Args:
         context: The running stage.
-        report: The admitted family.
-        export: The variant's export, diagnostic so far.
+        row: The admitted family.
+        report: Its saved report, whose rungs are the ladder's curriculum.
+
+    Returns:
+        One export per rung, qualified or diagnostic, recording its strength and position.
+    """
+    if not isinstance(report.ladder, ArtifactInput) or not report.rungs:
+        return []
+    root = context.dependencies.harbor_root
+    if root is None:
+        root = context.project.paths.runtime_directory / "decision-variance"
+    ladder, intent = report.ladder.artifact_id, context.spec.records.intent
+    exports: list[HarborExport] = []
+    for rung in report.rungs:
+        name = _slug(f"{row.tier}-{row.point}-rung-{rung.position}-{rung.scenario_id}")
+        destination = root / context.identity / name
+        export = HarborExport(
+            tier=row.tier,
+            point=row.point,
+            scenario_id=rung.scenario_id,
+            path=str(destination),
+            ladder=ladder,
+            strength=rung.strength,
+            position=rung.position,
+        )
+        try:
+            task = rung_executable_task(
+                report, rung, intent=intent, dense=context.spec.records.dense
+            )
+        except ValueError as error:
+            exports.append(export.model_copy(update={"failure": f"not exported: {error}"}))
+            continue
+        if context.spec.records.qualification is not None:
+            export = _qualify(context, task, export)
+        if not destination.exists():
+            _package_rung(context, report, rung, export, name)
+        exports.append(export)
+    return exports
+
+
+def _package_rung(
+    context: StageContext, report: FamilyReport, rung: RungTask, export: HarborExport, name: str
+) -> None:
+    """Write one rung's Harbor package, qualified only when its qualification passed."""
+    assert export.ladder is not None
+    export_rung_harbor(
+        context.project,
+        report,
+        rung,
+        Path(export.path),
+        name=f"decision-variance/{name}",
+        intent=context.spec.records.intent,
+        code_revision=context.code_revision,
+        ladder=export.ladder,
+        dense=context.spec.records.dense,
+        qualification=None if export.diagnostic else export.qualification,
+    )
+
+
+def _schedule(
+    context: StageContext,
+    tier: TierMining,
+    admitted: list[FamilyOutcome],
+    exports: list[HarborExport],
+) -> TierSchedule:
+    """Emit one tier's training schedule over its qualified curriculum rungs.
+
+    The base is the mining stage's own schedule for the tier when it has one, else the tier's
+    saved error-mining registration. Each curriculum stage whose rung export qualified is bound
+    to that exact task's job and frozen judge, which the stage's rollouts then run; diagnostic
+    rungs stay out. The objective is version 2, scored by point decisions the records stage's
+    option settings derive. The spec is saved and written as a file the ``variance-schedule``
+    action reads; nothing is called.
+
+    Args:
+        context: The running stage.
+        tier: The tier's error mining.
+        admitted: Every admitted family.
+        exports: Every Harbor export of this stage, curriculum rungs included.
+
+    Returns:
+        The saved schedule and its spec file, or why none could be built.
+    """
+    project, records = context.project, context.spec.records
+    ladders = [row.ladder for row in admitted if row.tier == tier.tier and row.ladder is not None]
+    qualified = {
+        (row.ladder, row.scenario_id): row
+        for row in exports
+        if row.tier == tier.tier and row.strength is not None and not row.diagnostic
+    }
+    stages = []
+    for stage in nudge_curriculum([load_ladder(project, ref) for ref in ladders]):
+        export = qualified.get((stage.ladder, stage.scenario_id))
+        if export is not None and export.task is not None:
+            bound = load_executable_task(project, export.task)
+            stages.append(
+                stage.model_copy(
+                    update={
+                        "job": bound.job,
+                        "judge": bound.judge,
+                        "task": export.task,
+                        "qualification": export.qualification,
+                    }
+                )
+            )
+    plan = (
+        CurriculumPlan(stages=tuple(stages), rollouts_per_tier=records.rollouts_per_tier)
+        if stages
+        else None
+    )
+    scored: JsonObject = {
+        "curriculum": None if plan is None else plan.model_dump(mode="json"),
+        "objective": SelectorObjectiveV2().model_dump(mode="json"),
+        "point_options": (
+            None
+            if (options := context.spec.point_options()) is None
+            else options.model_dump(mode="json")
+        ),
+    }
+    mined = context.spec.mining.schedule
+    try:
+        if mined is not None and mined.base.initial.actor_alias == tier.tier:
+            spec = TrainingScheduleSpec.model_validate({**mined.model_dump(mode="json"), **scored})
+        else:
+            spec = TrainingScheduleSpec.model_validate(
+                {
+                    "name": _slug(f"dv-{tier.tier}")[:64],
+                    "base": load_report(project, tier.report).spec.model_dump(mode="json"),
+                    **scored,
+                }
+            )
+    except ValueError as error:
+        return TierSchedule(tier=tier.tier, failure=f"{type(error).__name__}: {error}"[:2000])
+    reference = save_schedule(
+        project, spec, code_revision=context.code_revision, inputs=(tier.report, *ladders)
+    )
+    root = context.dependencies.harbor_root
+    if root is None:
+        root = project.paths.runtime_directory / "decision-variance"
+    path = root / context.identity / "schedules" / f"{_slug(tier.tier)}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(spec.model_dump_json(indent=2) + "\n")
+    return TierSchedule(tier=tier.tier, schedule=reference, path=str(path), stages=len(stages))
+
+
+def _qualify(context: StageContext, task: ExecutableTask, export: HarborExport) -> HarborExport:
+    """Qualify one variant's or rung's exact executable task, recording every refusal or failure.
+
+    The task is the one its Harbor package starts from, rewarded only by its frozen judge. Its
+    feasibility run executes, or replays, once; the declared controls are witnessed against the
+    independent specification and the result is saved, passing or not.
+
+    Args:
+        context: The running stage.
+        task: The exact executable task.
+        export: The variant's or rung's export, diagnostic so far.
 
     Returns:
         The export, qualified when every observable-contract check passed.
@@ -375,12 +579,6 @@ def _qualify(context: StageContext, report: FamilyReport, export: HarborExport) 
     project, revision = context.project, context.code_revision
     settings = context.spec.records.qualification
     assert settings is not None
-    task = family_executable_task(
-        report,
-        export.scenario_id,
-        intent=context.spec.records.intent,
-        dense=context.spec.records.dense,
-    )
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=revision
     )

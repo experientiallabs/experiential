@@ -3450,6 +3450,13 @@ def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture(
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     """Prove the installed release happy path with deterministic loopback providers.
 
+    It needs ``uv`` and a Rust toolchain on ``PATH`` (the companion native wheel is built here)
+    and runs the installed wheel with ``PYTHONPATH`` cleared and private XDG directories, so no
+    source checkout or host state leaks in. Run it alone with, for example::
+
+        env -u PYTHONPATH PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" python -m pytest -q
+            exp/tests/release_test.py -k test_installed_wheel_no_spend_release_evidence
+
     Args:
         tmp_path: Pytest-owned build, virtual environment, and execution root.
     """
@@ -3463,6 +3470,8 @@ def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
     assert uv is not None, "release evidence requires the repository's uv toolchain"
     environment = os.environ.copy()
     environment["UV_CACHE_DIR"] = str(tmp_path / "uv-cache")
+    # The installed wheel must import only from its own environment, never a caller's sources.
+    environment.pop("PYTHONPATH", None)
     _run_checked(
         [uv, "build", "--wheel", "--out-dir", str(distribution)],
         cwd=repository,

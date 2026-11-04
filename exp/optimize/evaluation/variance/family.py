@@ -12,7 +12,8 @@ saved actor-critic run over a mining-probe task:
 3. **Scenarios.** One forced scenario draw varies it; a set with any structural problem stops the
    family. With ``search`` set, a measured variant search
    (:func:`~exp.optimize.evaluation.variance.family_search.searched_scenarios`) replaces the draw
-   and only a set the joint measure admits goes on.
+   and only a set the joint measure admits goes on. With ``reuse`` set, an earlier
+   registration's decision and scenario set replace both draws, to be measured again.
 4. **Variants.** Each scenario becomes a coherent variant checkpoint, proven to restore to its
    edited state. A variant forked before the decision is replayed to it by imposing the original
    trajectory's recorded calls in the edited world; a replay that diverges is kept as
@@ -131,6 +132,7 @@ from exp.optimize.evaluation.variance.family_export import variant_job as varian
 from exp.optimize.evaluation.variance.family_search import (
     FamilyBinder,
     FamilyInputs,
+    RegisteredSet,
     RungTask,
     SetJudges,
     family_ladder,
@@ -215,6 +217,9 @@ class DecisionFamilySpec(ContractModel):
         ladder: Nudge ladder settings: an admitted family builds a ladder over its hardest
             state and records every curriculum rung as its own task. Needs the measure; unkeyed
             while None.
+        reuse: An earlier registration's decision draw, scenario set and ladder, used instead of
+            fresh draws when the family is registered again under revised judges; the set is
+            contrasted and measured again and the ladder is carried over. Unkeyed while None.
     """
 
     decision_author: AuthorSettings
@@ -241,12 +246,15 @@ class DecisionFamilySpec(ContractModel):
     coalition: CoalitionEvidence | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    reuse: RegisteredSet | None = None
 
     @model_validator(mode="after")
     def _measured(self) -> DecisionFamilySpec:
-        """Require the joint measure for a variant search or a nudge ladder."""
+        """Require the joint measure for a search or a ladder, and neither beside a reused set."""
         if (self.search is not None or self.ladder is not None) and not self.measure_decisions:
             raise ValueError("a variant search or a nudge ladder needs measure_decisions")
+        if self.reuse is not None and (self.search is not None or self.ladder is not None):
+            raise ValueError("a reused scenario set replaces the variant search and the ladder")
         return self
 
     @property
@@ -268,7 +276,7 @@ class DecisionFamilySpec(ContractModel):
         """
         unset = {"fresh_briefing"} if not self.fresh_briefing else set()
         unset |= {"decision_variance"} if self.decision_variance is None else set()
-        unset |= {name for name in ("search", "ladder") if getattr(self, name) is None}
+        unset |= {name for name in ("search", "ladder", "reuse") if getattr(self, name) is None}
         return {
             "dispositions",
             "measure_decisions",
@@ -461,13 +469,17 @@ def run_decision_family(
             code_revision,
         )
         sources = (context_ref, spec.rules_stage, stage.rulebook, report.group)
-        decision = author_decision_state(
-            project,
-            spec.decision_author,
-            context,
-            identity=draws + "-decision-state",
-            code_revision=code_revision,
-            sources=sources,
+        decision = (
+            spec.reuse.decision
+            if spec.reuse is not None
+            else author_decision_state(
+                project,
+                spec.decision_author,
+                context,
+                identity=draws + "-decision-state",
+                code_revision=code_revision,
+                sources=sources,
+            )
         )
         family = _Family(
             project=project,
@@ -627,7 +639,11 @@ def _continue(
     boundaries = (study.spec.checkpoint, *picked.checkpoints)
     binder = FamilyBinder(project, base.job, spec.judging, judges)
     inputs: FamilyInputs | None = None
-    if spec.search is not None and spec.measure_spec is not None:
+    if spec.reuse is not None:
+        scenarios = spec.reuse.scenarios
+        reused = {"search": spec.reuse.search, "ladder": spec.reuse.ladder}
+        base = base.model_copy(update={**reused, "rungs": spec.reuse.rungs})
+    elif spec.search is not None and spec.measure_spec is not None:
         try:
             resolved = dict(spec.actions or (actions(state) if actions is not None else {}))
         except (ValueError, KeyError, TypeError) as error:
@@ -948,6 +964,7 @@ def _dependencies(result: FamilyReport, report: ActorCriticReport) -> tuple[Arti
     """Collect every saved artifact the family report rests on."""
     refs = {result.checkpoint, result.context, report.group, result.spec.rules_stage}
     refs |= {ref for ref in (result.search, result.ladder) if isinstance(ref, ArtifactInput)}
+    refs |= set() if result.spec.reuse is None else {result.spec.reuse.source}
     refs |= {ref for row in result.rungs if (ref := row.variant.decision_checkpoint) is not None}
     refs |= {row.judge.definition.rubric for row in (result.judging or {}).values()}
     refs |= {

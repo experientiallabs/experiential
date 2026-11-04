@@ -665,7 +665,10 @@ def world_runtime_definition(
     elif set(coverage.programs) != set(world.programs) or coverage.manifest != world.manifest():
         raise ValueError("the supplied coverage is not this world's validated programs")
     row = world.initialization(variant_id)
-    instruction = packet.variant(variant_id).instruction
+    variant = packet.variant(variant_id)
+    # A resumed nudge keeps the task's own instruction; the nudge reaches the actor as a message.
+    resumed = variant.nudge is not None and row.mode == "resume"
+    instruction = packet.task.instruction if resumed else variant.instruction
     if row.briefing is not None:
         instruction = row.briefing + "\n\n" + instruction
     configuration = base.model_dump(mode="json")
@@ -727,7 +730,9 @@ def _check_initializations(world: WorldSpec, packet: AuthoringPacket) -> None:
 
     Raises:
         ValueError: A variant is missing or invented, a state names other domains, a resume
-            state differs from the variant's packet state, or a fresh briefing drops an edit.
+            state differs from the variant's packet state, a resumed instruction variant is not
+            a nudge (whose message the resumed actor receives), or a fresh briefing drops an
+            edit.
     """
     variants = {variant.variant_id: variant for variant in packet.variants}
     named = [row.variant_id for row in world.initializations]
@@ -750,7 +755,8 @@ def _check_initializations(world: WorldSpec, packet: AuthoringPacket) -> None:
             raise ValueError(
                 f"initialization {row.variant_id} rewrites the variant's declared briefing"
             )
-        if row.mode == "resume" and variant.axis in ("instruction", "state_and_instruction"):
+        instructed = variant.axis in ("instruction", "state_and_instruction")
+        if row.mode == "resume" and instructed and variant.nudge is None:
             raise ValueError(
                 f"resume initialization {row.variant_id} keeps a prefix that shows the original "
                 "instruction; an instruction variant needs fresh_briefing"
