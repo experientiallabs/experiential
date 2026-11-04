@@ -34,7 +34,10 @@ def _command(project: ProjectStore, request: Path, *extra: str) -> list[str]:
 def _request(run: Run, root: Path, *, execute: bool) -> Path:
     """Write a single-tier spec without TraceML and its operation file."""
     spec = make_spec(run.fixture, run.rubric, run.bank, actors=("actor",), crosstalk=False)
-    spec = spec.model_copy(update={"traceml": TraceMLSettings(enabled=False)})
+    # The CLI run has no injected System One client and the stand-in rules owner learns no
+    # memory, so the rules stage keeps the research profile here.
+    rules = spec.rules.model_copy(update={"jev_memory": False})
+    spec = spec.model_copy(update={"traceml": TraceMLSettings(enabled=False), "rules": rules})
     spec_path = root / "decision-variance.json"
     spec_path.write_text(spec.model_dump_json())
     command = ContinuationCommand(
