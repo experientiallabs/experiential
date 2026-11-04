@@ -94,6 +94,12 @@ from exp.cli.evaluation.sample_count import handle_sample_count
 from exp.cli.evaluation.state_retention import handle_collect_garbage, handle_retire_checkpoint
 from exp.cli.evaluation.task_hardening import handle_check_task_validity, handle_harden_tasks
 from exp.cli.evaluation.trajectory_traces import handle_export_traces
+from exp.cli.evaluation.variance_actions import (
+    ActorCriticAction,
+    RulesStageAction,
+    handle_actor_critic,
+    handle_rules_stage,
+)
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import ArtifactInput, ContractModel, stable_id
@@ -240,6 +246,8 @@ CONTINUATION_ACTIONS = (
     ContinuationAction(
         "validate-transitions", "transition_validation", handle_validate_transitions
     ),
+    ContinuationAction("rules-stage", "rules_stage", handle_rules_stage),
+    ContinuationAction("actor-critic", "actor_critic", handle_actor_critic),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -317,6 +325,8 @@ class ContinuationCommand(ContractModel):
         references: Saved artifact IDs or types whose exact references to print.
         native_workbook: Starting workbooks, task and answer ranges for a native capture.
         rubric_trajectory: Development chronology to register as a rubric source.
+        rules_stage: Rules-stage spec and exposure files and the world-learning trace IDs.
+        actor_critic: Actor-critic spec and exposure files for one mining-probe task.
     """
 
     action: ContinuationActionName
@@ -378,6 +388,8 @@ class ContinuationCommand(ContractModel):
     references: ArtifactReferenceQuery | None = None
     native_workbook: NativeWorkbookPayload | None = None
     rubric_trajectory: RubricTrajectoryRegistration | None = None
+    rules_stage: RulesStageAction | None = None
+    actor_critic: ActorCriticAction | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
