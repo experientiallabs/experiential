@@ -428,9 +428,14 @@ def _decode(
     prefill_disclosures: tuple[str, ...] = ()
     last_index = len(request.messages) - 1
     for index, message in enumerate(request.messages):
-        if index == last_index and index > 0 and _is_empty_prefill(message):
-            # Anthropic accepts an empty final assistant turn as no prefill;
-            # an empty turn anywhere else still fails in _gateway_messages.
+        if (
+            index == last_index
+            and _is_empty_prefill(message)
+            and any(turn.role != "system" for turn in request.messages[:index])
+        ):
+            # Anthropic accepts an empty final assistant turn as no prefill
+            # once a conversation turn precedes it; an empty turn anywhere
+            # else, or one that would leave no turn, still fails below.
             prefill_disclosures = (EMPTY_FINAL_ASSISTANT_DROPPED,)
             continue
         try:
