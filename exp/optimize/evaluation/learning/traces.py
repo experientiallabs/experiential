@@ -502,6 +502,9 @@ def _lineage(project: ProjectStore, world_model: ArtifactInput, scope: Scope) ->
     return memory_lineage(project.artifacts, world_model, scope, learning_cases(project, scope))
 
 
+_LEARNING_CASES: dict[tuple[str, str, str], tuple[ReplayCase, ...]] = {}
+
+
 def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...]:
     """Every trace in scope with something to replay, in canonical dataset order.
 
@@ -516,6 +519,19 @@ def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...
         Replay cases in learning order.
     """
     build = _build(project)
+    # Cases are a pure function of the immutable build graph and scope; one build's learning
+    # pass asks for them several times, and each derivation re-extracts every trace.
+    key = (str(project.paths.root), build.model_dump_json(), scope)
+    if key not in _LEARNING_CASES:
+        _LEARNING_CASES.clear()
+        _LEARNING_CASES[key] = _derive_learning_cases(project, build, scope)
+    return _LEARNING_CASES[key]
+
+
+def _derive_learning_cases(
+    project: ProjectStore, build: ProjectBuildArtifacts, scope: Scope
+) -> tuple[ReplayCase, ...]:
+    """Derive every replayable case in scope from one completed build (see learning_cases)."""
     bindings = {
         row.trace_id: row
         for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)

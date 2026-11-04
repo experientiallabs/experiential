@@ -15,7 +15,13 @@ from collections.abc import Sequence
 from functools import partial
 
 from exp.common.core.artifacts import sha256_json
-from exp.common.models import Embedding, EmbeddingClient, EmbeddingCostReservation, ModelCatalog
+from exp.common.models import (
+    Embedding,
+    EmbeddingClient,
+    EmbeddingCostReservation,
+    ModelCatalog,
+    ModelSnapshot,
+)
 from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
@@ -27,6 +33,32 @@ from exp.simulation.retrieval import RAGEmbedderBinding, RAGIndex, load_rag_inde
 from exp.simulation.retrieval.embedding import default_rag_embedder
 from exp.simulation.retrieval.embedding_inputs import embedding_chunk_bytes
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
+
+_INDEX_EMBEDDERS: dict[tuple[str, str], tuple[int, ModelSnapshot]] = {}
+
+
+def _index_embedder(
+    root: str, artifact_id: str, project: ProjectStore
+) -> tuple[int, ModelSnapshot]:
+    """Read a retrieval index's embedding dimension and embedder once per immutable artifact.
+
+    Pricing calls this for every replay case; loading the whole index each time made learning
+    preflight quadratic in practice. Artifacts are immutable by identity, so the cached answer
+    cannot go stale.
+
+    Args:
+        root: Project root, part of the cache key.
+        artifact_id: Retrieval index artifact identity, part of the cache key.
+        project: Store the index is loaded from on a miss.
+
+    Returns:
+        The index's embedding dimension and embedder snapshot.
+    """
+    key = (root, artifact_id)
+    if key not in _INDEX_EMBEDDERS:
+        index = load_rag_index(project.artifacts, artifact_id).index
+        _INDEX_EMBEDDERS[key] = (index.embedding_dimension, index.embedder)
+    return _INDEX_EMBEDDERS[key]
 
 
 def index_embedder_alias(
@@ -51,8 +83,10 @@ def index_embedder_alias(
     """
     if artifact.original_evidence == "none":
         return None
-    index = load_rag_index(project.artifacts, artifact.serving_rag.artifact_id).index
-    return rag_index_embedder_alias(project, catalog, index)
+    dimension, embedder = _index_embedder(
+        str(project.paths.root), artifact.serving_rag.artifact_id, project
+    )
+    return _embedder_alias(project, catalog, dimension, embedder)
 
 
 def rag_index_embedder_alias(
@@ -74,20 +108,27 @@ def rag_index_embedder_alias(
     Raises:
         ValueError: No embedder is configured, or its identity differs from the index's.
     """
-    if default_rag_embedder(index.embedding_dimension).snapshot == index.embedder:
+    return _embedder_alias(project, catalog, index.embedding_dimension, index.embedder)
+
+
+def _embedder_alias(
+    project: ProjectStore, catalog: ModelCatalog, dimension: int, embedder: ModelSnapshot
+) -> str | None:
+    """Resolve the configured embedder alias for an index's dimension and embedder identity."""
+    if default_rag_embedder(dimension).snapshot == embedder:
         return None
     config = project.load_project()
     alias = config.models.embedder if config.models is not None else catalog.roles.embedder
     if alias is None or alias not in catalog.models:
         raise ValueError(
-            f"the retrieval index was embedded with {index.embedder.model_id}; "
+            f"the retrieval index was embedded with {embedder.model_id}; "
             "configure that model as the project's embedder alias and run again"
         )
     configured, _ = RuntimeModelCatalog(catalog).snapshot(alias)
-    if configured != index.embedder:
+    if configured != embedder:
         raise ValueError(
             f"embedder alias {alias!r} serves {configured.model_id}, but the retrieval index "
-            f"was embedded with {index.embedder.model_id}; restore the build's embedder "
+            f"was embedded with {embedder.model_id}; restore the build's embedder "
             "configuration or rebuild the project"
         )
     return alias
