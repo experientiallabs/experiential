@@ -251,6 +251,32 @@ class Witness(ContractModel):
     supports: bool
 
 
+class RuleWeighing(ContractModel):
+    """A model's weighing of one merged rule's evidence, citing what it weighed.
+
+    The status is the weigher's judgment, not a count: one strong, direct observation may
+    support a rule, and several correlated weak ones may leave it unknown. Code checks only the
+    structure (the rule exists, every citation is one of the rule's own locators, no citation
+    reaches an excluded trace, and a decided status cites evidence on its side).
+
+    Attributes:
+        rule_id: The weighed rule.
+        status: Supported, contradicted, or unknown.
+        rationale: Why the cited evidence decides, or fails to decide, the rule.
+        supporting: Cited supporting locators, each among the rule's evidence.
+        contradicting: Cited contradicting locators, each among the rule's counter-evidence or
+            evidence.
+        independence: How independent the cited observations are of one another.
+    """
+
+    rule_id: str = Field(min_length=1, max_length=128)
+    status: RuleStatus
+    rationale: str = Field(min_length=1, max_length=4000)
+    supporting: tuple[str, ...] = ()
+    contradicting: tuple[str, ...] = ()
+    independence: str = Field(default="", max_length=2000)
+
+
 class Rule(ContractModel):
     """A merged rule with all evidence kept.
 
@@ -266,6 +292,7 @@ class Rule(ContractModel):
         evidence: Supporting locators.
         counter_evidence: Contradicting locators.
         witnesses: Independent witnesses; a decision boundary without one stays diagnostic.
+        weighing: The evidence weighing that decided the status, when one was applied.
     """
 
     rule_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$")
@@ -279,6 +306,7 @@ class Rule(ContractModel):
     evidence: tuple[str, ...] = ()
     counter_evidence: tuple[str, ...] = ()
     witnesses: tuple[Witness, ...] = ()
+    weighing: RuleWeighing | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class RuleBook(ContractModel):

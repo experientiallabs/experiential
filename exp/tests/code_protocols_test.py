@@ -300,7 +300,44 @@ PROTOCOLS = (
             "exp.simulation.rules.contracts:trajectory_view",
             "exp.simulation.rules.model",
         ),
-        "e31cd3f6e6a2b24550d7bd7f5bc442d2edeec394379ae007972cedd87b81c477",
+        "794dbbff4b6eb696efe3295910d93537cba799e3062a3b9428bfd65a049711d5",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.agent_loop:AGENT_LOOP_PROTOCOL",
+        "rules-agent-loop-v1",
+        ("exp.optimize.evaluation.rules.agent_loop",),
+        "0d766e002b19ea7fdbcafc30bad5832726d42bf8802d983fdcbfb527efddb55e",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.research:RESEARCH_PROTOCOL",
+        "rule-research-v1",
+        (
+            "exp.optimize.evaluation.rules.research",
+            "exp.optimize.evaluation.rules.agent_loop",
+            "exp.simulation.rules.contracts:trajectory_view",
+            "exp.simulation.rules.model",
+        ),
+        "8f0078fd210a4a35962dce4bec8d676f042c0cfb30a20001ee3fc49dd27136f4",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.weighing:WEIGHING_PROTOCOL",
+        "rule-weighing-v1",
+        (
+            "exp.optimize.evaluation.rules.weighing",
+            "exp.optimize.evaluation.rules.agent_loop",
+            "exp.simulation.rules.merge:check_weighing",
+            "exp.simulation.rules.model",
+        ),
+        "88dd8af8c2970ff6e3457622c70e0fd5f9353c04ce3605465701683371f9700c",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.condense:CONDENSATION_PROTOCOL",
+        "rule-condensation-v1",
+        (
+            "exp.optimize.evaluation.rules.condense",
+            "exp.optimize.evaluation.rules.agent_loop",
+        ),
+        "c5d8ca53783448abc2ec6e031ea7c83b00bc2819cae6f61bcaa4641cbf5d5bd4",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",

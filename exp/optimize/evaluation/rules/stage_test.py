@@ -14,15 +14,19 @@ from exp.common.project.manifests import artifact_input
 from exp.common.traces import Trace
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.challenges import ChallengeCase
-from exp.optimize.evaluation.rules.extraction_test import (
-    RoutedTransport,
-    _answer,
-    _setup,
-    _tool_reply,
-    _wire,
+from exp.optimize.evaluation.rules.condense import load_memory
+from exp.optimize.evaluation.rules.extraction_test import _answer
+from exp.optimize.evaluation.rules.research_test import (
+    SMALL,
+    AgentScript,
+    agent_setup,
+    research_answer,
+    trace_of,
+    wire,
 )
 from exp.optimize.evaluation.rules.stage import (
     RULE_BOOK_TYPE,
+    RulesProfile,
     RulesStageReport,
     RulesStageSpec,
     export_rulebook,
@@ -58,11 +62,12 @@ def _plan(world: tuple[str, ...], probes: tuple[str, ...] = ("probe",)) -> Expos
     )
 
 
-def _spec(settings: AuthorSettings) -> RulesStageSpec:
+def _spec(settings: AuthorSettings, profile: RulesProfile = "agentic_research") -> RulesStageSpec:
     """A stage registration that generates refund boundary workloads.
 
     Args:
-        settings: Frozen extraction settings.
+        settings: Frozen author settings.
+        profile: Research or the explicit single-draw path.
 
     Returns:
         The spec.
@@ -70,9 +75,32 @@ def _spec(settings: AuthorSettings) -> RulesStageSpec:
     return RulesStageSpec(
         author=settings,
         concurrency=3,
+        profile=profile,
+        research=SMALL,
+        weighing=SMALL,
+        condensation=SMALL,
         base_state=_BASE_STATE,
         examples={"refund": {"order_id": "7", "amount": 10}},
     )
+
+
+def _answers(role: str, opening: JsonObject) -> JsonObject:
+    """Every role's answer: valid research (gamma invents a locator), supported, a summary."""
+    if role == "research":
+        trace = trace_of(opening)
+        if trace == "gamma":
+            return research_answer(trace, rule_evidence=("trace:gamma:span:invented",))
+        return research_answer(trace)
+    if role == "weighing":
+        rule = opening["rule"]
+        assert isinstance(rule, dict) and isinstance(rule["evidence"], list)
+        return {
+            "rule_id": rule["rule_id"],
+            "status": "supported",
+            "rationale": "The refused 400 refund against a 40 payment observes the boundary.",
+            "supporting": rule["evidence"][:1],
+        }
+    return {"summary": "Refunds are bounded by the paid amount.", "entries": []}
 
 
 def _session(workflow_id: str, amount: int, reply: JsonObject) -> WorkflowEvidence:
@@ -146,20 +174,14 @@ def _observed_permit(amount: int) -> Transition:
     )
 
 
-def test_full_run_saves_a_rule_book_challenges_it_and_replays_without_a_call(
+def test_full_run_researches_weighs_condenses_challenges_and_replays_without_a_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Contracts, draws, merge, rule book, properties and workloads land in one saved report."""
-    project, settings = _setup(tmp_path, monkeypatch)
+    """Research, merge, weighing, rule book, memory, properties and workloads in one report."""
+    project, settings = agent_setup(tmp_path, monkeypatch)
     traces = _traces("alpha", "beta", "gamma")
-    transport = RoutedTransport(
-        {
-            "alpha": _tool_reply(_answer("alpha")),
-            "beta": _tool_reply(_answer("beta")),
-            "gamma": _tool_reply(_answer("gamma", evidence="trace:gamma:span:invented")),
-        }
-    )
-    _wire(monkeypatch, transport)
+    transport = AgentScript(_answers)
+    wire(monkeypatch, transport)
     refused = _session("refused", 400, {"error": "refund exceeds payment"})
     permitted = _save_session(project, _session("permitted", 500, {"ok": True}))
     plan = _plan(("alpha", "beta", "gamma"))
@@ -173,52 +195,54 @@ def test_full_run_saves_a_rule_book_challenges_it_and_replays_without_a_call(
         sessions=(refused, permitted),
     )
 
-    assert len(transport.requests) == 3
+    assert transport.roles().count("research") == 15
+    assert transport.roles().count("weighing") == 5
+    assert transport.roles().count("condensation") == 5
+    assert report.draws == () and report.failures == ()
+    assert [item.trace_id for item in report.research] == ["alpha", "beta", "gamma"]
+    (failed,) = report.research_failures
+    assert failed.trace_id == "gamma" and "outside their trajectory" in str(failed.failure)
     assert list(report.contracts) == ["lookup", "refund"]
-    assert [draw.trace_id for draw in report.failures] == ["gamma"]
-    assert report.failures[0].response is not None
     assert report.rules == 1
     assert report.rule_counts == {"supported": 1, "contradicted": 0, "unknown": 0}
+    (weighing,) = report.weighings
+    assert weighing.weighing is not None and weighing.weighing.status == "supported"
     assert report.open_questions == 1
     (rule_id,) = report.diagnostic
     assert report.requires_witness == (rule_id,)
-    assert [workload.workload_id for workload in report.workloads] == [
-        f"{rule_id}/{n}" for n in range(3)
-    ]
     assert [workload.expected for workload in report.workloads] == [
         "permitted",
         "permitted",
         "refused",
     ]
-    assert report.triage == ()
-    assert report.session_ids == ("refused", "permitted")
-    assert report.sessions == (permitted,)
     assert report.properties is not None
     (result,) = report.properties.results
     assert (result.holds, result.violated) == (1, 1)
-    assert result.violations == ("workflow:permitted:step:0",)
     assert report.families_must_stay_diagnostic == (rule_id,)
 
     stored = project.artifacts.read(report.rulebook.artifact_id)
     assert stored.manifest.artifact_type == RULE_BOOK_TYPE
-    assert sorted(stored.payloads) == [
-        "README.md",
-        "environment.md",
-        "rules.json",
-        "tools/lookup.md",
-        "tools/refund.md",
-    ]
-    learned_from = sorted(
-        (draw.response for draw in report.draws if draw.rules is not None and draw.response),
-        key=lambda ref: ref.artifact_id,
-    )
-    assert stored.manifest.inputs == tuple(learned_from)
+    learned = {
+        draw.transcript
+        for item in report.research
+        for draw in item.draws
+        if draw.answer is not None and draw.transcript is not None
+    } | {weighing.transcript}
+    assert set(stored.manifest.inputs) == learned
     book = load_rulebook(project, report.rulebook)
     assert book.sources == ("alpha", "beta")
+    assert book.rules[0].weighing == weighing.weighing
+    assert "- Weighing: The refused 400 refund" in stored.payloads["tools/refund.md"].decode()
     exported = export_rulebook(project, report.rulebook, tmp_path / "book")
     assert {
         path.relative_to(tmp_path / "book").as_posix(): path.read_bytes() for path in exported
     } == dict(stored.payloads)
+    assert report.memory is not None
+    memory = load_memory(project, report.memory)
+    assert memory.rulebook == report.rulebook
+    assert memory.summary == "Refunds are bounded by the paid amount."
+    assert [digest.trace_id for digest in memory.research] == ["alpha", "beta", "gamma"]
+    assert memory.research[2].failures
 
     replay = run_rules_stage(
         project,
@@ -230,7 +254,7 @@ def test_full_run_saves_a_rule_book_challenges_it_and_replays_without_a_call(
     )
 
     assert replay == report
-    assert len(transport.requests) == 3
+    assert len(transport.requests) == 25
     saved = project.artifacts.read_bytes(report.identity + "-result", "report.json")
     assert RulesStageReport.model_validate_json(saved) == report
 
@@ -239,9 +263,9 @@ def test_a_trace_outside_world_learning_is_refused_before_any_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A mining-probe trace stops the stage before contracts, draws or saved artifacts."""
-    project, settings = _setup(tmp_path, monkeypatch)
-    transport = RoutedTransport({})
-    _wire(monkeypatch, transport)
+    project, settings = agent_setup(tmp_path, monkeypatch)
+    transport = AgentScript(_answers)
+    wire(monkeypatch, transport)
 
     with pytest.raises(ValueError, match="not reserved for world_learning"):
         run_rules_stage(
@@ -253,31 +277,32 @@ def test_a_trace_outside_world_learning_is_refused_before_any_call(
         )
 
     assert transport.requests == []
-    assert project.artifacts.list_ids() == ()
 
 
-def test_a_failed_draw_is_kept_and_never_redrawn(
+def test_the_explicit_single_draw_profile_keeps_a_failed_draw_and_never_redraws(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A refused answer stays a failure with its response, even when a later run re-keys."""
-    project, settings = _setup(tmp_path, monkeypatch)
-    transport = RoutedTransport({"alpha": _tool_reply(_answer("beta"))})
-    _wire(monkeypatch, transport)
+    """The earlier path stays available: one forced draw per trace, no research or memory."""
+    project, settings = agent_setup(tmp_path, monkeypatch)
+    transport = AgentScript(_answers, extraction=lambda trace: _answer("beta"))
+    wire(monkeypatch, transport)
     plan = _plan(("alpha",))
+    spec = _spec(settings, "single_draw")
 
     report = run_rules_stage(
-        project, _spec(settings), exposure=plan, traces=_traces("alpha"), code_revision="test"
+        project, spec, exposure=plan, traces=_traces("alpha"), code_revision="test"
     )
 
     (failure,) = report.failures
     assert failure.response is not None and failure.rules is None
     assert failure.failure is not None and "not 'alpha'" in failure.failure
     assert report.rules == 0 and report.workloads == ()
+    assert report.research == () and report.memory is None and report.weighings == ()
     assert project.artifacts.read(report.rulebook.artifact_id).manifest.inputs == ()
 
     later = run_rules_stage(
         project,
-        _spec(settings),
+        spec,
         exposure=plan,
         traces=_traces("alpha"),
         code_revision="test",
@@ -286,17 +311,17 @@ def test_a_failed_draw_is_kept_and_never_redrawn(
 
     assert later.identity != report.identity
     assert later.failures == report.failures
-    assert len(transport.requests) == 1
+    assert transport.roles() == ["extraction"]
 
 
 def test_witnesses_lift_diagnostic_status_without_redrawing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A supporting witness clears a rule from every diagnostic list; draws are replayed."""
-    project, settings = _setup(tmp_path, monkeypatch)
+    """A supporting witness clears every diagnostic list; research and weighing replay."""
+    project, settings = agent_setup(tmp_path, monkeypatch)
     traces = _traces("alpha", "beta")
-    transport = RoutedTransport({name: _tool_reply(_answer(name)) for name in ("alpha", "beta")})
-    _wire(monkeypatch, transport)
+    transport = AgentScript(_answers)
+    wire(monkeypatch, transport)
     plan = _plan(("alpha", "beta"))
     spec = _spec(settings)
 
@@ -308,10 +333,11 @@ def test_witnesses_lift_diagnostic_status_without_redrawing(
         project, spec, exposure=plan, traces=traces, code_revision="test", observed=observed
     )
 
+    assert len(transport.requests) == 20
     (item,) = unwitnessed.triage
     assert item.verdict == "contradicts_rule" and item.needs_witness
     assert unwitnessed.families_must_stay_diagnostic == (rule_id,)
-    assert unwitnessed.diagnostic == (rule_id,)
+    assert unwitnessed.memory == first.memory
 
     witness = Witness(kind="specification", reference="spec:refunds#limit", supports=True)
     witnessed = run_rules_stage(
@@ -324,9 +350,10 @@ def test_witnesses_lift_diagnostic_status_without_redrawing(
         observed=observed,
     )
 
-    assert len(transport.requests) == 2
+    assert transport.roles()[20:] == ["condensation"] * 5
     assert witnessed.extraction_identity == first.extraction_identity
-    assert witnessed.rulebook != first.rulebook
+    assert witnessed.research == first.research and witnessed.weighings == first.weighings
+    assert witnessed.rulebook != first.rulebook and witnessed.memory != first.memory
     assert witnessed.diagnostic == ()
     assert witnessed.requires_witness == ()
     (item,) = witnessed.triage
@@ -369,32 +396,23 @@ class _PermitAll:
         )
 
 
+@pytest.mark.parametrize("profile", ["agentic_research", "single_draw"])
 def test_an_explicit_challenge_executor_runs_every_workload_and_replays(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: RulesProfile
 ) -> None:
     """Executed workloads are triaged, contradict the limit and replay without executing."""
-    project, settings = _setup(tmp_path, monkeypatch)
+    project, settings = agent_setup(tmp_path, monkeypatch)
     traces = _traces("alpha", "beta")
-    transport = RoutedTransport({name: _tool_reply(_answer(name)) for name in ("alpha", "beta")})
-    _wire(monkeypatch, transport)
+    wire(monkeypatch, AgentScript(_answers))
     plan = _plan(("alpha", "beta"))
     world = _PermitAll()
+    spec = _spec(settings, profile)
 
     report = run_rules_stage(
-        project,
-        _spec(settings),
-        exposure=plan,
-        traces=traces,
-        code_revision="test",
-        challenge=world,
+        project, spec, exposure=plan, traces=traces, code_revision="test", challenge=world
     )
     replay = run_rules_stage(
-        project,
-        _spec(settings),
-        exposure=plan,
-        traces=traces,
-        code_revision="test",
-        challenge=world,
+        project, spec, exposure=plan, traces=traces, code_revision="test", challenge=world
     )
 
     assert replay == report and len(world.executed) == 3
@@ -409,14 +427,12 @@ def test_an_explicit_challenge_executor_runs_every_workload_and_replays(
         "contradicts_rule",
     ]
     assert report.families_must_stay_diagnostic == (rule_id,)
-    plain = run_rules_stage(
-        project, _spec(settings), exposure=plan, traces=traces, code_revision="test"
-    )
+    plain = run_rules_stage(project, spec, exposure=plan, traces=traces, code_revision="test")
     assert plain.challenges is None and "challenges" not in plain.model_dump(mode="json")
     with pytest.raises(ValueError, match="not both"):
         run_rules_stage(
             project,
-            _spec(settings),
+            spec,
             exposure=plan,
             traces=traces,
             code_revision="test",

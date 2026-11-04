@@ -6,13 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from exp.simulation.rules.merge import attach_witnesses, merge_rules
+from exp.simulation.rules.merge import apply_weighings, attach_witnesses, merge_rules
 from exp.simulation.rules.model import (
     Operand,
     Predicate,
     ResearchQuestion,
     RuleBook,
     RuleProposal,
+    RuleWeighing,
     ToolContract,
     TrajectoryRules,
     Witness,
@@ -78,8 +79,16 @@ def _book() -> RuleBook:
             limitations=("none",),
         ),
     ]
-    book = merge_rules({"refund": contract}, analyses)
-    paid = next(rule for rule in book.rules if rule.predicate == _PAID)
+    merged = merge_rules({"refund": contract}, analyses)
+    paid = next(rule for rule in merged.rules if rule.predicate == _PAID)
+    weighing = RuleWeighing(
+        rule_id=paid.rule_id,
+        status="supported",
+        rationale="Both refusals turn on payment.",
+        supporting=paid.evidence,
+        independence="Two separate tasks.",
+    )
+    book = apply_weighings(merged, [weighing])
     witness = Witness(kind="native", reference="run:7", supports=True)
     return attach_witnesses(book, {paid.rule_id: [witness]})
 
@@ -116,6 +125,8 @@ def test_tool_file_has_contract_rules_and_questions() -> None:
     assert "  - `c:9`" in text
     assert "  - native `run:7`: supports" in text
     assert "- Support: 2 trajectories" in text
+    assert "- Weighing: Both refusals turn on payment." in text
+    assert "  - Independence: Two separate tasks." in text
     assert "Can amount be zero?" in text
     assert "Balances never go negative" not in text
 

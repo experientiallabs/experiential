@@ -13,7 +13,13 @@ and never on their order:
   of it, or ``eq``/``ne``, ``exists``/``absent``, ``lt``/``ge``, ``le``/``gt`` over the same
   operands), marks the rule contradicted and keeps every locator on both sides.
 - Support and contradiction count distinct trajectories, so one long trace that repeats a rule
-  many times still counts once.
+  many times still counts once. The counts are recorded, never compared to a threshold: a merged
+  rule without counter-evidence is ``unknown`` until an evidence weighing decides it.
+- Whether the evidence supports a rule is a judgment about strength and independence, not a
+  count. :func:`apply_weighings` applies weighings made elsewhere (a model that read the cited
+  evidence) after checking only their structure: the rule exists, every citation is one of the
+  rule's own locators, no citation reaches an excluded (held-out) trace, and a decided status
+  cites evidence on its side.
 - Independent witnesses attach afterwards by rule identity. A refuting witness contradicts the
   rule, and a rule without a supporting witness stays diagnostic.
 """
@@ -34,6 +40,7 @@ from exp.simulation.rules.model import (
     RuleKind,
     RuleProposal,
     RuleStatus,
+    RuleWeighing,
     ToolContract,
     TrajectoryRules,
     Witness,
@@ -105,19 +112,60 @@ def canonical_predicate(predicate: Predicate) -> str:
     return canonical_json_bytes(predicate).decode("utf-8")
 
 
+def locator_trace(locator: str) -> str | None:
+    """Return the trace a ``trace:<id>`` or ``trace:<id>:span:<span>`` locator names.
+
+    Args:
+        locator: Any evidence locator.
+
+    Returns:
+        The trace identity, or None for a locator that names no trace.
+    """
+    if not locator.startswith("trace:"):
+        return None
+    body = locator.removeprefix("trace:")
+    return body.rsplit(":span:", 1)[0] if ":span:" in body else body
+
+
 def merge_rules(
-    contracts: dict[str, ToolContract], analyses: Sequence[TrajectoryRules]
+    contracts: dict[str, ToolContract],
+    analyses: Sequence[TrajectoryRules],
+    *,
+    excluded: frozenset[str] = frozenset(),
 ) -> RuleBook:
     """Merge many per-trajectory analyses into one rule book.
+
+    Several analyses may share a trajectory (different research stances over one trace); support
+    still counts that trajectory once.
 
     Args:
         contracts: Tool contracts by tool name, carried into the book unchanged.
         analyses: Per-trajectory analyses, in any order.
+        excluded: Trace identities no rule may be learned from or cite (held-out traces).
 
     Returns:
         A rule book whose rules, questions and sources are in a stable order that does not
-        depend on the order of ``analyses`` or of the proposals inside them.
+        depend on the order of ``analyses`` or of the proposals inside them. A rule is
+        ``contradicted`` when counter-evidence or an opposite predicate exists and ``unknown``
+        otherwise, until :func:`apply_weighings` decides it.
+
+    Raises:
+        ValueError: An analysis comes from, or cites, an excluded trace.
     """
+    for analysis in analyses:
+        cited = {
+            locator
+            for proposal in analysis.rules
+            for locator in (*proposal.evidence, *proposal.counter_evidence)
+        } | {locator for question in analysis.questions for locator in question.evidence}
+        reached = {analysis.trace_id} | {
+            trace for trace in map(locator_trace, cited) if trace is not None
+        }
+        if reached & excluded:
+            raise ValueError(
+                f"analysis of {analysis.trace_id} reaches excluded traces "
+                f"{sorted(reached & excluded)}; held-out evidence never enters the rule book"
+            )
     items = [
         _Item(
             trace_id=analysis.trace_id,
@@ -181,6 +229,88 @@ def attach_witnesses(book: RuleBook, witnesses: Mapping[str, Sequence[Witness]])
             status = "contradicted"
         rules.append(rule.model_copy(update={"witnesses": merged, "status": status}))
     return book.model_copy(update={"rules": tuple(rules)})
+
+
+def check_weighing(rule: Rule, weighing: RuleWeighing, excluded: frozenset[str]) -> None:
+    """Check only the structure of one weighing against the rule it weighs.
+
+    Args:
+        rule: The merged rule.
+        weighing: The weighing proposed for it.
+        excluded: Trace identities no citation may reach.
+
+    Raises:
+        ValueError: The weighing names another rule, cites a locator that is not one of the
+            rule's own, cites an excluded trace, or decides a status without citing evidence on
+            that side.
+    """
+    if weighing.rule_id != rule.rule_id:
+        raise ValueError(f"weighing names rule {weighing.rule_id!r}, not {rule.rule_id!r}")
+    own = {*rule.evidence, *rule.counter_evidence}
+    cited = {*weighing.supporting, *weighing.contradicting}
+    outside = sorted(cited - own)
+    if outside:
+        raise ValueError(f"weighing cites locators outside the rule's evidence: {outside}")
+    reached = sorted(t for t in {locator_trace(loc) for loc in cited} if t in excluded)
+    if reached:
+        raise ValueError(f"weighing cites excluded traces: {reached}")
+    unsupported = sorted(set(weighing.supporting) - set(rule.evidence))
+    if unsupported:
+        raise ValueError(f"supporting citations are not supporting evidence: {unsupported}")
+    if weighing.status == "supported" and not weighing.supporting:
+        raise ValueError("a supported weighing must cite at least one supporting locator")
+    if weighing.status == "contradicted" and not weighing.contradicting:
+        raise ValueError("a contradicted weighing must cite at least one contradicting locator")
+
+
+def apply_weighings(
+    book: RuleBook,
+    weighings: Sequence[RuleWeighing],
+    *,
+    excluded: frozenset[str] = frozenset(),
+) -> RuleBook:
+    """Set each weighed rule's status from its structurally valid weighing.
+
+    A rule without a weighing keeps its merged status. Every locator on both sides stays in the
+    book whatever the weighing decided.
+
+    Args:
+        book: The merged rule book.
+        weighings: At most one weighing per rule.
+        excluded: Trace identities no citation may reach.
+
+    Returns:
+        A new rule book with the weighings attached.
+
+    Raises:
+        ValueError: A weighing names an unknown rule, a rule is weighed twice, or a weighing
+            fails :func:`check_weighing`.
+    """
+    rules = {rule.rule_id: rule for rule in book.rules}
+    by_rule: dict[str, RuleWeighing] = {}
+    for weighing in weighings:
+        rule = rules.get(weighing.rule_id)
+        if rule is None:
+            raise ValueError(f"weighing names a rule that is not in the book: {weighing.rule_id}")
+        if weighing.rule_id in by_rule:
+            raise ValueError(f"rule {weighing.rule_id} is weighed twice")
+        check_weighing(rule, weighing, excluded)
+        by_rule[weighing.rule_id] = weighing
+    return book.model_copy(
+        update={
+            "rules": tuple(
+                rule
+                if rule.rule_id not in by_rule
+                else rule.model_copy(
+                    update={
+                        "status": by_rule[rule.rule_id].status,
+                        "weighing": by_rule[rule.rule_id],
+                    }
+                )
+                for rule in book.rules
+            )
+        }
+    )
 
 
 def diagnostic_rules(book: RuleBook) -> tuple[Rule, ...]:
@@ -281,13 +411,7 @@ def _rule(group: tuple[_Item, ...], groups: Sequence[tuple[_Item, ...]]) -> Rule
         locator for item, inside in opposing if not inside for locator in item.proposal.evidence
     )
     support = len({item.trace_id for item in group})
-    status: RuleStatus
-    if contradicting:
-        status = "contradicted"
-    elif support >= 2:
-        status = "supported"
-    else:
-        status = "unknown"
+    status: RuleStatus = "contradicted" if contradicting else "unknown"
     identities = sorted({item.identity for item in group})
     return Rule(
         rule_id=_rule_id(tool, kind, identities),

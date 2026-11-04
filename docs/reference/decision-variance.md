@@ -65,14 +65,30 @@ model, both bindings and the world-learning traces for the rules stage.
 the environment behaves from world-learning traces only, keeping rules apart from state:
 
 1. `parse_tool_contracts` reads tool contracts from traces without a model call.
-2. `extract_rules_in_parallel` makes one draw per trajectory proposing preconditions, effects,
-   observations, invariants (optionally as predicates in a closed language) and open questions.
-   Answers citing anything outside their own trajectory are kept as failures, never redrawn.
-3. `merge_rules` keeps contradictions and unknowns; a rule is supported only with two or more
-   supporting trajectories and no contradiction. Witnesses (native or specification) attach by
-   rule id.
+2. `research_in_parallel` (`rules/research.py`, the default `agentic_research` profile) researches
+   every trajectory with bounded agentic draws, one per assigned prompt variant
+   (`contract_first`, `state_transition_first`, `failure_and_error_first`), concurrently up to
+   `concurrency`. Each draw plans, reads with read-only tools (its own steps, tool contracts,
+   related steps of the other admitted world-learning traces, the registered world-learning
+   retrieval, earlier rounds' notes), drafts, self-checks and answers with rules, open questions
+   and a research history (questions asked, resolved or not; hypotheses confirmed, refuted or
+   open). Rules cite only their own trajectory; history notes may also cite what the draw read.
+   Anything else is refused and kept as a failure, never redrawn. Each trace's history is saved
+   as a `rule-research-history` artifact (JSON plus Markdown). The explicit `single_draw` profile
+   keeps the earlier path: `extract_rules_in_parallel` makes one forced draw per trajectory.
+3. `merge_rules` groups proposals, keeps contradictions and unknowns, counts distinct
+   trajectories and decides no support; held-out traces are excluded. `weigh_rules_in_parallel`
+   (`rules/weighing.py`) then weighs each rule in its own agentic draw: supported, contradicted
+   or unknown from the strength and independence of the cited evidence, with a rationale. Code
+   checks only structure (`check_weighing`: citations are the rule's own locators, none reach an
+   excluded trace, a decided status cites its side). Witnesses (native or specification) attach
+   by rule id.
 4. The rule book is saved as Markdown (`README.md`, `tools/<tool>.md`, `environment.md`) plus
-   `rules.json` in one `rule-book` artifact.
+   `rules.json` in one `rule-book` artifact. Under `agentic_research`, `condense_memory`
+   (`rules/condense.py`) condenses the book and every research history into the
+   `world-model-memory` artifact (`memory.md` plus `memory.json`) bound for the world model at
+   runtime; every contradiction, unknown rule, open question and unresolved research question is
+   kept, by the host when the condenser leaves one out.
 5. Properties are checked against simulated sessions and boundary workloads challenge numeric and
    membership boundaries; a contradicted rule with no independent witness keeps every family that
    relies on it diagnostic.

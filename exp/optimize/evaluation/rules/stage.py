@@ -5,14 +5,26 @@ One run follows a fixed sequence over saved, replayable owners:
 1. **Exposure.** Every trace must be reserved for world learning; any other trace is refused
    before anything is read, bought or replayed.
 2. **Contracts.** Tool contracts are parsed from every trace, with no model call.
-3. **Extraction.** One rule-extraction draw per trajectory runs concurrently. Draws are bought
-   once and replayed exactly; a refused or failed draw stays a failure record and is never
-   redrawn.
-4. **Merge.** The successful per-trajectory analyses merge into one rule book.
-5. **Witnesses.** Optional independent witnesses attach by rule identity.
-6. **Rule book.** The rendered Markdown files and ``rules.json`` are saved as one
-   ``rule-book`` artifact whose inputs are the extraction responses it was learned from.
-7. **Challenges.** Properties derived from the rules are checked on supplied simulated
+3. **Research.** Under the default ``agentic_research`` profile every trajectory is researched
+   by bounded agentic draws, one per assigned prompt variant, concurrently
+   (:mod:`~exp.optimize.evaluation.rules.research`), over one or more rounds (a later round reads
+   the earlier rounds' notes). Each trace's research history is saved. Under the explicit
+   ``single_draw`` profile the earlier path runs instead: one forced extraction draw per
+   trajectory (:mod:`~exp.optimize.evaluation.rules.extraction`). Either way a refused or failed
+   draw stays a failure record and is never redrawn.
+4. **Merge.** The usable per-trajectory analyses merge into one rule book, excluding every trace
+   the exposure plan does not reserve for world learning. Merging decides no support.
+5. **Weighing.** Each merged rule's status is decided by an agentic evidence weighing
+   (:mod:`~exp.optimize.evaluation.rules.weighing`); code checks only its structure.
+6. **Witnesses.** Optional independent witnesses attach by rule identity.
+7. **Rule book.** The rendered Markdown files and ``rules.json`` are saved as one
+   ``rule-book`` artifact whose inputs are the responses or transcripts it was learned from and
+   weighed by.
+8. **Memory.** Under ``agentic_research`` an agentic condenser turns the rule book and every
+   research history into the ``world-model-memory`` artifact (Markdown plus JSON) the
+   environment simulator reads at runtime (:mod:`~exp.optimize.evaluation.rules.condense`),
+   keeping every contradiction and unknown.
+9. **Challenges.** Properties derived from the rules are checked on supplied simulated
    sessions and boundary workloads are generated from a supplied base state. Observed workload
    transitions, when supplied, are triaged. With an explicit ``challenge`` executor the workloads
    are instead executed in that bound world by
@@ -20,9 +32,11 @@ One run follows a fixed sequence over saved, replayable owners:
    case, updates each challenged rule's status with its executed witnesses and replays without
    executing or calling anything.
 
-Draw identities depend only on what extraction reads (the author settings, the traces, their
-sources, the extraction protocol and the code revision), so a later run that adds witnesses,
-sessions or observed workload transitions replays every draw and buys nothing. The report is
+Research and extraction identities depend only on what those draws read (the author settings,
+the profile, the traces, their sources, the protocols and the code revision), and weighing
+identities only on the merged book, so a later run that adds witnesses, sessions or observed
+workload transitions replays every research and weighing draw. Witnesses change the saved book,
+so the memory is condensed again. The report is
 saved as a ``rules-stage-report`` artifact under an identity that also binds those additions,
 and a repeated run returns it exactly.
 
@@ -37,6 +51,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 
@@ -55,20 +70,41 @@ from exp.common.project import ArtifactAlreadyExistsError, ProjectStore
 from exp.common.project.manifests import artifact_input
 from exp.common.traces import Trace
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.agent_loop import AGENT_LOOP_PROTOCOL, AgentProfile
 from exp.optimize.evaluation.rules.challenges import (
     ChallengeCase,
     ChallengeExecutor,
     ChallengeReport,
     run_challenges,
 )
+from exp.optimize.evaluation.rules.condense import condensation_protocol_sha256, condense_memory
 from exp.optimize.evaluation.rules.extraction import (
     ExtractionDraw,
     extract_rules_in_parallel,
     extraction_protocol_sha256,
 )
+from exp.optimize.evaluation.rules.research import (
+    RESEARCH_VARIANTS,
+    ResearchDraw,
+    ResearchMaterial,
+    TraceResearch,
+    research_in_parallel,
+    research_protocol_sha256,
+)
+from exp.optimize.evaluation.rules.weighing import (
+    WeighingDraw,
+    weigh_rules_in_parallel,
+    weighing_protocol_sha256,
+)
+from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.simulation.rules.contracts import parse_tool_contracts
-from exp.simulation.rules.merge import attach_witnesses, diagnostic_rules, merge_rules
+from exp.simulation.rules.merge import (
+    apply_weighings,
+    attach_witnesses,
+    diagnostic_rules,
+    merge_rules,
+)
 from exp.simulation.rules.model import (
     RuleBook,
     RuleStatus,
@@ -105,14 +141,25 @@ SESSION_EVIDENCE = "evidence.json"
 
 _STATUSES: tuple[RuleStatus, ...] = ("supported", "contradicted", "unknown")
 
+RulesProfile = Literal["agentic_research", "single_draw"]
+"""How rules are learned: agentic per-trace research (default) or one forced draw per trace."""
+
 
 class RulesStageSpec(ContractModel):
     """One registered learned-rules stage.
 
     Attributes:
-        author: Frozen extraction model and allowance, shared by every draw.
-        concurrency: Most extraction draws in flight at once. It does not affect what is
-            bought, so it is left out of every identity.
+        author: Frozen model and per-call allowance, shared by every research, extraction,
+            weighing and condensation call.
+        concurrency: Most research, extraction or weighing draws in flight at once. It does not
+            affect what is bought, so it is left out of every identity.
+        profile: ``agentic_research`` (default) or the explicit earlier ``single_draw`` path.
+        research: Budgets of each research draw.
+        variants: Research prompt variants assigned to traces.
+        draws_per_trace: Research variants run per trace.
+        rounds: Research rounds; a later round reads the earlier rounds' notes.
+        weighing: Budgets of each rule's evidence weighing.
+        condensation: Budgets of the memory condenser.
         sources: Saved artifacts the traces came from, pinned on every extraction draw.
         witnesses: Independent witnesses keyed by ``rule_id``; merged with any passed to
             :func:`run_rules_stage`.
@@ -126,6 +173,13 @@ class RulesStageSpec(ContractModel):
 
     author: AuthorSettings
     concurrency: int = Field(default=4, ge=1, le=64, strict=True)
+    profile: RulesProfile = "agentic_research"
+    research: AgentProfile = AgentProfile()
+    variants: tuple[str, ...] = tuple(RESEARCH_VARIANTS)
+    draws_per_trace: int = Field(default=1, ge=1, le=8, strict=True)
+    rounds: int = Field(default=1, ge=1, le=4, strict=True)
+    weighing: AgentProfile = AgentProfile()
+    condensation: AgentProfile = AgentProfile()
     sources: tuple[ArtifactInput, ...] = ()
     witnesses: dict[str, tuple[Witness, ...]] = Field(default_factory=dict)
     base_state: JsonObject | None = None
@@ -148,28 +202,43 @@ class RulesStageSpec(ContractModel):
             {
                 "spec": sha256_json(self.model_dump(mode="json", exclude={"concurrency"})),
                 "extraction": extraction_protocol_sha256(),
+                "research": research_protocol_sha256(),
+                "weighing": weighing_protocol_sha256(),
+                "condensation": condensation_protocol_sha256(),
+                "loop": AGENT_LOOP_PROTOCOL,
                 "code": code_revision,
             },
         )
 
     def extraction_identity(self, traces: Sequence[Trace], code_revision: str) -> str:
-        """Bind exactly what extraction reads, so later challenges never re-key a draw.
+        """Bind exactly what research or extraction reads, so challenges never re-key a draw.
 
         Args:
             traces: The trajectories the draws read.
             code_revision: Producing source identity.
 
         Returns:
-            Run identity from which each trajectory's draw identity is derived.
+            Run identity from which each trajectory's draw identities are derived.
         """
+        fields: JsonObject = {
+            "author": sha256_json(self.author),
+            "sources": [source.model_dump(mode="json") for source in self.sources],
+            "traces": sorted(sha256_json(trace) for trace in traces),
+            "extraction": extraction_protocol_sha256(),
+            "code": code_revision,
+        }
+        if self.profile == "single_draw":
+            return stable_id("rules-extraction", fields)
         return stable_id(
-            "rules-extraction",
+            "rules-research",
             {
-                "author": sha256_json(self.author),
-                "sources": [source.model_dump(mode="json") for source in self.sources],
-                "traces": sorted(sha256_json(trace) for trace in traces),
-                "extraction": extraction_protocol_sha256(),
-                "code": code_revision,
+                **fields,
+                "research": research_protocol_sha256(),
+                "loop": AGENT_LOOP_PROTOCOL,
+                "profile": sha256_json(self.research),
+                "variants": list(self.variants),
+                "draws_per_trace": self.draws_per_trace,
+                "rounds": self.rounds,
             },
         )
 
@@ -180,10 +249,10 @@ class RulesStageReport(ContractModel):
     Attributes:
         spec: The registration.
         identity: Identity of this run, which names its saved report.
-        extraction_identity: Identity the extraction draws derive from.
+        extraction_identity: Identity the research or extraction draws derive from.
         contracts: Tool contracts parsed from every trace.
-        draws: Every extraction draw, in trace order.
-        failures: The draws that produced no usable rules, in trace order; never redrawn.
+        draws: Every single-draw extraction draw, in trace order; empty under research.
+        failures: The extraction draws that produced no usable rules; never redrawn.
         rulebook: The saved rule book artifact.
         rules: Number of merged rules.
         rule_counts: Merged rules per status.
@@ -200,6 +269,10 @@ class RulesStageReport(ContractModel):
             contradicted (a property violation on a session or a contradicting workload), in
             book order. Any environment family built on them stays diagnostic.
         challenges: The executed challenges, when a challenge executor was supplied.
+        research: Every trace's research history, in trace order, under ``agentic_research``.
+        research_failures: Research draws that produced no usable answer; never redrawn.
+        weighings: Every rule's evidence weighing, in merged-book order.
+        memory: The saved ``world-model-memory``, under ``agentic_research``.
     """
 
     spec: RulesStageSpec
@@ -221,6 +294,12 @@ class RulesStageReport(ContractModel):
     triage: tuple[Triage, ...]
     families_must_stay_diagnostic: tuple[str, ...]
     challenges: ChallengeReport | None = Field(default=None, exclude_if=lambda value: value is None)
+    research: tuple[TraceResearch, ...] = Field(default=(), exclude_if=lambda value: not value)
+    research_failures: tuple[ResearchDraw, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+    weighings: tuple[WeighingDraw, ...] = Field(default=(), exclude_if=lambda value: not value)
+    memory: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def run_rules_stage(
@@ -234,6 +313,7 @@ def run_rules_stage(
     sessions: Sequence[WorkflowEvidence | ArtifactInput] = (),
     observed: Mapping[str, Transition] | None = None,
     challenge: ChallengeExecutor | None = None,
+    search: TraceSearch | None = None,
 ) -> RulesStageReport:
     """Run, or replay, the learned-rules stage over world-learning traces.
 
@@ -250,6 +330,8 @@ def run_rules_stage(
             ``<rule_id>/<n>`` as listed in an earlier report's ``workloads``.
         challenge: Explicit bound world to execute every boundary workload in, instead of
             supplying observed transitions; its identity joins the run identity.
+        search: Registered world-learning retrieval research draws may query; its index joins
+            the run identity.
 
     Returns:
         The report, also saved as a ``rules-stage-report`` artifact.
@@ -283,6 +365,8 @@ def run_rules_stage(
     loaded = tuple(_load_session(project, session) for session in sessions)
     extraction_identity = spec.extraction_identity(traces, code_revision)
     fields: JsonObject = {} if challenge is None else {"challenge": challenge.identity}
+    if search is not None:
+        fields["search"] = search.inventory()
     identity = stable_id(
         "rules-stage",
         {
@@ -310,24 +394,94 @@ def run_rules_stage(
         if store.exists(result_id):
             return RulesStageReport.model_validate_json(store.read_bytes(result_id, "report.json"))
         contracts = parse_tool_contracts(traces)
-        draws = extract_rules_in_parallel(
+        excluded = frozenset(
+            trace for trace in exposure.traces if exposure.role_of(trace) != "world_learning"
+        )
+        draws: tuple[ExtractionDraw, ...] = ()
+        research: tuple[TraceResearch, ...] = ()
+        if spec.profile == "single_draw":
+            draws = extract_rules_in_parallel(
+                project,
+                spec.author,
+                traces,
+                contracts,
+                identity=extraction_identity,
+                code_revision=code_revision,
+                concurrency=spec.concurrency,
+                sources=spec.sources,
+            )
+            analyses: list[TrajectoryRules] = [d.rules for d in draws if d.rules is not None]
+            learned = tuple(d.response for d in draws if d.rules is not None and d.response)
+        else:
+            research = _research(
+                project, spec, traces, contracts, extraction_identity, code_revision, search
+            )
+            analyses = [analysis for item in research for analysis in item.analyses()]
+            learned = tuple(
+                draw.transcript
+                for item in research
+                for draw in item.draws
+                if draw.answer is not None and draw.transcript is not None
+            )
+        merged = merge_rules(contracts, analyses, excluded=excluded)
+        weighings = weigh_rules_in_parallel(
             project,
             spec.author,
-            traces,
-            contracts,
-            identity=extraction_identity,
+            spec.weighing,
+            merged,
+            ResearchMaterial(traces, contracts, maximum_bytes=spec.weighing.maximum_result_bytes),
+            {item.trace_id: item for item in research},
+            identity=stable_id(
+                "rules-weighing",
+                {
+                    "extraction": extraction_identity,
+                    "book": sha256_json(merged),
+                    "author": sha256_json(spec.author),
+                    "profile": sha256_json(spec.weighing),
+                    "weighing": weighing_protocol_sha256(),
+                    "loop": AGENT_LOOP_PROTOCOL,
+                    "excluded": sorted(excluded),
+                },
+            ),
+            excluded=excluded,
             code_revision=code_revision,
             concurrency=spec.concurrency,
             sources=spec.sources,
         )
-        analyses: list[TrajectoryRules] = [draw.rules for draw in draws if draw.rules is not None]
-        book = merge_rules(contracts, analyses)
+        book = apply_weighings(
+            merged, [w.weighing for w in weighings if w.weighing is not None], excluded=excluded
+        )
         if combined:
             book = attach_witnesses(book, combined)
-        responses = tuple(
-            draw.response for draw in draws if draw.rules is not None and draw.response is not None
-        )
+        responses = learned + tuple(w.transcript for w in weighings if w.transcript is not None)
         rulebook = _save_rulebook(project, book, responses, extraction_identity, code_revision)
+        memory: ArtifactInput | None = None
+        if spec.profile == "agentic_research":
+            memory, _ = condense_memory(
+                project,
+                spec.author,
+                spec.condensation,
+                book,
+                rulebook,
+                research,
+                identity=stable_id(
+                    "rules-condensation",
+                    {
+                        "rulebook": rulebook.model_dump(mode="json"),
+                        "research": [
+                            item.history.model_dump(mode="json")
+                            for item in research
+                            if item.history is not None
+                        ],
+                        "author": sha256_json(spec.author),
+                        "profile": sha256_json(spec.condensation),
+                        "condensation": condensation_protocol_sha256(),
+                        "loop": AGENT_LOOP_PROTOCOL,
+                    },
+                ),
+                code_revision=code_revision,
+                sources=spec.sources,
+            )
         workloads: tuple[Workload, ...] = ()
         if spec.base_state is not None:
             workloads = boundary_workloads(
@@ -360,8 +514,21 @@ def run_rules_stage(
             loaded,
             workloads,
             observed or {},
-        ).model_copy(update={"challenges": executed})
+        ).model_copy(
+            update={
+                "challenges": executed,
+                "research": research,
+                "research_failures": tuple(
+                    draw for item in research for draw in item.draws if draw.answer is None
+                ),
+                "weighings": weighings,
+                "memory": memory,
+            }
+        )
         dependencies = {rulebook, *responses, *spec.sources}
+        dependencies |= {item.history for item in research if item.history is not None}
+        if memory is not None:
+            dependencies.add(memory)
         if executed is not None:
             dependencies.add(artifact_input(store.read(executed.identity + "-result").manifest))
         dependencies |= {reference for reference, _ in loaded if reference is not None}
@@ -377,6 +544,51 @@ def run_rules_stage(
             files={"report.json": report},
         )
         return report
+
+
+def _research(
+    project: ProjectStore,
+    spec: RulesStageSpec,
+    traces: Sequence[Trace],
+    contracts: Mapping[str, ToolContract],
+    identity: str,
+    code_revision: str,
+    search: TraceSearch | None,
+) -> tuple[TraceResearch, ...]:
+    """Run, or replay, every research round; each round reads the previous rounds' notes.
+
+    Args:
+        project: Project holding every draw.
+        spec: The registration.
+        traces: World-learning trajectories.
+        contracts: Parsed tool contracts.
+        identity: Research run identity.
+        code_revision: Producing source identity.
+        search: Registered world-learning retrieval, when any.
+
+    Returns:
+        Each trace's research history across every round, in trace order.
+    """
+    prior: dict[str, TraceResearch] = {}
+    for round_ in range(spec.rounds):
+        found = research_in_parallel(
+            project,
+            spec.author,
+            spec.research,
+            traces,
+            contracts,
+            identity=identity,
+            code_revision=code_revision,
+            concurrency=spec.concurrency,
+            variants=spec.variants,
+            draws_per_trace=spec.draws_per_trace,
+            round_=round_,
+            prior=prior or None,
+            search=search,
+            sources=spec.sources,
+        )
+        prior = {item.trace_id: item for item in found}
+    return tuple(prior[trace.trace_id] for trace in traces)
 
 
 def load_rulebook(project: ProjectStore, reference: ArtifactInput) -> RuleBook:
@@ -509,7 +721,7 @@ def _save_rulebook(
     Args:
         project: Project receiving the artifact.
         book: The merged rule book, with witnesses attached.
-        responses: Extraction responses the book was learned from.
+        responses: Responses or transcripts the book was learned from and weighed by.
         extraction_identity: Identity the draws derive from.
         code_revision: Producing source identity.
 

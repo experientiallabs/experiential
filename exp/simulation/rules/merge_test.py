@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from exp.simulation.rules.merge import attach_witnesses, diagnostic_rules, merge_rules
+from exp.simulation.rules.merge import (
+    apply_weighings,
+    attach_witnesses,
+    check_weighing,
+    diagnostic_rules,
+    locator_trace,
+    merge_rules,
+)
 from exp.simulation.rules.model import (
     Operand,
     Predicate,
@@ -12,6 +19,7 @@ from exp.simulation.rules.model import (
     RuleBook,
     RuleKind,
     RuleProposal,
+    RuleWeighing,
     ToolContract,
     TrajectoryRules,
     Witness,
@@ -69,7 +77,7 @@ def test_same_statement_groups_and_counts_distinct_trajectories() -> None:
     )
     assert len(book.rules) == 2
     paid = next(rule for rule in book.rules if rule.support == 2)
-    assert paid.status == "supported"
+    assert paid.status == "unknown" and paid.weighing is None
     assert paid.evidence == ("trace:t1:span:1", "trace:t2:span:1")
     settled = next(rule for rule in book.rules if rule.support == 1)
     assert settled.status == "unknown"
@@ -102,7 +110,7 @@ def test_identical_predicates_group_despite_different_wording() -> None:
     )
     (rule,) = book.rules
     assert rule.predicate == _PAID
-    assert rule.status == "supported"
+    assert rule.status == "unknown"
     assert rule.support == 2
 
 
@@ -238,7 +246,7 @@ def test_questions_are_deduplicated_and_keep_evidence() -> None:
 
 
 def _book() -> RuleBook:
-    """A book with one supported rule."""
+    """A book with one rule seen in two trajectories, not yet weighed."""
     return merge_rules(
         _CONTRACTS,
         [
@@ -256,7 +264,7 @@ def test_refuting_witness_contradicts_and_supporting_one_clears_diagnostic() -> 
     native = Witness(kind="native", reference="run:1", supports=True)
     supported = attach_witnesses(book, {rule.rule_id: [native, native]})
     assert supported.rules[0].witnesses == (native,)
-    assert supported.rules[0].status == "supported"
+    assert supported.rules[0].status == "unknown"
     assert diagnostic_rules(supported) == ()
     refuting = Witness(kind="specification", reference="spec:2", supports=False)
     refuted = attach_witnesses(supported, {rule.rule_id: [refuting]})
@@ -270,3 +278,75 @@ def test_witnesses_for_unknown_rules_are_refused() -> None:
         attach_witnesses(
             _book(), {"missing": [Witness(kind="native", reference="r", supports=True)]}
         )
+
+
+def _weighing(rule_id: str, **fields: object) -> RuleWeighing:
+    """A weighing of one rule with overrides."""
+    values: dict[str, object] = {
+        "rule_id": rule_id,
+        "status": "supported",
+        "rationale": "Directly observed.",
+        "supporting": ("trace:t1:span:1",),
+        **fields,
+    }
+    return RuleWeighing.model_validate(values)
+
+
+def test_no_count_decides_support_and_a_valid_weighing_does() -> None:
+    """One witness is enough when the weighing says so; two stay unknown when it says so."""
+    book = merge_rules(
+        _CONTRACTS,
+        [
+            _analysis("t1", _proposal("Order must be paid", "t1")),
+            _analysis("t2", _proposal("Order must be settled", "t2")),
+            _analysis("t3", _proposal("Order must be settled", "t3")),
+        ],
+    )
+    paid = next(rule for rule in book.rules if rule.support == 1)
+    settled = next(rule for rule in book.rules if rule.support == 2)
+    assert {rule.status for rule in book.rules} == {"unknown"}
+    weighed = apply_weighings(
+        book,
+        [
+            _weighing(paid.rule_id),
+            _weighing(
+                settled.rule_id,
+                status="unknown",
+                rationale="Correlated.",
+                supporting=settled.evidence,
+            ),
+        ],
+    )
+    after = {rule.rule_id: rule for rule in weighed.rules}
+    assert after[paid.rule_id].status == "supported"
+    assert after[settled.rule_id].status == "unknown"
+    assert after[settled.rule_id].evidence == settled.evidence
+
+
+def test_weighing_structure_is_checked_and_held_out_traces_are_excluded() -> None:
+    """Citations stay within the rule's own evidence, never reach excluded traces, and back the
+    decided side; merging refuses an analysis that reaches an excluded trace."""
+    book = _book()
+    (rule,) = book.rules
+    with pytest.raises(ValueError, match="outside the rule's evidence"):
+        check_weighing(rule, _weighing(rule.rule_id, supporting=("trace:t9:span:1",)), frozenset())
+    with pytest.raises(ValueError, match="excluded traces"):
+        check_weighing(rule, _weighing(rule.rule_id), frozenset({"t1"}))
+    with pytest.raises(ValueError, match="at least one supporting"):
+        check_weighing(rule, _weighing(rule.rule_id, supporting=()), frozenset())
+    with pytest.raises(ValueError, match="at least one contradicting"):
+        check_weighing(rule, _weighing(rule.rule_id, status="contradicted"), frozenset())
+    with pytest.raises(ValueError, match="not in the book"):
+        apply_weighings(book, [_weighing("missing")])
+    with pytest.raises(ValueError, match="weighed twice"):
+        apply_weighings(book, [_weighing(rule.rule_id), _weighing(rule.rule_id)])
+    with pytest.raises(ValueError, match="held-out evidence"):
+        merge_rules(_CONTRACTS, [_analysis("t1", _proposal("x", "t1"))], excluded=frozenset({"t1"}))
+    with pytest.raises(ValueError, match="held-out evidence"):
+        merge_rules(
+            _CONTRACTS,
+            [_analysis("t1", _proposal("x", "t1", counter=("trace:held:span:2",)))],
+            excluded=frozenset({"held"}),
+        )
+    assert locator_trace("trace:a:b:span:c") == "a:b"
+    assert locator_trace("trace:a") == "a" and locator_trace("contract:x") is None

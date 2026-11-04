@@ -287,6 +287,10 @@ def _rule_block(rule: Rule) -> list[str]:
             lines.append(f"  - {witness.kind} {_code(witness.reference)}: {verdict}")
     else:
         lines.append("- Witnesses: none")
+    if rule.weighing is not None:
+        lines.append(f"- Weighing: {_line(rule.weighing.rationale)}")
+        if rule.weighing.independence:
+            lines.append(f"  - Independence: {_line(rule.weighing.independence)}")
     lines.append("")
     if rule.predicate is not None:
         text = canonical_predicate(rule.predicate)
