@@ -28,6 +28,10 @@ task that ran with its status. An exception (provider outage, interrupted draw, 
 only that task ``failed``; the others proceed, and a rerun retries it while replaying the rest.
 :func:`freeze_batch` saves the manifest as an artifact a pipeline registration can pin, and
 :func:`registered_job` returns one task's job from it.
+
+Replay rechecks current source presence and exposure. An immutable per-task evidence binding
+pins every family and task source trace's content before learning or authoring begins; changed
+evidence fails that task instead of returning a validation of different traces.
 """
 
 from __future__ import annotations
@@ -305,6 +309,18 @@ def run_bootstrap(
         ids = {
             row.task.task_id: task_identity(spec, family, row, code_revision) for row in selected
         }
+        admitted: list[BootstrapTask] = []
+        for row in selected:
+            try:
+                _bind_evidence(
+                    project, family, row, ids[row.task.task_id], exposure, traces, code_revision
+                )
+            except Exception as error:  # noqa: BLE001 - invalid evidence fails only its task
+                previous = manifest.entry(row.task.task_id)
+                record(_failed(family, ids[row.task.task_id], row, previous, error, "evidence"))
+            else:
+                admitted.append(row)
+        selected = admitted
         pending = [row for row in selected if load_outcome(project, ids[row.task.task_id]) is None]
         knowledge: FamilyKnowledge | None = None
         if pending:
@@ -342,6 +358,57 @@ def run_bootstrap(
         ]
         run_bounded(calls, spec.concurrency)
     return manifest
+
+
+def _bind_evidence(
+    project: ProjectStore,
+    family: BootstrapFamily,
+    task: BootstrapTask,
+    identity: str,
+    exposure: ExposurePlan,
+    traces: Mapping[str, Trace],
+    code_revision: str,
+) -> None:
+    """Validate current access and freeze exact trace content before replay or paid work.
+
+    Raises:
+        ValueError: Required evidence is absent, excluded, changed or lacks a saved binding.
+    """
+    members = family.family.member_traces
+    needed = {*members, *task.source_traces}
+    missing = sorted(needed - set(traces))
+    if missing:
+        raise ValueError(f"traces of {task.task.task_id} were not supplied: {missing}; supply them")
+    exposure.require(members, "world_learning")
+    exposure.require_lineage(task.task.lineage_group_id, "mining_probes")
+    exposure.require(task.source_traces, "mining_probes")
+    evidence: JsonObject = {trace_id: sha256_json(traces[trace_id]) for trace_id in sorted(needed)}
+    store = project.artifacts
+    artifact_id = identity + "-evidence"
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
+        if store.exists(artifact_id):
+            saved = json.loads(store.read_bytes(artifact_id, "evidence.json"))
+            if saved != evidence:
+                raise ValueError(
+                    f"trace evidence of {task.task.task_id} changed; restore the exact sources "
+                    "or prepare a fresh bootstrap"
+                )
+            return
+        if load_outcome(project, identity) is not None:
+            raise ValueError(
+                f"saved bootstrap of {task.task.task_id} has no trace evidence binding; "
+                "prepare a fresh bootstrap"
+            )
+        store.write_json(
+            artifact_id=artifact_id,
+            artifact_type="start-bootstrap-evidence",
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+            ),
+            files={"evidence.json": evidence},
+        )
 
 
 def load_outcome(project: ProjectStore, identity: str) -> Outcome | None:
@@ -539,7 +606,11 @@ def _bootstrap_task(
         material = StartMaterial(
             knowledge, task, {trace: traces[trace] for trace in task.source_traces}, recorded
         )
-        refs = {knowledge.rulebook, *(() if knowledge.report is None else (knowledge.report,))}
+        refs = {
+            artifact_input(store.read(identity + "-evidence").manifest),
+            knowledge.rulebook,
+            *(() if knowledge.report is None else (knowledge.report,)),
+        }
         if knowledge.rule_memory is not None:
             refs.add(knowledge.rule_memory.memory_set)
         if task.recorded_state is not None:
@@ -671,7 +742,8 @@ def _refuser(
             unresolved=unresolved,
             validation=validation,
         )
-        inputs = _inputs(refusal.rounds, findings, validation, None, ())
+        evidence = artifact_input(project.artifacts.read(identity + "-evidence").manifest)
+        inputs = _inputs(refusal.rounds, findings, validation, None, (evidence,))
         _save(project, identity + "-refusal", REFUSAL_TYPE, "refusal.json", refusal, inputs,
               code_revision)  # fmt: skip
         return refusal

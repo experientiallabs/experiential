@@ -533,6 +533,82 @@ def test_a_missing_deciding_fact_becomes_research_and_resolves(
     assert script.tasks("start_author") == ["gap", "gap"]
 
 
+@pytest.mark.parametrize("trace_id", ["src-recon", "w1"])
+@pytest.mark.parametrize("change", ["content", "missing", "held_out"])
+def test_replay_rechecks_current_trace_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trace_id: str, change: str
+) -> None:
+    """Saved starts refuse changed, absent or excluded evidence before any provider call."""
+    setup = _setup(tmp_path, monkeypatch)
+    first = setup.run(BootScript(), monkeypatch, tasks={"recon", "auth"})
+    assert first.by_status("registered") == ("recon", "auth")
+    if change == "content":
+        setup.traces[trace_id] = _ticket_trace(trace_id, severity="low")
+    elif change == "missing":
+        del setup.traces[trace_id]
+    else:
+        lineage = setup.exposure.traces[trace_id]
+        setup.exposure = setup.exposure.model_copy(
+            update={"roles": setup.exposure.roles | {lineage: "final_evaluation"}}
+        )
+    silent = BootScript(lambda role, opening: True)
+    replay = setup.run(silent, monkeypatch, tasks={"recon", "auth"})
+    assert _row(replay, "recon").status == "failed"
+    assert _row(replay, "recon").outcome is None
+    assert _row(replay, "auth").status == ("registered" if trace_id == "src-recon" else "failed")
+    assert silent.requests == []
+
+
+def test_replay_ignores_unrelated_traces_and_keeps_exact_saved_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evidence outside a task's family and sources never invalidates its saved outcome."""
+    setup = _setup(tmp_path, monkeypatch)
+    first = setup.run(BootScript(), monkeypatch, tasks={"auth", "bad"})
+    setup.traces["src-recon"] = _ticket_trace("src-recon", severity="low")
+    silent = BootScript(lambda role, opening: True)
+    replay = setup.run(silent, monkeypatch, tasks={"auth", "bad"})
+    assert [(row.identity, row.outcome, row.attempts) for row in replay.entries] == [
+        (row.identity, row.outcome, row.attempts) for row in first.entries
+    ]
+    assert silent.requests == []
+
+
+def test_replay_refuses_a_saved_outcome_without_its_evidence_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved outcome cannot adopt caller trace bytes after its validation was recorded."""
+    setup = _setup(tmp_path, monkeypatch)
+    first = setup.run(BootScript(), monkeypatch, tasks={"recon"})
+    evidence_id = _row(first, "recon").identity + "-evidence"
+    store = setup.project.artifacts
+    exists = store.exists
+
+    def without_binding(artifact_id: str) -> bool:
+        """Represent a persisted outcome that has no trace binding."""
+        return artifact_id != evidence_id and exists(artifact_id)
+
+    monkeypatch.setattr(store, "exists", without_binding)
+    silent = BootScript(lambda role, opening: True)
+    replay = setup.run(silent, monkeypatch, tasks={"recon"})
+    assert _row(replay, "recon").status == "failed"
+    assert "no trace evidence binding" in (_row(replay, "recon").failure or "")
+    assert silent.requests == []
+
+
+def test_invalid_task_evidence_is_checked_before_family_learning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task with absent source evidence spends nothing learning an unfrozen family."""
+    setup = _setup(tmp_path, monkeypatch)
+    del setup.traces["src-recon"]
+    silent = BootScript(lambda role, opening: True)
+    manifest = setup.run(silent, monkeypatch, tasks={"recon"})
+    assert manifest.by_status("failed") == ("recon",)
+    assert "were not supplied" in (_row(manifest, "recon").failure or "")
+    assert silent.requests == []
+
+
 def test_unresolved_research_and_refusing_reviews_end_in_diagnostic_refusals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
