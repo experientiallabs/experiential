@@ -98,9 +98,11 @@ from exp.cli.evaluation.variance_actions import (
     ActorCriticAction,
     RulesStageAction,
     VarianceBuildAction,
+    VarianceScheduleAction,
     handle_actor_critic,
     handle_rules_stage,
     handle_variance_build,
+    handle_variance_schedule,
 )
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -249,6 +251,7 @@ CONTINUATION_ACTIONS = (
         "validate-transitions", "transition_validation", handle_validate_transitions
     ),
     ContinuationAction("variance-build", "variance_build", handle_variance_build),
+    ContinuationAction("variance-schedule", "variance_schedule", handle_variance_schedule),
     ContinuationAction("rules-stage", "rules_stage", handle_rules_stage),
     ContinuationAction("actor-critic", "actor_critic", handle_actor_critic),
 )
@@ -329,6 +332,7 @@ class ContinuationCommand(ContractModel):
         native_workbook: Starting workbooks, task and answer ranges for a native capture.
         rubric_trajectory: Development chronology to register as a rubric source.
         variance_build: Variance-build spec file over the completed build.
+        variance_schedule: Training-schedule operation (status, plan or register-revision).
         rules_stage: Rules-stage spec and exposure files and the world-learning trace IDs.
         actor_critic: Actor-critic spec and exposure files for one mining-probe task.
     """
@@ -393,6 +397,7 @@ class ContinuationCommand(ContractModel):
     native_workbook: NativeWorkbookPayload | None = None
     rubric_trajectory: RubricTrajectoryRegistration | None = None
     variance_build: VarianceBuildAction | None = None
+    variance_schedule: VarianceScheduleAction | None = None
     rules_stage: RulesStageAction | None = None
     actor_critic: ActorCriticAction | None = None
 
