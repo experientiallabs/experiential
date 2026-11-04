@@ -276,4 +276,13 @@ def render_metrics_text(snapshot: JsonObject) -> str:
         "Control-plane accounting health (1 healthy, 0 failed).",
         [f"{_PREFIX}accounting_healthy {_value(control_plane['accounting_healthy'])}"],
     )
+    lines += _family(
+        f"{_PREFIX}accounting_fenced_organizations",
+        "gauge",
+        "Organizations fenced by failed accounting writes.",
+        [
+            f"{_PREFIX}accounting_fenced_organizations "
+            f"{_value(control_plane['accounting_fenced_organizations'])}"
+        ],
+    )
     return "\n".join(lines) + "\n"

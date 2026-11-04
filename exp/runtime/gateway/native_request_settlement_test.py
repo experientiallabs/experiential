@@ -41,15 +41,15 @@ def test_pre_dispatch_search_meter_is_retried_by_the_accounting_sweep() -> None:
         web_search_requests=1,
     )
     assert not accounting.accounting_healthy
+    organization_id = entry.authorization.organization_id
+    assert accounting.request_settlements.fenced_organizations() == {organization_id}
     with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.request_settlements.require_clear()
-    with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.require_clear()
+        accounting.require_clear(organization_id)
     accounting.sweep_expired()
     assert not accounting.accounting_healthy
     accounting.sweep_expired()
     assert accounting.accounting_healthy
-    accounting.request_settlements.require_clear()
+    accounting.require_clear(organization_id)
     accounting.sweep_expired()
     assert ledger.finished_requests == [failure]
     assert ledger.request_search_meters == [1]
@@ -105,7 +105,7 @@ def test_normal_in_progress_terminal_write_does_not_block_unrelated_admission() 
         try:
             assert entered.wait(3)
             assert accounting.accounting_healthy
-            accounting.request_settlements.require_clear()
+            assert not accounting.request_settlements.fenced_organizations()
             accounting.request_settlements.retry(16)
             assert calls == [1]
         finally:
@@ -226,7 +226,7 @@ def test_failed_abandonment_retains_search_meter_and_original_failure() -> None:
         )
     assert not accounting.accounting_healthy
     with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.request_settlements.require_clear()
+        accounting.require_clear(entry.authorization.organization_id)
     accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
     accounting.sweep_expired()
     assert accounting.accounting_healthy

@@ -736,6 +736,33 @@ def test_batch_machinery_failure_fails_blocked_callers_and_writer_recovers(
     assert int(count) == 1
 
 
+def test_writer_wide_transaction_failure_is_unwritable_until_storage_recovers(
+    tmp_path: Path,
+) -> None:
+    """A batch that cannot begin is writer-wide; one empty probe re-proves recovery."""
+    clock = FakeLedgerClock()
+    _, _, _ = _authority_fixture(tmp_path, clock)
+    core = SQLiteAttemptLedger(tmp_path / "gateway.db", clock=clock, busy_timeout_ms=50)
+    grouped = GroupCommitAttemptLedger(core)
+    facade = SyncGroupCommitLedger(grouped)
+    holder = sqlite3.connect(tmp_path / "gateway.db", timeout=0)
+    try:
+        assert grouped.writable()
+        holder.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            facade.flush()
+        assert not grouped.writable()
+        assert not grouped.closed
+        holder.rollback()
+        assert grouped.writable()
+        facade.flush()
+        assert grouped.writable()
+    finally:
+        holder.close()
+        grouped.close()
+    assert not grouped.writable()
+
+
 def test_writer_startup_failure_fails_sync_callers_instead_of_hanging(
     tmp_path: Path,
 ) -> None:
