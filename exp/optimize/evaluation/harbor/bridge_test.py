@@ -205,3 +205,69 @@ def test_unix_partial_startup_failure_closes_fd_and_owned_socket(
             pytest.fail("startup must fail")
     assert not path.exists()
     assert len(tuple(Path("/proc/self/fd").iterdir())) <= before
+
+
+class DialogueTrial(PublicTrial):
+    """Fake backend that also records customer-facing messages, in arrival order."""
+
+    def __init__(self) -> None:
+        """Start with no recorded messages."""
+        self.messages: list[str] = []
+
+    def message(self, text: str) -> JsonObject:
+        """Record one message and acknowledge its sequence."""
+        self.messages.append(text)
+        return {"recorded": True, "sequence": len(self.messages) - 1}
+
+
+def test_message_endpoint_takes_only_actor_text_and_only_on_dialogue_trials(
+    tmp_path: Path,
+) -> None:
+    """``say`` reaches a dialogue trial with the actor capability only; others have no route."""
+    directory = tmp_path / "ipc"
+    directory.mkdir(mode=0o755)
+    path = directory / "backend.sock"
+    trial = DialogueTrial()
+    with serve_harbor_trial(trial, socket_path=path) as endpoint:
+        said = run_client(path, endpoint.actor_token, "say", "I am checking your order now.")
+        assert said.returncode == 0, said.stderr
+        assert json.loads(said.stdout) == {"recorded": True, "sequence": 0}
+        denied = run_client(path, endpoint.verifier_token, "say", "verifier must not speak")
+        assert denied.returncode != 0 and "403" in denied.stderr
+        malformed = run_client(
+            path, endpoint.actor_token, "call", "--body", '{"text": "not a tool call"}'
+        )
+        assert malformed.returncode != 0 and "400" in malformed.stderr
+        missing = run_client(path, endpoint.actor_token, "say")
+        assert missing.returncode == 2 and "say takes one quoted message" in missing.stderr
+        extra = run_client(path, endpoint.actor_token, "tools", "stray text")
+        assert extra.returncode == 2
+    assert trial.messages == ["I am checking your order now."]
+    with serve_harbor_trial(PublicTrial(), socket_path=path) as endpoint:
+        absent = run_client(path, endpoint.actor_token, "say", "nobody records this")
+        assert absent.returncode != 0 and "404" in absent.stderr
+
+
+def test_message_body_must_be_exactly_one_text_string(tmp_path: Path) -> None:
+    """Extra fields or non-text bodies are refused before reaching the trial."""
+    directory = tmp_path / "ipc"
+    directory.mkdir(mode=0o755)
+    path = directory / "backend.sock"
+    trial = DialogueTrial()
+    with serve_harbor_trial(trial, socket_path=path) as endpoint:
+        for body in ('{"text": 1}', '{"text": "hi", "role": "system"}', "{}"):
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.connect(str(path))
+            connection.sendall(
+                (
+                    "POST /message HTTP/1.1\r\nHost: localhost\r\n"
+                    f"Authorization: Bearer {endpoint.actor_token}\r\n"
+                    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}"
+                ).encode()
+            )
+            response = b""
+            while chunk := connection.recv(4096):
+                response += chunk
+            connection.close()
+            assert response.startswith(b"HTTP/1.0 400") or response.startswith(b"HTTP/1.1 400")
+    assert trial.messages == []

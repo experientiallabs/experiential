@@ -107,6 +107,20 @@ trial lease. Committed calls replay; unknown outcomes never re-dispatch. Optiona
 supplies a deadline and attempt cap for supported `trial_runtime` factories, bounded by the frozen
 simulator ceiling. Resumes keep the same grant and counter for predictor, embedding and memory calls.
 Submission requires every declared output file; missing files leave the trial open for correction.
+Executable trials keep a harness-owned, append-only ledger beside their call records: the initial
+evaluator projection, every tool request and its reply (`is_error` kept) or failure, every
+customer-facing message and the submission, numbered in one sequence. The actor sends customer-facing
+text with `python /app/tools.py say 'TEXT'` (`POST /message`, actor capability only, at most 256
+messages of 16,000 characters, refused after submission); the exported `instruction.md` says the
+customer sees only those messages. Repeated calls replay without new entries, and a restart appends
+any entry its process stopped before writing, marked `reconciled`. The ledger records evidence only;
+reward is computed as before. `trial_ledger` reads it, and
+`exp.optimize.evaluation.variance.episode_evidence` converts a ledger (`ledger_evidence`), a
+continuation branch (`evidence_from_branch`) or an action-contrast cell
+(`evidence_from_contrast_cell`) into `EpisodeEvidence`: the checkpoint's actor messages are context,
+everything after the scored start is scored, and an imposed contrast action is scored but owned by
+`experiment`. Missing replies, unanswered actor calls and interrupted branches are listed as missing.
+World-model Harbor trials do not record dialogue, so their packages do not mention `say`.
 Configure a reachable private endpoint for containers. Packages use Harbor 0.24.0 schema 1.4 with a separate verifier environment.
 The verifier always writes `reward.json`: `{"reward": 0 or 1, "scored": 1}` for a qualified completed
 verdict, else `{"scored": 0}` (diagnostic, unsubmitted, failed or unknown); `experiential.json` keeps

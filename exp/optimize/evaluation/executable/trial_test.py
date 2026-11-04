@@ -13,7 +13,12 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
-from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial
+from exp.optimize.evaluation.executable.trial import (
+    ExecutableHarborTrial,
+    LedgerKind,
+    open_executable_harbor_trial,
+    trial_ledger,
+)
 from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
@@ -201,3 +206,110 @@ def test_proven_rollback_stops_trial_without_claiming_ambiguous_effects(
         assert resumed.result() == result
         with pytest.raises(ValueError, match="closed"):
             resumed.call(workbook_case().first)
+
+
+def test_ledger_records_dialogue_calls_and_submission_in_order_without_changing_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every actor operation through the real bridge lands in one sequenced, durable ledger."""
+    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
+    qualification = qualify_executable_task(
+        project, spec, created_at=datetime.now(UTC), code_revision="test"
+    )
+    case = workbook_case()
+    malformed = case.first.model_copy(update={"call_id": "malformed", "arguments": {}})
+    with open_executable_harbor_trial(
+        project, task, trial_id="ledger", code_revision="test", qualification=qualification
+    ) as trial:
+        with serve_harbor_trial(trial) as endpoint:
+            actor = endpoint.actor_token
+            assert _post(endpoint.url + "/message", actor, {"text": "Looking now."}) == {
+                "recorded": True,
+                "sequence": 1,
+            }
+            with pytest.raises(HTTPError) as refused:
+                _post(endpoint.url + "/message", endpoint.verifier_token, {"text": "no"})
+            assert refused.value.code == 403
+            with pytest.raises(HTTPError) as empty:
+                _post(endpoint.url + "/message", actor, {"text": "  "})
+            assert empty.value.code == 400
+            failed = _post(endpoint.url + "/call", actor, malformed.model_dump(mode="json"))
+            assert failed["is_error"] is True
+            done = _post(endpoint.url + "/call", actor, case.first.model_dump(mode="json"))
+            assert done["is_error"] is False
+            # A replayed call returns the saved reply and records nothing new.
+            assert _post(endpoint.url + "/call", actor, case.first.model_dump(mode="json")) == done
+            _post(endpoint.url + "/message", actor, {"text": "Row deleted."})
+            _post(endpoint.url + "/submit", actor, {"answer": "done"})
+            with pytest.raises(HTTPError) as closed:
+                _post(endpoint.url + "/message", actor, {"text": "one more thing"})
+            assert closed.value.code == 400
+            result = _post(endpoint.url + "/grade", endpoint.verifier_token, {})
+        assert result["status"] == "completed" and result["reward"] == 1
+        identity = trial.identity
+        assert trial.ledger() == trial_ledger(project, identity)
+    ledger = trial_ledger(project, identity)
+    assert [entry.kind for entry in ledger] == [
+        "start",
+        "message",
+        "tool_call",
+        "tool_reply",
+        "tool_call",
+        "tool_reply",
+        "message",
+        "submission",
+    ]
+    assert [entry.sequence for entry in ledger] == list(range(8))
+    assert not any(entry.reconciled for entry in ledger)
+    assert ledger[1].content == {"text": "Looking now."} and ledger[1].record is None
+    assert ledger[3].record == identity + "-call-0"
+    step = ledger[3].content["step"]
+    assert isinstance(step, dict) and isinstance(step["reply"], dict)
+    assert step["reply"]["is_error"] is True
+    assert ledger[7].content["answer"] == {"answer": "done"}
+    # Reopening neither duplicates entries nor changes the saved verdict.
+    with open_executable_harbor_trial(
+        project, task, trial_id="ledger", code_revision="test", qualification=qualification
+    ) as resumed:
+        assert resumed.ledger() == ledger
+        assert resumed.result() == result
+
+
+def test_ledger_reconciles_a_committed_reply_after_the_process_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply saved before its ledger entry is appended on restart, marked reconciled."""
+    project, task, _ = qualified_fixture(tmp_path, monkeypatch)
+    append = ExecutableHarborTrial._append
+
+    def stop_before_reply(
+        self: ExecutableHarborTrial,
+        kind: LedgerKind,
+        content: JsonObject,
+        record: str | None = None,
+        *,
+        reconciled: bool = False,
+    ) -> int:
+        """Emulate a crash after the call record and before its ledger entry."""
+        if kind == "tool_reply":
+            raise RuntimeError("process stopped")
+        return append(self, kind, content, record, reconciled=reconciled)
+
+    with open_executable_harbor_trial(
+        project, task, trial_id="crash", code_revision="test"
+    ) as trial:
+        monkeypatch.setattr(ExecutableHarborTrial, "_append", stop_before_reply)
+        with pytest.raises(RuntimeError, match="stopped"):
+            trial.call(workbook_case().first)
+        monkeypatch.setattr(ExecutableHarborTrial, "_append", append)
+    with open_executable_harbor_trial(
+        project, task, trial_id="crash", code_revision="test"
+    ) as resumed:
+        ledger = resumed.ledger()
+        assert [(entry.kind, entry.reconciled) for entry in ledger] == [
+            ("start", False),
+            ("tool_call", False),
+            ("tool_reply", True),
+        ]
+        assert resumed.call(workbook_case().first)["is_error"] is False
+        assert resumed.ledger() == ledger

@@ -1,4 +1,9 @@
-"""Trial-scoped HTTP transport without actor access to grading evidence or source stores."""
+"""Trial-scoped HTTP transport without actor access to grading evidence or source stores.
+
+The actor capability may list tools, call them, send customer-facing messages (``/message``,
+when the trial records dialogue), submit and fetch declared outputs. Only the verifier capability
+may grade. The trial owner records every dispatched operation in its own durable ledger.
+"""
 
 import json
 import os
@@ -12,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import ThreadingUnixStreamServer
 from threading import Lock, Thread, current_thread
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
@@ -39,6 +44,15 @@ class HarborTrialOperations(Protocol):
 
     def output_files(self) -> JsonObject:
         """Return only explicitly declared public output files."""
+        ...
+
+
+@runtime_checkable
+class HarborDialogueOperations(HarborTrialOperations, Protocol):
+    """A trial that also records the actor's customer-facing messages in its ledger."""
+
+    def message(self, text: str) -> JsonObject:
+        """Record one customer-facing message and return its acknowledgement."""
         ...
 
 
@@ -169,7 +183,9 @@ def serve_harbor_trial(
 
         def do_POST(self) -> None:
             """Dispatch fixed typed operations, without actor-selected paths or code."""
-            if self.path not in ("/call", "/submit", "/grade", "/outputs"):
+            if self.path not in ("/call", "/message", "/submit", "/grade", "/outputs") or (
+                self.path == "/message" and not isinstance(trial, HarborDialogueOperations)
+            ):
                 self.reply(404, {"error": "unknown endpoint"})
                 return
             if not self.authorized(verifier_token if self.path == "/grade" else actor_token):
@@ -183,6 +199,13 @@ def serve_harbor_trial(
                     raise ValueError("expected a JSON object")
                 if self.path == "/call":
                     result = trial.call(ToolCall.model_validate(value))
+                elif self.path == "/message":
+                    text = value.get("text")
+                    if set(value) != {"text"} or not isinstance(text, str):
+                        raise ValueError("a message is one JSON object with only a text string")
+                    if not isinstance(trial, HarborDialogueOperations):
+                        raise TypeError("trial does not record dialogue")
+                    result = trial.message(text)
                 elif self.path == "/submit":
                     result = trial.submit(value)
                 elif self.path == "/outputs":

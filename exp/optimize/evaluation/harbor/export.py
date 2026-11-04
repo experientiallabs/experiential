@@ -105,6 +105,7 @@ def export_harbor_task(
         qualified=qualified,
         notice="All observations come from a reconstructed simulator.",
         output_paths=() if native_binding is None else native_binding.output_paths,
+        dialogue=False,
     )
 
 
@@ -119,6 +120,7 @@ def write_harbor_package(
     notice: str,
     output_paths: tuple[str, ...] = (),
     transport: Literal["http", "unix-no-network"] = "http",
+    dialogue: bool = True,
 ) -> Path:
     """Write the shared Harbor client and isolated verifier package for one frozen backend.
 
@@ -132,6 +134,9 @@ def write_harbor_package(
         notice: Accurate execution-authority disclosure for the selected backend.
         output_paths: Declared native output files, when supported by the backend.
         transport: Explicit Unix/no-network package policy, or the unchanged HTTP default.
+        dialogue: Whether the backend records customer-facing messages sent with ``say``. The
+            instruction then routes every customer-facing message through it. A backend without
+            a message ledger passes False, and the instruction does not mention ``say``.
 
     Returns:
         Published package with the complete digest-bound file inventory.
@@ -169,7 +174,16 @@ def write_harbor_package(
                 "Use python /app/tools.py tools to inspect the permitted interfaces. "
                 "Call a tool with python /app/tools.py call --body 'JSON', using "
                 "call_id, name and arguments. Keep call_id stable when retrying an operation. "
-                "Submit the task's declared final JSON answer with "
+                + (
+                    "Send every message meant for the customer, including progress updates, "
+                    "questions, explanations and the closing reply, with "
+                    "python /app/tools.py say 'TEXT'. The customer sees only messages sent "
+                    "this way, in order with your tool calls; nothing else you write reaches "
+                    "them. "
+                    if dialogue
+                    else ""
+                )
+                + "Submit the task's declared final JSON answer with "
                 "python /app/tools.py submit --body 'JSON'. "
                 + notice
                 + " "

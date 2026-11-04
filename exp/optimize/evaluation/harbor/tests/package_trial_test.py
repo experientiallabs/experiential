@@ -404,6 +404,9 @@ def _run_trial(
             listed = _client(client, actor_file, actor_home, "tools")
             assert listed.returncode == 0, listed.stderr
             assert json.loads(listed.stdout)["tools"]
+            said = _client(client, actor_file, actor_home, "say", "Working on your request.")
+            assert said.returncode == 0, said.stderr
+            assert json.loads(said.stdout)["recorded"] is True
             for action in actions:
                 called = _client(
                     client, actor_file, actor_home, "call", "--body", action.model_dump_json()
@@ -508,6 +511,7 @@ def test_qualified_package_passes_local_harbor_trial_with_proven_cleanup(
         package / "environment" / "tools.py"
     ).read_bytes()
     assert 'environment_mode = "separate"' in (package / "task.toml").read_text()
+    assert "python /app/tools.py say 'TEXT'" in (package / "instruction.md").read_text()
     assert [path.name for path in package.parent.iterdir()] == [kind]
     assert not list(scratch.iterdir())
 
@@ -561,4 +565,13 @@ def test_qualified_package_passes_local_harbor_trial_with_proven_cleanup(
     assert sum(key.endswith("-start") for key in records) == 3
     assert sum(key.endswith("-answer") for key in records) == 2
     assert sum(key.endswith("-result") for key in records) == 2
+    # Every trial's harness ledger holds the customer-facing message the actor sent with say.
+    ledgers = [
+        json.loads(project.artifacts.read_bytes(key, "record.json"))
+        for key in records
+        if "-ledger-" in key
+    ]
+    messages = [entry["content"] for entry in ledgers if entry["kind"] == "message"]
+    assert messages == [{"text": "Working on your request."}] * 3
+    assert sum(entry["kind"] == "submission" for entry in ledgers) == 2
     assert not list(scratch.iterdir())

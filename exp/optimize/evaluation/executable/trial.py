@@ -1,4 +1,10 @@
-"""Durable Harbor tool access to the existing executable or mixed world runtime."""
+"""Durable Harbor tool access to the existing executable or mixed world runtime.
+
+Besides its call, submission and grade records, every trial keeps a harness-owned, append-only
+ledger: the initial evaluator projection, each tool request and its observed reply or failure,
+each customer-facing message the actor sends through the bridge, and the final submission, in
+one sequence. The ledger is what an episode judge reads; it never changes how reward is computed.
+"""
 
 import base64
 import json
@@ -7,10 +13,14 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from threading import RLock
+from typing import Literal
+
+from pydantic import Field
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
+    ContractModel,
     JsonObject,
     sha256_bytes,
     sha256_json,
@@ -38,6 +48,63 @@ from exp.runtime.environments.world_outcomes import (
 )
 from exp.simulation.continuations import WorldCheckpoint, load_continuation_checkpoint
 from exp.simulation.evaluation.tasks import grade
+
+MAXIMUM_MESSAGES = 256
+"""Customer-facing messages one trial accepts."""
+
+MAXIMUM_MESSAGE_CHARACTERS = 16_000
+"""Characters in one customer-facing message."""
+
+LedgerKind = Literal["start", "tool_call", "tool_reply", "tool_failure", "message", "submission"]
+"""What one trial ledger entry records."""
+
+
+class TrialLedgerEntry(ContractModel):
+    """One harness-recorded entry of a trial's append-only ledger.
+
+    Attributes:
+        sequence: Logical position in the ledger, starting at 0 with the ``start`` entry.
+        kind: ``start`` holds the initial evaluator projection; ``tool_call`` the exact request;
+            ``tool_reply`` the saved step (observation, receipt and resulting projection);
+            ``tool_failure`` a dispatch or observation failure; ``message`` customer-facing
+            text the actor sent; ``submission`` the final answer and final projection.
+        content: The recorded payload.
+        record: Backing trial record artifact, or None when the ledger entry is the record.
+        recorded_at: Wall-clock time the harness appended the entry.
+        reconciled: Whether the entry was appended on restart from an already saved record,
+            because the process stopped between that record and its ledger entry.
+    """
+
+    sequence: int = Field(ge=0)
+    kind: LedgerKind
+    content: JsonObject
+    record: str | None = None
+    recorded_at: datetime
+    reconciled: bool = False
+
+
+def trial_ledger(project: ProjectStore, identity: str) -> tuple[TrialLedgerEntry, ...]:
+    """Read a trial's contiguous ledger without opening its runtime.
+
+    Args:
+        project: Project holding the trial records.
+        identity: Durable trial identity (``ExecutableHarborTrial.identity``).
+
+    Returns:
+        Every saved entry in sequence order.
+
+    Raises:
+        ValueError: An entry's recorded sequence differs from its position.
+    """
+    entries: list[TrialLedgerEntry] = []
+    while project.artifacts.exists(f"{identity}-ledger-{len(entries)}"):
+        entry = TrialLedgerEntry.model_validate_json(
+            project.artifacts.read_bytes(f"{identity}-ledger-{len(entries)}", "record.json")
+        )
+        if entry.sequence != len(entries):
+            raise ValueError("trial ledger entry differs from its position")
+        entries.append(entry)
+    return tuple(entries)
 
 
 class ExecutableHarborTrial:
@@ -75,17 +142,25 @@ class ExecutableHarborTrial:
         self._initial = runtime.probe(checkpoint.world)
         self._failed = False
         self._outcome_unknown = False
+        self._ledger = list(trial_ledger(project, identity))
+        expected: list[tuple[LedgerKind, str | None, JsonObject]] = [
+            ("start", None, {"initial_state": self._initial})
+        ]
         for index in range(task.maximum_tool_calls):
             key = f"{identity}-call-{index}"
+            if project.artifacts.exists(key + "-intent"):
+                intent = json.loads(project.artifacts.read_bytes(key + "-intent", "record.json"))
+                expected.append(("tool_call", key + "-intent", {"action": intent["action"]}))
             if project.artifacts.exists(key):
                 row = json.loads(project.artifacts.read_bytes(key, "record.json"))
                 action = ToolCall.model_validate(row["action"])
                 self._steps.append(row["step"])
                 self._calls[action.call_id] = (action, row["reply"])
+                expected.append(("tool_reply", key, {"step": row["step"]}))
             elif project.artifacts.exists(key + "-intent"):
-                intent = json.loads(project.artifacts.read_bytes(key + "-intent", "record.json"))
                 failed = self._saved(f"call-{index}-failure")
                 if failed is not None:
+                    expected.append(("tool_failure", key + "-failure", failed))
                     step = failed.get("step")
                     if not isinstance(step, dict) or step.get("action") != intent["action"]:
                         raise ValueError("saved failure differs from its original tool intent")
@@ -105,6 +180,65 @@ class ExecutableHarborTrial:
                 break
             else:
                 break
+        answer = self._saved("answer")
+        if answer is not None:
+            expected.append(("submission", identity + "-answer", answer))
+        self._reconcile(expected)
+
+    def _reconcile(self, expected: list[tuple[LedgerKind, str | None, JsonObject]]) -> None:
+        """Append ledger entries for saved records the process stopped before recording.
+
+        Records are always saved before their ledger entry, and the owner lock serializes
+        operations, so a missing entry can only follow every entry already in the ledger.
+
+        Args:
+            expected: Every saved record in operation order, with its ledger kind and content.
+        """
+        recorded = {(entry.kind, entry.record) for entry in self._ledger}
+        for kind, record, content in expected:
+            if (kind, record) not in recorded:
+                self._append(kind, content, record, reconciled=bool(self._ledger))
+
+    def _append(
+        self,
+        kind: LedgerKind,
+        content: JsonObject,
+        record: str | None = None,
+        *,
+        reconciled: bool = False,
+    ) -> int:
+        """Append one ledger entry after its backing record, bound to that record's digest.
+
+        Args:
+            kind: What the entry records.
+            content: Exact recorded payload.
+            record: Backing record artifact, already saved, or None.
+            reconciled: Whether the entry is appended on restart for an earlier record.
+
+        Returns:
+            The entry's sequence number.
+        """
+        entry = TrialLedgerEntry(
+            sequence=len(self._ledger),
+            kind=kind,
+            content=content,
+            record=record,
+            recorded_at=datetime.now(UTC),
+            reconciled=reconciled,
+        )
+        inputs = (
+            ()
+            if record is None
+            else (artifact_input(self.project.artifacts.read(record).manifest),)
+        )
+        self._save(f"ledger-{entry.sequence}", entry.model_dump(mode="json"), inputs)
+        self._ledger.append(entry)
+        return entry.sequence
+
+    def ledger(self) -> tuple[TrialLedgerEntry, ...]:
+        """Return the harness-owned ledger recorded so far, in sequence order."""
+        with self._lock:
+            return tuple(self._ledger)
 
     def _save(self, suffix: str, value: JsonObject, inputs: tuple[ArtifactInput, ...] = ()) -> None:
         """Publish immutable evidence without exposing the project store to actors."""
@@ -151,6 +285,11 @@ class ExecutableHarborTrial:
                 raise ValueError("trial tool-call allowance exhausted")
             ordinal = len(self._steps)
             self._save(f"call-{ordinal}-intent", {"action": action.model_dump(mode="json")})
+            self._append(
+                "tool_call",
+                {"action": action.model_dump(mode="json")},
+                f"{self.identity}-call-{ordinal}-intent",
+            )
             returned = False
             try:
                 observation = (
@@ -189,7 +328,6 @@ class ExecutableHarborTrial:
                 )
                 self._steps.append(step)
                 self._calls[action.call_id] = (action, reply)
-                return deepcopy(reply)
             except BaseException as error:
                 failed: JsonObject = {
                     "action": action.model_dump(mode="json"),
@@ -202,14 +340,14 @@ class ExecutableHarborTrial:
                 self._steps.append(failed)
                 self._failed = True
                 self._outcome_unknown = returned or not known_failed_effects(receipt)
-                self._save(
-                    f"call-{ordinal}-failure",
-                    {
-                        "step": failed,
-                        "error_type": type(error).__name__,
-                    },
-                )
+                failure: JsonObject = {"step": failed, "error_type": type(error).__name__}
+                self._save(f"call-{ordinal}-failure", failure)
+                self._append("tool_failure", failure, f"{self.identity}-call-{ordinal}-failure")
                 raise
+            # The reply is committed; a ledger failure here is reconciled on restart, not a
+            # dispatch failure.
+            self._append("tool_reply", {"step": step}, f"{self.identity}-call-{ordinal}")
+            return deepcopy(reply)
 
     def submit(self, answer: JsonObject) -> JsonObject:
         """Freeze a final answer and the evaluator projection; repeat submission must agree."""
@@ -225,8 +363,34 @@ class ExecutableHarborTrial:
             if self.task.output_paths:
                 self._output_files(checkpoint)
             state = self.runtime.probe(checkpoint)
-            self._save("answer", {"answer": answer, "final_state": state})
+            record: JsonObject = {"answer": answer, "final_state": state}
+            self._save("answer", record)
+            self._append("submission", record, self.identity + "-answer")
             return {"submitted": True}
+
+    def message(self, text: str) -> JsonObject:
+        """Record one customer-facing message in the ledger; it has no world effect.
+
+        Args:
+            text: Exact text the actor addresses to the customer.
+
+        Returns:
+            Acknowledgement with the message's ledger sequence number.
+
+        Raises:
+            ValueError: The text is empty or too long, the message allowance is spent, or the
+                trial was already submitted.
+        """
+        with self._lock:
+            if not text.strip() or len(text) > MAXIMUM_MESSAGE_CHARACTERS:
+                raise ValueError(
+                    f"a message needs 1 to {MAXIMUM_MESSAGE_CHARACTERS} characters of text"
+                )
+            if self._saved("answer") is not None:
+                raise ValueError("trial is closed after submission; messages are not recorded")
+            if sum(entry.kind == "message" for entry in self._ledger) >= MAXIMUM_MESSAGES:
+                raise ValueError("trial message allowance exhausted")
+            return {"recorded": True, "sequence": self._append("message", {"text": text})}
 
     def result(self) -> JsonObject:
         """Grade observed goals and policy separately; only a qualified contract emits reward."""

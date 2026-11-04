@@ -1,5 +1,8 @@
 """Standalone actor/verifier transport copied into isolated Harbor environments.
 
+The actor sends every customer-facing message with ``say "TEXT"``; the trusted backend records
+it, in order with tool calls and the final submission, in the trial's harness-owned ledger.
+
 Harbor requires every verified trial to leave ``reward.json`` or ``reward.txt`` in its verifier
 log directory. The verifier therefore writes ``reward.json`` for every verdict the trusted backend
 returns: a scored verdict carries ``{"reward": 0 or 1, "scored": 1}``, while a diagnostic,
@@ -33,7 +36,12 @@ VERIFIER_FILES = ("reward.json", "reward.txt", "experiential.json")
 def main() -> int:
     """Send a fixed public operation, or publish a private completed verifier result."""
     parser = argparse.ArgumentParser(description="Access this trial's frozen simulator")
-    parser.add_argument("operation", choices=("tools", "call", "submit", "verify", "outputs"))
+    parser.add_argument(
+        "operation", choices=("tools", "call", "say", "submit", "verify", "outputs")
+    )
+    parser.add_argument(
+        "text", nargs="?", help="Customer-facing message text, required by say and only say"
+    )
     parser.add_argument(
         "--body", default="{}", help="JSON call or final answer, as declared by tools"
     )
@@ -46,6 +54,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "outputs" and args.directory is None:
         parser.error("outputs requires --directory")
+    if (args.operation == "say") != (args.text is not None):
+        parser.error("say takes one quoted message text; other operations take none")
+    if args.operation == "say":
+        args.body = json.dumps({"text": args.text})
     if args.operation == "verify":
         directory = args.directory or Path("/logs/verifier")
         directory.mkdir(parents=True, exist_ok=True)
@@ -67,7 +79,7 @@ def main() -> int:
     credential = os.environ[
         "EXP_HARBOR_VERIFIER_TOKEN" if args.operation == "verify" else "EXP_HARBOR_ACTOR_TOKEN"
     ]
-    path = "/grade" if args.operation == "verify" else "/" + args.operation
+    path = {"verify": "/grade", "say": "/message"}.get(args.operation, "/" + args.operation)
     request = Request(
         endpoint + path,
         data=None if args.operation == "tools" else args.body.encode(),
