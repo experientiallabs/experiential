@@ -66,21 +66,39 @@ _INJECTED_PREFIXES = (
 _CLAUDE_MESSAGE_TYPES = frozenset({"user", "assistant"})
 _EXPORT_TOOL_RESULT_ROLES = frozenset({"tool-result", "tool_result", "toolresult", "tool"})
 _CALL_PREFIX = "[Tool call: "
+FREE_FORM_ARGUMENT = "input"
+"""Key that holds a free-form (non-object) recorded tool-call value."""
 
 
 @dataclass(frozen=True)
 class SessionToolCall:
     """One tool call requested by an assistant turn.
 
+    Tool replay and tool contracts take JSON object arguments. A session that records a
+    free-form call (a raw command string, a patch body, or text that is not JSON) keeps its
+    exact value under the single key ``input``, so nothing is dropped or reinterpreted.
+
     Attributes:
         call_id: Recorded call identity, when the session declares one.
         name: Recorded tool name.
-        arguments: Recorded arguments as a JSON value.
+        arguments: Recorded arguments as a JSON object.
     """
 
     call_id: str | None
     name: str
-    arguments: JsonValue
+    arguments: JsonObject
+
+
+def object_arguments(recorded: JsonValue) -> JsonObject:
+    """Return recorded tool-call arguments as a JSON object.
+
+    Args:
+        recorded: The arguments exactly as the session recorded them.
+
+    Returns:
+        The object itself, or ``{"input": recorded}`` for any other JSON value.
+    """
+    return recorded if isinstance(recorded, dict) else {FREE_FORM_ARGUMENT: recorded}
 
 
 @dataclass(frozen=True)
@@ -389,7 +407,11 @@ def _claude_assistant(
                 if call_id in seen_calls:
                     continue
                 seen_calls.add(call_id)
-            calls.append(SessionToolCall(call_id, str(block["name"]), block.get("input", {})))
+            calls.append(
+                SessionToolCall(
+                    call_id, str(block["name"]), object_arguments(block.get("input", {}))
+                )
+            )
     model = message.get("model")
     error = None
     if record.get("isApiErrorMessage") is True or record.get("error") is not None:
@@ -649,7 +671,7 @@ def _pi_event(
                 SessionToolCall(
                     call_id if isinstance(call_id, str) else None,
                     str(block["name"]),
-                    block.get("arguments", {}),
+                    object_arguments(block.get("arguments", {})),
                 )
             )
     error = message.get("errorMessage")
@@ -765,7 +787,11 @@ def _export_event(
     calls: tuple[SessionToolCall, ...] = ()
     completion = text
     if tool_name is not None:
-        calls = (SessionToolCall(call_id, tool_name, _export_arguments(text, tool_name)),)
+        calls = (
+            SessionToolCall(
+                call_id, tool_name, object_arguments(_export_arguments(text, tool_name))
+            ),
+        )
         completion = ""
         if call_id is not None:
             names[call_id] = tool_name
