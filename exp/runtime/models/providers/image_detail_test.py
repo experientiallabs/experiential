@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 import pytest
+from pydantic import JsonValue
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
@@ -24,6 +27,9 @@ _OPENAI_CHAT = GatewayWireProfile(
 )
 _OPENAI_RESPONSES = GatewayWireProfile(
     dialect="openai_responses", url="https://api.openai.com/v1/responses"
+)
+_CHATGPT_CODEX = GatewayWireProfile(
+    dialect="openai_responses", url="https://chatgpt.com/backend-api/codex/responses"
 )
 _VLLM = GatewayWireProfile(
     dialect="openai_compatible", url="http://10.0.0.7:8000/v1/chat/completions"
@@ -46,6 +52,7 @@ _PNG = "aGk="
 
 
 def _image(detail: str | None) -> ImageContentPart:
+    """One inline PNG part carrying ``detail``."""
     return ImageContentPart.model_validate(
         {"media_type": "image/png", "data": _PNG, "detail": detail}
     )
@@ -77,11 +84,12 @@ def _request(
     )
 
 
-def _sent_details(payload: object) -> list[str | None]:
+def _sent_details(payload: JsonObject) -> list[str | None]:
     """Every ``detail`` value under an image part of the wire payload."""
     found: list[str | None] = []
 
-    def walk(value: object) -> None:
+    def walk(value: JsonValue) -> None:
+        """Collect image ``detail`` values from ``value`` and its descendants."""
         if isinstance(value, dict):
             detail = value.get("detail")
             if value.get("type") == "input_image":
@@ -96,12 +104,13 @@ def _sent_details(payload: object) -> list[str | None]:
             for child in value:
                 walk(child)
 
-    walk(json.loads(json.dumps(payload)))
+    walk(cast(JsonValue, json.loads(json.dumps(payload))))
     return found
 
 
-@pytest.mark.parametrize("profile", (_OPENAI_CHAT, _OPENAI_RESPONSES))
+@pytest.mark.parametrize("profile", (_OPENAI_CHAT, _OPENAI_RESPONSES, _CHATGPT_CODEX))
 def test_openai_own_api_takes_original_verbatim(profile: GatewayWireProfile) -> None:
+    """OpenAI's own API receives ``original`` unchanged and nothing is disclosed."""
     request = _request()
     assert original_image_detail_for_wire(profile, request) is request
     assert original_image_detail_disclosures(profile, request) == ()
@@ -119,6 +128,7 @@ def test_openai_own_api_takes_original_verbatim(profile: GatewayWireProfile) -> 
 def test_other_detail_wires_send_high_with_disclosure(
     profile: GatewayWireProfile, surface: GatewayApiSurface, disclosure: str
 ) -> None:
+    """Every other detail-carrying origin receives ``high`` and discloses it."""
     request = _request(surface=surface)
     sent = _sent_details(dialect_stream_payload(profile, request))
     assert sent and "original" not in sent and "high" in sent
@@ -126,6 +136,7 @@ def test_other_detail_wires_send_high_with_disclosure(
 
 
 def test_a_wire_without_a_detail_field_is_untouched_and_undisclosed() -> None:
+    """A wire with no ``detail`` field (Anthropic) needs no substitution."""
     request = _request()
     assert original_image_detail_for_wire(_ANTHROPIC, request) is request
     assert original_image_detail_disclosures(_ANTHROPIC, request) == ()
@@ -133,6 +144,7 @@ def test_a_wire_without_a_detail_field_is_untouched_and_undisclosed() -> None:
 
 @pytest.mark.parametrize("detail", (None, "auto", "low", "high"))
 def test_other_details_are_untouched_and_undisclosed(detail: str | None) -> None:
+    """Only ``original`` is substituted; every other detail rides unchanged."""
     request = _request(detail)
     assert original_image_detail_for_wire(_VLLM, request) is request
     assert original_image_detail_disclosures(_VLLM, request) == ()

@@ -9,7 +9,8 @@ session.
 
 ``original`` is OpenAI's own value: its vision guide lists it for the gpt-5.4
 and newer families and calls it unsupported on older models, and no other
-origin documents it. So OpenAI's own API takes the caller's value verbatim
+origin documents it. So OpenAI's own API, and the ChatGPT Codex backend that
+Codex itself sends ``original`` to, take the caller's value verbatim
 (an unsupported model answers exactly as OpenAI would), and every other
 detail-carrying wire receives ``high``, the nearest value every OpenAI-shaped
 origin accepts and the one Codex itself substitutes when a model cannot take
@@ -33,7 +34,8 @@ if TYPE_CHECKING:
 DETAIL_CARRYING_DIALECTS: Final = frozenset({"openai_compatible", "openai_responses"})
 """The wires whose image part carries a ``detail`` field."""
 
-_OPENAI_HOST: Final = "api.openai.com"
+_ORIGINAL_DETAIL_HOSTS: Final = frozenset({"api.openai.com", "chatgpt.com"})
+"""OpenAI's own origins: the Platform API and the ChatGPT Codex backend Codex itself calls."""
 
 RESPONSES_ORIGINAL_DETAIL_DOWNGRADED: Final = "input.input_image.detail->translated(original:high)"
 """Disclosure for a Responses request whose ``original`` detail a rung sends as ``high``."""
@@ -46,7 +48,7 @@ def _downgrades_original(profile: GatewayWireProfile) -> bool:
     """Whether this rung carries a detail field but not OpenAI's ``original`` value."""
     if profile.dialect not in DETAIL_CARRYING_DIALECTS:
         return False
-    return (urlsplit(profile.url).hostname or "").lower() != _OPENAI_HOST
+    return (urlsplit(profile.url).hostname or "").lower() not in _ORIGINAL_DETAIL_HOSTS
 
 
 def _carries_original(message: GatewayMessage) -> bool:

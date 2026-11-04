@@ -574,7 +574,7 @@ Chat image references accept Copilot's optional `image_url.media_type` MIME hint
 (`image/png`, `image/jpeg`, `image/gif`, or `image/webp`): validated and discarded
 before dispatch and replay identity, while the `url` and `detail` stay
 authoritative. A data URL keeps its embedded MIME type and a remote URL is fetched
-by the provider; unknown image fields and malformed URLs or base64 stay rejected. Image `detail` accepts OpenAI's `ImageDetail` (`auto`, `low`, `high`, `original`) on Chat `image_url` and every Responses `input_image`, `function_call_output` included (Codex sends `original` on tool screenshots): OpenAI's own API receives `original` verbatim and every other detail-carrying rung sends `high` and discloses `input.input_image.detail->translated(original:high)` (Chat: `messages.image_url.detail->translated(original:high)`).
+by the provider; unknown image fields and malformed URLs or base64 stay rejected. Image `detail` accepts OpenAI's `ImageDetail` (`auto`, `low`, `high`, `original`) on Chat `image_url` and every Responses `input_image`, `function_call_output` included (Codex sends `original` on tool screenshots): OpenAI's own API and the ChatGPT Codex backend receive `original` verbatim and every other detail-carrying rung sends `high` and discloses `input.input_image.detail->translated(original:high)` (Chat: `messages.image_url.detail->translated(original:high)`).
 A Chat `role: "tool"` message accepts `image_url` parts beside its text (GitHub Copilot Chat,
 Codex Desktop and node agents report a screenshot inside the tool message that took it), and a
 Messages `tool_result` accepts image and PDF `document` sub-blocks (Claude Code's Read tool

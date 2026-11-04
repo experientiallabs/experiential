@@ -107,7 +107,22 @@ first and, when KV runs out, preempts the highest value first.
 
 @dataclass(frozen=True, slots=True)
 class RungDispatch:
-    """One deployment's frozen dispatch material plus its shaping disclosure."""
+    """One deployment's frozen dispatch material plus its shaping disclosures.
+
+    Attributes:
+        wire_entry: The rung's frozen wire payload entry.
+        signer: Per-dispatch request signer, or ``None`` for an unsigned wire.
+        binding: Frozen dispatch binding, or ``None`` when the rung has none.
+        carrier_authority: Reasoning-carrier authority for replayed reasoning.
+        parallel_disclosure: Parallel-tool-call shaping disclosure, if any.
+        output_disclosure: Output-token shaping disclosure, if any.
+        developer_disclosure: Developer-role shaping disclosure, if any.
+        reserved_output_tokens: Output tokens the reservation holds.
+        sampling_disclosures: Sampling parameters the rung did not send.
+        history_argument_disclosures: Replayed tool arguments the rung reshaped.
+        image_detail_disclosures: The ``original`` image detail sent as ``high``
+            on this rung; empty when the rung forwards it or no image asked for it.
+    """
 
     wire_entry: JsonObject
     signer: GatewayDispatchSigner | None
