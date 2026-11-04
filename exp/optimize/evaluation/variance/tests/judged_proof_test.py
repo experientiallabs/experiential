@@ -1028,7 +1028,9 @@ def test_every_label_rate_advantage_and_reward_traces_to_a_saved_assessment(proo
         assert group.advantages == expected.advantages
     assert confirmed[("urgent", "escalate")] == (0.0, *(1.0,) * 5)
     assert {group.advantages for group in groups if group.option_id == "close"} == {(0.0,) * 6}
-    assert {(r.point, r.measured_rate) for r in records.critics} == {(0, 2 / 3), (1, 2 / 3)}
+    # The error-mining judge is not the per-variant frozen judges, so discovery critics
+    # scored by it are refused for training, with the reason recorded.
+    assert records.critics == () and records.critics_refused
     rewards = {trial: trial_reward(project, result) for trial, result in proof.trials.items()}
     assert rewards == {
         "check-then-escalate": 1.0,
