@@ -54,6 +54,8 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapBinding,
     BootstrapRegistration,
     BootstrapSettings,
+    TaskBaseKey,
+    TaskBaseProgress,
 )
 from exp.optimize.evaluation.variance.bootstrap_decisions import bootstrap_decisions
 from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
@@ -67,6 +69,7 @@ from exp.optimize.evaluation.variance.bootstrap_selection import (
     BootstrapLimits,
     SelectedBootstrap,
     select_bootstrap_families,
+    select_probe_task_bases,
 )
 from exp.optimize.evaluation.variance.build import (
     plan_variance_build,
@@ -145,7 +148,8 @@ class BootstrapPlan(ContractModel):
         build_saved: Whether family review and scoped indexes are already saved.
         completed_tasks: Exact selected tasks with saved registrations or refusals.
         remaining_tasks: Exact pending task IDs, empty while only the task cap is known.
-        task_bound: Most pending tasks, exact once scopes exist and bounded before review.
+        task_bound: Most pending native starts; opt-in many-base starts count task/base pairs.
+        task_base_progress: Explicit canonical/pair bounds and progress for all_exact_schemas.
         family_bound: Most selected families needing rules, exact once scopes exist.
         costs: Known and explicitly unpriced finite physical-request components.
         lines: Human-readable multiplicities and source/selection limitations.
@@ -163,6 +167,9 @@ class BootstrapPlan(ContractModel):
     completed_tasks: tuple[str, ...] = ()
     remaining_tasks: tuple[str, ...] = ()
     task_bound: int = Field(ge=0)
+    task_base_progress: TaskBaseProgress | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     family_bound: int = Field(ge=0)
     costs: tuple[CostLine, ...]
     lines: tuple[str, ...]
@@ -217,6 +224,8 @@ class BootstrapPreparationReport(ContractModel):
         simulators: Saved family definitions carrying the frozen rules and runtime.
         failed_tasks: Retryable failures; their preparation is not marked complete.
         refused_tasks: Saved diagnostic refusals, never silently treated as runnable jobs.
+        failed_starts: Exact failed task/base pairs under the opt-in policy.
+        refused_starts: Exact refused task/base pairs under the opt-in policy.
     """
 
     identity: str
@@ -227,6 +236,8 @@ class BootstrapPreparationReport(ContractModel):
     simulators: tuple[ArtifactInput, ...] = ()
     failed_tasks: tuple[str, ...] = ()
     refused_tasks: tuple[str, ...] = ()
+    failed_starts: tuple[TaskBaseKey, ...] = Field(default=(), exclude_if=lambda value: not value)
+    refused_starts: tuple[TaskBaseKey, ...] = Field(default=(), exclude_if=lambda value: not value)
 
 
 @dataclass(frozen=True)
@@ -423,10 +434,20 @@ def plan_bootstrap_preparation(
     )
     complete: list[str] = []
     pending: list[str] = []
+    completed_starts: list[TaskBaseKey] = []
+    pending_starts: list[TaskBaseKey] = []
+    family_settings = execution.build.spec.environment_families
+    assert family_settings is not None
+    many = family_settings.probe_placement == "all_exact_schemas"
     task_count = min(
         execution.limits.maximum_tasks,
         len(execution.task_ids) or build.roles["mining_probes"].tasks,
     )
+    canonical_bound = task_count
+    if many and saved is None:
+        task_count = min(
+            execution.limits.maximum_tasks, canonical_bound * execution.limits.maximum_families
+        )
     families = min(execution.limits.maximum_families, task_count) if saved is None else 0
     lines = [
         f"Variance build {build.identity}: {'saved' if build.saved else 'pending'}; "
@@ -459,6 +480,15 @@ def plan_bootstrap_preparation(
             ]
             pending.extend(task.task.task_id for task in missing)
             complete.extend(task.task.task_id for task in row.tasks if task not in missing)
+            pending_starts.extend(
+                TaskBaseKey(task_id=task.task.task_id, family_id=row.family.family_id)
+                for task in missing
+            )
+            completed_starts.extend(
+                TaskBaseKey(task_id=task.task.task_id, family_id=row.family.family_id)
+                for task in row.tasks
+                if task not in missing
+            )
             task_count += len(missing)
             if missing and not row.family.frozen:
                 assert batch.rules is not None
@@ -476,9 +506,35 @@ def plan_bootstrap_preparation(
                 )
             components.extend(_role_costs(project, batch, len(missing)))
             components.extend(_validation_costs(project, batch, len(missing), family))
+    progress = None
+    if many:
+        keys = (*completed_starts, *pending_starts)
+        selection = (
+            None
+            if saved is None
+            else select_probe_task_bases(
+                saved,
+                execution.limits,
+                task_ids=execution.task_ids,
+            )
+        )
+        progress = TaskBaseProgress(
+            canonical_task_bound=canonical_bound
+            if saved is None
+            else len({key.task_id for key in keys}),
+            task_base_start_bound=task_count if saved is None else len(keys),
+            completed=tuple(completed_starts),
+            remaining=tuple(pending_starts),
+            omitted={} if selection is None else selection.omissions,
+        )
+        lines.append(
+            f"Many-base placement: {progress.canonical_task_bound} distinct canonical tasks, "
+            f"{progress.task_base_start_bound} task/base starts; entire base groups are retained."
+        )
     settings = execution.bootstrap
     lines.append(
-        f"At most {task_count} pending tasks: each {settings.research_rounds + 1} author rounds, "
+        f"At most {task_count} pending {'task/base starts' if many else 'tasks'}: "
+        f"each {settings.research_rounds + 1} author rounds, "
         f"{len(settings.review_variants)} reviewers per round, "
         f"{settings.research_rounds * settings.research_items} research items, "
         f"{len(settings.reveal_variants)} reveal reviewers, and "
@@ -498,8 +554,9 @@ def plan_bootstrap_preparation(
         code_revision=code_revision,
         build_identity=build.identity,
         build_saved=build.saved,
-        completed_tasks=tuple(complete),
-        remaining_tasks=tuple(pending),
+        completed_tasks=tuple(task for task in dict.fromkeys(complete) if task not in set(pending)),
+        remaining_tasks=tuple(dict.fromkeys(pending)),
+        task_base_progress=progress,
         task_bound=task_count,
         family_bound=families,
         costs=cost_lines(tuple(row for row in components if row.attempts)),
@@ -729,6 +786,11 @@ def _run(
     simulators: list[ArtifactInput] = []
     failed: list[str] = []
     refused: list[str] = []
+    failed_starts: list[TaskBaseKey] = []
+    refused_starts: list[TaskBaseKey] = []
+    family_settings = spec.build.spec.environment_families
+    assert family_settings is not None
+    many = family_settings.probe_placement == "all_exact_schemas"
     for family in selected:
         manifest = run_bootstrap(
             project,
@@ -744,8 +806,16 @@ def _run(
         for entry in manifest.entries:
             if entry.status == "failed":
                 failed.append(entry.task_id)
+                if many:
+                    failed_starts.append(
+                        TaskBaseKey(task_id=entry.task_id, family_id=entry.family_id)
+                    )
             elif entry.status == "refused":
                 refused.append(entry.task_id)
+                if many:
+                    refused_starts.append(
+                        TaskBaseKey(task_id=entry.task_id, family_id=entry.family_id)
+                    )
             else:
                 bindings.append(BootstrapBinding(batch=batch, task_id=entry.task_id))
                 outcome = load_outcome(project, entry.identity)
@@ -770,6 +840,8 @@ def _run(
         batches=tuple(batches),
         bindings=tuple(bindings),
         simulators=tuple(simulators),
-        failed_tasks=tuple(failed),
-        refused_tasks=tuple(refused),
+        failed_tasks=tuple(dict.fromkeys(failed)),
+        refused_tasks=tuple(dict.fromkeys(refused)),
+        failed_starts=tuple(failed_starts),
+        refused_starts=tuple(refused_starts),
     )

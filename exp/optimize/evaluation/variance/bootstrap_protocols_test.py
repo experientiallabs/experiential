@@ -197,6 +197,20 @@ def test_source_snapshot_binds_complete_bounded_review_implementation() -> None:
         "exp/simulation/mining/environment_families.py",
         "exp/simulation/mining/environment_review.py",
     } <= snapshot.files.keys()
-    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v4"
+    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v5"
     assert snapshot.protocols["environment_candidates"] == candidate_protocol_sha256()
     assert snapshot.protocols["environment_review"] == review_protocol_sha256()
+
+
+def test_source_snapshot_binds_native_placement_and_schema_coverage() -> None:
+    """A reviewed source successor cannot omit placement semantics or shared declarations."""
+    from exp.optimize.evaluation.variance.family_scopes import probe_placement_protocol_sha256
+
+    snapshot = current_bootstrap_source()
+    assert {
+        "exp/optimize/evaluation/variance/family_scopes.py",
+        "exp/optimize/evaluation/variance/build_records.py",
+        "exp/optimize/evaluation/variance/bootstrap_pilot.py",
+        "exp/simulation/rules/contracts.py",
+    } <= snapshot.files.keys()
+    assert snapshot.protocols["probe_placement"] == probe_placement_protocol_sha256()

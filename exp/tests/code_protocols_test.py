@@ -47,13 +47,30 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
+        "exp.optimize.evaluation.variance.family_scopes:PROBE_PLACEMENT_PROTOCOL",
+        "probe-placement-v1",
+        (
+            "exp.optimize.evaluation.variance.family_scopes",
+            "exp.optimize.evaluation.variance.build_records:ProbePlacement",
+            "exp.optimize.evaluation.variance.build_records:ProbePlacementRegistration",
+            "exp.optimize.evaluation.variance.build_records:FamilyScoping",
+            "exp.simulation.mining.environment_families:EnvironmentFamilySpec",
+            "exp.simulation.rules.contracts:ToolSchemaCoverage",
+            "exp.simulation.rules.contracts:tool_schema_coverage",
+            "exp.optimize.evaluation.variance.bootstrap_selection:select_probe_task_bases",
+        ),
+        "5884af6217ca6904f22dfa781b4ab25a65149069009eae5c52af6c5c969833df",
+    ),
+    Protocol(
         "exp.optimize.evaluation.variance.environment_catalog:ENVIRONMENT_CATALOG_PROTOCOL",
         "environment-catalog-v2",
         (
             "exp.optimize.evaluation.variance.environment_catalog",
             "exp.simulation.mining.tag_selection",
+            "exp.simulation.rules.contracts:tool_schema_coverage",
+            "exp.simulation.rules.contracts:ToolSchemaCoverage",
         ),
-        "83c218f45b35ad10e7d564a4459107b7735a73402d551da240f8e73062539903",
+        "b8e7d2f2bf9511c504b626a593b80ec832cc0e45229bef85d2fb985cecc14172",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.behavior_differences:BEHAVIOR_DIFFERENCES_PROTOCOL",
@@ -716,7 +733,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
-        "bootstrap-source-revision-v4",
+        "bootstrap-source-revision-v5",
         (
             "exp.optimize.evaluation.variance.bootstrap_protocols",
             "exp.optimize.evaluation.variance.bootstrap_resume",
@@ -725,7 +742,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_selection",
             "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "77a7c0e3c1557332f301e37ff7c7bea3acf95784381c2e254e005e6cadf8bdaf",
+        "ba303a734f66d3e90680013c614a48f70b1bb8bee6e8a69b291df37d62ebefc1",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",

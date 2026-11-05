@@ -73,11 +73,17 @@ class EnvironmentFamilySpec(ContractModel):
     """How a tag clustering becomes environment families.
 
     Attributes:
+        probe_placement: Explicit placement policy; absent retains historical unique
+            tool-name placement.
+            all_exact_schemas attaches a task to every schema-covered base without start QA.
         review: The compatibility review registration.
         admit_uncertain: Uncertain group identities explicitly admitted as families; every other
             uncertain group is reported and left out of training.
     """
 
+    probe_placement: Literal["unique", "all_exact_schemas"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     review: CompatibilitySpec = Field(default_factory=CompatibilitySpec)
     admit_uncertain: tuple[str, ...] = ()
 
