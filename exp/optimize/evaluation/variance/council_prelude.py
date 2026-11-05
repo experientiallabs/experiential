@@ -76,6 +76,8 @@ _PRELUDE_SOURCES = (
     "pipeline_spec.py",
     "pipeline_stages.py",
     "pipeline_inputs.py",
+    "pipeline_admission.py",
+    "pipeline_downstream.py",
     "pipeline_errors.py",
     "pipeline_behaviors.py",
     "rubric_agent.py",

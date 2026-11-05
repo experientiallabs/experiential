@@ -65,6 +65,9 @@ from exp.optimize.evaluation.variance.judge_prompt import DEFAULT_AGENTIC_JUDGE
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.nudge_ladder import CurriculumStage, NudgeLadderSpec
 from exp.optimize.evaluation.variance.nudges import NudgeStrength, RungStrength
+from exp.optimize.evaluation.variance.pipeline_admission import (
+    PipelineStageAdmission,
+)
 from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings
 from exp.optimize.evaluation.variance.pipeline_plan import STAGES as STAGES
 from exp.optimize.evaluation.variance.pipeline_plan import CostLine as CostLine
@@ -100,7 +103,7 @@ if TYPE_CHECKING:
     from exp.simulation.mining.decisions import DecisionsTraceTagger
     from exp.simulation.mining.tagging import TraceTagger
 
-PIPELINE_PROTOCOL = "decision-variance-pipeline-v2"
+PIPELINE_PROTOCOL = "decision-variance-pipeline-v3"
 """Version of the stage graph, its identities and its saved records."""
 
 STAGE_TYPE = "decision-variance-stage"
@@ -556,7 +559,7 @@ class DecisionVarianceSpec(ContractModel):
     mining: MiningSettings
     authoring: AuthoringSettings
     records: RecordsSettings
-    protocol: Literal["decision-variance-pipeline-v2"] = PIPELINE_PROTOCOL
+    protocol: Literal["decision-variance-pipeline-v3"] = PIPELINE_PROTOCOL
 
     def slice(self, stage: StageName) -> JsonObject:
         """Return exactly the fields one stage reads, as keyed JSON.
@@ -631,6 +634,7 @@ class StageDependencies:
     """Injected collaborators a stage may use instead of building its admitted default.
 
     Attributes:
+        stage_admission: Exact native stage spend scope, before any stage owner dispatches.
         council_admission: Native phase admission authority; None preserves the original runner.
         council_prelude_admission: Native accounted TraceML, rubric and behavior authority.
         council_registration: Native barrier qualifying every real generated model study.
@@ -645,6 +649,7 @@ class StageDependencies:
             directory.
     """
 
+    stage_admission: PipelineStageAdmission | None = None
     council_admission: CouncilAdmission | None = None
     council_prelude_admission: CouncilPreludeAdmission | None = None
     council_registration: CouncilStudyRegistration | None = None

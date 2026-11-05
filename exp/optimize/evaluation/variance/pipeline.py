@@ -60,6 +60,7 @@ from exp.common.core.artifacts import (
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.variance.bootstrap import resolve_bootstrap
+from exp.optimize.evaluation.variance.pipeline_admission import complete_stage, stage_scope
 from exp.optimize.evaluation.variance.pipeline_build import BUILD_STAGE
 from exp.optimize.evaluation.variance.pipeline_families import FAMILIES_STAGE
 from exp.optimize.evaluation.variance.pipeline_records import RECORDS_STAGE
@@ -222,6 +223,19 @@ def run_decision_variance(
         else:
             replayed = True
         reference = artifact_input(project.artifacts.read(row.identity + "-stage").manifest)
+        if replayed:
+            complete_stage(
+                StageContext(
+                    project,
+                    spec,
+                    row.identity,
+                    code_revision,
+                    dict(records),
+                    dependencies or StageDependencies(),
+                    row,
+                ),
+                reference,
+            )
         records[row.stage] = saved
         references.append(reference)
         results.append(
@@ -294,9 +308,6 @@ def _execute(
     store = project.artifacts
     with CoordinationLock(store.project_directory / (row.identity + ".lock"), timeout=0):
         saved = load_stage_record(project, row.identity)
-        if saved is not None:
-            return saved
-        before = _measure(project)
         context = StageContext(
             project=project,
             spec=spec,
@@ -306,32 +317,39 @@ def _execute(
             dependencies=dependencies,
             plan=row,
         )
-        result = executor.run(context)
-        usage = _usage(before, _measure(project))
-        record = StageRecord(
-            stage=row.stage,
-            identity=row.identity,
-            upstream=tuple(upstream),
-            outputs=result.outputs.model_dump(mode="json"),
-            references=tuple(
-                sorted({ref for ref in result.references if ref is not None}, key=_artifact_id)
-            ),
-            usage=usage,
-            summary=result.summary,
-        )
-        store.write_json(
-            artifact_id=row.identity + "-stage",
-            artifact_type=STAGE_TYPE,
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=datetime.now(UTC),
-                code_revision=code_revision,
-                inputs=tuple(sorted({*upstream, *record.references}, key=_artifact_id)),
-            ),
-            files={"record.json": record},
-        )
-        logger.info("decision-variance stage %s saved as %s", row.stage, row.identity)
-        return record
+        if saved is not None:
+            complete_stage(context, artifact_input(store.read(row.identity + "-stage").manifest))
+            return saved
+        with stage_scope(context):
+            before = _measure(project)
+            result = executor.run(context)
+            usage = _usage(before, _measure(project))
+            record = StageRecord(
+                stage=row.stage,
+                identity=row.identity,
+                upstream=tuple(upstream),
+                outputs=result.outputs.model_dump(mode="json"),
+                references=tuple(
+                    sorted({ref for ref in result.references if ref is not None}, key=_artifact_id)
+                ),
+                usage=usage,
+                summary=result.summary,
+            )
+            store.write_json(
+                artifact_id=row.identity + "-stage",
+                artifact_type=STAGE_TYPE,
+                envelope=ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=datetime.now(UTC),
+                    code_revision=code_revision,
+                    inputs=tuple(sorted({*upstream, *record.references}, key=_artifact_id)),
+                ),
+                files={"record.json": record},
+            )
+            reference = artifact_input(store.read(row.identity + "-stage").manifest)
+            complete_stage(context, reference)
+            logger.info("decision-variance stage %s saved as %s", row.stage, row.identity)
+            return record
 
 
 def _identities(
