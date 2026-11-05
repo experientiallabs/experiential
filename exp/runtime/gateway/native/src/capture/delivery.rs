@@ -1,7 +1,7 @@
 //! Count- and byte-bounded delivery, isolated from request and bridge executors.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -106,7 +106,7 @@ impl Limits {
 
 #[derive(Default)]
 struct Counters {
-    abandoned: AtomicBool,
+    abandon_at: Mutex<Option<Instant>>,
     bytes: AtomicUsize,
     preparation_bytes: AtomicUsize,
     pending: AtomicUsize,
@@ -116,6 +116,15 @@ struct Counters {
     maintenance_failed: AtomicU64,
     capacity: Mutex<()>,
     available: Condvar,
+}
+
+impl Counters {
+    fn abandoned(&self) -> bool {
+        self.abandon_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() >= until)
+    }
 }
 
 struct Checkpoint {
@@ -171,7 +180,7 @@ fn run_worker<S: Sink>(
     let mut maintained = Instant::now();
     let mut delay = Duration::from_millis(25);
     loop {
-        if counters.abandoned.load(Ordering::Acquire) {
+        if counters.abandoned() {
             break;
         }
         if maintained.elapsed() >= Duration::from_secs(1) {
@@ -337,7 +346,7 @@ fn run_worker<S: Sink>(
                 Err(_) => break,
             }
         }
-        if counters.abandoned.load(Ordering::Acquire) {
+        if counters.abandoned() {
             break;
         }
         let ready: Vec<_> = pending.iter().filter_map(|p| p.value.as_ref()).collect();
@@ -404,7 +413,7 @@ fn run_worker<S: Sink>(
             // Prepared strings and admission charges remain live across retries.
             // Keep the preparation charge visible while sleeping too.
             let until = Instant::now() + delay;
-            while !counters.abandoned.load(Ordering::Acquire) && Instant::now() < until {
+            while !counters.abandoned() && Instant::now() < until {
                 std::thread::sleep(
                     Duration::from_millis(25).min(until.saturating_duration_since(Instant::now())),
                 );
@@ -417,7 +426,7 @@ fn run_worker<S: Sink>(
         }
     }
 
-    if counters.abandoned.load(Ordering::Acquire) {
+    if counters.abandoned() {
         // Destruction, unlike a close timeout, relinquishes the only recovery
         // owner. Fail receipts explicitly and account for every unfinished item.
         for entry in pending {
@@ -536,8 +545,13 @@ pub(crate) struct Delivery {
 impl Drop for Delivery {
     fn drop(&mut self) {
         // close_until(false) retains work for recovery while this owner lives.
-        // Once the owner is destroyed there can be no later drain attempt.
-        self.counters.abandoned.store(true, Ordering::Release);
+        // Give accepted checkpoints one final bounded drain after owner loss.
+        // No later caller can extend this deadline or recover the queue.
+        *self
+            .counters
+            .abandon_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(1));
         if let Ok(sender) = self.sender.get_mut() {
             if let Some(sender) = sender.take() {
                 let _ = sender.try_send(None);

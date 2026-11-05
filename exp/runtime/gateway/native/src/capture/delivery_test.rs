@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 #[test]
 fn delayed_capture_does_not_block_ready_neighbor() {
