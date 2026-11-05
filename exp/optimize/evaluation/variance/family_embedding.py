@@ -36,6 +36,7 @@ from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
 from exp.optimize.evaluation.variance.bootstrap_protocols import _predecessor
 from exp.optimize.evaluation.variance.build_records import FamilyScope, load_exposure_plan
 from exp.optimize.evaluation.variance.pipeline_inputs import rules_costs
+from exp.runtime.models.providers.openai_compatible import openai_embedding_response
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.spend_ceiling import MAXIMUM_UNPRICED_ATTEMPTS
 from exp.simulation.retrieval import load_rag_index
@@ -53,6 +54,9 @@ if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
     from exp.optimize.evaluation.variance.bootstrap_resume import BootstrapResumeBinding
     from exp.optimize.evaluation.variance.build_records import VarianceBuildReport
+    from exp.optimize.evaluation.variance.family_embedding_executor import (
+        FamilyEmbeddingExecutorRevision,
+    )
 
 INTENT_TYPE = "family-embedding-intent"
 COMPLETION_TYPE = "family-embedding-completion"
@@ -122,6 +126,7 @@ class FamilyEmbeddingPlan(ContractModel):
         physical_pending: Pending physical attempts across all priced/unpriced components.
         known_usd: Existing accounted and known-rate pending amount.
         stop: Native finite stop, never renewed by planning.
+        executor_revision: Exact same-intent source/executor compatibility, when required.
     """
 
     intent: ArtifactInput
@@ -133,6 +138,9 @@ class FamilyEmbeddingPlan(ContractModel):
     physical_pending: int
     known_usd: float
     stop: AwareDatetime
+    executor_revision: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class FamilyEmbeddingCompletion(ContractModel):
@@ -143,12 +151,16 @@ class FamilyEmbeddingCompletion(ContractModel):
         scope: Same admitted family with only its index/world pointers changed.
         dispatch_evidence: Native physical response records proving target inference occurred.
         producer_revision: Actual new artifact producer, never the historical build producer.
+        executor_revision: Explicit reviewed same-intent new executor, when required.
     """
 
     intent: ArtifactInput
     scope: FamilyScope
     dispatch_evidence: tuple[ArtifactInput, ...] = Field(min_length=1)
     producer_revision: str
+    executor_revision: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def check_rules_revision(old: RulesStageSpec, new: RulesStageSpec, deadline: datetime) -> None:
@@ -174,8 +186,33 @@ def check_rules_revision(old: RulesStageSpec, new: RulesStageSpec, deadline: dat
         raise ValueError("rules revision changes unrelated memory controls")
 
 
+def _executor(
+    project: ProjectStore,
+    reference: ArtifactInput | None,
+    intent: FamilyEmbeddingIntent,
+    *,
+    historical: bool = False,
+) -> FamilyEmbeddingExecutorRevision | None:
+    """Require exact native compatibility for a real new executor, never a historical bypass."""
+    if reference is None:
+        return None
+    from exp.optimize.evaluation.variance.family_embedding_executor import (
+        load_family_embedding_executor_revision,
+    )
+
+    revision = load_family_embedding_executor_revision(project, reference, historical=historical)
+    current = artifact_input(project.artifacts.read(stable_id(INTENT_TYPE, intent)).manifest)
+    if revision.intent != current:
+        raise ValueError("executor revision belongs to another embedding intent")
+    return revision
+
+
 def _context(
-    project: ProjectStore, intent: FamilyEmbeddingIntent, *, historical: bool = False
+    project: ProjectStore,
+    intent: FamilyEmbeddingIntent,
+    *,
+    historical: bool = False,
+    executor_revision: ArtifactInput | None = None,
 ) -> tuple[BootstrapResumeBinding, BootstrapPreparationSpec, VarianceBuildReport]:
     """Verify old authority, exact whole-family evidence and the real native execution window."""
     parent, original = _predecessor(project, intent.previous_binding)
@@ -207,7 +244,8 @@ def _context(
         or window.execution_deadline != intent.deadline
     ):
         raise ValueError("family embedding window changes original authority")
-    if not historical and intent.source_fingerprint != source_fingerprint():
+    executor = _executor(project, executor_revision, intent, historical=historical)
+    if not historical and executor is None and intent.source_fingerprint != source_fingerprint():
         raise ValueError("family embedding actual source changed")
     catalog = load_runtime_catalog(project, intent.target_catalog)
     snapshot, capabilities = RuntimeModelCatalog(catalog, environment={}).snapshot(
@@ -241,9 +279,13 @@ def _context(
         check_rules_revision(baseline.bootstrap.rules, intent.rules_revision, intent.deadline)
     from exp.optimize.evaluation.executable import grounded
 
-    if not historical and (
-        intent.runtime_file != Path(grounded.__file__).resolve()
-        or intent.runtime_sha256 != sha256_bytes(intent.runtime_file.read_bytes())
+    if (
+        not historical
+        and executor is None
+        and (
+            intent.runtime_file != Path(grounded.__file__).resolve()
+            or intent.runtime_sha256 != sha256_bytes(intent.runtime_file.read_bytes())
+        )
     ):
         raise ValueError("family embedding maintained runtime source changed")
     exposure = load_exposure_plan(project, report.exposure)
@@ -337,6 +379,7 @@ def load_family_embedding_intent(
     reference: ArtifactInput,
     *,
     historical: bool = False,
+    executor_revision: ArtifactInput | None = None,
 ) -> FamilyEmbeddingIntent:
     """Load an immutable native intent, refusing guessed identities and source changes."""
     manifest = project.artifacts.read(reference.artifact_id).manifest
@@ -367,19 +410,22 @@ def load_family_embedding_intent(
     )
     if manifest.inputs != expected:
         raise ValueError("family embedding intent ancestry changed")
-    _context(project, intent, historical=historical)
+    _context(project, intent, historical=historical, executor_revision=executor_revision)
     return intent
 
 
 def plan_family_embedding_migration(
-    project: ProjectStore, reference: ArtifactInput
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    executor_revision: ArtifactInput | None = None,
 ) -> FamilyEmbeddingPlan:
     """Price every pending native role and exact-family target input under unchanged authority."""
     from exp.optimize.evaluation.variance.bootstrap_plan import _role_costs, _validation_costs
     from exp.optimize.evaluation.variance.bootstrap_resume import bootstrap_execution_spec
 
-    intent = load_family_embedding_intent(project, reference)
-    parent, original, _ = _context(project, intent)
+    intent = load_family_embedding_intent(project, reference, executor_revision=executor_revision)
+    parent, original, _ = _context(project, intent, executor_revision=executor_revision)
     execution = bootstrap_execution_spec(project, parent, original)
     scope = intent.source_scope
     old = load_reembedding_input(project.artifacts, scope.index)
@@ -437,20 +483,26 @@ def plan_family_embedding_migration(
         + sum(r.attempts for r in costs if r.usd is None),
         known_usd=summary.accounted_usd + sum(r.usd or 0.0 for r in costs),
         stop=intent.deadline,
+        executor_revision=executor_revision,
     )
 
 
 @contextmanager
 def admitted_family_embedding_migration(
-    project: ProjectStore, reference: ArtifactInput
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    executor_revision: ArtifactInput | None = None,
 ) -> Iterator[FamilyEmbeddingPlan]:
     """Hold original-operation ownership from fresh full admission through materialization."""
-    intent = load_family_embedding_intent(project, reference)
+    intent = load_family_embedding_intent(project, reference, executor_revision=executor_revision)
     with CoordinationLock(
         project.artifacts.project_directory / (intent.original_operation + ".lock"), timeout=0
     ):
-        plan = plan_family_embedding_migration(project, reference)
-        parent, _, _ = _context(project, intent)
+        plan = plan_family_embedding_migration(
+            project, reference, executor_revision=executor_revision
+        )
+        parent, _, _ = _context(project, intent, executor_revision=executor_revision)
         if datetime.now(UTC) >= plan.stop:
             raise ValueError("family embedding native execution window expired")
         if plan.unpriced_attempts > min(
@@ -465,10 +517,15 @@ def admitted_family_embedding_migration(
 
 
 def admit_family_embedding_migration(
-    project: ProjectStore, reference: ArtifactInput
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    executor_revision: ArtifactInput | None = None,
 ) -> FamilyEmbeddingPlan:
     """Check full pending admission without dispatch; execution must reacquire the owner context."""
-    with admitted_family_embedding_migration(project, reference) as plan:
+    with admitted_family_embedding_migration(
+        project, reference, executor_revision=executor_revision
+    ) as plan:
         return plan
 
 
@@ -484,8 +541,14 @@ def validate_family_embedding_completion(
     project: ProjectStore,
     intent: FamilyEmbeddingIntent,
     completion: FamilyEmbeddingCompletion,
+    *,
+    historical: bool = False,
 ) -> None:
     """Require actual exact-scope target vectors and native target dispatch provenance."""
+    executor = _executor(project, completion.executor_revision, intent, historical=historical)
+    producer = intent.producer_revision if executor is None else executor.producer_revision
+    if completion.producer_revision != producer:
+        raise ValueError("completion does not name its actual admitted executor")
     check_scope_preservation(intent.source_scope, completion.scope)
     old = load_rag_index(project.artifacts, intent.source_scope.index.artifact_id)
     new = load_rag_index(project.artifacts, completion.scope.index.artifact_id)
@@ -533,7 +596,7 @@ def validate_family_embedding_completion(
         raise ValueError("new family artifacts must retain their actual producer")
     catalog = load_runtime_catalog(project, intent.target_catalog)
     target = catalog.models[intent.target_catalog.embedder_alias]
-    wire_model = target.served_model_id or target.model
+    wire_model = target.model
     import json
 
     proved: dict[str, Embedding] = {}
@@ -573,6 +636,10 @@ def validate_family_embedding_completion(
             raise ValueError("family embedding dispatch is not bound to this target and intent")
         cited = body.get("input")
         result = response.get("response_body")
+        if not isinstance(result, dict) or result.get("model") != (
+            target.served_model_id or target.model
+        ):
+            raise ValueError("embedding response echo differs from the declared served model")
         if (
             not isinstance(cited, list)
             or not isinstance(result, dict)
@@ -594,12 +661,8 @@ def validate_family_embedding_completion(
             texts.append(text)
         if request.get("request_sha256") != sha256_json({**body, "input": texts}):
             raise ValueError("family embedding reconstructed request digest differs")
-        rows = sorted(result["data"], key=lambda row: row["index"])
-        if [row["index"] for row in rows] != list(range(len(texts))):
-            raise ValueError("family embedding response coverage is incomplete")
-        for text, row in zip(texts, rows, strict=True):
-            assert isinstance(text, str)
-            value = Embedding(values=tuple(row["embedding"]))
+        values = openai_embedding_response(result, expected_count=len(texts))
+        for text, value in zip(texts, values, strict=True):
             if text in proved and proved[text] != value:
                 raise ValueError("family embedding native responses conflict")
             proved[text] = value
@@ -626,8 +689,12 @@ def register_family_embedding_completion(
     completion: FamilyEmbeddingCompletion,
 ) -> ArtifactInput:
     """Publish a genuine family-only completion, without relabeling the original build report."""
-    intent = load_family_embedding_intent(project, completion.intent)
-    if completion.producer_revision != intent.producer_revision:
+    intent = load_family_embedding_intent(
+        project, completion.intent, executor_revision=completion.executor_revision
+    )
+    executor = _executor(project, completion.executor_revision, intent)
+    producer = intent.producer_revision if executor is None else executor.producer_revision
+    if completion.producer_revision != producer:
         raise ValueError("family embedding completion producer changed")
     validate_family_embedding_completion(project, intent, completion)
     identity = stable_id(COMPLETION_TYPE, completion)
@@ -641,6 +708,11 @@ def register_family_embedding_completion(
                     completion.scope.index,
                     completion.scope.world_model,
                     *completion.dispatch_evidence,
+                    *(
+                        ()
+                        if completion.executor_revision is None
+                        else (completion.executor_revision,)
+                    ),
                 )
             ),
             key=lambda r: r.artifact_id,
@@ -686,6 +758,11 @@ def load_family_embedding_completion(
                     completion.scope.index,
                     completion.scope.world_model,
                     *completion.dispatch_evidence,
+                    *(
+                        ()
+                        if completion.executor_revision is None
+                        else (completion.executor_revision,)
+                    ),
                 )
             ),
             key=lambda r: r.artifact_id,
@@ -693,8 +770,13 @@ def load_family_embedding_completion(
     )
     if manifest.inputs != expected:
         raise ValueError("family embedding completion ancestry changed")
-    intent = load_family_embedding_intent(project, completion.intent, historical=historical)
-    validate_family_embedding_completion(project, intent, completion)
+    intent = load_family_embedding_intent(
+        project,
+        completion.intent,
+        historical=historical,
+        executor_revision=completion.executor_revision,
+    )
+    validate_family_embedding_completion(project, intent, completion, historical=historical)
     return intent, completion
 
 
@@ -706,14 +788,17 @@ def apply_family_embedding_spec(
     historical: bool = False,
 ) -> BootstrapPreparationSpec:
     """Apply only the exact registered catalog/runtime/rules changes to original pilot settings."""
-    intent, _ = load_family_embedding_completion(project, reference, historical=historical)
+    intent, completion = load_family_embedding_completion(project, reference, historical=historical)
+    executor = _executor(project, completion.executor_revision, intent, historical=historical)
     settings = spec.bootstrap
     runtime = settings.runtime.model_copy(
         update={
             "catalog_binding": intent.target_catalog,
             "catalog_sha256": intent.target_catalog.catalog_sha256,
-            "runtime_file": intent.runtime_file,
-            "runtime_sha256": intent.runtime_sha256,
+            "runtime_file": intent.runtime_file if executor is None else executor.runtime_file,
+            "runtime_sha256": intent.runtime_sha256
+            if executor is None
+            else executor.runtime_sha256,
         }
     )
     rules = intent.rules_revision or settings.rules
@@ -766,6 +851,8 @@ def materialize_family_embedding(
     project: ProjectStore,
     reference: ArtifactInput,
     embedder: RAGEmbedderBinding,
+    *,
+    executor_revision: ArtifactInput | None = None,
 ) -> FamilyScope:
     """Run only native exact-family index/world materialization after caller admission.
 
@@ -776,8 +863,10 @@ def materialize_family_embedding(
     from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
     from exp.simulation.world_model.artifact import persist_grounded_world_model
 
-    intent = load_family_embedding_intent(project, reference)
-    _, _, report = _context(project, intent)
+    intent = load_family_embedding_intent(project, reference, executor_revision=executor_revision)
+    _, _, report = _context(project, intent, executor_revision=executor_revision)
+    executor = _executor(project, executor_revision, intent)
+    producer = intent.producer_revision if executor is None else executor.producer_revision
     if (
         embedder.snapshot != intent.target_embedder
         or embedder.maximum_attempts != intent.attempts_per_batch
@@ -796,7 +885,7 @@ def materialize_family_embedding(
         tuple(source.artifact_input for source in old.index.sources),
         load_completed_build_rag_lineage_bindings(project.artifacts, report.build),
         created_at=datetime.now(UTC),
-        code_revision=intent.producer_revision,
+        code_revision=producer,
         embedder=embedder,
         default_top_k=old.index.default_top_k,
         included_partitions=frozenset(old.index.included_partitions),
@@ -809,7 +898,7 @@ def materialize_family_embedding(
         model_alias=original.model_alias,
         model=original.model,
         created_at=datetime.now(UTC),
-        code_revision=intent.producer_revision,
+        code_revision=producer,
         top_k=original.top_k,
         knowledge=original.knowledge,
         selection_policy_sha256=original.selection_policy_sha256,

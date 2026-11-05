@@ -34,6 +34,7 @@ from exp.optimize.evaluation.variance.family_embedding import (
 )
 from exp.runtime.models.call_evidence import canonical_call
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.openai_compatible import openai_embedding_response
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -153,7 +154,15 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
         def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
             values = HashingRAGEmbedder(8).embed(texts)
             self.requests.append((tuple(texts), values))
-            return values
+            return openai_embedding_response(
+                {
+                    "data": [
+                        {"index": i, "embedding": list(value.values)}
+                        for i, value in enumerate(values)
+                    ]
+                },
+                expected_count=len(texts),
+            )
 
     fixture = FixtureEmbedding()
     with pytest.raises(ValueError, match="chunk semantics"):
@@ -183,9 +192,10 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
         JsonHttpResponse(
             status_code=200,
             body={
+                "model": record.served_model_id,
                 "data": [
                     {"index": i, "embedding": list(value.values)} for i, value in enumerate(values)
-                ]
+                ],
             },
         )
         for _, values in fixture.requests
@@ -202,7 +212,7 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
             transport.post(
                 "https://fixture.invalid/v1/embeddings",
                 headers={},
-                payload={"model": "synthetic-target-wire", "input": list(texts)},
+                payload={"model": record.model, "input": list(texts)},
                 timeout_seconds=30,
             )
     refs = [
