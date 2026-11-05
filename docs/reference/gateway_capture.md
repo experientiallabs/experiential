@@ -173,7 +173,12 @@ batch from blocking unrelated captures. Updates can arrive out of order, so the
 destination must refuse to replace newer evidence with an older update and must
 retry a completion reference until its prompt exists. Sequential destinations
 leave this option disabled. Retried payloads remain within the delivery byte
-budget; genuine capacity exhaustion still refuses admission.
+budget; genuine capacity exhaustion still refuses admission. If a prepared
+payload expands beyond the remaining retained-byte budget, it must stay in the
+single preparation workspace. Already-accepted neighbors can then wait until
+that write recovers. Independent retries do not promise progress through this
+exhausted-budget case; moving that payload aside would require bounded spill
+storage or another explicitly budgeted workspace.
 Destinations that accept UTF-8 can set `bytes_output=True` to receive immutable
 bytes instead of strings. This skips Unicode decoding and re-encoding at the
 storage boundary; the JSON, size limits and acknowledgement semantics are
@@ -261,7 +266,13 @@ while releasing the GIL; a blocked destination cannot extend that caller's deadl
 A drain timeout returns false and leaves accepted delivery records queued, including
 producers already waiting for space. It does not purge them. The host must keep the
 process and destination alive to finish draining; closing its database before a
-successful drain is unsafe. This memory queue is not a crash-recovery journal.
+successful drain is unsafe. Destroying the collector ends retries and relinquishes
+remaining captures: unfinished delivery receipts fail and undelivered records
+are counted as dropped, never persisted. Teardown signals cancellation without
+joining a potentially blocked external callback; the worker exits when that
+callback returns and observes cancellation. A host that needs lossless shutdown
+must retain the collector until `close()` succeeds. This memory queue is not a
+crash-recovery journal.
 Unsettled hosted records remain pending until permission arrives or their TTL expires;
 closing does not grant permission or purge them. Per-record size limits and explicit retention
 policies still apply; this overload guarantee does not mean unlimited retention.
