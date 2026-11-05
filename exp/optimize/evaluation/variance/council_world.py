@@ -228,6 +228,14 @@ class CouncilRuntimeGrant(ContractModel):
         """Keep the saved registration as this job's durable physical-world identity."""
         return self.model_dump(mode="json")
 
+    def require_job(self, project: ProjectStore, job: ContinuationJob) -> None:
+        """A cached grant for one actor or checkpoint cannot authorize another incoming job."""
+        stored = project.artifacts.read(self.registration.artifact_id)
+        record = CouncilRuntimeRecord.model_validate_json(stored.payloads["grant.json"])
+        if record.job != job:
+            raise ValueError("council runtime authority belongs to another exact incoming job")
+        self.require_configuration(project, job.configuration, runtime_sha256=job.runtime_sha256)
+
     def require_configuration(
         self,
         project: ProjectStore,

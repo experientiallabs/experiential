@@ -146,6 +146,16 @@ def test_actual_loader_requires_exact_registered_job_envelope_and_preserves_resu
             with load_continuation_runtime(project, spec.initial) as runtime:
                 return runtime.probe_sha256
 
+        with runtime_authority_scope(lambda project, job: grant):
+            with load_continuation_runtime(project, spec.initial) as runtime:
+                assert runtime.probe_sha256 == spec.initial.study.probe_sha256
+            other = contract.studies[1].initial
+            assert other.configuration == spec.initial.configuration
+            assert other.runtime_sha256 == spec.initial.runtime_sha256
+            assert other != spec.initial
+            with pytest.raises(ValueError, match="another exact incoming job"):
+                load_continuation_runtime(project, other)
+
         with runtime_authority_scope(
             lambda project, job: register_council_runtime(
                 project, registration.qualification, reference, job, code_revision="corrected"

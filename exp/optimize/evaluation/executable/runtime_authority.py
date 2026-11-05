@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.executable.provider_grant import RuntimeProviderAuthority
@@ -14,9 +14,18 @@ from exp.runtime.models.spend_ceiling import current_spend_ceiling
 if TYPE_CHECKING:
     from exp.optimize.evaluation.continuations.job import ContinuationJob
 
+
+class JobRuntimeProviderAuthority(RuntimeProviderAuthority, Protocol):
+    """Operational authority must bind the entire incoming job before runtime source import."""
+
+    def require_job(self, project: ProjectStore, job: ContinuationJob) -> None:
+        """Verify actor, checkpoint, counts, horizon, runtime, configuration and lifecycle."""
+
+
 type RuntimeAuthorityResolver = Callable[
-    [ProjectStore, "ContinuationJob"], RuntimeProviderAuthority
+    [ProjectStore, "ContinuationJob"], JobRuntimeProviderAuthority
 ]
+
 
 _RESOLVER: ContextVar[RuntimeAuthorityResolver | None] = ContextVar(
     "native-runtime-authority-resolver", default=None
@@ -48,5 +57,6 @@ def runtime_authority(
     if not scoped:
         raise ValueError("runtime authority cannot be used outside its native spend envelope")
     authority = resolver(project, job)
+    authority.require_job(project, job)
     authority.require_configuration(project, job.configuration, runtime_sha256=job.runtime_sha256)
     return authority
