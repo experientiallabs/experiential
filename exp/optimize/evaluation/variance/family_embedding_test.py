@@ -227,6 +227,55 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
         producer_revision="fixture-new",
     )
     completed = register_family_embedding_completion(project, completion)
+    # The catalog may adopt only this exact verified completion, without new physical work.
+    from exp.optimize.evaluation.variance.build_records import REPORT_TYPE, save_artifact
+    from exp.optimize.evaluation.variance.build_test import TASK_BANK
+    from exp.optimize.evaluation.variance.environment_catalog import (
+        EnvironmentBaseSpec,
+        EnvironmentCatalogSpec,
+        TagTaskSetSpec,
+        plan_environment_catalog,
+    )
+    from exp.simulation.mining.questions import resolve_question_bank
+    from exp.simulation.mining.tag_selection import TagRule
+
+    catalog_spec = EnvironmentCatalogSpec(
+        task_sets=(
+            TagTaskSetSpec(
+                rule=TagRule(
+                    name="tagged-probes",
+                    require_all=("shape.q0",),
+                    threshold=0.05,
+                )
+            ),
+        ),
+        bases=(
+            EnvironmentBaseSpec(
+                name="completed-base",
+                family_id=scope.family_id,
+                embedding_completion=completed,
+            ),
+        ),
+        banks={"task": resolve_question_bank(TASK_BANK)},
+    )
+    ledger_before_catalog = ledger.summary()
+    catalog = plan_environment_catalog(project, intent.source_build, catalog_spec)
+    assert catalog.bases[0].scope == completion.scope
+    assert catalog.bases[0].index_embedder == intent.target_embedder
+    assert catalog.bases[0].producer_revision == completion.producer_revision
+    assert catalog.exposure == load_pilot_build(project, pilot).exposure
+    assert catalog.bases[0].scope.members == intent.source_scope.members
+    assert all(row.task_start_qa == "pending" for row in catalog.instances)
+    assert ledger.summary() == ledger_before_catalog
+    wrong_source = save_artifact(
+        project.artifacts,
+        REPORT_TYPE,
+        {"report.json": load_pilot_build(project, pilot)},
+        (intent.source_build,),
+        "test",
+    )
+    with pytest.raises(ValueError, match="another source build or base"):
+        plan_environment_catalog(project, wrong_source, catalog_spec)
     successor = register_bootstrap_resume(
         project,
         original_inputs=parent.original_inputs,
