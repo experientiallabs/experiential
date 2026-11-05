@@ -54,6 +54,12 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapRegistration,
     BootstrapSettings,
 )
+from exp.optimize.evaluation.variance.bootstrap_resume import (
+    BootstrapResumeBinding,
+    bootstrap_author_retries,
+    bootstrap_execution_spec,
+    load_bootstrap_resume,
+)
 from exp.optimize.evaluation.variance.bootstrap_selection import (
     BootstrapLimits,
     SelectedBootstrap,
@@ -143,6 +149,7 @@ class BootstrapPlan(ContractModel):
         accounted_usd: Existing settled or retained charges counted against resumed consent.
         accounted_unpriced_attempts: Existing unpriced requests counted against resumed consent.
         complete: Every selected task is already saved.
+        resume_binding: Explicit cross-producer permission retaining the original operation.
     """
 
     identity: str
@@ -159,6 +166,9 @@ class BootstrapPlan(ContractModel):
     accounted_usd: float = Field(default=0, ge=0)
     accounted_unpriced_attempts: int = Field(default=0, ge=0)
     complete: bool = False
+    resume_binding: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @property
     def digest(self) -> Sha256:
@@ -325,10 +335,21 @@ def _validation_costs(
 
 
 def plan_bootstrap_preparation(
-    project: ProjectStore, spec: BootstrapPreparationSpec, *, code_revision: str
+    project: ProjectStore,
+    spec: BootstrapPreparationSpec,
+    *,
+    code_revision: str,
+    resume_binding: ArtifactInput | None = None,
 ) -> BootstrapPlan:
     """Price selected completed-build preparation before credentials or a mining start exists."""
-    template = spec.bootstrap.runtime
+    binding = (
+        None
+        if resume_binding is None
+        else load_bootstrap_resume(project, resume_binding, spec=spec, code_revision=code_revision)
+    )
+    execution = spec if binding is None else bootstrap_execution_spec(project, binding, spec)
+    identity_revision = code_revision if binding is None else binding.original_revision
+    template = execution.bootstrap.runtime
     maintained = sha256_bytes(Path(grounded.__file__).read_bytes())
     if (
         template.runtime_sha256 != maintained
@@ -343,8 +364,13 @@ def plan_bootstrap_preparation(
         code_revision=code_revision,
         reviewer_model=reviewer.model,
         reviewer_configuration_sha256=sha256_json(reviewer),
+        identity_revision=None if binding is None else identity_revision,
     )
-    identity = _identity(spec, build.identity, code_revision)
+    identity = _identity(spec, build.identity, identity_revision)
+    if binding is not None and (
+        identity != binding.original_operation or build.identity != binding.original_build
+    ):
+        raise ValueError("bootstrap resume changed its original semantic identity")
     saved = _saved_build(project, build.identity)
     if saved is None and spec.simulators:
         raise ValueError("reusing frozen simulators requires their saved variance build first")
@@ -367,7 +393,7 @@ def plan_bootstrap_preparation(
         else select_bootstrap_families(
             project,
             saved,
-            spec.bootstrap,
+            execution.bootstrap,
             spec.limits,
             task_ids=spec.task_ids,
             simulators=spec.simulators,
@@ -384,10 +410,10 @@ def plan_bootstrap_preparation(
         f"{build.decision_calls} tagging and {build.review_calls} compatibility-review calls."
     ]
     if saved is None:
-        if spec.bootstrap.rules is not None:
+        if execution.bootstrap.rules is not None:
             rows, explanation = rules_costs(
                 project,
-                spec.bootstrap.rules,
+                execution.bootstrap.rules,
                 spec.limits.maximum_family_traces,
                 spec.limits.maximum_family_tools,
             )
@@ -396,8 +422,8 @@ def plan_bootstrap_preparation(
                 f"At most {families} selected families, each {explanation}; "
                 "actual scopes must fit the registered bounds."
             )
-        components.extend(_role_costs(project, spec.bootstrap, task_count))
-        components.extend(_validation_costs(project, spec.bootstrap, task_count))
+        components.extend(_role_costs(project, execution.bootstrap, task_count))
+        components.extend(_validation_costs(project, execution.bootstrap, task_count))
     else:
         task_count = 0
         for family in selected:
@@ -427,7 +453,7 @@ def plan_bootstrap_preparation(
                 )
             components.extend(_role_costs(project, batch, len(missing)))
             components.extend(_validation_costs(project, batch, len(missing), family))
-    settings = spec.bootstrap
+    settings = execution.bootstrap
     lines.append(
         f"At most {task_count} pending tasks: each {settings.research_rounds + 1} author rounds, "
         f"{len(settings.review_variants)} reviewers per round, "
@@ -441,6 +467,7 @@ def plan_bootstrap_preparation(
         spent = operation_spend_ceiling(project, identity).summary()
         accounted_usd, accounted_unpriced = spent.accounted_usd, spent.unpriced_attempts
     return BootstrapPlan(
+        resume_binding=resume_binding,
         accounted_usd=accounted_usd,
         accounted_unpriced_attempts=accounted_unpriced,
         identity=identity,
@@ -465,6 +492,7 @@ def run_bootstrap_preparation(
     code_revision: str,
     approval: BootstrapApproval | None = None,
     dependencies: BootstrapDependencies | None = None,
+    resume_binding: ArtifactInput | None = None,
 ) -> BootstrapPreparationReport:
     """Prepare or replay exact family starts under one explicitly approved operation ceiling.
 
@@ -474,13 +502,38 @@ def run_bootstrap_preparation(
     """
     dependencies = dependencies or BootstrapDependencies()
     spec = BootstrapPreparationSpec.model_validate_json(spec.model_dump_json())
-    plan = plan_bootstrap_preparation(project, spec, code_revision=code_revision)
+    binding = (
+        None
+        if resume_binding is None
+        else load_bootstrap_resume(project, resume_binding, spec=spec, code_revision=code_revision)
+    )
+    plan = plan_bootstrap_preparation(
+        project, spec, code_revision=code_revision, resume_binding=resume_binding
+    )
     result_id = plan.identity + "-result"
     if project.artifacts.exists(result_id):
         return BootstrapPreparationReport.model_validate_json(
             project.artifacts.read_bytes(result_id, "report.json")
         )
-    if not plan.complete:
+    if binding is not None:
+        if datetime.now(UTC) >= binding.stop:
+            raise ValueError(
+                "bootstrap preparation execution deadline expired; register a finite renewal"
+            )
+        if (
+            plan.known_usd > binding.preparation_usd
+            or plan.unpriced_attempts > binding.preparation_unpriced_attempts
+        ):
+            raise ValueError(
+                "bootstrap resume inventory exceeds the original preparation authority"
+            )
+        if approval is not None and (
+            approval.plan_sha256 != plan.digest
+            or approval.ceiling_usd != binding.preparation_usd
+            or approval.unpriced_attempts != binding.preparation_unpriced_attempts
+        ):
+            raise ValueError("bootstrap resume approval cannot change original authority")
+    elif not plan.complete:
         if approval is None or approval.plan_sha256 != plan.digest:
             raise ValueError(
                 "bootstrap preparation needs explicit approval of its exact current plan"
@@ -496,6 +549,7 @@ def run_bootstrap_preparation(
             project,
             spec.build.spec,
             code_revision=code_revision,
+            identity_revision=None if binding is None else binding.original_revision,
             reviewer_model=spec.build.reviewer.model if spec.build.reviewer is not None else None,
             reviewer_configuration_sha256=(
                 None if spec.build.reviewer is None else sha256_json(spec.build.reviewer)
@@ -504,7 +558,11 @@ def run_bootstrap_preparation(
         if injected != expected:
             raise ValueError("injected decision tagger differs from the approved model snapshot")
     reviewer = dependencies.reviewer or family_reviewer(
-        project, spec.build, code_revision=code_revision
+        project,
+        spec.build,
+        code_revision=code_revision,
+        author_retries=None if binding is None else bootstrap_author_retries(project, binding),
+        execution_window=None if binding is None else binding.execution_window,
     )
     assert spec.build.reviewer is not None
     if reviewer.model != spec.build.reviewer.model or reviewer.configuration_sha256 != sha256_json(
@@ -523,13 +581,15 @@ def run_bootstrap_preparation(
             return BootstrapPreparationReport.model_validate_json(
                 project.artifacts.read_bytes(result_id, "report.json")
             )
-        current = plan_bootstrap_preparation(project, spec, code_revision=code_revision)
+        current = plan_bootstrap_preparation(
+            project, spec, code_revision=code_revision, resume_binding=resume_binding
+        )
         if current.digest != plan.digest:
             raise ValueError(
                 "bootstrap preparation changed during admission; review its current plan"
             )
         ceiling = operation_spend_ceiling(project, plan.identity)
-        if approval is not None:
+        if approval is not None and binding is None:
             ceiling.authorize(
                 "preparation",
                 ceiling_usd=approval.ceiling_usd,
@@ -537,9 +597,17 @@ def run_bootstrap_preparation(
             )
         install_spend_ceiling(ceiling)
         try:
-            result = _run(project, spec, plan, dependencies, reviewer, code_revision)
+            execution = (
+                spec if binding is None else bootstrap_execution_spec(project, binding, spec)
+            )
+            result = _run(project, execution, plan, dependencies, reviewer, code_revision, binding)
             if not result.failed_tasks:
-                refs = (result.build_report, *result.batches, *result.simulators)
+                refs = (
+                    result.build_report,
+                    *result.batches,
+                    *result.simulators,
+                    *(() if resume_binding is None else (resume_binding,)),
+                )
                 project.artifacts.write_json(
                     artifact_id=result_id,
                     artifact_type=PREPARATION_TYPE,
@@ -563,12 +631,14 @@ def _run(
     dependencies: BootstrapDependencies,
     reviewer: CompatibilityReviewer,
     revision: str,
+    binding: BootstrapResumeBinding | None = None,
 ) -> BootstrapPreparationReport:
     """Execute existing build and bootstrap owners inside the already installed ceiling."""
     report = run_variance_build(
         project,
         spec.build.spec,
         code_revision=revision,
+        identity_revision=None if binding is None else binding.original_revision,
         tagger=dependencies.tagger,
         reviewer=reviewer,
         namer=dependencies.namer,
