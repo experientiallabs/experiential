@@ -101,10 +101,16 @@ def environment_candidates(
 
 
 def candidate_root_bound(traces: Sequence[Trace], spec: CompatibilitySpec, *, clusters: int) -> int:
-    """Bound cluster intersections with the exact registered evidence partition."""
+    """Bound roots by each candidate's members and the registered cluster maximum.
+
+    A nonempty candidate intersects at most one root per member and one per cluster. Candidates
+    partition the evidence, so summing these individual bounds retains every possible root.
+    """
     if clusters < 1:
         raise ValueError("environment review needs a positive cluster bound")
-    return min(len(traces), clusters * len(environment_candidates(traces, spec)))
+    return sum(
+        min(clusters, len(candidate.members)) for candidate in environment_candidates(traces, spec)
+    )
 
 
 def _candidate(traces: Sequence[Trace], contract: str) -> EnvironmentCandidate:
