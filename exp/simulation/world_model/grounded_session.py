@@ -147,6 +147,7 @@ class GroundedTransitionEngine:
         facts_version: int = 0,
         research_history: bool = True,
         prediction_reader: PredictionPreparation | None = None,
+        rule_research_document: JsonObject | None = None,
     ) -> None:
         """Bind an existing predictor to a single public fixed-action task."""
         if maximum_output_tokens <= 0 or task.reference_answer is not None:
@@ -167,6 +168,7 @@ class GroundedTransitionEngine:
                 runtime.artifact.model.model_copy(update={"model_id": served_model_id})
             )
         self.research_history = research_history
+        self.rule_research_document = rule_research_document
         self.prediction_reader = prediction_reader
         if facts_version < 0:
             raise ValueError("the facts state version of the first action cannot be negative")
@@ -178,6 +180,11 @@ class GroundedTransitionEngine:
         """Bind knowledge, source, task, selection and actual generation limits."""
         return sha256_json(
             {
+                **(
+                    {}
+                    if self.rule_research_document is None
+                    else {"rule_research_document": self.rule_research_document}
+                ),
                 "artifact": self.runtime.artifact_input.model_dump(mode="json"),
                 "knowledge": self.runtime.artifact.model_dump(mode="json"),
                 "selection": self.runtime.evidence_selector.policy.identity
@@ -406,6 +413,10 @@ class GroundedTransitionEngine:
             )
         if not self.research_history and memory is not None:
             memory = without_research(memory)
+        if self.rule_research_document is not None:
+            memory = (memory or MemoryContext()).model_copy(
+                update={"rule_research_document": self.rule_research_document}
+            )
         prepared = self.runtime.prepare_turn(
             task=task,
             visible_messages=visible,

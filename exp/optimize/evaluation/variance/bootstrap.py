@@ -202,6 +202,7 @@ def family_knowledge(
             rules are not a saved rules-stage report.
     """
     adapter = family.family
+    research_memory = None
     needed = {*adapter.member_traces, *(() if adapter.frozen else adapter.learning_traces)}
     missing = sorted(needed - set(traces))
     if missing:
@@ -213,6 +214,8 @@ def family_knowledge(
         if report is not None and frozen_report(project, report).rulebook != adapter.rule_book:
             raise ValueError(f"family {adapter.family_id} rules report names another rule book")
         rulebook, memory = adapter.rule_book, adapter.rule_memory
+        if report is not None:
+            research_memory = frozen_report(project, report).memory
     else:
         assert spec.rules is not None
         learned = run_rules_stage(
@@ -226,6 +229,7 @@ def family_knowledge(
         )
         report = artifact_input(project.artifacts.read(learned.identity + "-result").manifest)
         rulebook, memory = learned.rulebook, None
+        research_memory = learned.memory
         if learned.memory_set is not None:
             recall = RecallPolicy(jev_alias=spec.runtime.jev_alias)
             memory = RuleMemoryBinding(memory_set=learned.memory_set, recall=recall)
@@ -236,6 +240,7 @@ def family_knowledge(
         rulebook=rulebook,
         book=book,
         rule_memory=memory,
+        research_memory=research_memory,
         traces=members,
         contracts={**book.contracts, **adapter.tool_contracts},
         state_domains=tuple(sorted(adapter.state_domains)),
@@ -613,6 +618,8 @@ def _bootstrap_task(
         }
         if knowledge.rule_memory is not None:
             refs.add(knowledge.rule_memory.memory_set)
+        if knowledge.research_memory is not None:
+            refs.add(knowledge.research_memory)
         if task.recorded_state is not None:
             refs.add(task.recorded_state)
         sources = tuple(sorted(refs, key=lambda ref: ref.artifact_id))

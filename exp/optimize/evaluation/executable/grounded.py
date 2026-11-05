@@ -63,6 +63,7 @@ from exp.optimize.evaluation.fidelity.decision_access import decision_caller, re
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
+from exp.optimize.evaluation.rules.condense import load_memory, memory_files, render_memory
 from exp.optimize.evaluation.variance.build_records import load_tag_retrieval_binding
 from exp.runtime.environments.world_contracts import (
     ExecutableCheckpoint,
@@ -158,6 +159,7 @@ class GroundedRuntimeDefinition(ContractModel):
             manifest. Covered tools run as exact sandboxed code inside their validated domain;
             everything else goes to the grounded model and its rule-book check. Absent, the
             definition and every derived identity are unchanged.
+        rule_research_document: Exact native rules and research document, tied to rule_book.
         rule_memory: Optional pinned rule memory set with its recall policy. Each prediction
             receives only the rule files recalled for its call, alongside the task memory.
             Absent, the definition and every derived identity are unchanged.
@@ -192,6 +194,10 @@ class GroundedRuntimeDefinition(ContractModel):
     )
     programs: InducedCoverage | None = Field(default=None, exclude_if=lambda value: value is None)
     rule_memory: RuleMemoryBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    rule_research_document: ArtifactInput | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -395,6 +401,29 @@ def preflight_grounded_runtime(project: ProjectStore, spec: GroundedRuntimeDefin
     _checked(project, spec)
 
 
+def rule_research_context(
+    project: ProjectStore, spec: GroundedRuntimeDefinition
+) -> JsonObject | None:
+    """Verify the exact native document and book before any client or runtime dispatch."""
+    reference = spec.rule_research_document
+    if reference is None:
+        return None
+    memory = load_memory(project, reference)
+    if spec.rule_book is None or memory.rulebook != spec.rule_book:
+        raise ValueError("rule research document belongs to another rule book")
+    rendered = memory_files(memory)["memory.md"]
+    if project.artifacts.read_bytes(reference.artifact_id, "memory.md") != rendered:
+        raise ValueError("rule research document rendering differs from its native model")
+    if not spec.research_history:
+        memory = memory.model_copy(update={"research": ()})
+    return {
+        "kind": "rule-and-research-document",
+        "source": reference.model_dump(mode="json"),
+        "research_history": spec.research_history,
+        "document": render_memory(memory),
+    }
+
+
 def _checked(
     project: ProjectStore, spec: GroundedRuntimeDefinition
 ) -> tuple[
@@ -458,6 +487,7 @@ def _checked(
         tag_retrieval = load_tag_retrieval_binding(project, spec.tag_retrieval)
         if artifact.original_evidence == "none":
             raise ValueError("a memory-first simulator retrieves nothing to rank by tags")
+    rule_research_context(project, spec)
     rule_memory = None
     if spec.rule_memory is not None:
         alias = catalog.models.get(spec.rule_memory.recall.jev_alias)
@@ -644,7 +674,12 @@ def _runtime(
                         + (() if provider_grant is None else (provider_grant.registration,))
                         + (() if spec.rule_book is None else (spec.rule_book,))
                         + (() if spec.tag_retrieval is None else (spec.tag_retrieval,))
-                        + (() if spec.rule_memory is None else (spec.rule_memory.memory_set,)),
+                        + (() if spec.rule_memory is None else (spec.rule_memory.memory_set,))
+                        + (
+                            ()
+                            if spec.rule_research_document is None
+                            else (spec.rule_research_document,)
+                        ),
                         key=lambda reference: reference.artifact_id,
                     )
                 ),
@@ -676,6 +711,7 @@ def _runtime(
             facts_version=0 if spec.facts is None else spec.facts.first_version,
             research_history=spec.research_history,
             prediction_reader=reader,
+            rule_research_document=rule_research_context(project, spec),
         ),
         spec.manifest,
         spec.initial_state,

@@ -208,12 +208,16 @@ class MemoryContext(ContractModel):
         session: This instance's disclosed feedback and provisional investigations.
         prior_trajectories: Unresolved hypotheses produced by earlier trajectories.
         overview: Budgeted memory overview of log lines and model-written summaries.
+        rule_research_document: Pinned rule and research context, separate from observations.
     """
 
     observations: tuple[JsonObject, ...] = ()
     session: tuple[JsonObject, ...] = ()
     prior_trajectories: tuple[JsonObject, ...] = ()
     overview: tuple[JsonObject, ...] = ()
+    rule_research_document: JsonObject | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def build_world_model_request(
@@ -296,6 +300,13 @@ def build_world_model_request(
     if memory is not None:
         system_prompt += MEMORY_CONTEXT_GUIDANCE
         evidence["memory_observations"] = list(memory.observations)
+        if memory.rule_research_document is not None:
+            evidence["rule_research_document"] = memory.rule_research_document
+            system_prompt += (
+                "\nThe pinned rule_research_document distinguishes admitted rules, contradictions, "
+                "unknowns and research. Preserve these statuses; "
+                "inferred facts are not recorded truth."
+            )
         research = evidence.get("research_history")
         evidence["research_history"] = {
             **(research if isinstance(research, dict) else {}),

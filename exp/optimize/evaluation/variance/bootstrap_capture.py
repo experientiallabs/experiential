@@ -133,6 +133,9 @@ def start_definition(
             "tag_retrieval": None
             if template.tag_retrieval is None
             else template.tag_retrieval.model_dump(mode="json"),
+            "rule_research_document": None
+            if not bind or knowledge.research_memory is None
+            else knowledge.research_memory.model_dump(mode="json"),
             "rule_memory": None
             if not bind or knowledge.rule_memory is None
             else knowledge.rule_memory.model_dump(mode="json"),
