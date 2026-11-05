@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import Field
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, sha256_json
+from exp.common.models import ModelSnapshot
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, load_task_set
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
@@ -28,6 +29,7 @@ from exp.optimize.evaluation.variance.build_records import (
     save_artifact,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.family_embedding import load_family_embedding_completion
 from exp.optimize.evaluation.variance.family_simulators import (
     FamilySimulator,
     load_family_simulator,
@@ -42,7 +44,7 @@ from exp.simulation.retrieval.tags import TagView
 from exp.simulation.rules.model import ToolContract
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
-ENVIRONMENT_CATALOG_PROTOCOL = "environment-catalog-v1"
+ENVIRONMENT_CATALOG_PROTOCOL = "environment-catalog-v2"
 """Interpretation of saved views, evidence coverage and unique task/base plan rows."""
 
 CATALOG_TYPE = "environment-catalog"
@@ -74,12 +76,14 @@ class EnvironmentBaseSpec(ContractModel):
     Attributes:
         name: Stable name, independent of tag-set names.
         family_id: Native family whose scoped learning inputs are reused.
-        simulator: Optional pinned learned simulator of precisely that scope.
+        embedding_completion: Optional verified completed native exact-family index overlay.
+        simulator: Optional pinned learned simulator of precisely the resulting scope.
         starts: Existing frozen native start bindings, never requests to create starts.
     """
 
     name: str = Field(min_length=1, max_length=64)
     family_id: str = Field(min_length=1)
+    embedding_completion: ArtifactInput | None = None
     simulator: ArtifactInput | None = None
     starts: tuple[BootstrapBinding, ...] = ()
 
@@ -127,6 +131,8 @@ class EnvironmentBase(ContractModel):
         scope: Separate evidence, retrieval, world and rule-memory inputs.
         tool_contracts: Saved declarations used solely for schema diagnostics.
         runtime_bound: Whether a pinned simulator has a frozen runtime template.
+        index_embedder: Actual model snapshot of this base index, independent of other bases.
+        producer_revision: Actual scoped world producer, preserved through native overlays.
     """
 
     spec: EnvironmentBaseSpec
@@ -134,6 +140,8 @@ class EnvironmentBase(ContractModel):
     scope: FamilyScope
     tool_contracts: dict[str, ToolContract]
     runtime_bound: bool
+    index_embedder: ModelSnapshot
+    producer_revision: str
 
 
 class NativeStartProof(ContractModel):
@@ -315,6 +323,7 @@ def _view(
 
 def _base(
     project: ProjectStore,
+    report_ref: ArtifactInput,
     report: VarianceBuildReport,
     spec: EnvironmentBaseSpec,
     plan: ExposurePlan,
@@ -324,6 +333,13 @@ def _base(
     if scoping is None:
         raise ValueError("catalog source build has no environment-family scopes")
     scope = scoping.scope(spec.family_id)
+    if spec.embedding_completion is not None:
+        intent, completion = load_family_embedding_completion(
+            project, spec.embedding_completion, historical=True
+        )
+        if intent.source_build != report_ref or intent.source_scope != scope:
+            raise ValueError("catalog embedding completion names another source build or base")
+        scope = completion.scope
     plan.require((*scope.members, *scope.rules_traces), "world_learning")
     if not set(scope.rules_traces) <= set(scope.members):
         raise ValueError("base rules evidence lies outside its native family members")
@@ -387,6 +403,8 @@ def _base(
         scope=scope,
         tool_contracts=contracts,
         runtime_bound=simulator is not None and simulator.runtime is not None,
+        index_embedder=index.index.embedder,
+        producer_revision=world.code_revision,
     ), simulator
 
 
@@ -500,7 +518,9 @@ def plan_environment_catalog(
     views = tuple(
         _view(row, *matrices[row.view], spec.banks[row.view], tasks, plan) for row in spec.task_sets
     )
-    bases_and_simulators = tuple(_base(project, report, row, plan) for row in spec.bases)
+    bases_and_simulators = tuple(
+        _base(project, report_ref, report, row, plan) for row in spec.bases
+    )
     memberships: dict[str, list[str]] = {}
     for view in views:
         for task_id in view.task_ids:
@@ -567,6 +587,8 @@ def save_environment_catalog(
         refs.extend((base.families, base.scope.index, base.scope.world_model))
         if base.scope.tag_retrieval is not None:
             refs.append(base.scope.tag_retrieval)
+        if base.spec.embedding_completion is not None:
+            refs.append(base.spec.embedding_completion)
         if base.spec.simulator is not None:
             refs.append(base.spec.simulator)
         refs.extend(binding.batch for binding in base.spec.starts)
