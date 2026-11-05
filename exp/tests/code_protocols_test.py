@@ -59,7 +59,7 @@ PROTOCOLS = (
             "exp.simulation.rules.contracts:tool_schema_coverage",
             "exp.optimize.evaluation.variance.bootstrap_selection:select_probe_task_bases",
         ),
-        "5884af6217ca6904f22dfa781b4ab25a65149069009eae5c52af6c5c969833df",
+        "93670037f5970400afeaf725eb4f3835dedacc347e8c74539f076561aee4d81b",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.environment_catalog:ENVIRONMENT_CATALOG_PROTOCOL",
@@ -737,7 +737,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
-        "bootstrap-source-revision-v5",
+        "bootstrap-source-revision-v6",
         (
             "exp.optimize.evaluation.variance.bootstrap_protocols",
             "exp.optimize.evaluation.variance.bootstrap_resume",
@@ -746,7 +746,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_selection",
             "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "ba303a734f66d3e90680013c614a48f70b1bb8bee6e8a69b291df37d62ebefc1",
+        "74abb617bd85b5d4972eca6847be4f73348643254bb7b0ae4c28b128475a1638",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",

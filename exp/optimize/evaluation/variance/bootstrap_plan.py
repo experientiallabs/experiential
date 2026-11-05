@@ -371,19 +371,24 @@ def _bound_bootstrap_plan(
     code_revision: str,
     resume_binding: ArtifactInput | None,
     binding: BootstrapResumeBinding | None,
+    *,
+    historical: bool = False,
 ) -> BootstrapPlan:
     """Price the exact verified binding, with unchanged native selection and outcome owners."""
     execution = spec if binding is None else bootstrap_execution_spec(project, binding, spec)
     identity_revision = code_revision if binding is None else binding.build_revision
     if (
-        binding is not None
+        not historical
+        and binding is not None
         and binding.review_revision is not None
         and binding.review_revision.protocol_sha256 != review_protocol_sha256()
     ):
         raise ValueError("bootstrap resume review protocol differs from its actual producer")
     template = execution.bootstrap.runtime
+    if historical and sha256_bytes(template.runtime_file.read_bytes()) != template.runtime_sha256:
+        raise ValueError("historical preparation runtime differs from its original saved pin")
     maintained = sha256_bytes(Path(grounded.__file__).read_bytes())
-    if (
+    if not historical and (
         template.runtime_sha256 != maintained
         or sha256_bytes(template.runtime_file.read_bytes()) != maintained
     ):

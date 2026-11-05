@@ -118,4 +118,6 @@ def read_bootstrap_preparation_plan(
     producer for outcome lookup. Source provenance and original authority remain verified.
     """
     proof = read_bootstrap_preparation_provenance(project, reference, spec=spec)
-    return _bound_bootstrap_plan(project, spec, proof.producer_revision, reference, proof.binding)
+    return _bound_bootstrap_plan(
+        project, spec, proof.producer_revision, reference, proof.binding, historical=True
+    )

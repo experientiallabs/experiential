@@ -249,7 +249,7 @@ def propose_baseline_execution(
         catalog_sha256=sha256_json(load_model_catalog(project.model_catalog_path)),
         execution_source=current_bootstrap_execution_source(code_revision),
         preparation_floor=_bound_bootstrap_plan(
-            project, spec, proof.producer_revision, original_resume, binding
+            project, spec, proof.producer_revision, original_resume, binding, historical=True
         ),
     )
 
@@ -293,7 +293,7 @@ def _verified(
         project, load_exposure_plan(project, historical.exposure), exposure, expected_used
     )
     floor = _bound_bootstrap_plan(
-        project, spec, proof.producer_revision, proposal.original_resume, parent
+        project, spec, proof.producer_revision, proposal.original_resume, parent, historical=True
     )
     return parent, floor, native, costs
 
