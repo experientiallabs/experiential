@@ -147,3 +147,62 @@ def test_native_mixed_representation_graph_is_refused(
     changed = load_rag_index(child_store, child.index.rag_id)
     with pytest.raises(ValueError, match="original serving representation"):
         plan_rag_reembedding((original, changed))
+
+
+def test_manifest_input_inventory_never_decodes_old_vectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold-input costing stays separate from numerical old-vector qualification."""
+    from exp.simulation.retrieval import store as store_module
+    from exp.simulation.retrieval.reembedding import (
+        load_reembedding_input,
+        plan_rag_reembedding_inputs,
+    )
+
+    store = _store(tmp_path, "manifest-inputs")
+    source, traces = _persist_traces(store, count=4)
+    built = persist_trace_rag(
+        store,
+        (source,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision="fixture",
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    full = plan_rag_reembedding((load_rag_index(store, built.index.rag_id),))
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        """A cost-only reader must not claim numerical qualification."""
+        raise AssertionError("old vector decoder is outside input inventory")
+
+    monkeypatch.setattr(store_module, "_parse_vectors", forbidden)
+    original = load_reembedding_input(store, artifact_input(built.manifest))
+    fast = plan_rag_reembedding_inputs((original,))
+    assert fast.model_dump(exclude={"input_verification"}) == full.model_dump(
+        exclude={"input_verification"}
+    )
+    assert fast.input_verification == "manifest_bound_transition_inputs"
+    assert fast.admission == "not_admitted"
+    with pytest.raises(AssertionError, match="outside input inventory"):
+        load_rag_index(store, built.index.rag_id)
+
+
+def test_manifest_input_inventory_requires_the_exact_original_reference(tmp_path: Path) -> None:
+    """A guessed index manifest cannot become a migration input."""
+    from exp.common.project import ArtifactCorruptionError
+    from exp.simulation.retrieval.reembedding import load_reembedding_input
+
+    store = _store(tmp_path, "exact-ref")
+    source, traces = _persist_traces(store, count=4)
+    built = persist_trace_rag(
+        store,
+        (source,),
+        _bindings(traces),
+        created_at=_CREATED_AT,
+        code_revision="fixture",
+        included_partitions=frozenset({"fit", "held_out"}),
+    )
+    ref = artifact_input(built.manifest).model_copy(update={"sha256": "0" * 64})
+    with pytest.raises(ArtifactCorruptionError, match="index reference"):
+        load_reembedding_input(store, ref)

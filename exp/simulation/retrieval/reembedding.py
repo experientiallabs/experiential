@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ArtifactInput, ContractModel, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactInput,
+    ContractModel,
+    envelope_matches_manifest,
+    sha256_json,
+)
 from exp.common.models import ModelSnapshot
-from exp.common.project import artifact_input
+from exp.common.project import (
+    ArtifactCorruptionError,
+    ArtifactManifest,
+    ArtifactStore,
+    artifact_input,
+)
+from exp.simulation.retrieval.contracts import (
+    RAG_ARTIFACT_TYPE,
+    RAG_INDEX_PATH,
+    RAGIndex,
+    RAGTransition,
+)
 from exp.simulation.retrieval.embedding_inputs import (
     MAXIMUM_BATCH_BYTES,
     MAXIMUM_BATCH_INPUTS,
@@ -17,7 +35,8 @@ from exp.simulation.retrieval.embedding_inputs import (
     plan_rag_embedding_inputs,
     validate_batch_bounds,
 )
-from exp.simulation.retrieval.store import LoadedRAGIndex
+from exp.simulation.retrieval.store import LoadedRAGIndex, _parse_transitions
+from exp.simulation.retrieval.transitions import render_rag_key
 
 
 class ReembeddingNode(ContractModel):
@@ -52,10 +71,11 @@ class RAGReembeddingPlan(ContractModel):
         batches: Native request-batch count before transport attempts.
         attempts_per_batch: Explicit proposed maximum physical transport attempts.
         physical_attempt_bound: Batches multiplied by attempts, not observed spend.
+        input_verification: Distinguishes decoded old indexes from transition-only inventories.
         admission: This inventory never admits a migration or establishes readiness.
     """
 
-    protocol: Literal["rag-reembedding-plan-v1"] = "rag-reembedding-plan-v1"
+    protocol: Literal["rag-reembedding-plan-v2"] = "rag-reembedding-plan-v2"
     original_embedder: ModelSnapshot
     indexes: tuple[ReembeddingNode, ...]
     maximum_chunk_bytes: int = Field(ge=4, le=2048)
@@ -67,7 +87,82 @@ class RAGReembeddingPlan(ContractModel):
     batches: int = Field(ge=1)
     attempts_per_batch: int = Field(ge=1)
     physical_attempt_bound: int = Field(ge=1)
+    input_verification: Literal["fully_loaded_indexes", "manifest_bound_transition_inputs"]
     admission: Literal["not_admitted"] = "not_admitted"
+
+
+@dataclass(frozen=True)
+class RAGReembeddingInput:
+    """Manifest-bound original inputs for costing, without qualifying old vector values.
+
+    Attributes:
+        index: Original immutable index envelope.
+        manifest: Exact original artifact manifest.
+        transitions: Digest-bound action/result records; no new source evidence is authored.
+    """
+
+    index: RAGIndex
+    manifest: ArtifactManifest
+    transitions: tuple[RAGTransition, ...]
+
+
+def load_reembedding_input(
+    store: ArtifactStore,
+    reference: ArtifactInput,
+) -> RAGReembeddingInput:
+    """Read a saved transition inventory while leaving full vector/source qualification separate.
+
+    Artifact payload hashes, envelope, transition membership and canonical query keys are checked.
+    Old vector bytes are hash-checked but not numerically decoded, and source trace payloads are
+    not recursively requalified. This is only a physical-input inventory, never execution consent.
+
+    Args:
+        store: Immutable owner of the original index.
+        reference: Exact reviewed original manifest pointer.
+
+    Returns:
+        Original records for provider-free cold-input planning.
+
+    Raises:
+        ArtifactCorruptionError: Reference, payload, envelope, membership or query-key checks fail.
+    """
+    stored = store.read(reference.artifact_id)
+    if (
+        artifact_input(stored.manifest) != reference
+        or stored.manifest.artifact_type != RAG_ARTIFACT_TYPE
+    ):
+        raise ArtifactCorruptionError("re-embedding input differs from its index reference")
+    index = RAGIndex.model_validate_json(stored.payloads[RAG_INDEX_PATH])
+    if index.rag_id != reference.artifact_id or not envelope_matches_manifest(
+        index, stored.manifest
+    ):
+        raise ArtifactCorruptionError("re-embedding input envelope differs from its manifest")
+    transitions_payload = stored.payloads[index.transitions_path]
+    if (
+        hashlib.sha256(transitions_payload).hexdigest() != index.transitions_sha256
+        or hashlib.sha256(stored.payloads[index.vectors_path]).hexdigest() != index.vectors_sha256
+    ):
+        raise ArtifactCorruptionError("re-embedding input payload differs from its envelope")
+    transitions = _parse_transitions(index.rag_id, transitions_payload)
+    if (
+        tuple(row.transition_id for row in transitions) != index.transition_ids
+        or len(transitions) != index.transition_count
+    ):
+        raise ArtifactCorruptionError("re-embedding transition membership differs from envelope")
+    traces = {trace for source in index.sources for trace in source.trace_ids}
+    lineages = set(index.included_lineage_ids or index.fit_lineage_ids)
+    for row in transitions:
+        if row.trace_id not in traces or row.lineage_id not in lineages:
+            raise ArtifactCorruptionError("re-embedding input names undeclared source evidence")
+        if index.corpus_scope is not None and not index.corpus_scope.admits(
+            trace_id=row.trace_id,
+            lineage_id=row.lineage_id,
+        ):
+            raise ArtifactCorruptionError("re-embedding input lies outside its original scope")
+        key = render_rag_key(task=row.task, initial_context=row.initial_context, action=row.action)
+        if row.key_text != key or row.key_sha256 != hashlib.sha256(key.encode()).hexdigest():
+            raise ArtifactCorruptionError("re-embedding input has a noncanonical query key")
+    return RAGReembeddingInput(index=index, manifest=stored.manifest, transitions=transitions)
 
 
 def plan_rag_reembedding(
@@ -96,6 +191,51 @@ def plan_rag_reembedding(
     Raises:
         ValueError: The graph mixes roots, representations, evidence, scopes or invalid bounds.
     """
+    return _plan(
+        tuple(RAGReembeddingInput(row.index, row.manifest, row.transitions) for row in indexes),
+        maximum_batch_inputs=maximum_batch_inputs,
+        maximum_batch_bytes=maximum_batch_bytes,
+        attempts_per_batch=attempts_per_batch,
+        input_verification="fully_loaded_indexes",
+    )
+
+
+def plan_rag_reembedding_inputs(
+    inputs: Sequence[RAGReembeddingInput],
+    *,
+    maximum_batch_inputs: int = MAXIMUM_BATCH_INPUTS,
+    maximum_batch_bytes: int = MAXIMUM_BATCH_BYTES,
+    attempts_per_batch: int = 1,
+) -> RAGReembeddingPlan:
+    """Inventory manifest-bound transitions without claiming full source/vector qualification.
+
+    Args:
+        inputs: Original records from load_reembedding_input, not newly generated evidence.
+        maximum_batch_inputs: Proposed native input-count bound per request.
+        maximum_batch_bytes: Proposed native UTF-8 byte bound per request.
+        attempts_per_batch: Explicit finite physical-attempt bound.
+
+    Returns:
+        An unadmitted cost inventory requiring separate full migration/readiness validation.
+    """
+    return _plan(
+        inputs,
+        maximum_batch_inputs=maximum_batch_inputs,
+        maximum_batch_bytes=maximum_batch_bytes,
+        attempts_per_batch=attempts_per_batch,
+        input_verification="manifest_bound_transition_inputs",
+    )
+
+
+def _plan(
+    indexes: Sequence[RAGReembeddingInput],
+    *,
+    maximum_batch_inputs: int,
+    maximum_batch_bytes: int,
+    attempts_per_batch: int,
+    input_verification: Literal["fully_loaded_indexes", "manifest_bound_transition_inputs"],
+) -> RAGReembeddingPlan:
+    """Apply the shared original-graph checks and native cold input/batch planner."""
     validate_batch_bounds(maximum_inputs=maximum_batch_inputs, maximum_bytes=maximum_batch_bytes)
     if isinstance(attempts_per_batch, bool) or attempts_per_batch < 1:
         raise ValueError("re-embedding requires a positive physical attempt allowance")
@@ -143,6 +283,7 @@ def plan_rag_reembedding(
         )
     )
     return RAGReembeddingPlan(
+        input_verification=input_verification,
         original_embedder=root.index.embedder,
         indexes=tuple(
             ReembeddingNode(
