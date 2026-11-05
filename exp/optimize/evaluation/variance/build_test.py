@@ -696,3 +696,36 @@ def test_unit_outcomes_preserve_order_deduplication_and_call_count(
     assert matrix.view == "observations"
     assert sorted(decide.states) == ["different", "same"]
     assert failed == ()
+
+
+def test_resumed_identity_keeps_actual_artifact_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit semantic revision preserves run identity without relabelling new evidence."""
+    project = variance_project(tmp_path, monkeypatch)
+    spec = VarianceBuildSpec(task_bank=TASK_BANK, error_bank=None)
+    original = plan_variance_build(project, spec, code_revision="original")
+    fresh = plan_variance_build(project, spec, code_revision="current")
+    resumed = plan_variance_build(
+        project, spec, code_revision="current", identity_revision="original"
+    )
+
+    assert resumed.identity == original.identity
+    assert fresh.identity != original.identity
+    decide = FakeDecisions()
+    report = run_variance_build(
+        project,
+        spec,
+        code_revision="current",
+        identity_revision="original",
+        tagger=_tagger(project, decide),
+    )
+    manifest = project.artifacts.read(report.identity + "-result").manifest
+    assert manifest.code_revision == "current"
+    assert report.identity == original.identity
+    after = plan_variance_build(
+        project, spec, code_revision="current", identity_revision="original"
+    )
+    assert after.decision_attempts == original.decision_attempts
+    assert after.cached_decision_calls == after.decision_calls
+    assert after.remaining_decision_attempts == 0

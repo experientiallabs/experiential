@@ -77,6 +77,7 @@ from exp.optimize.evaluation.variance.build_records import (
     VarianceBuildReport,
     VarianceBuildSpec,
     ViewTagging,
+    cached_decision_calls,
     corpus_scope,
     next_steps,
     probe_selection,
@@ -192,6 +193,7 @@ def plan_variance_build(
     spec: VarianceBuildSpec,
     *,
     code_revision: str,
+    identity_revision: str | None = None,
     decision_model: ModelSnapshot | None = None,
     reviewer_model: ModelSnapshot | None = None,
     reviewer_configuration_sha256: Sha256 | None = None,
@@ -202,6 +204,7 @@ def plan_variance_build(
         project: Project with a completed build.
         spec: The registration.
         code_revision: Producing source identity.
+        identity_revision: Original semantic revision for an explicitly bound resume.
         decision_model: Identity of an injected tagger; the catalog alias's when omitted.
         reviewer_model: Identity of the compatibility reviewer, part of the run identity when
             the spec requests environment families.
@@ -214,27 +217,19 @@ def plan_variance_build(
         ValueError: There is no completed build, a bank or alias is missing, or a rule names a
             view that is not tagged.
     """
+    revision = identity_revision or code_revision
     return _prepare(
-        project, spec, code_revision, decision_model, reviewer_model, reviewer_configuration_sha256
+        project, spec, revision, decision_model, reviewer_model, reviewer_configuration_sha256
     ).summary
 
 
 def variance_build_costs(
     project: ProjectStore, plan: VarianceBuildPlan, alias: str
 ) -> tuple[CostComponent, ...]:
-    """Price every decision call at the retry ceiling from the catalog, or leave it unpriced.
-
-    Args:
-        project: Project whose catalog prices the decision alias.
-        plan: The summary whose calls are priced.
-        alias: The decision alias.
-
-    Returns:
-        One decision component; no embedding component, since vectors are reused.
-    """
-    if plan.saved or plan.decision_attempts == 0:
+    """Return remaining decision costs without changing the full dispatch allowance."""
+    if plan.saved or plan.remaining_decision_attempts == 0:
         return ()
-    return (decision_cost(project, alias, plan.decision_attempts),)
+    return (decision_cost(project, alias, plan.remaining_decision_attempts),)
 
 
 def run_variance_build(
@@ -242,6 +237,7 @@ def run_variance_build(
     spec: VarianceBuildSpec,
     *,
     code_revision: str,
+    identity_revision: str | None = None,
     tagger: DecisionsTraceTagger | None = None,
     constructor: Constructor | None = None,
     namer: ClusterNamer | None = None,
@@ -253,6 +249,7 @@ def run_variance_build(
         project: Project with a completed ``exp build``.
         spec: The registration.
         code_revision: Producing source identity.
+        identity_revision: Original semantic revision for an explicitly bound resume.
         tagger: Decision tagger with a project decision cache; built from the spec's catalog
             alias over the admitted transport when omitted.
         constructor: Admitted world-model constructor, required when the spec requests
@@ -285,10 +282,11 @@ def run_variance_build(
         raise ValueError("a variance build tagger needs a project decision cache to replay")
     model = None if tagger is None else ModelSnapshot.model_validate(tagger.model_identity)
     reviewed = None if reviewer is None else reviewer.model
+    revision = identity_revision or code_revision
     prepared = _prepare(
         project,
         spec,
-        code_revision,
+        revision,
         model,
         reviewed,
         None if reviewer is None else reviewer.configuration_sha256,
@@ -428,9 +426,7 @@ def _prepare(
     ordered = sorted(trace for trace in traces if trace in plan.traces)
     units_of = {trace for trace in ordered if plan.role_of(trace) in _TASK_ROLES}
     units: dict[TagView, tuple[Unit, ...]] = {
-        "task": tuple(
-            task_view(traces[trace]) for trace in ordered if plan.role_of(trace) in _TASK_ROLES
-        )
+        "task": tuple(task_view(traces[trace]) for trace in ordered if trace in units_of)
     }
     if "observations" in banks:
         units["observations"] = tuple(
@@ -478,6 +474,7 @@ def _prepare(
         views=views,
         decision_calls=calls,
         decision_attempts=calls * RetryPolicy().maximum_attempts,
+        cached_decision_calls=cached_decision_calls(project, model, banks, units, errors),
         embedder=serving.embedder,
         embedding_inputs=total,
         embedding_inputs_saved=saved_inputs,

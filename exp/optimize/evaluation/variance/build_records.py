@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -50,7 +50,13 @@ from exp.simulation.mining.tag_clusters import (
     ClusteringSpec,
 )
 from exp.simulation.mining.tag_selection import DEFAULT_FIRE_THRESHOLD, TagRule, TagSelection
-from exp.simulation.mining.tagging import TagMatrix, distinct_units, question_chunks
+from exp.simulation.mining.tagging import (
+    DecisionCache,
+    TagMatrix,
+    decision_key,
+    distinct_units,
+    question_chunks,
+)
 from exp.simulation.mining.views import Unit
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.tags import TagRetrievalBinding, TagRetrievalMode, TagView
@@ -245,7 +251,8 @@ class VarianceBuildPlan(ContractModel):
         roles: Exposure counts by role.
         views: Decisions each view may buy.
         decision_calls: Calls across every view.
-        decision_attempts: Physical attempts the calls may take under the retry policy.
+        decision_attempts: Full original physical dispatch allowance under the retry policy.
+        cached_decision_calls: Matching committed entries, excluded from remaining costs.
         embedder: Identity of the build's embedder, reused for the scoped index.
         embedding_inputs: Distinct embedding inputs of every world-learning transition.
         embedding_inputs_saved: Of those, the inputs already in the build's checkpoint; the
@@ -271,6 +278,22 @@ class VarianceBuildPlan(ContractModel):
     errors: ViewPlan | None = None
     naming_calls: int = Field(default=0, ge=0)
     review_calls: int = Field(default=0, ge=0)
+    cached_decision_calls: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
+
+    @model_validator(mode="after")
+    def _cached_within_inventory(self) -> Self:
+        """Refuse a cache count exceeding this exact call inventory."""
+        if self.cached_decision_calls > self.decision_calls:
+            raise ValueError("cached decision calls exceed the planned call inventory")
+        return self
+
+    @property
+    def remaining_decision_attempts(self) -> int:
+        """Return the original per-call retry allowance for unmatched requests."""
+        if not self.decision_calls:
+            return self.decision_attempts
+        pending = self.decision_calls - self.cached_decision_calls
+        return (self.decision_attempts * pending + self.decision_calls - 1) // self.decision_calls
 
 
 class TagMatrixRecord(ContractModel):
@@ -519,6 +542,41 @@ class VarianceBuildReport(ContractModel):
     selected_probes: tuple[str, ...] = ()
     environment_families: FamilyScoping | None = Field(
         default=None, exclude_if=lambda value: value is None
+    )
+
+
+def cached_decision_calls(
+    project: ProjectStore,
+    model: ModelSnapshot,
+    banks: Mapping[TagView, QuestionBank],
+    units: Mapping[TagView, tuple[Unit, ...]],
+    errors: tuple[QuestionBank, tuple[Unit, ...]] | None,
+) -> int:
+    """Count committed replies matching the exact rendered inputs, questions and model.
+
+    Args:
+        project: Project owning the read-only decision-cache lookup.
+        model: Frozen native decision-model identity.
+        banks: Selected question bank per ordinary view.
+        units: Exact rendered units per ordinary view.
+        errors: Optional error bank and its rendered units.
+
+    Returns:
+        Matching committed calls. Missing entries and unresolved intents remain pending.
+
+    Raises:
+        TraceTaggingError: A committed cache record is corrupt or mismatches its key.
+    """
+    cache = DecisionCache(project.paths)
+    identity = model.model_dump(mode="json")
+    inputs = tuple((bank, units[view]) for view, bank in banks.items())
+    if errors is not None:
+        inputs += (errors,)
+    return sum(
+        cache.saved(decision_key(unit, chunk, identity)) is not None
+        for bank, rendered in inputs
+        for unit in distinct_units(rendered)
+        for chunk in question_chunks(bank.questions, MAX_DECISION_QUESTIONS)
     )
 
 
