@@ -9,6 +9,7 @@ import pytest
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.rules.memory_stage import MemorySetSettings
+from exp.optimize.evaluation.rules.rule_tags import RuleTaggingSettings
 from exp.optimize.evaluation.rules.system_one import DecisionBoundary
 from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance import bootstrap_plan as owner
@@ -33,7 +34,11 @@ from exp.simulation.mining.environment_review import CompatibilityReviewer
 
 
 def launch_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, decision_alias: str = "jev"
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    decision_alias: str = "jev",
+    profile: str = "jev_memory",
 ) -> tuple[ProjectStore, BootstrapPreparationSpec, ArtifactInput]:
     """Freeze real native consent for a preparation with required rule-memory decisions."""
     project, spec, _ = preparation_fixture(tmp_path, monkeypatch)
@@ -41,8 +46,17 @@ def launch_fixture(
     assert spec.bootstrap.rules is not None
     rules = spec.bootstrap.rules.model_copy(
         update={
-            "profile": "jev_memory",
-            "memory": MemorySetSettings(decision_alias=decision_alias, maximum_topics=11),
+            "profile": profile,
+            "memory": (
+                MemorySetSettings(decision_alias=decision_alias, maximum_topics=11)
+                if profile == "jev_memory"
+                else None
+            ),
+            "tagging": (
+                RuleTaggingSettings(decision_alias=decision_alias, maximum_rules=1024)
+                if profile == "trajectory_tags"
+                else None
+            ),
         }
     )
     spec = spec.model_copy(update={"bootstrap": spec.bootstrap.model_copy(update={"rules": rules})})
@@ -56,11 +70,12 @@ def no_network(_socket: socket.socket, _address: str | tuple[str, int]) -> None:
     raise AssertionError("offline launch smoke must not open a socket")
 
 
+@pytest.mark.parametrize("profile", ["jev_memory", "trajectory_tags"])
 def test_actual_launch_composes_system_one_and_retains_original_claims_and_cache(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
     """An omitted driver collaborator is filled natively and buys through the original grant."""
-    project, spec, reference = launch_fixture(tmp_path, monkeypatch)
+    project, spec, reference = launch_fixture(tmp_path, monkeypatch, profile=profile)
     binding = load_bootstrap_resume(project, reference, spec=spec, code_revision="corrected")
     ceiling = operation_spend_ceiling(project, binding.original_operation)
     historical = ceiling.reserve(alias="unpriced", url="https://fixture.invalid/v1", payload={})

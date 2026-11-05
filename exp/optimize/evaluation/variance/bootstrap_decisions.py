@@ -42,17 +42,22 @@ def bootstrap_decisions(
     stage = settings.rules
     if (
         stage is None
-        or stage.profile != "jev_memory"
+        or stage.profile not in {"jev_memory", "trajectory_tags"}
         or plan.family_bound == 0
         or dependencies.decisions is not None
     ):
         return dependencies
-    assert stage.memory is not None
+    if stage.profile == "trajectory_tags":
+        assert stage.tagging is not None
+        decision_alias = stage.tagging.decision_alias
+    else:
+        assert stage.memory is not None
+        decision_alias = stage.memory.decision_alias
     ceiling = current_spend_ceiling()
     expected = operation_directory(project, plan.identity) / "ledger.sqlite"
     if ceiling is None or ceiling.path.resolve() != expected.resolve():
         raise ValueError("bootstrap System One requires the admitted original operation scope")
-    attempts = sum(row.attempts for row in plan.costs if row.name == stage.memory.decision_alias)
+    attempts = sum(row.attempts for row in plan.costs if row.name == decision_alias)
     if attempts < 1:
         raise ValueError("bootstrap System One has no full pending native decision allowance")
     purpose = f"{plan.identity}-rules-decisions"
