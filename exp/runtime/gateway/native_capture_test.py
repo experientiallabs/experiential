@@ -242,6 +242,84 @@ def test_wide_number_in_invalid_context_fails_closed_without_panicking() -> None
     assert collector.close(1)
 
 
+@pytest.mark.parametrize("independent_retries", [False, True])
+@pytest.mark.parametrize("batch_limit", ["records", "bytes"])
+def test_full_retry_batch_does_not_exhaust_other_capture_admissions(
+    independent_retries: bool,
+    batch_limit: str,
+) -> None:
+    """A deferred batch retains its captures while ready requests keep completing."""
+    release, full, ready = threading.Event(), threading.Event(), threading.Event()
+    waiting_count = 64 if batch_limit == "records" else 1
+    deferred: set[str] = set()
+    persisted: set[str] = set()
+
+    def write(records: tuple[bytes, ...]) -> list[bool]:
+        ids = [json.loads(value)["request"]["request_id"] for value in records]
+        outcomes = []
+        for request_id in ids:
+            if request_id.startswith("waiting-") and not release.is_set():
+                deferred.add(request_id)
+                outcomes.append(False)
+            else:
+                persisted.add(request_id)
+                outcomes.append(True)
+                if request_id == "ready":
+                    ready.set()
+        if len(deferred) == waiting_count:
+            full.set()
+        return outcomes
+
+    config = CaptureConfiguration(
+        asynchronous_delivery=True,
+        maximum_pending_records=waiting_count + 2,
+        delivery=CaptureDeliveryLimits(maximum_records=128),
+    )
+    collector = native.CaptureCollector.batched(
+        config.model_dump_json(),
+        write,
+        bytes_output=True,
+        independent_retries=independent_retries,
+    )
+
+    def submit(request_id: str) -> bool:
+        request = json.loads(_request_json())
+        request["request_id"] = request_id
+        if batch_limit == "bytes" and request_id.startswith("waiting-"):
+            request["context"]["request"]["messages"] = [
+                {"role": "user", "content": "x" * (3 * 1024 * 1024)}
+            ]
+        accepted = collector.begin(json.dumps(request))
+        if accepted:
+            collector.settle(request_id, True, False)
+        return accepted
+
+    try:
+        for index in range(waiting_count):
+            assert submit(f"waiting-{index}")
+        assert full.wait(3)
+        assert submit("ready")
+        progressed = ready.wait(1)
+        assert progressed is independent_retries
+        # Deferred ownership remains charged; successful neighbors free theirs.
+        if independent_retries:
+            for index in range(20):
+                request_id = f"healthy-{index}"
+                assert submit(request_id)
+                until = time.monotonic() + 1
+                while request_id not in persisted and time.monotonic() < until:
+                    time.sleep(0.005)
+                assert request_id in persisted
+                assert collector.counts()[1] <= config.delivery.maximum_bytes
+        else:
+            assert submit("fills-last-slot")
+            assert not submit("refused-at-capacity")
+    finally:
+        release.set()
+        assert collector.close(10)
+    assert deferred <= persisted
+
+
 def test_retained_async_handoffs_keep_native_batching() -> None:
     """A paused destination drains admitted records in batches without losing any."""
     entered, release = threading.Event(), threading.Event()
@@ -363,8 +441,10 @@ def test_python_sink_rechecks_policy_after_an_uncertain_commit() -> None:
 
 
 @pytest.mark.parametrize("bytes_output", [False, True])
+@pytest.mark.parametrize("independent_retries", [False, True])
 def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
     bytes_output: bool,
+    independent_retries: bool,
 ) -> None:
     """One failed record cannot hold healthy peers; retries reuse prepared objects."""
     entered = threading.Event()
@@ -397,12 +477,11 @@ def test_batched_sink_preserves_strings_and_retries_only_unacknowledged_members(
             healthy.set()
         return outcomes
 
-    collector = (
-        native.CaptureCollector.batched(
-            CaptureConfiguration().model_dump_json(), write, bytes_output=True
-        )
-        if bytes_output
-        else native.CaptureCollector.batched(CaptureConfiguration().model_dump_json(), write)
+    collector = native.CaptureCollector.batched(
+        CaptureConfiguration().model_dump_json(),
+        write,
+        bytes_output=bytes_output,
+        independent_retries=independent_retries,
     )
     threads = []
     for index in range(16):

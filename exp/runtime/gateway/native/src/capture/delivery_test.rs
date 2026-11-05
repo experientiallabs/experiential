@@ -1,5 +1,130 @@
 use super::*;
 
+#[test]
+fn delayed_capture_does_not_block_ready_neighbor() {
+    struct DeferredSink {
+        release: Arc<std::sync::atomic::AtomicBool>,
+        attempted: mpsc::Sender<String>,
+    }
+    impl Sink for DeferredSink {
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, value: &String) -> Result<(), ()> {
+            self.attempted.send(value.clone()).unwrap();
+            if value == "waiting" && !self.release.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (attempted, observed) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        DeferredSink {
+            release: release.clone(),
+            attempted,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("waiting")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "waiting"
+    );
+    assert!(delivery.submit(record("ready")));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut progressed = false;
+    while Instant::now() < deadline {
+        if observed
+            .recv_timeout(Duration::from_millis(30))
+            .is_ok_and(|id| id == "ready")
+        {
+            progressed = true;
+            break;
+        }
+    }
+    release.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(3)));
+    assert!(
+        progressed,
+        "a retry blocked an independently writable capture"
+    );
+    assert_eq!(delivery.counts()[2], 2);
+}
+
+#[test]
+fn deferred_retries_keep_batching_and_drain_without_dropping() {
+    struct BatchRetry {
+        attempts: mpsc::Sender<usize>,
+        recovered: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Sink for BatchRetry {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            unreachable!()
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn batch_records(&self) -> usize {
+            4
+        }
+        fn batch_bytes(&self) -> usize {
+            1024
+        }
+        fn batch_delay(&self) -> Duration {
+            Duration::from_millis(100)
+        }
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+        fn write_batch(&mut self, values: &[&String]) -> Vec<bool> {
+            self.attempts.send(values.len()).unwrap();
+            vec![self.recovered.load(Ordering::Acquire); values.len()]
+        }
+    }
+    let (attempts, observed) = mpsc::channel();
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let delivery = Delivery::new(
+        Limits {
+            maximum_records: 4,
+            maximum_bytes: limits().maximum_bytes * 4,
+            ..limits()
+        },
+        BatchRetry {
+            attempts,
+            recovered: recovered.clone(),
+        },
+    )
+    .unwrap();
+    for id in ["a", "b", "c", "d"] {
+        assert!(delivery.submit(record(id)));
+    }
+    assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+    assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+    assert!(!delivery.close_until(Instant::now()));
+    recovered.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    assert_eq!(delivery.counts()[0..3], [0, 0, 4]);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
 struct PausedSink {
     entered: mpsc::Sender<String>,
     resume: mpsc::Receiver<()>,

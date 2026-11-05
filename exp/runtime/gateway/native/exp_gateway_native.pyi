@@ -73,6 +73,7 @@ class CaptureCollector:
         sink: Callable[[tuple[str, ...]], list[bool]],
         *,
         completion_references: bool = False,
+        independent_retries: bool = False,
         bytes_output: Literal[False] = False,
     ) -> CaptureCollector: ...
     @staticmethod
@@ -82,6 +83,7 @@ class CaptureCollector:
         sink: Callable[[tuple[bytes | SplitRecord, ...]], list[bool]],
         *,
         completion_references: bool = False,
+        independent_retries: bool = False,
         bytes_output: Literal[True],
     ) -> CaptureCollector: ...
     @staticmethod

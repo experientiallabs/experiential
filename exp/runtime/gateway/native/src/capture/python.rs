@@ -59,6 +59,7 @@ const BATCH_BYTES: usize = 2 * 1024 * 1024;
 struct PythonBatchSink {
     callback: Py<PyAny>,
     completion_references: bool,
+    independent_retries: bool,
     bytes_output: bool,
     spill: Option<Arc<super::spill::SpillStore>>,
 }
@@ -66,6 +67,7 @@ struct PythonBatchSink {
 struct EncodedRecord {
     value: Py<PyAny>,
     bytes: usize,
+    retained_bytes: usize,
     /// Split-record parts stay on disk until the destination acknowledges.
     _parts: Vec<super::spill::SpillFile>,
 }
@@ -80,6 +82,14 @@ impl PythonBatchSink {
     ) -> Result<EncodedRecord, ()> {
         let split = super::split::split(record, store, maximum_bytes).ok_or(())?;
         let bytes = split.skeleton.len();
+        let retained_bytes = bytes
+            + split.marker.len() * 4
+            + 512
+            + split
+                .parts
+                .iter()
+                .map(|part| part.file.path().as_os_str().len() * 4 + part.file.heap_bytes() + 512)
+                .sum::<usize>();
         Python::try_attach(|py| {
             let parts = split
                 .parts
@@ -111,6 +121,7 @@ impl PythonBatchSink {
             Ok::<_, PyErr>(EncodedRecord {
                 value: value.into_any().unbind(),
                 bytes,
+                retained_bytes,
                 _parts: split.parts.into_iter().map(|part| part.file).collect(),
             })
         })
@@ -155,6 +166,7 @@ impl Sink for PythonBatchSink {
             Ok::<_, PyErr>(EncodedRecord {
                 value,
                 bytes,
+                retained_bytes: bytes * if self.bytes_output { 1 } else { 4 } + 256,
                 _parts: Vec::new(),
             })
         })
@@ -188,6 +200,14 @@ impl Sink for PythonBatchSink {
 
     fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
         prepared.bytes
+    }
+
+    fn retained_prepared_bytes(&self, prepared: &Self::Prepared, _: usize) -> usize {
+        prepared.retained_bytes
+    }
+
+    fn independent_retries(&self) -> bool {
+        self.independent_retries
     }
 
     fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
@@ -253,14 +273,17 @@ impl CaptureCollector {
     /// Deliver bounded groups with per-update commit acknowledgements. Default
     /// records remain complete schema 1. Opt-in schema-2 completion references
     /// require a destination that retries until the prompt checkpoint is durable.
+    /// Independent retries require idempotent, monotonic writes: delayed updates
+    /// may arrive after newer updates, and must never overwrite their evidence.
     #[staticmethod]
-    #[pyo3(signature = (config_json, sink, *, completion_references=false, bytes_output=false))]
+    #[pyo3(signature = (config_json, sink, *, completion_references=false, bytes_output=false, independent_retries=false))]
     fn batched(
         py: Python<'_>,
         config_json: &str,
         sink: Py<PyAny>,
         completion_references: bool,
         bytes_output: bool,
+        independent_retries: bool,
     ) -> PyResult<Self> {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture batch sink must be callable"));
@@ -278,6 +301,7 @@ impl CaptureCollector {
                 PythonBatchSink {
                     callback: sink,
                     completion_references,
+                    independent_retries,
                     bytes_output,
                     spill: spill.clone(),
                 },

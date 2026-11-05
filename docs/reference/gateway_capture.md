@@ -166,6 +166,14 @@ booleans in the same order: `True` acknowledges durable storage or an intentiona
 privacy exclusion, and `False` retains that record for retry. Exceptions or an
 incorrect receipt count acknowledge nothing. Failed members retain the exact same
 prepared string object; acknowledged members are released independently.
+A destination with idempotent, monotonic updates can set
+`independent_retries=True`: deferred records retain their admission and byte
+charges while later ready records get delivery turns. This prevents a full retry
+batch from blocking unrelated captures. Updates can arrive out of order, so the
+destination must refuse to replace newer evidence with an older update and must
+retry a completion reference until its prompt exists. Sequential destinations
+leave this option disabled. Retried payloads remain within the delivery byte
+budget; genuine capacity exhaustion still refuses admission.
 Destinations that accept UTF-8 can set `bytes_output=True` to receive immutable
 bytes instead of strings. This skips Unicode decoding and re-encoding at the
 storage boundary; the JSON, size limits and acknowledgement semantics are
