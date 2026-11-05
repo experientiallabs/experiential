@@ -1,5 +1,8 @@
 """Compatibility review draws retain exact model authority across replay."""
 
+import json
+from itertools import permutations
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -13,10 +16,13 @@ from exp.simulation.mining.environment_families_test import (
 from exp.simulation.mining.environment_review import (
     CompatibilityReviewer,
     CompatibilitySpec,
+    group_packet,
+    prepare_group_packets,
     reconcile,
     review_variant,
     validate_review,
 )
+from exp.simulation.rules.contracts_test import contract_merge_traces
 
 
 @pytest.mark.parametrize("field", ["model_id", "capabilities_sha256", "connection_sha256"])
@@ -110,3 +116,39 @@ def test_split_prefers_explicit_member_ids_over_locator_aliases() -> None:
         frozenset({"trace:a", "trace:trace:a"}),
     )
     assert tuple(row.members for row in reviewed.subgroups) == (("a",), ("trace:a",))
+
+
+def test_prepared_packets_equal_native_full_parse_bytes_and_locators() -> None:
+    """Every selected prefix matches the independent full parser, including exact JSON bytes."""
+    traces = contract_merge_traces()
+    prepared = prepare_group_packets(traces)
+    by_id = {trace.trace_id: trace for trace in traces}
+    for ordered in permutations(by_id):
+        for length in range(len(ordered) + 1):
+            ids = ordered[:length]
+            packet, shown = prepared.packet(ids)
+            direct, direct_shown = group_packet([by_id[member] for member in ids])
+            assert packet == direct
+            assert json.dumps(packet, sort_keys=True).encode("utf-8") == json.dumps(
+                direct, sort_keys=True
+            ).encode("utf-8")
+            assert shown == direct_shown
+    selected, shown = prepared.packet(("d",))
+    selected_contracts = selected["tool_contracts"]
+    assert isinstance(selected_contracts, dict)
+    assert set(selected_contracts) == {"unused"}
+    assert shown == frozenset({"trace:d"})
+    assert "trace:b" not in json.dumps(selected)
+    selected_members = selected["members"]
+    assert isinstance(selected_members, list) and isinstance(selected_members[0], dict)
+    selected_members[0]["task"] = "changed returned packet"
+    assert prepared.packet(("d",)) == group_packet((traces[3],))
+    isolated = prepare_group_packets((traces[3],))
+    with pytest.raises(ValueError, match="unknown"):
+        isolated.packet(("a",))
+    with pytest.raises(ValueError, match="distinct"):
+        prepared.packet(("a", "a"))
+    with pytest.raises(ValueError, match="unknown"):
+        prepared.packet(("absent",))
+    with pytest.raises(ValueError, match="distinct"):
+        prepare_group_packets((traces[0], traces[0]))

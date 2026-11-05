@@ -12,9 +12,8 @@ from exp.common.traces import Trace
 from exp.simulation.mining.environment_review import (
     CandidateCapacityError,
     CompatibilitySpec,
-    checked_group_packet,
+    prepare_group_packets,
 )
-from exp.simulation.rules.contracts import parse_tool_contracts
 
 ENVIRONMENT_CANDIDATE_PROTOCOL = "bounded-environment-candidates-v1"
 """Contract grouping and complete inventory partition semantics for explicitly bounded reviews."""
@@ -66,9 +65,10 @@ def environment_candidates(
         return ()
     if spec.maximum_candidate_members is None:
         return (_candidate(ordered, sha256_json({"unpartitioned": True})),)
+    prepared = prepare_group_packets(ordered)
     buckets: dict[str, list[Trace]] = defaultdict(list)
     for trace in ordered:
-        contracts = parse_tool_contracts((trace,))
+        contracts = prepared.contracts[trace.trace_id]
         fingerprint = sha256_json(
             {
                 "declared": sorted(
@@ -87,13 +87,13 @@ def environment_candidates(
         pending: list[Trace] = []
         for trace in members:
             try:
-                checked_group_packet((*pending, trace), spec)
+                prepared.checked_packet([item.trace_id for item in (*pending, trace)], spec)
             except CandidateCapacityError:
                 if not pending:
                     raise
                 candidates.append(_candidate(pending, fingerprint))
                 pending = []
-                checked_group_packet((trace,), spec)
+                prepared.checked_packet((trace.trace_id,), spec)
             pending.append(trace)
         if pending:
             candidates.append(_candidate(pending, fingerprint))

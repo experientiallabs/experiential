@@ -18,7 +18,7 @@ Locators have two forms: ``trace:<trace_id>`` for a whole trajectory and
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from exp.common.core.artifacts import JsonObject, JsonValue, stable_id
@@ -114,6 +114,47 @@ def parse_tool_contracts(traces: Sequence[Trace]) -> dict[str, ToolContract]:
         name: _contract(name, schemas.get(name), observed.get(name, []))
         for name in sorted(set(schemas) | set(observed))
     }
+
+
+def merge_tool_contracts(
+    groups: Sequence[Mapping[str, ToolContract]],
+) -> dict[str, ToolContract]:
+    """Combine native per-trace contracts in the same order their traces would be parsed.
+
+    Declaration precedence, required-call arguments and capped example prefixes follow
+    parse_tool_contracts exactly. Inputs are parsed contracts, never retained trace steps.
+    """
+    by_name: dict[str, list[ToolContract]] = {}
+    for group in groups:
+        for name, contract in group.items():
+            by_name.setdefault(name, []).append(contract)
+    merged: dict[str, ToolContract] = {}
+    for name, rows in sorted(by_name.items()):
+        types: dict[str, set[str]] = {}
+        required: set[str] | None = None
+        for row in rows:
+            for argument, found in row.argument_types.items():
+                types.setdefault(argument, set()).update(found)
+            if row.calls:
+                required = (
+                    set(row.required_arguments)
+                    if required is None
+                    else required & set(row.required_arguments)
+                )
+        merged[name] = ToolContract(
+            name=name,
+            declared_schema=next(
+                (row.declared_schema for row in rows if row.declared_schema is not None), None
+            ),
+            argument_types={key: tuple(sorted(found)) for key, found in sorted(types.items())},
+            required_arguments=tuple(sorted(required or ())),
+            result_shapes=tuple(sorted({shape for row in rows for shape in row.result_shapes})),
+            error_forms=tuple(sorted({form for row in rows for form in row.error_forms})),
+            calls=sum(row.calls for row in rows),
+            failures=sum(row.failures for row in rows),
+            examples=tuple(ref for row in rows for ref in row.examples)[:MAXIMUM_EXAMPLES],
+        )
+    return merged
 
 
 def trajectory_view(trace: Trace) -> tuple[JsonObject, frozenset[str]]:

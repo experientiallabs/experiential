@@ -1,12 +1,15 @@
 """Complete bounded candidates exercise native inventory, review and cost owners."""
 
 import json
+from collections.abc import Sequence
 
 import pytest
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import JsonValue, sha256_json
 from exp.common.tasks import ToolSchema
+from exp.common.traces import Trace
 from exp.simulation.mining import environment_candidates as candidate_owner
+from exp.simulation.mining import environment_review as review_owner
 from exp.simulation.mining.environment_candidates import (
     candidate_root_bound,
     environment_candidates,
@@ -25,10 +28,12 @@ from exp.simulation.mining.environment_families_test import (
 from exp.simulation.mining.environment_review import (
     CandidateCapacityError,
     CompatibilitySpec,
+    PreparedGroupPackets,
     checked_group_packet,
     group_packet,
     review_protocol_sha256,
 )
+from exp.simulation.rules.model import ToolContract
 
 
 def test_partition_preserves_complete_members_contracts_and_source_identity() -> None:
@@ -169,3 +174,33 @@ def test_candidate_protocol_rekeys_only_explicitly_bounded_family_reviews(
     assert families_identity(clustered, bound, bounded, traces, ()) != before
     assert environment_candidates(tuple(traces.values()), bounded) != candidates
     assert review_protocol_sha256() == review_protocol
+
+
+def test_candidate_partition_parses_each_trace_once_and_matches_native_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each partition parses its traces once and preserves native candidate identities."""
+    traces = tuple(order_trace(f"o{i:02}") for i in range(10))
+    by_id = {trace.trace_id: trace for trace in traces}
+    spec = CompatibilitySpec(maximum_candidate_members=3, maximum_candidate_packet_bytes=48_000)
+    original = review_owner.parse_tool_contracts
+    parsed: list[tuple[str, ...]] = []
+
+    def counted(selected: Sequence[Trace]) -> dict[str, ToolContract]:
+        """Count actual native trace parsing, retaining only identity evidence in the test."""
+        parsed.append(tuple(trace.trace_id for trace in selected))
+        return original(selected)
+
+    monkeypatch.setattr(review_owner, "parse_tool_contracts", counted)
+    fast = environment_candidates(traces, spec)
+    assert parsed == [(trace.trace_id,) for trace in traces]
+
+    def direct(
+        self: PreparedGroupPackets, member_ids: Sequence[str], registered: CompatibilitySpec
+    ) -> tuple[dict[str, JsonValue], frozenset[str]]:
+        """Use the independent full-parse inventory guard as the packing reference."""
+        del self
+        return checked_group_packet([by_id[member] for member in member_ids], registered)
+
+    monkeypatch.setattr(PreparedGroupPackets, "checked_packet", direct)
+    assert environment_candidates(traces, spec) == fast
