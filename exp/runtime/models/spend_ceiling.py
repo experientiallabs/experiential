@@ -45,6 +45,17 @@ from exp.common.models.token_cost import schedule_maximum_cost_nano_usd, schedul
 from exp.common.sqlite.connection import connect_database
 from exp.runtime.models.providers.backpressure import holder_alive, process_start
 from exp.runtime.models.providers.transport import JsonHttpResponse
+from exp.runtime.models.scoped_spending import (
+    SpendEnvelopeRef,
+    associate_reservation,
+    unpriced_used,
+)
+from exp.runtime.models.scoped_spending import (
+    allowance as scoped_allowance,
+)
+from exp.runtime.models.scoped_spending import (
+    check_reservation as check_scoped_reservation,
+)
 
 SCHEMA_VERSION: Final = 1
 """Ledger schema identity stored in ``PRAGMA user_version``."""
@@ -270,6 +281,7 @@ class OperationSpendCeiling:
         tariffs: Worst-case prices by catalog alias. An alias outside it is unpriced.
         sleep: Wait between admission polls while another request's settlement is pending.
         maximum_wait_seconds: Longest wait for in-flight settlements before refusing.
+        envelope: Exact registered child-scope lease, or None for unchanged legacy authority.
 
     Raises:
         ValueError: The file holds another schema.
@@ -282,9 +294,11 @@ class OperationSpendCeiling:
         tariffs: Mapping[str, AliasTariff],
         sleep: Callable[[float], None] = time.sleep,
         maximum_wait_seconds: float = 600.0,
+        envelope: SpendEnvelopeRef | None = None,
     ) -> None:
         """Create or open the ledger without authorizing any spend."""
         self._path, self._tariffs = path, dict(tariffs)
+        self._envelope = envelope
         self._sleep, self._maximum_wait = sleep, maximum_wait_seconds
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as connection:
@@ -340,6 +354,11 @@ class OperationSpendCeiling:
     def path(self) -> Path:
         """Return the operation's ledger file."""
         return self._path
+
+    @property
+    def envelope(self) -> SpendEnvelopeRef | None:
+        """Exact native child lease, or None for the unchanged legacy operation scope."""
+        return self._envelope
 
     def require_accounted_attempts(self, attempt_ids: Sequence[str]) -> None:
         """Require every named physical attempt to retain liability in this operation.
@@ -461,18 +480,14 @@ class OperationSpendCeiling:
             with self._transaction() as connection:
                 self._recover(connection)
                 ceiling, allowance = _authorized(connection)
+                allowance = scoped_allowance(connection, self._envelope, allowance)
                 if ceiling is None:
                     raise ValueError(
                         "no spend ceiling is authorized for this operation; "
                         "consent to its cost inventory first"
                     )
                 if cost is None:
-                    used = int(
-                        connection.execute(
-                            "SELECT COUNT(*) FROM reservations"
-                            " WHERE priced = 0 AND state != 'released'"
-                        ).fetchone()[0]
-                    )
+                    used = unpriced_used(connection, self._envelope)
                     if used >= allowance:
                         raise UnpricedDispatchRefused(alias, reason)
                     return self._insert(
@@ -505,6 +520,9 @@ class OperationSpendCeiling:
         embedding: bool,
     ) -> Reservation:
         """Write a ``reserved`` row owned by this process inside the admission transaction."""
+        check_scoped_reservation(
+            connection, self._envelope, alias, None if tariff is None else cost
+        )
         identity = uuid4().hex
         sequence = int(
             connection.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM reservations").fetchone()[0]
@@ -526,6 +544,7 @@ class OperationSpendCeiling:
                 datetime.now(UTC).isoformat(),
             ),
         )
+        associate_reservation(connection, identity, self._envelope)
         return Reservation(identity, tariff is not None, cost, tariff, embedding)
 
     def _recover(self, connection: sqlite3.Connection) -> None:
@@ -918,6 +937,8 @@ def install_spend_ceiling(ceiling: OperationSpendCeiling) -> None:
         raise ValueError("a spend ceiling needs an open operation scope")
     if holder[0] is not None and holder[0].path != ceiling.path:
         raise ValueError("an operation has exactly one spend ceiling")
+    if holder[0] is not None and holder[0].envelope != ceiling.envelope:
+        raise ValueError("a scoped ceiling requires an isolated nested operation scope")
     holder[0] = ceiling
 
 
