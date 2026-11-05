@@ -266,7 +266,7 @@ while releasing the GIL; a blocked destination cannot extend that caller's deadl
 A drain timeout returns false and leaves accepted delivery records queued, including
 producers already waiting for space. It does not purge them. The host must keep the
 process and destination alive to finish draining; closing its database before a
-successful drain is unsafe. Destroying the collector allows one final second to drain, then ends retries
+successful drain is unsafe. Destroying the collector allows two final seconds to drain, then ends retries
 and relinquishes remaining captures: unfinished delivery receipts fail and undelivered records
 are counted as dropped, never persisted. Teardown signals cancellation without
 joining a potentially blocked external callback; the worker exits when that

@@ -546,12 +546,14 @@ impl Drop for Delivery {
     fn drop(&mut self) {
         // close_until(false) retains work for recovery while this owner lives.
         // Give accepted checkpoints one final bounded drain after owner loss.
-        // No later caller can extend this deadline or recover the queue.
+        // Two seconds exceeds the maximum one-second retry backoff, so even
+        // a fully backed-off record gets another attempt. No later caller can
+        // extend this deadline or recover the queue.
         *self
             .counters
             .abandon_at
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(1));
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(2));
         if let Ok(sender) = self.sender.get_mut() {
             if let Some(sender) = sender.take() {
                 let _ = sender.try_send(None);

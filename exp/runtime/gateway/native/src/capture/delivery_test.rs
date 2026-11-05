@@ -869,11 +869,71 @@ fn destroying_failed_delivery_stops_worker_and_accounts_for_undelivered_records(
     let counters = delivery.counters.clone();
     drop(delivery);
     exited
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(Duration::from_secs(3))
         .expect("retry worker survived its owner");
     assert_eq!(counters.pending.load(Ordering::Acquire), 0);
     assert_eq!(counters.bytes.load(Ordering::Acquire), 0);
     assert_eq!(counters.preparation_bytes.load(Ordering::Acquire), 0);
     assert_eq!(counters.dropped.load(Ordering::Acquire), 4);
     assert_eq!(counters.persisted.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn owner_destruction_allows_recovery_after_maximum_retry_backoff() {
+    struct Recoverable {
+        attempts: mpsc::Sender<()>,
+        recovered: Arc<AtomicBool>,
+        exited: mpsc::Sender<()>,
+    }
+    impl Drop for Recoverable {
+        fn drop(&mut self) {
+            let _ = self.exited.send(());
+        }
+    }
+    impl Sink for Recoverable {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            let recovered = self.recovered.load(Ordering::Acquire);
+            self.attempts.send(()).unwrap();
+            if recovered {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+    let (attempts, observed) = mpsc::channel();
+    let (exited, stopped) = mpsc::channel();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let delivery = Delivery::new(
+        limits(),
+        Recoverable {
+            attempts,
+            recovered: recovered.clone(),
+            exited,
+        },
+    )
+    .unwrap();
+    let counters = delivery.counters.clone();
+    assert!(delivery.submit(record("recover")));
+    // Initial attempt plus 25/50/100/200/400/800 ms retries: next delay is 1s.
+    for _ in 0..7 {
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    drop(delivery);
+    std::thread::sleep(Duration::from_millis(100));
+    recovered.store(true, Ordering::Release);
+    stopped.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(counters.persisted.load(Ordering::Acquire), 1);
+    assert_eq!(counters.dropped.load(Ordering::Acquire), 0);
+    assert_eq!(counters.pending.load(Ordering::Acquire), 0);
 }
