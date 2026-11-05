@@ -119,6 +119,11 @@ def start_definition(
             **start,
             "world_model": template.world_model.model_dump(mode="json"),
             "catalog_sha256": template.catalog_sha256,
+            **(
+                {}
+                if template.catalog_binding is None
+                else {"catalog_binding": template.catalog_binding.model_dump(mode="json")}
+            ),
             "seed": template.seed,
             "maximum_output_tokens": template.maximum_output_tokens,
             "maximum_reasks": template.maximum_reasks,

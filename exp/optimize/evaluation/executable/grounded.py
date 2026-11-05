@@ -53,6 +53,10 @@ from exp.common.project import ArtifactStore, ProjectStore
 from exp.common.project.manifests import artifact_input
 from exp.common.release_revision import installed_execution_revision
 from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.executable.catalog_binding import (
+    RuntimeCatalogBinding,
+    load_runtime_catalog,
+)
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
@@ -123,6 +127,7 @@ class GroundedRuntimeDefinition(ContractModel):
         task: Public development task, without evaluator answers.
         world_model: Exact build-produced grounded artifact, including its retrieval index.
         catalog_sha256: Frozen connection/model definitions, excluding credential values.
+        catalog_binding: Optional native catalog/embedding alias, isolated from project settings.
         manifest: Domain ownership and per-tool effects; this factory owns simulated domains.
         initial_state: Exact initial JSON value of each simulated domain.
         facts: Optional validated instance facts describing the episode's starting world, with
@@ -161,6 +166,9 @@ class GroundedRuntimeDefinition(ContractModel):
     task: TaskCase
     world_model: ArtifactInput
     catalog_sha256: Sha256
+    catalog_binding: RuntimeCatalogBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     manifest: WorldManifest
     initial_state: JsonObject
     facts: ReplayFacts | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -408,12 +416,23 @@ def _checked(
     require_fact_scope(
         project, spec.task, spec.facts, None if spec.memory is None else spec.memory.lineage
     )
-    catalog = load_model_catalog(project.model_catalog_path)
+    catalog = (
+        load_model_catalog(project.model_catalog_path)
+        if spec.catalog_binding is None
+        else load_runtime_catalog(project, spec.catalog_binding)
+    )
     if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
         raise ValueError("executable simulator catalog differs from its frozen definition")
     artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
     reasoning_catalog(catalog, artifact.model_alias, spec.reasoning_effort)
-    embedder_alias = index_embedder_alias(project, catalog, artifact)
+    embedder_alias = index_embedder_alias(
+        project,
+        catalog,
+        artifact,
+        configured_alias=None
+        if spec.catalog_binding is None
+        else spec.catalog_binding.embedder_alias,
+    )
     aliases = [artifact.model_alias]
     if embedder_alias is not None:
         aliases.append(embedder_alias)

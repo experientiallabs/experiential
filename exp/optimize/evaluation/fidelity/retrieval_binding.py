@@ -62,7 +62,11 @@ def _index_embedder(
 
 
 def index_embedder_alias(
-    project: ProjectStore, catalog: ModelCatalog, artifact: GroundedWorldModelArtifact
+    project: ProjectStore,
+    catalog: ModelCatalog,
+    artifact: GroundedWorldModelArtifact,
+    *,
+    configured_alias: str | None = None,
 ) -> str | None:
     """Find the configured alias that embeds queries for a simulator's retrieval index.
 
@@ -73,6 +77,7 @@ def index_embedder_alias(
         project: Project whose configured embedder role built the index.
         catalog: Frozen model catalog of the evaluation.
         artifact: Verified simulator whose serving index is bound.
+        configured_alias: Native explicit runtime alias, otherwise project defaults.
 
     Returns:
         The project's embedder alias for a semantic index, or None for the local hashing index
@@ -86,7 +91,7 @@ def index_embedder_alias(
     dimension, embedder = _index_embedder(
         str(project.paths.root), artifact.serving_rag.artifact_id, project
     )
-    return _embedder_alias(project, catalog, dimension, embedder)
+    return _embedder_alias(project, catalog, dimension, embedder, configured_alias=configured_alias)
 
 
 def rag_index_embedder_alias(
@@ -112,13 +117,20 @@ def rag_index_embedder_alias(
 
 
 def _embedder_alias(
-    project: ProjectStore, catalog: ModelCatalog, dimension: int, embedder: ModelSnapshot
+    project: ProjectStore,
+    catalog: ModelCatalog,
+    dimension: int,
+    embedder: ModelSnapshot,
+    *,
+    configured_alias: str | None = None,
 ) -> str | None:
     """Resolve the configured embedder alias for an index's dimension and embedder identity."""
     if default_rag_embedder(dimension).snapshot == embedder:
         return None
     config = project.load_project()
-    alias = config.models.embedder if config.models is not None else catalog.roles.embedder
+    alias = configured_alias or (
+        config.models.embedder if config.models is not None else catalog.roles.embedder
+    )
     if alias is None or alias not in catalog.models:
         raise ValueError(
             f"the retrieval index was embedded with {embedder.model_id}; "

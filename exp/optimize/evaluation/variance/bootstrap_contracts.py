@@ -37,6 +37,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.executable.catalog_binding import RuntimeCatalogBinding
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
     RuleMemoryBinding,
@@ -134,6 +135,7 @@ class RuntimeTemplate(ContractModel):
         runtime_sha256: Its exact source digest.
         world_model: Build-produced grounded world model.
         catalog_sha256: Frozen catalog digest.
+        catalog_binding: Optional native runtime-only catalog and retrieval alias.
         tag_retrieval: Optional tag retrieval binding.
         bind_rule_book: Bind the family's rule book (and its rule memory set, when learned).
         jev_alias: Native decision alias rule memory recall uses.
@@ -148,6 +150,9 @@ class RuntimeTemplate(ContractModel):
     runtime_sha256: Sha256
     world_model: ArtifactInput
     catalog_sha256: Sha256
+    catalog_binding: RuntimeCatalogBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     tag_retrieval: ArtifactInput | None = None
     bind_rule_book: bool = True
     jev_alias: str = Field(default="jev", min_length=1)

@@ -323,6 +323,7 @@ def _validation_costs(
             attempts=template.maximum_physical_attempts,
             output_tokens=template.maximum_output_tokens,
             decision_aliases=recall,
+            catalog_binding=template.catalog_binding,
         )
     # Capture may open a runtime; reconstructed validation opens one; authored validation opens
     # one per reveal. Counting all of them is conservative even though provenances are exclusive.

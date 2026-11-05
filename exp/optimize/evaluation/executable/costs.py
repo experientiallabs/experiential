@@ -39,8 +39,13 @@ from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable import mixed as mixed_runtime
+from exp.optimize.evaluation.executable.catalog_binding import (
+    RuntimeCatalogBinding,
+    load_runtime_catalog,
+)
 from exp.optimize.evaluation.executable.model_costs import (
     CostComponent,
+    catalog_model_cost,
     decision_cost,
     model_cost,
 )
@@ -142,6 +147,7 @@ def _grounded_costs(
         attempts=spec.maximum_physical_attempts,
         output_tokens=spec.maximum_output_tokens,
         decision_aliases=aliases,
+        catalog_binding=spec.catalog_binding,
     )
 
 
@@ -152,6 +158,7 @@ def grounded_allowance_costs(
     attempts: int,
     output_tokens: int,
     decision_aliases: tuple[str, ...] = (),
+    catalog_binding: RuntimeCatalogBinding | None = None,
 ) -> tuple[CostComponent, ...]:
     """Price a grounded runtime allowance before its task or initial state is authored.
 
@@ -161,6 +168,7 @@ def grounded_allowance_costs(
         attempts: Finite lifetime physical-request ceiling of each served world.
         output_tokens: Per-prediction output allowance.
         decision_aliases: Every enabled memory recall and prediction-reading route.
+        catalog_binding: Exact native target runtime catalog, including prebuild embeddings.
 
     Returns:
         Predictor, query-embedding and decision costs at the same lifetime allowance. Summing
@@ -171,13 +179,39 @@ def grounded_allowance_costs(
     """
     if attempts < 1 or output_tokens < 1:
         raise ValueError("grounded runtime planning needs positive request and output allowances")
-    catalog = load_model_catalog(project.model_catalog_path)
+    catalog = (
+        load_model_catalog(project.model_catalog_path)
+        if catalog_binding is None
+        else load_runtime_catalog(project, catalog_binding)
+    )
     world = load_grounded_world_model_artifact(project.artifacts, world_model)
-    components = [model_cost(project, world.model_alias, attempts, output_tokens)]
-    embedder = index_embedder_alias(project, catalog, world)
+    components = [catalog_model_cost(catalog, world.model_alias, attempts, output_tokens)]
+    embedder = (
+        index_embedder_alias(project, catalog, world)
+        if catalog_binding is None
+        else catalog_binding.embedder_alias
+    )
     if embedder is not None:
-        components.append(model_cost(project, embedder, attempts, 0))
-    components.extend(decision_cost(project, alias, attempts) for alias in decision_aliases)
+        components.append(catalog_model_cost(catalog, embedder, attempts, 0))
+    if catalog_binding is None:
+        components.extend(decision_cost(project, alias, attempts) for alias in decision_aliases)
+    else:
+        from exp.runtime.gateway.decisions_contracts import (  # noqa: PLC0415
+            MAX_DECISION_CRITERIA,
+            MAX_DECISION_INPUT_BYTES,
+            MAX_DECISION_QUESTIONS,
+        )
+
+        components.extend(
+            catalog_model_cost(
+                catalog,
+                alias,
+                attempts,
+                MAX_DECISION_QUESTIONS * (1024 + 512 * MAX_DECISION_CRITERIA),
+                input_tokens=MAX_DECISION_QUESTIONS * (MAX_DECISION_INPUT_BYTES + 1024),
+            )
+            for alias in decision_aliases
+        )
     return tuple(components)
 
 

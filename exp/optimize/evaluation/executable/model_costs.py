@@ -7,7 +7,7 @@ roles without loading the executable inventories in :mod:`exp.optimize.evaluatio
 import math
 from dataclasses import dataclass
 
-from exp.common.models import load_model_catalog
+from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.models.pricing import completion_cost_reservation
 from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
 from exp.common.project import ProjectStore
@@ -53,7 +53,35 @@ def model_cost(
     input_tokens: int | None = None,
 ) -> CostComponent:
     """Price known tariff dimensions at full input capacity without resolving credentials."""
-    catalog = load_model_catalog(project.model_catalog_path)
+    return catalog_model_cost(
+        load_model_catalog(project.model_catalog_path),
+        alias,
+        attempts,
+        output,
+        input_tokens=input_tokens,
+    )
+
+
+def catalog_model_cost(
+    catalog: ModelCatalog,
+    alias: str,
+    attempts: int,
+    output: int,
+    *,
+    input_tokens: int | None = None,
+) -> CostComponent:
+    """Price an explicit immutable catalog without fake project context or credentials.
+
+    Args:
+        catalog: Exact native catalog selected for the planned runtime.
+        alias: Declared model alias.
+        attempts: Full physical attempt allowance.
+        output: Per-generation output allowance, zero for embeddings.
+        input_tokens: Explicit input bound, otherwise full native capacity.
+
+    Returns:
+        The same native known/unpriced component used for project-owned catalogs.
+    """
     model, caps = RuntimeModelCatalog(catalog, environment={}).snapshot(alias)
     if (
         output
