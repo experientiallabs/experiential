@@ -51,7 +51,16 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
-from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
+from exp.optimize.evaluation.factory.authoring import (
+    AuthorSettings,
+    author_request_bytes,
+    author_response,
+)
+from exp.optimize.evaluation.rules.evidence_pages import (
+    CONTINUE_EVIDENCE,
+    PAGE_INSTRUCTION,
+    EvidencePages,
+)
 from exp.optimize.evaluation.variance.evidence_tools import (
     EvidenceBudget,
     MeasuredUsage,
@@ -59,7 +68,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v2"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v3"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"
@@ -290,7 +299,8 @@ def run_agent(
         saved = AgentTranscript.model_validate_json(
             store.read_bytes(transcript_id, "transcript.json")
         )
-        if (saved.profile, saved.role, saved.variant, saved.answer_tool) != (
+        if (saved.protocol, saved.profile, saved.role, saved.variant, saved.answer_tool) != (
+            AGENT_LOOP_PROTOCOL,
             profile,
             role,
             variant,
@@ -298,10 +308,7 @@ def run_agent(
         ):
             raise ValueError("saved rules draw was made under a different profile or prompt")
         return artifact_input(store.read(transcript_id).manifest), saved
-    budget = json.dumps(profile.budget.model_dump(mode="json"), sort_keys=True)
-    system = instruction + LOOP_INSTRUCTION.replace("{budget}", budget).replace(
-        "{answer}", answer.name
-    )
+    system = agent_instruction(instruction, profile, answer.name)
     loop = _Loop(project, settings, profile, identity, sources, code_revision, role, variant)
     transcript = loop.run(system, opening, tuple(tools), runner, answer, check)
     inputs = {call.response for call in transcript.calls} | {t.result for t in transcript.tools}
@@ -317,6 +324,17 @@ def run_agent(
         files={"transcript.json": transcript},
     )
     return artifact_input(manifest), transcript
+
+
+def agent_instruction(instruction: str, profile: AgentProfile, answer: str) -> str:
+    """Compose the exact model-facing phase and evidence-delivery contract."""
+    budget = json.dumps(profile.budget.model_dump(mode="json"), sort_keys=True)
+    return (
+        instruction
+        + "\n"
+        + PAGE_INSTRUCTION
+        + LOOP_INSTRUCTION.replace("{budget}", budget).replace("{answer}", answer)
+    )
 
 
 def bounded(value: JsonValue, maximum_bytes: int) -> tuple[ToolStatus, JsonValue]:
@@ -366,6 +384,7 @@ class _Loop:
         self.executed = 0
         self.usage = MeasuredUsage()
         self.started = time.monotonic()
+        self.pages = EvidencePages()
 
     def _served(self) -> frozenset[str]:
         """Locators served by successful reads so far."""
@@ -375,6 +394,8 @@ class _Loop:
 
     def _call(self, request: ModelRequest, *, phase: Phase, forced: str | None) -> ModelResponse:
         """Buy or replay one model call and measure it."""
+        if author_request_bytes(self.settings, request) > self.settings.maximum_input_bytes:
+            raise ValueError("assembled rules request exceeds its frozen byte allowance")
         index = len(self.calls)
         name = f"{self.identity}-call-{index}"
         if self.profile.budget.maximum_usd is None:
@@ -492,12 +513,19 @@ class _Loop:
         first = {**opening, "phase": "plan", "phase_instruction": phase_prompt("plan", "")}
         messages = [
             ModelMessage(role="system", content=instruction),
-            ModelMessage(role="user", content=json.dumps(first, sort_keys=True)),
+            ModelMessage(
+                role="user",
+                content=json.dumps(
+                    first, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ),
+            ),
         ]
+        read_tools = (*tools, CONTINUE_EVIDENCE)
+        schemas = tuple((*read_tools, item) for item in own_tool.values())
         while True:
             own = own_tool[phase]
             reading = phase in ("investigate", "self_check")
-            offered = (*tools, own) if reading else (own,)
+            offered = (*read_tools, own) if reading else (own,)
             probe = self._request(messages, offered, None)
             free = (
                 reading
@@ -523,9 +551,17 @@ class _Loop:
                 messages.append(ModelMessage(role="user", content=json.dumps(body, sort_keys=True)))
                 continue
             forced = None if free else own.name
-            response = self._call(
-                self._request(messages, offered, forced), phase=phase, forced=forced
-            )
+            assembled = self._request(messages, offered, forced)
+            size = author_request_bytes(self.settings, assembled)
+            if size > self.settings.maximum_input_bytes:
+                return self._finish(
+                    answer.name,
+                    "budget_exhausted",
+                    exhausted=("serialized_request_bytes",),
+                    failure=f"assembled request is {size} bytes, above frozen "
+                    f"{self.settings.maximum_input_bytes}; retained mandatory history cannot fit",
+                )
+            response = self._call(assembled, phase=phase, forced=forced)
             calls = response.output.tool_calls
             if own is answer:
                 return self._answered(response, answer.name)
@@ -541,12 +577,26 @@ class _Loop:
                     answer.name, "protocol_failure", failure="role made no complete tool call"
                 )
             messages.append(ModelMessage(role="assistant", assistant_action=response.output))
-            messages.extend(self._reads([c for c in calls if c.name != own.name], runner))
+            messages.extend(
+                self._reads(
+                    [c for c in calls if c.name != own.name],
+                    runner,
+                    history=messages,
+                    schemas=schemas,
+                    remaining_mandatory=_MANDATORY[phase],
+                )
+            )
             if mine:
                 phase = self._record(phase, mine, messages, answer.name, check)
 
     def _answered(self, response: ModelResponse, answer: str) -> AgentTranscript:
         """Close the draw on the forced final call, checking measured usage."""
+        if self.pages.incomplete:
+            return self._finish(
+                answer,
+                "protocol_failure",
+                failure="evidence document remains incomplete; no final answer admitted",
+            )
         submitted = [call for call in response.output.tool_calls if call.name == answer]
         if len(submitted) != 1 or response.finish_reason.value != "completed":
             return self._finish(
@@ -563,7 +613,15 @@ class _Loop:
             )
         return self._finish(answer, "answered", answer=submitted[0].arguments)
 
-    def _reads(self, calls: Sequence[ToolCall], runner: ToolRunner) -> list[ModelMessage]:
+    def _reads(
+        self,
+        calls: Sequence[ToolCall],
+        runner: ToolRunner,
+        *,
+        history: list[ModelMessage],
+        schemas: tuple[tuple[ToolSchema, ...], ...],
+        remaining_mandatory: int = 3,
+    ) -> list[ModelMessage]:
         """Execute read calls within the tool budget, persisting each result."""
         messages: list[ModelMessage] = []
         for position, call in enumerate(calls):
@@ -573,11 +631,54 @@ class _Loop:
                 result: JsonValue = "tool budget exhausted; not executed"
             else:
                 self.executed += 1
-                status, result, served = runner(call)
+
+                def accepts(value: JsonValue, refs: tuple[str, ...], call: ToolCall = call) -> bool:
+                    """Measure escaped envelopes, retained history and mandatory schemas."""
+                    if bounded(value, self.profile.maximum_result_bytes)[0] != "ok":
+                        return False
+                    pending = _tool_message(
+                        call, {"status": "ok", "result": value, "citations": list(refs)}
+                    )
+                    return all(
+                        author_request_bytes(
+                            self.settings,
+                            self._request(
+                                [*history, *messages, pending], offered, offered[-1].name
+                            ),
+                        )
+                        <= self.settings.maximum_input_bytes
+                        for offered in schemas
+                    )
+
+                if call.name == CONTINUE_EVIDENCE.name:
+                    status, result, served = self.pages.resume(
+                        call.arguments.get("cursor"), accepts
+                    )
+                else:
+                    status, result, served = runner(call)
+                    if status == "ok":
+                        maximum_pages = 1 + max(
+                            0,
+                            min(
+                                self.profile.budget.model_calls
+                                - len(self.calls)
+                                - remaining_mandatory,
+                                self.profile.budget.tool_calls - self.executed,
+                            ),
+                        )
+                        status, result, served = self.pages.start(
+                            call,
+                            result,
+                            served,
+                            accepts,
+                            maximum_pages=maximum_pages,
+                        )
                 if status == "refused":
                     served = ()
             self.tools.append(self._save_tool(position, call, status, result, served))
-            messages.append(_tool_message(call, {"status": status, "result": result}))
+            messages.append(
+                _tool_message(call, {"status": status, "result": result, "citations": list(served)})
+            )
         return messages
 
     def _record(
@@ -670,7 +771,9 @@ class _Loop:
 def _tool_message(call: ToolCall, body: JsonObject) -> ModelMessage:
     """Return the tool-result message answering one call."""
     return ModelMessage(
-        role="tool", tool_call_id=call.call_id, content=json.dumps(body, sort_keys=True)
+        role="tool",
+        tool_call_id=call.call_id,
+        content=json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
     )
 
 

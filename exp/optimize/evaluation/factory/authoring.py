@@ -129,12 +129,17 @@ def _effective_request(spec: AuthorSettings, request: ModelRequest) -> ModelRequ
     return request.model_copy(update={"reasoning_effort": spec.reasoning_effort})
 
 
+def author_request_bytes(spec: AuthorSettings, request: ModelRequest) -> int:
+    """Measure the complete effective serialized request, including schemas and escaping."""
+    return len(_effective_request(spec, request).model_dump_json().encode())
+
+
 def _prepare_author(
     project: ProjectStore, spec: AuthorSettings, request: ModelRequest
 ) -> ModelCatalog:
     """Validate the effective request and return its credential-free per-call catalog view."""
     request = _effective_request(spec, request)
-    if len(request.model_dump_json().encode()) > spec.maximum_input_bytes:
+    if author_request_bytes(spec, request) > spec.maximum_input_bytes:
         raise ValueError("author context exceeds its frozen byte allowance")
     if request.maximum_output_tokens != spec.output_tokens:
         raise ValueError("author request differs from its frozen output allowance")

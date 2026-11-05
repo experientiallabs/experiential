@@ -38,6 +38,7 @@ from exp.optimize.evaluation.rules.agent_loop import (
     run_agent,
     run_bounded,
 )
+from exp.optimize.evaluation.rules.locator_inventory import encode_inventory
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapSpec,
     BootstrapTask,
@@ -186,7 +187,7 @@ class StartMaterial:
             "recorded_state_available": self.recorded_state is not None,
             "allowed_provenance": list(self.allowed()),
             "findings": [_finding_view(row) for row in self.findings],
-            "inventory": sorted(self.inventory),
+            "inventory": encode_inventory(self.inventory),
         }
 
     def run(

@@ -56,7 +56,7 @@ from exp.simulation.mining.tagging import DecisionCache
 from exp.simulation.rules.contracts import trajectory_view
 from exp.simulation.rules.memory_set import Passage
 
-SYSTEM_ONE_PROTOCOL = "jev-system-one-v1"
+SYSTEM_ONE_PROTOCOL = "jev-system-one-v2"
 """Version of the region questions, reading rule and findings format."""
 
 FINDINGS_TYPE = "jev-objective-findings"
@@ -90,6 +90,7 @@ class Region(ContractModel):
         tool: Tool called, when the step is a tool call.
         text: The original step, serialized exactly once.
         sha256: Digest of ``text``.
+        observation_locator: Trusted native observation alias, when present in the original step.
     """
 
     locator: str
@@ -98,6 +99,7 @@ class Region(ContractModel):
     tool: str | None = None
     text: str
     sha256: Sha256
+    observation_locator: str | None = None
 
     def passage(self) -> Passage:
         """The region as an original passage with coordinates."""
@@ -139,6 +141,9 @@ class RegionCorpus:
                     tool=name if isinstance(name, str) else None,
                     text=text,
                     sha256=sha256_json(text),
+                    observation_locator=row.get("observation_locator")
+                    if isinstance(row.get("observation_locator"), str)
+                    else None,
                 )
                 self.order[region.locator] = len(self.regions)
                 self.regions.append(region)

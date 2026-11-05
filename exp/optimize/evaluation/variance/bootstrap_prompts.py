@@ -22,15 +22,25 @@ from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
-from exp.optimize.evaluation.rules.agent_loop import tool_schema
+from exp.optimize.evaluation.rules.agent_loop import AGENT_LOOP_PROTOCOL, tool_schema
+from exp.optimize.evaluation.rules.evidence_pages import (
+    CONTINUE_EVIDENCE,
+    EVIDENCE_DELIVERY_PROTOCOL,
+    PAGE_INSTRUCTION,
+)
+from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v1"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v2"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
-_REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
+_REFERENCES = (
+    """References are strings from the material inventory: trace:<trace_id> or
 trace:<trace_id>:span:<span_id> for recorded evidence, rule:<rule_id> for the family's learned
 rules, contract:<tool> for parsed tool contracts, finding:<finding_id> for research findings and
 recorded-state for a recorded environment snapshot. Cite only references in the inventory."""
+    + "\n"
+    + LOCATOR_GRAMMAR
+)
 
 AUTHOR_INSTRUCTION = (
     """You author the starting state of one executable task from recorded agent traces.
@@ -250,6 +260,10 @@ def bootstrap_prompts_sha256() -> str:
     return sha256_json(
         {
             "protocol": BOOTSTRAP_PROTOCOL,
+            "loop_protocol": AGENT_LOOP_PROTOCOL,
+            "delivery_protocol": EVIDENCE_DELIVERY_PROTOCOL,
+            "delivery_instruction": PAGE_INSTRUCTION,
+            "delivery_tool": CONTINUE_EVIDENCE.model_dump(mode="json"),
             "instructions": [
                 AUTHOR_INSTRUCTION,
                 REVIEW_INSTRUCTION,
