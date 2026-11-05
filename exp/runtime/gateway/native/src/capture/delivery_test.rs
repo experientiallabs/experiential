@@ -125,6 +125,68 @@ fn deferred_retries_keep_batching_and_drain_without_dropping() {
     assert_eq!(delivery.counts()[4], 0);
 }
 
+#[test]
+fn a_new_retry_does_not_wait_for_an_older_records_long_backoff() {
+    struct BackoffSink {
+        recovered: Arc<std::sync::atomic::AtomicBool>,
+        attempts: mpsc::Sender<String>,
+        new_attempts: usize,
+    }
+    impl Sink for BackoffSink {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, id: &String) -> Result<(), ()> {
+            self.attempts.send(id.clone()).unwrap();
+            if id == "old" && !self.recovered.load(Ordering::Acquire) {
+                return Err(());
+            }
+            if id == "new" {
+                self.new_attempts += 1;
+                if self.new_attempts == 1 {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+    }
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (attempts, observed) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        BackoffSink {
+            recovered: recovered.clone(),
+            attempts,
+            new_attempts: 0,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("old")));
+    for _ in 0..7 {
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "old"
+        );
+    }
+    assert!(delivery.submit(record("new")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "new"
+    );
+    let next = observed.recv_timeout(Duration::from_millis(500));
+    recovered.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    assert_eq!(next.unwrap(), "new");
+    assert_eq!(delivery.counts()[2], 2);
+}
+
 struct PausedSink {
     entered: mpsc::Sender<String>,
     resume: mpsc::Receiver<()>,

@@ -373,7 +373,8 @@ fn run_worker<S: Sink>(
             {
                 let retry_at = Instant::now() + entry.retry_delay;
                 entry.retry_delay = (entry.retry_delay * 2).min(Duration::from_secs(1));
-                deferred.push_back((retry_at, entry));
+                let position = deferred.partition_point(|(at, _)| *at <= retry_at);
+                deferred.insert(position, (retry_at, entry));
             } else {
                 blocked.push(entry);
             }
