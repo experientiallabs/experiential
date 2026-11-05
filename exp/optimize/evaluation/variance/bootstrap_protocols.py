@@ -27,12 +27,14 @@ from exp.optimize.evaluation.variance.bootstrap_admission import BOOTSTRAP_ADMIS
 from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
 from exp.optimize.evaluation.variance.bootstrap_prompts import bootstrap_prompts_sha256
 from exp.optimize.evaluation.variance.bootstrap_reads import BOOTSTRAP_READ_PROTOCOL
+from exp.simulation.mining.environment_candidates import candidate_protocol_sha256
+from exp.simulation.mining.environment_review import review_protocol_sha256
 
 if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
     from exp.optimize.evaluation.variance.bootstrap_resume import BootstrapResumeBinding
 
-BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v3"
+BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v4"
 PROTOCOL_REVISION_TYPE = "bootstrap-protocol-revision"
 
 _SOURCE_FILES = (
@@ -60,6 +62,10 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/variance/bootstrap_plan.py",
     "exp/optimize/evaluation/variance/pipeline_inputs.py",
     "exp/optimize/evaluation/variance/bootstrap_admission.py",
+    "exp/optimize/evaluation/variance/build.py",
+    "exp/simulation/mining/environment_candidates.py",
+    "exp/simulation/mining/environment_families.py",
+    "exp/simulation/mining/environment_review.py",
 )
 
 
@@ -94,6 +100,7 @@ class BootstrapProtocolRevision(ContractModel):
         "bootstrap-source-revision-v1",
         "bootstrap-source-revision-v2",
         "bootstrap-source-revision-v3",
+        "bootstrap-source-revision-v4",
     ] = BOOTSTRAP_SOURCE_PROTOCOL
     previous_binding: ArtifactInput
     previous_producer_revision: str = Field(min_length=1)
@@ -121,6 +128,8 @@ def current_bootstrap_source() -> BootstrapSourceSnapshot:
             "memory_stage": MEMORY_STAGE_PROTOCOL,
             "direct_research": direct_research_protocol_sha256(),
             "rule_questions": rule_tagging_protocol_sha256(),
+            "environment_candidates": candidate_protocol_sha256(),
+            "environment_review": review_protocol_sha256(),
         },
     )
 

@@ -6,11 +6,15 @@ import pytest
 
 from exp.common.core.artifacts import sha256_json
 from exp.common.tasks import ToolSchema
+from exp.simulation.mining import environment_candidates as candidate_owner
 from exp.simulation.mining.environment_candidates import (
     candidate_root_bound,
     environment_candidates,
 )
-from exp.simulation.mining.environment_families import review_environment_families
+from exp.simulation.mining.environment_families import (
+    families_identity,
+    review_environment_families,
+)
 from exp.simulation.mining.environment_families_test import (
     answer,
     clustering,
@@ -23,6 +27,7 @@ from exp.simulation.mining.environment_review import (
     CompatibilitySpec,
     checked_group_packet,
     group_packet,
+    review_protocol_sha256,
 )
 
 
@@ -138,3 +143,28 @@ def test_depth_bound_uses_roots_fanout_and_preserves_unset_serialization() -> No
         CompatibilitySpec(maximum_candidate_members=64)
     with pytest.raises(ValueError, match="nonnegative"):
         spec.calls(10, roots=-1)
+
+
+def test_candidate_protocol_rekeys_only_explicitly_bounded_family_reviews(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Partition changes rekey bounded results while preserving original review semantics."""
+    traces = {"o0": order_trace("o0")}
+    clustered = clustering({"c00": ("o0",)})
+    _, bound = reviewer(lambda members, _variant: answer("compatible", members))
+    original = CompatibilitySpec(max_depth=0)
+    bounded = original.model_copy(
+        update={
+            "maximum_candidate_members": 64,
+            "maximum_candidate_packet_bytes": 48_000,
+        }
+    )
+    legacy = families_identity(clustered, bound, original, traces, ())
+    before = families_identity(clustered, bound, bounded, traces, ())
+    candidates = environment_candidates(tuple(traces.values()), bounded)
+    review_protocol = review_protocol_sha256()
+    monkeypatch.setattr(candidate_owner, "ENVIRONMENT_CANDIDATE_PROTOCOL", "changed-partition")
+    assert families_identity(clustered, bound, original, traces, ()) == legacy
+    assert families_identity(clustered, bound, bounded, traces, ()) != before
+    assert environment_candidates(tuple(traces.values()), bounded) != candidates
+    assert review_protocol_sha256() == review_protocol

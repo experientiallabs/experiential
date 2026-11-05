@@ -716,7 +716,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
-        "bootstrap-source-revision-v3",
+        "bootstrap-source-revision-v4",
         (
             "exp.optimize.evaluation.variance.bootstrap_protocols",
             "exp.optimize.evaluation.variance.bootstrap_resume",
@@ -725,7 +725,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_selection",
             "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "d0dc99273129310c27be2dd178a4c343eb0f34685d278f367ec276d30a42c0a1",
+        "77a7c0e3c1557332f301e37ff7c7bea3acf95784381c2e254e005e6cadf8bdaf",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
-from exp.common.models import ModelRequest, ModelResponse
+from exp.common.models import ModelMessage, ModelRequest, ModelResponse
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
@@ -14,7 +14,8 @@ from exp.optimize.evaluation.variance.build_test import FakeDecisions, _tagger, 
 from exp.optimize.evaluation.variance.family_scopes_test import spec as family_spec
 from exp.optimize.evaluation.variance.pipeline_review import family_reviewer
 from exp.optimize.evaluation.variance.pipeline_spec import BuildSettings
-from exp.simulation.mining.environment_families_test import answer, reviewer
+from exp.simulation.mining.environment_families_test import answer, order_trace, reviewer
+from exp.simulation.mining.environment_review import CompatibilitySpec, checked_group_packet
 
 
 def test_changed_reasoning_settings_rekey_build_family_and_review_draws(
@@ -147,3 +148,47 @@ def test_only_named_family_review_receives_explicit_retry_authority(
     bound.draw(request, identity="another-review")
     assert observed == [("named-review", registration, window), ("another-review", None, window)]
     assert bound.configuration_sha256 == sha256_json(settings)
+
+
+def test_bounded_inventory_never_bypasses_full_native_author_byte_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fitting initial shard still refuses an oversized full request before intent or dispatch."""
+    import json
+
+    project = variance_project(tmp_path, monkeypatch)
+    _, original = reviewer(lambda members, _variant: answer("compatible", members))
+    settings = AuthorSettings(
+        model_alias="reviewer",
+        model=original.model,
+        catalog_sha256="0" * 64,
+        output_tokens=2000,
+        maximum_input_bytes=128_000,
+        deadline=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+    spec = family_spec(
+        review=CompatibilitySpec(
+            maximum_candidate_members=64,
+            maximum_candidate_packet_bytes=48_000,
+        )
+    )
+    assert spec.environment_families is not None
+    packet, _ = checked_group_packet((order_trace("o0"),), spec.environment_families.review)
+    body = json.dumps(packet, sort_keys=True)
+    assert len(body.encode()) < 48_000
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content=body),
+            ModelMessage(role="assistant", content="x" * 128_000),
+        ),
+        maximum_output_tokens=settings.output_tokens,
+    )
+    assert len(request.model_dump_json().encode()) > settings.maximum_input_bytes
+    bound = family_reviewer(
+        project, BuildSettings(spec=spec, reviewer=settings), code_revision="test"
+    )
+    with pytest.raises(ValueError, match="author context exceeds its frozen byte allowance"):
+        bound.draw(request, identity="oversize-bounded-review")
+    assert not project.artifacts.exists("oversize-bounded-review-intent")
+    assert not project.artifacts.exists("oversize-bounded-review-response")

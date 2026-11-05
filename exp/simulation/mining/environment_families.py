@@ -39,6 +39,7 @@ from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace
 from exp.simulation.mining.environment_candidates import (
+    candidate_protocol_sha256,
     candidate_root_bound,
     environment_candidates,
 )
@@ -283,6 +284,11 @@ def family_review_identity(
         FAMILIES_TYPE,
         {
             "protocol": protocol_sha256,
+            **(
+                {}
+                if spec.maximum_candidate_members is None
+                else {"candidate_protocol": candidate_protocol_sha256()}
+            ),
             "clustering": clustering,
             "model": model,
             "configuration": configuration_sha256,
