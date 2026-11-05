@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel
@@ -35,6 +36,15 @@ class CouncilPreludeAdmission(Protocol):
     ) -> AbstractContextManager[object] | None:
         """Return exact native priced scope or raise before its clients/owners dispatch."""
 
+    def completed(
+        self,
+        context: StageContext,
+        checkpoint: CouncilPreludeCheckpoint,
+        owners: tuple[ArtifactInput, ...],
+        /,
+    ) -> None:
+        """Verify exact completed native owners while their paid envelope remains active."""
+
 
 class CouncilStudyRegistration(Protocol):
     """Qualify all real authored study registrations before any point-selector wave."""
@@ -43,12 +53,18 @@ class CouncilStudyRegistration(Protocol):
         """Register exact generated references under the existing qualified prelude policy."""
 
 
+@contextmanager
 def prelude_phase(
     context: StageContext, checkpoint: CouncilPreludeCheckpoint
-) -> AbstractContextManager[object]:
-    """Wrap the actual owner; legacy callers without conditional authority stay unchanged."""
+) -> Iterator[Callable[[tuple[ArtifactInput, ...]], None]]:
+    """Wrap the real owner and expose a completion sink only to its returned artifacts."""
     admission = context.dependencies.council_prelude_admission
-    if admission is None:
-        return nullcontext()
-    scope = admission(context, checkpoint)
-    return nullcontext() if scope is None else scope
+    scope = None if admission is None else admission(context, checkpoint)
+
+    def completed(owners: tuple[ArtifactInput, ...]) -> None:
+        """Forward actual immutable owner references to the native admission owner."""
+        if admission is not None:
+            admission.completed(context, checkpoint, owners)
+
+    with nullcontext() if scope is None else scope:
+        yield completed

@@ -419,8 +419,9 @@ class _TraceMLStage:
                     completed_labels=tuple(labels.values()),
                     completed_error_points=tuple(error_points.values()),
                 ),
-            ):
+            ) as completed:
                 reference, study = run_group(project, tier, revision)
+                completed((reference,))
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
             trajectories = []
             for branch in study.branches:
@@ -450,7 +451,7 @@ class _TraceMLStage:
                     completed_labels=tuple(labels.values()),
                     completed_error_points=tuple(error_points.values()),
                 ),
-            ):
+            ) as completed:
                 tagger = context.dependencies.traceml_tagger or _tagger(context)
                 labelled = label_traces(
                     trajectories,
@@ -481,6 +482,16 @@ class _TraceMLStage:
                     error_points[alias] = save_error_points(
                         project.artifacts, error_steps[alias], code_revision=revision
                     )
+                completed(
+                    (
+                        labels[alias],
+                        *(
+                            (errors[alias], error_steps[alias], error_points[alias])
+                            if error_bank is not None
+                            else ()
+                        ),
+                    )
+                )
         outputs = TraceMLOutputs(
             groups=groups,
             labels=labels,
@@ -612,8 +623,9 @@ class _MiningStage:
                     completed_labels=tuple(labels.values()),
                     completed_error_points=tuple(ranked.values()),
                 ),
-            ):
+            ) as completed:
                 rubric, packet = mining_rubric(context, build, rules)
+                completed((rubric, packet))
         embedder = None
         if spec.mining.retrieval and build.index is not None:
             embedder = retrieval_embedder(
@@ -733,7 +745,7 @@ def _rules_search(
         context,
         build.index,
         catalog_binding=GroundedRuntimeDefinition.model_validate(
-            RulesOutputs.model_validate(context.upstream["rules"].outputs).job.configuration
+            spec.mining.registered.configuration
         ).catalog_binding,
     )
     return open_trace_search(project.artifacts, registered, exposure, embedder)

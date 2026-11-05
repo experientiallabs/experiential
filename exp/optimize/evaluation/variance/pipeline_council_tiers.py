@@ -99,8 +99,10 @@ def prepare_tier(
             completed_labels=tuple(prior.labels.values()),
             completed_error_points=tuple(prior.error_points.values()),
         ),
-    ):
+    ) as completed:
         behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
+        if behavior is not None:
+            completed((behavior,))
     labels = tier_inputs.labels
     references = (
         *((behavior_reference(project, behavior),) if behavior is not None else ()),
