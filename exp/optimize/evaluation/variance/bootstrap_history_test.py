@@ -143,3 +143,22 @@ def test_current_protocol_source_precedes_inherited_embedding_producer(
     assert proof.source_ref == control and proof.source_type == "bootstrap-protocol-revision"
     assert proof.source_sha256 == sha256_json(revision.source)
     assert proof.binding.embedding_revision == previous
+
+
+def test_historical_floor_does_not_authorize_changed_current_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Original obligations remain priceable after source drift, while execution still refuses."""
+    from exp.optimize.evaluation.variance import bootstrap_plan as planner
+    from exp.optimize.evaluation.variance.bootstrap_history import read_bootstrap_preparation_plan
+
+    project, spec, root, pilot = pilot_fixture(tmp_path, monkeypatch)
+    reference = register_pilot(project, spec, root, pilot)
+    monkeypatch.setattr(planner, "sha256_bytes", lambda content: "0" * 64)
+    with pytest.raises(ValueError, match="maintained grounded.py"):
+        planner.plan_bootstrap_preparation(
+            project, spec, code_revision="pilot-executor", resume_binding=reference
+        )
+    floor = read_bootstrap_preparation_plan(project, reference, spec=spec)
+    assert floor.build_saved and floor.remaining_tasks == (pilot.task_id,)
+    assert floor.code_revision == "pilot-executor"
