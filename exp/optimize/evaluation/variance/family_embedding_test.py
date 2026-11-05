@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import sha256_bytes, sha256_json
 from exp.common.models import Embedding, ModelCapabilities, load_model_catalog
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.executable.catalog_binding import register_runtime_catalog
@@ -237,6 +237,29 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
     assert actual.original_operation == parent.original_operation
     assert actual.build_revision == pilot.build_producer_revision
     assert migrated.bootstrap.runtime.catalog_binding == binding
+    assert migrated.bootstrap.runtime.runtime_file == intent.runtime_file
+    from exp.optimize.evaluation.variance.family_embedding import apply_family_embedding_spec
+
+    historical_runtime = tmp_path / "historical-grounded.py"
+    historical_runtime.write_text("# genuine preserved old runtime fixture bytes\n")
+    assert historical_runtime.read_bytes() != intent.runtime_file.read_bytes()
+    stale = baseline.model_copy(
+        update={
+            "bootstrap": baseline.bootstrap.model_copy(
+                update={
+                    "runtime": baseline.bootstrap.runtime.model_copy(
+                        update={
+                            "runtime_file": historical_runtime,
+                            "runtime_sha256": sha256_bytes(historical_runtime.read_bytes()),
+                        }
+                    )
+                }
+            )
+        }
+    )
+    rebound = apply_family_embedding_spec(project, completed, stale)
+    assert rebound.bootstrap.runtime.runtime_file == intent.runtime_file
+    assert rebound.bootstrap.runtime.runtime_sha256 == intent.runtime_sha256
     assert migrated.bootstrap.rules is not None
     assert migrated.bootstrap.rules.profile == "trajectory_tags"
     historical_build = load_pilot_build(project, pilot)

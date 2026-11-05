@@ -83,6 +83,7 @@ class FamilyEmbeddingIntent(ContractModel):
         maximum_batch_bytes: Native UTF-8 byte bound.
         attempts_per_batch: Finite physical request allowance.
         source_fingerprint: Actual installed source digest.
+        runtime_file: Exact maintained executor runtime path, preserved in historical replay.
         runtime_sha256: Exact maintained grounded runtime source bytes.
         producer_revision: Actual producer of new native artifacts.
     """
@@ -103,6 +104,7 @@ class FamilyEmbeddingIntent(ContractModel):
     maximum_batch_bytes: int = Field(default=262144, ge=2048)
     attempts_per_batch: int = Field(default=3, ge=1, le=10)
     source_fingerprint: str
+    runtime_file: Path
     runtime_sha256: Sha256
     producer_revision: str
 
@@ -239,8 +241,9 @@ def _context(
         check_rules_revision(baseline.bootstrap.rules, intent.rules_revision, intent.deadline)
     from exp.optimize.evaluation.executable import grounded
 
-    if not historical and intent.runtime_sha256 != sha256_bytes(
-        Path(grounded.__file__).read_bytes()
+    if not historical and (
+        intent.runtime_file != Path(grounded.__file__).resolve()
+        or intent.runtime_sha256 != sha256_bytes(intent.runtime_file.read_bytes())
     ):
         raise ValueError("family embedding maintained runtime source changed")
     exposure = load_exposure_plan(project, report.exposure)
@@ -291,6 +294,7 @@ def propose_family_embedding_intent(
         maximum_batch_bytes=maximum_batch_bytes,
         attempts_per_batch=attempts_per_batch,
         source_fingerprint=source_fingerprint(),
+        runtime_file=Path(grounded.__file__).resolve(),
         runtime_sha256=sha256_bytes(Path(grounded.__file__).read_bytes()),
         producer_revision=code_revision,
     )
@@ -708,6 +712,7 @@ def apply_family_embedding_spec(
         update={
             "catalog_binding": intent.target_catalog,
             "catalog_sha256": intent.target_catalog.catalog_sha256,
+            "runtime_file": intent.runtime_file,
             "runtime_sha256": intent.runtime_sha256,
         }
     )
