@@ -26,6 +26,7 @@ from exp.optimize.evaluation.factory.author_retries import (
 )
 from exp.optimize.evaluation.spending import operation_directory, operation_spend_ceiling
 from exp.runtime.models.spend_ceiling import OperationSpendCeiling, SpendAuthorization
+from exp.simulation.mining.environment_review import review_protocol_sha256
 
 if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
@@ -34,7 +35,10 @@ RESUME_TYPE = "bootstrap-resume-binding"
 INPUTS_TYPE = "bootstrap-resume-inputs"
 REGISTRATION_TYPE = "bootstrap-resume-registration"
 ResumeChange = Literal[
-    "cached_tagging_inventory", "explicit_terminal_503_retry", "execution_watchdog_renewal"
+    "cached_tagging_inventory",
+    "explicit_terminal_503_retry",
+    "execution_watchdog_renewal",
+    "compatibility_review_revision",
 ]
 
 
@@ -54,8 +58,16 @@ class BootstrapResumeInputs(ContractModel):
     source_build: ProjectBuildArtifacts
 
 
+class BootstrapReviewRevision(ContractModel):
+    """Explicit review-only revision; model, evidence and logical study controls stay fixed."""
+
+    output_tokens: int = Field(ge=1, le=8192, strict=True)
+    maximum_physical_attempts: int = Field(ge=1, le=10, strict=True)
+    protocol_sha256: Sha256
+
+
 class BootstrapResumeBinding(ContractModel):
-    """Exact original semantics and authority a reviewed producer may continue.
+    """Original authority and exact execution changes a reviewed producer may continue.
 
     Attributes:
         original_inputs: Frozen original specification, plan and approval provenance.
@@ -75,10 +87,13 @@ class BootstrapResumeBinding(ContractModel):
         preparation_unpriced_attempts: Original preparation unpriced allowance.
         deadline: Original absolute operational deadline, preserved as evidence.
         execution_deadline: Explicit finite renewed watchdog, or None for the original stop.
-        execution_spec_sha256: Exact fresh bootstrap operational-deadline-only specification.
-        execution_window: Native author-owner permission for unchanged original review settings.
+        execution_spec_sha256: Exact execution specification including permitted review changes.
+        execution_window: Native author-owner permission for the selected exact review settings.
         permitted_changes: Exact reviewed repair and optional watchdog-renewal permissions.
         author_retries: Separately registered exact terminal-response retries.
+        previous_binding: Exact predecessor, or None for the immutable root registration.
+        review_revision: Explicit review output, physical-attempt and protocol revision.
+        execution_build: Separately pinned revised build identity, or None for original semantics.
     """
 
     original_inputs: ArtifactInput
@@ -102,6 +117,23 @@ class BootstrapResumeBinding(ContractModel):
     execution_window: ArtifactInput | None = None
     permitted_changes: tuple[ResumeChange, ...] = Field(min_length=1)
     author_retries: tuple[ArtifactInput, ...] = ()
+    previous_binding: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    review_revision: BootstrapReviewRevision | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    execution_build: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @property
+    def build_revision(self) -> str:
+        """Keep legacy identities, but bind revised review builds to their actual producer."""
+        return self.original_revision if self.review_revision is None else self.producer_revision
+
+    @property
+    def build_identity(self) -> str:
+        """Return the exact separately pinned execution build."""
+        return self.execution_build or self.original_build
 
     @property
     def stop(self) -> datetime:
@@ -275,16 +307,51 @@ def _load_inputs(project: ProjectStore, reference: ArtifactInput) -> BootstrapRe
 def _execution_spec(
     spec: BootstrapPreparationSpec,
     deadline: datetime | None,
+    review_revision: BootstrapReviewRevision | None = None,
 ) -> BootstrapPreparationSpec:
-    """Renew typed fresh bootstrap deadlines while retaining original build semantics.
+    """Apply explicit review bounds and renew only known fresh operational deadlines.
 
     Args:
         spec: Original frozen preparation settings, including any business JSON.
-        deadline: Explicit operational stop, or None to preserve every original value.
+        deadline: Explicit operational stop, or None to preserve original deadlines.
+        review_revision: Review-only changes, or None to retain original build semantics.
 
     Returns:
-        A typed specification differing only in known fresh bootstrap deadline fields.
+        A typed specification differing only in registered review bounds and known deadlines.
     """
+    if review_revision is not None:
+        build = spec.build
+        reviewer, families = build.reviewer, build.spec.environment_families
+        assert reviewer is not None and families is not None
+        if (
+            review_revision.output_tokens < reviewer.output_tokens
+            or review_revision.maximum_physical_attempts > reviewer.maximum_physical_attempts
+        ):
+            raise ValueError("review revision cannot lower output or enlarge physical attempts")
+        reviewer = reviewer.model_copy(
+            update={
+                "output_tokens": review_revision.output_tokens,
+                "maximum_physical_attempts": review_revision.maximum_physical_attempts,
+            }
+        )
+        families = families.model_copy(
+            update={
+                "review": families.review.model_copy(
+                    update={
+                        "maximum_output_tokens": review_revision.output_tokens,
+                    }
+                )
+            }
+        )
+        build = build.model_copy(
+            update={
+                "reviewer": reviewer,
+                "spec": build.spec.model_copy(update={"environment_families": families}),
+            }
+        )
+        spec = type(spec).model_validate(
+            spec.model_copy(update={"build": build}).model_dump(mode="json")
+        )
     if deadline is None:
         return spec
     settings = spec.bootstrap
@@ -333,7 +400,7 @@ def _validate_window(
     if binding.execution_window is None:
         raise ValueError("bootstrap watchdog renewal needs a native author execution window")
     window = load_author_execution_window(project, binding.execution_window)
-    reviewer = spec.build.reviewer
+    reviewer = _execution_spec(spec, None, binding.review_revision).build.reviewer
     assert reviewer is not None
     if (
         window.settings_sha256 != sha256_json(reviewer)
@@ -383,6 +450,60 @@ def bootstrap_author_retries(
     return result
 
 
+def _registration_identity(binding: BootstrapResumeBinding) -> str:
+    """Give each exact predecessor one append-only successor registration."""
+    if binding.previous_binding is None:
+        return binding.original_operation + "-resume"
+    return stable_id(
+        "bootstrap-resume-successor",
+        {
+            "operation": binding.original_operation,
+            "previous": binding.previous_binding.model_dump(mode="json"),
+        },
+    )
+
+
+def _validate_predecessor(
+    project: ProjectStore,
+    binding: BootstrapResumeBinding,
+    spec: BootstrapPreparationSpec,
+) -> None:
+    """Verify successor ancestry without changing the historical root selection."""
+    if binding.previous_binding is None:
+        if binding.review_revision is not None or binding.execution_build is not None:
+            raise ValueError("review revision requires its exact predecessor binding")
+        return
+    if binding.review_revision is None or binding.execution_build is None:
+        raise ValueError("successor requires an explicitly pinned review revision")
+    if binding.author_retries:
+        raise ValueError("review revision cannot reuse historical author retry registrations")
+    if "compatibility_review_revision" not in binding.permitted_changes:
+        raise ValueError("successor lacks its explicit review revision permission")
+    manifest = project.artifacts.read(binding.previous_binding.artifact_id).manifest
+    parent = load_bootstrap_resume(
+        project,
+        binding.previous_binding,
+        spec=spec,
+        code_revision=manifest.code_revision,
+    )
+    if (
+        parent.original_inputs != binding.original_inputs
+        or parent.original_operation != binding.original_operation
+        or parent.ledger_sha256 != binding.ledger_sha256
+        or parent.grants != binding.grants
+        or parent.source_build != binding.source_build
+    ):
+        raise ValueError("successor differs from its predecessor's original authority")
+    previous_review = _execution_spec(spec, None, parent.review_revision).build.reviewer
+    assert previous_review is not None
+    if (
+        binding.review_revision.output_tokens < previous_review.output_tokens
+        or binding.review_revision.maximum_physical_attempts
+        > previous_review.maximum_physical_attempts
+    ):
+        raise ValueError("successor cannot lower output or enlarge predecessor attempts")
+
+
 def register_bootstrap_resume(
     project: ProjectStore,
     *,
@@ -392,6 +513,8 @@ def register_bootstrap_resume(
     execution_deadline: datetime | None = None,
     execution_window: ArtifactInput | None = None,
     author_retries: tuple[ArtifactInput, ...] = (),
+    previous_binding: ArtifactInput | None = None,
+    review_revision: BootstrapReviewRevision | None = None,
 ) -> ArtifactInput:
     """Bind a reviewed producer to original consent and an optional native finite watchdog.
 
@@ -403,6 +526,8 @@ def register_bootstrap_resume(
         execution_deadline: Explicit renewed stop, at most six hours after registration.
         execution_window: Native permission for the unchanged original review settings.
         author_retries: Separate exact terminal-response retries under the same window.
+        previous_binding: Existing root or successor continued through an append-only selection.
+        review_revision: Explicit changed review bounds and current protocol, only for successors.
 
     Returns:
         Immutable resume permission and its exact fresh bootstrap execution specification.
@@ -424,7 +549,26 @@ def register_bootstrap_resume(
     ledger = _ledger(project, operation)
     _preparation_authority(ledger, dollars, attempts)
     summary = ledger.summary()
-    execution = _execution_spec(spec, execution_deadline)
+    if (previous_binding is None) != (review_revision is None):
+        raise ValueError("review revision requires its exact predecessor binding")
+    if (review_revision is not None) != ("compatibility_review_revision" in permitted_changes):
+        raise ValueError("review revision needs its exact explicit permission")
+    if review_revision is not None and review_revision.protocol_sha256 != review_protocol_sha256():
+        raise ValueError("review revision differs from the current review protocol")
+    execution = _execution_spec(spec, execution_deadline, review_revision)
+    execution_build = None
+    if review_revision is not None:
+        from exp.optimize.evaluation.variance.build import plan_variance_build  # noqa: PLC0415
+
+        actual_reviewer = execution.build.reviewer
+        assert actual_reviewer is not None
+        execution_build = plan_variance_build(
+            project,
+            execution.build.spec,
+            code_revision=code_revision,
+            reviewer_model=actual_reviewer.model,
+            reviewer_configuration_sha256=sha256_json(actual_reviewer),
+        ).identity
     binding = BootstrapResumeBinding(
         original_inputs=original_inputs,
         original_revision=revision,
@@ -447,13 +591,18 @@ def register_bootstrap_resume(
         execution_window=execution_window,
         permitted_changes=permitted_changes,
         author_retries=author_retries,
+        previous_binding=previous_binding,
+        review_revision=review_revision,
+        execution_build=execution_build,
     )
+    _validate_predecessor(project, binding, spec)
     _validate_window(project, binding, spec)
     bootstrap_author_retries(project, binding)
     references = tuple(
         sorted(
             {
                 original_inputs,
+                *(() if previous_binding is None else (previous_binding,)),
                 *author_retries,
                 *(() if execution_window is None else (execution_window,)),
             },
@@ -464,10 +613,16 @@ def register_bootstrap_resume(
         if artifact_input(project.artifacts.read(reference.artifact_id).manifest) != reference:
             raise ValueError("bootstrap resume permission reference changed")
     identity = stable_id(RESUME_TYPE, binding)
-    anchor = binding.original_operation + "-resume"
+    anchor = _registration_identity(binding)
     with CoordinationLock(
         project.artifacts.project_directory / (binding.original_operation + ".lock"), timeout=0
     ):
+        if (
+            previous_binding is not None
+            and not project.artifacts.exists(anchor)
+            and project.artifacts.exists(operation + "-result")
+        ):
+            raise ValueError("a completed preparation cannot register another review revision")
         if project.artifacts.exists(anchor):
             existing = ArtifactInput.model_validate_json(
                 project.artifacts.read_bytes(anchor, "binding.json")
@@ -508,7 +663,7 @@ def bootstrap_execution_spec(
     binding: BootstrapResumeBinding,
     spec: BootstrapPreparationSpec,
 ) -> BootstrapPreparationSpec:
-    """Read and verify that only fresh typed operational deadlines were renewed.
+    """Verify only the registered review bounds and fresh operational deadlines changed.
 
     Args:
         project: Owner of the saved binding and execution specification.
@@ -516,20 +671,20 @@ def bootstrap_execution_spec(
         spec: Exact unchanged original preparation specification.
 
     Returns:
-        Typed execution settings with every non-operational field unchanged.
+        Typed execution settings with all unrelated fields and study controls unchanged.
 
     Raises:
-        ValueError: Saved execution settings exceed the exact permitted deadline changes.
+        ValueError: Saved execution settings exceed registered review or deadline changes.
     """
     reference = stable_id(RESUME_TYPE, binding)
     execution = type(spec).model_validate_json(
         project.artifacts.read_bytes(reference, "execution-spec.json")
     )
     if sha256_json(execution) != binding.execution_spec_sha256 or execution != _execution_spec(
-        spec, binding.execution_deadline
+        spec, binding.execution_deadline, binding.review_revision
     ):
         raise ValueError(
-            "bootstrap execution settings changed beyond permitted operational deadlines"
+            "bootstrap execution settings changed beyond permitted review or operational deadlines"
         )
     return execution
 
@@ -567,7 +722,7 @@ def load_bootstrap_resume(
         or reference.artifact_id != stable_id(RESUME_TYPE, binding)
     ):
         raise ValueError("bootstrap resume actual producer differs from its binding")
-    anchor = project.artifacts.read(binding.original_operation + "-resume").manifest
+    anchor = project.artifacts.read(_registration_identity(binding)).manifest
     selected = ArtifactInput.model_validate_json(
         project.artifacts.read_bytes(anchor.artifact_id, "binding.json")
     )
@@ -618,6 +773,7 @@ def load_bootstrap_resume(
         sorted(
             {
                 binding.original_inputs,
+                *(() if binding.previous_binding is None else (binding.previous_binding,)),
                 *binding.author_retries,
                 *(() if binding.execution_window is None else (binding.execution_window,)),
             },
@@ -626,6 +782,7 @@ def load_bootstrap_resume(
     )
     if manifest.inputs != expected_inputs:
         raise ValueError("bootstrap resume permission ancestry differs")
+    _validate_predecessor(project, binding, spec)
     _validate_window(project, binding, spec)
     bootstrap_author_retries(project, binding)
     bootstrap_execution_spec(project, binding, spec)

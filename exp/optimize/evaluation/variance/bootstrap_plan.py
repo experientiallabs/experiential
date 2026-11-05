@@ -82,7 +82,7 @@ from exp.runtime.models.spend_ceiling import (
     operation_spend_scope,
 )
 from exp.simulation.mining.decisions import DecisionsTraceTagger
-from exp.simulation.mining.environment_review import CompatibilityReviewer
+from exp.simulation.mining.environment_review import CompatibilityReviewer, review_protocol_sha256
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
 
 PREPARATION_TYPE = "bootstrap-preparation"
@@ -348,7 +348,13 @@ def plan_bootstrap_preparation(
         else load_bootstrap_resume(project, resume_binding, spec=spec, code_revision=code_revision)
     )
     execution = spec if binding is None else bootstrap_execution_spec(project, binding, spec)
-    identity_revision = code_revision if binding is None else binding.original_revision
+    identity_revision = code_revision if binding is None else binding.build_revision
+    if (
+        binding is not None
+        and binding.review_revision is not None
+        and binding.review_revision.protocol_sha256 != review_protocol_sha256()
+    ):
+        raise ValueError("bootstrap resume review protocol differs from its actual producer")
     template = execution.bootstrap.runtime
     maintained = sha256_bytes(Path(grounded.__file__).read_bytes())
     if (
@@ -356,26 +362,28 @@ def plan_bootstrap_preparation(
         or sha256_bytes(template.runtime_file.read_bytes()) != maintained
     ):
         raise ValueError("bootstrap planning requires the maintained grounded.py runtime file")
-    reviewer = spec.build.reviewer
+    reviewer = execution.build.reviewer
     assert reviewer is not None
     build = plan_variance_build(
         project,
-        spec.build.spec,
+        execution.build.spec,
         code_revision=code_revision,
         reviewer_model=reviewer.model,
         reviewer_configuration_sha256=sha256_json(reviewer),
         identity_revision=None if binding is None else identity_revision,
     )
-    identity = _identity(spec, build.identity, identity_revision)
-    if binding is not None and (
-        identity != binding.original_operation or build.identity != binding.original_build
-    ):
+    identity = (
+        _identity(spec, build.identity, identity_revision)
+        if binding is None
+        else binding.original_operation
+    )
+    if binding is not None and build.identity != binding.build_identity:
         raise ValueError("bootstrap resume changed its original semantic identity")
     saved = _saved_build(project, build.identity)
     if saved is None and spec.simulators:
         raise ValueError("reusing frozen simulators requires their saved variance build first")
-    components = list(variance_build_costs(project, build, spec.build.spec.decision_alias))
-    components.extend(review_costs(project, spec.build, build))
+    components = list(variance_build_costs(project, build, execution.build.spec.decision_alias))
+    components.extend(review_costs(project, execution.build, build))
     naming = spec.build.spec.cluster_naming
     if not build.saved and naming is not None:
         assert spec.build.naming_alias is not None
@@ -549,7 +557,7 @@ def run_bootstrap_preparation(
             project,
             spec.build.spec,
             code_revision=code_revision,
-            identity_revision=None if binding is None else binding.original_revision,
+            identity_revision=None if binding is None else binding.build_revision,
             reviewer_model=spec.build.reviewer.model if spec.build.reviewer is not None else None,
             reviewer_configuration_sha256=(
                 None if spec.build.reviewer is None else sha256_json(spec.build.reviewer)
@@ -557,16 +565,19 @@ def run_bootstrap_preparation(
         ).decision_model
         if injected != expected:
             raise ValueError("injected decision tagger differs from the approved model snapshot")
+    execution = spec if binding is None else bootstrap_execution_spec(project, binding, spec)
     reviewer = dependencies.reviewer or family_reviewer(
         project,
-        spec.build,
+        execution.build,
         code_revision=code_revision,
         author_retries=None if binding is None else bootstrap_author_retries(project, binding),
         execution_window=None if binding is None else binding.execution_window,
     )
     assert spec.build.reviewer is not None
-    if reviewer.model != spec.build.reviewer.model or reviewer.configuration_sha256 != sha256_json(
-        spec.build.reviewer
+    assert execution.build.reviewer is not None
+    if (
+        reviewer.model != execution.build.reviewer.model
+        or reviewer.configuration_sha256 != sha256_json(execution.build.reviewer)
     ):
         raise ValueError("injected family reviewer differs from the approved model snapshot")
     if spec.build.spec.cluster_naming is not None and dependencies.namer is None:
@@ -638,7 +649,7 @@ def _run(
         project,
         spec.build.spec,
         code_revision=revision,
-        identity_revision=None if binding is None else binding.original_revision,
+        identity_revision=None if binding is None else binding.build_revision,
         tagger=dependencies.tagger,
         reviewer=reviewer,
         namer=dependencies.namer,

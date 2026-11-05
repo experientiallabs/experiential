@@ -30,6 +30,7 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
 )
 from exp.optimize.evaluation.variance.bootstrap_resume import (
     BootstrapResumeBinding,
+    BootstrapReviewRevision,
     bootstrap_author_retries,
     bootstrap_execution_spec,
     freeze_bootstrap_resume_inputs,
@@ -56,7 +57,11 @@ from exp.runtime.models.spend_ceiling import (
 )
 from exp.simulation.mining.environment_families import load_environment_families
 from exp.simulation.mining.environment_families_test import answer
-from exp.simulation.mining.environment_review import REVIEW_TOOL, CompatibilityReviewer
+from exp.simulation.mining.environment_review import (
+    REVIEW_TOOL,
+    CompatibilityReviewer,
+    review_protocol_sha256,
+)
 
 
 def _origin(
@@ -643,3 +648,228 @@ def test_real_partial_build_reaches_old_review_ids_and_only_its_authorized_child
         for identity in review.identities
     }
     assert wire.completed in reached and wire.failed in reached
+
+
+def _review_successor(
+    project: ProjectStore,
+    spec: BootstrapPreparationSpec,
+    parent: ArtifactInput,
+    *,
+    producer: str = "revised",
+    output_tokens: int = 8192,
+) -> ArtifactInput:
+    previous = load_bootstrap_resume(
+        project,
+        parent,
+        spec=spec,
+        code_revision=project.artifacts.read(parent.artifact_id).manifest.code_revision,
+    )
+    assert spec.build.reviewer is not None
+    revision = BootstrapReviewRevision(
+        output_tokens=output_tokens,
+        maximum_physical_attempts=1,
+        protocol_sha256=review_protocol_sha256(),
+    )
+    changed = spec.build.reviewer.model_copy(
+        update={
+            "output_tokens": output_tokens,
+            "maximum_physical_attempts": 1,
+        }
+    )
+    stop = datetime.now(UTC) + timedelta(hours=1)
+    ceiling = operation_spend_ceiling(project, previous.original_operation)
+    with operation_spend_scope():
+        install_spend_ceiling(ceiling)
+        window = register_author_execution_window(
+            project,
+            changed,
+            operation=ceiling,
+            window_id=producer,
+            execution_deadline=stop,
+            code_revision=producer,
+            sources=(previous.original_inputs, parent),
+        )
+    return register_bootstrap_resume(
+        project,
+        original_inputs=previous.original_inputs,
+        code_revision=producer,
+        permitted_changes=("compatibility_review_revision", "execution_watchdog_renewal"),
+        execution_deadline=stop,
+        execution_window=window,
+        previous_binding=parent,
+        review_revision=revision,
+    )
+
+
+def test_review_successor_keeps_root_and_authority_but_rekeys_execution_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, spec, reviewer = preparation_fixture(tmp_path, monkeypatch)
+    assert spec.build.reviewer is not None
+    spec = spec.model_copy(
+        update={
+            "build": spec.build.model_copy(
+                update={
+                    "reviewer": spec.build.reviewer.model_copy(
+                        update={
+                            "deadline": datetime(2000, 1, 1, tzinfo=UTC),
+                        }
+                    ),
+                }
+            ),
+        }
+    )
+    paths = _origin(project, spec, tmp_path)
+    parent = _register(project, paths)
+    root = load_bootstrap_resume(project, parent, spec=spec, code_revision="corrected")
+    assert root.stop < datetime.now(UTC)
+    root_bytes = project.artifacts.read_bytes(root.original_operation + "-resume", "binding.json")
+    before = operation_spend_ceiling(project, root.original_operation).summary()
+    successor = _review_successor(project, spec, parent)
+    bound = load_bootstrap_resume(project, successor, spec=spec, code_revision="revised")
+    executed = bootstrap_execution_spec(project, bound, spec)
+    assert bound.previous_binding == parent and bound.original_operation == root.original_operation
+    assert bound.build_identity != root.original_build and bound.build_revision == "revised"
+    assert executed.build.reviewer is not None and spec.build.reviewer is not None
+    assert executed.build.reviewer.deadline == spec.build.reviewer.deadline
+    assert executed.build.reviewer.model == spec.build.reviewer.model
+    assert executed.build.reviewer.catalog_sha256 == spec.build.reviewer.catalog_sha256
+    assert executed.build.reviewer.maximum_physical_attempts == 1
+    assert executed.build.reviewer.output_tokens == 8192
+    assert executed.build.spec.environment_families is not None
+    assert executed.build.spec.environment_families.review.maximum_output_tokens == 8192
+    assert (
+        project.artifacts.read_bytes(root.original_operation + "-resume", "binding.json")
+        == root_bytes
+    )
+    assert load_bootstrap_resume(project, parent, spec=spec, code_revision="corrected") == root
+    assert operation_spend_ceiling(project, root.original_operation).summary() == before
+    planned = plan_bootstrap_preparation(
+        project, spec, code_revision="revised", resume_binding=successor
+    )
+    assert (
+        planned.identity == root.original_operation
+        and planned.build_identity == bound.execution_build
+    )
+    assert planned.resume_binding == successor
+    observed: list[BootstrapPreparationSpec] = []
+
+    def run(
+        owner: ProjectStore,
+        actual: BootstrapPreparationSpec,
+        plan: BootstrapPlan,
+        dependencies: BootstrapDependencies,
+        actual_reviewer: CompatibilityReviewer,
+        revision: str,
+        binding: BootstrapResumeBinding | None,
+    ) -> BootstrapPreparationReport:
+        assert binding == bound and actual == executed and revision == "revised"
+        assert actual_reviewer.configuration_sha256 == sha256_json(executed.build.reviewer)
+        assert current_spend_ceiling() is not None
+        observed.append(actual)
+        source = owner.load_project().build
+        assert source is not None
+        return BootstrapPreparationReport(
+            identity=plan.identity,
+            plan=plan,
+            build_report=source.task_set,
+            batches=(),
+            bindings=(),
+            failed_tasks=(),
+        )
+
+    monkeypatch.setattr(preparation, "_run", run)
+    completed = run_bootstrap_preparation(
+        project,
+        spec,
+        code_revision="revised",
+        resume_binding=successor,
+        dependencies=BootstrapDependencies(
+            reviewer=replace(reviewer, configuration_sha256=sha256_json(executed.build.reviewer)),
+            tagger=_tagger(project, FakeDecisions()),
+        ),
+    )
+    assert observed == [executed]
+    assert (
+        run_bootstrap_preparation(
+            project,
+            spec,
+            code_revision="revised",
+            resume_binding=successor,
+        )
+        == completed
+    )
+    assert observed == [executed]
+    with pytest.raises(ValueError, match="completed preparation"):
+        _review_successor(project, spec, successor, producer="after-complete")
+    assert operation_spend_ceiling(project, root.original_operation).summary() == before
+
+
+def test_successor_refuses_parallel_replacement_and_retains_historical_binding_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, spec, _ = preparation_fixture(tmp_path, monkeypatch)
+    paths = _origin(project, spec, tmp_path)
+    parent = _register(project, paths)
+    old_payload = json.loads(project.artifacts.read_bytes(parent.artifact_id, "binding.json"))
+    assert "previous_binding" not in old_payload
+    assert "review_revision" not in old_payload and "execution_build" not in old_payload
+    parsed = BootstrapResumeBinding.model_validate(old_payload)
+    assert parsed.model_dump(mode="json") == old_payload
+    _review_successor(project, spec, parent)
+    with pytest.raises(ValueError, match="different resume binding"):
+        _review_successor(project, spec, parent, producer="another-revised")
+
+
+def test_successor_rejects_unknown_protocol_lower_allowance_and_changed_original_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, spec, _ = preparation_fixture(tmp_path, monkeypatch)
+    paths = _origin(project, spec, tmp_path)
+    parent = _register(project, paths)
+    root = load_bootstrap_resume(project, parent, spec=spec, code_revision="corrected")
+    revision = BootstrapReviewRevision(
+        output_tokens=8192,
+        maximum_physical_attempts=1,
+        protocol_sha256="e" * 64,
+    )
+    with pytest.raises(ValueError, match="current review protocol"):
+        register_bootstrap_resume(
+            project,
+            original_inputs=root.original_inputs,
+            code_revision="revised",
+            permitted_changes=("compatibility_review_revision",),
+            previous_binding=parent,
+            review_revision=revision,
+        )
+    assert spec.build.reviewer is not None
+    with pytest.raises(ValueError, match="lower output"):
+        _review_successor(
+            project, spec, parent, output_tokens=spec.build.reviewer.output_tokens - 1
+        )
+    successor = _review_successor(project, spec, parent)
+    changed = spec.model_copy(
+        update={
+            "limits": spec.limits.model_copy(update={"maximum_tasks": 1}),
+        }
+    )
+    with pytest.raises(ValueError, match="settings"):
+        load_bootstrap_resume(project, successor, spec=changed, code_revision="revised")
+    bound = load_bootstrap_resume(project, successor, spec=spec, code_revision="revised")
+    raw_read = project.artifacts.read_bytes
+
+    def modified(artifact_id: str, file: str) -> bytes:
+        content = raw_read(artifact_id, file)
+        if artifact_id == successor.artifact_id and file == "execution-spec.json":
+            payload = json.loads(content)
+            review = payload["build"]["spec"]["environment_families"]["review"]
+            review["max_turns"] = 1 + review["max_turns"] % 16
+            return json.dumps(payload).encode()
+        return content
+
+    monkeypatch.setattr(project.artifacts, "read_bytes", modified)
+    with pytest.raises(ValueError, match="execution settings"):
+        bootstrap_execution_spec(project, bound, spec)
