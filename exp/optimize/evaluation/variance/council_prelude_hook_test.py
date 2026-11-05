@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.common.core.artifacts import ArtifactInput
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint
 from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeCheckpoint
@@ -56,6 +57,26 @@ def test_real_pipeline_composes_trace_groups_labels_and_authored_rubric_under_sc
             assert len(checkpoint.completed_labels) == len(checkpoint.completed_error_points) == 2
         return scope(checkpoint)
 
+    class PreludeAdmissions:
+        """Observe explicit native admission and returned-owner completion in the same scope."""
+
+        def __call__(
+            self, context: StageContext, checkpoint: CouncilPreludeCheckpoint
+        ) -> AbstractContextManager[object]:
+            """Enter the real test phase around its native owners."""
+            return admission(context, checkpoint)
+
+        def completed(
+            self,
+            context: StageContext,
+            checkpoint: CouncilPreludeCheckpoint,
+            owners: tuple[ArtifactInput, ...],
+            /,
+        ) -> None:
+            """Require actual source-owned results while the admitting phase is still active."""
+            assert owners and active.get() is not None
+            assert all(context.project.artifacts.exists(owner.artifact_id) for owner in owners)
+
     original_admission = run.dependencies.council_admission
 
     def register(context: StageContext, studies: tuple[ActorCriticSpec, ...]) -> None:
@@ -76,7 +97,7 @@ def test_real_pipeline_composes_trace_groups_labels_and_authored_rubric_under_sc
 
     run.dependencies = replace(
         run.dependencies,
-        council_prelude_admission=admission,
+        council_prelude_admission=PreludeAdmissions(),
         council_registration=register,
         council_admission=require_registered,
     )

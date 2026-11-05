@@ -1,7 +1,6 @@
 """Exact native per-job world authority with scripted preparation and no real services."""
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -39,17 +38,11 @@ from exp.optimize.evaluation.variance.council_inventory import CouncilPhaseInven
 from exp.optimize.evaluation.variance.council_parallel import council_draws
 from exp.optimize.evaluation.variance.council_prelude import (
     freeze_council_prelude,
-    qualify_council_prelude,
 )
-from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeCheckpoint
-from exp.optimize.evaluation.variance.council_prelude_inventory import prelude_inventory
+from exp.optimize.evaluation.variance.council_prelude_execution import NativePreludeExecution
 from exp.optimize.evaluation.variance.council_prelude_test import (
     _prelude_fixture,
     _register_fixture,
-)
-from exp.optimize.evaluation.variance.council_prelude_world import (
-    register_prelude_runtime,
-    save_prelude_inventory,
 )
 from exp.optimize.evaluation.variance.council_qualification import (
     CONSENT_TYPE,
@@ -373,9 +366,6 @@ def test_native_descendant_keeps_original_prelude_policy(
         code_revision="council-executor",
     )
     registration = _register_fixture(project, prepared, resume, contract)
-    qualified = qualify_council_prelude(
-        project, prepared, resume, contract, code_revision="council-executor"
-    )
     binding = read_bootstrap_preparation_provenance(
         project, resume, spec=contract.preparation.preparation_spec
     ).binding
@@ -407,46 +397,7 @@ def test_native_descendant_keeps_original_prelude_policy(
     )
     descendants: list[ArtifactInput] = []
 
-    @contextmanager
-    def admit(context: StageContext, checkpoint: CouncilPreludeCheckpoint) -> Iterator[None]:
-        """Use native quotes and real original-ledger envelopes for actual prelude owners."""
-        del context
-        if checkpoint.phase == "behavior_reference":
-            assert pipeline.mining.behaviors is None
-            yield
-            return
-        inventory = prelude_inventory(project, qualified, checkpoint)
-        if not inventory.attempts:
-            yield
-            return
-        reference = save_prelude_inventory(
-            project, registration.qualification, checkpoint, code_revision="council-executor"
-        )
-        envelope = open_spend_envelope(
-            ceiling,
-            SpendEnvelopePlan(
-                policy=registration.policy,
-                scope=f"{checkpoint.phase}-{checkpoint.actor_alias}",
-                inventory=reference,
-                maximum_attempts=inventory.attempts,
-                maximum_known_usd=inventory.known_usd,
-                remaining_minimum_attempts=inventory.remaining.attempts,
-                requirements_sha256=sha256_json(contract),
-            ),
-        )
-        with (
-            spend_envelope_scope(ceiling, envelope),
-            runtime_authority_scope(
-                lambda owner, job: register_prelude_runtime(
-                    owner,
-                    registration.qualification,
-                    reference,
-                    job,
-                    code_revision="council-executor",
-                )
-            ),
-        ):
-            yield
+    admit = NativePreludeExecution(project, registration, code_revision="council-executor")
 
     def register(context: StageContext, studies: tuple[ActorCriticSpec, ...]) -> None:
         """Let the descendant owner verify actual pipeline-produced studies and native groups."""
