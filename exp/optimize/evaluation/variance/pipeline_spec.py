@@ -52,6 +52,7 @@ from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.council_checkpoint import CouncilAdmission
+from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeAdmission
 from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
@@ -625,6 +626,7 @@ class StageDependencies:
 
     Attributes:
         council_admission: Native phase admission authority; None preserves the original runner.
+        council_prelude_admission: Native accounted TraceML, rubric and behavior authority.
         build_tagger: Tagger for the variance build, or None for its admitted default.
         build_constructor: Admitted world-model constructor, when the build reconstructs.
         build_namer: Cluster naming model, or None for the admitted ``build.naming_alias``.
@@ -637,6 +639,7 @@ class StageDependencies:
     """
 
     council_admission: CouncilAdmission | None = None
+    council_prelude_admission: CouncilPreludeAdmission | None = None
     build_tagger: DecisionsTraceTagger | None = None
     build_namer: ClusterNamer | None = None
     build_reviewer: CompatibilityReviewer | None = None

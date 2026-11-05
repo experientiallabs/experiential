@@ -51,6 +51,10 @@ from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
 from exp.optimize.evaluation.variance.council_parallel import council_draws
+from exp.optimize.evaluation.variance.council_prelude_hook import (
+    CouncilPreludeCheckpoint,
+    prelude_phase,
+)
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import (
@@ -396,7 +400,6 @@ class _TraceMLStage:
             return StageRun(TraceMLOutputs(), (), {"enabled": False})
         job = RulesOutputs.model_validate(context.upstream["rules"].outputs).job
         bank = traceml_bank(spec.traceml.bank_root)
-        tagger = context.dependencies.traceml_tagger or _tagger(context)
         groups: dict[str, ArtifactInput] = {}
         labels: dict[str, ArtifactInput] = {}
         errors: dict[str, ArtifactInput] = {}
@@ -408,7 +411,12 @@ class _TraceMLStage:
         judge_settings = spec.traceml.move_judge
         assert judge_settings is not None
         for alias in spec.mining.actors:
-            reference, study = run_group(project, group_job(project, spec, job, alias), revision)
+            tier = group_job(project, spec, job, alias)
+            with prelude_phase(
+                context,
+                CouncilPreludeCheckpoint(phase="traceml_group", actor_alias=alias, job=tier),
+            ):
+                reference, study = run_group(project, tier, revision)
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
             trajectories = []
             for branch in study.branches:
@@ -428,35 +436,42 @@ class _TraceMLStage:
                         locator_prefix=f"attempt:{branch.index}/step",
                     )
                 )
-            labelled = label_traces(
-                trajectories,
-                tagger=tagger,
-                bank=bank,
-                trace_concurrency=spec.traceml.concurrency,
-                move_judge=_move_judge(context, reference),
-                move_variants=spec.traceml.move_variants,
-                move_window=spec.traceml.move_window,
-                move_output_tokens=judge_settings.output_tokens,
-                move_repairs=spec.traceml.move_repairs,
-            )
-            groups[alias] = reference
-            labels[alias] = persist_traceml_labels(
-                project.artifacts, labelled, code_revision=revision, inputs=(reference,)
-            )
-            if error_bank is not None:
-                errors[alias], error_steps[alias] = tag_tier_errors(
-                    project.artifacts,
-                    error_bank,
+            with prelude_phase(
+                context,
+                CouncilPreludeCheckpoint(
+                    phase="traceml_labels", actor_alias=alias, job=tier, group=reference
+                ),
+            ):
+                tagger = context.dependencies.traceml_tagger or _tagger(context)
+                labelled = label_traces(
                     trajectories,
-                    tagger,
-                    code_revision=revision,
-                    inputs=(reference,),
-                    concurrency=spec.traceml.concurrency,
+                    tagger=tagger,
+                    bank=bank,
+                    trace_concurrency=spec.traceml.concurrency,
+                    move_judge=_move_judge(context, reference),
+                    move_variants=spec.traceml.move_variants,
+                    move_window=spec.traceml.move_window,
+                    move_output_tokens=judge_settings.output_tokens,
+                    move_repairs=spec.traceml.move_repairs,
                 )
-                points[alias] = attempt_error_points(project.artifacts, error_steps[alias])
-                error_points[alias] = save_error_points(
-                    project.artifacts, error_steps[alias], code_revision=revision
+                groups[alias] = reference
+                labels[alias] = persist_traceml_labels(
+                    project.artifacts, labelled, code_revision=revision, inputs=(reference,)
                 )
+                if error_bank is not None:
+                    errors[alias], error_steps[alias] = tag_tier_errors(
+                        project.artifacts,
+                        error_bank,
+                        trajectories,
+                        tagger,
+                        code_revision=revision,
+                        inputs=(reference,),
+                        concurrency=spec.traceml.concurrency,
+                    )
+                    points[alias] = attempt_error_points(project.artifacts, error_steps[alias])
+                    error_points[alias] = save_error_points(
+                        project.artifacts, error_steps[alias], code_revision=revision
+                    )
         outputs = TraceMLOutputs(
             groups=groups,
             labels=labels,
@@ -578,7 +593,10 @@ class _MiningStage:
         probe = probe_line(build, start.task.task_id)
         rubric, packet = spec.mining.rubric, None
         if rubric is None:
-            rubric, packet = mining_rubric(context, build, rules)
+            with prelude_phase(
+                context, CouncilPreludeCheckpoint(phase="mining_rubric", job=rules.job)
+            ):
+                rubric, packet = mining_rubric(context, build, rules)
         embedder = None
         if spec.mining.retrieval and build.index is not None:
             embedder = retrieval_embedder(context, build.index)
@@ -667,7 +685,13 @@ class _MiningStage:
             world_sha256=run_world_sha256(tier.configuration),
         )
         judge = EpisodeJudge(definition=definition, settings=mining.judge)
-        behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
+        with prelude_phase(
+            context,
+            CouncilPreludeCheckpoint(
+                phase="behavior_reference", actor_alias=alias, job=tier, judge=judge
+            ),
+        ):
+            behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
         labels = tier_inputs.labels
         references = (
             *((behavior_reference(project, behavior),) if behavior is not None else ()),
