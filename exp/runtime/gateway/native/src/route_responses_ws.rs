@@ -35,6 +35,10 @@ use crate::route_responses::responses;
 use crate::server::AppState;
 use crate::sse::SseDecoder;
 
+/// Internal transport identity; no outer HTTP response relay observes these frames.
+#[derive(Clone, Copy)]
+pub(crate) struct WebSocketRequest;
+
 /// Bound on a buffered non-streaming (error) response body read back from
 /// the HTTP handler; its bodies are single compact JSON envelopes.
 const MAXIMUM_ADAPTED_BODY_BYTES: usize = 1_000_000;
@@ -348,6 +352,7 @@ async fn handle_frame(
         .body(axum::body::Body::from(compact_json(&value)))
         .expect("static request line is valid");
     *request.headers_mut() = headers.clone();
+    request.extensions_mut().insert(WebSocketRequest);
     let response = while_connected(
         socket,
         pending,

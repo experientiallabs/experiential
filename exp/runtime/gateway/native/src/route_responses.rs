@@ -53,6 +53,10 @@ pub(crate) async fn responses(
     let started = Instant::now();
     let deadline = started + state.request_timeout;
     let (parts, raw_body) = request.into_parts();
+    let websocket = parts
+        .extensions
+        .get::<crate::route_responses_ws::WebSocketRequest>()
+        .is_some();
     let headers = parts.headers;
     let body = match read_body(raw_body).await {
         Ok(body) => body,
@@ -255,6 +259,14 @@ pub(crate) async fn responses(
     let mut won =
         acquire_guarded_attempt(&context, &mut guard, admission.guardrail_input_pending).await;
     adopt_outcome(&mut admission, &mut won);
+    if websocket {
+        if let Some(capture) = state.capture.as_ref() {
+            // WebSocket frames never pass through the outer HTTP capture relay.
+            // Keep the native response tap and settlement policy, but do not wait
+            // for HTTP metadata that this transport cannot supply.
+            capture.without_relay(&admission.request_id);
+        }
+    }
     won = checkpoint_winner(
         state.capture.as_ref(),
         &admission,

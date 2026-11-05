@@ -109,7 +109,9 @@ class CaptureConfiguration(ContractModel):
         asynchronous_delivery: Explicit hosted opt-in to admission-owned handoff instead
             of waiting for delivery capacity or durable storage, false by default.
             The host owns draining. Admission and response-memory limits still apply.
-        relay_metadata: Wait for an outer relay's caller-facing metadata, false by default.
+        relay_metadata: Wait for an outer HTTP relay's caller-facing metadata, false by
+            default. Responses WebSocket frames complete through their native capture
+            tap without waiting for HTTP relay metadata.
         truncate_request: Preserve the hosted bounded-copy policy for oversized inputs.
         capture_hidden_reasoning: Retain reasoning text the caller did not see (a
             rung that withholds reasoning display, or a guardrailed request) as
