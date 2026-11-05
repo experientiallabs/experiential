@@ -47,6 +47,15 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
+        "exp.optimize.evaluation.variance.environment_catalog:ENVIRONMENT_CATALOG_PROTOCOL",
+        "environment-catalog-v1",
+        (
+            "exp.optimize.evaluation.variance.environment_catalog",
+            "exp.simulation.mining.tag_selection",
+        ),
+        "145a4ba742c753e63a3243c32e1d38ba7f97f32a19a8f7abe468a6cd2dc998f7",
+    ),
+    Protocol(
         "exp.optimize.evaluation.variance.behavior_differences:BEHAVIOR_DIFFERENCES_PROTOCOL",
         "behavior-differences-v1",
         (
