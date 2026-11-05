@@ -32,6 +32,7 @@ from exp.optimize.evaluation.executable.loader import (
     ContinuationRuntime,
     load_runtime_definition,
 )
+from exp.optimize.evaluation.executable.runtime_authority import runtime_authority
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
@@ -218,6 +219,7 @@ def load_continuation_runtime(project: ProjectStore, job: ContinuationJob) -> Co
         runtime_sha256=job.runtime_sha256,
         configuration=job.configuration,
         probe_sha256=job.study.probe_sha256,
+        provider_grant=runtime_authority(project, job),
     )
 
 

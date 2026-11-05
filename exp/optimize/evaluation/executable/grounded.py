@@ -58,7 +58,7 @@ from exp.optimize.evaluation.executable.catalog_binding import (
     load_runtime_catalog,
 )
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
-from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
+from exp.optimize.evaluation.executable.provider_grant import RuntimeProviderAuthority
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
@@ -351,7 +351,7 @@ def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> Co
 
 
 def trial_runtime(
-    project: ProjectStore, configuration: JsonObject, provider_grant: ProviderGrant
+    project: ProjectStore, configuration: JsonObject, provider_grant: RuntimeProviderAuthority
 ) -> ContinuationRuntime:
     """Use explicitly renewed trial authority while keeping the frozen world semantics exact."""
     provider_grant.require_configuration(project, configuration)
@@ -531,7 +531,7 @@ def recall_decider(
 def _runtime(
     project: ProjectStore,
     spec: GroundedRuntimeDefinition,
-    provider_grant: ProviderGrant | None = None,
+    provider_grant: RuntimeProviderAuthority | None = None,
 ) -> ContinuationRuntime:
     """Compose identical state/predictor definitions under one explicitly selected call ledger."""
     catalog, artifact, embedder_alias, rule_book, tag_retrieval, memory_set = _checked(
@@ -541,7 +541,7 @@ def _runtime(
     identity_fields: JsonObject = {"definition": spec.model_dump(mode="json"), "code": revision}
     if provider_grant is not None:
         identity_fields = {
-            "provider_grant": provider_grant.model_dump(mode="json"),
+            "provider_grant": provider_grant.identity_payload(),
             "code": revision,
         }
     identity = sha256_json(identity_fields)

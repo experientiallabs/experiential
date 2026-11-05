@@ -20,7 +20,7 @@ from typing import Self
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_bytes
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.study import WorldRuntime
-from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
+from exp.optimize.evaluation.executable.provider_grant import RuntimeProviderAuthority
 from exp.simulation.continuations import WorldCheckpoint
 
 
@@ -71,7 +71,7 @@ def load_runtime_definition(
     runtime_sha256: Sha256,
     configuration: JsonObject,
     probe_sha256: Sha256,
-    provider_grant: ProviderGrant | None = None,
+    provider_grant: RuntimeProviderAuthority | None = None,
 ) -> ContinuationRuntime:
     """Execute verified factory bytes for initial capture or exact checkpoint restoration.
 

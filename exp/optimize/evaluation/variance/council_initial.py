@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import JsonValue
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject
-from exp.common.project import ProjectStore
+from exp.common.core.artifacts import ArtifactInput, JsonObject, stable_id
+from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
     continuation_result_reference,
     execute_continuation_job,
@@ -24,7 +24,14 @@ from exp.optimize.evaluation.variance.evidence import (
     open_trace_search,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
-from exp.optimize.evaluation.variance.judged import judge_study, judged_episode, slot_rewards
+from exp.optimize.evaluation.variance.judged import (
+    JUDGED_LABELS_PROTOCOL,
+    JUDGED_STUDY_TYPE,
+    JudgedStudy,
+    judge_study,
+    judged_episode,
+    slot_rewards,
+)
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 
@@ -50,6 +57,45 @@ def initial_feedback(
         configuration=spec.initial.configuration,
         code_revision=code_revision,
     )
+    return render_initial_feedback(project, packet, reference, judged)
+
+
+def saved_initial_feedback(
+    project: ProjectStore,
+    spec: ActorCriticSpec,
+    group: ArtifactInput,
+    reference: ArtifactInput,
+    packet: EvidencePacket,
+) -> EvidencePacket:
+    """Restore exactly the recorded LLM feedback without any possible model dispatch."""
+    identity = stable_id(
+        JUDGED_STUDY_TYPE,
+        {
+            "protocol": JUDGED_LABELS_PROTOCOL,
+            "judge": spec.episode_judge.identity,
+            "study": group.model_dump(mode="json"),
+        },
+    )
+    stored = project.artifacts.read(identity)
+    judged = JudgedStudy.model_validate_json(stored.payloads["judged.json"])
+    if (
+        artifact_input(stored.manifest) != reference
+        or stored.manifest.artifact_type != JUDGED_STUDY_TYPE
+        or judged.study != group
+        or judged.judge != spec.episode_judge.identity
+        or len(judged.branches) != spec.initial.study.repeats
+    ):
+        raise ValueError("native selector feedback differs from the exact initial LLM judgments")
+    return render_initial_feedback(project, packet, reference, judged)[0]
+
+
+def render_initial_feedback(
+    project: ProjectStore,
+    packet: EvidencePacket,
+    reference: ArtifactInput,
+    judged: JudgedStudy,
+) -> tuple[EvidencePacket, ArtifactInput]:
+    """Render committed full-episode labels and supplied citations without model construction."""
     rewards = slot_rewards(project, judged.branches, judged.judge)
     labels = [reward for reward in rewards if reward is not None]
     historical = packet.payload["group"]

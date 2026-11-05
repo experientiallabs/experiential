@@ -592,3 +592,26 @@ def spend_envelope_scope(
     with operation_spend_scope():
         install_spend_ceiling(scoped)
         yield scoped
+
+
+class VerifiedSpendEnvelope(ContractModel):
+    """Exact currently open authority and native wave, read without dispatch or reconciliation."""
+
+    reference: SpendEnvelopeRef
+    policy: ParentSpendPolicy
+    plan: SpendEnvelopePlan
+
+
+def verify_spend_envelope(
+    ceiling: OperationSpendCeiling,
+    envelope: SpendEnvelopeRef,
+) -> VerifiedSpendEnvelope:
+    """Verify exact ledger, policy, envelope and lifecycle before operational client creation."""
+    if envelope.policy.ledger_sha256 != _ledger(ceiling):
+        raise ValueError("operational authority belongs to another original ledger")
+    with ceiling._transaction() as connection:
+        policy = _policy(connection, envelope.policy.identity)
+        plan = _plan(connection, envelope)
+        if datetime.now(UTC) >= policy.deadline:
+            raise ScopeBudgetRefused("operational authority's native window expired")
+    return VerifiedSpendEnvelope(reference=envelope, policy=policy, plan=plan)

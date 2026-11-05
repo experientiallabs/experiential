@@ -74,22 +74,34 @@ from exp.simulation.world_model.runtime import load_grounded_world_model_artifac
 CONSENT_TYPE = "conditional-council-consent"
 QUALIFICATION_TYPE = "conditional-council-qualification"
 _SOURCE_FILES = (
-    "actor_critic.py",
-    "bootstrap.py",
-    "bootstrap_capture.py",
-    "bootstrap_contracts.py",
-    "council_inventory.py",
-    "council_qualification.py",
-    "judge_prompt.py",
-    "judged.py",
-    "role_prompts.py",
-    "roles.py",
+    "exp/optimize/evaluation/variance/actor_critic.py",
+    "exp/optimize/evaluation/variance/bootstrap.py",
+    "exp/optimize/evaluation/variance/bootstrap_capture.py",
+    "exp/optimize/evaluation/variance/bootstrap_contracts.py",
+    "exp/optimize/evaluation/variance/council_checkpoint.py",
+    "exp/optimize/evaluation/variance/council_initial.py",
+    "exp/optimize/evaluation/variance/council_inventory.py",
+    "exp/optimize/evaluation/variance/council_parallel.py",
+    "exp/optimize/evaluation/variance/council_qualification.py",
+    "exp/optimize/evaluation/variance/council_world.py",
+    "exp/optimize/evaluation/variance/judge_prompt.py",
+    "exp/optimize/evaluation/variance/judged.py",
+    "exp/optimize/evaluation/variance/role_prompts.py",
+    "exp/optimize/evaluation/variance/roles.py",
+    "exp/optimize/evaluation/continuations/job.py",
+    "exp/optimize/evaluation/executable/grounded.py",
+    "exp/optimize/evaluation/executable/loader.py",
+    "exp/optimize/evaluation/executable/provider_grant.py",
+    "exp/optimize/evaluation/executable/runtime_authority.py",
+    "exp/runtime/models/scoped_spending.py",
+    "exp/runtime/models/spend_ceiling.py",
+    "exp/runtime/models/providers/admitted_transport.py",
 )
 
 
 def council_sources() -> dict[str, Sha256]:
-    """Freeze maintained domain owners and protocols without importing runtime factories."""
-    root = Path(__file__).parent
+    """Freeze actual domain, runtime authority, prompt and physical-admission owners."""
+    root = Path(__file__).resolve().parents[4]
     return {name: sha256_bytes((root / name).read_bytes()) for name in _SOURCE_FILES}
 
 
