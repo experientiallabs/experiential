@@ -16,6 +16,23 @@ from exp.simulation.mining.environment_review import (
 )
 from exp.simulation.rules.contracts import parse_tool_contracts
 
+ENVIRONMENT_CANDIDATE_PROTOCOL = "bounded-environment-candidates-v1"
+"""Contract grouping and complete inventory partition semantics for explicitly bounded reviews."""
+
+
+def candidate_protocol_sha256() -> str:
+    """Identify the independent-base partition contract without changing review draw semantics."""
+    return sha256_json(
+        {
+            "protocol": ENVIRONMENT_CANDIDATE_PROTOCOL,
+            "grouping": "exact_declared_and_observed_contracts",
+            "packing": "sorted_members_native_packet_utf8_bytes",
+            "excluded_contract_counters": ["calls", "failures", "examples"],
+            "coverage": "every_member_once_no_elision",
+            "compatibility": "independent_cluster_intersections_no_merge",
+        }
+    )
+
 
 class EnvironmentCandidate(ContractModel):
     """One complete evidence shard, with no compatibility verdict.
@@ -94,7 +111,10 @@ def _candidate(traces: Sequence[Trace], contract: str) -> EnvironmentCandidate:
     """Bind every member and its complete provenance to one candidate identity."""
     source = sha256_json({trace.trace_id: sha256_json(trace) for trace in traces})
     return EnvironmentCandidate(
-        candidate_id=stable_id("environment-candidate", {"contract": contract, "source": source}),
+        candidate_id=stable_id(
+            "environment-candidate",
+            {"protocol": candidate_protocol_sha256(), "contract": contract, "source": source},
+        ),
         contract_sha256=contract,
         source_sha256=source,
         members=tuple(trace.trace_id for trace in traces),

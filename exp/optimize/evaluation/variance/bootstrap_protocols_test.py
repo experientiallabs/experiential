@@ -23,6 +23,8 @@ from exp.optimize.evaluation.variance.bootstrap_resume import (
     load_bootstrap_resume,
     register_bootstrap_resume,
 )
+from exp.simulation.mining.environment_candidates import candidate_protocol_sha256
+from exp.simulation.mining.environment_review import review_protocol_sha256
 
 
 def test_source_successor_preserves_native_plan_claims_and_original_build(
@@ -184,3 +186,17 @@ def test_source_snapshot_binds_direct_research_and_rule_questions() -> None:
     assert "exp/optimize/evaluation/rules/direct_research.py" in snapshot.files
     assert snapshot.protocols["direct_research"] == direct_research_protocol_sha256()
     assert snapshot.protocols["rule_questions"] == rule_tagging_protocol_sha256()
+
+
+def test_source_snapshot_binds_complete_bounded_review_implementation() -> None:
+    """Source successors fingerprint partition, native review, family and quote owners."""
+    snapshot = current_bootstrap_source()
+    assert {
+        "exp/optimize/evaluation/variance/build.py",
+        "exp/simulation/mining/environment_candidates.py",
+        "exp/simulation/mining/environment_families.py",
+        "exp/simulation/mining/environment_review.py",
+    } <= snapshot.files.keys()
+    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v4"
+    assert snapshot.protocols["environment_candidates"] == candidate_protocol_sha256()
+    assert snapshot.protocols["environment_review"] == review_protocol_sha256()
