@@ -111,6 +111,7 @@ def test_each_cluster_candidate_intersection_is_independently_reviewed() -> None
     assert all("environment-candidate" in family.path for family in record.families)
     assert len({family.family_id for family in record.families}) == 5
     roots = candidate_root_bound(traces, spec, clusters=2)
+    assert roots == 5
     assert len(script.requests) <= spec.calls(len(traces), roots=roots)
     assert not record.uncertain
     changed = traces[0].model_copy(update={"task": "Different source content"})

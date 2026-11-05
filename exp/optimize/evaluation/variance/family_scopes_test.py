@@ -8,6 +8,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.tasks import TaskCase, load_task_set
+from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import (
     ConstructionSettings,
@@ -22,10 +23,11 @@ from exp.optimize.evaluation.variance.build_test import (
     _tagger,
     variance_project,
 )
-from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.exposure import ExposurePlan, plan_exposure
 from exp.optimize.evaluation.variance.family_scopes import _place
 from exp.optimize.evaluation.variance.family_simulators import family_simulator
 from exp.optimize.evaluation.variance.family_simulators_test import ref
+from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.environment_families import (
     EnvironmentFamilySpec,
     load_environment_families,
@@ -314,3 +316,56 @@ def test_native_quote_counts_registered_candidate_roots_and_depth(
     planned = plan_variance_build(project, bounded, code_revision="test")
     assert planned.review_calls == count * 11
     assert planned.identity != baseline.identity
+
+
+def test_native_quote_bounds_uneven_candidates_by_their_available_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full native quote counts one singleton root and at most two roots in the larger shard."""
+    project = variance_project(tmp_path, monkeypatch)
+    review = CompatibilitySpec(max_depth=0, max_turns=2, repairs=1)
+    baseline = plan_variance_build(project, spec(review=review), code_revision="test")
+    count = baseline.roles["world_learning"].traces
+    assert count > 3
+    bounded_review = review.model_copy(
+        update={
+            "maximum_candidate_members": count - 1,
+            "maximum_candidate_packet_bytes": 48_000,
+        }
+    )
+    registered = spec(review=bounded_review).model_copy(
+        update={"clustering": ClusteringSpec(min_clusters=1, max_clusters=2)}
+    )
+    planned = plan_variance_build(project, registered, code_revision="test")
+    assert planned.review_calls == 33
+    assert planned.review_calls < min(count, 2 * 2) * review.calls_per_group()
+
+    build = project.load_project().build
+    assert build is not None
+    rows = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id).bindings
+    exposure = plan_exposure(
+        build.task_set,
+        rows,
+        seed=registered.seed,
+        probe_fraction=registered.probe_fraction,
+    )
+    traces = {
+        trace.trace_id: trace
+        for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces
+        if exposure.role_of(trace.trace_id) == "world_learning"
+    }
+    assert len(traces) == count
+    ordered = sorted(traces)
+    script, bound = reviewer(lambda members, _variant: answer("compatible", members))
+    record = review_environment_families(
+        clustering({"c00": tuple(ordered[::2]), "c01": tuple(ordered[1::2])}),
+        bound,
+        traces=traces,
+        eligible=ordered,
+        held_out=(),
+        spec=bounded_review,
+    )
+    assert len(record.families) == 3
+    assert sorted(member for family in record.families for member in family.members) == ordered
+    assert len(script.requests) <= planned.review_calls
