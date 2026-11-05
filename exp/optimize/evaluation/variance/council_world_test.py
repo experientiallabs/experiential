@@ -7,7 +7,10 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_json
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import load_continuation_runtime
+from exp.optimize.evaluation.continuations.job import (
+    continuation_result_reference,
+    load_continuation_runtime,
+)
 from exp.optimize.evaluation.executable.runtime_authority import runtime_authority_scope
 from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance.bootstrap_resume import load_bootstrap_resume
@@ -270,3 +273,350 @@ def test_suffix_authority_rechecks_seeded_group_and_actual_selector_citations(
             code_revision="suffix-authority",
         )
     assert (len(actor.requests), len(judge.judged)) == calls
+
+
+class RegistrationReached(Exception):
+    """Stop the native pipeline after its actual full studies have been registered."""
+
+
+def test_native_descendant_keeps_original_prelude_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native produced groups and labels admit a full descendant without replacing its parent."""
+    from collections.abc import Iterator, Mapping
+    from contextlib import contextmanager
+
+    from exp.common.core.artifacts import JsonObject, stable_id
+    from exp.optimize.evaluation.variance import council_descendant as descendant_owner
+    from exp.optimize.evaluation.variance import council_world as world_owner
+    from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+    from exp.optimize.evaluation.variance.actor_critic_test import _done
+    from exp.optimize.evaluation.variance.bootstrap_history import (
+        read_bootstrap_preparation_provenance,
+    )
+    from exp.optimize.evaluation.variance.build_test import FakeDecisions, _tagger
+    from exp.optimize.evaluation.variance.council_descendant import (
+        load_council_descendant,
+        register_full_council_from_prelude,
+    )
+    from exp.optimize.evaluation.variance.council_prelude import (
+        freeze_council_prelude,
+        qualify_council_prelude,
+    )
+    from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeCheckpoint
+    from exp.optimize.evaluation.variance.council_prelude_inventory import prelude_inventory
+    from exp.optimize.evaluation.variance.council_prelude_test import (
+        _prelude_fixture,
+        _register_fixture,
+    )
+    from exp.optimize.evaluation.variance.council_prelude_world import (
+        register_prelude_runtime,
+        save_prelude_inventory,
+    )
+    from exp.optimize.evaluation.variance.council_world import resolve_council_qualification
+    from exp.optimize.evaluation.variance.pipeline import (
+        plan_decision_variance,
+        run_decision_variance,
+    )
+    from exp.optimize.evaluation.variance.pipeline_spec import (
+        PipelineApproval,
+        StageContext,
+        StageDependencies,
+    )
+    from exp.optimize.evaluation.variance.rubric_author import Rubric, RubricBody
+    from exp.optimize.evaluation.variance.rubric_author_test import rubric_answer
+    from exp.runtime.models.providers.transport import (
+        JsonHttpResponse,
+        RecordedRequest,
+        ScriptedJsonTransport,
+    )
+    from exp.runtime.models.scoped_spending import verify_spend_envelope
+    from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
+
+    project, prepared, resume, contract, wire = _prelude_fixture(tmp_path, monkeypatch)
+    rubric_ids = project.artifacts.list_ids(artifact_type="episode-rubric")
+    assert len(rubric_ids) == 1
+    declared = Rubric(
+        protocol="explicit-fixture-declaration-v1",
+        family_id="native-descendant-fixture",
+        packet_sha256=sha256_json(contract.preparation),
+        body=RubricBody.model_validate(rubric_answer()["rubric"]),
+    )
+    rubric = artifact_input(
+        project.artifacts.write_json(
+            artifact_id="explicit-native-descendant-rubric",
+            artifact_type="episode-rubric",
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision="explicit-fixture-declaration",
+                inputs=(prepared,),
+            ),
+            files={"rubric.json": declared},
+        )
+    )
+    pipeline = contract.pipeline.model_copy(
+        update={
+            "mining": contract.pipeline.mining.model_copy(
+                update={"rubric": rubric, "behaviors": None}
+            )
+        }
+    )
+    contract = freeze_council_prelude(
+        contract.preparation,
+        pipeline,
+        actor_model_ids=contract.actor_model_ids,
+        code_revision="council-executor",
+    )
+    registration = _register_fixture(project, prepared, resume, contract)
+    qualified = qualify_council_prelude(
+        project, prepared, resume, contract, code_revision="council-executor"
+    )
+    binding = read_bootstrap_preparation_provenance(
+        project, resume, spec=contract.preparation.preparation_spec
+    ).binding
+    ceiling = operation_spend_ceiling(project, binding.original_operation)
+    authorizations = ceiling.summary().authorizations
+
+    class DoneActors(ScriptedJsonTransport):
+        """Return a complete actor message using each requested model's actual wire identity."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Record one actual admitted actor request without creating artificial study rows."""
+            del timeout_seconds
+            self.requests.append(RecordedRequest(url, dict(headers), payload))
+            response = _done()
+            return JsonHttpResponse(
+                response.status_code, {**response.body, "model": payload["model"]}
+            )
+
+    actors = DoneActors(())
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actors
+    )
+    descendants: list[ArtifactInput] = []
+
+    @contextmanager
+    def admit(context: StageContext, checkpoint: CouncilPreludeCheckpoint) -> Iterator[None]:
+        """Use native quotes and real original-ledger envelopes for actual prelude owners."""
+        del context
+        if checkpoint.phase == "behavior_reference":
+            assert pipeline.mining.behaviors is None
+            yield
+            return
+        inventory = prelude_inventory(project, qualified, checkpoint)
+        if not inventory.attempts:
+            yield
+            return
+        reference = save_prelude_inventory(
+            project, registration.qualification, checkpoint, code_revision="council-executor"
+        )
+        envelope = open_spend_envelope(
+            ceiling,
+            SpendEnvelopePlan(
+                policy=registration.policy,
+                scope=f"{checkpoint.phase}-{checkpoint.actor_alias}",
+                inventory=reference,
+                maximum_attempts=inventory.attempts,
+                maximum_known_usd=inventory.known_usd,
+                remaining_minimum_attempts=inventory.remaining.attempts,
+                requirements_sha256=sha256_json(contract),
+            ),
+        )
+        with (
+            spend_envelope_scope(ceiling, envelope),
+            runtime_authority_scope(
+                lambda owner, job: register_prelude_runtime(
+                    owner,
+                    registration.qualification,
+                    reference,
+                    job,
+                    code_revision="council-executor",
+                )
+            ),
+        ):
+            yield
+
+    def register(context: StageContext, studies: tuple[ActorCriticSpec, ...]) -> None:
+        """Let the descendant owner verify actual pipeline-produced studies and native groups."""
+        del context
+        assert len(actors.requests) == 5 * 16
+        descendants.append(
+            register_full_council_from_prelude(
+                project, registration.qualification, studies, code_revision="council-executor"
+            )
+        )
+        raise RegistrationReached()
+
+    plan = plan_decision_variance(project, pipeline, code_revision="council-executor")
+    with operation_spend_scope():
+        install_spend_ceiling(ceiling)
+        with pytest.raises(RegistrationReached):
+            run_decision_variance(
+                project,
+                pipeline,
+                code_revision="council-executor",
+                approval=PipelineApproval(
+                    plan_sha256=plan.digest, ceiling_usd=plan.known_usd, unpriced_allowed=True
+                ),
+                dependencies=StageDependencies(
+                    council_prelude_admission=admit,
+                    council_registration=register,
+                    traceml_tagger=_tagger(project, FakeDecisions()),
+                ),
+            )
+    assert len(actors.requests) == 5 * 16
+    assert len(descendants) == 1
+    descendant = load_council_descendant(project, descendants[0])
+    assert descendant.prelude == registration.qualification
+    assert ceiling.summary().authorizations == authorizations
+    altered = descendant.qualified.contract.studies[1].model_copy(
+        update={"references": descendant.qualified.contract.studies[0].references}
+    )
+    with pytest.raises(ValueError, match="native model group"):
+        register_full_council_from_prelude(
+            project,
+            registration.qualification,
+            (
+                descendant.qualified.contract.studies[0],
+                altered,
+                *descendant.qualified.contract.studies[2:],
+            ),
+            code_revision="council-executor",
+        )
+    with pytest.raises(ValueError, match="another original parent"):
+        resolve_council_qualification(project, descendants[0], parent_execution=prepared)
+    with pytest.raises(ValueError):
+        resolve_council_qualification(
+            project, descendants[0].model_copy(update={"sha256": "0" * 64})
+        )
+
+    first = descendant.qualified.contract.studies[0]
+    assert first.retrieval is not None
+    changed_search = first.model_copy(
+        update={"retrieval": first.retrieval.model_copy(update={"index": prepared})}
+    )
+    foreign = descendant.model_copy(
+        update={
+            "qualified": descendant.qualified.model_copy(
+                update={
+                    "contract": descendant.qualified.contract.model_copy(
+                        update={
+                            "studies": (changed_search, *descendant.qualified.contract.studies[1:])
+                        }
+                    )
+                }
+            )
+        }
+    )
+    foreign_ref = artifact_input(
+        project.artifacts.write_json(
+            artifact_id=stable_id(
+                descendant_owner.DESCENDANT_TYPE, {"descendant": sha256_json(foreign)}
+            ),
+            artifact_type=descendant_owner.DESCENDANT_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=descendant.qualified.producer_revision,
+                inputs=project.artifacts.read(descendants[0].artifact_id).manifest.inputs,
+            ),
+            files={"descendant.json": foreign},
+        )
+    )
+    with pytest.raises(ValueError, match="family RAG scope"):
+        resolve_council_qualification(
+            project, foreign_ref, parent_execution=registration.qualification
+        )
+
+    def history_must_not_replay(owner: ProjectStore, reference: ArtifactInput) -> None:
+        """Prove parent-bound current reads do not replay historical preparation qualification."""
+        del owner, reference
+        raise AssertionError("historical preparation replayed after immutable parent registration")
+
+    with monkeypatch.context() as bounded:
+        bounded.setattr(descendant_owner, "load_qualified_prelude", history_must_not_replay)
+        for study in descendant.qualified.contract.studies:
+            reference = save_council_inventory(
+                project,
+                descendants[0],
+                study,
+                CouncilCheckpoint(
+                    run_identity=study.identity("council-executor"),
+                    phase="selectors",
+                    group=continuation_result_reference(
+                        project, study.initial, code_revision="council-executor"
+                    ),
+                    draws=tuple(range(8)),
+                ),
+                code_revision="council-executor",
+                parent_execution=registration.qualification,
+            )
+            native_quote = CouncilPhaseInventory.model_validate_json(
+                project.artifacts.read_bytes(reference.artifact_id, "inventory.json")
+            )
+            envelope = open_spend_envelope(
+                ceiling,
+                SpendEnvelopePlan(
+                    policy=registration.policy,
+                    scope=f"actual-full-study-{study.initial.actor_alias}",
+                    inventory=reference,
+                    maximum_attempts=max(1, native_quote.attempts),
+                    maximum_known_usd=native_quote.known_usd,
+                    remaining_minimum_attempts=0,
+                    requirements_sha256=sha256_json(contract),
+                ),
+            )
+            with spend_envelope_scope(ceiling, envelope):
+                actual, parent = resolve_council_qualification(
+                    project, descendants[0], parent_execution=registration.qualification
+                )
+                opened = verify_spend_envelope(ceiling, envelope)
+                assert actual == descendant.qualified
+                assert parent == opened.policy.execution == registration.qualification
+    with monkeypatch.context() as changed_source:
+        changed_source.setattr(world_owner, "council_sources", lambda: {})
+        with pytest.raises(ValueError, match="qualified council producer"):
+            resolve_council_qualification(
+                project, descendants[0], parent_execution=registration.qualification
+            )
+    study = descendant.qualified.contract.studies[0]
+    cached = CouncilCheckpoint(
+        run_identity=study.identity("council-executor"), phase="actors", jobs=(study.initial,)
+    )
+    reference = save_council_inventory(
+        project,
+        descendants[0],
+        study,
+        cached,
+        code_revision="council-executor",
+        parent_execution=registration.qualification,
+    )
+    native_quote = CouncilPhaseInventory.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "inventory.json")
+    )
+    envelope = open_spend_envelope(
+        ceiling,
+        SpendEnvelopePlan(
+            policy=registration.policy,
+            scope="no-initial-world-refill",
+            inventory=reference,
+            maximum_attempts=max(1, native_quote.attempts),
+            maximum_known_usd=native_quote.known_usd,
+            remaining_minimum_attempts=0,
+            requirements_sha256=sha256_json(contract),
+        ),
+    )
+    with spend_envelope_scope(ceiling, envelope):
+        with pytest.raises(ValueError, match="cannot refill"):
+            register_council_runtime(
+                project, descendants[0], reference, study.initial, code_revision="council-executor"
+            )
+    assert ceiling.summary().authorizations == authorizations
