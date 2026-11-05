@@ -5,13 +5,10 @@ One run follows a fixed sequence over saved, replayable owners:
 1. **Exposure.** Every trace must be reserved for world learning; any other trace is refused
    before anything is read, bought or replayed.
 2. **Contracts.** Tool contracts are parsed from every trace, with no model call.
-3. **Research.** Under the default ``agentic_research`` profile every trajectory is researched
-   by bounded agentic draws, one per assigned prompt variant, concurrently
-   (:mod:`~exp.optimize.evaluation.rules.research`), over one or more rounds (a later round reads
-   the earlier rounds' notes). Each trace's research history is saved. Under the explicit
-   ``single_draw`` profile the earlier path runs instead: one forced extraction draw per
-   trajectory (:mod:`~exp.optimize.evaluation.rules.extraction`). Either way a refused or failed
-   draw stays a failure record and is never redrawn.
+3. **Research.** ``trajectory_tags`` reads each full trajectory in one independent native author
+   response, concurrently; ``agentic_research`` retains the bounded investigation loop and
+   ``single_draw`` retains the rules-only extractor. Each refused or failed draw stays saved and
+   is never implicitly redrawn.
 4. **Merge.** The usable per-trajectory analyses merge into one rule book, excluding every trace
    the exposure plan does not reserve for world learning. Merging decides no support.
 5. **Weighing.** Each merged rule's status is decided by an agentic evidence weighing
@@ -84,6 +81,10 @@ from exp.optimize.evaluation.rules.challenges import (
     run_challenges,
 )
 from exp.optimize.evaluation.rules.condense import condensation_protocol_sha256, condense_memory
+from exp.optimize.evaluation.rules.direct_research import (
+    direct_research_in_parallel,
+    direct_research_protocol_sha256,
+)
 from exp.optimize.evaluation.rules.extraction import (
     ExtractionDraw,
     extract_rules_in_parallel,
@@ -247,7 +248,11 @@ class RulesStageSpec(ContractModel):
             {
                 "spec": sha256_json(self.model_dump(mode="json", exclude={"concurrency"})),
                 "extraction": extraction_protocol_sha256(),
-                "research": research_protocol_sha256(),
+                "research": (
+                    direct_research_protocol_sha256()
+                    if self.profile == "trajectory_tags"
+                    else research_protocol_sha256()
+                ),
                 "weighing": weighing_protocol_sha256(),
                 "condensation": condensation_protocol_sha256(),
                 "loop": AGENT_LOOP_PROTOCOL,
@@ -292,7 +297,11 @@ class RulesStageSpec(ContractModel):
             "rules-research",
             {
                 **fields,
-                "research": research_protocol_sha256(),
+                "research": (
+                    direct_research_protocol_sha256()
+                    if self.profile == "trajectory_tags"
+                    else research_protocol_sha256()
+                ),
                 "loop": AGENT_LOOP_PROTOCOL,
                 "profile": sha256_json(self.research),
                 "variants": list(self.variants),
@@ -526,10 +535,11 @@ def run_rules_stage(
             )
             analyses = [analysis for item in research for analysis in item.analyses()]
             learned = tuple(
-                draw.transcript
+                reference
                 for item in research
                 for draw in item.draws
-                if draw.answer is not None and draw.transcript is not None
+                for reference in (draw.transcript, draw.response)
+                if draw.answer is not None and reference is not None
             )
         rule_tags = None
         if staged is None:
@@ -708,6 +718,23 @@ def _research(
     """
     prior: dict[str, TraceResearch] = {}
     for round_ in range(spec.rounds):
+        if spec.profile == "trajectory_tags":
+            found = direct_research_in_parallel(
+                project,
+                spec.author,
+                traces,
+                contracts,
+                identity=identity,
+                code_revision=code_revision,
+                concurrency=spec.concurrency,
+                variants=spec.variants,
+                draws_per_trace=spec.draws_per_trace,
+                round_=round_,
+                prior=prior or None,
+                sources=spec.sources,
+            )
+            prior = {item.trace_id: item for item in found}
+            continue
         found = research_in_parallel(
             project,
             spec.author,

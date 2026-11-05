@@ -213,6 +213,7 @@ class ResearchDraw(ContractModel):
         round: Research round, from zero.
         identity: Stable identity of the draw.
         transcript: Saved loop transcript, when the loop ran.
+        response: Native author response for a direct full-trajectory draw.
         evidence_read: Locators the draw's reads served.
         answer: The validated answer, when usable.
         failure: Why the draw is unusable, when it is.
@@ -223,6 +224,7 @@ class ResearchDraw(ContractModel):
     round: int = Field(default=0, ge=0)
     identity: str = Field(min_length=1)
     transcript: ArtifactInput | None = None
+    response: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
     evidence_read: tuple[str, ...] = ()
     answer: TraceResearchAnswer | None = None
     failure: str | None = None
@@ -814,7 +816,12 @@ def save_history(
         if dict(stored.payloads) != files:
             raise ValueError(f"saved research history {artifact_id} differs from this run")
         return bare.model_copy(update={"history": artifact_input(stored.manifest)})
-    inputs = {draw.transcript for draw in research.draws if draw.transcript is not None}
+    inputs = {
+        ref
+        for draw in research.draws
+        for ref in (draw.transcript, draw.response)
+        if ref is not None
+    }
     manifest = store.write(
         artifact_id=artifact_id,
         artifact_type=HISTORY_TYPE,

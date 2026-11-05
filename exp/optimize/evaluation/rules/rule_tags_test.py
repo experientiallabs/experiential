@@ -187,6 +187,11 @@ class ConversionScript(AgentScript):
         if str(messages[0]["content"]).startswith("You convert one"):
             rule = json.loads(str(messages[1]["content"]))
             return _reply([(CONVERSION_TOOL, _questions(rule["rule_id"]).model_dump(mode="json"))])
+        if "Read the complete supplied trajectory independently in ONE pass." in str(
+            messages[0]["content"]
+        ):
+            opening = json.loads(str(messages[1]["content"]))
+            return _reply([("submit_research", self.answer("research", opening))])
         return super()._reply(payload)
 
 
@@ -390,7 +395,7 @@ def test_native_cost_inventory_covers_each_new_physical_stage(
         maximum_rules=2,
         draws_per_trace=spec.draws_per_trace,
         rounds=spec.rounds,
-        research_calls=SMALL.budget.model_calls,
+        research_calls=1,
         condensation_calls=SMALL.budget.model_calls,
         author_attempts=author.maximum_physical_attempts,
     )
@@ -417,3 +422,89 @@ def test_unpriced_small_decision_batches_refuse_before_conversion(
     )
     with pytest.raises(ValueError, match="priced native batch size"):
         require_rule_tagger(project, RuleTaggingSettings(decision_alias="judge"), tagger)
+
+
+def test_transferable_questions_preserve_semantics_without_original_source_answers() -> None:
+    from exp.optimize.evaluation.rules.rule_tags import question_conversion_request
+
+    book = _book()
+    rule = book.rules[0]
+    request = question_conversion_request(rule, 4096)
+    criterion = json.loads(str(request.messages[1].content))
+    assert (
+        criterion["statement"] == rule.statement
+        and criterion["predicate"] == json.loads(rule.model_dump_json())["predicate"]
+    )
+    assert not {"evidence", "counter_evidence", "witnesses", "status"} & criterion.keys()
+    bank = rule_question_bank(book, (_questions(rule.rule_id),))
+    assert all("trace:alpha" not in row.text for row in bank.questions)
+    source_answer = _questions(rule.rule_id).model_copy(
+        update={"applicability": "Yes. Source trace:alpha:span:r2 shows this already."}
+    )
+    with pytest.raises(ValueError, match="source trace"):
+        rule_question_bank(book, (source_answer,))
+    assert rule.evidence
+
+
+def test_non_observation_is_not_criterion_ambiguity_but_visible_ambiguity_stays_held() -> None:
+    from exp.simulation.mining.tagging import TagRow
+
+    book = _book()
+    bank, units, matrix = _matrix(book, ((0.99, 0.99, 0.01),) * 2)
+    absent = Unit("gamma", "observations", "no relevant call was observed")
+    all_units = (*units, absent)
+    base = matrix.model_copy(
+        update={
+            "rows": (
+                *matrix.rows,
+                TagRow(trace_id="gamma", unit_hash=absent.unit_hash, values=(0.01, 0.01, 0.01)),
+            )
+        }
+    )
+    admitted, audits = admit_tagged_rules(
+        book, bank, base, all_units, exposure=_plan(("alpha", "beta", "gamma"))
+    )
+    assert admitted.rules[0].status == "supported" and not audits[0].ambiguous
+    ambiguous = base.model_copy(
+        update={
+            "rows": (
+                *matrix.rows,
+                TagRow(trace_id="gamma", unit_hash=absent.unit_hash, values=(0.99, 0.5, 0.01)),
+            )
+        }
+    )
+    held, audits = admit_tagged_rules(
+        book, bank, ambiguous, all_units, exposure=_plan(("alpha", "beta", "gamma"))
+    )
+    assert held.rules[0].status == "unknown" and audits[0].ambiguous == ("gamma",)
+
+
+def test_native_conversion_source_bound_answer_refuses_and_keeps_bought_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from exp.optimize.evaluation.rules.rule_tags import convert_rule_questions
+
+    project, author = agent_setup(tmp_path, monkeypatch)
+    rule = _book().rules[0]
+
+    class SourceAnswer(ConversionScript):
+        def _reply(self, payload: JsonObject) -> JsonHttpResponse:
+            answer = _questions(rule.rule_id).model_copy(
+                update={"applicability": "Yes. The trace trace:alpha:span:r2 already proves this."}
+            )
+            return _reply([(CONVERSION_TOOL, answer.model_dump(mode="json"))])
+
+    transport = SourceAnswer(lambda role, opening: {})
+    wire(monkeypatch, transport)
+    for _ in range(2):
+        with pytest.raises(ValueError, match="source trace"):
+            convert_rule_questions(
+                project,
+                author,
+                rule,
+                identity="source-bound-conversion",
+                code_revision="new-question-producer",
+                sources=(),
+            )
+    assert len(transport.requests) == 1
+    assert project.artifacts.exists("source-bound-conversion-response")
