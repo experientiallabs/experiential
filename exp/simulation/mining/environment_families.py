@@ -24,6 +24,9 @@ reviewer model, the registration, the review protocol and the exact traces and t
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context, copy_context
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import Field
@@ -69,6 +72,34 @@ TaskRole = Literal["world_learning", "mining_probes"]
 """The data role a family task belongs to."""
 
 
+class EnvironmentReviewWindow(ContractModel):
+    """An explicitly registered finite slice of deterministic native review roots.
+
+    Attributes:
+        start: Zero-based first root in cluster and candidate order.
+        count: Maximum roots selected before any review dispatch.
+    """
+
+    start: int = Field(default=0, ge=0)
+    count: int = Field(ge=1)
+
+
+class QueuedReviewRoot(ContractModel):
+    """A complete native root left unreviewed by the registered window.
+
+    Attributes:
+        group_id: Unchanged native group identity used by every review draw.
+        cluster_id: Original source cluster.
+        path: Original deterministic position in the review forest.
+        members: Complete original member identities, without admission or a verdict.
+    """
+
+    group_id: str
+    cluster_id: str
+    path: str
+    members: tuple[str, ...] = Field(min_length=1)
+
+
 class EnvironmentFamilySpec(ContractModel):
     """How a tag clustering becomes environment families.
 
@@ -77,6 +108,7 @@ class EnvironmentFamilySpec(ContractModel):
             tool-name placement.
             all_exact_schemas attaches a task to every schema-covered base without start QA.
         review: The compatibility review registration.
+        review_window: Optional finite root slice; every other root remains queued.
         admit_uncertain: Uncertain group identities explicitly admitted as families; every other
             uncertain group is reported and left out of training.
     """
@@ -85,6 +117,9 @@ class EnvironmentFamilySpec(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     review: CompatibilitySpec = Field(default_factory=CompatibilitySpec)
+    review_window: EnvironmentReviewWindow | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     admit_uncertain: tuple[str, ...] = ()
 
     def calls(self, traces: int, *, roots: int | None = None) -> int:
@@ -94,7 +129,9 @@ class EnvironmentFamilySpec(ContractModel):
     def candidate_calls(self, traces: Sequence[Trace], *, clusters: int) -> int:
         """Quote complete evidence using its registered partition and cluster root bound."""
         roots = candidate_root_bound(traces, self.review, clusters=clusters)
-        return self.calls(len(traces), roots=roots)
+        if self.review_window is not None:
+            roots = min(self.review_window.count, max(0, roots - self.review_window.start))
+        return 0 if roots == 0 else self.calls(len(traces), roots=roots)
 
 
 class StartingState(ContractModel):
@@ -217,6 +254,9 @@ class EnvironmentFamilies(ContractModel):
         families: Compatible families, in review order.
         uncertain: Uncertain groups, in review order.
         skipped: Clusters with no eligible member, with why.
+        review_window: Registered root slice, when explicitly selected.
+        queued: Complete roots outside that slice, without a compatibility verdict.
+        unclustered: Eligible traces absent from the clustering, recorded for a windowed run.
     """
 
     protocol: str = ENVIRONMENT_REVIEW_PROTOCOL
@@ -227,6 +267,11 @@ class EnvironmentFamilies(ContractModel):
     families: tuple[EnvironmentFamily, ...] = ()
     uncertain: tuple[UncertainGroup, ...] = ()
     skipped: dict[str, str] = Field(default_factory=dict)
+    review_window: EnvironmentReviewWindow | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    queued: tuple[QueuedReviewRoot, ...] = Field(default=(), exclude_if=lambda value: not value)
+    unclustered: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
 
     def identity(self) -> str:
         """Return the content-addressed identity of this record."""
@@ -264,6 +309,9 @@ def families_identity(
     spec: CompatibilitySpec,
     traces: Mapping[str, Trace],
     tasks: Sequence[TaskCase],
+    *,
+    review_window: EnvironmentReviewWindow | None = None,
+    unclustered: Collection[str] = (),
 ) -> str:
     """Return the identity families are saved under, computed before any call."""
     return family_review_identity(
@@ -273,6 +321,8 @@ def families_identity(
         spec=spec,
         evidence_sha256=_evidence_digest(traces, tasks),
         protocol_sha256=review_protocol_sha256(),
+        review_window=review_window,
+        unclustered=unclustered,
     )
 
 
@@ -284,6 +334,8 @@ def family_review_identity(
     spec: CompatibilitySpec,
     evidence_sha256: str,
     protocol_sha256: str,
+    review_window: EnvironmentReviewWindow | None = None,
+    unclustered: Collection[str] = (),
 ) -> str:
     """Bind a review's immutable input identity without loading or reviewing its evidence."""
     return stable_id(
@@ -299,9 +351,32 @@ def family_review_identity(
             "model": model,
             "configuration": configuration_sha256,
             "spec": sha256_json(spec),
+            **({} if review_window is None else {"review_window": sha256_json(review_window)}),
+            **(
+                {}
+                if review_window is None or not unclustered
+                else {"unclustered": sorted(unclustered)}
+            ),
             "evidence": evidence_sha256,
         },
     )
+
+
+@dataclass(frozen=True)
+class _ReviewRoot:
+    """One independent root's immutable position and exact evidence membership.
+
+    Attributes:
+        scope: Clustering or bounded candidate identity used by the native review.
+        cluster_id: Original source cluster identity.
+        path: Original root position, preserved through ordered result collection.
+        members: Complete ordered source member identities, without truncation.
+    """
+
+    scope: str
+    cluster_id: str
+    path: str
+    members: tuple[str, ...]
 
 
 def review_environment_families(
@@ -313,6 +388,7 @@ def review_environment_families(
     held_out: Collection[str],
     tasks: Sequence[TaskCase] = (),
     spec: CompatibilitySpec | None = None,
+    review_window: EnvironmentReviewWindow | None = None,
 ) -> EnvironmentFamilies:
     """Review every cluster into compatible families and uncertain groups.
 
@@ -325,6 +401,7 @@ def review_environment_families(
         tasks: World-learning tasks to attach; a task joins the family holding every one of its
             eligible source traces.
         spec: Review registration; defaults apply when omitted.
+        review_window: Finite root slice; other complete roots stay queued without review.
 
     Raises:
         ValueError: The clustering holds a held-out trace, a task is held out, or an eligible
@@ -344,6 +421,7 @@ def review_environment_families(
     if missing:
         raise ValueError(f"trace content missing for eligible members {missing[:5]}")
     candidates = environment_candidates([traces[trace] for trace in shown], spec)
+    roots: list[_ReviewRoot] = []
     for cluster in clustering.clusters:
         members = tuple(sorted(t for t in cluster.members if t in allowed))
         if not members:
@@ -364,18 +442,59 @@ def review_environment_families(
                     "environment-candidate-review",
                     {"clustering": ident, "candidate": candidate.model_dump(mode="json")},
                 )
-            _review_group(
-                reviewer,
-                spec,
-                traces,
-                scope,
-                cluster.cluster_id,
-                path,
-                partition,
-                0,
-                families,
-                uncertain,
+            roots.append(_ReviewRoot(scope, cluster.cluster_id, path, partition))
+
+    queued: tuple[QueuedReviewRoot, ...] = ()
+    if review_window is not None:
+        stop = review_window.start + review_window.count
+        queued = tuple(
+            QueuedReviewRoot(
+                group_id=family_identity(root.scope, root.members),
+                cluster_id=root.cluster_id,
+                path=root.path,
+                members=root.members,
             )
+            for index, root in enumerate(roots)
+            if not review_window.start <= index < stop
+        )
+        roots = roots[review_window.start : stop]
+
+    def review_root(
+        root: _ReviewRoot,
+    ) -> tuple[list[EnvironmentFamily], list[UncertainGroup]]:
+        """Review one whole tree with private collectors and serial recursive children."""
+        local_families: list[EnvironmentFamily] = []
+        local_uncertain: list[UncertainGroup] = []
+        _review_group(
+            reviewer,
+            spec,
+            traces,
+            root.scope,
+            root.cluster_id,
+            root.path,
+            root.members,
+            0,
+            local_families,
+            local_uncertain,
+        )
+        return local_families, local_uncertain
+
+    def in_context(
+        context: Context, root: _ReviewRoot
+    ) -> tuple[list[EnvironmentFamily], list[UncertainGroup]]:
+        """Run one tree under an independent copy of the original caller's authority."""
+        return context.run(review_root, root)
+
+    workers = spec.maximum_parallel_groups
+    if workers is None or workers == 1 or len(roots) < 2:
+        results = [review_root(root) for root in roots]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(roots))) as pool:
+            pending = [pool.submit(in_context, copy_context(), root) for root in roots]
+            results = [future.result() for future in pending]
+    for root_families, root_uncertain in results:
+        families.extend(root_families)
+        uncertain.extend(root_uncertain)
     attached = _attach(families, tasks, allowed)
     return EnvironmentFamilies(
         clustering=ident,
@@ -385,6 +504,11 @@ def review_environment_families(
         families=attached,
         uncertain=tuple(uncertain),
         skipped=skipped,
+        review_window=review_window,
+        queued=queued,
+        unclustered=()
+        if review_window is None
+        else tuple(sorted(allowed - set(clustering.trace_ids))),
     )
 
 
@@ -398,6 +522,7 @@ def environment_families(
     held_out: Collection[str],
     tasks: Sequence[TaskCase] = (),
     spec: CompatibilitySpec | None = None,
+    review_window: EnvironmentReviewWindow | None = None,
     code_revision: str,
     inputs: Sequence[ArtifactInput] = (),
 ) -> tuple[EnvironmentFamilies, ArtifactInput]:
@@ -409,7 +534,15 @@ def environment_families(
     spec = spec or CompatibilitySpec()
     allowed = set(eligible) - set(held_out)
     shown = {t: traces[t] for t in sorted(allowed & set(clustering.trace_ids)) if t in traces}
-    identity = families_identity(clustering, reviewer, spec, shown, tasks)
+    identity = families_identity(
+        clustering,
+        reviewer,
+        spec,
+        shown,
+        tasks,
+        review_window=review_window,
+        unclustered=allowed - set(clustering.trace_ids),
+    )
     if store.exists(identity):
         reference = artifact_input(store.read(identity).manifest)
         return load_environment_families(store, reference), reference
@@ -421,6 +554,7 @@ def environment_families(
         held_out=held_out,
         tasks=tasks,
         spec=spec,
+        review_window=review_window,
     )
     return record, write_record(
         store, identity, FAMILIES_TYPE, "families.json", record, code_revision, inputs

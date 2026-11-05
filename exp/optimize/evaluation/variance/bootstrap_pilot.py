@@ -145,6 +145,8 @@ def validate_pilot_revision(
         spec=reviewed.spec,
         evidence_sha256=reviewed.evidence_sha256,
         protocol_sha256=revision.protocol_sha256,
+        review_window=reviewed.review_window,
+        unclustered=reviewed.unclustered,
     )
     if (
         placed_manifest.inputs != (revision.reviewed_families,)
@@ -152,6 +154,7 @@ def validate_pilot_revision(
         or reviewed.model != reviewer.model.model_dump(mode="json")
         or baseline.build.spec.environment_families is None
         or reviewed.spec != baseline.build.spec.environment_families.review
+        or reviewed.review_window != baseline.build.spec.environment_families.review_window
     ):
         raise ValueError("pilot historical review protocol or configuration differs")
     record = load_environment_families(project.artifacts, revision.families)

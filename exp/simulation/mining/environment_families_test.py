@@ -26,6 +26,9 @@ from exp.common.traces import Trace
 from exp.common.traces.trace import TraceOutcome, TraceSource
 from exp.simulation.mining.environment_families import (
     FAMILIES_TYPE,
+    EnvironmentFamilies,
+    EnvironmentFamilySpec,
+    EnvironmentReviewWindow,
     admitted_families,
     environment_families,
     review_environment_families,
@@ -457,3 +460,157 @@ def test_traces_outside_the_fit_are_placed_by_the_mixture_over_their_answered_co
 
     assert placed["p1"][0] == "c00" and placed["p2"][0] == "c01"
     assert placed["p1"][1] > 0.5 and "p3" not in placed
+
+
+@pytest.mark.parametrize("workers", [None, 1, 2, 4])
+def test_root_review_keeps_serial_results_and_complete_split_trees(
+    workers: int | None,
+) -> None:
+    """Root scheduling preserves native draw IDs, private collectors and original order."""
+    groups = {"mixed": ("o1", "f1"), "uncertain": ("o2",), "orders": ("o3",)}
+    selected = {key: TRACES[key] for members in groups.values() for key in members}
+
+    def decide(members: frozenset[str], variant: str) -> JsonObject:
+        """Leave one root uncertain and recursively review the mixed root."""
+        if members == frozenset(("o2",)):
+            return answer("uncertain", members)
+        return by_tools(members, variant)
+
+    def run(cap: int | None) -> tuple[EnvironmentFamilies, ScriptedReviewer]:
+        """Run the exact evidence with only the registered execution cap changed."""
+        script, bound = reviewer(decide)
+        record = review_environment_families(
+            clustering(groups),
+            bound,
+            traces=selected,
+            eligible=tuple(selected),
+            held_out=(),
+            spec=CompatibilitySpec(maximum_parallel_groups=cap),
+        )
+        return record, script
+
+    serial, serial_script = run(None)
+    actual, script = run(workers)
+    assert actual.model_copy(update={"spec": serial.spec}) == serial
+    assert script.saved == serial_script.saved
+    assert len(script.requests) == len(serial_script.requests)
+    assert [family.members for family in actual.families] == [("o1",), ("f1",), ("o3",)]
+    assert [row.members for row in actual.uncertain] == [("o2",)]
+    members = [member for row in (*actual.families, *actual.uncertain) for member in row.members]
+    assert sorted(members) == sorted(selected)
+    assert len(members) == len(set(members))
+
+
+@pytest.mark.parametrize("start,count", [(0, 2), (2, 2), (4, 3), (10, 1)])
+def test_registered_window_quotes_native_roots_and_retains_all_queued_evidence(
+    start: int,
+    count: int,
+) -> None:
+    """A finite wave executes its source-order slice and keeps every unselected root."""
+    traces = {f"o{i}": order_trace(f"o{i}") for i in range(5)}
+    dropped = order_trace("not-tagged")
+    script, bound = reviewer(lambda members, _variant: answer("compatible", members))
+    spec = EnvironmentFamilySpec(
+        review=CompatibilitySpec(
+            variants=("contract_first",),
+            min_reviews=1,
+            max_turns=1,
+            repairs=0,
+            max_depth=0,
+            maximum_parallel_groups=2,
+            maximum_candidate_members=64,
+            maximum_candidate_packet_bytes=48_000,
+        ),
+        review_window=EnvironmentReviewWindow(start=start, count=count),
+    )
+    fitted = clustering({f"c{i}": (key,) for i, key in enumerate(traces)})
+    record = review_environment_families(
+        fitted,
+        bound,
+        traces={**traces, dropped.trace_id: dropped},
+        eligible=(*traces, dropped.trace_id),
+        held_out=(),
+        spec=spec.review,
+        review_window=spec.review_window,
+    )
+    selected = list(traces)[start : start + count]
+    assert [row.members for row in record.families] == [(key,) for key in selected]
+    assert len(script.requests) == len(selected) * 2
+    quote = spec.candidate_calls(tuple(traces.values()), clusters=5)
+    assert quote == min(count, max(0, 5 - start)) * 2
+    assert len(script.requests) <= quote
+    represented = [member for row in (*record.families, *record.queued) for member in row.members]
+    assert sorted(represented) == sorted(traces)
+    assert len(set(represented)) == len(represented)
+    assert record.unclustered == ("not-tagged",)
+    assert not record.uncertain
+    assert [root.cluster_id for root in record.queued] == [
+        f"c{i}" for i, key in enumerate(traces) if key not in selected
+    ]
+    assert all(root.group_id for root in record.queued)
+    assert spec.review_window == record.review_window
+
+
+def test_unset_window_preserves_native_aggregate_identity_and_serialized_records() -> None:
+    """Absent window and empty queued inventory retain the original canonical contract."""
+    from exp.simulation.mining.environment_families import families_identity
+
+    traces = {"o1": TRACES["o1"]}
+    _, bound = reviewer(lambda members, _variant: answer("compatible", members))
+    fitted = clustering({"orders": ("o1",)})
+    spec = CompatibilitySpec()
+    assert "review_window" not in EnvironmentFamilySpec().model_dump(mode="json")
+    original = families_identity(fitted, bound, spec, traces, ())
+    assert families_identity(fitted, bound, spec, traces, (), review_window=None) == original
+    assert (
+        families_identity(
+            fitted,
+            bound,
+            spec,
+            traces,
+            (),
+            review_window=EnvironmentReviewWindow(count=1),
+        )
+        != original
+    )
+    record = review_environment_families(
+        fitted, bound, traces=traces, eligible=traces, held_out=(), spec=spec
+    )
+    payload = record.model_dump(mode="json")
+    assert not {"review_window", "queued", "unclustered"} & payload.keys()
+    for values in ({"start": -1, "count": 1}, {"start": 0, "count": 0}):
+        with pytest.raises(ValueError):
+            EnvironmentReviewWindow.model_validate(values)
+
+
+def test_windowed_replay_keys_the_exact_eligible_unclustered_inventory(tmp_path: Path) -> None:
+    """Two excluded tag inventories cannot silently share a saved windowed report."""
+    project = ProjectStore(tmp_path, "queued")
+    traces = {"o1": TRACES["o1"]}
+    script, bound = reviewer(lambda members, _variant: answer("compatible", members))
+    fitted = clustering({"orders": ("o1",)})
+    first, before = environment_families(
+        project.artifacts,
+        fitted,
+        bound,
+        traces=traces,
+        eligible=(*traces, "untagged-a"),
+        held_out=(),
+        review_window=EnvironmentReviewWindow(count=1),
+        code_revision="test",
+    )
+    calls = len(script.requests)
+    second, after = environment_families(
+        project.artifacts,
+        fitted,
+        bound,
+        traces=traces,
+        eligible=(*traces, "untagged-b"),
+        held_out=(),
+        review_window=EnvironmentReviewWindow(count=1),
+        code_revision="test",
+    )
+    assert first.unclustered == ("untagged-a",)
+    assert second.unclustered == ("untagged-b",)
+    assert before != after
+    assert len(script.requests) == calls

@@ -161,6 +161,7 @@ def scope_families(
         held_out=held_out,
         tasks=[task for task in tasks if _role(plan, task) == "world_learning"],
         spec=spec.review,
+        review_window=spec.review_window,
         code_revision=code_revision,
         inputs=(report.clustering,),
     )

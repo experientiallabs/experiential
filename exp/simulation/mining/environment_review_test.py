@@ -152,3 +152,27 @@ def test_prepared_packets_equal_native_full_parse_bytes_and_locators() -> None:
         prepared.packet(("absent",))
     with pytest.raises(ValueError, match="distinct"):
         prepare_group_packets((traces[0], traces[0]))
+
+
+def test_root_parallelism_is_registered_bounded_and_absent_from_unset_serialization() -> None:
+    """Only an explicit finite concurrency registration changes canonical spec identity."""
+    spec = CompatibilitySpec()
+    expected = {
+        "variants": list(spec.variants),
+        "max_turns": 6,
+        "repairs": 1,
+        "max_depth": 2,
+        "min_reviews": 2,
+        "trace_characters": 6000,
+        "maximum_output_tokens": 2000,
+        "temperature": 0.0,
+    }
+    assert spec.model_dump(mode="json") == expected
+    assert CompatibilitySpec(maximum_parallel_groups=None).model_dump(mode="json") == expected
+    for workers in (1, 2, 64):
+        parallel = CompatibilitySpec(maximum_parallel_groups=workers)
+        assert parallel.model_dump(mode="json") == {**expected, "maximum_parallel_groups": workers}
+        assert parallel.calls(100, roots=20) == spec.calls(100, roots=20)
+    for workers in (0, -1, 65):
+        with pytest.raises(ValueError):
+            CompatibilitySpec(maximum_parallel_groups=workers)

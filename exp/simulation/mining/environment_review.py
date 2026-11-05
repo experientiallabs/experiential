@@ -155,6 +155,8 @@ class CompatibilitySpec(ContractModel):
         maximum_candidate_members: Registered initial-candidate member bound, when set.
         maximum_candidate_packet_bytes: Paired initial inventory UTF-8 byte bound. Full
             requests and later histories retain their caller-owned admission checks.
+        maximum_parallel_groups: Independent root reviews allowed in flight, from one to
+            64; absent runs roots serially. Variants and split children remain serial.
         maximum_output_tokens: Output allowance per call.
         temperature: Sampling temperature, or None for a model that pins its own.
     """
@@ -170,6 +172,9 @@ class CompatibilitySpec(ContractModel):
     )
     maximum_candidate_packet_bytes: int | None = Field(
         default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    maximum_parallel_groups: int | None = Field(
+        default=None, ge=1, le=64, exclude_if=lambda value: value is None
     )
     maximum_output_tokens: int = Field(default=2_000, ge=128, le=16_000)
     temperature: float | None = 0.0

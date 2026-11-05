@@ -682,3 +682,54 @@ def test_many_base_progress_does_not_hide_a_pending_base_behind_one_finished_tas
         complete.task_base_progress is not None and len(complete.task_base_progress.completed) == 2
     )
     assert not complete.task_base_progress.remaining
+
+
+def test_native_build_plan_and_scoping_use_the_registered_finite_review_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native build quotes and dispatches only the registered roots and saves the queue."""
+    from exp.simulation.mining.environment_families import EnvironmentReviewWindow
+
+    project = variance_project(tmp_path, monkeypatch)
+    registered = spec(
+        review=CompatibilitySpec(
+            variants=("contract_first",),
+            min_reviews=1,
+            max_turns=1,
+            repairs=0,
+            max_depth=0,
+            maximum_candidate_members=1,
+            maximum_candidate_packet_bytes=48_000,
+            maximum_parallel_groups=2,
+        ),
+        review_window=EnvironmentReviewWindow(start=1, count=2),
+    )
+    script, bound = reviewer(lambda members, _variant: answer("compatible", members))
+    plan = plan_variance_build(
+        project,
+        registered,
+        code_revision="test",
+        reviewer_model=bound.model,
+        reviewer_configuration_sha256=bound.configuration_sha256,
+    )
+    assert plan.review_calls == 4
+    report = run_variance_build(
+        project,
+        registered,
+        code_revision="test",
+        tagger=_tagger(project, FakeDecisions()),
+        reviewer=bound,
+    )
+    assert report.identity == plan.identity
+    assert len(script.requests) == plan.review_calls
+    scoping = report.environment_families
+    assert scoping is not None
+    record = load_environment_families(project.artifacts, scoping.families)
+    assert registered.environment_families is not None
+    assert record.review_window == registered.environment_families.review_window
+    assert len(record.families) == len(scoping.scopes) == 2
+    assert record.queued
+    assert not record.uncertain
+    actual = [member for row in (*record.families, *record.queued) for member in row.members]
+    assert sorted(actual) == sorted(report.retrieval_scope.ids)
+    assert len(actual) == len(set(actual))
