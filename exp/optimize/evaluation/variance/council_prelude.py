@@ -71,6 +71,7 @@ _PRELUDE_SOURCES = (
     "council_preparation.py",
     "council_prelude.py",
     "council_prelude_inventory.py",
+    "council_prelude_world.py",
     "pipeline_spec.py",
     "pipeline_stages.py",
     "pipeline_inputs.py",
