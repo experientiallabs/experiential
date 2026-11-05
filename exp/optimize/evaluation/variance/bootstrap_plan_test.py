@@ -13,6 +13,7 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.executable import grounded
 from exp.optimize.evaluation.executable.costs import grounded_allowance_costs, runtime_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
+from exp.optimize.evaluation.rules.locator_inventory import LocatorInventory
 from exp.optimize.evaluation.variance import bootstrap_plan as module
 from exp.optimize.evaluation.variance.bootstrap import registered_job
 from exp.optimize.evaluation.variance.bootstrap_contracts import MAX_REVEAL_PROBES, StartDraft
@@ -228,7 +229,8 @@ class PreparationScript(ScriptedJsonTransport):
                 body = _draft("auth", opening)
                 facts = body["facts"]
                 assert isinstance(facts, list) and isinstance(facts[0], dict)
-                facts[0]["references"] = [opening["inventory"][0]]
+                inventory = LocatorInventory.model_validate(opening["inventory"]).decode()
+                facts[0]["references"] = [inventory[0]]
             elif role == "reveal_checker":
                 body = {"consistent": True, "summary": "Observed tier matches the authored fact."}
             else:
