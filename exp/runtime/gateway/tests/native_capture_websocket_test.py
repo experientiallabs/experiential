@@ -29,6 +29,7 @@ native = pytest.importorskip("exp_gateway_native")
 def test_response_capture_completes_on_its_own_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relay_metadata: bool, transport: str
 ) -> None:
+    """Persist every completed frame while HTTP alone awaits its outer relay."""
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     monkeypatch.setenv("LOOPBACK_PROVIDER_KEY", "local-diagnostic")
@@ -37,6 +38,7 @@ def test_response_capture_completes_on_its_own_transport(
     response_stored = threading.Event()
 
     def persist(record: str) -> None:
+        """Acknowledge records and signal when a complete response reaches the sink."""
         records.append(record)
         if json.loads(record).get("response") is not None:
             response_stored.set()
@@ -50,12 +52,14 @@ def test_response_capture_completes_on_its_own_transport(
     original_admit, original_settle = control.admit, control.settle
 
     def admit(argument: str) -> str:
+        """Make the local provider eligible for the hosted checkpoint lifecycle."""
         result = json.loads(original_admit(argument))
         for wire in result["route"]:
             wire["billing_customer_managed"] = False
         return json.dumps(result)
 
     def settle(argument: str) -> str:
+        """Grant final response retention after real request settlement."""
         result = original_settle(argument)
         collector.settle(json.loads(argument)["request_id"], True, True)
         return result
