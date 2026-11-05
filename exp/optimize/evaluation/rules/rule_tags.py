@@ -151,6 +151,8 @@ def require_rule_tagger(
     """Refuse missing/wrong native model or cache before any discovery/conversion is bought."""
     if not isinstance(tagger, DecisionsTraceTagger) or tagger.cache is None:
         raise ValueError("rule evidence requires the existing native tagger and shared cache")
+    if tagger.batch_limit != MAX_DECISION_QUESTIONS:
+        raise ValueError("rule evidence tagger differs from the priced native batch size")
     if tagger.cache.paths != project.paths:
         raise ValueError("rule evidence cache belongs to another project")
     expected = RuntimeModelCatalog(

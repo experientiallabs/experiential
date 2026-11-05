@@ -397,3 +397,23 @@ def test_native_cost_inventory_covers_each_new_physical_stage(
     assert sum(cost.attempts for cost in costs) == author_calls + decision_calls
     assert "separate rule-question conversions" in line
     assert all(cost.usd is not None for cost in costs)
+
+
+def test_unpriced_small_decision_batches_refuse_before_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from exp.optimize.evaluation.rules.rule_tags import require_rule_tagger
+
+    project, _ = agent_setup(tmp_path, monkeypatch)
+    snapshot = RuntimeModelCatalog(
+        load_model_catalog(project.model_catalog_path), environment={}
+    ).snapshot("judge")[0]
+
+    def unexpected(request: DecisionRequest) -> JsonObject:
+        raise AssertionError("unpriced batch must not dispatch")
+
+    tagger = DecisionsTraceTagger(
+        unexpected, snapshot, cache=DecisionCache(project.paths), batch_limit=1
+    )
+    with pytest.raises(ValueError, match="priced native batch size"):
+        require_rule_tagger(project, RuleTaggingSettings(decision_alias="judge"), tagger)
