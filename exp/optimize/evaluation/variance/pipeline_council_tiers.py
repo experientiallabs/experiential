@@ -24,7 +24,12 @@ from exp.optimize.evaluation.variance.pipeline_behaviors import (
 from exp.optimize.evaluation.variance.pipeline_errors import error_point_reference
 from exp.optimize.evaluation.variance.pipeline_inputs import trace_search
 from exp.optimize.evaluation.variance.pipeline_schedule import require_scheduled_plan
-from exp.optimize.evaluation.variance.pipeline_spec import BuildOutputs, StageContext, TierMining
+from exp.optimize.evaluation.variance.pipeline_spec import (
+    BuildOutputs,
+    StageContext,
+    TierMining,
+    TraceMLOutputs,
+)
 from exp.optimize.evaluation.variance.rubric_author import judge_definition
 from exp.optimize.evaluation.variance.schedule import complete_rollout, next_rollout_plan
 from exp.simulation.continuations import load_continuation_checkpoint
@@ -81,6 +86,7 @@ def prepare_tier(
         world_sha256=run_world_sha256(tier.configuration),
     )
     judge = EpisodeJudge(definition=definition, settings=mining.judge)
+    prior = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs)
     with prelude_phase(
         context,
         CouncilPreludeCheckpoint(
@@ -89,6 +95,8 @@ def prepare_tier(
             job=tier,
             judge=judge,
             completed_rubric=tier_inputs.rubric,
+            completed_labels=tuple(prior.labels.values()),
+            completed_error_points=tuple(prior.error_points.values()),
         ),
     ):
         behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)

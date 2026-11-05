@@ -51,6 +51,9 @@ def test_real_pipeline_composes_trace_groups_labels_and_authored_rubric_under_sc
             assert run.project.artifacts.exists(checkpoint.group.artifact_id)
         if checkpoint.phase == "behavior_reference":
             assert checkpoint.judge is not None
+            assert len(checkpoint.completed_labels) == len(checkpoint.completed_error_points) == 2
+        if checkpoint.phase == "mining_rubric":
+            assert len(checkpoint.completed_labels) == len(checkpoint.completed_error_points) == 2
         return scope(checkpoint)
 
     original_admission = run.dependencies.council_admission

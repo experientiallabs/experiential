@@ -411,6 +411,7 @@ class _TraceMLStage:
                     actor_alias=alias,
                     job=tier,
                     completed_labels=tuple(labels.values()),
+                    completed_error_points=tuple(error_points.values()),
                 ),
             ):
                 reference, study = run_group(project, tier, revision)
@@ -441,6 +442,7 @@ class _TraceMLStage:
                     job=tier,
                     group=reference,
                     completed_labels=tuple(labels.values()),
+                    completed_error_points=tuple(error_points.values()),
                 ),
             ):
                 tagger = context.dependencies.traceml_tagger or _tagger(context)
@@ -595,7 +597,13 @@ class _MiningStage:
         rubric, packet = spec.mining.rubric, None
         if rubric is None:
             with prelude_phase(
-                context, CouncilPreludeCheckpoint(phase="mining_rubric", job=rules.job)
+                context,
+                CouncilPreludeCheckpoint(
+                    phase="mining_rubric",
+                    job=rules.job,
+                    completed_labels=tuple(labels.values()),
+                    completed_error_points=tuple(ranked.values()),
+                ),
             ):
                 rubric, packet = mining_rubric(context, build, rules)
         embedder = None

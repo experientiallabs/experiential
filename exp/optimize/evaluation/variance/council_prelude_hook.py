@@ -23,6 +23,7 @@ class CouncilPreludeCheckpoint(ContractModel):
     group: ArtifactInput | None = None
     judge: EpisodeJudge | None = None
     completed_labels: tuple[ArtifactInput, ...] = ()
+    completed_error_points: tuple[ArtifactInput, ...] = ()
     completed_rubric: ArtifactInput | None = None
 
 
