@@ -154,7 +154,9 @@ def test_historical_floor_does_not_authorize_changed_current_runtime(
 
     project, spec, root, pilot = pilot_fixture(tmp_path, monkeypatch)
     reference = register_pilot(project, spec, root, pilot)
-    monkeypatch.setattr(planner, "sha256_bytes", lambda content: "0" * 64)
+    changed_runtime = tmp_path / "current_runtime.py"
+    changed_runtime.write_text('"""A different current runtime fixture."""\n')
+    monkeypatch.setattr(planner.grounded, "__file__", str(changed_runtime))
     with pytest.raises(ValueError, match="maintained grounded.py"):
         planner.plan_bootstrap_preparation(
             project, spec, code_revision="pilot-executor", resume_binding=reference
@@ -162,3 +164,7 @@ def test_historical_floor_does_not_authorize_changed_current_runtime(
     floor = read_bootstrap_preparation_plan(project, reference, spec=spec)
     assert floor.build_saved and floor.remaining_tasks == (pilot.task_id,)
     assert floor.code_revision == "pilot-executor"
+
+    monkeypatch.setattr(planner, "sha256_bytes", lambda content: "0" * 64)
+    with pytest.raises(ValueError, match="original saved pin"):
+        read_bootstrap_preparation_plan(project, reference, spec=spec)

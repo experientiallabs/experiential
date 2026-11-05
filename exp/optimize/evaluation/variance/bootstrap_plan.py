@@ -385,6 +385,8 @@ def _bound_bootstrap_plan(
     ):
         raise ValueError("bootstrap resume review protocol differs from its actual producer")
     template = execution.bootstrap.runtime
+    if historical and sha256_bytes(template.runtime_file.read_bytes()) != template.runtime_sha256:
+        raise ValueError("historical preparation runtime differs from its original saved pin")
     maintained = sha256_bytes(Path(grounded.__file__).read_bytes())
     if not historical and (
         template.runtime_sha256 != maintained
