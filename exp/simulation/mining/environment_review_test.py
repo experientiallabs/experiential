@@ -15,6 +15,7 @@ from exp.simulation.mining.environment_review import (
     CompatibilitySpec,
     reconcile,
     review_variant,
+    validate_review,
 )
 
 
@@ -56,3 +57,56 @@ def test_review_and_reconcile_isolate_changed_reviewer_snapshots(field: str) -> 
         assert reconcile(reviewer, traces, (reviewed,), spec=spec, scope="one-group") == reconciled
         assert len(script.requests) == calls
     assert len(script.requests) == 6
+
+
+def _split_groups(groups: tuple[tuple[str, ...], ...]) -> dict[str, object]:
+    return {
+        "verdict": "split",
+        "rationale": "Different tool contracts require separate environments.",
+        "evidence": ["trace:a"],
+        "subgroups": [
+            {"members": list(group), "rationale": "Shared tool contracts.", "evidence": ["trace:a"]}
+            for group in groups
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        (("a",), ("b",)),
+        (("trace:a",), ("trace:b",)),
+        (("a",), ("trace:b",)),
+    ],
+)
+def test_split_resolves_exact_registered_member_locators(
+    groups: tuple[tuple[str, ...], ...],
+) -> None:
+    reviewed = validate_review(_split_groups(groups), ("a", "b"), frozenset({"trace:a", "trace:b"}))
+    assert tuple(row.members for row in reviewed.subgroups) == (("a",), ("b",))
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        (("a", "trace:a"), ("b",)),
+        (("trace:unknown",), ("trace:b",)),
+        (("trace:a:span:step",), ("trace:b",)),
+        (("trace:trace:a",), ("trace:b",)),
+        (("a",), ("a",)),
+    ],
+)
+def test_split_member_aliases_still_require_an_exact_partition(
+    groups: tuple[tuple[str, ...], ...],
+) -> None:
+    with pytest.raises(ValueError, match="partition exactly"):
+        validate_review(_split_groups(groups), ("a", "b"), frozenset({"trace:a", "trace:b"}))
+
+
+def test_split_prefers_explicit_member_ids_over_locator_aliases() -> None:
+    reviewed = validate_review(
+        _split_groups((("a",), ("trace:a",))),
+        ("a", "trace:a"),
+        frozenset({"trace:a", "trace:trace:a"}),
+    )
+    assert tuple(row.members for row in reviewed.subgroups) == (("a",), ("trace:a",))

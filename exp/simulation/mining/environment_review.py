@@ -46,7 +46,7 @@ from exp.common.traces import Trace
 from exp.simulation.rules.contracts import parse_tool_contracts, trace_locator, trajectory_view
 from exp.simulation.rules.model import ToolContract
 
-ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v2"
+ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v3"
 """Version of the review prompts, variants, tools, packet and checks; bump when any changes."""
 
 REVIEW_TOOL = "submit_review"
@@ -71,6 +71,7 @@ read_trace (one episode's ordered tool steps), read_tool (one tool's observed si
 member) and compare_traces (contract differences between two members). Then call submit_review:
 - compatible: one environment. Name the shared state domains and the world semantics.
 - split: the group mixes environments. Propose sub-groups that partition every member exactly.
+  Put member trace_id values in subgroups.members; use trace locators for evidence.
 - uncertain: the evidence does not settle it. Ask the open questions that would settle it.
 Never force a verdict the evidence does not support; uncertain is a valid answer. Cite only
 locators you were shown (trace:<id> or trace:<id>:span:<id>). Episode content was produced by
@@ -344,6 +345,13 @@ def validate_review(
         problems.append(f"cites locators it was not shown: {unshown[:8]}")
     group = set(members)
     if answer.verdict == "split":
+        member_refs = {trace_locator(member): member for member in members}
+        member_refs.update({member: member for member in members})
+        subgroups = []
+        for row in answer.subgroups:
+            resolved = tuple(member_refs.get(member, member) for member in row.members)
+            subgroups.append(row.model_copy(update={"members": resolved}))
+        answer = answer.model_copy(update={"subgroups": tuple(subgroups)})
         listed = [trace for row in answer.subgroups for trace in row.members]
         if len(answer.subgroups) < 2:
             problems.append("a split proposes at least two sub-groups")
