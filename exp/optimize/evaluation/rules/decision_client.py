@@ -26,15 +26,17 @@ def rule_memory_decisions(
         ValueError: Memory settings or operation accounting are absent.
         TraceTaggingError: The configured alias has no native decisions wire.
     """
-    if stage.profile != "jev_memory" or stage.memory is None:
-        raise ValueError("System One construction requires the jev_memory profile")
+    if stage.profile == "jev_memory" and stage.memory is not None:
+        alias = stage.memory.decision_alias
+    elif stage.profile == "trajectory_tags" and stage.tagging is not None:
+        alias = stage.tagging.decision_alias
+    else:
+        raise ValueError("System One construction requires a registered decisions profile")
     if transport.spend_ceiling is None:
         raise ValueError("System One transport requires its admitted operation spend ceiling")
     catalog = load_model_catalog(project.model_catalog_path)
-    priced = transport.priced_as(stage.memory.decision_alias)
-    resolved = RuntimeModelCatalog(catalog, transport_factory=lambda: priced).resolve(
-        stage.memory.decision_alias
-    )
+    priced = transport.priced_as(alias)
+    resolved = RuntimeModelCatalog(catalog, transport_factory=lambda: priced).resolve(alias)
     return DecisionsTraceTagger.for_alias(
         resolved,
         transport=priced,

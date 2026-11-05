@@ -58,6 +58,7 @@ from exp.optimize.evaluation.rules.agent_loop import (
     run_bounded,
     tool_schema,
 )
+from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR, encode_inventory
 from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
@@ -70,7 +71,7 @@ from exp.simulation.rules.model import (
     TrajectoryRules,
 )
 
-RESEARCH_PROTOCOL = "rule-research-v4"
+RESEARCH_PROTOCOL = "rule-research-v5"
 """Version of the research prompts, tools and answer schema; change it whenever any changes."""
 
 RESEARCH_TOOL = "submit_research"
@@ -110,6 +111,11 @@ counter_evidence. Use tool null only for an environment-wide invariant. A rule m
 predicate in the closed language (eq, ne, lt, le, gt, ge, in, exists, absent, and, or, not,
 implies; operands read scope before, after, action or observation at a JSON pointer, or are a
 literal with scope null); omit it when you cannot write it exactly.
+
+Describe the kind of environment this trajectory reveals and record decision-relevant state facts.
+Label each fact observed or inferred, cite actual evidence, and never label inferred state as
+recorded truth. State facts describe the cited moment, not an invariant over all time. Leave
+unsettled facts in limitations rather than guessing.
 
 Keep a research history: every question you asked and whether the evidence resolved it (with
 the answer), and every hypothesis you tested and whether it was confirmed, refuted or left open.
@@ -151,6 +157,22 @@ class QuestionNote(ContractModel):
     evidence: tuple[str, ...] = ()
 
 
+class EnvironmentFact(ContractModel):
+    """One trajectory-local environment description or state observation.
+
+    Attributes:
+        kind: Environment kind or state fact at the cited moment.
+        basis: Recorded observation or explicitly marked inference.
+        statement: What the trajectory reveals.
+        evidence: Actual supplied/read locators grounding the fact.
+    """
+
+    kind: Literal["environment", "state"]
+    basis: Literal["observed", "inferred"]
+    statement: str = Field(min_length=1, max_length=2000)
+    evidence: tuple[str, ...] = Field(min_length=1)
+
+
 class TraceResearchAnswer(ContractModel):
     """Everything one research draw concluded about one trajectory.
 
@@ -158,12 +180,14 @@ class TraceResearchAnswer(ContractModel):
         trace_id: The trajectory researched.
         rules: Proposed rules, citing only this trajectory.
         questions: Open questions for the rule book, citing only this trajectory.
+        facts: Cited environment characteristics and observed or inferred state facts.
         hypotheses: Hypotheses tested.
         questions_asked: Questions asked of the evidence.
         limitations: What the draw could not determine.
     """
 
     trace_id: str
+    facts: tuple[EnvironmentFact, ...] = Field(default=(), exclude_if=lambda value: not value)
     rules: tuple[RuleProposal, ...] = ()
     questions: tuple[ResearchQuestion, ...] = ()
     hypotheses: tuple[HypothesisNote, ...] = ()
@@ -236,6 +260,9 @@ class TraceResearch(ContractModel):
                     "questions_asked": []
                     if draw.answer is None
                     else [note.model_dump(mode="json") for note in draw.answer.questions_asked],
+                    "facts": []
+                    if draw.answer is None
+                    else [fact.model_dump(mode="json") for fact in draw.answer.facts],
                     "rules": []
                     if draw.answer is None
                     else [
@@ -363,6 +390,7 @@ class ResearchMaterial:
         prior: Mapping[str, TraceResearch] | None = None,
         search: TraceSearch | None = None,
         maximum_bytes: int = 32_000,
+        compact: bool = False,
     ) -> None:
         """Render every trajectory once and index its steps by locator and tool.
 
@@ -372,6 +400,7 @@ class ResearchMaterial:
             prior: Earlier research per trace, readable as notes.
             search: Registered world-learning retrieval, when any.
             maximum_bytes: Largest serialized tool result returned.
+            compact: Expose coordinates initially; require successful reads before citations.
         """
         self.views: dict[str, JsonObject] = {}
         self.locators: dict[str, frozenset[str]] = {}
@@ -392,6 +421,7 @@ class ResearchMaterial:
         self.prior = dict(prior or {})
         self.search = search
         self.maximum_bytes = maximum_bytes
+        self.compact = compact
 
     def opening(self, trace_id: str, variant: str) -> JsonObject:
         """Return one draw's opening content."""
@@ -404,8 +434,20 @@ class ResearchMaterial:
                     related[name] = related.get(name, 0) + 1
         return {
             "variant": variant,
-            "trajectory": self.views[trace_id],
-            "citable_locators": sorted(self.locators[trace_id]),
+            "trajectory": (
+                {
+                    "trace_id": trace_id,
+                    "locator_grammar": LOCATOR_GRAMMAR,
+                    "delivery": "coordinates only; call read_step for evidence before citing",
+                }
+                if self.compact
+                else self.views[trace_id]
+            ),
+            "citable_locators": (
+                encode_inventory(self.locators[trace_id])
+                if self.compact
+                else sorted(self.locators[trace_id])
+            ),
             "tools_with_contracts": sorted(self.contracts),
             "related_world_learning_steps_by_tool": dict(sorted(related.items())),
             "earlier_research_notes": sorted(self.prior),
@@ -542,6 +584,7 @@ def validate_research(
     if outside:
         raise ValueError(f"rules or questions cite locators outside their trajectory: {outside}")
     noted = {
+        *(ref for fact in answer.facts for ref in fact.evidence),
         *(ref for note in answer.hypotheses for ref in note.evidence),
         *(ref for note in answer.questions_asked for ref in note.evidence),
     }
@@ -592,7 +635,13 @@ def research_trace(
     def check(draft: JsonObject, read: frozenset[str]) -> str | None:
         """Show the host's structural check of a draft."""
         try:
-            validate_research(draft, trace_id=trace_id, locators=locators, read=read, tools=tools)
+            validate_research(
+                draft,
+                trace_id=trace_id,
+                locators=locators & read if material.compact else locators,
+                read=read,
+                tools=tools,
+            )
         except ValueError as error:
             return reason(error)
         return None
@@ -625,7 +674,11 @@ def research_trace(
         return record.model_copy(update={"failure": transcript.failure or transcript.stop})
     try:
         answer = validate_research(
-            transcript.answer, trace_id=trace_id, locators=locators, read=read, tools=tools
+            transcript.answer,
+            trace_id=trace_id,
+            locators=locators & read if material.compact else locators,
+            read=read,
+            tools=tools,
         )
     except ValueError as error:
         return record.model_copy(update={"failure": reason(error)})
@@ -648,6 +701,7 @@ def research_in_parallel(
     prior: Mapping[str, TraceResearch] | None = None,
     search: TraceSearch | None = None,
     sources: tuple[ArtifactInput, ...] = (),
+    compact: bool = False,
 ) -> tuple[TraceResearch, ...]:
     """Run, or replay, every trace's research draws concurrently and save each history.
 
@@ -666,6 +720,7 @@ def research_in_parallel(
         prior: Earlier research per trace; its draws are kept at the front of each history.
         search: Registered world-learning retrieval, when any.
         sources: Saved artifacts the trajectories came from.
+        compact: Initially supply coordinates only, requiring explicit evidence reads.
 
     Returns:
         One research history per trace, in input order, each saved.
@@ -681,7 +736,12 @@ def research_in_parallel(
         raise ValueError("research concurrency must be positive")
     plan = {trace_id: assign_variants(trace_id, variants, draws_per_trace) for trace_id in ids}
     material = ResearchMaterial(
-        traces, contracts, prior=prior, search=search, maximum_bytes=profile.maximum_result_bytes
+        traces,
+        contracts,
+        prior=prior,
+        search=search,
+        maximum_bytes=profile.maximum_result_bytes,
+        compact=compact,
     )
     units: list[tuple[str, str]] = [(t, v) for t in ids for v in plan[t]]
     calls: list[Callable[[], ResearchDraw]] = [
@@ -784,7 +844,11 @@ def render_history(research: TraceResearch) -> str:
         if draw.answer is None:
             lines += [f"Failed: {' '.join((draw.failure or '').split())}", ""]
             continue
-        lines.append("### Questions asked")
+        lines.append("### Environment and state facts")
+        for fact in draw.answer.facts:
+            lines.append(f"- [{fact.kind}, {fact.basis}] {fact.statement}")
+            lines += _cites(fact.evidence)
+        lines += ["", "### Questions asked"]
         for question in draw.answer.questions_asked:
             answer = f": {' '.join((question.answer or '').split())}" if question.answer else ""
             lines.append(f"- [{question.status}] {' '.join(question.question.split())}{answer}")

@@ -23,10 +23,11 @@ from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
-from exp.optimize.evaluation.executable.model_costs import CostComponent
+from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.fidelity.retrieval_binding import rag_index_embedder_alias
 from exp.optimize.evaluation.induction.episodes import trace_episode
 from exp.optimize.evaluation.rules.memory_stage import memory_stage_costs
+from exp.optimize.evaluation.rules.rule_tags import rule_tag_call_bounds
 from exp.optimize.evaluation.rules.stage import RulesStageSpec, load_rulebook
 from exp.optimize.evaluation.variance.authoring_packet import (
     SourceRef,
@@ -160,6 +161,24 @@ def rules_costs(
         The cost components and one line describing them.
     """
     author = spec.author
+    if spec.profile == "trajectory_tags":
+        assert spec.tagging is not None
+        logical_author, physical_decisions = rule_tag_call_bounds(
+            traces=traces,
+            maximum_rules=spec.tagging.maximum_rules,
+            draws_per_trace=spec.draws_per_trace,
+            rounds=spec.rounds,
+            research_calls=spec.research.budget.model_calls,
+            condensation_calls=spec.condensation.budget.model_calls,
+            author_attempts=1,
+        )
+        rows = tuple(row.scaled(logical_author) for row in evaluation_costs(project, author))
+        rows += (decision_cost(project, spec.tagging.decision_alias, physical_decisions),)
+        return rows, (
+            f"{traces} parallel trajectory research inputs, at most "
+            f"{spec.tagging.maximum_rules} separate rule-question conversions, "
+            f"{physical_decisions} native evidence-tag attempts and one condensation"
+        )
     if spec.profile == "jev_memory" and spec.memory is not None:
         topics = min(tools + 1, spec.memory.maximum_topics)
         return memory_stage_costs(project, author, spec.weighing, spec.memory, topics=topics)

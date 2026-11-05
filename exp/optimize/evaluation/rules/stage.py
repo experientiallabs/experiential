@@ -103,6 +103,12 @@ from exp.optimize.evaluation.rules.research import (
     research_in_parallel,
     research_protocol_sha256,
 )
+from exp.optimize.evaluation.rules.rule_tags import (
+    RuleTaggingSettings,
+    require_rule_tagger,
+    rule_tagging_protocol_sha256,
+    run_rule_tagging,
+)
 from exp.optimize.evaluation.rules.system_one import DecisionBoundary
 from exp.optimize.evaluation.rules.weighing import (
     WeighingDraw,
@@ -155,7 +161,7 @@ SESSION_EVIDENCE = "evidence.json"
 
 _STATUSES: tuple[RuleStatus, ...] = ("supported", "contradicted", "unknown")
 
-RulesProfile = Literal["jev_memory", "agentic_research", "single_draw"]
+RulesProfile = Literal["jev_memory", "agentic_research", "single_draw", "trajectory_tags"]
 """How rules are learned: System Two plus System One into a governed memory set, agentic per-trace
 research, or one forced draw per trace."""
 
@@ -170,6 +176,7 @@ class RulesStageSpec(ContractModel):
             affect what is bought, so it is left out of every identity.
         profile: ``jev_memory`` (the default when ``memory`` is registered), or the explicit
             earlier ``agentic_research`` (the default otherwise) and ``single_draw`` paths.
+        tagging: Separate rule conversion and native evidence questions for trajectory_tags.
         research: Budgets of each research draw.
         variants: Research prompt variants assigned to traces.
         draws_per_trace: Research variants run per trace.
@@ -191,6 +198,9 @@ class RulesStageSpec(ContractModel):
     author: AuthorSettings
     concurrency: int = Field(default=4, ge=1, le=64, strict=True)
     profile: RulesProfile = "agentic_research"
+    tagging: RuleTaggingSettings | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     research: AgentProfile = AgentProfile()
     variants: tuple[str, ...] = tuple(RESEARCH_VARIANTS)
     draws_per_trace: int = Field(default=1, ge=1, le=8, strict=True)
@@ -219,6 +229,8 @@ class RulesStageSpec(ContractModel):
         """Require memory settings for the ``jev_memory`` profile."""
         if self.profile == "jev_memory" and self.memory is None:
             raise ValueError("the jev_memory profile needs memory settings with a decision_alias")
+        if self.profile == "trajectory_tags" and self.tagging is None:
+            raise ValueError("trajectory_tags requires explicit rule tagging settings")
         return self
 
     def identity(self, code_revision: str) -> str:
@@ -261,6 +273,9 @@ class RulesStageSpec(ContractModel):
             "extraction": extraction_protocol_sha256(),
             "code": code_revision,
         }
+        if self.profile == "trajectory_tags":
+            fields["rule_tags"] = rule_tagging_protocol_sha256()
+            fields["tagging"] = sha256_json(self.tagging)
         if self.profile == "single_draw":
             return stable_id("rules-extraction", fields)
         if self.profile == "jev_memory" and self.memory is not None:
@@ -322,6 +337,7 @@ class RulesStageReport(ContractModel):
     """
 
     spec: RulesStageSpec
+    rule_tags: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
     identity: str
     extraction_identity: str
     contracts: dict[str, ToolContract]
@@ -427,6 +443,12 @@ def run_rules_stage(
         if isinstance(decisions, DecisionsTraceTagger)
         else decisions
     )
+    if spec.profile == "trajectory_tags":
+        if not isinstance(decisions, DecisionsTraceTagger) or decisions.cache is None:
+            raise ValueError("trajectory_tags requires the existing native tagger and shared cache")
+        assert spec.tagging is not None
+        require_rule_tagger(project, spec.tagging, decisions)
+        fields["decisions"] = decisions.model_identity
     if spec.profile == "jev_memory":
         if boundary is None:
             raise ValueError("the jev_memory profile needs a System One decisions client")
@@ -509,8 +531,27 @@ def run_rules_stage(
                 for draw in item.draws
                 if draw.answer is not None and draw.transcript is not None
             )
+        rule_tags = None
         if staged is None:
             merged = merge_rules(contracts, analyses, excluded=excluded)
+        if spec.profile == "trajectory_tags":
+            assert spec.tagging is not None and isinstance(decisions, DecisionsTraceTagger)
+            rule_tags, tagged = run_rule_tagging(
+                project,
+                spec.author,
+                spec.tagging,
+                merged,
+                traces,
+                exposure=exposure,
+                tagger=decisions,
+                identity=extraction_identity,
+                concurrency=spec.concurrency,
+                code_revision=code_revision,
+                sources=tuple(sorted({*spec.sources, *learned}, key=lambda ref: ref.artifact_id)),
+            )
+            book, weighings = tagged.book, ()
+            responses = (*learned, rule_tags)
+        elif staged is None:
             weighings = weigh_rules_in_parallel(
                 project,
                 spec.author,
@@ -545,7 +586,7 @@ def run_rules_stage(
             book = attach_witnesses(book, combined)
         rulebook = _save_rulebook(project, book, responses, extraction_identity, code_revision)
         memory: ArtifactInput | None = None
-        if spec.profile == "agentic_research":
+        if spec.profile in ("agentic_research", "trajectory_tags"):
             memory, _ = condense_memory(
                 project,
                 spec.author,
@@ -556,6 +597,7 @@ def run_rules_stage(
                 identity=stable_id(
                     "rules-condensation",
                     {
+                        "complete_rules": spec.profile == "trajectory_tags",
                         "rulebook": rulebook.model_dump(mode="json"),
                         "research": [
                             item.history.model_dump(mode="json")
@@ -570,6 +612,7 @@ def run_rules_stage(
                 ),
                 code_revision=code_revision,
                 sources=spec.sources,
+                complete_rules=spec.profile == "trajectory_tags",
             )
         workloads: tuple[Workload, ...] = ()
         if spec.base_state is not None:
@@ -605,6 +648,7 @@ def run_rules_stage(
             observed or {},
         ).model_copy(
             update={
+                "rule_tags": rule_tags,
                 "challenges": executed,
                 "research": research,
                 "research_failures": tuple(
@@ -679,6 +723,7 @@ def _research(
             prior=prior or None,
             search=search,
             sources=spec.sources,
+            compact=spec.profile == "trajectory_tags",
         )
         prior = {item.trace_id: item for item in found}
     return tuple(prior[trace.trace_id] for trace in traces)

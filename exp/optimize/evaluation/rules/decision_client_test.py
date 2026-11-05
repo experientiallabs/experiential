@@ -8,20 +8,27 @@ import pytest
 from exp.common.core.artifacts import sha256_json
 from exp.optimize.evaluation.rules.decision_client import rule_memory_decisions
 from exp.optimize.evaluation.rules.memory_stage import MemorySetSettings
+from exp.optimize.evaluation.rules.rule_tags import RuleTaggingSettings
+from exp.optimize.evaluation.rules.stage import RulesProfile
 from exp.optimize.evaluation.variance.bootstrap_selection_test import preparation_fixture
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 
+@pytest.mark.parametrize("profile", ["jev_memory", "trajectory_tags"])
 def test_system_one_refuses_unaccounted_transport_before_dispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: RulesProfile
 ) -> None:
     """Even a correctly configured native alias cannot buy through a naked transport."""
     project, spec, _ = preparation_fixture(tmp_path, monkeypatch)
     assert spec.bootstrap.rules is not None
     stage = spec.bootstrap.rules.model_copy(
-        update={"profile": "jev_memory", "memory": MemorySetSettings(decision_alias="jev")}
+        update={
+            "profile": profile,
+            "memory": MemorySetSettings(decision_alias="jev"),
+            "tagging": RuleTaggingSettings(decision_alias="jev"),
+        }
     )
     wire = ScriptedJsonTransport()
     transport = AdmittedJsonTransport(

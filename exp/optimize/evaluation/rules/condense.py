@@ -46,12 +46,12 @@ from exp.optimize.evaluation.rules.agent_loop import (
     run_agent,
     tool_schema,
 )
-from exp.optimize.evaluation.rules.research import TraceResearch
+from exp.optimize.evaluation.rules.research import EnvironmentFact, TraceResearch
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import RuleBook, RuleStatus
 
-CONDENSATION_PROTOCOL = "rule-condensation-v4"
+CONDENSATION_PROTOCOL = "rule-condensation-v5"
 """Version of the condenser prompt, tools, answer schema and memory format."""
 
 CONDENSE_TOOL = "write_memory"
@@ -160,6 +160,7 @@ class TraceDigest(ContractModel):
         trace_id: The trajectory.
         history: Its saved research history.
         variants: Variants of its usable draws.
+        facts: Environment/state findings, retaining inference labels and citations.
         resolved: Questions the research answered, with answers.
         unresolved: Questions it left open.
         hypotheses: Hypotheses by verdict.
@@ -169,6 +170,7 @@ class TraceDigest(ContractModel):
     trace_id: str
     history: ArtifactInput | None = None
     variants: tuple[str, ...] = ()
+    facts: tuple[EnvironmentFact, ...] = Field(default=(), exclude_if=lambda value: not value)
     resolved: tuple[str, ...] = ()
     unresolved: tuple[str, ...] = ()
     hypotheses: dict[str, int] = Field(default_factory=dict)
@@ -335,6 +337,7 @@ def digest_research(research: Sequence[TraceResearch]) -> tuple[TraceDigest, ...
                 trace_id=trace.trace_id,
                 history=trace.history,
                 variants=tuple(d.variant for d in trace.draws if d.answer is not None),
+                facts=tuple(fact for answer in answers for fact in answer.facts),
                 resolved=tuple(
                     f"{note.question} {note.answer or ''}".strip()
                     for answer in answers
@@ -428,6 +431,7 @@ def condense_memory(
     identity: str,
     code_revision: str,
     sources: tuple[ArtifactInput, ...] = (),
+    complete_rules: bool = False,
 ) -> tuple[ArtifactInput, WorldModelMemory]:
     """Run, or replay, the condenser and save the world-model memory.
 
@@ -443,6 +447,7 @@ def condense_memory(
         identity: Stable identity of the condensation; it must bind the book and research.
         code_revision: Producing source identity.
         sources: Saved artifacts the trajectories came from.
+        complete_rules: Keep an explicit host entry for every admitted rule as well.
 
     Returns:
         The saved memory artifact reference and the memory.
@@ -551,7 +556,10 @@ def condense_memory(
     entries = list(() if draft is None else draft.entries)
     covered = {(entry.kind, rule_id) for entry in entries for rule_id in entry.rule_ids}
     for rule in book.rules:
-        for kind in required_kinds(rule.status, bool(rule.counter_evidence)):
+        kinds = required_kinds(rule.status, bool(rule.counter_evidence))
+        if complete_rules and rule.status == "supported" and not rule.counter_evidence:
+            kinds = (*kinds, "behavior")
+        for kind in kinds:
             if (kind, rule.rule_id) not in covered:
                 entries.append(
                     MemoryEntry(
@@ -700,6 +708,9 @@ def render_memory(memory: WorldModelMemory) -> str:
         if digest.hypotheses:
             counts = ", ".join(f"{k} {v}" for k, v in digest.hypotheses.items())
             lines.append(f"- Hypotheses: {counts}")
+        for fact in digest.facts:
+            lines.append(f"- {fact.kind} ({fact.basis}): {_one(fact.statement)}")
+            lines.append("  - Evidence: " + ", ".join(f"`{ref}`" for ref in fact.evidence))
         lines += [f"- Resolved: {_one(text)}" for text in digest.resolved]
         lines += [f"- Unresolved: {_one(text)}" for text in digest.unresolved]
         lines += [f"- Failed draw: {_one(text)}" for text in digest.failures]
