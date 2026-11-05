@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal, Protocol, Self
 
@@ -43,7 +44,12 @@ from exp.common.models import (
 )
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
-from exp.simulation.rules.contracts import parse_tool_contracts, trace_locator, trajectory_view
+from exp.simulation.rules.contracts import (
+    merge_tool_contracts,
+    parse_tool_contracts,
+    trace_locator,
+    trajectory_view,
+)
 from exp.simulation.rules.model import ToolContract
 
 ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v3"
@@ -318,26 +324,84 @@ def group_contracts(traces: Sequence[Trace]) -> dict[str, ToolContract]:
 def group_packet(traces: Sequence[Trace]) -> tuple[JsonObject, frozenset[str]]:
     """Render the members and parsed contracts every draw starts from, and their locators."""
     contracts = group_contracts(traces)
-    members: list[JsonValue] = []
-    for trace in sorted(traces, key=lambda item: item.trace_id):
-        own = parse_tool_contracts([trace])
-        members.append(
-            {
-                "trace_id": trace.trace_id,
-                "locator": trace_locator(trace.trace_id),
-                "task": trace.task[:600],
-                "declared_tools": sorted(tool.name for tool in trace.tools),
-                "called_tools": sorted(name for name, row in own.items() if row.calls),
-                "outcome": None if trace.outcome is None else trace.outcome.status,
-            }
-        )
-    shown = {trace_locator(trace.trace_id) for trace in traces}
+    members = [
+        _packet_member(trace, parse_tool_contracts((trace,)))
+        for trace in sorted(traces, key=lambda item: item.trace_id)
+    ]
+    return _render_group_packet(members, contracts)
+
+
+def _packet_member(trace: Trace, own: Mapping[str, ToolContract]) -> JsonObject:
+    """Render exactly one original member summary from its native parsed contracts."""
+    return {
+        "trace_id": trace.trace_id,
+        "locator": trace_locator(trace.trace_id),
+        "task": trace.task[:600],
+        "declared_tools": sorted(tool.name for tool in trace.tools),
+        "called_tools": sorted(name for name, row in own.items() if row.calls),
+        "outcome": None if trace.outcome is None else trace.outcome.status,
+    }
+
+
+def _render_group_packet(
+    members: Sequence[JsonObject], contracts: Mapping[str, ToolContract]
+) -> tuple[JsonObject, frozenset[str]]:
+    """Assemble the native inventory and its exact whole-trace and example locators."""
+    shown = {str(member["locator"]) for member in members}
     shown |= {ref for row in contracts.values() for ref in row.examples}
     packet: JsonObject = {
-        "members": members,
+        "members": list(members),
         "tool_contracts": {name: row.model_dump(mode="json") for name, row in contracts.items()},
     }
     return packet, frozenset(shown)
+
+
+@dataclass(frozen=True)
+class PreparedGroupPackets:
+    """Ephemeral native per-trace parsing for one explicit candidate partition operation.
+
+    Attributes:
+        contracts: Native contracts per exact input identity, without retained parsed steps.
+        members: Native summaries per input identity, only exposed when explicitly selected.
+    """
+
+    contracts: Mapping[str, Mapping[str, ToolContract]]
+    members: Mapping[str, JsonObject]
+
+    def packet(self, member_ids: Sequence[str]) -> tuple[JsonObject, frozenset[str]]:
+        """Render only distinct known members, preserving the native sorted packet exactly."""
+        if len(set(member_ids)) != len(member_ids):
+            raise ValueError("review packet requires distinct member identities")
+        missing = sorted(set(member_ids) - self.members.keys())
+        if missing:
+            raise ValueError(f"review packet has unknown member identities {missing[:5]}")
+        ordered = sorted(member_ids)
+        contracts = merge_tool_contracts([self.contracts[member] for member in ordered])
+        return _render_group_packet(
+            [deepcopy(self.members[member]) for member in ordered], contracts
+        )
+
+    def checked_packet(
+        self, member_ids: Sequence[str], spec: CompatibilitySpec
+    ) -> tuple[JsonObject, frozenset[str]]:
+        """Apply the same native member and serialized inventory bounds to selected members."""
+        _require_candidate_members(len(member_ids), spec)
+        packet, shown = self.packet(member_ids)
+        _require_candidate_packet(packet, spec)
+        return packet, shown
+
+
+def prepare_group_packets(traces: Sequence[Trace]) -> PreparedGroupPackets:
+    """Parse each provided trace once for one partition call, retaining no trajectory steps."""
+    contracts: dict[str, Mapping[str, ToolContract]] = {}
+    members: dict[str, JsonObject] = {}
+    for trace in traces:
+        if trace.trace_id in members:
+            raise ValueError("review packet preparation requires distinct source trace identities")
+        own = parse_tool_contracts((trace,))
+        contracts[trace.trace_id] = own
+        members[trace.trace_id] = _packet_member(trace, own)
+    return PreparedGroupPackets(contracts=contracts, members=members)
 
 
 class CandidateCapacityError(ValueError):
@@ -348,11 +412,22 @@ def checked_group_packet(
     traces: Sequence[Trace], spec: CompatibilitySpec
 ) -> tuple[JsonObject, frozenset[str]]:
     """Render every member and refuse inventories exceeding registered bounds."""
-    if spec.maximum_candidate_members is not None and len(traces) > spec.maximum_candidate_members:
+    _require_candidate_members(len(traces), spec)
+    packet, shown = group_packet(traces)
+    _require_candidate_packet(packet, spec)
+    return packet, shown
+
+
+def _require_candidate_members(count: int, spec: CompatibilitySpec) -> None:
+    """Refuse a member inventory exceeding its exact registered count bound."""
+    if spec.maximum_candidate_members is not None and count > spec.maximum_candidate_members:
         raise CandidateCapacityError(
             "review candidate exceeds registered member bound; repartition evidence"
         )
-    packet, shown = group_packet(traces)
+
+
+def _require_candidate_packet(packet: JsonObject, spec: CompatibilitySpec) -> None:
+    """Measure the exact native JSON encoding before accepting an inventory."""
     size = len(json.dumps(packet, sort_keys=True).encode("utf-8"))
     if (
         spec.maximum_candidate_packet_bytes is not None
@@ -363,7 +438,6 @@ def checked_group_packet(
             f"{spec.maximum_candidate_packet_bytes}; "
             "repartition evidence or register a fitting bound"
         )
-    return packet, shown
 
 
 def validate_review(

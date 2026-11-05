@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from itertools import permutations
 
 import pytest
 
@@ -10,7 +11,12 @@ from exp.common.core.artifacts import FailureCode, JsonObject, SourceIdentity, S
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace, TraceSpan
 from exp.common.traces.trace import TraceOutcome, TraceSource
-from exp.simulation.rules.contracts import parse_tool_contracts, result_shape, trajectory_view
+from exp.simulation.rules.contracts import (
+    merge_tool_contracts,
+    parse_tool_contracts,
+    result_shape,
+    trajectory_view,
+)
 
 _START = datetime(2026, 10, 1, tzinfo=UTC)
 _LOOKUP = ToolSchema(
@@ -247,3 +253,69 @@ def test_result_shapes_name_types_keys_and_elements() -> None:
     assert result_shape([{"x": 1}, 2, {"x": 3}]) == "array<integer|object[x]>"
     assert result_shape("text") == "string"
     assert result_shape(None) == "null"
+
+
+def contract_merge_traces() -> tuple[Trace, ...]:
+    """Native traces exercise declaration precedence, zero-call tools and full contract counters."""
+    declared = trace("a", (_span("a0", 0, {"gen_ai.operation.name": "chat"}),)).model_copy(
+        update={
+            "tools": (ToolSchema(name="lookup", description="empty first schema", input_schema={}),)
+        }
+    )
+    called = trace(
+        "b",
+        (
+            call("b1", 0, "lookup", {"x": 1}, "k1"),
+            result("br1", 1, "lookup", {"ok": True}, "k1"),
+            call("b2", 2, "lookup", {"x": True, "extra": "é"}, "k2"),
+            result("br2", 3, "lookup", '[{"nested": 1},3]', "k2"),
+            call("b3", 4, "lookup", {"x": "two"}, "k3"),
+            result("br3", 5, "lookup", "denied   now", "k3", is_error=True),
+            call("b4", 6, "lookup", {"x": None}, "unpaired"),
+        ),
+        declare=False,
+    )
+    later = trace(
+        "c",
+        (
+            call("c1", 0, "lookup", {"x": 2.5}, "k1"),
+            result("cr1", 1, "lookup", None, "k1"),
+        ),
+    ).model_copy(
+        update={
+            "tools": (
+                ToolSchema(
+                    name="lookup", description="later schema", input_schema={"type": "array"}
+                ),
+            ),
+            "task": "Épisode " * 100,
+            "outcome": None,
+        }
+    )
+    unused = trace("d", (_span("d0", 0, {"gen_ai.operation.name": "chat"}),)).model_copy(
+        update={
+            "tools": (
+                ToolSchema(
+                    name="unused", description="never called", input_schema={"type": "object"}
+                ),
+            )
+        }
+    )
+    return declared, called, later, unused
+
+
+def test_merged_native_contracts_equal_direct_parse_in_every_trace_order() -> None:
+    """Native merges preserve independently parsed counts, types and example prefixes."""
+    traces = contract_merge_traces()
+    for ordered in permutations(traces):
+        own = [parse_tool_contracts((trace,)) for trace in ordered]
+        assert merge_tool_contracts(own) == parse_tool_contracts(ordered)
+    merged = merge_tool_contracts([parse_tool_contracts((trace,)) for trace in traces])
+    lookup = merged["lookup"]
+    assert lookup.declared_schema == {}
+    assert lookup.required_arguments == ("x",)
+    assert lookup.calls == 5 and lookup.failures == 1
+    assert len(lookup.examples) == 3
+    assert lookup.argument_types["x"] == ("boolean", "integer", "null", "number", "string")
+    assert merged["unused"].calls == 0
+    assert merge_tool_contracts(()) == {}

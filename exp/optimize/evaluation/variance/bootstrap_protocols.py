@@ -66,6 +66,7 @@ _SOURCE_FILES = (
     "exp/simulation/mining/environment_candidates.py",
     "exp/simulation/mining/environment_families.py",
     "exp/simulation/mining/environment_review.py",
+    "exp/simulation/rules/contracts.py",
 )
 
 

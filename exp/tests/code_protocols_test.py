@@ -725,7 +725,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_selection",
             "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "77a7c0e3c1557332f301e37ff7c7bea3acf95784381c2e254e005e6cadf8bdaf",
+        "955ae60bb0cffd119e01bd8bc96b3ad82a4239e1fbe682a5241c912bd1647110",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",
