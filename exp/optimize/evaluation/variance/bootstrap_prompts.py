@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v4"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v5"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -160,62 +160,28 @@ READ_TOOLS: tuple[ToolSchema, ...] = (
 )
 """Read-only tools every bootstrap role may call."""
 
-_FACT: JsonObject = {
-    "type": "object",
-    "properties": {
-        "fact_id": {"type": "string"},
-        "statement": {"type": "string"},
-        "status": {"type": "string", "enum": ["observed", "inferred", "unknown"]},
-        "deciding": {"type": "boolean"},
-        "state_paths": _STRINGS,
-        "references": _STRINGS,
-    },
-    "required": ["fact_id", "statement", "status", "deciding", "references"],
-}
 
-AUTHOR_ANSWER = tool_schema(
-    "submit_start",
-    "Submit the complete starting state.",
-    {
-        "instruction": {"type": "string"},
-        "tools": {"type": "array", "items": {"type": "object"}},
-        "manifest": {"type": "object"},
-        "initial_state": {"type": "object"},
-        "probe_paths": {"type": "object"},
-        "verifier": {"type": "object"},
-        "provenance": {"type": "string", "enum": ["observed", "reconstructed", "authored"]},
-        "replay_trace": {"type": ["string", "null"]},
-        "prefix_steps": {"type": "integer"},
-        "facts": {"type": "array", "items": _FACT},
-        "reveal_probes": {"type": "array", "items": {"type": "object"}},
-        "limitations": _STRINGS,
-    },
-    (
-        "instruction",
-        "tools",
-        "manifest",
-        "initial_state",
-        "probe_paths",
-        "verifier",
-        "provenance",
-        "facts",
-    ),
-)
-"""The author's answer tool."""
+def author_answer_tool() -> ToolSchema:
+    """Expose the complete accepted start contract, including nested world and verifier fields."""
+    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft
 
-REVIEW_ANSWER = tool_schema(
-    "submit_review",
-    "Submit the review verdict.",
-    {
-        "verdict": {"type": "string", "enum": ["accept", "research", "refuse"]},
-        "summary": {"type": "string"},
-        "findings": {"type": "array", "items": {"type": "object"}},
-        "research_items": {"type": "array", "items": {"type": "object"}},
-        "refusal": {"type": ["string", "null"]},
-    },
-    ("verdict", "summary"),
-)
-"""The reviewer's answer tool."""
+    return ToolSchema(
+        name="submit_start",
+        description="Submit the complete starting state.",
+        input_schema=StartDraft.model_json_schema(),
+    )
+
+
+def review_answer_tool() -> ToolSchema:
+    """Expose the accepted review verdict, findings and research-item structures."""
+    from exp.optimize.evaluation.variance.bootstrap_contracts import ReviewAnswer
+
+    return ToolSchema(
+        name="submit_review",
+        description="Submit the review verdict.",
+        input_schema=ReviewAnswer.model_json_schema(),
+    )
+
 
 RESEARCH_ANSWER = tool_schema(
     "submit_finding",
@@ -230,17 +196,16 @@ RESEARCH_ANSWER = tool_schema(
 )
 """The researcher's answer tool."""
 
-REVEAL_ANSWER = tool_schema(
-    "submit_reveal_check",
-    "Submit whether the first reveals agree with the start.",
-    {
-        "consistent": {"type": "boolean"},
-        "summary": {"type": "string"},
-        "conflicts": {"type": "array", "items": {"type": "object"}},
-    },
-    ("consistent", "summary"),
-)
-"""The first-reveal checker's answer tool."""
+
+def reveal_answer_tool() -> ToolSchema:
+    """Expose the accepted first-reveal verdict and conflict records."""
+    from exp.optimize.evaluation.variance.bootstrap_contracts import RevealAnswer
+
+    return ToolSchema(
+        name="submit_reveal_check",
+        description="Submit whether the first reveals agree with the start.",
+        input_schema=RevealAnswer.model_json_schema(),
+    )
 
 
 def instruction(base: str, stances: dict[str, str], variant: str) -> str:
@@ -282,10 +247,10 @@ def bootstrap_prompts_sha256() -> str:
                 tool.model_dump(mode="json")
                 for tool in (
                     *READ_TOOLS,
-                    AUTHOR_ANSWER,
-                    REVIEW_ANSWER,
+                    author_answer_tool(),
+                    review_answer_tool(),
                     RESEARCH_ANSWER,
-                    REVEAL_ANSWER,
+                    reveal_answer_tool(),
                 )
             ],
         }

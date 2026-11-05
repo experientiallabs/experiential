@@ -16,12 +16,12 @@ from exp.optimize.evaluation.executable.grounded import (
 )
 from exp.optimize.evaluation.rules.agent_loop import TRANSCRIPT_TYPE, AgentTranscript
 from exp.optimize.evaluation.variance.bootstrap import frozen_report, registration_entry
-from exp.optimize.evaluation.variance.bootstrap_agents import RevealAnswer
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     REGISTRATION_TYPE,
     BootstrapBinding,
     BootstrapRegistration,
     BootstrapSettings,
+    RevealAnswer,
     ReviewAnswer,
     StartDraft,
 )

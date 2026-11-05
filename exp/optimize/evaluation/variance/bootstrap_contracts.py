@@ -684,6 +684,34 @@ class Reveal(ContractModel):
     is_error: bool
 
 
+class _RevealConflict(ContractModel):
+    """One conflict between a reveal and the start.
+
+    Attributes:
+        probe: Zero-based reveal probe coordinate.
+        fact_ids: Start facts contradicted by the reveal.
+        explanation: Evidence-backed description of the contradiction.
+    """
+
+    probe: int
+    fact_ids: tuple[str, ...] = ()
+    explanation: str
+
+
+class RevealAnswer(ContractModel):
+    """A first-reveal checker's answer.
+
+    Attributes:
+        consistent: Whether no reveal contradicts the start.
+        summary: The check in brief.
+        conflicts: Each contradiction.
+    """
+
+    consistent: bool
+    summary: str
+    conflicts: tuple[_RevealConflict, ...] = ()
+
+
 class StartValidation(ContractModel):
     """The validation a start's provenance requires, and its result.
 

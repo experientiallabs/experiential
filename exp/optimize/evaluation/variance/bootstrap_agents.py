@@ -47,27 +47,28 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     ResearchItem,
     ResearchRequest,
     Reveal,
+    RevealAnswer,
     ReviewAnswer,
     RoleDraw,
     StartDraft,
     Verdict,
 )
 from exp.optimize.evaluation.variance.bootstrap_prompts import (
-    AUTHOR_ANSWER,
     AUTHOR_INSTRUCTION,
     AUTHOR_VARIANTS,
     READ_TOOLS,
     RESEARCH_ANSWER,
     RESEARCH_INSTRUCTION,
     RESEARCH_VARIANTS,
-    REVEAL_ANSWER,
     REVEAL_INSTRUCTION,
     REVEAL_VARIANTS,
-    REVIEW_ANSWER,
     REVIEW_INSTRUCTION,
     REVIEW_VARIANTS,
+    author_answer_tool,
     bootstrap_prompts_sha256,
     instruction,
+    reveal_answer_tool,
+    review_answer_tool,
 )
 from exp.optimize.evaluation.variance.bootstrap_reads import read_trace_steps, read_whole_trace
 from exp.simulation.reconstruction.models import resolve
@@ -357,28 +358,6 @@ def validate_finding(
     return finding
 
 
-class _RevealConflict(ContractModel):
-    """One conflict between a reveal and the start."""
-
-    probe: int
-    fact_ids: tuple[str, ...] = ()
-    explanation: str
-
-
-class RevealAnswer(ContractModel):
-    """A first-reveal checker's answer.
-
-    Attributes:
-        consistent: Whether no reveal contradicts the start.
-        summary: The check in brief.
-        conflicts: Each contradiction.
-    """
-
-    consistent: bool
-    summary: str
-    conflicts: tuple[_RevealConflict, ...] = ()
-
-
 def validate_reveal(answer: JsonObject, draft: StartDraft, probes: int) -> RevealAnswer:
     """Check a first-reveal answer's probe and fact references.
 
@@ -436,7 +415,7 @@ def author_start(
         identity=_draw_id(identity, "start_author", variant, round_, 0, opening),
         system=instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant),
         opening=opening,
-        answer=AUTHOR_ANSWER,
+        answer=author_answer_tool(),
         validate=lambda answer, read: validate_draft(answer, material, read),
         sources=sources,
         code_revision=code_revision,
@@ -473,7 +452,7 @@ def review_start(
             identity=_draw_id(identity, "start_reviewer", variant, round_, 0, opening),
             system=instruction(REVIEW_INSTRUCTION, REVIEW_VARIANTS, variant),
             opening=opening,
-            answer=REVIEW_ANSWER,
+            answer=review_answer_tool(),
             validate=lambda answer, read: validate_review(answer, draft, material.inventory),
             sources=sources,
             code_revision=code_revision,
@@ -640,7 +619,7 @@ def check_reveals(
             identity=_draw_id(identity, "reveal_checker", variant, 0, 0, opening),
             system=instruction(REVEAL_INSTRUCTION, REVEAL_VARIANTS, variant),
             opening=opening,
-            answer=REVEAL_ANSWER,
+            answer=reveal_answer_tool(),
             validate=lambda answer, read: validate_reveal(answer, draft, len(reveals)),
             sources=sources,
             code_revision=code_revision,
