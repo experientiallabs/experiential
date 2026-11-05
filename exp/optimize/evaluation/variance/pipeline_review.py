@@ -1,6 +1,8 @@
 """Persisted, admitted family review draws and their credential-free cost inventory."""
 
-from exp.common.core.artifacts import sha256_json
+from collections.abc import Mapping
+
+from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.models import ModelRequest, ModelResponse
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.executable.costs import evaluation_costs
@@ -25,9 +27,17 @@ def review_costs(
 
 
 def family_reviewer(
-    project: ProjectStore, build: BuildSettings, *, code_revision: str
+    project: ProjectStore,
+    build: BuildSettings,
+    *,
+    code_revision: str,
+    author_retries: Mapping[str, ArtifactInput] | None = None,
+    execution_window: ArtifactInput | None = None,
 ) -> CompatibilityReviewer:
-    """Bind one reviewer whose calls use exact saved author-response replay and admission."""
+    """Bind admitted review calls, forwarding retry grants only for named logical identities.
+
+    Retry references are operational authority and do not change the semantic configuration.
+    """
     settings = build.reviewer
     if settings is None:
         raise ValueError("environment families need build.reviewer settings before execution")
@@ -41,6 +51,12 @@ def family_reviewer(
             identity=identity,
             sources=(),
             code_revision=code_revision,
+            **({"execution_window": execution_window} if execution_window is not None else {}),
+            **(
+                {"retry_authorization": author_retries[identity]}
+                if author_retries and identity in author_retries
+                else {}
+            ),
         )
         return response
 

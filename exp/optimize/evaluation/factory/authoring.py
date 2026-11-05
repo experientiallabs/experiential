@@ -24,6 +24,14 @@ from exp.common.models import (
     load_model_catalog,
 )
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.factory.author_retries import (
+    RESOLUTION_TYPE,
+    AuthorRetryResolution,
+    author_execution_deadline,
+    load_author_execution_window,
+    load_author_retry,
+    retry_resolution_id,
+)
 from exp.runtime.models.call_evidence import canonical_call
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
@@ -217,6 +225,11 @@ def _verify_author_intent(
             spec, request, effective, supports_reasoning=profile.supports_reasoning
         ):
             raise ValueError("author response lost its original reasoning profile")
+    if "execution-window.json" in intent.files:
+        window_ref = ArtifactInput.model_validate_json(
+            store.read_bytes(intent_id, "execution-window.json")
+        )
+        load_author_execution_window(project, window_ref).require_settings(spec)
     return artifact_input(intent)
 
 
@@ -228,6 +241,8 @@ def author_response(
     identity: str,
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
+    retry_authorization: ArtifactInput | None = None,
+    execution_window: ArtifactInput | None = None,
 ) -> tuple[ArtifactInput, ModelResponse]:
     """Save one draw under the caller's exclusive operation lease; replay requires exact pins.
 
@@ -236,6 +251,8 @@ def author_response(
     receipt and replays as the same known budget stop. Other malformed output stays available.
     Logical requests remain unchanged for producer replay; explicit reasoning overrides add the
     exact dispatched request and its catalog-bound profile to the same immutable intent.
+    An explicit retry registration can authorize one bounded child after retained terminal
+    503s. Its immutable parent resolution replays the actual child response without a new call.
     """
     store = project.artifacts
     effective = _effective_request(spec, request)
@@ -245,6 +262,17 @@ def author_response(
             raise ValueError("author source changed; pin the saved immutable reference")
     intent_id, response_id = identity + "-intent", identity + "-response"
     rejection_id = identity + "-rejection"
+    if retry_authorization is not None or store.exists(retry_resolution_id(identity)):
+        return _retry_response(
+            project,
+            spec,
+            request,
+            identity=identity,
+            sources=sources,
+            code_revision=code_revision,
+            authorization=retry_authorization,
+            execution_window=execution_window,
+        )
     if store.exists(response_id) and store.exists(rejection_id):
         raise ValueError("author identity has conflicting saved outcomes")
     if store.exists(rejection_id):
@@ -263,10 +291,17 @@ def author_response(
     if not store.exists(response_id):
         if store.exists(intent_id):
             raise ValueError("author dispatch has an unknown outcome; no implicit redraw")
+        deadline = (
+            spec.deadline
+            if execution_window is None
+            else author_execution_deadline(project, spec, execution_window)
+        )
         catalog = _prepare_author(project, spec, request)
-        if datetime.now(UTC) >= spec.deadline:
+        if datetime.now(UTC) >= deadline:
             raise ValueError("author deadline expired before dispatch")
         request_files: dict[str, ContractModel] = {"spec.json": spec, "request.json": request}
+        if execution_window is not None:
+            request_files["execution-window.json"] = execution_window
         if spec.reasoning_effort is not None:
             request_files["effective-request.json"] = effective
             _, capability = RuntimeModelCatalog(catalog, environment={}).snapshot(spec.model_alias)
@@ -284,11 +319,18 @@ def author_response(
             ),
             files=request_files,
         )
+
+        def check_execution_window() -> None:
+            """Recheck explicit operational authority at every physical attempt boundary."""
+            if execution_window is not None:
+                author_execution_deadline(project, spec, execution_window)
+
         transport = AdmittedJsonTransport(
             HttpxJsonTransport(),
             artifacts=store,
             code_revision=code_revision,
-            deadline=spec.deadline,
+            deadline=deadline,
+            before_claim=check_execution_window if execution_window is not None else None,
             ledger=DispatchLedger(
                 store.project_directory / (identity + ".sqlite"),
                 spec.maximum_physical_attempts,
@@ -339,3 +381,89 @@ def author_response(
     return artifact_input(response_manifest), ModelResponse.model_validate_json(
         store.read_bytes(response_id, "response.json")
     )
+
+
+def _retry_response(
+    project: ProjectStore,
+    spec: AuthorSettings,
+    request: ModelRequest,
+    *,
+    identity: str,
+    sources: tuple[ArtifactInput, ...],
+    code_revision: str,
+    authorization: ArtifactInput | None,
+    execution_window: ArtifactInput | None,
+) -> tuple[ArtifactInput, ModelResponse]:
+    """Execute one explicit child lifetime or replay its verified parent resolution offline."""
+    store = project.artifacts
+    resolution_id = retry_resolution_id(identity)
+    saved: AuthorRetryResolution | None = None
+    if store.exists(resolution_id):
+        saved = AuthorRetryResolution.model_validate_json(
+            store.read_bytes(resolution_id, "resolution.json")
+        )
+        if authorization is not None and authorization != saved.retry_registration:
+            raise ValueError("saved author retry resolution has different authorization")
+        authorization = saved.retry_registration
+    if authorization is None:
+        raise ValueError("author retry needs an explicit immutable authorization")
+    grant = load_author_retry(project, authorization)
+    if execution_window is not None and execution_window != grant.execution_window:
+        raise ValueError("author retry execution window differs from its registration")
+    parent = _verify_author_intent(
+        project, spec, request, _effective_request(spec, request), sources, identity + "-intent"
+    )
+    if grant.parent_intent != parent:
+        raise ValueError("author retry differs from the original parent")
+    if saved is not None:
+        manifest = store.read(resolution_id).manifest
+        expected_inputs = tuple(
+            sorted((parent, authorization, saved.response), key=lambda ref: ref.artifact_id)
+        )
+        if (
+            manifest.artifact_type != RESOLUTION_TYPE
+            or manifest.inputs != expected_inputs
+            or saved.response.artifact_id != grant.child_identity + "-response"
+            or not store.exists(saved.response.artifact_id)
+            or artifact_input(store.read(saved.response.artifact_id).manifest) != saved.response
+        ):
+            raise ValueError("saved author retry resolution lost its exact authority or response")
+    if not any(
+        store.exists(grant.child_identity + suffix) for suffix in ("-response", "-rejection")
+    ):
+        grant.require_operation()
+    child_settings = spec.model_copy(
+        update={"maximum_physical_attempts": grant.maximum_physical_attempts}
+    )
+    reference, response = author_response(
+        project,
+        child_settings,
+        request,
+        identity=grant.child_identity,
+        sources=sources,
+        code_revision=code_revision,
+        execution_window=grant.execution_window,
+    )
+    resolution = AuthorRetryResolution(retry_registration=authorization, response=reference)
+    inputs = tuple(sorted((parent, authorization, reference), key=lambda ref: ref.artifact_id))
+    if saved is not None:
+        manifest = store.read(resolution_id).manifest
+        if (
+            saved != resolution
+            or manifest.artifact_type != RESOLUTION_TYPE
+            or manifest.inputs != inputs
+        ):
+            raise ValueError("saved author retry resolution lost its exact authority or response")
+    else:
+        store.write_json(
+            artifact_id=resolution_id,
+            artifact_type=RESOLUTION_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+                inputs=inputs,
+            ),
+            files={"resolution.json": resolution},
+        )
+    return reference, response

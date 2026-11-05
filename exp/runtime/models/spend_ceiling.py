@@ -25,7 +25,7 @@ import math
 import os
 import sqlite3
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -340,6 +340,30 @@ class OperationSpendCeiling:
     def path(self) -> Path:
         """Return the operation's ledger file."""
         return self._path
+
+    def require_accounted_attempts(self, attempt_ids: Sequence[str]) -> None:
+        """Require every named physical attempt to retain liability in this operation.
+
+        This reads existing content-free accounting only, without reserving, releasing,
+        recovering, or changing any limit or reservation.
+
+        Args:
+            attempt_ids: Exact provider attempt identities whose original liability must remain.
+
+        Raises:
+            ValueError: A physical attempt is absent from this ledger or was released.
+        """
+        connection = connect_database(self._path)
+        try:
+            for attempt in attempt_ids:
+                row = connection.execute(
+                    "SELECT 1 FROM reservations WHERE attempt_id = ? AND state != 'released'",
+                    (attempt,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("physical attempt is not accounted in the original operation")
+        finally:
+            connection.close()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
