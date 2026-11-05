@@ -11,7 +11,6 @@ Family authoring and record export live in ``pipeline_families`` and ``pipeline_
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 
@@ -39,8 +38,6 @@ from exp.optimize.evaluation.rules.decision_client import rule_memory_decisions
 from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
-    ActorCriticSpec,
-    run_actor_critic,
 )
 from exp.optimize.evaluation.variance.actor_critic_costs import (
     actor_critic_costs,
@@ -51,32 +48,38 @@ from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
 from exp.optimize.evaluation.variance.council_parallel import council_draws
-from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
+from exp.optimize.evaluation.variance.council_prelude_hook import (
+    CouncilPreludeCheckpoint,
+    prelude_phase,
+)
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import (
-    ReferenceSource,
     TraceSearch,
     open_trace_search,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
-from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
 from exp.optimize.evaluation.variance.pipeline_behaviors import (
     behavior_bank,
     behavior_costs,
     behavior_lines,
-    behavior_reference,
-    prepare_behavior_reference,
+)
+from exp.optimize.evaluation.variance.pipeline_council_tiers import (
+    TierInputs,
+    prepare_tier,
+    run_tier,
 )
 from exp.optimize.evaluation.variance.pipeline_errors import (
     attempt_error_points,
-    error_point_reference,
     error_tag_costs,
     probe_line,
     save_error_points,
     tag_tier_errors,
     tier_error_bank,
+    traceml_decision_attempts,
+    traceml_label_attempts,
 )
+from exp.optimize.evaluation.variance.pipeline_family_rag import mining_family_build
 from exp.optimize.evaluation.variance.pipeline_inputs import (
     admitted_transport,
     mining_rubric,
@@ -101,12 +104,9 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     RulesOutputs,
     StageContext,
     StageRun,
-    TierMining,
     TraceMLOutputs,
     cost_lines,
 )
-from exp.optimize.evaluation.variance.rubric_author import judge_definition
-from exp.optimize.evaluation.variance.schedule import complete_rollout, next_rollout_plan
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -125,7 +125,6 @@ from exp.simulation.mining.traceml import (
     trajectory_from_workflow_steps,
 )
 from exp.simulation.mining.traceml_moves import MoveJudge, MoveJudgeError
-from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.rules.recall import RecallPolicy
 
 __all__ = ["MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
@@ -236,7 +235,9 @@ class _RulesStage:
         if context.spec.mining.bootstrap is not None:
             return run_bootstrapped_rules(context)
         project, spec, revision = context.project, context.spec, context.code_revision
-        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        build = mining_family_build(
+            context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        )
         exposure = load_exposure_plan(project, build.exposure)
         traces = world_learning_traces(project, build)
         if len(traces) > spec.rules.maximum_traces:
@@ -361,14 +362,15 @@ class _TraceMLStage:
         steps = spec.mining.attempts * spec.mining.registered.maximum_model_calls
         steps *= settings.steps_per_call
         bank = traceml_bank(settings.bank_root)
-        calls = steps * math.ceil(len(bank.questions) / 32)
         judged = move_draws(spec)
         assert settings.move_judge is not None
         for alias in spec.mining.actors:
             costs.extend(
                 job_costs(project, group_job(project, spec, spec.mining.registered, alias))
             )
-            costs.append(decision_cost(project, settings.decision_alias, calls))
+            costs.append(
+                decision_cost(project, settings.decision_alias, traceml_label_attempts(spec))
+            )
             costs.extend(
                 row.scaled(judged) for row in evaluation_costs(project, settings.move_judge)
             )
@@ -396,7 +398,6 @@ class _TraceMLStage:
             return StageRun(TraceMLOutputs(), (), {"enabled": False})
         job = RulesOutputs.model_validate(context.upstream["rules"].outputs).job
         bank = traceml_bank(spec.traceml.bank_root)
-        tagger = context.dependencies.traceml_tagger or _tagger(context)
         groups: dict[str, ArtifactInput] = {}
         labels: dict[str, ArtifactInput] = {}
         errors: dict[str, ArtifactInput] = {}
@@ -408,7 +409,18 @@ class _TraceMLStage:
         judge_settings = spec.traceml.move_judge
         assert judge_settings is not None
         for alias in spec.mining.actors:
-            reference, study = run_group(project, group_job(project, spec, job, alias), revision)
+            tier = group_job(project, spec, job, alias)
+            with prelude_phase(
+                context,
+                CouncilPreludeCheckpoint(
+                    phase="traceml_group",
+                    actor_alias=alias,
+                    job=tier,
+                    completed_labels=tuple(labels.values()),
+                    completed_error_points=tuple(error_points.values()),
+                ),
+            ):
+                reference, study = run_group(project, tier, revision)
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
             trajectories = []
             for branch in study.branches:
@@ -428,35 +440,47 @@ class _TraceMLStage:
                         locator_prefix=f"attempt:{branch.index}/step",
                     )
                 )
-            labelled = label_traces(
-                trajectories,
-                tagger=tagger,
-                bank=bank,
-                trace_concurrency=spec.traceml.concurrency,
-                move_judge=_move_judge(context, reference),
-                move_variants=spec.traceml.move_variants,
-                move_window=spec.traceml.move_window,
-                move_output_tokens=judge_settings.output_tokens,
-                move_repairs=spec.traceml.move_repairs,
-            )
-            groups[alias] = reference
-            labels[alias] = persist_traceml_labels(
-                project.artifacts, labelled, code_revision=revision, inputs=(reference,)
-            )
-            if error_bank is not None:
-                errors[alias], error_steps[alias] = tag_tier_errors(
-                    project.artifacts,
-                    error_bank,
+            with prelude_phase(
+                context,
+                CouncilPreludeCheckpoint(
+                    phase="traceml_labels",
+                    actor_alias=alias,
+                    job=tier,
+                    group=reference,
+                    completed_labels=tuple(labels.values()),
+                    completed_error_points=tuple(error_points.values()),
+                ),
+            ):
+                tagger = context.dependencies.traceml_tagger or _tagger(context)
+                labelled = label_traces(
                     trajectories,
-                    tagger,
-                    code_revision=revision,
-                    inputs=(reference,),
-                    concurrency=spec.traceml.concurrency,
+                    tagger=tagger,
+                    bank=bank,
+                    trace_concurrency=spec.traceml.concurrency,
+                    move_judge=_move_judge(context, reference),
+                    move_variants=spec.traceml.move_variants,
+                    move_window=spec.traceml.move_window,
+                    move_output_tokens=judge_settings.output_tokens,
+                    move_repairs=spec.traceml.move_repairs,
                 )
-                points[alias] = attempt_error_points(project.artifacts, error_steps[alias])
-                error_points[alias] = save_error_points(
-                    project.artifacts, error_steps[alias], code_revision=revision
+                groups[alias] = reference
+                labels[alias] = persist_traceml_labels(
+                    project.artifacts, labelled, code_revision=revision, inputs=(reference,)
                 )
+                if error_bank is not None:
+                    errors[alias], error_steps[alias] = tag_tier_errors(
+                        project.artifacts,
+                        error_bank,
+                        trajectories,
+                        tagger,
+                        code_revision=revision,
+                        inputs=(reference,),
+                        concurrency=spec.traceml.concurrency,
+                    )
+                    points[alias] = attempt_error_points(project.artifacts, error_steps[alias])
+                    error_points[alias] = save_error_points(
+                        project.artifacts, error_steps[alias], code_revision=revision
+                    )
         outputs = TraceMLOutputs(
             groups=groups,
             labels=labels,
@@ -568,7 +592,9 @@ class _MiningStage:
         planned = scheduled_preview(project, spec)
         if planned is not None:
             require_scheduled_plan(context, planned)
-        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        build = mining_family_build(
+            context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        )
         exposure = load_exposure_plan(project, build.exposure)
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
         traceml = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs)
@@ -578,16 +604,31 @@ class _MiningStage:
         probe = probe_line(build, start.task.task_id)
         rubric, packet = spec.mining.rubric, None
         if rubric is None:
-            rubric, packet = mining_rubric(context, build, rules)
+            with prelude_phase(
+                context,
+                CouncilPreludeCheckpoint(
+                    phase="mining_rubric",
+                    job=rules.job,
+                    completed_labels=tuple(labels.values()),
+                    completed_error_points=tuple(ranked.values()),
+                ),
+            ):
+                rubric, packet = mining_rubric(context, build, rules)
         embedder = None
         if spec.mining.retrieval and build.index is not None:
-            embedder = retrieval_embedder(context, build.index)
-        tiers = council_draws(
+            embedder = retrieval_embedder(
+                context,
+                build.index,
+                catalog_binding=GroundedRuntimeDefinition.model_validate(
+                    RulesOutputs.model_validate(context.upstream["rules"].outputs).job.configuration
+                ).catalog_binding,
+            )
+        prepared = council_draws(
             tuple(
                 partial(
-                    self._tier,
+                    prepare_tier,
                     context,
-                    _Tier(
+                    TierInputs(
                         exposure,
                         rules.job,
                         profile,
@@ -597,10 +638,16 @@ class _MiningStage:
                         ranked.get(alias),
                     ),
                     build,
-                    embedder,
                 )
                 for alias in spec.mining.actors
             ),
+            spec.mining.concurrency,
+        )
+        register = context.dependencies.council_registration
+        if register is not None:
+            register(context, tuple(tier.registration for tier in prepared))
+        tiers = council_draws(
+            tuple(partial(run_tier, context, tier, embedder) for tier in prepared),
             spec.mining.concurrency,
         )
         references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
@@ -630,157 +677,12 @@ class _MiningStage:
         }
         return StageRun(outputs, tuple(references), summary)
 
-    def _tier(
-        self,
-        context: StageContext,
-        tier_inputs: _Tier,
-        build: BuildOutputs,
-        embedder: RAGEmbedderBinding | None,
-    ) -> TierMining:
-        """Run one tier: its judge, its registration (or the schedule's) and its group judging.
-
-        Args:
-            context: The running stage.
-            tier_inputs: The frozen roles, rule-bound job, judge profile, rubric and tier.
-            build: The variance build, whose scoped index the roles search.
-            embedder: Query embedder of a semantic index, or None.
-
-        Returns:
-            The tier's mining.
-        """
-        project, spec, revision = context.project, context.spec, context.code_revision
-        mining, alias = spec.mining, tier_inputs.alias
-        schedule = mining.schedule
-        scheduled = schedule is not None and schedule.base.initial.actor_alias == alias
-        plan = None
-        if scheduled:
-            assert schedule is not None
-            plan = next_rollout_plan(project, schedule, code_revision=revision)
-            require_scheduled_plan(context, plan)
-        tier = group_job(project, spec, tier_inputs.job, alias)
-        start = load_continuation_checkpoint(project.artifacts, tier.study.checkpoint)
-        definition = judge_definition(
-            project,
-            tier_inputs.profile,
-            tier_inputs.rubric,
-            task_sha256=run_task_sha256(start),
-            world_sha256=run_world_sha256(tier.configuration),
-        )
-        judge = EpisodeJudge(definition=definition, settings=mining.judge)
-        behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
-        labels = tier_inputs.labels
-        references = (
-            *((behavior_reference(project, behavior),) if behavior is not None else ()),
-            *(
-                ()
-                if labels is None
-                else (
-                    ReferenceSource(
-                        kind="traceml_labels", name="traceml", artifact=labels, file="labels.json"
-                    ),
-                )
-            ),
-            *(
-                ()
-                if tier_inputs.error_points is None
-                else (error_point_reference(tier_inputs.error_points),)
-            ),
-        )
-        retrieval = (
-            trace_search(project, build, start.task.task_id, mining.retrieval_top_k)
-            if mining.retrieval
-            else None
-        )
-        registration = ActorCriticSpec.error_mining(
-            tier,
-            episode_judge=judge,
-            selector=mining.selector,
-            critic=mining.critic,
-            concurrency=mining.concurrency,
-            attempts=mining.attempts,
-            selector_draws=mining.selector_draws,
-            critic_draws=mining.critic_draws,
-            points=mining.points,
-            continuations=mining.continuations,
-            seed=mining.seed,
-            continuation_physical_attempts=mining.continuation_physical_attempts,
-            selector_profile=mining.selector_profile,
-            critic_profile=mining.critic_profile,
-            references=references,
-            actor_tier=alias,
-        ).model_copy(update={"retrieval": retrieval})
-        if scheduled:
-            assert plan is not None and plan.spec is not None
-            registration = plan.spec
-            judge = registration.episode_judge
-            tier = registration.initial
-        report = run_actor_critic(
-            project,
-            registration,
-            exposure=tier_inputs.exposure,
-            code_revision=revision,
-            embedder=embedder if registration.retrieval is not None else None,
-            admission=context.dependencies.council_admission,
-        )
-        saved = _report_reference(project, registration, revision)
-        if scheduled:
-            assert schedule is not None
-            complete_rollout(project, schedule, saved, code_revision=revision)
-        judged = report.initial_judged
-        if judged is None:
-            judged, _ = judge_study(
-                project,
-                report.group,
-                judge,
-                configuration=tier.configuration,
-                code_revision=revision,
-            )
-        return TierMining(
-            tier=alias,
-            report=saved,
-            judged_group=judged,
-            judge=judge,
-            job=tier,
-            retrieval=registration.retrieval,
-            behavior_differences=behavior,
-        )
-
-
-@dataclass(frozen=True)
-class _Tier:
-    """What one tier's error mining reads besides the stage context.
-
-    Attributes:
-        exposure: The frozen data roles.
-        job: The rule-bound mining job.
-        profile: The episode-judge profile.
-        rubric: The mining-probe task's rubric.
-        alias: The tier's actor alias.
-        labels: The tier's TraceML labels, when labelled.
-        error_points: The tier's error-ranked attempt points, when its attempts were tagged.
-    """
-
-    exposure: ExposurePlan
-    job: ContinuationJob
-    profile: JudgeProfile
-    rubric: ArtifactInput
-    alias: str
-    labels: ArtifactInput | None
-    error_points: ArtifactInput | None = None
-
 
 def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:
     """Read one saved actor-critic report."""
     return ActorCriticReport.model_validate_json(
         project.artifacts.read_bytes(reference.artifact_id, "report.json")
     )
-
-
-def _report_reference(
-    project: ProjectStore, spec: ActorCriticSpec, code_revision: str
-) -> ArtifactInput:
-    """Return the saved report of a registration."""
-    return artifact_input(project.artifacts.read(spec.identity(code_revision) + "-result").manifest)
 
 
 def _world(
@@ -827,7 +729,13 @@ def _rules_search(
     registered = trace_search(project, build, start.task.task_id, spec.mining.retrieval_top_k)
     if registered is None or build.index is None:
         return None
-    embedder = retrieval_embedder(context, build.index)
+    embedder = retrieval_embedder(
+        context,
+        build.index,
+        catalog_binding=GroundedRuntimeDefinition.model_validate(
+            RulesOutputs.model_validate(context.upstream["rules"].outputs).job.configuration
+        ).catalog_binding,
+    )
     return open_trace_search(project.artifacts, registered, exposure, embedder)
 
 
@@ -889,8 +797,7 @@ def _tagger(context: StageContext) -> TraceTagger:
     project, settings = context.project, context.spec.traceml
     catalog = load_model_catalog(project.model_catalog_path)
     resolved = RuntimeModelCatalog(catalog).resolve(settings.decision_alias)
-    attempts = context.spec.mining.attempts * context.spec.mining.registered.maximum_model_calls
-    attempts *= settings.steps_per_call * len(context.spec.mining.actors)
+    attempts = traceml_decision_attempts(project, context.spec)
     transport = admitted_transport(
         context, "traceml", attempts, datetime.now(UTC) + timedelta(hours=settings.deadline_hours)
     ).priced_as(settings.decision_alias)

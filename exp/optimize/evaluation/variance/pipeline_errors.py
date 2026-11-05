@@ -69,7 +69,7 @@ from exp.simulation.mining.error_tags import (
 from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
 from exp.simulation.mining.tagging import TraceTagger
-from exp.simulation.mining.traceml import TraceTrajectory
+from exp.simulation.mining.traceml import TraceTrajectory, traceml_bank
 
 _QUESTIONS_PER_CALL = 32
 
@@ -208,6 +208,28 @@ def tier_error_bank(spec: DecisionVarianceSpec) -> QuestionBank | None:
         return None
     return error_bank(
         settings.error_bank, root=settings.bank_root, families=settings.error_families
+    )
+
+
+def traceml_label_attempts(spec: DecisionVarianceSpec) -> int:
+    """Physical request bound for one full tier's action taxonomy, including native retries."""
+    bank = traceml_bank(spec.traceml.bank_root)
+    steps = (
+        spec.mining.attempts
+        * spec.mining.registered.maximum_model_calls
+        * spec.traceml.steps_per_call
+    )
+    return (
+        steps
+        * math.ceil(len(bank.questions) / _QUESTIONS_PER_CALL)
+        * RetryPolicy().maximum_attempts
+    )
+
+
+def traceml_decision_attempts(project: ProjectStore, spec: DecisionVarianceSpec) -> int:
+    """One shared default tagger covers action labels plus whole/step errors for every tier."""
+    return len(spec.mining.actors) * traceml_label_attempts(spec) + sum(
+        row.attempts for row in error_tag_costs(project, spec)
     )
 
 

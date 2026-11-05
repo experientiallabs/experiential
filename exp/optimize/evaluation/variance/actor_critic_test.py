@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -219,16 +222,63 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
             },
         ),
     ]
-    actor_transport, role_transport = _wire(
-        monkeypatch, group + continuations, roles, lambda _: "fail"
+    active: ContextVar[str | None] = ContextVar("active-council-phase", default=None)
+    seen: list[str] = []
+
+    class ScopedTransport(ScriptedJsonTransport):
+        """Require the actual native model boundary to be inside its admitted phase."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Observe real native dispatch, not a mocked admission setter."""
+            phase = active.get()
+            assert phase in ("actors", "selectors", "critics", "continuations")
+            seen.append(phase)
+            return super().post(
+                url,
+                headers=headers,
+                payload=payload,
+                timeout_seconds=timeout_seconds,
+            )
+
+    def fail(evidence: JsonObject) -> str:
+        """Initial and suffix LLM judging must share their real actor/suffix scopes."""
+        assert evidence and active.get() in ("actors", "continuations")
+        return "fail"
+
+    _, role_transport = _wire(monkeypatch, group + continuations, roles, fail)
+    actor_transport = ScopedTransport(tuple(group + continuations))
+    role_transport.inner = ScopedTransport(tuple(roles))
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport",
+        lambda: actor_transport,
     )
 
     checkpoints: list[CouncilCheckpoint] = []
 
-    def admit(actual: ActorCriticSpec, checkpoint: CouncilCheckpoint) -> None:
-        """Record the actual native inventory at each paid wave boundary."""
+    @contextmanager
+    def scope(phase: str) -> Iterator[None]:
+        """Open and restore the phase context inherited by native bounded workers."""
+        token = active.set(phase)
+        try:
+            yield
+        finally:
+            active.reset(token)
+
+    def admit(
+        actual: ActorCriticSpec,
+        checkpoint: CouncilCheckpoint,
+    ) -> AbstractContextManager[None]:
+        """Return a real admitted context around every native paid phase."""
         assert actual == spec
         checkpoints.append(checkpoint)
+        return scope(checkpoint.phase)
 
     report = run_actor_critic(
         project,
@@ -239,7 +289,6 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
     )
     assert [row.phase for row in checkpoints] == [
         "actors",
-        "initial_judging",
         "selectors",
         "critics",
         "continuations",
@@ -250,16 +299,16 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
     assert checkpoints[0].jobs == (spec.initial,)
     assert checkpoints[0].actors_remaining == 3
     assert checkpoints[0].minimum_suffixes_remaining == spec.continuations
-    assert checkpoints[1].initial_judgments_remaining == 3
-    assert checkpoints[2].draws == (0,) and checkpoints[2].group == report.group
-    assert checkpoints[2].initial_judged == report.initial_judged
+    assert checkpoints[0].initial_judgments_remaining == 3
+    assert checkpoints[1].draws == (0,) and checkpoints[1].group == report.group
+    assert checkpoints[1].initial_judged == report.initial_judged
     assert report.initial_judged is not None
-    assert checkpoints[3].selected == (0, 1)
-    assert checkpoints[4].suffixes_remaining == 4
-    assert checkpoints[5].completed == (0,) and checkpoints[5].suffixes_remaining == 2
+    assert checkpoints[2].selected == (0, 1)
+    assert checkpoints[3].suffixes_remaining == 4
+    assert checkpoints[4].completed == (0,) and checkpoints[4].suffixes_remaining == 2
     assert checkpoints[-1].completed == (0, 1)
     assert checkpoints[-1].suffixes_remaining == 0
-    assert all(row.study.repeats == 2 for cp in checkpoints[4:] for row in cp.jobs)
+    assert all(row.study.repeats == 2 for cp in checkpoints[3:] for row in cp.jobs)
 
     assert len(role_transport.requests) == 2
     first_request = role_transport.requests[0].payload["messages"]
@@ -300,8 +349,10 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
     )
 
     assert replay == report
+    assert active.get() is None
+    assert set(seen) == {"actors", "selectors", "critics", "continuations"}
     assert len(role_transport.requests) == 2
-    assert len(checkpoints) == 8
+    assert len(checkpoints) == 7
 
 
 def test_a_judge_citing_an_unsupplied_locator_is_kept_as_a_failed_draw(

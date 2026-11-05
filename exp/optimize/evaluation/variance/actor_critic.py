@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from functools import cache, partial
+from functools import partial
 from pathlib import Path
 from typing import Literal, Self
 
@@ -36,12 +36,11 @@ from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.contracts import CriticAssessment, JudgeSelection
 from exp.optimize.evaluation.variance.council_checkpoint import (
     CouncilAdmission,
-    admit_phase,
     continuation_waves,
+    phase_draws,
     point_job,
 )
-from exp.optimize.evaluation.variance.council_initial import initial_feedback
-from exp.optimize.evaluation.variance.council_parallel import council_draws
+from exp.optimize.evaluation.variance.council_initial import prepare_initial
 from exp.optimize.evaluation.variance.evidence import (
     EvidencePacket,
     LoadedReference,
@@ -51,8 +50,6 @@ from exp.optimize.evaluation.variance.evidence import (
     candidate_branches,
     continuable_points,
     evidence_packet,
-    load_references,
-    open_trace_search,
 )
 from exp.optimize.evaluation.variance.evidence_tools import (
     AGENTIC_PROFILE,
@@ -512,18 +509,14 @@ def run_actor_critic(
         result_id = identity + "-result"
         if store.exists(result_id):
             return ActorCriticReport.model_validate_json(store.read_bytes(result_id, "report.json"))
-        group = saved_continuation_job(project, spec.initial, code_revision=code_revision)
-        if group is None:
-            admit_phase(admission, spec, identity, "actors")
-            group = execute_continuation_job(project, spec.initial, code_revision=code_revision)
-        source = continuation_result_reference(project, spec.initial, code_revision=code_revision)
-        loader = cache(lambda ref: load_continuation_checkpoint(store, ref))
-        references = load_references(store, spec.references)
-        search = open_trace_search(store, r, exposure, embedder) if (r := spec.retrieval) else None
-        pick, packet = _pick(group, identity, spec, loader, references)
-        admit_phase(admission, spec, identity, "initial_judging", group=source)
-        packet, initial_judged = initial_feedback(
-            project, spec, source, packet, code_revision=code_revision
+        group, source, initial_judged, pick, packet, loader, search = prepare_initial(
+            project,
+            spec,
+            identity,
+            exposure=exposure,
+            code_revision=code_revision,
+            embedder=embedder,
+            admission=admission,
         )
         sources = (
             source,
@@ -531,37 +524,36 @@ def run_actor_critic(
             *packet.pool.points.values(),
             *{reference.artifact for reference in spec.references},
         )
-        admit_phase(
-            admission, spec, identity, "selectors", group=source, initial_judged=initial_judged
-        )
-        judges = council_draws(
+        judges = phase_draws(
+            admission,
+            spec,
+            identity,
+            "selectors",
             tuple(
                 partial(_judge, project, spec, packet, j, identity, sources, code_revision, search)
                 for j in range(len(spec.judges))
             ),
-            spec.concurrency,
+            group=source,
+            initial_judged=initial_judged,
         )
         chosen = tuple(
             sorted({p.step for d in judges if d.selection is not None for p in d.selection.points})
         )
         if not chosen:
             raise ValueError("no judge produced a usable selection; inspect the saved draws")
-        admit_phase(
+        critic_draw = partial(_critic, project, spec, packet, chosen)
+        critic_answers = phase_draws(
             admission,
             spec,
             identity,
             "critics",
-            group=source,
-            selected=chosen,
-            initial_judged=initial_judged,
-        )
-        critic_draw = partial(_critic, project, spec, packet, chosen)
-        critic_answers = council_draws(
             tuple(
                 partial(critic_draw, c, identity, sources, code_revision, search)
                 for c in range(len(spec.critics))
             ),
-            spec.concurrency,
+            group=source,
+            selected=chosen,
+            initial_judged=initial_judged,
         )
         catalog = load_model_catalog(project.model_catalog_path)
         points = continuation_waves(

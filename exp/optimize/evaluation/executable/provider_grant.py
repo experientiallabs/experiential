@@ -1,6 +1,7 @@
 """Explicit per-trial provider authority, separate from a frozen world's semantics."""
 
 import json
+from typing import Protocol
 
 from pydantic import AwareDatetime, Field
 
@@ -20,6 +21,25 @@ class ProviderLimits(ContractModel):
     deadline: AwareDatetime
 
 
+class RuntimeProviderAuthority(Protocol):
+    """Exact native operational authority accepted by a trusted frozen runtime factory."""
+
+    registration: ArtifactInput
+    limits: ProviderLimits
+
+    def require_configuration(
+        self,
+        project: ProjectStore,
+        configuration: JsonObject,
+        *,
+        runtime_sha256: Sha256 | None = None,
+    ) -> None:
+        """Verify immutable native registration before source import or client construction."""
+
+    def identity_payload(self) -> JsonObject:
+        """Return the exact persisted operational identity, never state/model overrides."""
+
+
 class ProviderGrant(ContractModel):
     """Limits bound to a durable trial registration, not an actor-supplied scope identifier.
 
@@ -30,6 +50,10 @@ class ProviderGrant(ContractModel):
 
     registration: ArtifactInput
     limits: ProviderLimits
+
+    def identity_payload(self) -> JsonObject:
+        """Preserve the existing trial's exact serialized operational identity."""
+        return self.model_dump(mode="json")
 
     def verify(self, project: ProjectStore) -> None:
         """Require a matching owner receipt before constructing any admitted transport."""

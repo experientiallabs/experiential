@@ -6,7 +6,8 @@ the native jobs/role draws under its actual ledger before returning from admissi
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel
@@ -66,8 +67,10 @@ class CouncilCheckpoint(ContractModel):
 class CouncilAdmission(Protocol):
     """Native authority callback; refusal must raise before this wave dispatches."""
 
-    def __call__(self, spec: ActorCriticSpec, checkpoint: CouncilCheckpoint, /) -> None:
-        """Check actual full pending/native wave costs and remaining-study feasibility."""
+    def __call__(
+        self, spec: ActorCriticSpec, checkpoint: CouncilCheckpoint, /
+    ) -> AbstractContextManager[object] | None:
+        """Check native costs/future work and optionally return its genuine paid-wave scope."""
 
 
 def admit_phase(
@@ -79,11 +82,11 @@ def admit_phase(
     group: ArtifactInput | None = None,
     selected: tuple[int, ...] = (),
     initial_judged: ArtifactInput | None = None,
-) -> None:
-    """Expose an initial study or all role draws before dispatch, retaining native identities."""
+) -> AbstractContextManager[object]:
+    """Expose exact native inventory and enter the admitted scope around physical work."""
     if admission is None:
-        return
-    admission(
+        return nullcontext()
+    context = admission(
         spec,
         CouncilCheckpoint(
             run_identity=identity,
@@ -110,6 +113,31 @@ def admit_phase(
             point_capacity=len(spec.judges) * spec.points,
         ),
     )
+    return nullcontext() if context is None else context
+
+
+def phase_draws[T](
+    admission: CouncilAdmission | None,
+    spec: ActorCriticSpec,
+    identity: str,
+    phase: CouncilPhase,
+    calls: Sequence[Callable[[], T]],
+    *,
+    group: ArtifactInput,
+    selected: tuple[int, ...] = (),
+    initial_judged: ArtifactInput | None = None,
+) -> tuple[T, ...]:
+    """Run an independent role wave entirely within its native admitted scope."""
+    with admit_phase(
+        admission,
+        spec,
+        identity,
+        phase,
+        group=group,
+        selected=selected,
+        initial_judged=initial_judged,
+    ):
+        return council_draws(calls, spec.concurrency)
 
 
 def point_job(spec: ActorCriticSpec, checkpoint: ArtifactInput) -> ContinuationJob:
@@ -151,10 +179,10 @@ def continuation_waves(
             phase: CouncilPhase,
             wave: tuple[int, ...] = wave,
             jobs: tuple[ContinuationJob, ...] = jobs,
-        ) -> None:
-            """Publish the real current inventory without estimating physical spend."""
+        ) -> AbstractContextManager[object]:
+            """Publish the current native inventory and return its real scoped dispatch context."""
             if admission is not None:
-                admission(
+                context = admission(
                     spec,
                     CouncilCheckpoint(
                         run_identity=identity,
@@ -172,10 +200,13 @@ def continuation_waves(
                         failures=tuple(row.failure for row in results if row.failure),
                     ),
                 )
+                return nullcontext() if context is None else context
+            return nullcontext()
 
-        emit("continuations")
         calls = tuple((lambda point=point: call(point)) for point in wave)
-        results.extend(council_draws(calls, spec.concurrency))
+        with emit("continuations"):
+            results.extend(council_draws(calls, spec.concurrency))
         completed.extend(wave)
-        emit("settled")
+        with emit("settled"):
+            pass
     return tuple(results)

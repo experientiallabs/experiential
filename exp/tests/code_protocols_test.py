@@ -288,7 +288,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v8",
+        "variance-roles-v9",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -300,7 +300,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "3abd222af6b1dcd02c3a7301925582bc33e689e9e22bd2e142968d3ace68ae7a",
+        "6d677f3a0a1efed976abc83ea7d80d92987e3be198eddb455336665d37d8205e",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -707,7 +707,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
-        "bootstrap-source-revision-v2",
+        "bootstrap-source-revision-v3",
         (
             "exp.optimize.evaluation.variance.bootstrap_protocols",
             "exp.optimize.evaluation.variance.bootstrap_resume",
@@ -716,7 +716,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_selection",
             "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "3cefe5417cee6f24f957b029e537f0fa63b26c592961d8601e13a51e332f42dc",
+        "d0dc99273129310c27be2dd178a4c343eb0f34685d278f367ec276d30a42c0a1",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",

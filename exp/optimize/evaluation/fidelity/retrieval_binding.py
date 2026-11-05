@@ -95,7 +95,11 @@ def index_embedder_alias(
 
 
 def rag_index_embedder_alias(
-    project: ProjectStore, catalog: ModelCatalog, index: RAGIndex
+    project: ProjectStore,
+    catalog: ModelCatalog,
+    index: RAGIndex,
+    *,
+    configured_alias: str | None = None,
 ) -> str | None:
     """Find the configured alias that embeds queries for one retrieval index.
 
@@ -113,7 +117,13 @@ def rag_index_embedder_alias(
     Raises:
         ValueError: No embedder is configured, or its identity differs from the index's.
     """
-    return _embedder_alias(project, catalog, index.embedding_dimension, index.embedder)
+    return _embedder_alias(
+        project,
+        catalog,
+        index.embedding_dimension,
+        index.embedder,
+        configured_alias=configured_alias,
+    )
 
 
 def _embedder_alias(

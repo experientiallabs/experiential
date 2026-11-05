@@ -17,10 +17,7 @@ The native council enriches this base packet before selectors or critics run: it
 judge labels the initial group, replaces the primary group rate, and supplies exact cited
 per-attempt verdicts and feedback. Historical verifier diagnostics remain explicitly separate.
 
-The packet also names what it does *not* contain. Every reference kind the run did not register is
-listed as unavailable, and so is any independent correctness label, so a role is never told it
-was given material it was not. Every locator an answer may cite is listed in the packet's
-inventory, so an answer that cites anything else is refused rather than trusted.
+The inventory states unavailable material and permits citations only to supplied locators.
 
 Locators address exact pieces of evidence, which :func:`execute_evidence_tool` (the read-only
 tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`) fetches:
@@ -41,11 +38,8 @@ tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`
 - ``environment``: the public task, the harness settings and the world kind; ``tool:<name>``: one
   declared actor tool schema.
 
-Two derived views are computed from those documents, never from anything else:
-:func:`compare_attempts` lines attempts up step by step, and :func:`divergence_points` lists, for
-every group of attempts sharing an identical action history, the step at which they split, with
-each branch's historical grades. :class:`TraceSearch` serves read-only, tag-aware retrieval over
-world-learning traces only.
+:func:`compare_attempts` and :func:`divergence_points` derive comparisons solely from these records.
+:class:`TraceSearch` serves read-only, tag-aware retrieval over world-learning traces only.
 
 Point ``k`` of the picked trajectory is the boundary before its ``k``-th tool turn: point 0 is the
 study's starting checkpoint and point ``k`` (k >= 1) is the checkpoint saved after turn ``k``.
@@ -65,13 +59,12 @@ from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.continuations.study import ContinuationStudy, known_outcomes
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.trace_search_spec import TraceSearchSpec as TraceSearchSpec
 from exp.simulation.continuations import ContinuationCheckpoint
 from exp.simulation.retrieval.contracts import RAGAction, RAGQuery
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.retrieval.retriever import TraceRAGRetriever
-from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import load_rag_index
-from exp.simulation.retrieval.tags import TagRetrievalBinding
 from exp.simulation.rules.model import RuleBook
 
 ReferenceKind = Literal[
@@ -706,24 +699,6 @@ def divergence_points(documents: Mapping[str, JsonValue]) -> JsonObject:
         frontier.extend((step + 1, rows) for rows in live.values() if len(rows) > 1)
     splits.sort(key=lambda row: (row[0], row[1]))
     return {"divergence_points": [row for _, _, row in splits], "label_authority": _HISTORICAL}
-
-
-class TraceSearchSpec(ContractModel):
-    """A registered tag-aware retrieval over world-learning traces.
-
-    Attributes:
-        index: The saved fit-only RAG index, scoped to world-learning traces.
-        scope: The world-learning retrieval scope the index was built with.
-        tags: Tag ranking policy and task query tags, or None for cosine ranking alone.
-        task_id: Task identity whose query tags rank results.
-        maximum_top_k: Most matches one search may return.
-    """
-
-    index: ArtifactInput
-    scope: CorpusScope
-    tags: TagRetrievalBinding | None = None
-    task_id: str = Field(min_length=1)
-    maximum_top_k: int = Field(default=5, ge=1, le=20, strict=True)
 
 
 class TraceSearch:

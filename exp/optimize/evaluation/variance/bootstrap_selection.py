@@ -70,6 +70,50 @@ def select_bootstrap_families(
     simulators: Sequence[ArtifactInput] = (),
     embedding_revision: ArtifactInput | None = None,
 ) -> tuple[SelectedBootstrap, ...]:
+    """Select preparation inputs from verified completed family artifacts."""
+    return _select_bootstrap_families(
+        project,
+        report,
+        settings,
+        limits,
+        task_ids=task_ids,
+        simulators=simulators,
+        embedding_revision=embedding_revision,
+    )
+
+
+def read_historical_bootstrap_families(
+    project: ProjectStore,
+    report: VarianceBuildReport,
+    settings: BootstrapSettings,
+    limits: BootstrapLimits,
+    *,
+    task_ids: Sequence[str] = (),
+    simulators: Sequence[ArtifactInput] = (),
+    embedding_revision: ArtifactInput | None = None,
+) -> tuple[SelectedBootstrap, ...]:
+    """Read the exact native family selection and completed overlay without execution authority."""
+    return _select_bootstrap_families(
+        project,
+        report,
+        settings,
+        limits,
+        task_ids=task_ids,
+        simulators=simulators,
+        embedding_revision=embedding_revision,
+    )
+
+
+def _select_bootstrap_families(
+    project: ProjectStore,
+    report: VarianceBuildReport,
+    settings: BootstrapSettings,
+    limits: BootstrapLimits,
+    *,
+    task_ids: Sequence[str] = (),
+    simulators: Sequence[ArtifactInput] = (),
+    embedding_revision: ArtifactInput | None = None,
+) -> tuple[SelectedBootstrap, ...]:
     """Build one exact registration per selected family without authors, captures or fake jobs.
 
     Explicit task IDs must be selected probes with a compatible saved placement. Without an

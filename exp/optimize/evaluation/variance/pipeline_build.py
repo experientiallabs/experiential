@@ -15,6 +15,7 @@ from exp.optimize.evaluation.variance.pipeline_errors import (
     cluster_namer,
     naming_costs,
 )
+from exp.optimize.evaluation.variance.pipeline_family_rag import prepared_family_build
 from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
@@ -148,20 +149,29 @@ def _outputs(context: StageContext, report: VarianceBuildReport) -> StageRun:
         scoping = report.environment_families
         if scoping is None:
             raise ValueError("a bootstrapped pipeline needs its selected environment-family build")
-        scope = scoping.scope(registration.family_id)
-        definition = GroundedRuntimeDefinition.model_validate(registration.job.configuration)
-        if definition.world_model != scope.world_model:
-            raise ValueError("the bootstrap world differs from its saved family scope")
-        outputs = outputs.model_copy(
-            update={
-                "world_model": scope.world_model,
-                "tag_retrieval": scope.tag_retrieval,
-                "rules_traces": scope.rules_traces,
-                "index": scope.index,
-                "retrieval_scope": scope.retrieval_scope,
-                "selected_probes": (registration.task_id,),
-            }
-        )
+        if context.spec.mining.family_simulator is not None:
+            outputs = prepared_family_build(
+                project,
+                outputs,
+                family_ref=context.spec.mining.family_simulator,
+                binding=binding,
+                job=registration.job,
+            )
+        else:
+            scope = scoping.scope(registration.family_id)
+            definition = GroundedRuntimeDefinition.model_validate(registration.job.configuration)
+            if definition.world_model != scope.world_model:
+                raise ValueError("the bootstrap world differs from its saved family scope")
+            outputs = outputs.model_copy(
+                update={
+                    "world_model": scope.world_model,
+                    "tag_retrieval": scope.tag_retrieval,
+                    "rules_traces": scope.rules_traces,
+                    "index": scope.index,
+                    "retrieval_scope": scope.retrieval_scope,
+                    "selected_probes": (registration.task_id,),
+                }
+            )
     summary: JsonObject = {
         "exposure": report.exposure.artifact_id,
         "world_model": outputs.world_model.artifact_id,

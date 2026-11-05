@@ -159,7 +159,23 @@ class AdmittedJsonTransport(JsonHttpTransport):
 
     @property
     def spend_ceiling(self) -> OperationSpendCeiling | None:
-        """Return the operation ceiling this transport reserves against, if any."""
+        """Return its pinned native lease, or an active child of its original legacy ledger."""
+        current = current_spend_ceiling()
+        if (
+            current is not None
+            and current.envelope is not None
+            and self._ceiling is not None
+            and current.path != self._ceiling.path
+        ):
+            raise ValueError("scoped client belongs to a different original operation")
+        if (
+            self._ceiling is not None
+            and self._ceiling.envelope is None
+            and current is not None
+            and current.envelope is not None
+            and current.path == self._ceiling.path
+        ):
+            return current
         return self._ceiling
 
     def priced_as(self, alias: str) -> AdmittedJsonTransport:
@@ -259,7 +275,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         remaining = (self._deadline - now).total_seconds()
         if remaining <= 0 or timeout_seconds <= 0:
             raise TimeoutError("transport deadline reached before physical dispatch")
-        ceiling = self._ceiling
+        ceiling = self.spend_ceiling
         reservation: Reservation | None = None
         if ceiling is not None and payload is not None:
             alias = self._priced_alias or (None if self._route is None else self._route.alias)

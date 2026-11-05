@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
     from exp.optimize.evaluation.variance.bootstrap_resume import BootstrapResumeBinding
 
-BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v2"
+BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v3"
 PROTOCOL_REVISION_TYPE = "bootstrap-protocol-revision"
 
 _SOURCE_FILES = (
@@ -90,9 +90,11 @@ class BootstrapProtocolRevision(ContractModel):
         source: Exact current reviewed implementation and semantic fingerprints.
     """
 
-    protocol: Literal["bootstrap-source-revision-v1", "bootstrap-source-revision-v2"] = (
-        BOOTSTRAP_SOURCE_PROTOCOL
-    )
+    protocol: Literal[
+        "bootstrap-source-revision-v1",
+        "bootstrap-source-revision-v2",
+        "bootstrap-source-revision-v3",
+    ] = BOOTSTRAP_SOURCE_PROTOCOL
     previous_binding: ArtifactInput
     previous_producer_revision: str = Field(min_length=1)
     producer_revision: str = Field(min_length=1)
@@ -306,3 +308,11 @@ def validate_protocol_successor(
         != set(parent.permitted_changes) | {"preparation_protocol_revision"}
     ):
         raise ValueError("source successor changes unreviewed settings, stage reuse or lifecycle")
+
+
+def read_historical_bootstrap_protocol(
+    project: ProjectStore, reference: ArtifactInput
+) -> BootstrapProtocolRevision:
+    """Validate original source evidence intrinsically without authorizing a current executor."""
+    producer = project.artifacts.read(reference.artifact_id).manifest.code_revision
+    return _load_protocol_revision(project, reference, code_revision=producer, verify_source=False)

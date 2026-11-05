@@ -21,9 +21,17 @@ from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
+from exp.optimize.evaluation.executable.catalog_binding import (
+    RuntimeCatalogBinding,
+    load_runtime_catalog,
+)
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
-from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
+from exp.optimize.evaluation.executable.model_costs import (
+    CostComponent,
+    catalog_model_cost,
+    decision_cost,
+)
 from exp.optimize.evaluation.fidelity.retrieval_binding import rag_index_embedder_alias
 from exp.optimize.evaluation.induction.episodes import trace_episode
 from exp.optimize.evaluation.rules.memory_stage import memory_stage_costs
@@ -204,7 +212,12 @@ def rules_costs(
 
 
 def trace_search(
-    project: ProjectStore, build: BuildOutputs, task_id: str, top_k: int
+    project: ProjectStore,
+    build: BuildOutputs,
+    task_id: str,
+    top_k: int,
+    *,
+    catalog_binding: RuntimeCatalogBinding | None = None,
 ) -> TraceSearchSpec | None:
     """Register tag-aware search over the build's scoped world-learning index.
 
@@ -230,6 +243,7 @@ def trace_search(
         tags=tags,
         task_id=task_id,
         maximum_top_k=top_k,
+        catalog_binding=catalog_binding,
     )
 
 
@@ -329,7 +343,12 @@ def world_learning_traces(project: ProjectStore, build: BuildOutputs) -> tuple[T
     return tuple(by_id[trace_id] for trace_id in build.rules_traces)
 
 
-def retrieval_embedder(context: StageContext, index: ArtifactInput) -> RAGEmbedderBinding | None:
+def retrieval_embedder(
+    context: StageContext,
+    index: ArtifactInput,
+    *,
+    catalog_binding: RuntimeCatalogBinding | None = None,
+) -> RAGEmbedderBinding | None:
     """Bind the build's catalog embedder role for a semantic index, behind the admitted transport.
 
     Args:
@@ -343,9 +362,18 @@ def retrieval_embedder(context: StageContext, index: ArtifactInput) -> RAGEmbedd
         ValueError: The configured embedder differs from the index's or cannot embed.
     """
     project = context.project
-    catalog = load_model_catalog(project.model_catalog_path)
+    catalog = (
+        load_model_catalog(project.model_catalog_path)
+        if catalog_binding is None
+        else load_runtime_catalog(project, catalog_binding)
+    )
     loaded = load_rag_index(project.artifacts, index.artifact_id).index
-    alias = rag_index_embedder_alias(project, catalog, loaded)
+    alias = rag_index_embedder_alias(
+        project,
+        catalog,
+        loaded,
+        configured_alias=None if catalog_binding is None else catalog_binding.embedder_alias,
+    )
     if alias is None:
         return None
     transport = admitted_transport(
@@ -368,6 +396,28 @@ def retrieval_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[
     The scoped index reuses the completed build's embedder, so the build's serving index decides
     before the variance build runs whether queries need a provider.
     """
+    if spec.mining.retrieval and spec.mining.family_simulator is not None:
+        from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
+
+        family = load_family_simulator(project.artifacts, spec.mining.family_simulator)
+        if family.runtime is None:
+            raise ValueError("family query pricing requires its exact prepared runtime")
+        from exp.optimize.evaluation.variance.pipeline_family_rag import native_world_catalog
+
+        catalog = native_world_catalog(project, family.runtime)
+        binding = family.runtime.catalog_binding
+        index = load_rag_index(project.artifacts, family.index.artifact_id).index
+        alias = rag_index_embedder_alias(
+            project,
+            catalog,
+            index,
+            configured_alias=None if binding is None else binding.embedder_alias,
+        )
+        if alias is None:
+            return ()
+        return (
+            catalog_model_cost(catalog, alias, _searches(spec) * RetryPolicy().maximum_attempts, 0),
+        )
     build = project.load_project().build
     if not spec.mining.retrieval or build is None:
         return ()
