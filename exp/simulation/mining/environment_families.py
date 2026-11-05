@@ -38,6 +38,10 @@ from exp.common.core.artifacts import (
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace
+from exp.simulation.mining.environment_candidates import (
+    candidate_root_bound,
+    environment_candidates,
+)
 from exp.simulation.mining.environment_review import (
     ENVIRONMENT_REVIEW_PROTOCOL,
     CompatibilityReviewer,
@@ -76,9 +80,14 @@ class EnvironmentFamilySpec(ContractModel):
     review: CompatibilitySpec = Field(default_factory=CompatibilitySpec)
     admit_uncertain: tuple[str, ...] = ()
 
-    def calls(self, traces: int) -> int:
+    def calls(self, traces: int, *, roots: int | None = None) -> int:
         """Return an upper bound of the review calls over ``traces`` eligible traces."""
-        return self.review.calls(traces)
+        return self.review.calls(traces, roots=roots)
+
+    def candidate_calls(self, traces: Sequence[Trace], *, clusters: int) -> int:
+        """Quote complete evidence using its registered partition and cluster root bound."""
+        roots = candidate_root_bound(traces, self.review, clusters=clusters)
+        return self.calls(len(traces), roots=roots)
 
 
 class StartingState(ContractModel):
@@ -318,6 +327,11 @@ def review_environment_families(
     uncertain: list[UncertainGroup] = []
     skipped: dict[str, str] = {}
     ident = clustering.identity()
+    shown = sorted(allowed & set(clustering.trace_ids))
+    missing = [trace for trace in shown if trace not in traces]
+    if missing:
+        raise ValueError(f"trace content missing for eligible members {missing[:5]}")
+    candidates = environment_candidates([traces[trace] for trace in shown], spec)
     for cluster in clustering.clusters:
         members = tuple(sorted(t for t in cluster.members if t in allowed))
         if not members:
@@ -326,18 +340,30 @@ def review_environment_families(
         missing = [t for t in members if t not in traces]
         if missing:
             raise ValueError(f"trace content missing for eligible members {missing[:5]}")
-        _review_group(
-            reviewer,
-            spec,
-            traces,
-            ident,
-            cluster.cluster_id,
-            cluster.cluster_id,
-            members,
-            0,
-            families,
-            uncertain,
-        )
+        for candidate in candidates:
+            partition = tuple(sorted(set(members) & set(candidate.members)))
+            if not partition:
+                continue
+            path = cluster.cluster_id
+            scope = ident
+            if spec.maximum_candidate_members is not None:
+                path += "/" + candidate.candidate_id
+                scope = stable_id(
+                    "environment-candidate-review",
+                    {"clustering": ident, "candidate": candidate.model_dump(mode="json")},
+                )
+            _review_group(
+                reviewer,
+                spec,
+                traces,
+                scope,
+                cluster.cluster_id,
+                path,
+                partition,
+                0,
+                families,
+                uncertain,
+            )
     attached = _attach(families, tasks, allowed)
     return EnvironmentFamilies(
         clustering=ident,

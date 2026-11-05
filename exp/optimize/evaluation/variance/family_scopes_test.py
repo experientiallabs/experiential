@@ -95,7 +95,9 @@ def test_each_family_gets_its_own_index_world_and_rule_inputs_and_uncertainty_st
     registered = spec()
     planned = plan_variance_build(project, registered, code_revision="test")
     families = registered.environment_families
-    assert families is not None and planned.review_calls == families.calls(len(learning))
+    assert families is not None and planned.review_calls == families.calls(
+        len(learning), roots=CLUSTERING.max_clusters
+    )
     with pytest.raises(ValueError, match="admitted reviewer"):
         run_variance_build(
             project, registered, code_revision="test", tagger=_tagger(project, FakeDecisions())
@@ -289,3 +291,26 @@ def test_a_probe_is_never_placed_in_a_family_whose_contracts_lack_its_tools() ->
 
     assert placements[0].family_id is None and not placed
     assert placements[0].cluster_id == "c00" and "covering" in placements[0].reason
+
+
+def test_native_quote_counts_registered_candidate_roots_and_depth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real build planner quotes bounded roots, rather than hypothetical deeper trees."""
+    project = variance_project(tmp_path, monkeypatch)
+    review = CompatibilitySpec(max_depth=0, max_turns=2, repairs=1)
+    baseline = plan_variance_build(project, spec(review=review), code_revision="test")
+    count = baseline.roles["world_learning"].traces
+    assert count > 1
+    assert baseline.review_calls == 11
+    bounded = spec(
+        review=review.model_copy(
+            update={
+                "maximum_candidate_members": 1,
+                "maximum_candidate_packet_bytes": 48_000,
+            }
+        )
+    )
+    planned = plan_variance_build(project, bounded, code_revision="test")
+    assert planned.review_calls == count * 11
+    assert planned.identity != baseline.identity

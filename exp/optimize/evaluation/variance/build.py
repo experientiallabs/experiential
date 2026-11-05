@@ -466,6 +466,7 @@ def _prepare(
         },
     )
     summary_roles = role_counts(plan, tasks)
+    learning = [traces[t] for t in ordered if plan.role_of(t) == "world_learning"]
     summary = VarianceBuildPlan(
         identity=identity,
         saved=store.exists(identity + "-result"),
@@ -485,7 +486,9 @@ def _prepare(
         else spec.cluster_naming.calls(spec.clustering.max_clusters),
         review_calls=0
         if spec.environment_families is None
-        else spec.environment_families.calls(summary_roles["world_learning"].traces),
+        else spec.environment_families.candidate_calls(
+            learning, clusters=1 if spec.clustering is None else spec.clustering.max_clusters
+        ),
     )
     return _Prepared(build, plan, traces, tasks, banks, units, summary, errors)
 

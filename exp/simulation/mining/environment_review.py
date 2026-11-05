@@ -146,6 +146,9 @@ class CompatibilitySpec(ContractModel):
         max_depth: Split levels whose sub-groups are re-reviewed; deeper ones stay uncertain.
         min_reviews: Usable variant reviews a group needs before it is reconciled.
         trace_characters: Characters of one trace's steps a read returns.
+        maximum_candidate_members: Registered initial-candidate member bound, when set.
+        maximum_candidate_packet_bytes: Paired initial inventory UTF-8 byte bound. Full
+            requests and later histories retain their caller-owned admission checks.
         maximum_output_tokens: Output allowance per call.
         temperature: Sampling temperature, or None for a model that pins its own.
     """
@@ -156,12 +159,24 @@ class CompatibilitySpec(ContractModel):
     max_depth: int = Field(default=2, ge=0, le=4)
     min_reviews: int = Field(default=2, ge=1, le=8)
     trace_characters: int = Field(default=6_000, ge=500, le=100_000)
+    maximum_candidate_members: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
+    maximum_candidate_packet_bytes: int | None = Field(
+        default=None, ge=1, exclude_if=lambda value: value is None
+    )
     maximum_output_tokens: int = Field(default=2_000, ge=128, le=16_000)
     temperature: float | None = 0.0
 
     @model_validator(mode="after")
     def _known(self) -> Self:
         """Require known, distinct variants and no more required reviews than variants."""
+        if (self.maximum_candidate_members is None) != (
+            self.maximum_candidate_packet_bytes is None
+        ):
+            raise ValueError(
+                "candidate member and packet byte bounds must both be registered or both unset"
+            )
         unknown = sorted(set(self.variants) - set(REVIEW_VARIANTS))
         if unknown or len(set(self.variants)) != len(self.variants):
             raise ValueError(f"review variants must be distinct and known; unknown {unknown}")
@@ -173,13 +188,21 @@ class CompatibilitySpec(ContractModel):
         """Return the most calls one group's review takes: every variant draw, then a reconcile."""
         return len(self.variants) * (self.max_turns + self.repairs) + 1 + self.repairs
 
-    def calls(self, traces: int) -> int:
-        """Return an upper bound of the calls reviewing ``traces`` traces takes.
+    def calls(self, traces: int, *, roots: int | None = None) -> int:
+        """Bound calls by members, registered depth, root bound and split fanout.
 
-        A split partitions a group into smaller non-empty groups, so at most ``2n - 1`` groups
-        are ever reviewed over ``n`` traces.
+        Valid splits have two to sixteen nonempty children. At most 2n - 1 groups can exist
+        over n members. Without a tighter root inventory every trace may be a root.
         """
-        return max(0, 2 * traces - 1) * self.calls_per_group()
+        if traces < 0 or (roots is not None and roots < 0):
+            raise ValueError("trace and root counts must be nonnegative")
+        if not traces:
+            return 0
+        root_bound = min(traces, traces if roots is None else roots)
+        if not root_bound:
+            raise ValueError("nonempty evidence needs at least one possible review root")
+        levels = sum(16**level for level in range(self.max_depth + 1))
+        return min(2 * traces - 1, root_bound * levels) * self.calls_per_group()
 
 
 def review_protocol_sha256() -> str:
@@ -317,6 +340,32 @@ def group_packet(traces: Sequence[Trace]) -> tuple[JsonObject, frozenset[str]]:
     return packet, frozenset(shown)
 
 
+class CandidateCapacityError(ValueError):
+    """A complete review inventory exceeds its registered candidate bounds."""
+
+
+def checked_group_packet(
+    traces: Sequence[Trace], spec: CompatibilitySpec
+) -> tuple[JsonObject, frozenset[str]]:
+    """Render every member and refuse inventories exceeding registered bounds."""
+    if spec.maximum_candidate_members is not None and len(traces) > spec.maximum_candidate_members:
+        raise CandidateCapacityError(
+            "review candidate exceeds registered member bound; repartition evidence"
+        )
+    packet, shown = group_packet(traces)
+    size = len(json.dumps(packet, sort_keys=True).encode("utf-8"))
+    if (
+        spec.maximum_candidate_packet_bytes is not None
+        and size > spec.maximum_candidate_packet_bytes
+    ):
+        raise CandidateCapacityError(
+            f"review candidate packet has {size} bytes, above registered "
+            f"{spec.maximum_candidate_packet_bytes}; "
+            "repartition evidence or register a fitting bound"
+        )
+    return packet, shown
+
+
 def validate_review(
     arguments: object,
     members: Sequence[str],
@@ -391,7 +440,7 @@ def review_variant(
         spec: Review registration.
         scope: Stable identity of the group under review, bound into every draw identity.
     """
-    packet, shown = group_packet(traces)
+    packet, shown = checked_group_packet(traces, spec)
     by_id = {trace.trace_id: trace for trace in traces}
     system = REVIEW_PROMPT + "\n\n" + REVIEW_VARIANTS[variant]
     messages = [
@@ -410,7 +459,7 @@ def reconcile(
     scope: str,
 ) -> GroupReview:
     """Reconcile the usable variant reviews of one group into its verdict (forced answer)."""
-    packet, shown = group_packet(traces)
+    packet, shown = checked_group_packet(traces, spec)
     usable = [row for row in reviews if row.answer is not None]
     cited = {ref for row in usable if row.answer for ref in row.answer.locators()}
     body = {
