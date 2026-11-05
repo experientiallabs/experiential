@@ -307,7 +307,61 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
     assert native_plan.identity == parent.original_operation
     assert native_plan.build_saved and native_plan.remaining_tasks == migrated.task_ids
     assert ledger.summary() == before
+
     with pytest.raises(ValueError, match="complete successful"):
         register_family_embedding_completion(
             project, completion.model_copy(update={"dispatch_evidence": (reference,)})
         )
+
+    # A later source producer must inherit this completed asset, not execute its old intent.
+    from exp.optimize.evaluation.variance import family_embedding as embedding_owner
+    from exp.optimize.evaluation.variance.bootstrap_protocols import (
+        propose_bootstrap_protocol_revision,
+        register_bootstrap_protocol_revision,
+    )
+
+    monkeypatch.setattr(embedding_owner, "source_fingerprint", lambda: "c" * 64)
+    proposal = propose_bootstrap_protocol_revision(
+        project, previous_binding=successor, code_revision="rules-source-executor"
+    )
+    protocol = register_bootstrap_protocol_revision(
+        project, proposal, code_revision="rules-source-executor"
+    )
+    continued = register_bootstrap_resume(
+        project,
+        original_inputs=actual.original_inputs,
+        code_revision="rules-source-executor",
+        previous_binding=successor,
+        review_revision=actual.review_revision,
+        pilot_revision=actual.pilot_revision,
+        permitted_changes=(*actual.permitted_changes, "preparation_protocol_revision"),
+        execution_deadline=actual.execution_deadline,
+        execution_window=actual.execution_window,
+        embedding_revision=completed,
+        protocol_revision=protocol,
+    )
+    revised = load_bootstrap_resume(
+        project, continued, spec=spec, code_revision="rules-source-executor"
+    )
+    assert bootstrap_execution_spec(project, revised, spec) == migrated
+    assert revised.embedding_revision == completed
+    from exp.optimize.evaluation.variance.bootstrap_protocols import validate_protocol_successor
+
+    for wrong_embedding in (None, reference, protocol):
+        with pytest.raises(ValueError, match="unreviewed settings"):
+            validate_protocol_successor(
+                project,
+                revised.model_copy(update={"embedding_revision": wrong_embedding}),
+                actual,
+            )
+    assert revised.producer_revision != completion.producer_revision
+    assert revised.original_operation == actual.original_operation
+    assert revised.grants == actual.grants and revised.stop == actual.stop
+    continued_plan = plan_bootstrap_preparation(
+        project, spec, code_revision="rules-source-executor", resume_binding=continued
+    )
+    assert continued_plan.identity == actual.original_operation
+    assert continued_plan.build_saved and continued_plan.accounted_unpriced_attempts == 0
+    assert ledger.summary() == before
+    with pytest.raises(ValueError, match="source changed"):
+        load_family_embedding_intent(project, reference)

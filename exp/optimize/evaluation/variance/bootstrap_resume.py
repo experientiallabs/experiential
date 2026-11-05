@@ -552,15 +552,15 @@ def _validate_predecessor(
         "pilot_selection_revision" in binding.permitted_changes
     ):
         raise ValueError("pilot revision requires its exact explicit permission")
+    if binding.protocol_revision is not None:
+        validate_protocol_successor(project, binding, parent, historical=historical)
+        return
     if binding.embedding_revision is not None:
         from exp.optimize.evaluation.variance.family_embedding import (
             validate_family_embedding_successor,
         )
 
         validate_family_embedding_successor(project, binding, parent, historical=historical)
-        return
-    if binding.protocol_revision is not None:
-        validate_protocol_successor(project, binding, parent, historical=historical)
         return
     if binding.pilot_revision is not None:
         if (
@@ -656,7 +656,9 @@ def register_bootstrap_resume(
     if embedding_revision is not None:
         from exp.optimize.evaluation.variance.family_embedding import apply_family_embedding_spec
 
-        execution = apply_family_embedding_spec(project, embedding_revision, execution)
+        execution = apply_family_embedding_spec(
+            project, embedding_revision, execution, historical=protocol_revision is not None
+        )
     execution_build = None
     if pilot_revision is not None:
         execution_build = pilot_revision.saved_build.artifact_id.removesuffix("-result")

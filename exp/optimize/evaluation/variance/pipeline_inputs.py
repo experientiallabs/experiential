@@ -168,7 +168,7 @@ def rules_costs(
             maximum_rules=spec.tagging.maximum_rules,
             draws_per_trace=spec.draws_per_trace,
             rounds=spec.rounds,
-            research_calls=spec.research.budget.model_calls,
+            research_calls=1,
             condensation_calls=spec.condensation.budget.model_calls,
             author_attempts=1,
         )

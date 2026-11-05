@@ -122,7 +122,9 @@ def select_bootstrap_families(
             load_family_embedding_completion,
         )
 
-        intent, overlay = load_family_embedding_completion(project, embedding_revision)
+        intent, overlay = load_family_embedding_completion(
+            project, embedding_revision, historical=True
+        )
         actual_build = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
         if (
             actual_build != intent.source_build

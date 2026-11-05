@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
     from exp.optimize.evaluation.variance.bootstrap_resume import BootstrapResumeBinding
 
-BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v1"
+BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v2"
 PROTOCOL_REVISION_TYPE = "bootstrap-protocol-revision"
 
 _SOURCE_FILES = (
@@ -43,15 +43,19 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/rules/memory_stage.py",
     "exp/optimize/evaluation/rules/governance.py",
     "exp/optimize/evaluation/rules/research.py",
+    "exp/optimize/evaluation/rules/rule_tags.py",
+    "exp/optimize/evaluation/rules/stage.py",
     "exp/optimize/evaluation/rules/weighing.py",
     "exp/optimize/evaluation/rules/condense.py",
     "exp/optimize/evaluation/rules/inspectors.py",
     "exp/optimize/evaluation/variance/bootstrap_agents.py",
     "exp/optimize/evaluation/variance/bootstrap_prompts.py",
     "exp/optimize/evaluation/variance/bootstrap_reads.py",
+    "exp/optimize/evaluation/variance/bootstrap_selection.py",
     "exp/optimize/evaluation/variance/bootstrap_protocols.py",
     "exp/optimize/evaluation/variance/bootstrap_resume.py",
     "exp/optimize/evaluation/variance/bootstrap_plan.py",
+    "exp/optimize/evaluation/variance/pipeline_inputs.py",
     "exp/optimize/evaluation/variance/bootstrap_admission.py",
 )
 
@@ -83,7 +87,9 @@ class BootstrapProtocolRevision(ContractModel):
         source: Exact current reviewed implementation and semantic fingerprints.
     """
 
-    protocol: Literal["bootstrap-source-revision-v1"] = BOOTSTRAP_SOURCE_PROTOCOL
+    protocol: Literal["bootstrap-source-revision-v1", "bootstrap-source-revision-v2"] = (
+        BOOTSTRAP_SOURCE_PROTOCOL
+    )
     previous_binding: ArtifactInput
     previous_producer_revision: str = Field(min_length=1)
     producer_revision: str = Field(min_length=1)
@@ -286,6 +292,7 @@ def validate_protocol_successor(
         or revision.previous_producer_revision != parent.producer_revision
         or binding.review_revision != parent.review_revision
         or binding.pilot_revision != parent.pilot_revision
+        or binding.embedding_revision != parent.embedding_revision
         or binding.build_identity != parent.build_identity
         or binding.execution_spec_sha256 != parent.execution_spec_sha256
         or binding.execution_deadline != parent.execution_deadline
