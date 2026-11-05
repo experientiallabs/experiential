@@ -223,6 +223,17 @@ class BatchEngine:
                     )
                 )
                 continue
+            try:
+                custom_id.encode("utf-8")
+            except UnicodeEncodeError:
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        code="invalid_request",
+                        message=(f"line {line_number} cannot be encoded as strict UTF-8 JSON"),
+                    )
+                )
+                continue
             if custom_id in seen_ids:
                 raise BatchSubmitError(f"custom_id {custom_id!r} appears more than once")
             seen_ids.add(custom_id)
@@ -322,7 +333,7 @@ class BatchEngine:
             # whole failed batch at dispatch; the provider's own per-model
             # admission still applies when the batch runs.
             try:
-                client.line_request(line)
+                provider_request = client.line_request(line)
             except BatchSubmitError as rejection:
                 errors.append(
                     BatchLineError(
@@ -330,6 +341,25 @@ class BatchEngine:
                         custom_id=custom_id,
                         code="invalid_request",
                         message=rejection.message,
+                    )
+                )
+                continue
+            try:
+                json.dumps(
+                    {
+                        "custom_id": line.custom_id,
+                        "request": provider_request,
+                    },
+                    allow_nan=False,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError, UnicodeEncodeError):
+                errors.append(
+                    BatchLineError(
+                        line_number=line_number,
+                        custom_id=custom_id,
+                        code="invalid_request",
+                        message=(f"line {line_number} cannot be encoded as strict UTF-8 JSON"),
                     )
                 )
                 continue
