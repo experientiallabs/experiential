@@ -51,6 +51,7 @@ from exp.optimize.evaluation.variance.behavior_differences import BehaviorDiffer
 from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
+from exp.optimize.evaluation.variance.council_checkpoint import CouncilAdmission
 from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import TraceSearchSpec
@@ -259,6 +260,7 @@ class MiningSettings(ContractModel):
         selector: Point-selector model settings.
         critic: Critic model settings.
         actors: Catalog aliases of the actors; each is its own tier.
+        concurrency: Independent actor groups and council draws in flight.
         attempts: Group size ``G``.
         selector_draws: Point-selector draws ``J``.
         critic_draws: Critic draws ``C``.
@@ -285,6 +287,7 @@ class MiningSettings(ContractModel):
     selector: AuthorSettings
     critic: AuthorSettings
     actors: tuple[str, ...] = Field(default=COUNCIL_ACTORS, min_length=1, max_length=16)
+    concurrency: int = Field(default=4, ge=1, le=64, strict=True, exclude_if=lambda n: n == 4)
     attempts: int = Field(default=16, ge=2, le=100, strict=True)
     selector_draws: int = Field(default=8, ge=1, le=16, strict=True)
     critic_draws: int = Field(default=8, ge=1, le=16, strict=True)
@@ -621,6 +624,7 @@ class StageDependencies:
     """Injected collaborators a stage may use instead of building its admitted default.
 
     Attributes:
+        council_admission: Native phase admission authority; None preserves the original runner.
         build_tagger: Tagger for the variance build, or None for its admitted default.
         build_constructor: Admitted world-model constructor, when the build reconstructs.
         build_namer: Cluster naming model, or None for the admitted ``build.naming_alias``.
@@ -632,6 +636,7 @@ class StageDependencies:
             directory.
     """
 
+    council_admission: CouncilAdmission | None = None
     build_tagger: DecisionsTraceTagger | None = None
     build_namer: ClusterNamer | None = None
     build_reviewer: CompatibilityReviewer | None = None
@@ -785,6 +790,7 @@ class FamilyOutcome(ContractModel):
         failure: Why the family stopped before admission, when it did.
         search: The saved variant search of the first registration, when one ran.
         ladder: The saved nudge ladder of the first registration, when one was built.
+        behavior_questions: Same-evidence model-targeted bank for the existing trace tagger.
         rungs_kept: Why a re-registration carried the ladder's rungs over with their first
             judges instead of re-measuring them, when it had rungs.
     """
@@ -804,6 +810,9 @@ class FamilyOutcome(ContractModel):
     search: ArtifactInput | None = None
     ladder: ArtifactInput | None = None
     rungs_kept: str | None = None
+    behavior_questions: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda ref: ref is None
+    )
 
 
 class FamiliesOutputs(ContractModel):

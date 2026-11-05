@@ -24,6 +24,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
     policy_groups,
     run_actor_critic,
 )
+from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.evidence_tools import (
     AGENTIC_PROFILE,
@@ -218,13 +219,58 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
             },
         ),
     ]
-    actor_transport, role_transport = _wire(monkeypatch, group + continuations, roles)
-
-    report = run_actor_critic(
-        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    actor_transport, role_transport = _wire(
+        monkeypatch, group + continuations, roles, lambda _: "fail"
     )
 
+    checkpoints: list[CouncilCheckpoint] = []
+
+    def admit(actual: ActorCriticSpec, checkpoint: CouncilCheckpoint) -> None:
+        """Record the actual native inventory at each paid wave boundary."""
+        assert actual == spec
+        checkpoints.append(checkpoint)
+
+    report = run_actor_critic(
+        project,
+        spec,
+        exposure=_exposure(project, job, "mining_probes"),
+        code_revision="test",
+        admission=admit,
+    )
+    assert [row.phase for row in checkpoints] == [
+        "actors",
+        "initial_judging",
+        "selectors",
+        "critics",
+        "continuations",
+        "settled",
+        "continuations",
+        "settled",
+    ]
+    assert checkpoints[0].jobs == (spec.initial,)
+    assert checkpoints[0].actors_remaining == 3
+    assert checkpoints[0].minimum_suffixes_remaining == spec.continuations
+    assert checkpoints[1].initial_judgments_remaining == 3
+    assert checkpoints[2].draws == (0,) and checkpoints[2].group == report.group
+    assert checkpoints[2].initial_judged == report.initial_judged
+    assert report.initial_judged is not None
+    assert checkpoints[3].selected == (0, 1)
+    assert checkpoints[4].suffixes_remaining == 4
+    assert checkpoints[5].completed == (0,) and checkpoints[5].suffixes_remaining == 2
+    assert checkpoints[-1].completed == (0, 1)
+    assert checkpoints[-1].suffixes_remaining == 0
+    assert all(row.study.repeats == 2 for cp in checkpoints[4:] for row in cp.jobs)
+
     assert len(role_transport.requests) == 2
+    first_request = role_transport.requests[0].payload["messages"]
+    assert isinstance(first_request, list) and isinstance(first_request[-1], dict)
+    packet = json.loads(str(first_request[-1]["content"]))
+    assert packet["group"]["success_rate"] == 0
+    assert packet["group"]["historical_verifier"]["success_rate"] == 1
+    assert packet["group"]["label_authority"] == "frozen full-episode LLM judge"
+    assert packet["episode_judgments"]["judgment:0"]["assessment"]["verdict"] == "fail"
+    assert packet["attempts"][0]["llm_verdict"] == "fail"
+    assert len(role_transport.judged) == 7
     assert len(actor_transport.requests) == len(group) + len(continuations)
     assert {row.meaning.actor_model for row in report.points} == {spec.initial.study.actor_model}
     assert [row.meaning.checkpoint for row in report.points] == [
@@ -246,11 +292,16 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
         assert len(row.group.advantages) == 2
 
     replay = run_actor_critic(
-        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+        project,
+        spec,
+        exposure=_exposure(project, job, "mining_probes"),
+        code_revision="test",
+        admission=admit,
     )
 
     assert replay == report
     assert len(role_transport.requests) == 2
+    assert len(checkpoints) == 8
 
 
 def test_a_judge_citing_an_unsupplied_locator_is_kept_as_a_failed_draw(
@@ -376,9 +427,10 @@ def test_the_error_mining_defaults_run_and_record_populations_and_usage(
     assert report.picked == next(i for i in report.pick.order if i in report.pick.eligible)
     other = spec.model_copy(
         update={
+            "concurrency": 4,
             "episode_judge": episode_judge(
                 project, settings, task_sha256="e" * 64, world_sha256="e" * 64
-            )
+            ),
         }
     )
     group = load_study(project.artifacts, report.group)
@@ -600,7 +652,7 @@ def test_a_flipped_judge_verdict_moves_every_label_advantage_and_critic_reward(
                 project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="t"
             )
         )
-        assert len(router.judged) == 4
+        assert len(router.judged) == 7
         assert all(row.judged is not None for row in reports[-1].points)
     first, second = reports
     for one, two in zip(first.points, second.points, strict=True):
@@ -640,3 +692,40 @@ def test_unscored_judgments_stay_unknown_in_the_point_denominator(
     assert all(row.group.advantages == (None, None) for row in report.points)
     assert report.counts is not None and report.counts.continuations_unknown == 4
     assert report.critics[0].score is not None and report.critics[0].score.reward is None
+
+
+def test_native_admission_refusal_precedes_any_initial_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native allocator can stop the full group before any model or role dispatch."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    spec = _spec(project, job)
+    actor, roles = _wire(monkeypatch, [], [])
+
+    def refuse(actual: ActorCriticSpec, checkpoint: CouncilCheckpoint) -> None:
+        """Veto the exact original native group, without changing counts or its identity."""
+        assert actual == spec
+        assert checkpoint.phase == "actors"
+        assert checkpoint.jobs == (spec.initial,)
+        raise ValueError("remaining full study cannot fit")
+
+    with pytest.raises(ValueError, match="remaining full study"):
+        run_actor_critic(
+            project,
+            spec,
+            exposure=_exposure(project, job, "mining_probes"),
+            code_revision="test",
+            admission=refuse,
+        )
+    assert actor.requests == [] and roles.requests == []
+
+
+def test_operational_concurrency_does_not_rekey_native_draws(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing only the dispatch bound preserves every semantic run identity."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    spec = _spec(project, job)
+    assert spec.identity("test") == spec.model_copy(update={"concurrency": 4}).identity("test")

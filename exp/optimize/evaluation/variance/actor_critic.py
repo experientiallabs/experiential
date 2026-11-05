@@ -1,39 +1,11 @@
-"""Selected estimation points, critic values and continuations over one group of attempts.
-
-One error-mining run (protocol :data:`ERROR_MINING_PROTOCOL`) follows a fixed sequence over saved,
-replayable owners. :meth:`ActorCriticSpec.error_mining` registers the reference configuration
-G=16, J=8, C=8, K=4, M=8 with agentic selectors and critics; every count, model setting, prompt
-variant weight, evidence-tool budget and seed stays an explicit spec field.
-
-1. **Group.** The initial job runs ``G`` attempts of one task from one starting checkpoint in the
-   configured world, saving a paired actor/world checkpoint after every tool turn.
-2. **Pick.** A seeded uniform choice over the *eligible* attempts (completed, at least one saved
-   tool turn, at least two boundaries with actor calls left), never an unconditional draw over
-   every attempt; the seed excludes the episode judge. :class:`PickRecord` saves the rule, seed
-   material, shuffled order and every attempt's eligibility.
-3. **Point selectors.** ``J`` selector draws (saved as ``judges``; not the episode judge) each
-   choose up to ``K`` points from the privileged evidence under a seeded prompt variant.
-4. **Critics.** ``C`` critic draws estimate success from every distinct chosen point first.
-5. **Continuations.** ``M`` continuations per distinct point (up to ``J*K`` points), each judged by
-   the frozen episode judge (:func:`~exp.optimize.evaluation.variance.judged.judge_study`), whose
-   saved verdicts are the only labels; an unscored continuation stays in the denominator as unknown.
-6. **Rewards.** Each critic is scored by squared error against the measured rates, each judge by
-   how far its points' measured rates separate beyond sampling noise, and each point's
-   continuations form their own group for group-relative advantages.
-
-:class:`MiningCounts` records planned and actual populations; every draw, the group and each
-point's study carry measured usage, and no cost ratio between roles is assumed. Every group carries
-its :class:`ActorTier`; groups of different tiers are never pooled (:func:`policy_groups`). Points
-are ranked by informativeness (rate near one half, large drop to the next point) as candidate
-Harbor starts. Unknown outcomes stay explicit and are never redrawn.
-"""
+"""Saved per-model actor groups, privileged council draws and independent continuations."""
 
 from __future__ import annotations
 
 import random
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 from typing import Literal, Self
 
@@ -62,6 +34,14 @@ from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.contracts import CriticAssessment, JudgeSelection
+from exp.optimize.evaluation.variance.council_checkpoint import (
+    CouncilAdmission,
+    admit_phase,
+    continuation_waves,
+    point_job,
+)
+from exp.optimize.evaluation.variance.council_initial import initial_feedback
+from exp.optimize.evaluation.variance.council_parallel import council_draws
 from exp.optimize.evaluation.variance.evidence import (
     EvidencePacket,
     LoadedReference,
@@ -138,8 +118,10 @@ class ActorCriticSpec(ContractModel):
         actor_tier: Declared model-tier label of the actor policy; groups with different tiers
             are never pooled.
         episode_judge: The frozen episode judge whose verdicts label every continuation.
+        concurrency: Operational bound for independent selectors, critics and point groups.
     """
 
+    concurrency: int = Field(default=1, ge=1, le=64, strict=True, exclude_if=lambda n: n == 1)
     initial: ContinuationJob
     episode_judge: EpisodeJudge
     judges: tuple[AuthorSettings, ...] = Field(min_length=1, max_length=16)
@@ -173,6 +155,7 @@ class ActorCriticSpec(ContractModel):
         episode_judge: EpisodeJudge,
         selector: AuthorSettings,
         critic: AuthorSettings,
+        concurrency: int = 4,
         attempts: int = 16,
         selector_draws: int = 8,
         critic_draws: int = 8,
@@ -193,6 +176,7 @@ class ActorCriticSpec(ContractModel):
             episode_judge: The frozen episode judge labelling every continuation.
             selector: Frozen model setting of every point-selector draw.
             critic: Frozen model setting of every critic draw.
+            concurrency: Operational parallel draw and point-group bound.
             attempts: Group size ``G``.
             selector_draws: Point-selector draws ``J``.
             critic_draws: Critic draws ``C``.
@@ -218,6 +202,7 @@ class ActorCriticSpec(ContractModel):
         )
         return cls.model_validate(
             {
+                "concurrency": concurrency,
                 "initial": group,
                 "episode_judge": episode_judge,
                 "judges": (selector,) * selector_draws,
@@ -237,7 +222,11 @@ class ActorCriticSpec(ContractModel):
         """Bind the registration, role prompts and producing code."""
         return stable_id(
             "actor-critic-run",
-            {"spec": sha256_json(self), "roles": role_protocol_sha256(), "code": code_revision},
+            {
+                "spec": sha256_json(self.model_dump(mode="json", exclude={"concurrency"})),
+                "roles": role_protocol_sha256(),
+                "code": code_revision,
+            },
         )
 
 
@@ -436,6 +425,7 @@ class ActorCriticReport(ContractModel):
         ineligible_reasons: Why it may not, when it may not.
         pick: The pick rule, its eligible population and the seeded order.
         counts: Planned and actual populations.
+        initial_judged: Exact frozen LLM group feedback supplied before point selection.
         group_tier: Policy tier of the group of attempts.
         group_cost: Measured cost of the group of attempts.
         usage: Measured usage per role: ``group``, ``selectors``, ``critics``, ``continuations``.
@@ -443,6 +433,7 @@ class ActorCriticReport(ContractModel):
 
     spec: ActorCriticSpec
     group: ArtifactInput
+    initial_judged: ArtifactInput | None = Field(default=None, exclude_if=lambda ref: ref is None)
     picked: int
     judges: tuple[JudgeDraw, ...]
     critics: tuple[CriticDraw, ...]
@@ -494,6 +485,7 @@ def run_actor_critic(
     exposure: ExposurePlan,
     code_revision: str,
     embedder: RAGEmbedderBinding | None = None,
+    admission: CouncilAdmission | None = None,
 ) -> ActorCriticReport:
     """Run, or replay, one actor-critic registration over a mining-probe task.
 
@@ -503,6 +495,7 @@ def run_actor_critic(
         exposure: The frozen data roles; the task must come from a mining-probe lineage.
         code_revision: Producing source identity.
         embedder: Query embedder of a semantic retrieval index; a hashing index needs none.
+        admission: Optional native authority invoked before independent paid waves.
 
     Returns:
         The report, also saved as an ``actor-critic-report`` artifact.
@@ -521,34 +514,73 @@ def run_actor_critic(
             return ActorCriticReport.model_validate_json(store.read_bytes(result_id, "report.json"))
         group = saved_continuation_job(project, spec.initial, code_revision=code_revision)
         if group is None:
+            admit_phase(admission, spec, identity, "actors")
             group = execute_continuation_job(project, spec.initial, code_revision=code_revision)
         source = continuation_result_reference(project, spec.initial, code_revision=code_revision)
         loader = cache(lambda ref: load_continuation_checkpoint(store, ref))
         references = load_references(store, spec.references)
         search = open_trace_search(store, r, exposure, embedder) if (r := spec.retrieval) else None
         pick, packet = _pick(group, identity, spec, loader, references)
+        admit_phase(admission, spec, identity, "initial_judging", group=source)
+        packet, initial_judged = initial_feedback(
+            project, spec, source, packet, code_revision=code_revision
+        )
         sources = (
             source,
+            initial_judged,
             *packet.pool.points.values(),
             *{reference.artifact for reference in spec.references},
         )
-        judges = tuple(
-            _judge(project, spec, packet, j, identity, sources, code_revision, search)
-            for j in range(len(spec.judges))
+        admit_phase(
+            admission, spec, identity, "selectors", group=source, initial_judged=initial_judged
+        )
+        judges = council_draws(
+            tuple(
+                partial(_judge, project, spec, packet, j, identity, sources, code_revision, search)
+                for j in range(len(spec.judges))
+            ),
+            spec.concurrency,
         )
         chosen = tuple(
             sorted({p.step for d in judges if d.selection is not None for p in d.selection.points})
         )
         if not chosen:
             raise ValueError("no judge produced a usable selection; inspect the saved draws")
-        critic_answers = tuple(
-            _critic(project, spec, packet, chosen, c, identity, sources, code_revision, search)
-            for c in range(len(spec.critics))
+        admit_phase(
+            admission,
+            spec,
+            identity,
+            "critics",
+            group=source,
+            selected=chosen,
+            initial_judged=initial_judged,
+        )
+        critic_draw = partial(_critic, project, spec, packet, chosen)
+        critic_answers = council_draws(
+            tuple(
+                partial(critic_draw, c, identity, sources, code_revision, search)
+                for c in range(len(spec.critics))
+            ),
+            spec.concurrency,
         )
         catalog = load_model_catalog(project.model_catalog_path)
-        points = tuple(
-            _continue(project, spec, packet, point, loader, catalog, code_revision)
-            for point in chosen
+        points = continuation_waves(
+            admission,
+            spec,
+            identity,
+            source,
+            chosen,
+            packet.pool.points,
+            partial(
+                _continue,
+                project,
+                spec,
+                packet,
+                loader=loader,
+                catalog=catalog,
+                code_revision=code_revision,
+            ),
+            initial_judged=initial_judged,
         )
         group_tier = actor_tier(
             spec.actor_tier,
@@ -566,6 +598,7 @@ def run_actor_critic(
         report = ActorCriticReport(
             spec=spec,
             group=source,
+            initial_judged=initial_judged,
             picked=packet.pool.branch,
             judges=judges,
             critics=critics,
@@ -587,6 +620,7 @@ def run_actor_critic(
             },
         )
         dependencies = {source, *(d.response for d in (*judges, *critics) if d.response)}
+        dependencies.add(initial_judged)
         dependencies |= {d.transcript for d in (*judges, *critics) if d.transcript}
         dependencies |= {r.study for r in points if r.study} | {r.checkpoint for r in points}
         dependencies |= {r.judged for r in points if r.judged}
@@ -641,7 +675,7 @@ def export_point_harbor(
     rows = {row.point: row for row in report.points}
     if point not in rows:
         raise ValueError(f"point {point} was not chosen in this run; choose from {sorted(rows)}")
-    job = _point_job(report.spec, rows[point].checkpoint)
+    job = point_job(report.spec, rows[point].checkpoint)
     task = ExecutableTask(intent=intent, job=job, judge=report.spec.episode_judge)
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=code_revision
@@ -663,25 +697,13 @@ def _pick(
     loader: Callable[[ArtifactInput], ContinuationCheckpoint],
     references: tuple[LoadedReference, ...],
 ) -> tuple[PickRecord, EvidencePacket]:
-    """Pick the first seeded-shuffled eligible attempt and record the eligible population.
-
-    Args:
-        group: The group of attempts.
-        identity: Run identity; it binds the judge, so it is not mixed into the seed.
-        spec: The registration.
-        loader: Cached checkpoint loader.
-        references: Registered references rendered into the packet.
-
-    Returns:
-        The pick record and the packet for the picked attempt.
-
-    Raises:
-        ValueError: No attempt offers two continuable points.
-    """
+    """Pick a seeded eligible attempt, independently of judges and dispatch concurrency."""
     candidates = candidate_branches(group)
     order = list(candidates)
     del identity
-    registration = sha256_json(spec.model_dump(mode="json", exclude={"episode_judge"}))
+    registration = sha256_json(
+        spec.model_dump(mode="json", exclude={"episode_judge", "concurrency"})
+    )
     material = f"{registration}:{spec.seed}"
     random.Random(material).shuffle(order)
     calls = spec.initial.maximum_model_calls
@@ -847,24 +869,6 @@ def _counts(
     )
 
 
-def _point_job(spec: ActorCriticSpec, checkpoint: ArtifactInput) -> ContinuationJob:
-    """Return the continuation job that starts at one point."""
-    return spec.initial.model_copy(
-        update={
-            "maximum_physical_attempts": spec.continuation_physical_attempts,
-            "study": spec.initial.study.model_copy(
-                update={
-                    "checkpoint": checkpoint,
-                    "repeats": spec.continuations,
-                    "critic_prediction": None,
-                    "predicted_success": None,
-                    "selection_plan": None,
-                }
-            ),
-        }
-    )
-
-
 def _continue(
     project: ProjectStore,
     spec: ActorCriticSpec,
@@ -876,7 +880,7 @@ def _continue(
 ) -> PointResult:
     """Run or replay one point's continuations, judge them and measure their cost."""
     checkpoint = packet.pool.points[point]
-    job = _point_job(spec, checkpoint)
+    job = point_job(spec, checkpoint)
     meaning = estimate_meaning(job, loader(checkpoint), judge=spec.episode_judge.definition)
     tier = actor_tier(spec.actor_tier, meaning)
     point_id = f"point-{point}"
@@ -964,15 +968,11 @@ def _audit(
 
 
 def _ineligible(audit: tuple[JsonObject, ...], critics: tuple[CriticDraw, ...]) -> tuple[str, ...]:
-    """Explain why a run's records may not be trained on yet.
-
-    A screening run never qualifies on its own: no point has been shown to be a decision until
-    competing actions from the same checkpoint have been run under a frozen policy and budget.
+    """Explain why screening alone cannot qualify training data.
 
     Args:
         audit: Every audit flag the run raised.
         critics: Every critic draw.
-
     Returns:
         The reasons, most fundamental first.
     """

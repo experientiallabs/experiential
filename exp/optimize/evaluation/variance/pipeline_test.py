@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -61,7 +61,7 @@ from exp.optimize.evaluation.rules.stage import (
     load_rulebook,
     run_rules_stage,
 )
-from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
+from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, ActorCriticSpec
 from exp.optimize.evaluation.variance.authoring_packet import (
     WHOLE_TASK,
     AuthoringPacket,
@@ -75,6 +75,7 @@ from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENAR
 from exp.optimize.evaluation.variance.behavior_labeling import LABEL_TOOL
 from exp.optimize.evaluation.variance.build_records import EXPOSURE_TYPE, VarianceBuildSpec
 from exp.optimize.evaluation.variance.contracts import OptionCall
+from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint
 from exp.optimize.evaluation.variance.decision_measure import CHOICE_TOOL
 from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.optimize.evaluation.variance.evidence_tools import AGENTIC_PROFILE, EvidenceToolProfile
@@ -1292,6 +1293,7 @@ class Run:
         bank: The TraceML bank directory.
         executors: The build stand-in.
         dependencies: The injected TraceML tagger and Harbor root.
+        council_checkpoints: Actual native admission boundaries from both model tiers.
     """
 
     fixture: GroundedFixture
@@ -1300,6 +1302,7 @@ class Run:
     bank: Path
     executors: dict[StageName, StageExecutor]
     dependencies: StageDependencies
+    council_checkpoints: list[CouncilCheckpoint] = field(default_factory=list)
 
     @property
     def project(self) -> ProjectStore:
@@ -1357,13 +1360,23 @@ def wired(root: Path, monkeypatch: pytest.MonkeyPatch, *, agentic: bool = False)
         run_rules_stage if agentic else fixture_rules_stage,
     )
     rubric = None if agentic else mining_rubric(fixture)
+    checkpoints: list[CouncilCheckpoint] = []
+
+    def admission(actual: ActorCriticSpec, checkpoint: CouncilCheckpoint) -> None:
+        """Observe the actual configured stage composition and immutable native inventory."""
+        assert actual.initial.actor_alias in ("actor", TIER_B)
+        assert checkpoint.run_identity == actual.identity(REVISION)
+        checkpoints.append(checkpoint)
+
     return Run(
         fixture=fixture,
         wire=wire,
         rubric=rubric,
         bank=write_bank(root),
         executors={"variance-build": FixtureBuild(fixture)},
+        council_checkpoints=checkpoints,
         dependencies=StageDependencies(
+            council_admission=admission,
             traceml_tagger=step_tagger(fixture.project),
             rules_decisions=step_tagger(fixture.project),
             harbor_root=root / "harbor",
@@ -1427,6 +1440,15 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
     """Stages run in order, each saved, with the rule book bound before any probe."""
     run, report = pipeline
     project = run.project
+    assert {row.phase for row in run.council_checkpoints} == {
+        "initial_judging",
+        "selectors",
+        "critics",
+        "continuations",
+        "settled",
+    }
+    assert len({row.run_identity for row in run.council_checkpoints}) == 2
+    assert all(row.jobs for row in run.council_checkpoints if row.phase == "continuations")
     assert report.complete and [row.replayed for row in report.stages] == [False] * 6
     assert [row.stage for row in report.stages] == [
         "variance-build",

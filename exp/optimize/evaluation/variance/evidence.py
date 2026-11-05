@@ -7,10 +7,15 @@ reference or specification the run registered, and, for the one trajectory whose
 estimated, every boundary at which a continuation could start, each with the conversation the
 actor had seen by then.
 
-The group grades and rate are **historical diagnostics** of the mechanical verifier. They are not
+The base group grades and rate are **historical diagnostics** of the mechanical verifier.
+They are not
 the success labels the run's critics are scored against: continuation outcomes are labelled only
 by the frozen episode judge (:mod:`~exp.optimize.evaluation.variance.judged`), and the packet says
 so in its ``label_authority`` entry.
+
+The native council enriches this base packet before selectors or critics run: its frozen LLM
+judge labels the initial group, replaces the primary group rate, and supplies exact cited
+per-attempt verdicts and feedback. Historical verifier diagnostics remain explicitly separate.
 
 The packet also names what it does *not* contain. Every reference kind the run did not register is
 listed as unavailable, and so is any independent correctness label, so a role is never told it

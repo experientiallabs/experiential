@@ -56,6 +56,7 @@ from exp.optimize.evaluation.variance.behavior_profiles import (
     load_library,
     refuse_actor_exposure,
 )
+from exp.optimize.evaluation.variance.behavior_questions import save_behavior_questions
 from exp.optimize.evaluation.variance.briefing_review import (
     DEFAULT_REVIEW_REPAIRS,
     DEFAULT_REVIEW_VARIANTS,
@@ -158,6 +159,7 @@ class _Authored:
         identity: Prefix of every author and reviser draw, binding the family's draws and the
             packet, so a packet that changes with another tier's coalition is authored afresh.
         library: The behavior library version the rubric was authored from, if any.
+        behavior_questions: Model-targeted standard tagging bank from this same evidence.
         judging: Frozen judge binding per variant.
     """
 
@@ -171,6 +173,7 @@ class _Authored:
     freeze_ref: ArtifactInput
     identity: str
     library: LibraryBinding | None = None
+    behavior_questions: ArtifactInput | None = None
     judging: dict[str, VariantJudging] = field(default_factory=dict)
 
 
@@ -310,6 +313,20 @@ class _Point:
             packet, packet_ref, world, world_run.draft, rubric, review, freeze, freeze_ref, prefix,
             library=library,
         )  # fmt: skip
+        if library is not None:
+            if self.report.group_tier is None:
+                raise ValueError("behavior tags require the actual actor snapshot")
+            build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+            authored.behavior_questions = save_behavior_questions(
+                project,
+                packet=packet_ref,
+                rubric=rubric,
+                library=library,
+                target_tier=self.tier.tier,
+                target_model=self.report.group_tier.actor_model,
+                exposure=load_exposure_plan(project, build.exposure),
+                code_revision=revision,
+            )
         for scenario in scenarios:
             authored.judging[scenario.scenario_id] = self.binding(
                 authored, scenario.scenario_id, rubric, review, base
@@ -591,7 +608,14 @@ class _FamiliesStage:
         references = [
             ref
             for row in outcomes
-            for ref in (row.report, row.packet, row.world, row.rubric, row.freeze)
+            for ref in (
+                row.report,
+                row.packet,
+                row.world,
+                row.rubric,
+                row.freeze,
+                row.behavior_questions,
+            )
             if ref is not None
         ]
         references.extend(ref for row in outcomes for ref in row.revisions.values())
@@ -687,6 +711,7 @@ def _family(point: _Point) -> FamilyOutcome:
         world=None if authored is None else authored.world_ref,
         rubric=None if authored is None else authored.rubric,
         freeze=None if authored is None else authored.freeze_ref,
+        behavior_questions=None if authored is None else authored.behavior_questions,
         judging=dict(family.judging or {}),
         revisions=revisions,
         admitted=family.eligibility.eligible,

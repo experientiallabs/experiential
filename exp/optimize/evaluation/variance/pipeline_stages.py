@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.core.locks import CoordinationLock
@@ -49,6 +50,7 @@ from exp.optimize.evaluation.variance.bootstrap_stage import PLAN_LINE, run_boot
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
+from exp.optimize.evaluation.variance.council_parallel import council_draws
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import (
@@ -580,24 +582,29 @@ class _MiningStage:
         embedder = None
         if spec.mining.retrieval and build.index is not None:
             embedder = retrieval_embedder(context, build.index)
-        tiers: list[TierMining] = []
+        tiers = council_draws(
+            tuple(
+                partial(
+                    self._tier,
+                    context,
+                    _Tier(
+                        exposure,
+                        rules.job,
+                        profile,
+                        rubric,
+                        alias,
+                        labels.get(alias),
+                        ranked.get(alias),
+                    ),
+                    build,
+                    embedder,
+                )
+                for alias in spec.mining.actors
+            ),
+            spec.mining.concurrency,
+        )
         references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
-        for alias in spec.mining.actors:
-            tier = self._tier(
-                context,
-                _Tier(
-                    exposure,
-                    rules.job,
-                    profile,
-                    rubric,
-                    alias,
-                    labels.get(alias),
-                    ranked.get(alias),
-                ),
-                build,
-                embedder,
-            )
-            tiers.append(tier)
+        for tier in tiers:
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))
             if tier.behavior_differences is not None:
                 references.append(tier.behavior_differences)
@@ -689,6 +696,7 @@ class _MiningStage:
             episode_judge=judge,
             selector=mining.selector,
             critic=mining.critic,
+            concurrency=mining.concurrency,
             attempts=mining.attempts,
             selector_draws=mining.selector_draws,
             critic_draws=mining.critic_draws,
@@ -712,14 +720,21 @@ class _MiningStage:
             exposure=tier_inputs.exposure,
             code_revision=revision,
             embedder=embedder if registration.retrieval is not None else None,
+            admission=context.dependencies.council_admission,
         )
         saved = _report_reference(project, registration, revision)
         if scheduled:
             assert schedule is not None
             complete_rollout(project, schedule, saved, code_revision=revision)
-        judged, _ = judge_study(
-            project, report.group, judge, configuration=tier.configuration, code_revision=revision
-        )
+        judged = report.initial_judged
+        if judged is None:
+            judged, _ = judge_study(
+                project,
+                report.group,
+                judge,
+                configuration=tier.configuration,
+                code_revision=revision,
+            )
         return TierMining(
             tier=alias,
             report=saved,
