@@ -209,7 +209,11 @@ fn run_worker<S: Sink>(
         if pending.is_empty() {
             #[cfg(test)]
             sink.before_receive();
-            match receiver.recv_timeout(Duration::from_millis(100)) {
+            let idle_wait = Duration::from_millis(100);
+            let wait = deferred.front().map_or(idle_wait, |(at, _)| {
+                idle_wait.min(at.saturating_duration_since(Instant::now()))
+            });
+            match receiver.recv_timeout(wait) {
                 Ok(Some(item)) => pending.push(Prepared::new(item)),
                 Ok(None) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
