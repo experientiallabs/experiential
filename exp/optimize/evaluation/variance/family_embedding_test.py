@@ -13,12 +13,14 @@ from exp.optimize.evaluation.executable.catalog_binding import register_runtime_
 from exp.optimize.evaluation.factory.author_retries import register_author_execution_window
 from exp.optimize.evaluation.rules.rule_tags import RuleTaggingSettings
 from exp.optimize.evaluation.spending import operation_spend_ceiling
+from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
 from exp.optimize.evaluation.variance.bootstrap_pilot_test import pilot_fixture, register_pilot
 from exp.optimize.evaluation.variance.bootstrap_resume import (
     bootstrap_execution_spec,
     load_bootstrap_resume,
     register_bootstrap_resume,
 )
+from exp.optimize.evaluation.variance.bootstrap_selection import select_bootstrap_families
 from exp.optimize.evaluation.variance.family_embedding import (
     FamilyEmbeddingCompletion,
     check_rules_revision,
@@ -237,6 +239,40 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
     assert migrated.bootstrap.runtime.catalog_binding == binding
     assert migrated.bootstrap.rules is not None
     assert migrated.bootstrap.rules.profile == "trajectory_tags"
+    historical_build = load_pilot_build(project, pilot)
+    rows = select_bootstrap_families(
+        project,
+        historical_build,
+        migrated.bootstrap,
+        migrated.limits,
+        task_ids=migrated.task_ids,
+        embedding_revision=completed,
+    )
+    assert len(rows) == 1
+    selected = rows[0]
+    assert selected.scope == scope
+    assert selected.simulator.index == scope.index
+    assert selected.simulator.world_model == scope.world_model
+    assert selected.spec.runtime.world_model == scope.world_model
+    assert selected.spec.runtime.catalog_binding == binding
+    assert historical_build.environment_families is not None
+    assert historical_build.environment_families.scope(pilot.family_id) == intent.source_scope
+    with pytest.raises(ValueError, match="registered runtime catalog"):
+        select_bootstrap_families(
+            project,
+            historical_build,
+            baseline.bootstrap,
+            migrated.limits,
+            task_ids=migrated.task_ids,
+            embedding_revision=completed,
+        )
+    from exp.optimize.evaluation.variance.bootstrap_plan import plan_bootstrap_preparation
+
+    native_plan = plan_bootstrap_preparation(
+        project, spec, code_revision="fixture-new", resume_binding=successor
+    )
+    assert native_plan.identity == parent.original_operation
+    assert native_plan.build_saved and native_plan.remaining_tasks == migrated.task_ids
     assert ledger.summary() == before
     with pytest.raises(ValueError, match="complete successful"):
         register_family_embedding_completion(

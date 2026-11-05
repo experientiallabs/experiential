@@ -418,6 +418,7 @@ def plan_bootstrap_preparation(
             execution.limits,
             task_ids=execution.task_ids,
             simulators=execution.simulators,
+            embedding_revision=None if binding is None else binding.embedding_revision,
         )
     )
     complete: list[str] = []
@@ -714,6 +715,7 @@ def _run(
         spec.limits,
         task_ids=spec.task_ids,
         simulators=spec.simulators,
+        embedding_revision=None if binding is None else binding.embedding_revision,
     )
     exposure = load_exposure_plan(project, report.exposure)
     traces = {

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pydantic import Field
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import load_task_set
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
@@ -68,6 +68,7 @@ def select_bootstrap_families(
     *,
     task_ids: Sequence[str] = (),
     simulators: Sequence[ArtifactInput] = (),
+    embedding_revision: ArtifactInput | None = None,
 ) -> tuple[SelectedBootstrap, ...]:
     """Build one exact registration per selected family without authors, captures or fake jobs.
 
@@ -115,6 +116,27 @@ def select_bootstrap_families(
             "no selected mining-probe task has a compatible family; review the saved placements"
         )
     family_ids = tuple(dict.fromkeys(placements[task_id] for task_id in selected))
+    overlay = None
+    if embedding_revision is not None:
+        from exp.optimize.evaluation.variance.family_embedding import (
+            load_family_embedding_completion,
+        )
+
+        intent, overlay = load_family_embedding_completion(project, embedding_revision)
+        actual_build = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
+        if (
+            actual_build != intent.source_build
+            or family_ids != (intent.source_scope.family_id,)
+            or scoping.scope(intent.source_scope.family_id) != intent.source_scope
+        ):
+            raise ValueError(
+                "embedding revision differs from the exact selected build and family scope"
+            )
+        if (
+            settings.runtime.catalog_binding != intent.target_catalog
+            or settings.runtime.catalog_sha256 != intent.target_catalog.catalog_sha256
+        ):
+            raise ValueError("embedding revision differs from the registered runtime catalog")
     if len(family_ids) > limits.maximum_families:
         raise ValueError("selected tasks exceed maximum_families; narrow the task selection")
     record = load_environment_families(project.artifacts, scoping.families)
@@ -147,6 +169,16 @@ def select_bootstrap_families(
             families[family_id], scope, scoping.families
         )
         _require_scope(simulator, scope)
+        if overlay is not None:
+            if simulator.runtime is not None:
+                raise ValueError(
+                    "embedding revision cannot silently rebind a frozen executable runtime"
+                )
+            scope = overlay.scope
+            simulator = simulator.model_copy(
+                update={"index": scope.index, "world_model": scope.world_model}
+            )
+            _require_scope(simulator, scope)
         chosen = []
         for task_id in selected:
             if placements[task_id] != family_id:
