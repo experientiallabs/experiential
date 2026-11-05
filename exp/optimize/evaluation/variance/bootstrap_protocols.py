@@ -294,3 +294,11 @@ def validate_protocol_successor(
         != set(parent.permitted_changes) | {"preparation_protocol_revision"}
     ):
         raise ValueError("source successor changes unreviewed settings, stage reuse or lifecycle")
+
+
+def read_historical_bootstrap_protocol(
+    project: ProjectStore, reference: ArtifactInput
+) -> BootstrapProtocolRevision:
+    """Validate original source evidence intrinsically without authorizing a current executor."""
+    producer = project.artifacts.read(reference.artifact_id).manifest.code_revision
+    return _load_protocol_revision(project, reference, code_revision=producer, verify_source=False)

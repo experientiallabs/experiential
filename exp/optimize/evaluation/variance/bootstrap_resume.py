@@ -924,3 +924,16 @@ def _load_bootstrap_resume(
     bootstrap_author_retries(project, binding)
     bootstrap_execution_spec(project, binding, spec)
     return binding
+
+
+def read_historical_bootstrap_resume(
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    spec: BootstrapPreparationSpec,
+) -> BootstrapResumeBinding:
+    """Read intrinsic saved provenance only; this grants no current execution or new lifecycle."""
+    producer = project.artifacts.read(reference.artifact_id).manifest.code_revision
+    return _load_bootstrap_resume(
+        project, reference, spec=spec, code_revision=producer, historical=True
+    )
