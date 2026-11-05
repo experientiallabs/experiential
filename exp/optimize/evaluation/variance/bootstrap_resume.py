@@ -25,6 +25,11 @@ from exp.optimize.evaluation.factory.author_retries import (
     operation_identity,
 )
 from exp.optimize.evaluation.spending import operation_directory, operation_spend_ceiling
+from exp.optimize.evaluation.variance.bootstrap_pilot import (
+    BootstrapPilotRevision,
+    apply_pilot_revision,
+    validate_pilot_revision,
+)
 from exp.runtime.models.spend_ceiling import OperationSpendCeiling, SpendAuthorization
 from exp.simulation.mining.environment_review import review_protocol_sha256
 
@@ -39,6 +44,7 @@ ResumeChange = Literal[
     "explicit_terminal_503_retry",
     "execution_watchdog_renewal",
     "compatibility_review_revision",
+    "pilot_selection_revision",
 ]
 
 
@@ -94,6 +100,7 @@ class BootstrapResumeBinding(ContractModel):
         previous_binding: Exact predecessor, or None for the immutable root registration.
         review_revision: Explicit review output, physical-attempt and protocol revision.
         execution_build: Separately pinned revised build identity, or None for original semantics.
+        pilot_revision: Explicit selection and saved-build evidence, or None for review repairs.
     """
 
     original_inputs: ArtifactInput
@@ -125,9 +132,15 @@ class BootstrapResumeBinding(ContractModel):
     )
     execution_build: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
+    pilot_revision: BootstrapPilotRevision | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
     @property
     def build_revision(self) -> str:
         """Keep legacy identities, but bind revised review builds to their actual producer."""
+        if self.pilot_revision is not None:
+            return self.pilot_revision.build_producer_revision
         return self.original_revision if self.review_revision is None else self.producer_revision
 
     @property
@@ -308,16 +321,18 @@ def _execution_spec(
     spec: BootstrapPreparationSpec,
     deadline: datetime | None,
     review_revision: BootstrapReviewRevision | None = None,
+    pilot_revision: BootstrapPilotRevision | None = None,
 ) -> BootstrapPreparationSpec:
-    """Apply explicit review bounds and renew only known fresh operational deadlines.
+    """Apply registered review and pilot changes and renew only known operational deadlines.
 
     Args:
         spec: Original frozen preparation settings, including any business JSON.
         deadline: Explicit operational stop, or None to preserve original deadlines.
         review_revision: Review-only changes, or None to retain original build semantics.
+        pilot_revision: Explicit three-field pilot revision, without changing build inputs.
 
     Returns:
-        A typed specification differing only in registered review bounds and known deadlines.
+        A typed specification differing only in registered review, pilot and deadline fields.
     """
     if review_revision is not None:
         build = spec.build
@@ -352,6 +367,8 @@ def _execution_spec(
         spec = type(spec).model_validate(
             spec.model_copy(update={"build": build}).model_dump(mode="json")
         )
+    if pilot_revision is not None:
+        spec = apply_pilot_revision(spec, pilot_revision)
     if deadline is None:
         return spec
     settings = spec.bootstrap
@@ -470,14 +487,23 @@ def _validate_predecessor(
 ) -> None:
     """Verify successor ancestry without changing the historical root selection."""
     if binding.previous_binding is None:
-        if binding.review_revision is not None or binding.execution_build is not None:
+        if (
+            binding.review_revision is not None
+            or binding.execution_build is not None
+            or binding.pilot_revision is not None
+        ):
             raise ValueError("review revision requires its exact predecessor binding")
         return
-    if binding.review_revision is None or binding.execution_build is None:
-        raise ValueError("successor requires an explicitly pinned review revision")
+    if binding.execution_build is None or (
+        binding.review_revision is None and binding.pilot_revision is None
+    ):
+        raise ValueError("successor requires an explicitly pinned revision")
     if binding.author_retries:
         raise ValueError("review revision cannot reuse historical author retry registrations")
-    if "compatibility_review_revision" not in binding.permitted_changes:
+    if (
+        binding.review_revision is not None
+        and "compatibility_review_revision" not in binding.permitted_changes
+    ):
         raise ValueError("successor lacks its explicit review revision permission")
     manifest = project.artifacts.read(binding.previous_binding.artifact_id).manifest
     parent = load_bootstrap_resume(
@@ -494,6 +520,26 @@ def _validate_predecessor(
         or parent.source_build != binding.source_build
     ):
         raise ValueError("successor differs from its predecessor's original authority")
+    if (binding.pilot_revision is not None) != (
+        "pilot_selection_revision" in binding.permitted_changes
+    ):
+        raise ValueError("pilot revision requires its exact explicit permission")
+    if binding.pilot_revision is not None:
+        if (
+            binding.review_revision != parent.review_revision
+            or binding.build_identity != parent.build_identity
+        ):
+            raise ValueError(
+                "pilot revision cannot change its predecessor's review or build identity"
+            )
+        baseline = bootstrap_execution_spec(project, parent, spec)
+        validate_pilot_revision(
+            project, binding.pilot_revision, baseline, expected_build=parent.build_identity
+        )
+        return
+    if parent.pilot_revision is not None:
+        raise ValueError("a saved pilot revision cannot revert to review-build semantics")
+    assert binding.review_revision is not None
     previous_review = _execution_spec(spec, None, parent.review_revision).build.reviewer
     assert previous_review is not None
     if (
@@ -515,6 +561,7 @@ def register_bootstrap_resume(
     author_retries: tuple[ArtifactInput, ...] = (),
     previous_binding: ArtifactInput | None = None,
     review_revision: BootstrapReviewRevision | None = None,
+    pilot_revision: BootstrapPilotRevision | None = None,
 ) -> ArtifactInput:
     """Bind a reviewed producer to original consent and an optional native finite watchdog.
 
@@ -528,6 +575,7 @@ def register_bootstrap_resume(
         author_retries: Separate exact terminal-response retries under the same window.
         previous_binding: Existing root or successor continued through an append-only selection.
         review_revision: Explicit changed review bounds and current protocol, only for successors.
+        pilot_revision: Concrete reviewed selection and truthful existing completed-build binding.
 
     Returns:
         Immutable resume permission and its exact fresh bootstrap execution specification.
@@ -549,15 +597,19 @@ def register_bootstrap_resume(
     ledger = _ledger(project, operation)
     _preparation_authority(ledger, dollars, attempts)
     summary = ledger.summary()
-    if (previous_binding is None) != (review_revision is None):
+    if (previous_binding is None) != (review_revision is None and pilot_revision is None):
         raise ValueError("review revision requires its exact predecessor binding")
     if (review_revision is not None) != ("compatibility_review_revision" in permitted_changes):
         raise ValueError("review revision needs its exact explicit permission")
     if review_revision is not None and review_revision.protocol_sha256 != review_protocol_sha256():
         raise ValueError("review revision differs from the current review protocol")
-    execution = _execution_spec(spec, execution_deadline, review_revision)
+    if (pilot_revision is not None) != ("pilot_selection_revision" in permitted_changes):
+        raise ValueError("pilot revision needs its exact explicit permission")
+    execution = _execution_spec(spec, execution_deadline, review_revision, pilot_revision)
     execution_build = None
-    if review_revision is not None:
+    if pilot_revision is not None:
+        execution_build = pilot_revision.saved_build.artifact_id.removesuffix("-result")
+    elif review_revision is not None:
         from exp.optimize.evaluation.variance.build import plan_variance_build  # noqa: PLC0415
 
         actual_reviewer = execution.build.reviewer
@@ -594,6 +646,7 @@ def register_bootstrap_resume(
         previous_binding=previous_binding,
         review_revision=review_revision,
         execution_build=execution_build,
+        pilot_revision=pilot_revision,
     )
     _validate_predecessor(project, binding, spec)
     _validate_window(project, binding, spec)
@@ -604,6 +657,7 @@ def register_bootstrap_resume(
                 original_inputs,
                 *(() if previous_binding is None else (previous_binding,)),
                 *author_retries,
+                *(() if pilot_revision is None else pilot_revision.references),
                 *(() if execution_window is None else (execution_window,)),
             },
             key=lambda row: row.artifact_id,
@@ -663,7 +717,7 @@ def bootstrap_execution_spec(
     binding: BootstrapResumeBinding,
     spec: BootstrapPreparationSpec,
 ) -> BootstrapPreparationSpec:
-    """Verify only the registered review bounds and fresh operational deadlines changed.
+    """Verify only the registered review, pilot and operational deadline fields changed.
 
     Args:
         project: Owner of the saved binding and execution specification.
@@ -681,7 +735,7 @@ def bootstrap_execution_spec(
         project.artifacts.read_bytes(reference, "execution-spec.json")
     )
     if sha256_json(execution) != binding.execution_spec_sha256 or execution != _execution_spec(
-        spec, binding.execution_deadline, binding.review_revision
+        spec, binding.execution_deadline, binding.review_revision, binding.pilot_revision
     ):
         raise ValueError(
             "bootstrap execution settings changed beyond permitted review or operational deadlines"
@@ -775,6 +829,7 @@ def load_bootstrap_resume(
                 binding.original_inputs,
                 *(() if binding.previous_binding is None else (binding.previous_binding,)),
                 *binding.author_retries,
+                *(() if binding.pilot_revision is None else binding.pilot_revision.references),
                 *(() if binding.execution_window is None else (binding.execution_window,)),
             },
             key=lambda row: row.artifact_id,

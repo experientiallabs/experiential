@@ -250,15 +250,35 @@ def families_identity(
     tasks: Sequence[TaskCase],
 ) -> str:
     """Return the identity families are saved under, computed before any call."""
+    return family_review_identity(
+        clustering=clustering.identity(),
+        model=reviewer.model.model_dump(mode="json"),
+        configuration_sha256=reviewer.configuration_sha256,
+        spec=spec,
+        evidence_sha256=_evidence_digest(traces, tasks),
+        protocol_sha256=review_protocol_sha256(),
+    )
+
+
+def family_review_identity(
+    *,
+    clustering: str,
+    model: JsonObject,
+    configuration_sha256: str | None,
+    spec: CompatibilitySpec,
+    evidence_sha256: str,
+    protocol_sha256: str,
+) -> str:
+    """Bind a review's immutable input identity without loading or reviewing its evidence."""
     return stable_id(
         FAMILIES_TYPE,
         {
-            "protocol": review_protocol_sha256(),
-            "clustering": clustering.identity(),
-            "model": reviewer.model.model_dump(mode="json"),
-            "configuration": reviewer.configuration_sha256,
+            "protocol": protocol_sha256,
+            "clustering": clustering,
+            "model": model,
+            "configuration": configuration_sha256,
             "spec": sha256_json(spec),
-            "evidence": _evidence_digest(traces, tasks),
+            "evidence": evidence_sha256,
         },
     )
 

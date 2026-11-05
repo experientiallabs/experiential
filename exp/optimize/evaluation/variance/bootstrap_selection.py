@@ -117,13 +117,16 @@ def select_bootstrap_families(
     family_ids = tuple(dict.fromkeys(placements[task_id] for task_id in selected))
     if len(family_ids) > limits.maximum_families:
         raise ValueError("selected tasks exceed maximum_families; narrow the task selection")
-    traces = {
-        row.trace_id: row
-        for row in load_trace_dataset(
-            project.artifacts, report.build.trace_dataset.artifact_id
-        ).traces
-    }
     record = load_environment_families(project.artifacts, scoping.families)
+    compatible_ids = {row.family_id for row in record.families}
+    traces = None
+    if set(family_ids) - compatible_ids:
+        traces = {
+            row.trace_id: row
+            for row in load_trace_dataset(
+                project.artifacts, report.build.trace_dataset.artifact_id
+            ).traces
+        }
     families = {
         row.family_id: row
         for row in admitted_families(record, family_settings.admit_uncertain, traces=traces)

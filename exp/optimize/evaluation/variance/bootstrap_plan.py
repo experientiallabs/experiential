@@ -54,6 +54,7 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapRegistration,
     BootstrapSettings,
 )
+from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
 from exp.optimize.evaluation.variance.bootstrap_resume import (
     BootstrapResumeBinding,
     bootstrap_author_retries,
@@ -364,13 +365,22 @@ def plan_bootstrap_preparation(
         raise ValueError("bootstrap planning requires the maintained grounded.py runtime file")
     reviewer = execution.build.reviewer
     assert reviewer is not None
-    build = plan_variance_build(
-        project,
-        execution.build.spec,
-        code_revision=code_revision,
-        reviewer_model=reviewer.model,
-        reviewer_configuration_sha256=sha256_json(reviewer),
-        identity_revision=None if binding is None else identity_revision,
+    reused = (
+        None
+        if binding is None or binding.pilot_revision is None
+        else load_pilot_build(project, binding.pilot_revision)
+    )
+    build = (
+        reused.plan.model_copy(update={"saved": True})
+        if reused is not None
+        else plan_variance_build(
+            project,
+            execution.build.spec,
+            code_revision=code_revision,
+            reviewer_model=reviewer.model,
+            reviewer_configuration_sha256=sha256_json(reviewer),
+            identity_revision=None if binding is None else identity_revision,
+        )
     )
     identity = (
         _identity(spec, build.identity, identity_revision)
@@ -379,7 +389,7 @@ def plan_bootstrap_preparation(
     )
     if binding is not None and build.identity != binding.build_identity:
         raise ValueError("bootstrap resume changed its original semantic identity")
-    saved = _saved_build(project, build.identity)
+    saved = reused if reused is not None else _saved_build(project, build.identity)
     if saved is None and spec.simulators:
         raise ValueError("reusing frozen simulators requires their saved variance build first")
     components = list(variance_build_costs(project, build, execution.build.spec.decision_alias))
@@ -402,17 +412,18 @@ def plan_bootstrap_preparation(
             project,
             saved,
             execution.bootstrap,
-            spec.limits,
-            task_ids=spec.task_ids,
-            simulators=spec.simulators,
+            execution.limits,
+            task_ids=execution.task_ids,
+            simulators=execution.simulators,
         )
     )
     complete: list[str] = []
     pending: list[str] = []
     task_count = min(
-        spec.limits.maximum_tasks, len(spec.task_ids) or build.roles["mining_probes"].tasks
+        execution.limits.maximum_tasks,
+        len(execution.task_ids) or build.roles["mining_probes"].tasks,
     )
-    families = min(spec.limits.maximum_families, task_count) if saved is None else 0
+    families = min(execution.limits.maximum_families, task_count) if saved is None else 0
     lines = [
         f"Variance build {build.identity}: {'saved' if build.saved else 'pending'}; "
         f"{build.decision_calls} tagging and {build.review_calls} compatibility-review calls."
@@ -422,8 +433,8 @@ def plan_bootstrap_preparation(
             rows, explanation = rules_costs(
                 project,
                 execution.bootstrap.rules,
-                spec.limits.maximum_family_traces,
-                spec.limits.maximum_family_tools,
+                execution.limits.maximum_family_traces,
+                execution.limits.maximum_family_tools,
             )
             components.extend(row.scaled(families) for row in rows)
             lines.append(
@@ -553,16 +564,22 @@ def run_bootstrap_preparation(
             raise ValueError("bootstrap approval does not cover its priced and unpriced inventory")
     if dependencies.tagger is not None:
         injected = ModelSnapshot.model_validate(dependencies.tagger.model_identity)
-        expected = plan_variance_build(
-            project,
-            spec.build.spec,
-            code_revision=code_revision,
-            identity_revision=None if binding is None else binding.build_revision,
-            reviewer_model=spec.build.reviewer.model if spec.build.reviewer is not None else None,
-            reviewer_configuration_sha256=(
-                None if spec.build.reviewer is None else sha256_json(spec.build.reviewer)
-            ),
-        ).decision_model
+        expected = (
+            load_pilot_build(project, binding.pilot_revision).plan.decision_model
+            if binding is not None and binding.pilot_revision is not None
+            else plan_variance_build(
+                project,
+                spec.build.spec,
+                code_revision=code_revision,
+                identity_revision=None if binding is None else binding.build_revision,
+                reviewer_model=spec.build.reviewer.model
+                if spec.build.reviewer is not None
+                else None,
+                reviewer_configuration_sha256=(
+                    None if spec.build.reviewer is None else sha256_json(spec.build.reviewer)
+                ),
+            ).decision_model
+        )
         if injected != expected:
             raise ValueError("injected decision tagger differs from the approved model snapshot")
     execution = spec if binding is None else bootstrap_execution_spec(project, binding, spec)
@@ -645,14 +662,18 @@ def _run(
     binding: BootstrapResumeBinding | None = None,
 ) -> BootstrapPreparationReport:
     """Execute existing build and bootstrap owners inside the already installed ceiling."""
-    report = run_variance_build(
-        project,
-        spec.build.spec,
-        code_revision=revision,
-        identity_revision=None if binding is None else binding.build_revision,
-        tagger=dependencies.tagger,
-        reviewer=reviewer,
-        namer=dependencies.namer,
+    report = (
+        load_pilot_build(project, binding.pilot_revision)
+        if binding is not None and binding.pilot_revision is not None
+        else run_variance_build(
+            project,
+            spec.build.spec,
+            code_revision=revision,
+            identity_revision=None if binding is None else binding.build_revision,
+            tagger=dependencies.tagger,
+            reviewer=reviewer,
+            namer=dependencies.namer,
+        )
     )
     if report.identity != plan.build_identity:
         raise ValueError("executed variance build differs from its approved identity")
