@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
     from exp.optimize.evaluation.variance.bootstrap_resume import BootstrapResumeBinding
 
-BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v5"
+BOOTSTRAP_SOURCE_PROTOCOL = "bootstrap-source-revision-v6"
 PROTOCOL_REVISION_TYPE = "bootstrap-protocol-revision"
 
 _SOURCE_FILES = (
@@ -64,6 +64,10 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/variance/pipeline_inputs.py",
     "exp/optimize/evaluation/variance/bootstrap_admission.py",
     "exp/optimize/evaluation/variance/build.py",
+    "exp/optimize/evaluation/variance/build_clients.py",
+    "exp/optimize/evaluation/variance/baseline_execution.py",
+    "exp/optimize/evaluation/variance/bootstrap_history.py",
+    "exp/optimize/evaluation/variance/pipeline_review.py",
     "exp/optimize/evaluation/variance/build_records.py",
     "exp/optimize/evaluation/variance/family_scopes.py",
     "exp/optimize/evaluation/variance/bootstrap_pilot.py",
@@ -107,6 +111,7 @@ class BootstrapProtocolRevision(ContractModel):
         "bootstrap-source-revision-v3",
         "bootstrap-source-revision-v4",
         "bootstrap-source-revision-v5",
+        "bootstrap-source-revision-v6",
     ] = BOOTSTRAP_SOURCE_PROTOCOL
     previous_binding: ArtifactInput
     previous_producer_revision: str = Field(min_length=1)

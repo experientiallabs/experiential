@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance.bootstrap_history import (
     read_bootstrap_preparation_provenance,
@@ -90,3 +90,56 @@ def test_fresh_native_binding_records_real_source_and_current_drift_refuses_exec
         load_bootstrap_resume(project, reference, spec=spec, code_revision="corrected")
     assert read_bootstrap_preparation_provenance(project, reference, spec=spec) == proof
     assert project.artifacts.list_ids() == before
+
+
+def test_current_protocol_source_precedes_inherited_embedding_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source-only successor uses its own source proof while retaining older corpus evidence."""
+    from exp.common.project import ProjectStore
+    from exp.optimize.evaluation.variance import bootstrap_history as owner
+    from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
+    from exp.optimize.evaluation.variance.bootstrap_resume import BootstrapResumeBinding
+
+    project, spec, root, pilot = pilot_fixture(tmp_path, monkeypatch)
+    previous = register_pilot(project, spec, root, pilot)
+    parent = load_bootstrap_resume(project, previous, spec=spec, code_revision="pilot-executor")
+    revision = propose_bootstrap_protocol_revision(
+        project, previous_binding=previous, code_revision="current-source"
+    )
+    control = register_bootstrap_protocol_revision(
+        project, revision, code_revision="current-source"
+    )
+    reference = register_bootstrap_resume(
+        project,
+        original_inputs=parent.original_inputs,
+        code_revision="current-source",
+        permitted_changes=(*parent.permitted_changes, "preparation_protocol_revision"),
+        previous_binding=previous,
+        review_revision=parent.review_revision,
+        pilot_revision=parent.pilot_revision,
+        execution_deadline=parent.execution_deadline,
+        execution_window=parent.execution_window,
+        protocol_revision=control,
+    )
+    actual = read_bootstrap_preparation_provenance(project, reference, spec=spec)
+    inherited = actual.binding.model_copy(update={"embedding_revision": previous})
+
+    def verified_history(
+        project: ProjectStore, reference: ArtifactInput, *, spec: BootstrapPreparationSpec
+    ) -> BootstrapResumeBinding:
+        """Supply an already verified inherited corpus at the historical-reader boundary."""
+        return inherited
+
+    def execution(
+        project: ProjectStore, binding: BootstrapResumeBinding, spec: BootstrapPreparationSpec
+    ) -> BootstrapPreparationSpec:
+        """Keep the verified original execution settings while isolating source selection."""
+        return actual.execution_spec
+
+    monkeypatch.setattr(owner, "read_historical_bootstrap_resume", verified_history)
+    monkeypatch.setattr(owner, "bootstrap_execution_spec", execution)
+    proof = owner.read_bootstrap_preparation_provenance(project, reference, spec=spec)
+    assert proof.source_ref == control and proof.source_type == "bootstrap-protocol-revision"
+    assert proof.source_sha256 == sha256_json(revision.source)
+    assert proof.binding.embedding_revision == previous

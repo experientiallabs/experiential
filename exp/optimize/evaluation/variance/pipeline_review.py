@@ -1,6 +1,6 @@
 """Persisted, admitted family review draws and their credential-free cost inventory."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.models import ModelRequest, ModelResponse
@@ -33,6 +33,7 @@ def family_reviewer(
     code_revision: str,
     author_retries: Mapping[str, ArtifactInput] | None = None,
     execution_window: ArtifactInput | None = None,
+    before_claim: Callable[[], None] | None = None,
 ) -> CompatibilityReviewer:
     """Bind admitted review calls, forwarding retry grants only for named logical identities.
 
@@ -51,6 +52,7 @@ def family_reviewer(
             identity=identity,
             sources=(),
             code_revision=code_revision,
+            **({"before_claim": before_claim} if before_claim is not None else {}),
             **({"execution_window": execution_window} if execution_window is not None else {}),
             **(
                 {"retry_authorization": author_retries[identity]}
