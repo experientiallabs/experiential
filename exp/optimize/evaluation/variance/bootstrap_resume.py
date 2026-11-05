@@ -47,6 +47,7 @@ ResumeChange = Literal[
     "compatibility_review_revision",
     "pilot_selection_revision",
     "preparation_protocol_revision",
+    "family_embedding_revision",
 ]
 
 
@@ -104,6 +105,7 @@ class BootstrapResumeBinding(ContractModel):
         execution_build: Separately pinned revised build identity, or None for original semantics.
         pilot_revision: Explicit selection and saved-build evidence, or None for review repairs.
         protocol_revision: Exact reviewed source contracts, without configuration changes.
+        embedding_revision: Genuine completed exact-family embedding and rules revision.
     """
 
     original_inputs: ArtifactInput
@@ -139,6 +141,10 @@ class BootstrapResumeBinding(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     protocol_revision: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    embedding_revision: ArtifactInput | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -498,12 +504,17 @@ def _validate_predecessor(
         "preparation_protocol_revision" in binding.permitted_changes
     ):
         raise ValueError("source successor requires its exact explicit protocol permission")
+    if (binding.embedding_revision is not None) != (
+        "family_embedding_revision" in binding.permitted_changes
+    ):
+        raise ValueError("family embedding successor requires its exact explicit permission")
     if binding.previous_binding is None:
         if (
             binding.review_revision is not None
             or binding.execution_build is not None
             or binding.pilot_revision is not None
             or binding.protocol_revision is not None
+            or binding.embedding_revision is not None
         ):
             raise ValueError("review revision requires its exact predecessor binding")
         return
@@ -511,6 +522,7 @@ def _validate_predecessor(
         binding.review_revision is None
         and binding.pilot_revision is None
         and binding.protocol_revision is None
+        and binding.embedding_revision is None
     ):
         raise ValueError("successor requires an explicitly pinned revision")
     if binding.author_retries:
@@ -540,6 +552,13 @@ def _validate_predecessor(
         "pilot_selection_revision" in binding.permitted_changes
     ):
         raise ValueError("pilot revision requires its exact explicit permission")
+    if binding.embedding_revision is not None:
+        from exp.optimize.evaluation.variance.family_embedding import (
+            validate_family_embedding_successor,
+        )
+
+        validate_family_embedding_successor(project, binding, parent, historical=historical)
+        return
     if binding.protocol_revision is not None:
         validate_protocol_successor(project, binding, parent, historical=historical)
         return
@@ -582,6 +601,7 @@ def register_bootstrap_resume(
     review_revision: BootstrapReviewRevision | None = None,
     pilot_revision: BootstrapPilotRevision | None = None,
     protocol_revision: ArtifactInput | None = None,
+    embedding_revision: ArtifactInput | None = None,
 ) -> ArtifactInput:
     """Bind a reviewed producer to original consent and an optional native finite watchdog.
 
@@ -597,6 +617,7 @@ def register_bootstrap_resume(
         review_revision: Explicit changed review bounds and current protocol, only for successors.
         pilot_revision: Concrete reviewed selection and truthful existing completed-build binding.
         protocol_revision: Reviewed source-only successor control, with unchanged pilot/settings.
+        embedding_revision: Actual completed exact-family target representation and reviewed rules.
 
     Returns:
         Immutable resume permission and its exact fresh bootstrap execution specification.
@@ -619,7 +640,10 @@ def register_bootstrap_resume(
     _preparation_authority(ledger, dollars, attempts)
     summary = ledger.summary()
     if (previous_binding is None) != (
-        review_revision is None and pilot_revision is None and protocol_revision is None
+        review_revision is None
+        and pilot_revision is None
+        and protocol_revision is None
+        and embedding_revision is None
     ):
         raise ValueError("review revision requires its exact predecessor binding")
     if (review_revision is not None) != ("compatibility_review_revision" in permitted_changes):
@@ -629,6 +653,10 @@ def register_bootstrap_resume(
     if (pilot_revision is not None) != ("pilot_selection_revision" in permitted_changes):
         raise ValueError("pilot revision needs its exact explicit permission")
     execution = _execution_spec(spec, execution_deadline, review_revision, pilot_revision)
+    if embedding_revision is not None:
+        from exp.optimize.evaluation.variance.family_embedding import apply_family_embedding_spec
+
+        execution = apply_family_embedding_spec(project, embedding_revision, execution)
     execution_build = None
     if pilot_revision is not None:
         execution_build = pilot_revision.saved_build.artifact_id.removesuffix("-result")
@@ -671,6 +699,7 @@ def register_bootstrap_resume(
         execution_build=execution_build,
         pilot_revision=pilot_revision,
         protocol_revision=protocol_revision,
+        embedding_revision=embedding_revision,
     )
     _validate_predecessor(project, binding, spec)
     _validate_window(project, binding, spec)
@@ -683,6 +712,7 @@ def register_bootstrap_resume(
                 *author_retries,
                 *(() if pilot_revision is None else pilot_revision.references),
                 *(() if protocol_revision is None else (protocol_revision,)),
+                *(() if embedding_revision is None else (embedding_revision,)),
                 *(() if execution_window is None else (execution_window,)),
             },
             key=lambda row: row.artifact_id,
@@ -759,9 +789,16 @@ def bootstrap_execution_spec(
     execution = type(spec).model_validate_json(
         project.artifacts.read_bytes(reference, "execution-spec.json")
     )
-    if sha256_json(execution) != binding.execution_spec_sha256 or execution != _execution_spec(
+    expected = _execution_spec(
         spec, binding.execution_deadline, binding.review_revision, binding.pilot_revision
-    ):
+    )
+    if binding.embedding_revision is not None:
+        from exp.optimize.evaluation.variance.family_embedding import apply_family_embedding_spec
+
+        expected = apply_family_embedding_spec(
+            project, binding.embedding_revision, expected, historical=True
+        )
+    if sha256_json(execution) != binding.execution_spec_sha256 or execution != expected:
         raise ValueError(
             "bootstrap execution settings changed beyond permitted review or operational deadlines"
         )
@@ -874,6 +911,7 @@ def _load_bootstrap_resume(
                 *binding.author_retries,
                 *(() if binding.pilot_revision is None else binding.pilot_revision.references),
                 *(() if binding.protocol_revision is None else (binding.protocol_revision,)),
+                *(() if binding.embedding_revision is None else (binding.embedding_revision,)),
                 *(() if binding.execution_window is None else (binding.execution_window,)),
             },
             key=lambda row: row.artifact_id,
