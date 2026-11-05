@@ -17,10 +17,7 @@ The native council enriches this base packet before selectors or critics run: it
 judge labels the initial group, replaces the primary group rate, and supplies exact cited
 per-attempt verdicts and feedback. Historical verifier diagnostics remain explicitly separate.
 
-The packet also names what it does *not* contain. Every reference kind the run did not register is
-listed as unavailable, and so is any independent correctness label, so a role is never told it
-was given material it was not. Every locator an answer may cite is listed in the packet's
-inventory, so an answer that cites anything else is refused rather than trusted.
+The inventory states unavailable material and permits citations only to supplied locators.
 
 Locators address exact pieces of evidence, which :func:`execute_evidence_tool` (the read-only
 tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`) fetches:
@@ -41,11 +38,8 @@ tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`
 - ``environment``: the public task, the harness settings and the world kind; ``tool:<name>``: one
   declared actor tool schema.
 
-Two derived views are computed from those documents, never from anything else:
-:func:`compare_attempts` lines attempts up step by step, and :func:`divergence_points` lists, for
-every group of attempts sharing an identical action history, the step at which they split, with
-each branch's historical grades. :class:`TraceSearch` serves read-only, tag-aware retrieval over
-world-learning traces only.
+:func:`compare_attempts` and :func:`divergence_points` derive comparisons solely from these records.
+:class:`TraceSearch` serves read-only, tag-aware retrieval over world-learning traces only.
 
 Point ``k`` of the picked trajectory is the boundary before its ``k``-th tool turn: point 0 is the
 study's starting checkpoint and point ``k`` (k >= 1) is the checkpoint saved after turn ``k``.
