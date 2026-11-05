@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -48,7 +49,16 @@ from exp.runtime.models.registry import RuntimeModelCatalog
 
 
 class NativePreparationScript(PreparationScript):
-    """Decode the native lossless locator grammar for the legacy fixture responder."""
+    """Decode native locator grammar and optionally refuse one task through its real reviewer.
+
+    Attributes:
+        refused_task_id: Synthetic task whose scripted native reviewer refuses, or None.
+    """
+
+    def __init__(self, *, refused_task_id: str | None = None) -> None:
+        """Initialize scripted response recording and an optional task refusal."""
+        super().__init__()
+        self.refused_task_id = refused_task_id
 
     def post(
         self,
@@ -68,15 +78,54 @@ class NativePreparationScript(PreparationScript):
             messages = list(messages)
             messages[1] = {**messages[1], "content": json.dumps(opening)}
             payload = {**payload, "messages": messages}
-        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+        result = super().post(
+            url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+        )
+        task = opening.get("task")
+        system = messages[0]
+        assert isinstance(system, dict)
+        if (
+            self.refused_task_id is not None
+            and isinstance(task, dict)
+            and task.get("task_id") == self.refused_task_id
+            and str(system.get("content", "")).startswith("You review the starting state")
+        ):
+            body = deepcopy(result.body)
+            choices = body["choices"]
+            assert isinstance(choices, list) and isinstance(choices[0], dict)
+            message = choices[0]["message"]
+            assert isinstance(message, dict)
+            calls = message.get("tool_calls", [])
+            assert isinstance(calls, list)
+            for call in calls:
+                assert isinstance(call, dict)
+                function = call["function"]
+                assert isinstance(function, dict)
+                if function["name"] in ("submit_draft", "submit_review"):
+                    arguments: JsonObject = json.loads(str(function["arguments"]))
+                    arguments.update(
+                        verdict="refuse",
+                        summary="Unrelated synthetic task refused.",
+                        refusal="Independent fixture refusal.",
+                    )
+                    function["arguments"] = json.dumps(arguments)
+            return JsonHttpResponse(result.status_code, body)
+        return result
 
 
 def _fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_ids: tuple[str, ...] | None = None,
+    refused_task_id: str | None = None,
 ) -> tuple[ProjectStore, ArtifactInput, ArtifactInput, CouncilStudyContract, PreparationScript]:
     """Run resumed preparation owners, then freeze five real configured native studies."""
     initial_catalog = fixtures._catalog
     aliases = tuple(f"open-actor-{index}" for index in range(5))
+    models = (
+        tuple(f"open-fixture-{index}" for index in range(5)) if model_ids is None else model_ids
+    )
 
     def catalog(root: Path) -> None:
         """Add five explicitly generative fixture routes before any evidence freezes."""
@@ -91,7 +140,12 @@ def _fixture(
         )
         actors = {
             alias: current.models["world"].model_copy(
-                update={"model": f"open-fixture-{index}", "capabilities": caps}
+                update={
+                    "model": models[index],
+                    "capabilities": caps.model_copy(
+                        update={"context_window_tokens": 200000 + index}
+                    ),
+                }
             )
             for index, alias in enumerate(aliases)
         }
@@ -115,7 +169,7 @@ def _fixture(
     )
     paths = _origin(project, preparation, tmp_path)
     resume = _register(project, paths)
-    wire = NativePreparationScript()
+    wire = NativePreparationScript(refused_task_id=refused_task_id)
     predictor = PreparationPredictor()
     monkeypatch.setattr(
         "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: wire
@@ -133,7 +187,8 @@ def _fixture(
             reviewer=reviewer, tagger=_tagger(project, FakeDecisions())
         ),
     )
-    assert not report.failed_tasks and not report.refused_tasks
+    assert not report.failed_tasks
+    assert report.refused_tasks == (() if refused_task_id is None else (refused_task_id,))
     prepared = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
     bootstrap = report.bindings[0]
     start = bootstrapped_registration(project, bootstrap)
@@ -352,3 +407,56 @@ def test_registration_preserves_native_original_ledger_and_legacy_grants(
         )
         == result
     )
+
+
+def test_aliases_and_capability_metadata_cannot_relabel_one_model_as_five(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Five full snapshots still represent one model when only capability metadata differs."""
+    project, prepared, resume, spec, wire = _fixture(
+        tmp_path,
+        monkeypatch,
+        model_ids=("one-actual-model",) * 5,
+    )
+    registry = RuntimeModelCatalog(load_model_catalog(project.model_catalog_path), environment={})
+    snapshots = tuple(registry.snapshot(alias)[0] for alias in spec.mining.actors)
+    assert len(set(snapshots)) == 5
+    assert len({snapshot.model_id for snapshot in snapshots}) == 1
+    calls = len(wire.requests)
+    with pytest.raises(ValueError, match="distinct model IDs"):
+        qualify_council(project, prepared, resume, spec, code_revision="corrected")
+    assert len(wire.requests) == calls
+
+
+@pytest.mark.parametrize("refuse_selected", [False, True])
+def test_native_diagnostic_refusal_is_scoped_to_the_selected_council_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refuse_selected: bool
+) -> None:
+    """A native refusal blocks its own target while another accepted start keeps its QA."""
+    refused = "task-159fe06cea8222c9790e" if refuse_selected else "task-530b380c1ff78e0a726d"
+    project, prepared, resume, spec, wire = _fixture(
+        tmp_path,
+        monkeypatch,
+        refused_task_id=refused,
+    )
+    raw = project.artifacts.read_bytes(prepared.artifact_id, "report.json")
+    report = BootstrapPreparationReport.model_validate_json(raw)
+    assert report.refused_tasks == (refused,) and not report.failed_tasks
+    assert len(report.bindings) == 1 and report.bindings[0].task_id != refused
+    if refuse_selected:
+        target = spec.bootstrap.model_copy(update={"task_id": refused})
+        spec = spec.model_copy(
+            update={
+                "bootstrap": target,
+                "mining": spec.mining.model_copy(update={"bootstrap": target}),
+            }
+        )
+    calls = len(wire.requests)
+    if refuse_selected:
+        with pytest.raises(ValueError, match="not complete"):
+            qualify_council(project, prepared, resume, spec, code_revision="corrected")
+    else:
+        qualified = qualify_council(project, prepared, resume, spec, code_revision="corrected")
+        assert qualified.contract.bootstrap == report.bindings[0]
+    assert project.artifacts.read_bytes(prepared.artifact_id, "report.json") == raw
+    assert len(wire.requests) == calls

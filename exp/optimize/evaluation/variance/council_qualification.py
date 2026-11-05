@@ -276,7 +276,7 @@ def qualify_council(
     """Verify real completed preparation, exact world scope and five configured native studies.
 
     This reader never creates artifacts, installs a ceiling, executes QA or resolves credentials.
-    Missing, failed or refused preparation cannot grant even preliminary parent authority.
+    Missing preparation, failed execution or a refused target cannot grant parent authority.
     """
     _pinned(project, prepared, PREPARATION_TYPE)
     report = BootstrapPreparationReport.model_validate_json(
@@ -293,7 +293,7 @@ def qualify_council(
         or report.plan.code_revision != code_revision
         or report.plan.build_identity != binding.build_identity
         or report.failed_tasks
-        or report.refused_tasks
+        or spec.bootstrap.task_id in report.refused_tasks
         or not report.bindings
     ):
         raise ValueError("native preparation is not complete under the exact original resume")
@@ -397,8 +397,8 @@ def validate_council_studies(
         snapshot, capabilities = registry.snapshot(alias)
         if capabilities.supports_completions is False or capabilities.supports_tools is not True:
             raise ValueError("council actor must be an explicitly configured generative tool model")
-        if snapshot in [row.model for row in actors]:
-            raise ValueError("five aliases cannot relabel the same configured actor model")
+        if snapshot.model_id in {row.model.model_id for row in actors}:
+            raise ValueError("five configured actor tiers require distinct model IDs")
         actors.append(RoutedCandidateSnapshot(alias=alias, model=snapshot))
         expected = start.job.model_copy(
             update={
