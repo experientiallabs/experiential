@@ -6,6 +6,7 @@ It does not qualify downstream training records or dispatch any actor, world, or
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -23,13 +24,17 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import RoutedCandidateSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import preflight_continuation_job
+from exp.optimize.evaluation.continuations.job import (
+    continuation_result_reference,
+    preflight_continuation_job,
+)
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
 )
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapBinding,
     BootstrapRegistration,
@@ -51,6 +56,7 @@ from exp.optimize.evaluation.variance.council_preparation import (
 )
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.evidence import load_references
+from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
 from exp.optimize.evaluation.variance.pipeline_family_rag import native_world_catalog
 from exp.optimize.evaluation.variance.pipeline_spec import COUNCIL_ACTORS, MiningSettings
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -232,21 +238,10 @@ def qualify_council(
         ),
         code_revision=code_revision,
     )
-    start, family, task_start = proof.start, proof.family, proof.task_start
-    runtime = GroundedRuntimeDefinition.model_validate(start.job.configuration)
-    for study in spec.studies:
-        search = study.retrieval
-        if search is not None and (
-            search.index != family.index
-            or search.scope != family.corpus
-            or search.task_id != start.task_id
-            or search.maximum_top_k != spec.mining.retrieval_top_k
-            or search.catalog_binding != runtime.catalog_binding
-        ):
-            raise ValueError("native study retrieval differs from the exact family RAG scope")
+    start, task_start = proof.start, proof.task_start
     if spec.sources != council_sources():
         raise ValueError("council producer, source or prompt protocol changed")
-    actors = validate_council_studies(project, spec, start)
+    actors = validate_council_studies(project, spec, start, code_revision=code_revision)
     return QualifiedCouncil(
         contract=spec,
         preparation=prepared,
@@ -258,9 +253,25 @@ def qualify_council(
 
 
 def validate_council_studies(
-    project: ProjectStore, spec: CouncilStudyContract, start: BootstrapRegistration
+    project: ProjectStore,
+    spec: CouncilStudyContract,
+    start: BootstrapRegistration,
+    *,
+    code_revision: str,
 ) -> tuple[RoutedCandidateSnapshot, ...]:
     """Bind native study controls and aliases directly to configured snapshots and routes."""
+    family = load_family_simulator(project.artifacts, spec.family_simulator)
+    runtime = GroundedRuntimeDefinition.model_validate(start.job.configuration)
+    for study in spec.studies:
+        search = study.retrieval
+        if search is not None and (
+            search.index != family.index
+            or search.scope != family.corpus
+            or search.task_id != start.task_id
+            or search.maximum_top_k != spec.mining.retrieval_top_k
+            or search.catalog_binding != runtime.catalog_binding
+        ):
+            raise ValueError("native study retrieval differs from the exact family RAG scope")
     mining = spec.mining
     aliases = mining.actors
     if (
@@ -313,7 +324,6 @@ def validate_council_studies(
             or study.selector_prompts != spec.studies[0].selector_prompts
             or study.critic_prompts != spec.studies[0].critic_prompts
             or study.episode_judge != spec.studies[0].episode_judge
-            or study.references != spec.studies[0].references
         ):
             raise ValueError("native study reduced controls or changed configured roles/protocol")
         if mining.retrieval and study.retrieval is None:
@@ -332,7 +342,63 @@ def validate_council_studies(
                 raise ValueError("native selector, critic or episode-judge route snapshot changed")
         preflight_continuation_job(project, job)
         load_references(project.artifacts, study.references)
+        shared = tuple(ref for ref in study.references if ref.kind not in MODEL_REFERENCE_KINDS)
+        first = tuple(
+            ref for ref in spec.studies[0].references if ref.kind not in MODEL_REFERENCE_KINDS
+        )
+        if shared != first:
+            raise ValueError("native studies changed their shared non-model evidence")
+        council_reference_owners(project, study, mining, code_revision=code_revision)
     return tuple(actors)
+
+
+MODEL_REFERENCE_KINDS = frozenset({"traceml_labels", "error_points", "behavior_differences"})
+
+
+def council_reference_owners(
+    project: ProjectStore,
+    study: ActorCriticSpec,
+    mining: MiningSettings,
+    *,
+    code_revision: str,
+    behavior_bank_sha256: Sha256 | None = None,
+) -> tuple[ArtifactInput, ...]:
+    """Verify each model's generated references against its actual native group owner."""
+    owned = tuple(ref for ref in study.references if ref.kind in MODEL_REFERENCE_KINDS)
+    if not owned:
+        return ()
+    group = continuation_result_reference(project, study.initial, code_revision=code_revision)
+    owners = {group}
+    for reference in owned:
+        owners.add(reference.artifact)
+        manifest = project.artifacts.read(reference.artifact.artifact_id).manifest
+        if reference.kind == "traceml_labels" and group not in manifest.inputs:
+            raise ValueError("full council labels do not belong to the native model group")
+        if reference.kind == "error_points" and not any(
+            group in project.artifacts.read(parent.artifact_id).manifest.inputs
+            for parent in manifest.inputs
+        ):
+            raise ValueError("full council errors belong to another native model group")
+        if reference.kind == "behavior_differences":
+            raw = json.loads(
+                project.artifacts.read_bytes(reference.artifact.artifact_id, reference.file)
+            )
+            source = ArtifactInput.model_validate(raw["source"])
+            report = load_behavior_differences(project, source)
+            if (
+                manifest.inputs != (source,)
+                or report.study != group
+                or report.tier != study.initial.actor_alias
+                or report.judge != study.episode_judge.identity
+                or report.spec != mining.behaviors
+                or (
+                    behavior_bank_sha256 is not None
+                    and sha256_json(report.bank) != behavior_bank_sha256
+                )
+            ):
+                raise ValueError("full council behavior belongs to another group or judge")
+            owners.add(source)
+    return tuple(sorted(owners, key=lambda ref: ref.artifact_id))
 
 
 def register_conditional_council(

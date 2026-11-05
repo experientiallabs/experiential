@@ -25,6 +25,11 @@ from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinitio
 from exp.optimize.evaluation.executable.provider_grant import ProviderLimits
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec, _pick
 from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint, point_job
+from exp.optimize.evaluation.variance.council_descendant import (
+    DESCENDANT_TYPE,
+    load_council_descendant,
+    load_parent_bound_council_descendant,
+)
 from exp.optimize.evaluation.variance.council_initial import saved_initial_feedback
 from exp.optimize.evaluation.variance.council_inventory import (
     CouncilPhaseInventory,
@@ -51,18 +56,48 @@ INVENTORY_TYPE = "council-native-phase-inventory"
 RUNTIME_GRANT_TYPE = "council-runtime-grant"
 
 
-def _qualified(project: ProjectStore, reference: ArtifactInput) -> QualifiedCouncil:
-    """Read exact immutable domain authority, never a caller-authored replacement job."""
+def resolve_council_qualification(
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    parent_execution: ArtifactInput | None = None,
+) -> tuple[QualifiedCouncil, ArtifactInput]:
+    """Verify a full native study and return its unchanged original parent execution.
+
+    Args:
+        project: Owner of immutable native qualification and generated study evidence.
+        reference: Full qualification or a genuine registered post-prelude descendant.
+        parent_execution: Exact registered parent for a bound read; None performs initial
+            deep qualification.
+
+    Returns:
+        Exact qualified studies and the original execution reference bound by their parent policy.
+    """
     stored = project.artifacts.read(reference.artifact_id)
-    value = QualifiedCouncil.model_validate_json(stored.payloads["qualification.json"])
+    if artifact_input(stored.manifest) != reference:
+        raise ValueError("runtime authority lost its exact qualified council producer")
+    if stored.manifest.artifact_type == DESCENDANT_TYPE:
+        descendant = (
+            load_council_descendant(project, reference)
+            if parent_execution is None
+            else load_parent_bound_council_descendant(
+                project, reference, parent_execution=parent_execution
+            )
+        )
+        value, parent = descendant.qualified, descendant.prelude
+    elif stored.manifest.artifact_type == QUALIFICATION_TYPE:
+        value = QualifiedCouncil.model_validate_json(stored.payloads["qualification.json"])
+        parent = reference
+    else:
+        raise ValueError("runtime authority requires a native full council qualification")
     if (
-        artifact_input(stored.manifest) != reference
-        or stored.manifest.artifact_type != QUALIFICATION_TYPE
-        or stored.manifest.code_revision != value.producer_revision
+        stored.manifest.code_revision != value.producer_revision
         or value.contract.sources != council_sources()
     ):
         raise ValueError("runtime authority lost its exact qualified council producer")
-    return value
+    if parent_execution is not None and parent != parent_execution:
+        raise ValueError("council qualification belongs to another original parent execution")
+    return value, parent
 
 
 def _open() -> VerifiedSpendEnvelope:
@@ -80,9 +115,12 @@ def save_council_inventory(
     checkpoint: CouncilCheckpoint,
     *,
     code_revision: str,
+    parent_execution: ArtifactInput | None = None,
 ) -> ArtifactInput:
     """Price and persist the actual native wave before any reservation or client creation."""
-    qualified = _qualified(project, qualification)
+    qualified, _ = resolve_council_qualification(
+        project, qualification, parent_execution=parent_execution
+    )
     if code_revision != qualified.producer_revision or spec not in qualified.contract.studies:
         raise ValueError("inventory is outside the exact qualified study")
     inventory = phase_inventory(project, spec, checkpoint, code_revision=code_revision)
@@ -253,13 +291,16 @@ class CouncilRuntimeGrant(ContractModel):
             or stored.manifest.code_revision != record.producer_revision
             or record.limits != self.limits
             or record.envelope != opened.reference
-            or opened.policy.execution != record.qualification
             or opened.plan.inventory != record.inventory
             or configuration != record.job.configuration
             or (runtime_sha256 is not None and runtime_sha256 != record.job.runtime_sha256)
         ):
             raise ValueError("council runtime authority differs from its exact job or native wave")
-        qualified = _qualified(project, record.qualification)
+        qualified, parent = resolve_council_qualification(
+            project, record.qualification, parent_execution=opened.policy.execution
+        )
+        if opened.policy.execution != parent:
+            raise ValueError("council runtime lost its original parent execution")
         inventory, spec = _inventory(project, record.inventory, record.qualification, qualified)
         if (
             record.producer_revision != qualified.producer_revision
@@ -273,6 +314,8 @@ class CouncilRuntimeGrant(ContractModel):
         runtime = GroundedRuntimeDefinition.model_validate(configuration)
         if record.limits.maximum_physical_attempts != runtime.maximum_physical_attempts:
             raise ValueError("council runtime cannot change its frozen world allowance")
+        if parent != record.qualification and inventory.checkpoint.phase == "actors":
+            raise ValueError("a full descendant cannot refill its completed initial group")
         if inventory.checkpoint.phase == "actors":
             if inventory.checkpoint.jobs != (spec.initial,) or record.job != spec.initial:
                 raise ValueError("initial runtime cannot substitute another actor group")
@@ -296,10 +339,12 @@ def register_council_runtime(
     An existing job grant cannot be re-keyed under another envelope after partial execution.
     """
     opened = _open()
-    qualified = _qualified(project, qualification)
+    qualified, parent = resolve_council_qualification(
+        project, qualification, parent_execution=opened.policy.execution
+    )
     priced, spec = _inventory(project, inventory, qualification, qualified)
     if (
-        opened.policy.execution != qualification
+        opened.policy.execution != parent
         or opened.plan.inventory != inventory
         or opened.policy.producer_revision != code_revision
         or qualified.producer_revision != code_revision
@@ -308,6 +353,8 @@ def register_council_runtime(
         or opened.plan.maximum_known_usd < priced.known_usd
     ):
         raise ValueError("per-job runtime has no exact admitted native wave")
+    if parent != qualification and priced.checkpoint.phase == "actors":
+        raise ValueError("a full descendant cannot refill its completed initial group")
     if priced.checkpoint.phase == "actors":
         if priced.checkpoint.jobs != (spec.initial,) or job != spec.initial:
             raise ValueError("initial runtime cannot substitute another actor group")
