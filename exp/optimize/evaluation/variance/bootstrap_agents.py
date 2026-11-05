@@ -168,7 +168,14 @@ class StartMaterial:
         return tuple(rows)
 
     def context(self) -> JsonObject:
-        """Return the opening context every role shares."""
+        """List source evidence for explicit reads without duplicating complete trace bodies."""
+        source_traces: list[JsonObject] = []
+        for trace_id in sorted(self.sources):
+            steps = self.views[trace_id][0]["steps"]
+            assert isinstance(steps, list)
+            source_traces.append(
+                {"trace_id": trace_id, "total_steps": len(steps), "content_delivered": False}
+            )
         task = self.task.task
         return {
             "task": {
@@ -186,7 +193,7 @@ class StartMaterial:
                     row.model_dump(mode="json") for row in self.knowledge.book.questions
                 ],
             },
-            "source_traces": [self.views[trace_id][0] for trace_id in sorted(self.sources)],
+            "source_traces": source_traces,
             "recorded_state_available": self.recorded_state is not None,
             "allowed_provenance": list(self.allowed()),
             "findings": [_finding_view(row) for row in self.findings],
@@ -240,8 +247,8 @@ class StartMaterial:
         return status, result, served if status == "ok" else ()
 
 
-def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
-    """Check a draft's structure, citations and claimed provenance.
+def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[str]) -> StartDraft:
+    """Check a draft's structure, delivered citations and claimed provenance.
 
     Args:
         answer: The author's answer arguments.
@@ -271,7 +278,8 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")
-    _check_facts(draft, material.inventory)
+    opening_refs = {f"finding:{row.finding_id}" for row in material.findings}
+    _check_facts(draft, material.inventory & (read | opening_refs))
     if draft.provenance not in material.allowed():
         raise ValueError(
             f"provenance {draft.provenance!r} is not supported by the evidence; allowed: "
@@ -429,7 +437,7 @@ def author_start(
         system=instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant),
         opening=opening,
         answer=AUTHOR_ANSWER,
-        validate=lambda answer, read: validate_draft(answer, material),
+        validate=lambda answer, read: validate_draft(answer, material, read),
         sources=sources,
         code_revision=code_revision,
     )

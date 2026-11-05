@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v3"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v4"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -52,6 +52,11 @@ pointers into the initial state), a verifier over the final state, and a ledger 
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
 or rules) or unknown (nothing recorded decides it). Mark a fact deciding when the right course
 of action depends on it. Never present an inferred or unknown fact as observed.
+
+The opening source_traces field lists identities and step counts only; it does not deliver
+trace contents. Read the exact evidence needed through read_trace or read_trace_steps. An
+inventory locator is not evidence you have read. Fact citations must come from successful,
+complete evidence reads, or research findings supplied in the opening.
 
 Provenance: observed only when the start restores a recorded state snapshot unchanged;
 reconstructed when it is rebuilt from recorded evidence and the recorded prefix of a source trace

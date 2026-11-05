@@ -277,6 +277,10 @@ def _task_id(opening: JsonObject) -> str:
 
 def _reads(role: str, opening: JsonObject) -> tuple[str, JsonObject]:
     """One read per role."""
+    if role == "start_author" and _task_id(opening) == "obs":
+        return "read_recorded_state", {}
+    if role == "start_author" and _task_id(opening) == "recon":
+        return "read_trace", {"trace_id": "src-recon"}
     if role == "research":
         return "search_related_steps", {"tool_name": "escalate", "top_k": 2}
     if role == "weighing":
