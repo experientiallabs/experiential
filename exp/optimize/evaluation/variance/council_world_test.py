@@ -1,11 +1,19 @@
 """Exact native per-job world authority with scripted preparation and no real services."""
 
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    sha256_json,
+    stable_id,
+)
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
     continuation_result_reference,
@@ -13,10 +21,36 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.executable.runtime_authority import runtime_authority_scope
 from exp.optimize.evaluation.spending import operation_spend_ceiling
+from exp.optimize.evaluation.variance import council_descendant as descendant_owner
+from exp.optimize.evaluation.variance import council_world as world_owner
+from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+from exp.optimize.evaluation.variance.actor_critic_test import _done
+from exp.optimize.evaluation.variance.bootstrap_history import (
+    read_bootstrap_preparation_provenance,
+)
 from exp.optimize.evaluation.variance.bootstrap_resume import load_bootstrap_resume
+from exp.optimize.evaluation.variance.build_test import FakeDecisions, _tagger
 from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint
+from exp.optimize.evaluation.variance.council_descendant import (
+    load_council_descendant,
+    register_full_council_from_prelude,
+)
 from exp.optimize.evaluation.variance.council_inventory import CouncilPhaseInventory
 from exp.optimize.evaluation.variance.council_parallel import council_draws
+from exp.optimize.evaluation.variance.council_prelude import (
+    freeze_council_prelude,
+    qualify_council_prelude,
+)
+from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeCheckpoint
+from exp.optimize.evaluation.variance.council_prelude_inventory import prelude_inventory
+from exp.optimize.evaluation.variance.council_prelude_test import (
+    _prelude_fixture,
+    _register_fixture,
+)
+from exp.optimize.evaluation.variance.council_prelude_world import (
+    register_prelude_runtime,
+    save_prelude_inventory,
+)
 from exp.optimize.evaluation.variance.council_qualification import (
     CONSENT_TYPE,
     ConditionalCouncilRegistration,
@@ -28,13 +62,32 @@ from exp.optimize.evaluation.variance.council_qualification import (
 from exp.optimize.evaluation.variance.council_qualification_test import _fixture
 from exp.optimize.evaluation.variance.council_world import (
     register_council_runtime,
+    resolve_council_qualification,
     save_council_inventory,
+)
+from exp.optimize.evaluation.variance.pipeline import (
+    plan_decision_variance,
+    run_decision_variance,
+)
+from exp.optimize.evaluation.variance.pipeline_spec import (
+    PipelineApproval,
+    StageContext,
+    StageDependencies,
+)
+from exp.optimize.evaluation.variance.rubric_author import Rubric, RubricBody
+from exp.optimize.evaluation.variance.rubric_author_test import rubric_answer
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    RecordedRequest,
+    ScriptedJsonTransport,
 )
 from exp.runtime.models.scoped_spending import (
     SpendEnvelopePlan,
     open_spend_envelope,
     spend_envelope_scope,
+    verify_spend_envelope,
 )
+from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
 
 
 def register_fixture(
@@ -283,55 +336,6 @@ def test_native_descendant_keeps_original_prelude_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Native produced groups and labels admit a full descendant without replacing its parent."""
-    from collections.abc import Iterator, Mapping
-    from contextlib import contextmanager
-
-    from exp.common.core.artifacts import JsonObject, stable_id
-    from exp.optimize.evaluation.variance import council_descendant as descendant_owner
-    from exp.optimize.evaluation.variance import council_world as world_owner
-    from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
-    from exp.optimize.evaluation.variance.actor_critic_test import _done
-    from exp.optimize.evaluation.variance.bootstrap_history import (
-        read_bootstrap_preparation_provenance,
-    )
-    from exp.optimize.evaluation.variance.build_test import FakeDecisions, _tagger
-    from exp.optimize.evaluation.variance.council_descendant import (
-        load_council_descendant,
-        register_full_council_from_prelude,
-    )
-    from exp.optimize.evaluation.variance.council_prelude import (
-        freeze_council_prelude,
-        qualify_council_prelude,
-    )
-    from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeCheckpoint
-    from exp.optimize.evaluation.variance.council_prelude_inventory import prelude_inventory
-    from exp.optimize.evaluation.variance.council_prelude_test import (
-        _prelude_fixture,
-        _register_fixture,
-    )
-    from exp.optimize.evaluation.variance.council_prelude_world import (
-        register_prelude_runtime,
-        save_prelude_inventory,
-    )
-    from exp.optimize.evaluation.variance.council_world import resolve_council_qualification
-    from exp.optimize.evaluation.variance.pipeline import (
-        plan_decision_variance,
-        run_decision_variance,
-    )
-    from exp.optimize.evaluation.variance.pipeline_spec import (
-        PipelineApproval,
-        StageContext,
-        StageDependencies,
-    )
-    from exp.optimize.evaluation.variance.rubric_author import Rubric, RubricBody
-    from exp.optimize.evaluation.variance.rubric_author_test import rubric_answer
-    from exp.runtime.models.providers.transport import (
-        JsonHttpResponse,
-        RecordedRequest,
-        ScriptedJsonTransport,
-    )
-    from exp.runtime.models.scoped_spending import verify_spend_envelope
-    from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
 
     project, prepared, resume, contract, wire = _prelude_fixture(tmp_path, monkeypatch)
     rubric_ids = project.artifacts.list_ids(artifact_type="episode-rubric")
