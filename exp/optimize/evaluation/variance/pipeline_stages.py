@@ -11,7 +11,6 @@ Family authoring and record export live in ``pipeline_families`` and ``pipeline_
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 
@@ -39,8 +38,6 @@ from exp.optimize.evaluation.rules.decision_client import rule_memory_decisions
 from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
-    ActorCriticSpec,
-    run_actor_critic,
 )
 from exp.optimize.evaluation.variance.actor_critic_costs import (
     actor_critic_costs,
@@ -55,26 +52,25 @@ from exp.optimize.evaluation.variance.council_prelude_hook import (
     CouncilPreludeCheckpoint,
     prelude_phase,
 )
-from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import (
-    ReferenceSource,
     TraceSearch,
     open_trace_search,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
-from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
 from exp.optimize.evaluation.variance.pipeline_behaviors import (
     behavior_bank,
     behavior_costs,
     behavior_lines,
-    behavior_reference,
-    prepare_behavior_reference,
+)
+from exp.optimize.evaluation.variance.pipeline_council_tiers import (
+    TierInputs,
+    prepare_tier,
+    run_tier,
 )
 from exp.optimize.evaluation.variance.pipeline_errors import (
     attempt_error_points,
-    error_point_reference,
     error_tag_costs,
     probe_line,
     save_error_points,
@@ -105,12 +101,9 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     RulesOutputs,
     StageContext,
     StageRun,
-    TierMining,
     TraceMLOutputs,
     cost_lines,
 )
-from exp.optimize.evaluation.variance.rubric_author import judge_definition
-from exp.optimize.evaluation.variance.schedule import complete_rollout, next_rollout_plan
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -129,7 +122,6 @@ from exp.simulation.mining.traceml import (
     trajectory_from_workflow_steps,
 )
 from exp.simulation.mining.traceml_moves import MoveJudge, MoveJudgeError
-from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.rules.recall import RecallPolicy
 
 __all__ = ["MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
@@ -414,7 +406,12 @@ class _TraceMLStage:
             tier = group_job(project, spec, job, alias)
             with prelude_phase(
                 context,
-                CouncilPreludeCheckpoint(phase="traceml_group", actor_alias=alias, job=tier),
+                CouncilPreludeCheckpoint(
+                    phase="traceml_group",
+                    actor_alias=alias,
+                    job=tier,
+                    completed_labels=tuple(labels.values()),
+                ),
             ):
                 reference, study = run_group(project, tier, revision)
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
@@ -439,7 +436,11 @@ class _TraceMLStage:
             with prelude_phase(
                 context,
                 CouncilPreludeCheckpoint(
-                    phase="traceml_labels", actor_alias=alias, job=tier, group=reference
+                    phase="traceml_labels",
+                    actor_alias=alias,
+                    job=tier,
+                    group=reference,
+                    completed_labels=tuple(labels.values()),
                 ),
             ):
                 tagger = context.dependencies.traceml_tagger or _tagger(context)
@@ -600,12 +601,12 @@ class _MiningStage:
         embedder = None
         if spec.mining.retrieval and build.index is not None:
             embedder = retrieval_embedder(context, build.index)
-        tiers = council_draws(
+        prepared = council_draws(
             tuple(
                 partial(
-                    self._tier,
+                    prepare_tier,
                     context,
-                    _Tier(
+                    TierInputs(
                         exposure,
                         rules.job,
                         profile,
@@ -615,10 +616,16 @@ class _MiningStage:
                         ranked.get(alias),
                     ),
                     build,
-                    embedder,
                 )
                 for alias in spec.mining.actors
             ),
+            spec.mining.concurrency,
+        )
+        register = context.dependencies.council_registration
+        if register is not None:
+            register(context, tuple(tier.registration for tier in prepared))
+        tiers = council_draws(
+            tuple(partial(run_tier, context, tier, embedder) for tier in prepared),
             spec.mining.concurrency,
         )
         references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
@@ -648,163 +655,12 @@ class _MiningStage:
         }
         return StageRun(outputs, tuple(references), summary)
 
-    def _tier(
-        self,
-        context: StageContext,
-        tier_inputs: _Tier,
-        build: BuildOutputs,
-        embedder: RAGEmbedderBinding | None,
-    ) -> TierMining:
-        """Run one tier: its judge, its registration (or the schedule's) and its group judging.
-
-        Args:
-            context: The running stage.
-            tier_inputs: The frozen roles, rule-bound job, judge profile, rubric and tier.
-            build: The variance build, whose scoped index the roles search.
-            embedder: Query embedder of a semantic index, or None.
-
-        Returns:
-            The tier's mining.
-        """
-        project, spec, revision = context.project, context.spec, context.code_revision
-        mining, alias = spec.mining, tier_inputs.alias
-        schedule = mining.schedule
-        scheduled = schedule is not None and schedule.base.initial.actor_alias == alias
-        plan = None
-        if scheduled:
-            assert schedule is not None
-            plan = next_rollout_plan(project, schedule, code_revision=revision)
-            require_scheduled_plan(context, plan)
-        tier = group_job(project, spec, tier_inputs.job, alias)
-        start = load_continuation_checkpoint(project.artifacts, tier.study.checkpoint)
-        definition = judge_definition(
-            project,
-            tier_inputs.profile,
-            tier_inputs.rubric,
-            task_sha256=run_task_sha256(start),
-            world_sha256=run_world_sha256(tier.configuration),
-        )
-        judge = EpisodeJudge(definition=definition, settings=mining.judge)
-        with prelude_phase(
-            context,
-            CouncilPreludeCheckpoint(
-                phase="behavior_reference", actor_alias=alias, job=tier, judge=judge
-            ),
-        ):
-            behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
-        labels = tier_inputs.labels
-        references = (
-            *((behavior_reference(project, behavior),) if behavior is not None else ()),
-            *(
-                ()
-                if labels is None
-                else (
-                    ReferenceSource(
-                        kind="traceml_labels", name="traceml", artifact=labels, file="labels.json"
-                    ),
-                )
-            ),
-            *(
-                ()
-                if tier_inputs.error_points is None
-                else (error_point_reference(tier_inputs.error_points),)
-            ),
-        )
-        retrieval = (
-            trace_search(project, build, start.task.task_id, mining.retrieval_top_k)
-            if mining.retrieval
-            else None
-        )
-        registration = ActorCriticSpec.error_mining(
-            tier,
-            episode_judge=judge,
-            selector=mining.selector,
-            critic=mining.critic,
-            concurrency=mining.concurrency,
-            attempts=mining.attempts,
-            selector_draws=mining.selector_draws,
-            critic_draws=mining.critic_draws,
-            points=mining.points,
-            continuations=mining.continuations,
-            seed=mining.seed,
-            continuation_physical_attempts=mining.continuation_physical_attempts,
-            selector_profile=mining.selector_profile,
-            critic_profile=mining.critic_profile,
-            references=references,
-            actor_tier=alias,
-        ).model_copy(update={"retrieval": retrieval})
-        if scheduled:
-            assert plan is not None and plan.spec is not None
-            registration = plan.spec
-            judge = registration.episode_judge
-            tier = registration.initial
-        report = run_actor_critic(
-            project,
-            registration,
-            exposure=tier_inputs.exposure,
-            code_revision=revision,
-            embedder=embedder if registration.retrieval is not None else None,
-            admission=context.dependencies.council_admission,
-        )
-        saved = _report_reference(project, registration, revision)
-        if scheduled:
-            assert schedule is not None
-            complete_rollout(project, schedule, saved, code_revision=revision)
-        judged = report.initial_judged
-        if judged is None:
-            judged, _ = judge_study(
-                project,
-                report.group,
-                judge,
-                configuration=tier.configuration,
-                code_revision=revision,
-            )
-        return TierMining(
-            tier=alias,
-            report=saved,
-            judged_group=judged,
-            judge=judge,
-            job=tier,
-            retrieval=registration.retrieval,
-            behavior_differences=behavior,
-        )
-
-
-@dataclass(frozen=True)
-class _Tier:
-    """What one tier's error mining reads besides the stage context.
-
-    Attributes:
-        exposure: The frozen data roles.
-        job: The rule-bound mining job.
-        profile: The episode-judge profile.
-        rubric: The mining-probe task's rubric.
-        alias: The tier's actor alias.
-        labels: The tier's TraceML labels, when labelled.
-        error_points: The tier's error-ranked attempt points, when its attempts were tagged.
-    """
-
-    exposure: ExposurePlan
-    job: ContinuationJob
-    profile: JudgeProfile
-    rubric: ArtifactInput
-    alias: str
-    labels: ArtifactInput | None
-    error_points: ArtifactInput | None = None
-
 
 def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:
     """Read one saved actor-critic report."""
     return ActorCriticReport.model_validate_json(
         project.artifacts.read_bytes(reference.artifact_id, "report.json")
     )
-
-
-def _report_reference(
-    project: ProjectStore, spec: ActorCriticSpec, code_revision: str
-) -> ArtifactInput:
-    """Return the saved report of a registration."""
-    return artifact_input(project.artifacts.read(spec.identity(code_revision) + "-result").manifest)
 
 
 def _world(

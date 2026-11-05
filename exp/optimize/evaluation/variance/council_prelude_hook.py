@@ -10,6 +10,7 @@ from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.variance.judged import EpisodeJudge
 
 if TYPE_CHECKING:
+    from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
     from exp.optimize.evaluation.variance.pipeline_spec import StageContext
 
 
@@ -21,6 +22,8 @@ class CouncilPreludeCheckpoint(ContractModel):
     job: ContinuationJob
     group: ArtifactInput | None = None
     judge: EpisodeJudge | None = None
+    completed_labels: tuple[ArtifactInput, ...] = ()
+    completed_rubric: ArtifactInput | None = None
 
 
 class CouncilPreludeAdmission(Protocol):
@@ -30,6 +33,13 @@ class CouncilPreludeAdmission(Protocol):
         self, context: StageContext, checkpoint: CouncilPreludeCheckpoint, /
     ) -> AbstractContextManager[object] | None:
         """Return exact native priced scope or raise before its clients/owners dispatch."""
+
+
+class CouncilStudyRegistration(Protocol):
+    """Qualify all real authored study registrations before any point-selector wave."""
+
+    def __call__(self, context: StageContext, studies: tuple[ActorCriticSpec, ...], /) -> None:
+        """Register exact generated references under the existing qualified prelude policy."""
 
 
 def prelude_phase(

@@ -26,41 +26,30 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import preflight_continuation_job
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
-    preflight_grounded_runtime,
 )
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
-from exp.optimize.evaluation.rules.agent_loop import TRANSCRIPT_TYPE, AgentTranscript
 from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
-from exp.optimize.evaluation.variance.bootstrap import frozen_report, registration_entry
-from exp.optimize.evaluation.variance.bootstrap_agents import RevealAnswer
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
-    REGISTRATION_TYPE,
     BootstrapBinding,
     BootstrapRegistration,
-    BootstrapSettings,
-    ReviewAnswer,
-    StartDraft,
 )
 from exp.optimize.evaluation.variance.bootstrap_plan import (
-    PREPARATION_TYPE,
-    BootstrapPreparationReport,
     BootstrapPreparationSpec,
 )
 from exp.optimize.evaluation.variance.bootstrap_resume import (
-    bootstrap_execution_spec,
     load_bootstrap_resume,
 )
-from exp.optimize.evaluation.variance.bootstrap_selection import select_bootstrap_families
-from exp.optimize.evaluation.variance.bootstrap_stage import bootstrapped_registration
-from exp.optimize.evaluation.variance.build_records import (
-    REPORT_TYPE,
-    VarianceBuildReport,
-    load_exposure_plan,
+from exp.optimize.evaluation.variance.council_preparation import (
+    CouncilPreparationContract,
+    _pinned,
+    qualify_prepared_council,
+)
+from exp.optimize.evaluation.variance.council_preparation import (
+    _native_start as _native_start,
 )
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.evidence import load_references
-from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
 from exp.optimize.evaluation.variance.pipeline_spec import COUNCIL_ACTORS, MiningSettings
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.scoped_spending import (
@@ -84,6 +73,14 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/variance/council_parallel.py",
     "exp/optimize/evaluation/variance/council_qualification.py",
     "exp/optimize/evaluation/variance/council_world.py",
+    "exp/optimize/evaluation/variance/council_preparation.py",
+    "exp/optimize/evaluation/variance/council_prelude_hook.py",
+    "exp/optimize/evaluation/variance/pipeline_council_tiers.py",
+    "exp/optimize/evaluation/variance/pipeline_inputs.py",
+    "exp/optimize/evaluation/variance/pipeline_stages.py",
+    "exp/optimize/evaluation/variance/pipeline_spec.py",
+    "exp/optimize/evaluation/variance/pipeline_behaviors.py",
+    "exp/optimize/evaluation/variance/pipeline_errors.py",
     "exp/optimize/evaluation/variance/judge_prompt.py",
     "exp/optimize/evaluation/variance/judged.py",
     "exp/optimize/evaluation/variance/role_prompts.py",
@@ -191,92 +188,6 @@ class ConditionalCouncilRegistration(ContractModel):
     policy: ParentSpendRef
 
 
-def _pinned(project: ProjectStore, reference: ArtifactInput, kind: str) -> None:
-    """Require exact immutable bytes and the actual native owner's artifact type."""
-    if not project.artifacts.exists(reference.artifact_id):
-        raise ValueError(f"completed native {kind} is missing: {reference.artifact_id}")
-    manifest = project.artifacts.read(reference.artifact_id).manifest
-    if artifact_input(manifest) != reference or manifest.artifact_type != kind:
-        raise ValueError(f"{reference.artifact_id} is not the exact native {kind}")
-
-
-def _native_start(
-    project: ProjectStore,
-    binding: BootstrapBinding,
-    report: BootstrapPreparationReport,
-    settings: BootstrapSettings,
-) -> tuple[BootstrapRegistration, ArtifactInput]:
-    """Independently verify the selected committed start and its provenance-required QA."""
-    if binding not in report.bindings or binding.batch not in report.batches:
-        raise ValueError("selected task has no binding in the completed preparation")
-    entry = registration_entry(project, binding)
-    assert entry.outcome is not None
-    _pinned(project, entry.outcome, REGISTRATION_TYPE)
-    start = bootstrapped_registration(project, binding)
-    validation = start.validation
-    if (
-        start.task_id != binding.task_id
-        or start.checkpoint != start.job.study.checkpoint
-        or validation.provenance != start.provenance
-        or not validation.passed
-        or not start.rounds
-        or start.rounds[-1].verdict != "accept"
-    ):
-        raise ValueError("native task-start acceptance and provenance QA are incomplete")
-    draws = [start.rounds[-1].author, *start.rounds[-1].reviews]
-    if tuple(draw.variant for draw in start.rounds[-1].reviews) != settings.review_variants:
-        raise ValueError("native task-start has no complete mandatory reviewer receipts")
-    draws.extend(validation.checks)
-    manifest = project.artifacts.read(entry.outcome.artifact_id).manifest
-    if manifest.code_revision != report.plan.code_revision:
-        raise ValueError("native task-start producer differs from completed preparation")
-    if StartDraft.model_validate(start.rounds[-1].author.answer) != start.draft:
-        raise ValueError("native final author receipt describes another task-start draft")
-    if any(
-        ReviewAnswer.model_validate(draw.answer).verdict != "accept"
-        for draw in start.rounds[-1].reviews
-    ):
-        raise ValueError("native mandatory reviewer did not accept the task start")
-    if any(not RevealAnswer.model_validate(draw.answer).consistent for draw in validation.checks):
-        raise ValueError("native first-reveal reviewer found a contradiction")
-    for draw in draws:
-        if draw.transcript is None or draw.failure is not None:
-            raise ValueError("native task-start author/reviewer/reveal receipt is unavailable")
-        _pinned(project, draw.transcript, TRANSCRIPT_TYPE)
-        transcript = AgentTranscript.model_validate_json(
-            project.artifacts.read_bytes(draw.transcript.artifact_id, "transcript.json")
-        )
-        if (
-            transcript.answer != draw.answer
-            or transcript.stop != "answered"
-            or transcript.failure is not None
-            or transcript.role != draw.role
-            or transcript.variant != draw.variant
-        ):
-            raise ValueError("native task-start role receipt differs from its completed transcript")
-        stored = project.artifacts.read(draw.transcript.artifact_id).manifest
-        if artifact_input(stored) != draw.transcript or draw.transcript not in manifest.inputs:
-            raise ValueError("native task-start lost its exact role receipt ancestry")
-    methods = {
-        "observed": "exact_restore",
-        "reconstructed": "prefix_replay",
-        "authored": "coherence_and_first_reveal",
-    }
-    if validation.method != methods[start.provenance]:
-        raise ValueError("native task-start used another provenance QA method")
-    if start.provenance == "reconstructed" and (
-        len(validation.replay) != start.draft.prefix_steps
-        or any(not row.agrees for row in validation.replay)
-    ):
-        raise ValueError("native prefix replay QA is incomplete")
-    if start.provenance == "authored" and (
-        tuple(draw.variant for draw in validation.checks) != settings.reveal_variants
-        or len(validation.reveals) != len(start.draft.reveal_probes)
-    ):
-        raise ValueError("native authored start lacks complete first-reveal QA receipts")
-    return start, entry.outcome
-
-
 def qualify_council(
     project: ProjectStore,
     prepared: ArtifactInput,
@@ -290,77 +201,19 @@ def qualify_council(
     This reader never creates artifacts, installs a ceiling, executes QA or resolves credentials.
     Missing preparation, failed execution or a refused target cannot grant parent authority.
     """
-    _pinned(project, prepared, PREPARATION_TYPE)
-    report = BootstrapPreparationReport.model_validate_json(
-        project.artifacts.read_bytes(prepared.artifact_id, "report.json")
-    )
-    binding = load_bootstrap_resume(
-        project, resume_binding, spec=spec.preparation_spec, code_revision=code_revision
-    )
-    if (
-        prepared.artifact_id != binding.original_operation + "-result"
-        or report.identity != binding.original_operation
-        or report.plan.identity != report.identity
-        or report.plan.resume_binding != resume_binding
-        or report.plan.code_revision != code_revision
-        or report.plan.build_identity != binding.build_identity
-        or report.failed_tasks
-        or spec.bootstrap.task_id in report.refused_tasks
-        or not report.bindings
-    ):
-        raise ValueError("native preparation is not complete under the exact original resume")
-    manifest = project.artifacts.read(prepared.artifact_id).manifest
-    expected = {report.build_report, *report.batches, *report.simulators, resume_binding}
-    if manifest.code_revision != code_revision or set(manifest.inputs) != expected:
-        raise ValueError("native completed preparation producer or ancestry differs")
-    _pinned(project, report.build_report, REPORT_TYPE)
-    build = VarianceBuildReport.model_validate_json(
-        project.artifacts.read_bytes(report.build_report.artifact_id, "report.json")
-    )
-    if build.identity != binding.build_identity or build.build != binding.source_build:
-        raise ValueError("native preparation changed its original source build")
-    execution = bootstrap_execution_spec(project, binding, spec.preparation_spec)
-    selected = select_bootstrap_families(
+    proof = qualify_prepared_council(
         project,
-        build,
-        execution.bootstrap,
-        execution.limits,
-        task_ids=execution.task_ids,
-        simulators=execution.simulators,
+        prepared,
+        resume_binding,
+        CouncilPreparationContract(
+            preparation_spec=spec.preparation_spec,
+            bootstrap=spec.bootstrap,
+            exposure=spec.exposure,
+            family_simulator=spec.family_simulator,
+        ),
+        code_revision=code_revision,
     )
-    start, task_start = _native_start(project, spec.bootstrap, report, execution.bootstrap)
-    families = [row for row in selected if row.simulator.family_id == start.family_id]
-    if len(families) != 1 or spec.family_simulator not in report.simulators:
-        raise ValueError("selected start has no exact prepared family simulator")
-    family = load_family_simulator(project.artifacts, spec.family_simulator)
-    unchanged = {"rule_book", "rule_memory", "rules_report", "runtime", "tasks"}
-    if family.model_dump(exclude=unchanged) != families[0].simulator.model_dump(exclude=unchanged):
-        raise ValueError("prepared family compatibility or scoped source inventory differs")
-    if family.family_id != start.family_id or family.runtime is None:
-        raise ValueError("prepared family runtime is unavailable or belongs to another family")
-    if (
-        family.world_model != families[0].scope.world_model
-        or family.index != families[0].scope.index
-        or family.corpus != families[0].scope.retrieval_scope
-        or family.rule_book != start.rulebook
-        or family.rule_memory != start.rule_memory
-        or family.rules_report != start.rules_report
-        or start.rules_report is None
-        or spec.exposure != build.exposure
-    ):
-        raise ValueError("family world, fit-only RAG scope, exposure or frozen rules differ")
-    exposure = load_exposure_plan(project, spec.exposure)
-    exposure.require(family.members, "world_learning")
-    exposure.require(family.rules_traces, "world_learning")
-    checkpoint = load_continuation_checkpoint(project.artifacts, start.checkpoint)
-    exposure.require_lineage(checkpoint.task.lineage_group_id, "mining_probes")
-    runtime = GroundedRuntimeDefinition.model_validate(start.job.configuration)
-    excluded = {"task", "manifest", "initial_state", "probe_paths", "facts"}
-    if runtime.model_dump(exclude=excluded) != family.runtime.model_dump(exclude=excluded):
-        raise ValueError("task runtime changed its frozen family definition")
-    preflight_grounded_runtime(project, runtime)
-    if frozen_report(project, start.rules_report).rulebook != start.rulebook:
-        raise ValueError("native rules report binds another rule book")
+    start, family, task_start = proof.start, proof.family, proof.task_start
     for study in spec.studies:
         search = study.retrieval
         if search is not None and (

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint
 from exp.optimize.evaluation.variance.council_prelude_hook import CouncilPreludeCheckpoint
 from exp.optimize.evaluation.variance.pipeline_spec import StageContext
 from exp.optimize.evaluation.variance.pipeline_test import TIER_B, make_spec, wired
@@ -21,6 +23,7 @@ def test_real_pipeline_composes_trace_groups_labels_and_authored_rubric_under_sc
     active: ContextVar[str | None] = ContextVar("offline-prelude-phase", default=None)
     events: list[tuple[str, str | None, int]] = []
     observed: list[CouncilPreludeCheckpoint] = []
+    registered: list[tuple[ActorCriticSpec, ...]] = []
 
     @contextmanager
     def scope(checkpoint: CouncilPreludeCheckpoint) -> Iterator[None]:
@@ -50,8 +53,33 @@ def test_real_pipeline_composes_trace_groups_labels_and_authored_rubric_under_sc
             assert checkpoint.judge is not None
         return scope(checkpoint)
 
-    run.dependencies = replace(run.dependencies, council_prelude_admission=admission)
+    original_admission = run.dependencies.council_admission
+
+    def register(context: StageContext, studies: tuple[ActorCriticSpec, ...]) -> None:
+        """All actual generated references are available before any selector can dispatch."""
+        assert context.project == run.project and not registered
+        assert tuple(row.actor_tier for row in studies) == ("actor", TIER_B)
+        assert all(row.references and row.episode_judge.definition.rubric for row in studies)
+        assert [phase for phase, _, _ in events].count("behavior_reference") == 2
+        registered.append(studies)
+
+    def require_registered(
+        actual: ActorCriticSpec, checkpoint: CouncilCheckpoint
+    ) -> AbstractContextManager[object] | None:
+        """The actual actor admission receives only one of the already registered studies."""
+        assert len(registered) == 1 and actual in registered[0]
+        assert original_admission is not None
+        return original_admission(actual, checkpoint)
+
+    run.dependencies = replace(
+        run.dependencies,
+        council_prelude_admission=admission,
+        council_registration=register,
+        council_admission=require_registered,
+    )
     spec = make_spec(run.fixture, run.rubric, run.bank, agentic=True)
+    # More tiers than workers proves registration is a prepare barrier, not a waiting actor.
+    spec = spec.model_copy(update={"mining": spec.mining.model_copy(update={"concurrency": 1})})
     report = run.run(spec)
     assert report.complete, report.stages
     assert active.get() is None
