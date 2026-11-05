@@ -41,6 +41,7 @@ from exp.simulation.mining.tagging import TagMatrix
 from exp.simulation.retrieval.contracts import RAG_ARTIFACT_TYPE, RAG_INDEX_PATH
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.retrieval.tags import TagView
+from exp.simulation.rules.contracts import tool_schema_coverage
 from exp.simulation.rules.model import ToolContract
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -408,29 +409,6 @@ def _base(
     ), simulator
 
 
-def _tool_coverage(
-    task: TaskCase,
-    contracts: dict[str, ToolContract],
-) -> tuple[
-    Literal["schema_matches", "schema_unknown", "schema_mismatch", "missing_tools"], dict[str, str]
-]:
-    """Compare declarations only; equal tool schemas do not establish semantic compatibility."""
-    issues: dict[str, str] = {}
-    for tool in task.tools:
-        contract = contracts.get(tool.name)
-        if contract is None:
-            issues[tool.name] = "missing tool"
-        elif contract.declared_schema is None:
-            issues[tool.name] = "no saved declaration"
-        elif contract.declared_schema != tool.input_schema:
-            issues[tool.name] = "declaration differs"
-    if "missing tool" in issues.values():
-        return "missing_tools", issues
-    if "declaration differs" in issues.values():
-        return "schema_mismatch", issues
-    return ("schema_unknown" if issues else "schema_matches"), issues
-
-
 def _starts(
     project: ProjectStore,
     base: EnvironmentBase,
@@ -533,7 +511,7 @@ def plan_environment_catalog(
             role = plan.roles[task.lineage_group_id]
             if role == "final_evaluation" or task.partition != "fit":
                 raise ValueError("catalog views selected a globally held-out task")
-            coverage, issues = _tool_coverage(task, base.tool_contracts)
+            coverage = tool_schema_coverage(task.tools, base.tool_contracts)
             member, proof = task_id in base.scope.tasks, proofs.get(task_id)
             rows.append(
                 EnvironmentInstancePlan(
@@ -543,8 +521,8 @@ def plan_environment_catalog(
                     lineage_id=task.lineage_group_id,
                     partition=task.partition,
                     role=role,
-                    tool_coverage=coverage,
-                    tool_issues=issues,
+                    tool_coverage=coverage.status,
+                    tool_issues=coverage.issues,
                     native_family_member=member,
                     state_evidence="native_start_validated"
                     if proof

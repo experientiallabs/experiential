@@ -779,6 +779,36 @@ class BootstrapRefusal(ContractModel):
     validation: StartValidation | None = None
 
 
+class TaskBaseKey(ContractModel):
+    """One canonical task in one independent base, the unit of native start progress.
+
+    Attributes:
+        task_id: Canonical task, never copied or renamed per base.
+        family_id: Base whose task identity, capture and checkpoint are independent.
+    """
+
+    task_id: str
+    family_id: str
+
+
+class TaskBaseProgress(ContractModel):
+    """Opt-in many-base inventory; schema placement alone does not validate a start.
+
+    Attributes:
+        canonical_task_bound: Distinct selected tasks, or their pre-build upper bound.
+        task_base_start_bound: Selected task/base starts, or their pre-build upper bound.
+        completed: Exact pairs with saved registrations or diagnostic refusals.
+        remaining: Exact pairs still requiring native preparation.
+        omitted: Automatic task groups omitted by eligibility or whole-group capacity.
+    """
+
+    canonical_task_bound: int = Field(ge=0)
+    task_base_start_bound: int = Field(ge=0)
+    completed: tuple[TaskBaseKey, ...] = ()
+    remaining: tuple[TaskBaseKey, ...] = ()
+    omitted: dict[str, str] = Field(default_factory=dict)
+
+
 class BootstrapBinding(ContractModel):
     """One task's registered start in a frozen batch, as a pipeline registration pins it.
 

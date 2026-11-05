@@ -319,9 +319,8 @@ def test_missing_analysis_remains_diagnostic_without_tagging_again(built: Built)
 def test_observed_tool_declarations_are_only_schema_diagnostics() -> None:
     """Actual trace-parsed tool contracts distinguish absent, unknown and unequal schemas."""
     from exp.common.tasks import TaskCase
-    from exp.optimize.evaluation.variance.environment_catalog import _tool_coverage
     from exp.simulation.mining.environment_families_test import file_trace
-    from exp.simulation.rules.contracts import parse_tool_contracts
+    from exp.simulation.rules.contracts import parse_tool_contracts, tool_schema_coverage
 
     trace = file_trace("source")
     task = TaskCase(
@@ -334,17 +333,17 @@ def test_observed_tool_declarations_are_only_schema_diagnostics() -> None:
         source_trace_ids=(trace.trace_id,),
     )
     contracts = parse_tool_contracts((trace,))
-    assert _tool_coverage(task, contracts)[0] == "schema_matches"
-    assert _tool_coverage(task, {})[0] == "missing_tools"
+    assert tool_schema_coverage(task.tools, contracts).status == "schema_matches"
+    assert tool_schema_coverage(task.tools, {}).status == "missing_tools"
     unknown = {
         name: contract.model_copy(update={"declared_schema": None})
         for name, contract in contracts.items()
     }
-    assert _tool_coverage(task, unknown)[0] == "schema_unknown"
+    assert tool_schema_coverage(task.tools, unknown).status == "schema_unknown"
     changed = {
         **contracts,
         "read_file": contracts["read_file"].model_copy(
             update={"declared_schema": {"type": "array"}}
         ),
     }
-    assert _tool_coverage(task, changed)[0] == "schema_mismatch"
+    assert tool_schema_coverage(task.tools, changed).status == "schema_mismatch"

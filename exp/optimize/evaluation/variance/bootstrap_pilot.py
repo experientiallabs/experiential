@@ -19,6 +19,7 @@ from exp.simulation.mining.environment_families import (
     load_environment_families,
 )
 from exp.simulation.mining.environment_review import review_protocol_sha256
+from exp.simulation.rules.contracts import tool_schema_coverage
 
 if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
@@ -155,7 +156,7 @@ def validate_pilot_revision(
         raise ValueError("pilot historical review protocol or configuration differs")
     record = load_environment_families(project.artifacts, revision.families)
     families = {family.family_id: family for family in record.families}
-    placements = {row.task_id: row.family_id for row in scoping.placements}
+    placements = scoping.placements_by_task()
     scopes = {scope.family_id: scope for scope in scoping.scopes}
     tasks = {
         task.task_id: task
@@ -164,23 +165,20 @@ def validate_pilot_revision(
     exposure = load_exposure_plan(project, revision.exposure)
     eligible: list[str] = []
     for task_id in report.selected_probes:
-        family_id = placements.get(task_id)
-        if family_id not in scopes or family_id not in families:
-            continue
-        family, scope, task = families[family_id], scopes[family_id], tasks[task_id]
-        if family.status != "compatible" or scope.status != "compatible":
-            continue
-        exposure.require_lineage(task.lineage_group_id, "mining_probes")
-        exposure.require(task.source_trace_ids, "mining_probes")
-        exposure.require(scope.members, "world_learning")
-        exposure.require(scope.rules_traces, "world_learning")
-        exposure.require(scope.retrieval_scope.ids, "world_learning")
-        if all(
-            tool.name in family.tool_contracts
-            and tool.input_schema == family.tool_contracts[tool.name].declared_schema
-            for tool in task.tools
-        ):
-            eligible.append(task_id)
+        for family_id in placements.get(task_id, ()):
+            if family_id not in scopes or family_id not in families:
+                continue
+            family, scope, task = families[family_id], scopes[family_id], tasks[task_id]
+            if family.status != "compatible" or scope.status != "compatible":
+                continue
+            exposure.require_lineage(task.lineage_group_id, "mining_probes")
+            exposure.require(task.source_trace_ids, "mining_probes")
+            exposure.require(scope.members, "world_learning")
+            exposure.require(scope.rules_traces, "world_learning")
+            exposure.require(scope.retrieval_scope.ids, "world_learning")
+            if tool_schema_coverage(task.tools, family.tool_contracts).status == "schema_matches":
+                eligible.append(task_id)
+                break
     if not eligible or revision.task_id != eligible[0]:
         raise ValueError(
             "pilot task must be the first ranked exactly covered compatible mining probe"
@@ -189,7 +187,9 @@ def validate_pilot_revision(
         raise ValueError("pilot names no existing compatible family")
     scope, family = scopes[revision.family_id], families[revision.family_id]
     if (
-        placements[revision.task_id] != revision.family_id
+        revision.family_id not in placements[revision.task_id]
+        or tool_schema_coverage(tasks[revision.task_id].tools, family.tool_contracts).status
+        != "schema_matches"
         or sha256_json(scope) != revision.scope_sha256
         or sha256_json(family.model_dump(mode="json")["tool_contracts"])
         != revision.contracts_sha256

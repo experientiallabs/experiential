@@ -7,11 +7,14 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase, load_task_set
 from exp.common.traces import load_trace_dataset
+from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import (
     ConstructionSettings,
+    VarianceBuildReport,
     VarianceBuildSpec,
     load_exposure_plan,
     load_tag_retrieval_binding,
@@ -369,3 +372,313 @@ def test_native_quote_bounds_uneven_candidates_by_their_available_members(
     assert len(record.families) == 3
     assert sorted(member for family in record.families for member in family.members) == ordered
     assert len(script.requests) <= planned.review_calls
+
+
+@pytest.fixture
+def multi_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ProjectStore, BootstrapPreparationSpec, VarianceBuildReport, VarianceBuildReport]:
+    """Build two reviewed bases twice, reusing all canonical tag and review decisions."""
+    from dataclasses import replace
+
+    from exp.common.core.artifacts import sha256_json
+    from exp.optimize.evaluation.variance.bootstrap_selection_test import preparation_fixture
+
+    project, preparation, _ = preparation_fixture(tmp_path, monkeypatch)
+    whole: frozenset[str] | None = None
+
+    def two_bases(members: frozenset[str], variant: str) -> JsonObject:
+        """Split one source cluster into two independent compatible child bases."""
+        nonlocal whole
+        del variant
+        if whole is None:
+            whole = members
+        if members == whole:
+            ordered = sorted(members)
+            half = len(ordered) // 2
+            return answer(
+                "split", members, subgroups=split(tuple(ordered[:half]), tuple(ordered[half:]))
+            )
+        return answer("compatible", members)
+
+    script, bound = reviewer(two_bases)
+    bound = replace(bound, configuration_sha256=sha256_json(preparation.build.reviewer))
+    decisions = FakeDecisions()
+    legacy = run_variance_build(
+        project,
+        preparation.build.spec,
+        code_revision="test",
+        tagger=_tagger(project, decisions),
+        reviewer=bound,
+    )
+    settings = preparation.build.spec.environment_families
+    assert settings is not None
+    enabled = preparation.build.spec.model_copy(
+        update={
+            "environment_families": settings.model_copy(
+                update={"probe_placement": "all_exact_schemas"}
+            )
+        }
+    )
+    before = len(decisions.asked), len(script.requests)
+    report = run_variance_build(
+        project, enabled, code_revision="test", tagger=_tagger(project, decisions), reviewer=bound
+    )
+    assert (len(decisions.asked), len(script.requests)) == before
+    preparation = preparation.model_copy(
+        update={"build": preparation.build.model_copy(update={"spec": enabled})}
+    )
+    return project, preparation, legacy, report
+
+
+def test_many_base_placement_keeps_one_canonical_task_in_each_qualified_base(
+    multi_base: tuple[
+        ProjectStore, BootstrapPreparationSpec, VarianceBuildReport, VarianceBuildReport
+    ],
+) -> None:
+    """Opt-in expands exact-schema pairs while legacy ambiguity remains an honest refusal."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.optimize.evaluation.variance.family_scopes import probe_placement_protocol_sha256
+
+    project, preparation, legacy, report = multi_base
+    old, current = legacy.environment_families, report.environment_families
+    assert old is not None and current is not None
+    assert len(current.scopes) == 2
+    assert report.exposure == legacy.exposure and report.build.task_set == legacy.build.task_set
+    assert old.placement is None and "placement" not in old.model_dump(mode="json")
+    assert legacy.spec.environment_families is not None
+    assert "probe_placement" not in legacy.spec.environment_families.model_dump(mode="json")
+    assert not any(row.family_id for row in old.placements)
+    assert current.placement is not None and current.placement.mode == "all_exact_schemas"
+    assert current.placement.protocol_sha256 == probe_placement_protocol_sha256()
+    accepted = [row for row in current.placements if row.family_id is not None]
+    grouped = current.placements_by_task()
+    assert grouped and all(len(families) == 2 for families in grouped.values())
+    assert len(accepted) == 2 * len(grouped)
+    assert len({(row.task_id, row.family_id) for row in accepted}) == len(accepted)
+    assert all(
+        row.tool_coverage is not None and row.tool_coverage.status == "schema_matches"
+        for row in accepted
+    )
+    canonical = {
+        task.task_id: task
+        for task in load_task_set(project.artifacts, report.build.task_set.artifact_id).tasks
+    }
+    plan = load_exposure_plan(project, report.exposure)
+    record = load_environment_families(project.artifacts, current.families)
+    for family in record.families:
+        scope = current.scope(family.family_id)
+        plan.require(scope.members, "world_learning")
+        plan.require(scope.rules_traces, "world_learning")
+        for task in family.tasks:
+            original = canonical[task.task_id]
+            assert task.lineage_id == original.lineage_group_id
+            assert task.source_trace_ids == original.source_trace_ids
+            assert task.start.initial_context_sha256 == sha256_json(original.initial_context)
+            assert task.start.checkpoint is None
+            assert task.role == plan.roles[original.lineage_group_id]
+            assert original.partition == "fit"
+    first, second = current.scopes
+    assert first.index != second.index and first.world_model != second.world_model
+    assert set(first.members).isdisjoint(second.members)
+    assert preparation.build.spec.environment_families is not None
+
+
+@pytest.mark.parametrize("status", ["schema_unknown", "schema_mismatch", "missing_tools"])
+def test_many_base_schema_rejections_remain_candidate_diagnostics(
+    multi_base: tuple[
+        ProjectStore, BootstrapPreparationSpec, VarianceBuildReport, VarianceBuildReport
+    ],
+    status: str,
+) -> None:
+    """Unknown or unequal declarations never attach the rejected candidate to the task."""
+    from exp.optimize.evaluation.variance.build_records import load_tag_matrix
+    from exp.simulation.mining.tag_clusters import load_tag_clustering
+    from exp.simulation.rules.contracts import parse_tool_contracts
+
+    project, _, _, report = multi_base
+    scoping = report.environment_families
+    assert scoping is not None and report.clustering is not None
+    record = load_environment_families(project.artifacts, scoping.families)
+    native = file_trace("schema-evidence")
+    contracts = parse_tool_contracts((native,))
+    task_id = next(iter(scoping.placements_by_task()))
+    task = next(
+        t
+        for t in load_task_set(project.artifacts, report.build.task_set.artifact_id).tasks
+        if t.task_id == task_id
+    )
+    task = task.model_copy(update={"tools": native.tools})
+    changed = (
+        {}
+        if status == "missing_tools"
+        else {
+            name: contract.model_copy(
+                update={
+                    "declared_schema": None if status == "schema_unknown" else {"type": "array"}
+                }
+            )
+            for name, contract in contracts.items()
+        }
+    )
+    good = record.families[0].model_copy(update={"tool_contracts": contracts})
+    bad = record.families[1].model_copy(update={"tool_contracts": changed})
+    rows, placed = _place(
+        load_exposure_plan(project, report.exposure),
+        (task,),
+        load_tag_clustering(project.artifacts, report.clustering),
+        [load_tag_matrix(project, view.matrix) for view in report.tagging],
+        (good, bad),
+        policy="all_exact_schemas",
+    )
+    assert len(rows) == 2 and set(placed) == {good.family_id}
+    rejected = next(row for row in rows if row.family_id is None)
+    assert rejected.candidate_family_id == bad.family_id
+    assert rejected.tool_coverage is not None and rejected.tool_coverage.status == status
+    assert rejected.tool_coverage.issues
+    assert all(t.start.checkpoint is None for tasks in placed.values() for t in tasks)
+
+
+def test_many_base_selection_counts_starts_and_refuses_partial_base_groups(
+    multi_base: tuple[
+        ProjectStore, BootstrapPreparationSpec, VarianceBuildReport, VarianceBuildReport
+    ],
+) -> None:
+    """A canonical task expands to both bases, with distinct native identities and exact quotes."""
+    from exp.optimize.evaluation.variance.bootstrap import task_identity
+    from exp.optimize.evaluation.variance.bootstrap_plan import plan_bootstrap_preparation
+    from exp.optimize.evaluation.variance.bootstrap_selection import (
+        select_bootstrap_families,
+        select_probe_task_bases,
+    )
+
+    project, preparation, _, report = multi_base
+    assert report.environment_families is not None
+    task_id = next(iter(report.environment_families.placements_by_task()))
+    exact = preparation.model_copy(update={"task_ids": (task_id,)})
+    rows = select_bootstrap_families(
+        project, report, exact.bootstrap, exact.limits, task_ids=exact.task_ids
+    )
+    assert len(rows) == 2
+    assert all(len(row.spec.families[0].tasks) == 1 for row in rows)
+    assert {row.spec.families[0].tasks[0].task.task_id for row in rows} == {task_id}
+    identities = {
+        task_identity(row.spec, row.spec.families[0], row.spec.families[0].tasks[0], "test")
+        for row in rows
+    }
+    assert len(identities) == 2
+    assert all(row.simulator.runtime is None for row in rows)
+    with pytest.raises(ValueError, match="whole task/base groups exceed"):
+        select_bootstrap_families(
+            project,
+            report,
+            exact.bootstrap,
+            exact.limits.model_copy(update={"maximum_tasks": 1}),
+            task_ids=exact.task_ids,
+        )
+    automatic = select_probe_task_bases(
+        report, exact.limits.model_copy(update={"maximum_tasks": 3})
+    )
+    assert len(automatic.task_ids) == 1 and len(automatic.task_bases()) == 2
+    assert automatic.omissions and any(
+        "capacity" in reason for reason in automatic.omissions.values()
+    )
+    plan = plan_bootstrap_preparation(project, exact, code_revision="test")
+    assert plan.task_bound == 2 and plan.remaining_tasks == (task_id,)
+    assert plan.task_base_progress is not None
+    assert plan.task_base_progress.canonical_task_bound == 1
+    assert plan.task_base_progress.task_base_start_bound == 2
+    bad_registration = report.environment_families.placement
+    assert bad_registration is not None
+    malformed = report.model_copy(
+        update={
+            "environment_families": report.environment_families.model_copy(
+                update={
+                    "placement": bad_registration.model_copy(update={"protocol_sha256": "0" * 64})
+                },
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="native policy or protocol"):
+        select_probe_task_bases(malformed, exact.limits, task_ids=exact.task_ids)
+    assert len(plan.task_base_progress.remaining) == 2
+    assert {key.family_id for key in plan.task_base_progress.remaining} == {
+        row.scope.family_id for row in rows
+    }
+    unsaved = exact.model_copy(
+        update={
+            "build": exact.build.model_copy(
+                update={"spec": exact.build.spec.model_copy(update={"probe_limit": 987})}
+            )
+        }
+    )
+    quoted = plan_bootstrap_preparation(project, unsaved, code_revision="test")
+    assert not quoted.build_saved and quoted.task_bound == 2
+    assert quoted.task_base_progress is not None
+    assert quoted.task_base_progress.canonical_task_bound == 1
+    assert quoted.task_base_progress.task_base_start_bound == 2
+
+
+def test_many_base_progress_does_not_hide_a_pending_base_behind_one_finished_task(
+    multi_base: tuple[
+        ProjectStore, BootstrapPreparationSpec, VarianceBuildReport, VarianceBuildReport
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Typed completed refusals are counted per base, never as passed task-start QA."""
+    from exp.optimize.evaluation.variance import bootstrap_plan as owner
+    from exp.optimize.evaluation.variance.bootstrap import task_identity
+    from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapRefusal
+    from exp.optimize.evaluation.variance.bootstrap_selection import select_bootstrap_families
+
+    project, preparation, _, report = multi_base
+    assert report.environment_families is not None
+    task_id = next(iter(report.environment_families.placements_by_task()))
+    spec = preparation.model_copy(update={"task_ids": (task_id,)})
+    selected = select_bootstrap_families(
+        project, report, spec.bootstrap, spec.limits, task_ids=spec.task_ids
+    )
+    outcomes: dict[str, BootstrapRefusal] = {}
+    for row in selected:
+        family = row.spec.families[0]
+        identity = task_identity(row.spec, family, family.tasks[0], "test")
+        outcomes[identity] = BootstrapRefusal(
+            family_id=row.scope.family_id,
+            task_id=task_id,
+            identity=identity,
+            kind="author_unusable",
+            diagnosis="Typed refusal fixture, never a validated start.",
+            rounds=(),
+        )
+    first = next(iter(outcomes))
+
+    def completed_first(_project: ProjectStore, identity: str) -> BootstrapRefusal | None:
+        """Expose one completed diagnostic outcome at the native outcome-reader boundary."""
+        return outcomes.get(identity) if identity == first else None
+
+    monkeypatch.setattr(owner, "load_outcome", completed_first)
+    partial = owner.plan_bootstrap_preparation(project, spec, code_revision="test")
+    assert partial.completed_tasks == () and partial.remaining_tasks == (task_id,)
+    assert not partial.complete and partial.task_bound == 1
+    assert partial.task_base_progress is not None
+    assert (
+        len(partial.task_base_progress.completed) == len(partial.task_base_progress.remaining) == 1
+    )
+    assert (
+        partial.task_base_progress.completed[0].family_id
+        != partial.task_base_progress.remaining[0].family_id
+    )
+
+    def completed_both(_project: ProjectStore, identity: str) -> BootstrapRefusal | None:
+        """Expose both complete refusals, still without creating any runnable start."""
+        return outcomes.get(identity)
+
+    monkeypatch.setattr(owner, "load_outcome", completed_both)
+    complete = owner.plan_bootstrap_preparation(project, spec, code_revision="test")
+    assert complete.completed_tasks == (task_id,) and complete.remaining_tasks == ()
+    assert complete.complete and complete.task_bound == 0
+    assert (
+        complete.task_base_progress is not None and len(complete.task_base_progress.completed) == 2
+    )
+    assert not complete.task_base_progress.remaining

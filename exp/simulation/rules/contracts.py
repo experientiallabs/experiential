@@ -20,13 +20,52 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
-from exp.common.core.artifacts import JsonObject, JsonValue, stable_id
+from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, stable_id
+from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace, TraceSpan
 from exp.common.traces.attributes import is_tool_result, tool_arguments, tool_name, tool_result
 from exp.simulation.retrieval.contracts import RAGLineageBinding
 from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.rules.model import ToolContract
+
+
+class ToolSchemaCoverage(ContractModel):
+    """Declared-schema coverage only, without semantic, state or task-start validation.
+
+    Attributes:
+        status: Whether every requested tool has the exact saved input declaration.
+        issues: Missing, absent or unequal declarations by tool name.
+    """
+
+    status: Literal["schema_matches", "schema_unknown", "schema_mismatch", "missing_tools"]
+    issues: dict[str, str]
+
+
+def tool_schema_coverage(
+    tools: Sequence[ToolSchema],
+    contracts: Mapping[str, ToolContract],
+) -> ToolSchemaCoverage:
+    """Compare exact declarations without treating names or schemas as runnable validity."""
+    issues: dict[str, str] = {}
+    for tool in tools:
+        contract = contracts.get(tool.name)
+        if contract is None:
+            issues[tool.name] = "missing tool"
+        elif contract.declared_schema is None:
+            issues[tool.name] = "no saved declaration"
+        elif contract.declared_schema != tool.input_schema:
+            issues[tool.name] = "declaration differs"
+    status: Literal["schema_matches", "schema_unknown", "schema_mismatch", "missing_tools"]
+    if "missing tool" in issues.values():
+        status = "missing_tools"
+    elif "declaration differs" in issues.values():
+        status = "schema_mismatch"
+    else:
+        status = "schema_unknown" if issues else "schema_matches"
+    return ToolSchemaCoverage(status=status, issues=issues)
+
 
 MAXIMUM_EXAMPLES = 3
 """Most example locators a contract keeps per tool."""

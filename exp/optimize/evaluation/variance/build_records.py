@@ -20,6 +20,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
+    Sha256,
     sha256_json,
     stable_id,
 )
@@ -60,6 +61,7 @@ from exp.simulation.mining.tagging import (
 from exp.simulation.mining.views import Unit
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.tags import TagRetrievalBinding, TagRetrievalMode, TagView
+from exp.simulation.rules.contracts import ToolSchemaCoverage
 
 DEFAULT_TASK_BANK = "capability-shape-task-v1"
 """Local question bank asked about the task view unless the spec names another."""
@@ -395,14 +397,32 @@ class ProbePlacement(ContractModel):
         posterior: That cluster's posterior probability.
         family_id: The family it joined, or None when it stays unplaced.
         reason: Why it was placed there, or why not.
+        candidate_family_id: Rejected opt-in candidate; it is never a membership.
+        tool_coverage: Exact-schema diagnostics, independent of state and start QA.
     """
 
+    candidate_family_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    tool_coverage: ToolSchemaCoverage | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     task_id: str
     trace_id: str | None = None
     cluster_id: str | None = None
     posterior: float | None = None
     family_id: str | None = None
     reason: str
+
+
+class ProbePlacementRegistration(ContractModel):
+    """Explicit opt-in placement semantics bound into a saved family-scoping report.
+
+    Attributes:
+        mode: Registered native placement policy.
+        protocol_sha256: Versioned interpretation of coverage and membership records.
+    """
+
+    mode: Literal["unique", "all_exact_schemas"]
+    protocol_sha256: Sha256
 
 
 class FamilyScope(ContractModel):
@@ -446,7 +466,8 @@ class FamilyScoping(ContractModel):
         uncertain: Uncertain groups reported and left out of training.
         admitted_uncertain: Uncertain groups the spec explicitly admitted.
         left_out: Admitted families without a scope, with why.
-        placements: Every mining-probe task's placement.
+        placements: Accepted task/base pairs and diagnostic rejected candidates.
+        placement: Explicit policy registration; absent retains historical unique semantics.
     """
 
     families: ArtifactInput
@@ -455,6 +476,21 @@ class FamilyScoping(ContractModel):
     admitted_uncertain: tuple[str, ...] = ()
     left_out: dict[str, str] = Field(default_factory=dict)
     placements: tuple[ProbePlacement, ...] = ()
+    placement: ProbePlacementRegistration | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    def placements_by_task(self) -> dict[str, tuple[str, ...]]:
+        """Return every accepted base per canonical task, refusing duplicate physical pairs."""
+        pairs: dict[str, list[str]] = {}
+        for row in self.placements:
+            if row.family_id is None:
+                continue
+            family_ids = pairs.setdefault(row.task_id, [])
+            if row.family_id in family_ids:
+                raise ValueError("family scoping repeats a task/base placement")
+            family_ids.append(row.family_id)
+        return {task_id: tuple(families) for task_id, families in pairs.items()}
 
     def scope(self, family_id: str) -> FamilyScope:
         """Return one family's scope.

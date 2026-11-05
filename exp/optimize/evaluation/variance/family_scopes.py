@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ProjectStore, artifact_input
@@ -39,6 +40,7 @@ from exp.optimize.evaluation.variance.build_records import (
     FamilyScope,
     FamilyScoping,
     ProbePlacement,
+    ProbePlacementRegistration,
     VarianceBuildReport,
     VarianceBuildSpec,
     load_exposure_plan,
@@ -68,6 +70,7 @@ from exp.simulation.retrieval.embedding import RAGEmbeddingCache
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.retrieval.tags import TagRetrievalBinding, TaskQueryTags
+from exp.simulation.rules.contracts import ToolSchemaCoverage, tool_schema_coverage
 from exp.simulation.world_model.construction import construct_world_model
 from exp.simulation.world_model.runtime import (
     load_grounded_world_model_artifact,
@@ -76,6 +79,21 @@ from exp.simulation.world_model.runtime import (
 
 Constructor = Callable[[JsonObject, str], JsonObject]
 """Admitted world-model constructor, as :func:`construct_world_model` takes it."""
+
+
+PROBE_PLACEMENT_PROTOCOL = "probe-placement-v1"
+"""Exact declared-schema candidate coverage remains separate from state and native start QA."""
+
+
+def probe_placement_protocol_sha256() -> str:
+    """Return the guarded placement version and its persisted coverage contract identity."""
+    return sha256_json(
+        {
+            "protocol": PROBE_PLACEMENT_PROTOCOL,
+            "coverage": ToolSchemaCoverage.model_json_schema(),
+            "placement": ProbePlacement.model_json_schema(),
+        }
+    )
 
 
 def require_family_review(spec: VarianceBuildSpec, reviewer: CompatibilityReviewer | None) -> None:
@@ -151,7 +169,9 @@ def scope_families(
     if report.errors is not None:
         errors = load_error_tags(store, report.errors).matrix
         matrices.append(errors.model_copy(update={"view": "errors"}))
-    placements, placed = _place(plan, tasks, clustering, matrices, admitted)
+    placements, placed = _place(
+        plan, tasks, clustering, matrices, admitted, policy=spec.probe_placement or "unique"
+    )
     record = with_placed(record, placed)
     saved = persist_environment_families(
         store, record, code_revision=code_revision, inputs=(reviewed,)
@@ -246,6 +266,12 @@ def scope_families(
         admitted_uncertain=tuple(sorted(admitted_ids)),
         left_out=left_out,
         placements=placements,
+        placement=None
+        if spec.probe_placement is None
+        else ProbePlacementRegistration(
+            mode=spec.probe_placement,
+            protocol_sha256=probe_placement_protocol_sha256(),
+        ),
     )
     return report.model_copy(update={"environment_families": scoping})
 
@@ -261,8 +287,14 @@ def _place(
     clustering: TagClustering,
     matrices: Sequence[TagMatrix],
     families: Sequence[EnvironmentFamily],
+    *,
+    policy: Literal["unique", "all_exact_schemas"] = "unique",
 ) -> tuple[tuple[ProbePlacement, ...], dict[str, list[FamilyTask]]]:
-    """Place each mining-probe task in one family by its source trace's cluster posterior."""
+    """Retain unique legacy placement or attach every exact-schema-covered same-cluster base.
+
+    An attached task carries its recorded source context only. No base state or start QA is
+    inferred from matching schemas; rejected candidates remain diagnostics without membership.
+    """
     rows: list[ProbePlacement] = []
     placed: dict[str, list[FamilyTask]] = {}
     for task in tasks:
@@ -281,6 +313,40 @@ def _place(
         found = ProbePlacement(
             task_id=task.task_id, trace_id=trace, cluster_id=cluster, posterior=posterior, reason=""
         )
+        if policy == "all_exact_schemas":
+            same_cluster = [family for family in families if family.cluster_id == cluster]
+            if not same_cluster:
+                rows.append(
+                    found.model_copy(update={"reason": f"cluster {cluster} has no admitted family"})
+                )
+            for family in same_cluster:
+                coverage = tool_schema_coverage(task.tools, family.tool_contracts)
+                if coverage.status != "schema_matches":
+                    rows.append(
+                        found.model_copy(
+                            update={
+                                "candidate_family_id": family.family_id,
+                                "tool_coverage": coverage,
+                                "reason": f"family {family.path}: {coverage.status}",
+                            }
+                        )
+                    )
+                    continue
+                placed.setdefault(family.family_id, []).append(family_task(task, "mining_probes"))
+                rows.append(
+                    found.model_copy(
+                        update={
+                            "family_id": family.family_id,
+                            "tool_coverage": coverage,
+                            "reason": (
+                                f"posterior {posterior:.3f} in cluster {cluster}; "
+                                f"family {family.path}; "
+                                "exact declared schemas cover the task tools"
+                            ),
+                        }
+                    )
+                )
+            continue
         if len(candidates) != 1:
             why = (
                 f"cluster {cluster} has no admitted family"
