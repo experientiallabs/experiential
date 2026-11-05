@@ -41,7 +41,11 @@ from exp.runtime.models.spend_ceiling import MAXIMUM_UNPRICED_ATTEMPTS
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding, embed_rag_texts
 from exp.simulation.retrieval.embedding_checkpoint import RAGEmbeddingCheckpoint
-from exp.simulation.retrieval.embedding_inputs import embedding_batches, plan_rag_embedding_inputs
+from exp.simulation.retrieval.embedding_inputs import (
+    embedding_batches,
+    embedding_chunk_bytes,
+    plan_rag_embedding_inputs,
+)
 from exp.simulation.retrieval.reembedding import load_reembedding_input
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -777,6 +781,8 @@ def materialize_family_embedding(
     ):
         raise ValueError("family embedding client differs from native admitted intent")
     old = load_rag_index(project.artifacts, intent.source_scope.index.artifact_id)
+    if embedding_chunk_bytes(embedder.maximum_input_tokens) != old.index.embedding_chunk_bytes:
+        raise ValueError("family embedding client changes admitted chunk semantics")
     original = load_grounded_world_model_artifact(
         project.artifacts, intent.source_scope.world_model
     )

@@ -154,6 +154,19 @@ def test_native_intent_and_pending_inventory_preserve_original_scope_and_account
             return values
 
     fixture = FixtureEmbedding()
+    with pytest.raises(ValueError, match="chunk semantics"):
+        materialize_family_embedding(
+            project,
+            reference,
+            RAGEmbedderBinding(
+                client=fixture,
+                snapshot=intent.target_embedder,
+                maximum_attempts=3,
+                maximum_batch_inputs=64,
+                maximum_input_tokens=64,
+            ),
+        )
+    assert fixture.requests == []
     scope = materialize_family_embedding(
         project,
         reference,
