@@ -15,8 +15,9 @@ operator with write access to the file can still replace it or remove its guards
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 from uuid import uuid4
 
 from exp.common.sqlite.connection import connect_database
@@ -48,13 +49,16 @@ class DispatchLedger:
         LedgerSchemaError: If an existing file has a different schema.
     """
 
-    def __init__(self, path: Path, cap: int, phase_config_sha256: str) -> None:
+    def __init__(
+        self, path: Path, cap: int, phase_config_sha256: str, *, create: bool = True
+    ) -> None:
         """Create or open the ledger, validating the cap and the phase digest.
 
         Args:
             path: SQLite file path.
             cap: Global provider-call cap.
             phase_config_sha256: Lowercase hex SHA-256 of the phase configuration.
+            create: Permit initial registration; False requires the existing registered file.
 
         Raises:
             ValueError: If ``cap`` is not positive or the digest is malformed.
@@ -67,12 +71,15 @@ class DispatchLedger:
         self._path = path
         self._cap = cap
         self._phase = phase_config_sha256
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = connect_database(path)
+        if create:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        connection = connect_database(path, create=create)
         try:
             connection.execute("BEGIN IMMEDIATE")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 0:
+                if not create:
+                    raise LedgerSchemaError("cannot reopen an unregistered ledger")
                 existing = connection.execute(
                     "SELECT COUNT(*) FROM sqlite_master"
                     " WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -135,6 +142,39 @@ class DispatchLedger:
             raise
         finally:
             connection.close()
+
+    @classmethod
+    def reopen(cls, path: Path, phase_config_sha256: str) -> Self:
+        """Reopen the immutable registered cap and every prior slot without new registration.
+
+        Args:
+            path: Existing ledger file owned by this phase.
+            phase_config_sha256: Expected immutable phase identity.
+
+        Returns:
+            The same registered allowance and retained invocation history.
+
+        Raises:
+            LedgerSchemaError: The file, schema, registration or phase is absent or differs.
+        """
+        if not path.is_file():
+            raise LedgerSchemaError("registered dispatch ledger is missing")
+        try:
+            connection = connect_database(path, create=False, enable_wal=False)
+            try:
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version != SCHEMA_VERSION:
+                    raise LedgerSchemaError("registered dispatch ledger schema differs")
+                row = connection.execute(
+                    "SELECT cap, phase_config_sha256 FROM registration WHERE singleton = 1"
+                ).fetchone()
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            raise LedgerSchemaError("cannot read the registered dispatch ledger") from error
+        if row is None or row[1] != phase_config_sha256:
+            raise LedgerSchemaError("registered dispatch ledger phase differs")
+        return cls(path, int(row[0]), phase_config_sha256, create=False)
 
     @property
     def cap(self) -> int:

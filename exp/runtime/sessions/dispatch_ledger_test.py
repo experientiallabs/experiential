@@ -251,3 +251,36 @@ def test_attempt_snapshot_is_ordered_detached_and_durable_without_claims(tmp_pat
     assert reopened.used() == 2
     with pytest.raises(DispatchCapExhaustedError):
         reopened.claim(NOW)
+
+
+def test_reopen_uses_original_cap_and_retains_every_claim(tmp_path: Path) -> None:
+    """Resuming an immutable phase never registers the caller's new pending-work estimate."""
+    path = tmp_path / "ledger.sqlite"
+    original = DispatchLedger(path, cap=2, phase_config_sha256=PHASE)
+    original.claim(NOW)
+    reopened = DispatchLedger.reopen(path, PHASE)
+    assert reopened.cap == 2 and reopened.attempt_ids() == original.attempt_ids()
+    reopened.claim(NOW)
+    with pytest.raises(DispatchCapExhaustedError):
+        DispatchLedger.reopen(path, PHASE).claim(NOW)
+    assert original.used() == 2
+
+
+def test_reopen_refuses_missing_wrong_phase_and_unregistered_files(tmp_path: Path) -> None:
+    """Reopen cannot create authority or adopt another phase's existing counter."""
+    path = tmp_path / "ledger.sqlite"
+    with pytest.raises(LedgerSchemaError, match="missing"):
+        DispatchLedger.reopen(path, PHASE)
+    assert not path.exists()
+    DispatchLedger(path, cap=2, phase_config_sha256=PHASE)
+    with pytest.raises(LedgerSchemaError, match="phase"):
+        DispatchLedger.reopen(path, "b" * 64)
+    empty = tmp_path / "empty.sqlite"
+    with sqlite3.connect(empty):
+        pass
+    with pytest.raises(LedgerSchemaError, match="schema"):
+        DispatchLedger.reopen(empty, PHASE)
+    with sqlite3.connect(empty) as connection:
+        assert not connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()

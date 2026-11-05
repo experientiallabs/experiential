@@ -54,6 +54,7 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapRegistration,
     BootstrapSettings,
 )
+from exp.optimize.evaluation.variance.bootstrap_decisions import bootstrap_decisions
 from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
 from exp.optimize.evaluation.variance.bootstrap_resume import (
     BootstrapResumeBinding,
@@ -235,7 +236,7 @@ class BootstrapDependencies:
         tagger: Variance build tagger, or None for the admitted default.
         reviewer: Compatibility reviewer matching the frozen settings, or None for the default.
         namer: Cluster naming client when naming is registered.
-        decisions: Native rule-memory decision client, or None for its admitted default.
+        decisions: Native rule-memory decision client, or None to compose it inside admission.
     """
 
     tagger: DecisionsTraceTagger | None = None
@@ -628,6 +629,7 @@ def run_bootstrap_preparation(
             execution = (
                 spec if binding is None else bootstrap_execution_spec(project, binding, spec)
             )
+            dependencies = bootstrap_decisions(project, execution.bootstrap, plan, dependencies)
             result = _run(project, execution, plan, dependencies, reviewer, code_revision, binding)
             if not result.failed_tasks:
                 refs = (

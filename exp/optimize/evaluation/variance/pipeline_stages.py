@@ -34,6 +34,7 @@ from exp.optimize.evaluation.executable.grounded import (
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.rules.challenges import RuntimeChallenges
+from exp.optimize.evaluation.rules.decision_client import rule_memory_decisions
 from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
@@ -795,19 +796,9 @@ def _rules_decisions(context: StageContext, stage: RulesStageSpec) -> DecisionsT
     if injected is not None:
         return injected
     assert stage.memory is not None
-    project = context.project
-    catalog = load_model_catalog(project.model_catalog_path)
-    resolved = RuntimeModelCatalog(catalog).resolve(stage.memory.decision_alias)
     deadline = datetime.now(UTC) + timedelta(hours=context.spec.traceml.deadline_hours)
-    transport = admitted_transport(context, "rules-decisions", 100_000, deadline).priced_as(
-        stage.memory.decision_alias
-    )
-    return DecisionsTraceTagger.for_alias(
-        resolved,
-        transport=transport,
-        cache=DecisionCache(project.paths),
-        maximum_concurrency=stage.concurrency,
-    )
+    transport = admitted_transport(context, "rules-decisions", 100_000, deadline)
+    return rule_memory_decisions(context.project, stage, transport)
 
 
 def _rules_search(
