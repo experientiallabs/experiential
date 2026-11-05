@@ -2,17 +2,34 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from functools import cache
+from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.variance.evidence import EvidencePacket
+from exp.optimize.evaluation.continuations.job import (
+    continuation_result_reference,
+    execute_continuation_job,
+    saved_continuation_job,
+)
+from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.variance.council_checkpoint import CouncilAdmission, admit_phase
+from exp.optimize.evaluation.variance.evidence import (
+    EvidencePacket,
+    TraceSearch,
+    load_references,
+    open_trace_search,
+)
+from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judged import judge_study, judged_episode, slot_rewards
+from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
+from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 
 if TYPE_CHECKING:
-    from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
+    from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec, PickRecord
 
 INITIAL_FEEDBACK_PROTOCOL = "council-initial-llm-feedback-v1"
 
@@ -113,3 +130,61 @@ def initial_feedback(
             "refs": frozenset(documents),
         }
     ), reference
+
+
+class PreparedCouncil(NamedTuple):
+    """Native initial group, judged feedback and read-only selected evidence."""
+
+    group: ContinuationStudy
+    source: ArtifactInput
+    initial_judged: ArtifactInput
+    pick: PickRecord
+    packet: EvidencePacket
+    loader: Callable[[ArtifactInput], ContinuationCheckpoint]
+    search: TraceSearch | None
+
+
+def prepare_initial(
+    project: ProjectStore,
+    spec: ActorCriticSpec,
+    identity: str,
+    *,
+    exposure: ExposurePlan,
+    code_revision: str,
+    embedder: RAGEmbedderBinding | None,
+    admission: CouncilAdmission | None,
+) -> PreparedCouncil:
+    """Sample and LLM-grade a new group within one native wave, or grade its saved actors.
+
+    A cached TraceML actor group needs only the initial-judging wave. New groups' actor-wave
+    inventory includes their LLM labels and this owner performs both before its scope exits.
+    """
+    from exp.optimize.evaluation.variance.actor_critic import _pick
+
+    store = project.artifacts
+    group = saved_continuation_job(project, spec.initial, code_revision=code_revision)
+    source = (
+        None
+        if group is None
+        else continuation_result_reference(
+            project,
+            spec.initial,
+            code_revision=code_revision,
+        )
+    )
+    phase = "actors" if group is None else "initial_judging"
+    with admit_phase(admission, spec, identity, phase, group=source):
+        if group is None:
+            group = execute_continuation_job(project, spec.initial, code_revision=code_revision)
+            source = continuation_result_reference(
+                project, spec.initial, code_revision=code_revision
+            )
+        assert source is not None
+        loader = cache(lambda ref: load_continuation_checkpoint(store, ref))
+        references = load_references(store, spec.references)
+        search = open_trace_search(store, r, exposure, embedder) if (r := spec.retrieval) else None
+        pick, packet = _pick(group, identity, spec, loader, references)
+        packet, judged = initial_feedback(
+            project, spec, source, packet, code_revision=code_revision
+        )
+    return PreparedCouncil(group, source, judged, pick, packet, loader, search)

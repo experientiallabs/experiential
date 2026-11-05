@@ -46,6 +46,7 @@ class ParentSpendPolicy(ContractModel):
         producer_revision: Actual reviewed executor allowed to certify native completion.
     """
 
+    protocol: Literal["scoped-parent-spend-v1"] = "scoped-parent-spend-v1"
     operation: str = Field(min_length=1)
     legacy_attempt_limit: int = Field(ge=0, le=MAXIMUM_PARENT_ATTEMPTS, strict=True)
     parent_attempt_limit: int = Field(ge=1, le=MAXIMUM_PARENT_ATTEMPTS, strict=True)
@@ -61,6 +62,7 @@ class ParentSpendPolicy(ContractModel):
 class _ParentRecord(ContractModel):
     """Registration-time immutable audit of original authority and retained liabilities."""
 
+    protocol: Literal["scoped-parent-audit-v1"] = "scoped-parent-audit-v1"
     policy: ParentSpendPolicy
     ledger_sha256: Sha256
     legacy_authorizations: tuple[JsonObject, ...]
@@ -100,6 +102,7 @@ class SpendEnvelopePlan(ContractModel):
     The budget primitive deliberately cannot decide domain admission or task correctness.
     """
 
+    protocol: Literal["native-spend-envelope-v1"] = "native-spend-envelope-v1"
     policy: ParentSpendRef
     scope: str = Field(min_length=1, max_length=256)
     inventory: ArtifactInput
@@ -118,7 +121,7 @@ class SpendEnvelopeRef(ContractModel):
 
 def _ledger(ceiling: OperationSpendCeiling) -> Sha256:
     """Bind authority to the actual existing ledger path, without copying claims."""
-    return sha256_json({"path": str(ceiling.path.resolve())})
+    return sha256_json({"ledger_path": str(ceiling.path.resolve())})
 
 
 def _present(connection: sqlite3.Connection) -> bool:

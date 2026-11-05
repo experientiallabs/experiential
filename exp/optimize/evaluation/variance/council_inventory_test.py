@@ -96,3 +96,30 @@ def test_phase_inventory_rejects_native_identity_count_and_job_substitution(
             code_revision="inventory",
         )
     assert missing.artifact_id == "missing" and not actor.requests
+
+
+def test_scoped_parent_keeps_existing_bootstrap_operation_identity(tmp_path: Path) -> None:
+    """The additive parent points at the existing native ledger, not a new identity namespace."""
+    from datetime import UTC, datetime, timedelta
+
+    from exp.optimize.evaluation.factory.author_retries import operation_identity
+    from exp.runtime.models.scoped_spending import ParentSpendPolicy, register_parent_policy
+    from exp.runtime.models.spend_ceiling import OperationSpendCeiling
+
+    ceiling = OperationSpendCeiling(tmp_path / "original.sqlite", tariffs={})
+    ceiling.authorize_policy(ceiling_usd=0, unpriced_attempts=2)
+    proof = ArtifactInput(artifact_id="fixture-proof", sha256="0" * 64)
+    policy = ParentSpendPolicy(
+        operation="original-operation",
+        legacy_attempt_limit=2,
+        parent_attempt_limit=5,
+        maximum_known_usd=0,
+        deadline=datetime.now(UTC) + timedelta(hours=1),
+        aliases=("actor",),
+        authorization=proof,
+        preparation=proof,
+        execution=proof,
+        producer_revision="fixture",
+    )
+    reference = register_parent_policy(ceiling, policy)
+    assert reference.ledger_sha256 == operation_identity(ceiling)
