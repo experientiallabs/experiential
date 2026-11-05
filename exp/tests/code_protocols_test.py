@@ -617,14 +617,18 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.pipeline_spec:PIPELINE_PROTOCOL",
-        "decision-variance-pipeline-v2",
+        "decision-variance-pipeline-v3",
         (
             "exp.optimize.evaluation.variance.pipeline_spec:DecisionVarianceSpec.slice",
             "exp.optimize.evaluation.variance.pipeline_spec:stage_identity",
             "exp.optimize.evaluation.variance.pipeline:_identities",
             "exp.optimize.evaluation.variance.pipeline:_register",
+            "exp.optimize.evaluation.variance.pipeline_admission",
+            "exp.optimize.evaluation.variance.pipeline_downstream",
+            "exp.optimize.evaluation.variance.pipeline:_execute",
+            "exp.optimize.evaluation.variance.pipeline:run_decision_variance",
         ),
-        "e44b4d9bfd3adbaeb7387cd875ae65483f7bf4779c8e62303b07e196a3caf8fa",
+        "13029ea86f0a6836c5ffaec312a2edd3cd9244aaca4c2d96740ff9e9ecd395c1",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.system_one:SYSTEM_ONE_PROTOCOL",
