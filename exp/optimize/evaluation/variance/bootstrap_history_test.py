@@ -69,12 +69,24 @@ def test_historical_reader_pins_real_source_record_without_granting_current_exec
         )
 
 
-def test_legacy_resume_without_native_source_proof_is_correctly_refused(
+def test_fresh_native_binding_records_real_source_and_current_drift_refuses_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A producer label and a completed build never substitute for recorded source bytes."""
+    """New native writers record actual package bytes, with no producer-label hashing."""
     project, spec, reference, _ = pilot_fixture(tmp_path, monkeypatch)
+    from exp.optimize.evaluation.variance.bootstrap_source import current_bootstrap_execution_source
+
+    proof = read_bootstrap_preparation_provenance(project, reference, spec=spec)
+    witness = current_bootstrap_execution_source("corrected")
+    assert proof.source_type == "bootstrap-resume-binding"
+    assert proof.source_ref == reference and proof.source_sha256 == witness.source_sha256
+    assert proof.binding.execution_source == witness
     before = project.artifacts.list_ids()
-    with pytest.raises(ValueError, match="no recorded source provenance"):
-        read_bootstrap_preparation_provenance(project, reference, spec=spec)
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.variance.bootstrap_resume.current_bootstrap_execution_source",
+        lambda producer: witness.model_copy(update={"source_sha256": "0" * 64}),
+    )
+    with pytest.raises(ValueError, match="registered witness"):
+        load_bootstrap_resume(project, reference, spec=spec, code_revision="corrected")
+    assert read_bootstrap_preparation_provenance(project, reference, spec=spec) == proof
     assert project.artifacts.list_ids() == before

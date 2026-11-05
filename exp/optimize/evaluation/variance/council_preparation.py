@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pydantic import Field
+
 from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
+    Sha256,
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.grounded import (
@@ -22,16 +25,18 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     ReviewAnswer,
     StartDraft,
 )
+from exp.optimize.evaluation.variance.bootstrap_history import (
+    PreparationSourceType,
+    read_bootstrap_preparation_provenance,
+)
 from exp.optimize.evaluation.variance.bootstrap_plan import (
     PREPARATION_TYPE,
     BootstrapPreparationReport,
     BootstrapPreparationSpec,
 )
-from exp.optimize.evaluation.variance.bootstrap_resume import (
-    bootstrap_execution_spec,
-    load_bootstrap_resume,
+from exp.optimize.evaluation.variance.bootstrap_selection import (
+    read_historical_bootstrap_families,
 )
-from exp.optimize.evaluation.variance.bootstrap_selection import select_bootstrap_families
 from exp.optimize.evaluation.variance.bootstrap_stage import bootstrapped_registration
 from exp.optimize.evaluation.variance.build_records import (
     REPORT_TYPE,
@@ -49,12 +54,20 @@ class CouncilPreparationContract(ContractModel):
     """Exact native preparation inputs shared by prelude and full-study registration.
 
     Attributes:
+        preparation_producer: True historical producer of the native preparation.
+        preparation_source_sha256: Native source digest under its declared provenance type.
+        preparation_provenance: Actual native source-authority artifact reference.
+        preparation_provenance_type: Native digest owner, preserving its algorithm and scope.
         preparation_spec: Original frozen preparation settings.
         bootstrap: Exact selected native task-start binding.
         exposure: Saved preparation build exposure plan.
         family_simulator: Frozen prepared family world, rules and retrieval scope.
     """
 
+    preparation_producer: str = Field(min_length=1)
+    preparation_source_sha256: Sha256
+    preparation_provenance: ArtifactInput
+    preparation_provenance_type: PreparationSourceType
     preparation_spec: BootstrapPreparationSpec
     bootstrap: BootstrapBinding
     exposure: ArtifactInput
@@ -72,7 +85,7 @@ class PreparedCouncilTask(ContractModel):
         task_start: Exact native task-start registration with its QA receipts.
         start: Independently checked native start and job.
         family: Checked shared family runtime, rules and fit-only retrieval scope.
-        producer_revision: Actual producing source revision.
+        producer_revision: Actual current council verifier and executor revision.
     """
 
     contract: CouncilPreparationContract
@@ -101,6 +114,8 @@ def _native_start(
     settings: BootstrapSettings,
 ) -> tuple[BootstrapRegistration, ArtifactInput]:
     """Independently verify the selected committed start and its provenance-required QA."""
+    if binding.task_id in report.refused_tasks:
+        raise ValueError("native preparation selected task was refused")
     if binding not in report.bindings or binding.batch not in report.batches:
         raise ValueError("selected task has no binding in the completed preparation")
     entry = registration_entry(project, binding)
@@ -184,15 +199,30 @@ def qualify_prepared_council(
     report = BootstrapPreparationReport.model_validate_json(
         project.artifacts.read_bytes(prepared.artifact_id, "report.json")
     )
-    binding = load_bootstrap_resume(
-        project, resume_binding, spec=spec.preparation_spec, code_revision=code_revision
+    provenance = read_bootstrap_preparation_provenance(
+        project,
+        resume_binding,
+        spec=spec.preparation_spec,
     )
+    if (
+        spec.preparation_producer,
+        spec.preparation_source_sha256,
+        spec.preparation_provenance,
+        spec.preparation_provenance_type,
+    ) != (
+        provenance.producer_revision,
+        provenance.source_sha256,
+        provenance.source_ref,
+        provenance.source_type,
+    ):
+        raise ValueError("declared preparation provenance differs from the actual native owner")
+    binding = provenance.binding
     if (
         prepared.artifact_id != binding.original_operation + "-result"
         or report.identity != binding.original_operation
         or report.plan.identity != report.identity
         or report.plan.resume_binding != resume_binding
-        or report.plan.code_revision != code_revision
+        or report.plan.code_revision != provenance.producer_revision
         or report.plan.build_identity != binding.build_identity
         or report.failed_tasks
         or spec.bootstrap.task_id in report.refused_tasks
@@ -201,7 +231,7 @@ def qualify_prepared_council(
         raise ValueError("native preparation is not complete under the exact original resume")
     manifest = project.artifacts.read(prepared.artifact_id).manifest
     expected = {report.build_report, *report.batches, *report.simulators, resume_binding}
-    if manifest.code_revision != code_revision or set(manifest.inputs) != expected:
+    if manifest.code_revision != provenance.producer_revision or set(manifest.inputs) != expected:
         raise ValueError("native completed preparation producer or ancestry differs")
     _pinned(project, report.build_report, REPORT_TYPE)
     build = VarianceBuildReport.model_validate_json(
@@ -209,14 +239,15 @@ def qualify_prepared_council(
     )
     if build.identity != binding.build_identity or build.build != binding.source_build:
         raise ValueError("native preparation changed its original source build")
-    execution = bootstrap_execution_spec(project, binding, spec.preparation_spec)
-    selected = select_bootstrap_families(
+    execution = provenance.execution_spec
+    selected = read_historical_bootstrap_families(
         project,
         build,
         execution.bootstrap,
         execution.limits,
         task_ids=execution.task_ids,
         simulators=execution.simulators,
+        embedding_revision=binding.embedding_revision,
     )
     start, task_start = _native_start(project, spec.bootstrap, report, execution.bootstrap)
     families = [row for row in selected if row.simulator.family_id == start.family_id]

@@ -70,6 +70,53 @@ def select_bootstrap_families(
     simulators: Sequence[ArtifactInput] = (),
     embedding_revision: ArtifactInput | None = None,
 ) -> tuple[SelectedBootstrap, ...]:
+    """Select current executable preparation inputs under their live source contracts."""
+    return _select_bootstrap_families(
+        project,
+        report,
+        settings,
+        limits,
+        task_ids=task_ids,
+        simulators=simulators,
+        embedding_revision=embedding_revision,
+        historical_embedding=False,
+    )
+
+
+def read_historical_bootstrap_families(
+    project: ProjectStore,
+    report: VarianceBuildReport,
+    settings: BootstrapSettings,
+    limits: BootstrapLimits,
+    *,
+    task_ids: Sequence[str] = (),
+    simulators: Sequence[ArtifactInput] = (),
+    embedding_revision: ArtifactInput | None = None,
+) -> tuple[SelectedBootstrap, ...]:
+    """Read the exact native family selection and completed overlay without execution authority."""
+    return _select_bootstrap_families(
+        project,
+        report,
+        settings,
+        limits,
+        task_ids=task_ids,
+        simulators=simulators,
+        embedding_revision=embedding_revision,
+        historical_embedding=True,
+    )
+
+
+def _select_bootstrap_families(
+    project: ProjectStore,
+    report: VarianceBuildReport,
+    settings: BootstrapSettings,
+    limits: BootstrapLimits,
+    *,
+    task_ids: Sequence[str] = (),
+    simulators: Sequence[ArtifactInput] = (),
+    embedding_revision: ArtifactInput | None = None,
+    historical_embedding: bool,
+) -> tuple[SelectedBootstrap, ...]:
     """Build one exact registration per selected family without authors, captures or fake jobs.
 
     Explicit task IDs must be selected probes with a compatible saved placement. Without an
@@ -122,7 +169,9 @@ def select_bootstrap_families(
             load_family_embedding_completion,
         )
 
-        intent, overlay = load_family_embedding_completion(project, embedding_revision)
+        intent, overlay = load_family_embedding_completion(
+            project, embedding_revision, historical=historical_embedding
+        )
         actual_build = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
         if (
             actual_build != intent.source_build

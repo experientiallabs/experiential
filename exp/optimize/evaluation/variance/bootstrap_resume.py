@@ -31,6 +31,10 @@ from exp.optimize.evaluation.variance.bootstrap_pilot import (
     validate_pilot_revision,
 )
 from exp.optimize.evaluation.variance.bootstrap_protocols import validate_protocol_successor
+from exp.optimize.evaluation.variance.bootstrap_source import (
+    BootstrapExecutionSource,
+    current_bootstrap_execution_source,
+)
 from exp.runtime.models.spend_ceiling import OperationSpendCeiling, SpendAuthorization
 from exp.simulation.mining.environment_review import review_protocol_sha256
 
@@ -108,6 +112,9 @@ class BootstrapResumeBinding(ContractModel):
         embedding_revision: Genuine completed exact-family embedding and rules revision.
     """
 
+    execution_source: BootstrapExecutionSource | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     original_inputs: ArtifactInput
     original_revision: str = Field(min_length=1)
     producer_revision: str = Field(min_length=1)
@@ -673,6 +680,7 @@ def register_bootstrap_resume(
             reviewer_configuration_sha256=sha256_json(actual_reviewer),
         ).identity
     binding = BootstrapResumeBinding(
+        execution_source=current_bootstrap_execution_source(code_revision),
         original_inputs=original_inputs,
         original_revision=revision,
         producer_revision=code_revision,
@@ -856,6 +864,14 @@ def _load_bootstrap_resume(
         or reference.artifact_id != stable_id(RESUME_TYPE, binding)
     ):
         raise ValueError("bootstrap resume actual producer differs from its binding")
+    if binding.execution_source is not None and (
+        binding.execution_source.producer_revision != code_revision
+        or (
+            not historical
+            and binding.execution_source != current_bootstrap_execution_source(code_revision)
+        )
+    ):
+        raise ValueError("bootstrap execution source differs from its registered witness")
     anchor = project.artifacts.read(_registration_identity(binding)).manifest
     selected = ArtifactInput.model_validate_json(
         project.artifacts.read_bytes(anchor.artifact_id, "binding.json")

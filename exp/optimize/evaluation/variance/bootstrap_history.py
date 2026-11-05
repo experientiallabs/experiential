@@ -19,7 +19,7 @@ from exp.optimize.evaluation.variance.family_embedding_executor import (
 )
 
 type PreparationSourceType = Literal[
-    "family-embedding-executor-revision", "bootstrap-protocol-revision"
+    "family-embedding-executor-revision", "bootstrap-protocol-revision", "bootstrap-resume-binding"
 ]
 
 
@@ -78,6 +78,13 @@ def read_bootstrap_preparation_provenance(
             raise ValueError("native protocol source provenance belongs to another producer")
         source_sha256 = sha256_json(protocol.source)
         source_type = "bootstrap-protocol-revision"
+    elif binding.execution_source is not None:
+        witness = binding.execution_source
+        if witness.producer_revision != binding.producer_revision:
+            raise ValueError("native execution witness belongs to another producer")
+        source_ref = reference
+        source_sha256 = witness.source_sha256
+        source_type = "bootstrap-resume-binding"
     else:
         raise ValueError("native preparation binding has no recorded source provenance")
     return BootstrapPreparationProvenance(

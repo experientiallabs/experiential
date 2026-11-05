@@ -34,11 +34,12 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapBinding,
     BootstrapRegistration,
 )
+from exp.optimize.evaluation.variance.bootstrap_history import (
+    PreparationSourceType,
+    read_bootstrap_preparation_provenance,
+)
 from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapPreparationSpec,
-)
-from exp.optimize.evaluation.variance.bootstrap_resume import (
-    load_bootstrap_resume,
 )
 from exp.optimize.evaluation.variance.council_preparation import (
     CouncilPreparationContract,
@@ -67,6 +68,11 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/variance/bootstrap.py",
     "exp/optimize/evaluation/variance/bootstrap_capture.py",
     "exp/optimize/evaluation/variance/bootstrap_contracts.py",
+    "exp/optimize/evaluation/variance/bootstrap_history.py",
+    "exp/optimize/evaluation/variance/bootstrap_source.py",
+    "exp/optimize/evaluation/variance/bootstrap_resume.py",
+    "exp/optimize/evaluation/variance/bootstrap_protocols.py",
+    "exp/optimize/evaluation/variance/bootstrap_selection.py",
     "exp/optimize/evaluation/variance/council_checkpoint.py",
     "exp/optimize/evaluation/variance/council_initial.py",
     "exp/optimize/evaluation/variance/council_inventory.py",
@@ -116,6 +122,10 @@ class CouncilStudyContract(ContractModel):
     """
 
     preparation_spec: BootstrapPreparationSpec
+    preparation_producer: str = Field(min_length=1)
+    preparation_source_sha256: Sha256
+    preparation_provenance: ArtifactInput
+    preparation_provenance_type: PreparationSourceType
     bootstrap: BootstrapBinding
     mining: MiningSettings
     studies: tuple[ActorCriticSpec, ...] = Field(min_length=5, max_length=5)
@@ -207,6 +217,10 @@ def qualify_council(
         resume_binding,
         CouncilPreparationContract(
             preparation_spec=spec.preparation_spec,
+            preparation_producer=spec.preparation_producer,
+            preparation_source_sha256=spec.preparation_source_sha256,
+            preparation_provenance=spec.preparation_provenance,
+            preparation_provenance_type=spec.preparation_provenance_type,
             bootstrap=spec.bootstrap,
             exposure=spec.exposure,
             family_simulator=spec.family_simulator,
@@ -334,9 +348,9 @@ def register_conditional_council(
     approved = CouncilConditionalConsent.model_validate_json(
         project.artifacts.read_bytes(consent.artifact_id, "consent.json")
     )
-    binding = load_bootstrap_resume(
-        project, resume_binding, spec=spec.preparation_spec, code_revision=code_revision
-    )
+    binding = read_bootstrap_preparation_provenance(
+        project, resume_binding, spec=spec.preparation_spec
+    ).binding
     if (
         approved.operation != binding.original_operation
         or approved.ledger_sha256 != binding.ledger_sha256

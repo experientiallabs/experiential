@@ -17,6 +17,7 @@ from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance import bootstrap_selection_test as fixtures
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.actor_critic_test import _spec
+from exp.optimize.evaluation.variance.bootstrap_history import read_bootstrap_preparation_provenance
 from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapDependencies,
     BootstrapPreparationReport,
@@ -240,8 +241,13 @@ def _fixture(
     build = VarianceBuildReport.model_validate_json(
         project.artifacts.read_bytes(report.build_report.artifact_id, "report.json")
     )
+    provenance = read_bootstrap_preparation_provenance(project, resume, spec=preparation)
     contract = CouncilStudyContract(
         preparation_spec=preparation,
+        preparation_producer=provenance.producer_revision,
+        preparation_source_sha256=provenance.source_sha256,
+        preparation_provenance=provenance.source_ref,
+        preparation_provenance_type=provenance.source_type,
         bootstrap=bootstrap,
         mining=mining,
         studies=tuple(studies),
@@ -315,7 +321,7 @@ def test_drift_cannot_borrow_completed_preparation_authority(
     project, prepared, resume, spec, wire = _fixture(tmp_path, monkeypatch)
     revision = "corrected"
     if change == "producer":
-        revision = "unreviewed"
+        spec = spec.model_copy(update={"preparation_producer": "unreviewed"})
     elif change == "source":
         spec = spec.model_copy(update={"sources": {}})
     else:
