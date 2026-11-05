@@ -18,8 +18,10 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.rules.agent_loop import AGENT_LOOP_PROTOCOL
+from exp.optimize.evaluation.rules.direct_research import direct_research_protocol_sha256
 from exp.optimize.evaluation.rules.evidence_pages import EVIDENCE_DELIVERY_PROTOCOL
 from exp.optimize.evaluation.rules.memory_stage import MEMORY_STAGE_PROTOCOL
+from exp.optimize.evaluation.rules.rule_tags import rule_tagging_protocol_sha256
 from exp.optimize.evaluation.rules.system_two import system_two_protocol_sha256
 from exp.optimize.evaluation.variance.bootstrap_admission import BOOTSTRAP_ADMISSION_PROTOCOL
 from exp.optimize.evaluation.variance.bootstrap_pilot import load_pilot_build
@@ -43,6 +45,7 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/rules/memory_stage.py",
     "exp/optimize/evaluation/rules/governance.py",
     "exp/optimize/evaluation/rules/research.py",
+    "exp/optimize/evaluation/rules/direct_research.py",
     "exp/optimize/evaluation/rules/rule_tags.py",
     "exp/optimize/evaluation/rules/stage.py",
     "exp/optimize/evaluation/rules/weighing.py",
@@ -114,6 +117,8 @@ def current_bootstrap_source() -> BootstrapSourceSnapshot:
             "evidence_delivery": EVIDENCE_DELIVERY_PROTOCOL,
             "system_two": system_two_protocol_sha256(),
             "memory_stage": MEMORY_STAGE_PROTOCOL,
+            "direct_research": direct_research_protocol_sha256(),
+            "rule_questions": rule_tagging_protocol_sha256(),
         },
     )
 

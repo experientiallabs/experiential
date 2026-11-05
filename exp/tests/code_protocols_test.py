@@ -288,7 +288,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v7",
+        "variance-roles-v8",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -300,7 +300,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "cd0fddb7297c7cde2a651402b0c7018a727cdc12b85faad7ea5ad76d34950075",
+        "3abd222af6b1dcd02c3a7301925582bc33e689e9e22bd2e142968d3ace68ae7a",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -325,7 +325,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.research:RESEARCH_PROTOCOL",
-        "rule-research-v4",
+        "rule-research-v5",
         (
             "exp.optimize.evaluation.rules.research",
             "exp.optimize.evaluation.rules.agent_loop",
@@ -334,8 +334,9 @@ PROTOCOLS = (
             "exp.optimize.evaluation.rules.evidence_pages",
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
+            "exp.optimize.evaluation.rules.direct_research",
         ),
-        "4b25031b15a3790076870be7b57f06caceaf009473aeb055f21802a0d455f4be",
+        "4ef59aa9fbb22b1b50f4055e787fb9986bd0ac23e4b300ae40212c7d16df1ad7",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.weighing:WEIGHING_PROTOCOL",
@@ -353,7 +354,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.condense:CONDENSATION_PROTOCOL",
-        "rule-condensation-v4",
+        "rule-condensation-v5",
         (
             "exp.optimize.evaluation.rules.condense",
             "exp.optimize.evaluation.rules.agent_loop",
@@ -361,7 +362,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "ac24e9edc249abe25dd880d2c48d58018778327d5aa530e8fb4cd45e6fa57e2d",
+        "eecb287955db41aa392514a528c82a8fde95301883ab3c4a1c2385ec1b752b90",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
@@ -696,7 +697,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.rules.locator_inventory",
             "exp.optimize.evaluation.variance.bootstrap_reads",
         ),
-        "dae111ea429b5008f017d37a68f607cfdb3916abe05c49d61e8f1518f871e848",
+        "ea5fbc8f108c0338105a6877801de51c6ba5ed328a6eb32690fbac188c3b5c96",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_reads:BOOTSTRAP_READ_PROTOCOL",
@@ -706,14 +707,16 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
-        "bootstrap-source-revision-v1",
+        "bootstrap-source-revision-v2",
         (
             "exp.optimize.evaluation.variance.bootstrap_protocols",
             "exp.optimize.evaluation.variance.bootstrap_resume",
             "exp.optimize.evaluation.variance.bootstrap_plan",
             "exp.optimize.evaluation.variance.bootstrap_admission",
+            "exp.optimize.evaluation.variance.bootstrap_selection",
+            "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "f1ed76cf76b4aa402e859e7d5e4985e68b6937cb84c4163fa1f8e887abd51eb2",
+        "3cefe5417cee6f24f957b029e537f0fa63b26c592961d8601e13a51e332f42dc",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",
@@ -724,6 +727,18 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_plan:run_bootstrap_preparation",
         ),
         "d94589a4998e702cd77f75754e2a99029cdc48092a41d33a60f33aef75ec7f66",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.direct_research:DIRECT_RESEARCH_PROTOCOL",
+        "full-trajectory-research-v1",
+        ("exp.optimize.evaluation.rules.direct_research",),
+        "0d3ad4285470877e106137ed46e90f789ac73d5a326d9f7d147cf44d02536920",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.rule_tags:RULE_TAG_PROTOCOL",
+        "discovered-rule-tags-v2",
+        ("exp.optimize.evaluation.rules.rule_tags",),
+        "4833ff6460f427ea989b581ff4f4bf2a3dac75894e81abbed7eb88a6826323f9",
     ),
 )
 

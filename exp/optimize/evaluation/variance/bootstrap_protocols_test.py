@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import ArtifactInput
+from exp.optimize.evaluation.rules.direct_research import direct_research_protocol_sha256
+from exp.optimize.evaluation.rules.rule_tags import rule_tagging_protocol_sha256
 from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.optimize.evaluation.variance import bootstrap_plan as preparation
 from exp.optimize.evaluation.variance import bootstrap_protocols as protocol_owner
@@ -174,3 +176,11 @@ def test_source_successor_refuses_unreviewed_values_refs_and_lifecycle(
         )
     assert operation_spend_ceiling(project, parent.original_operation).summary() == before
     assert current_bootstrap_source() == proposal.source
+
+
+def test_source_snapshot_binds_direct_research_and_rule_questions() -> None:
+    """Source continuations pin extraction implementation and transferable question semantics."""
+    snapshot = current_bootstrap_source()
+    assert "exp/optimize/evaluation/rules/direct_research.py" in snapshot.files
+    assert snapshot.protocols["direct_research"] == direct_research_protocol_sha256()
+    assert snapshot.protocols["rule_questions"] == rule_tagging_protocol_sha256()
