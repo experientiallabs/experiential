@@ -156,67 +156,9 @@ struct Pending {
     closed: bool,
 }
 
-struct MaintainedSink<S> {
-    sink: S,
-    pending: Arc<Mutex<Pending>>,
-    skipped: Arc<AtomicU64>,
-}
-
-impl<S: Sink> Sink for MaintainedSink<S> {
-    type Prepared = S::Prepared;
-
-    fn preparation_bytes(maximum_record_bytes: usize) -> usize {
-        S::preparation_bytes(maximum_record_bytes)
-    }
-
-    fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
-        self.sink.prepare(record, maximum_bytes)
-    }
-
-    fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()> {
-        self.sink.write(prepared)
-    }
-
-    fn split_raw_above(&self) -> Option<usize> {
-        self.sink.split_raw_above()
-    }
-
-    fn batch_records(&self) -> usize {
-        self.sink.batch_records()
-    }
-
-    fn batch_bytes(&self) -> usize {
-        self.sink.batch_bytes()
-    }
-
-    fn batch_delay(&self) -> Duration {
-        self.sink.batch_delay()
-    }
-
-    fn prepared_bytes(&self, prepared: &Self::Prepared) -> usize {
-        self.sink.prepared_bytes(prepared)
-    }
-
-    fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
-        self.sink.write_batch(prepared)
-    }
-
-    fn take_maintenance_failures(&mut self) -> u64 {
-        self.sink.take_maintenance_failures()
-    }
-
-    #[cfg(test)]
-    fn before_receive(&mut self) {
-        self.sink.before_receive();
-    }
-
-    fn maintain(&mut self) -> Result<(), ()> {
-        if let Ok(mut pending) = self.pending.lock() {
-            expire_pending(&mut pending, &self.skipped);
-        }
-        self.sink.maintain()
-    }
-}
+#[path = "collector_sink.rs"]
+mod sink;
+use sink::MaintainedSink;
 
 fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     let now = Instant::now();

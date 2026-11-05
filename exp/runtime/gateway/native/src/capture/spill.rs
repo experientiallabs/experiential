@@ -84,6 +84,11 @@ impl Drop for FileInner {
 pub(crate) struct SpillFile(Arc<FileInner>);
 
 impl SpillFile {
+    /// Retained file ownership, excluding the store shared across all files.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<FileInner>() + 2 * std::mem::size_of::<usize>() + self.0.path.capacity()
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.0.path
     }
