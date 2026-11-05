@@ -76,7 +76,10 @@ from exp.optimize.evaluation.variance.pipeline_errors import (
     save_error_points,
     tag_tier_errors,
     tier_error_bank,
+    traceml_decision_attempts,
+    traceml_label_attempts,
 )
+from exp.optimize.evaluation.variance.pipeline_family_rag import mining_family_build
 from exp.optimize.evaluation.variance.pipeline_inputs import (
     admitted_transport,
     mining_rubric,
@@ -232,7 +235,9 @@ class _RulesStage:
         if context.spec.mining.bootstrap is not None:
             return run_bootstrapped_rules(context)
         project, spec, revision = context.project, context.spec, context.code_revision
-        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        build = mining_family_build(
+            context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        )
         exposure = load_exposure_plan(project, build.exposure)
         traces = world_learning_traces(project, build)
         if len(traces) > spec.rules.maximum_traces:
@@ -357,14 +362,15 @@ class _TraceMLStage:
         steps = spec.mining.attempts * spec.mining.registered.maximum_model_calls
         steps *= settings.steps_per_call
         bank = traceml_bank(settings.bank_root)
-        calls = steps * math.ceil(len(bank.questions) / 32)
         judged = move_draws(spec)
         assert settings.move_judge is not None
         for alias in spec.mining.actors:
             costs.extend(
                 job_costs(project, group_job(project, spec, spec.mining.registered, alias))
             )
-            costs.append(decision_cost(project, settings.decision_alias, calls))
+            costs.append(
+                decision_cost(project, settings.decision_alias, traceml_label_attempts(spec))
+            )
             costs.extend(
                 row.scaled(judged) for row in evaluation_costs(project, settings.move_judge)
             )
@@ -586,7 +592,9 @@ class _MiningStage:
         planned = scheduled_preview(project, spec)
         if planned is not None:
             require_scheduled_plan(context, planned)
-        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        build = mining_family_build(
+            context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        )
         exposure = load_exposure_plan(project, build.exposure)
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
         traceml = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs)
@@ -608,7 +616,13 @@ class _MiningStage:
                 rubric, packet = mining_rubric(context, build, rules)
         embedder = None
         if spec.mining.retrieval and build.index is not None:
-            embedder = retrieval_embedder(context, build.index)
+            embedder = retrieval_embedder(
+                context,
+                build.index,
+                catalog_binding=GroundedRuntimeDefinition.model_validate(
+                    RulesOutputs.model_validate(context.upstream["rules"].outputs).job.configuration
+                ).catalog_binding,
+            )
         prepared = council_draws(
             tuple(
                 partial(
@@ -715,7 +729,13 @@ def _rules_search(
     registered = trace_search(project, build, start.task.task_id, spec.mining.retrieval_top_k)
     if registered is None or build.index is None:
         return None
-    embedder = retrieval_embedder(context, build.index)
+    embedder = retrieval_embedder(
+        context,
+        build.index,
+        catalog_binding=GroundedRuntimeDefinition.model_validate(
+            RulesOutputs.model_validate(context.upstream["rules"].outputs).job.configuration
+        ).catalog_binding,
+    )
     return open_trace_search(project.artifacts, registered, exposure, embedder)
 
 
@@ -777,8 +797,7 @@ def _tagger(context: StageContext) -> TraceTagger:
     project, settings = context.project, context.spec.traceml
     catalog = load_model_catalog(project.model_catalog_path)
     resolved = RuntimeModelCatalog(catalog).resolve(settings.decision_alias)
-    attempts = context.spec.mining.attempts * context.spec.mining.registered.maximum_model_calls
-    attempts *= settings.steps_per_call * len(context.spec.mining.actors)
+    attempts = traceml_decision_attempts(project, context.spec)
     transport = admitted_transport(
         context, "traceml", attempts, datetime.now(UTC) + timedelta(hours=settings.deadline_hours)
     ).priced_as(settings.decision_alias)

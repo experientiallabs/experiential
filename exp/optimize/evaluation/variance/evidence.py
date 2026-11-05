@@ -59,13 +59,12 @@ from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.continuations.study import ContinuationStudy, known_outcomes
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.optimize.evaluation.variance.trace_search_spec import TraceSearchSpec as TraceSearchSpec
 from exp.simulation.continuations import ContinuationCheckpoint
 from exp.simulation.retrieval.contracts import RAGAction, RAGQuery
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.retrieval.retriever import TraceRAGRetriever
-from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import load_rag_index
-from exp.simulation.retrieval.tags import TagRetrievalBinding
 from exp.simulation.rules.model import RuleBook
 
 ReferenceKind = Literal[
@@ -700,24 +699,6 @@ def divergence_points(documents: Mapping[str, JsonValue]) -> JsonObject:
         frontier.extend((step + 1, rows) for rows in live.values() if len(rows) > 1)
     splits.sort(key=lambda row: (row[0], row[1]))
     return {"divergence_points": [row for _, _, row in splits], "label_authority": _HISTORICAL}
-
-
-class TraceSearchSpec(ContractModel):
-    """A registered tag-aware retrieval over world-learning traces.
-
-    Attributes:
-        index: The saved fit-only RAG index, scoped to world-learning traces.
-        scope: The world-learning retrieval scope the index was built with.
-        tags: Tag ranking policy and task query tags, or None for cosine ranking alone.
-        task_id: Task identity whose query tags rank results.
-        maximum_top_k: Most matches one search may return.
-    """
-
-    index: ArtifactInput
-    scope: CorpusScope
-    tags: TagRetrievalBinding | None = None
-    task_id: str = Field(min_length=1)
-    maximum_top_k: int = Field(default=5, ge=1, le=20, strict=True)
 
 
 class TraceSearch:

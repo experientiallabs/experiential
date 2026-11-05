@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec, run_actor_critic
 from exp.optimize.evaluation.variance.council_prelude_hook import (
     CouncilPreludeCheckpoint,
@@ -119,7 +120,15 @@ def prepare_tier(
         ),
     )
     retrieval = (
-        trace_search(project, build, start.task.task_id, mining.retrieval_top_k)
+        trace_search(
+            project,
+            build,
+            start.task.task_id,
+            mining.retrieval_top_k,
+            catalog_binding=GroundedRuntimeDefinition.model_validate(
+                tier.configuration
+            ).catalog_binding,
+        )
         if mining.retrieval
         else None
     )

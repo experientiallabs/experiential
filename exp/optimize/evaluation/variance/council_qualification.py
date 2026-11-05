@@ -51,6 +51,7 @@ from exp.optimize.evaluation.variance.council_preparation import (
 )
 from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.evidence import load_references
+from exp.optimize.evaluation.variance.pipeline_family_rag import native_world_catalog
 from exp.optimize.evaluation.variance.pipeline_spec import COUNCIL_ACTORS, MiningSettings
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.scoped_spending import (
@@ -87,6 +88,10 @@ _SOURCE_FILES = (
     "exp/optimize/evaluation/variance/pipeline_spec.py",
     "exp/optimize/evaluation/variance/pipeline_behaviors.py",
     "exp/optimize/evaluation/variance/pipeline_errors.py",
+    "exp/optimize/evaluation/variance/pipeline_family_rag.py",
+    "exp/optimize/evaluation/variance/trace_search_spec.py",
+    "exp/optimize/evaluation/fidelity/retrieval_binding.py",
+    "exp/optimize/evaluation/executable/catalog_binding.py",
     "exp/optimize/evaluation/variance/judge_prompt.py",
     "exp/optimize/evaluation/variance/judged.py",
     "exp/optimize/evaluation/variance/role_prompts.py",
@@ -228,6 +233,7 @@ def qualify_council(
         code_revision=code_revision,
     )
     start, family, task_start = proof.start, proof.family, proof.task_start
+    runtime = GroundedRuntimeDefinition.model_validate(start.job.configuration)
     for study in spec.studies:
         search = study.retrieval
         if search is not None and (
@@ -235,6 +241,7 @@ def qualify_council(
             or search.scope != family.corpus
             or search.task_id != start.task_id
             or search.maximum_top_k != spec.mining.retrieval_top_k
+            or search.catalog_binding != runtime.catalog_binding
         ):
             raise ValueError("native study retrieval differs from the exact family RAG scope")
     if spec.sources != council_sources():
@@ -263,6 +270,7 @@ def validate_council_studies(
         != (16, 8, 8, 8)
         or not 1 <= mining.points <= 4
         or mining.bootstrap != spec.bootstrap
+        or mining.family_simulator != spec.family_simulator
         or mining.schedule is not None
     ):
         raise ValueError("council requires five separate configured G16/J8/C8/K<=4/M8 studies")
@@ -433,7 +441,6 @@ def council_aliases(project: ProjectStore, qualified: QualifiedCouncil) -> tuple
 
     Cost component display names never supply authority or model identity.
     """
-    catalog = load_model_catalog(project.model_catalog_path)
     aliases: set[str] = set()
     for study in qualified.contract.studies:
         aliases.add(study.initial.actor_alias)
@@ -448,7 +455,14 @@ def council_aliases(project: ProjectStore, qualified: QualifiedCouncil) -> tuple
         runtime = GroundedRuntimeDefinition.model_validate(study.initial.configuration)
         world = load_grounded_world_model_artifact(project.artifacts, runtime.world_model)
         aliases.add(world.model_alias)
-        embedder = index_embedder_alias(project, catalog, world)
+        embedder = index_embedder_alias(
+            project,
+            native_world_catalog(project, runtime),
+            world,
+            configured_alias=None
+            if runtime.catalog_binding is None
+            else runtime.catalog_binding.embedder_alias,
+        )
         if embedder is not None:
             aliases.add(embedder)
         if runtime.memory is not None:

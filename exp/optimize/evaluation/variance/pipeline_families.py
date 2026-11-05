@@ -79,6 +79,7 @@ from exp.optimize.evaluation.variance.pipeline_behaviors import (
     coalition_differences,
 )
 from exp.optimize.evaluation.variance.pipeline_errors import coalition_patterns, tier_error_bank
+from exp.optimize.evaluation.variance.pipeline_family_rag import mining_family_build
 from exp.optimize.evaluation.variance.pipeline_inputs import (
     library_draws,
     local_id,
@@ -316,7 +317,9 @@ class _Point:
         if library is not None:
             if self.report.group_tier is None:
                 raise ValueError("behavior tags require the actual actor snapshot")
-            build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+            build = mining_family_build(
+                context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+            )
             authored.behavior_questions = save_behavior_questions(
                 project,
                 packet=packet_ref,
@@ -351,7 +354,9 @@ class _Point:
         library_id = authoring.library_id
         if library_id is None:
             return None
-        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        build = mining_family_build(
+            context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        )
         base = library_head(project, library_id)
         labels = label_behaviors(
             project,
@@ -412,7 +417,9 @@ class _Point:
         """Assemble the packet from the sources, the coalition, the rule book and the brief."""
         context = self.context
         project = context.project
-        build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        build = mining_family_build(
+            context, BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+        )
         rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
         traceml = TraceMLOutputs.model_validate(context.upstream["traceml"].outputs)
         labels, bank = traceml.labels, tier_error_bank(context.spec)

@@ -197,6 +197,7 @@ def _fixture(
     role = base.judges[0]
     mining = MiningSettings(
         bootstrap=bootstrap,
+        family_simulator=report.simulators[0],
         actors=aliases,
         judge=role,
         selector=role,

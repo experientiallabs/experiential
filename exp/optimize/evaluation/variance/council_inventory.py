@@ -17,8 +17,9 @@ from exp.optimize.evaluation.continuations.job import (
     continuation_result_reference,
     saved_continuation_job,
 )
+from exp.optimize.evaluation.executable.catalog_binding import load_runtime_catalog
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
-from exp.optimize.evaluation.executable.model_costs import CostComponent, model_cost
+from exp.optimize.evaluation.executable.model_costs import CostComponent, catalog_model_cost
 from exp.optimize.evaluation.fidelity.retrieval_binding import rag_index_embedder_alias
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticSpec
 from exp.optimize.evaluation.variance.council_checkpoint import CouncilCheckpoint, point_job
@@ -174,12 +175,21 @@ def phase_inventory(
             loaded = load_rag_index(project.artifacts, spec.retrieval.index.artifact_id)
             if artifact_input(loaded.manifest) != spec.retrieval.index:
                 raise ValueError("search index differs from the native registered reference")
+            binding = spec.retrieval.catalog_binding
+            catalog = (
+                load_model_catalog(project.model_catalog_path)
+                if binding is None
+                else load_runtime_catalog(project, binding)
+            )
             alias = rag_index_embedder_alias(
-                project, load_model_catalog(project.model_catalog_path), loaded.index
+                project,
+                catalog,
+                loaded.index,
+                configured_alias=None if binding is None else binding.embedder_alias,
             )
             if alias is not None:
                 calls = uncached * profile.budget.tool_calls * RetryPolicy().maximum_attempts
-                costs.append(model_cost(project, alias, calls, 0))
+                costs.append(catalog_model_cost(catalog, alias, calls, 0))
     elif phase == "continuations":
         if len(checkpoint.jobs) != len(checkpoint.wave) or len(set(checkpoint.wave)) != len(
             checkpoint.wave

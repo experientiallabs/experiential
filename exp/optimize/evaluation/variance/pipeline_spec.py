@@ -284,6 +284,9 @@ class MiningSettings(ContractModel):
 
     job: ContinuationJob | None = None
     bootstrap: BootstrapBinding | None = Field(default=None, exclude_if=lambda value: value is None)
+    family_simulator: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     rubric: ArtifactInput | None = None
     judge: AuthorSettings
     judge_prompt_set: str = DEFAULT_AGENTIC_JUDGE
