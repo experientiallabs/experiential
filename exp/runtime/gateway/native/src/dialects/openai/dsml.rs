@@ -37,6 +37,83 @@ pub(crate) const SPAN_LIMIT: usize = 1 << 20;
 pub(crate) const MALFORMED_TOOL_CALL: &str =
     "the model emitted a malformed tool call; retry the request";
 
+/// Which DSML parse step refused a captured span. Logged as a content-free
+/// reason code (never the markup) so a lane failing with
+/// `MALFORMED_TOOL_CALL` can be diagnosed from the worker log: the caller
+/// still sees only the one malformed-tool-call reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reject {
+    /// The captured span outgrew `SPAN_LIMIT`.
+    SpanTooLarge,
+    /// Something other than a tag where a tag was expected.
+    ExpectedTag,
+    /// A tag opener without the DSML marker.
+    MissingMarker,
+    /// A tag that never closed with `>`.
+    UnclosedTag,
+    /// A tag with no name.
+    EmptyTagName,
+    /// An attribute without `=`.
+    AttributeMissingEquals,
+    /// An attribute value not opened with `"`.
+    AttributeUnquoted,
+    /// An attribute value never closed with `"`.
+    AttributeUnterminated,
+    /// A parameter value with no closing parameter tag.
+    ParameterUnclosed,
+    /// Where an invoke was expected, a closing or other tag.
+    ExpectedInvoke,
+    /// An invoke without a non-empty `name`.
+    InvokeNameMissing,
+    /// Inside an invoke, a tag that is neither a parameter nor its close.
+    ExpectedParameter,
+    /// A parameter without a non-empty `name`.
+    ParameterNameMissing,
+    /// A `string="false"` parameter whose value is not JSON.
+    ParameterNotJson,
+    /// Text after the outer block's closing tag.
+    TrailingAfterClose,
+}
+
+impl Reject {
+    /// The stable reason code written to the log.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::SpanTooLarge => "span_too_large",
+            Self::ExpectedTag => "expected_tag",
+            Self::MissingMarker => "missing_marker",
+            Self::UnclosedTag => "unclosed_tag",
+            Self::EmptyTagName => "empty_tag_name",
+            Self::AttributeMissingEquals => "attribute_missing_equals",
+            Self::AttributeUnquoted => "attribute_unquoted",
+            Self::AttributeUnterminated => "attribute_unterminated",
+            Self::ParameterUnclosed => "parameter_unclosed",
+            Self::ExpectedInvoke => "expected_invoke",
+            Self::InvokeNameMissing => "invoke_name_missing",
+            Self::ExpectedParameter => "expected_parameter",
+            Self::ParameterNameMissing => "parameter_name_missing",
+            Self::ParameterNotJson => "parameter_not_json",
+            Self::TrailingAfterClose => "trailing_after_close",
+        }
+    }
+}
+
+/// Log one refused span by step and size only, then answer the caller-facing
+/// reason. `closed` says whether the outer closing tag was seen (false: the
+/// span was still open at the stream's end); `calls` counts the invokes that
+/// parsed before the refusal.
+fn reject(step: Reject, span_bytes: usize, closed: bool, calls: usize) -> &'static str {
+    let line = serde_json::json!({
+        "event": "dsml_tool_call_rejected",
+        "step": step.code(),
+        "span_bytes": span_bytes,
+        "closed": closed,
+        "calls_parsed": calls,
+    });
+    eprintln!("exp-gateway-native: {line}");
+    MALFORMED_TOOL_CALL
+}
+
 /// One tool call assembled from a complete DSML invoke.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DsmlCall {
@@ -111,13 +188,13 @@ impl DsmlGuard {
             if let Some(span) = self.span.as_mut() {
                 span.push(character);
                 if span.len() > SPAN_LIMIT {
-                    return Err(MALFORMED_TOOL_CALL);
+                    return Err(reject(Reject::SpanTooLarge, span.len(), false, 0));
                 }
                 // Both outer closings end in `calls>`: only then is the
                 // (normalizing) block check worth running.
                 if character == '>' && span.ends_with("calls>") && closes_block(span) {
                     let block = self.span.take().unwrap_or_default();
-                    released.calls.extend(parse_block(&block)?);
+                    released.calls.extend(parse_block(&block, true)?);
                 }
                 continue;
             }
@@ -176,7 +253,7 @@ impl DsmlGuard {
             ..Released::default()
         };
         if let Some(span) = self.span.take() {
-            released.calls = parse_block(&span)?;
+            released.calls = parse_block(&span, false)?;
         }
         Ok(released)
     }
@@ -231,12 +308,12 @@ struct Cursor<'a> {
 impl Cursor<'_> {
     /// The next tag, after whitespace and duplicated `<`; anything else is
     /// malformed.
-    fn tag(&mut self) -> Result<Tag, &'static str> {
+    fn tag(&mut self) -> Result<Tag, Reject> {
         let mut rest = self
             .rest
             .trim_start()
             .strip_prefix('<')
-            .ok_or(MALFORMED_TOOL_CALL)?;
+            .ok_or(Reject::ExpectedTag)?;
         while let Some(again) = rest.trim_start().strip_prefix('<') {
             rest = again;
         }
@@ -244,26 +321,26 @@ impl Cursor<'_> {
             Some(rest) => (true, rest),
             None => (false, rest),
         };
-        let rest = rest.strip_prefix(MARKER).ok_or(MALFORMED_TOOL_CALL)?;
-        let end = rest.find('>').ok_or(MALFORMED_TOOL_CALL)?;
+        let rest = rest.strip_prefix(MARKER).ok_or(Reject::MissingMarker)?;
+        let end = rest.find('>').ok_or(Reject::UnclosedTag)?;
         let (body, after) = (&rest[..end], &rest[end + 1..]);
         let name_end = body
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(body.len());
         let name = body[..name_end].to_string();
         if name.is_empty() {
-            return Err(MALFORMED_TOOL_CALL);
+            return Err(Reject::EmptyTagName);
         }
         let mut attributes = Vec::new();
         let mut attrs = body[name_end..].trim_start();
         while !attrs.is_empty() {
-            let eq = attrs.find('=').ok_or(MALFORMED_TOOL_CALL)?;
+            let eq = attrs.find('=').ok_or(Reject::AttributeMissingEquals)?;
             let key = attrs[..eq].trim().to_string();
             let value = attrs[eq + 1..]
                 .trim_start()
                 .strip_prefix('"')
-                .ok_or(MALFORMED_TOOL_CALL)?;
-            let close = value.find('"').ok_or(MALFORMED_TOOL_CALL)?;
+                .ok_or(Reject::AttributeUnquoted)?;
+            let close = value.find('"').ok_or(Reject::AttributeUnterminated)?;
             attributes.push((key, value[..close].to_string()));
             attrs = value[close + 1..].trim_start();
         }
@@ -276,9 +353,9 @@ impl Cursor<'_> {
     }
 
     /// The raw parameter value up to its closing tag, consuming the tag.
-    fn value(&mut self) -> Result<&str, &'static str> {
+    fn value(&mut self) -> Result<&str, Reject> {
         const CLOSE: &str = "</｜DSML｜parameter>";
-        let end = self.rest.find(CLOSE).ok_or(MALFORMED_TOOL_CALL)?;
+        let end = self.rest.find(CLOSE).ok_or(Reject::ParameterUnclosed)?;
         let value = &self.rest[..end];
         self.rest = &self.rest[end + CLOSE.len()..];
         Ok(value)
@@ -304,21 +381,30 @@ fn attribute<'a>(tag: &'a Tag, key: &str) -> Option<&'a str> {
 /// parameter a name and a closing tag; `string="false"` values must be JSON.
 /// Anything else (a lost opening, a stray closing tag) is malformed: a
 /// partial call set is never executed.
-pub(crate) fn parse_block(raw: &str) -> Result<Vec<DsmlCall>, &'static str> {
+///
+/// A refusal logs its parse step (`reject`); `closed` says whether the outer
+/// closing tag ended the span.
+fn parse_block(raw: &str, closed: bool) -> Result<Vec<DsmlCall>, &'static str> {
+    let mut calls = Vec::new();
+    parse_steps(raw, &mut calls).map_err(|step| reject(step, raw.len(), closed, calls.len()))?;
+    Ok(calls)
+}
+
+/// The parse proper; completed invokes accumulate in `calls`.
+fn parse_steps(raw: &str, calls: &mut Vec<DsmlCall>) -> Result<(), Reject> {
     let normalized = normalize(raw);
     let mut cursor = Cursor { rest: &normalized };
     let mut tag = cursor.tag()?;
     if !tag.closing && is_calls(&tag.name) {
         tag = cursor.tag()?;
     }
-    let mut calls = Vec::new();
     loop {
         if tag.closing || tag.name != "invoke" {
-            return Err(MALFORMED_TOOL_CALL);
+            return Err(Reject::ExpectedInvoke);
         }
         let name = attribute(&tag, "name")
             .filter(|name| !name.is_empty())
-            .ok_or(MALFORMED_TOOL_CALL)?
+            .ok_or(Reject::InvokeNameMissing)?
             .to_string();
         let mut arguments = Map::new();
         loop {
@@ -327,17 +413,17 @@ pub(crate) fn parse_block(raw: &str) -> Result<Vec<DsmlCall>, &'static str> {
                 break;
             }
             if next.closing || next.name != "parameter" {
-                return Err(MALFORMED_TOOL_CALL);
+                return Err(Reject::ExpectedParameter);
             }
             let key = attribute(&next, "name")
                 .filter(|key| !key.is_empty())
-                .ok_or(MALFORMED_TOOL_CALL)?
+                .ok_or(Reject::ParameterNameMissing)?
                 .to_string();
             let raw_value = cursor.value()?;
             let value = match attribute(&next, "string") {
                 Some("true") => Value::String(raw_value.to_string()),
                 Some("false") => {
-                    serde_json::from_str(raw_value.trim()).map_err(|_| MALFORMED_TOOL_CALL)?
+                    serde_json::from_str(raw_value.trim()).map_err(|_| Reject::ParameterNotJson)?
                 }
                 _ => serde_json::from_str(raw_value.trim())
                     .unwrap_or_else(|_| Value::String(raw_value.to_string())),
@@ -346,14 +432,14 @@ pub(crate) fn parse_block(raw: &str) -> Result<Vec<DsmlCall>, &'static str> {
         }
         calls.push(DsmlCall { name, arguments });
         if cursor.rest.trim().is_empty() {
-            return Ok(calls);
+            return Ok(());
         }
         tag = cursor.tag()?;
         if tag.closing && is_calls(&tag.name) {
             return if cursor.rest.trim().is_empty() {
-                Ok(calls)
+                Ok(())
             } else {
-                Err(MALFORMED_TOOL_CALL)
+                Err(Reject::TrailingAfterClose)
             };
         }
     }
