@@ -30,6 +30,7 @@ from exp.optimize.evaluation.variance.bootstrap_pilot import (
     apply_pilot_revision,
     validate_pilot_revision,
 )
+from exp.optimize.evaluation.variance.bootstrap_protocols import validate_protocol_successor
 from exp.runtime.models.spend_ceiling import OperationSpendCeiling, SpendAuthorization
 from exp.simulation.mining.environment_review import review_protocol_sha256
 
@@ -45,6 +46,7 @@ ResumeChange = Literal[
     "execution_watchdog_renewal",
     "compatibility_review_revision",
     "pilot_selection_revision",
+    "preparation_protocol_revision",
 ]
 
 
@@ -101,6 +103,7 @@ class BootstrapResumeBinding(ContractModel):
         review_revision: Explicit review output, physical-attempt and protocol revision.
         execution_build: Separately pinned revised build identity, or None for original semantics.
         pilot_revision: Explicit selection and saved-build evidence, or None for review repairs.
+        protocol_revision: Exact reviewed source contracts, without configuration changes.
     """
 
     original_inputs: ArtifactInput
@@ -133,6 +136,9 @@ class BootstrapResumeBinding(ContractModel):
     execution_build: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     pilot_revision: BootstrapPilotRevision | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    protocol_revision: ArtifactInput | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -484,18 +490,27 @@ def _validate_predecessor(
     project: ProjectStore,
     binding: BootstrapResumeBinding,
     spec: BootstrapPreparationSpec,
+    *,
+    historical: bool = False,
 ) -> None:
     """Verify successor ancestry without changing the historical root selection."""
+    if (binding.protocol_revision is not None) != (
+        "preparation_protocol_revision" in binding.permitted_changes
+    ):
+        raise ValueError("source successor requires its exact explicit protocol permission")
     if binding.previous_binding is None:
         if (
             binding.review_revision is not None
             or binding.execution_build is not None
             or binding.pilot_revision is not None
+            or binding.protocol_revision is not None
         ):
             raise ValueError("review revision requires its exact predecessor binding")
         return
     if binding.execution_build is None or (
-        binding.review_revision is None and binding.pilot_revision is None
+        binding.review_revision is None
+        and binding.pilot_revision is None
+        and binding.protocol_revision is None
     ):
         raise ValueError("successor requires an explicitly pinned revision")
     if binding.author_retries:
@@ -506,11 +521,12 @@ def _validate_predecessor(
     ):
         raise ValueError("successor lacks its explicit review revision permission")
     manifest = project.artifacts.read(binding.previous_binding.artifact_id).manifest
-    parent = load_bootstrap_resume(
+    parent = _load_bootstrap_resume(
         project,
         binding.previous_binding,
         spec=spec,
         code_revision=manifest.code_revision,
+        historical=True,
     )
     if (
         parent.original_inputs != binding.original_inputs
@@ -524,6 +540,9 @@ def _validate_predecessor(
         "pilot_selection_revision" in binding.permitted_changes
     ):
         raise ValueError("pilot revision requires its exact explicit permission")
+    if binding.protocol_revision is not None:
+        validate_protocol_successor(project, binding, parent, historical=historical)
+        return
     if binding.pilot_revision is not None:
         if (
             binding.review_revision != parent.review_revision
@@ -562,6 +581,7 @@ def register_bootstrap_resume(
     previous_binding: ArtifactInput | None = None,
     review_revision: BootstrapReviewRevision | None = None,
     pilot_revision: BootstrapPilotRevision | None = None,
+    protocol_revision: ArtifactInput | None = None,
 ) -> ArtifactInput:
     """Bind a reviewed producer to original consent and an optional native finite watchdog.
 
@@ -576,6 +596,7 @@ def register_bootstrap_resume(
         previous_binding: Existing root or successor continued through an append-only selection.
         review_revision: Explicit changed review bounds and current protocol, only for successors.
         pilot_revision: Concrete reviewed selection and truthful existing completed-build binding.
+        protocol_revision: Reviewed source-only successor control, with unchanged pilot/settings.
 
     Returns:
         Immutable resume permission and its exact fresh bootstrap execution specification.
@@ -597,7 +618,9 @@ def register_bootstrap_resume(
     ledger = _ledger(project, operation)
     _preparation_authority(ledger, dollars, attempts)
     summary = ledger.summary()
-    if (previous_binding is None) != (review_revision is None and pilot_revision is None):
+    if (previous_binding is None) != (
+        review_revision is None and pilot_revision is None and protocol_revision is None
+    ):
         raise ValueError("review revision requires its exact predecessor binding")
     if (review_revision is not None) != ("compatibility_review_revision" in permitted_changes):
         raise ValueError("review revision needs its exact explicit permission")
@@ -647,6 +670,7 @@ def register_bootstrap_resume(
         review_revision=review_revision,
         execution_build=execution_build,
         pilot_revision=pilot_revision,
+        protocol_revision=protocol_revision,
     )
     _validate_predecessor(project, binding, spec)
     _validate_window(project, binding, spec)
@@ -658,6 +682,7 @@ def register_bootstrap_resume(
                 *(() if previous_binding is None else (previous_binding,)),
                 *author_retries,
                 *(() if pilot_revision is None else pilot_revision.references),
+                *(() if protocol_revision is None else (protocol_revision,)),
                 *(() if execution_window is None else (execution_window,)),
             },
             key=lambda row: row.artifact_id,
@@ -750,6 +775,24 @@ def load_bootstrap_resume(
     spec: BootstrapPreparationSpec,
     code_revision: str,
 ) -> BootstrapResumeBinding:
+    """Verify original authority, ancestry and the actual current executing source."""
+    return _load_bootstrap_resume(
+        project,
+        reference,
+        spec=spec,
+        code_revision=code_revision,
+        historical=False,
+    )
+
+
+def _load_bootstrap_resume(
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    spec: BootstrapPreparationSpec,
+    code_revision: str,
+    historical: bool,
+) -> BootstrapResumeBinding:
     """Verify exact original semantics and spend history, plus explicit deadline-only permissions.
 
     Args:
@@ -830,6 +873,7 @@ def load_bootstrap_resume(
                 *(() if binding.previous_binding is None else (binding.previous_binding,)),
                 *binding.author_retries,
                 *(() if binding.pilot_revision is None else binding.pilot_revision.references),
+                *(() if binding.protocol_revision is None else (binding.protocol_revision,)),
                 *(() if binding.execution_window is None else (binding.execution_window,)),
             },
             key=lambda row: row.artifact_id,
@@ -837,7 +881,7 @@ def load_bootstrap_resume(
     )
     if manifest.inputs != expected_inputs:
         raise ValueError("bootstrap resume permission ancestry differs")
-    _validate_predecessor(project, binding, spec)
+    _validate_predecessor(project, binding, spec, historical=historical)
     _validate_window(project, binding, spec)
     bootstrap_author_retries(project, binding)
     bootstrap_execution_spec(project, binding, spec)

@@ -60,6 +60,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
     CONTINUE_EVIDENCE,
     PAGE_INSTRUCTION,
     EvidencePages,
+    NativeEvidenceDelivery,
 )
 from exp.optimize.evaluation.variance.evidence_tools import (
     EvidenceBudget,
@@ -68,7 +69,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v3"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v4"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"
@@ -178,6 +179,7 @@ class AgentToolRecord(ContractModel):
         status: ``ok`` or ``refused``.
         served: Evidence locators the result served; empty when refused.
         result: Saved result artifact.
+        delivery: Host-issued original-value identity and completion, never untrusted content.
     """
 
     call: int = Field(ge=0)
@@ -186,6 +188,9 @@ class AgentToolRecord(ContractModel):
     status: ToolStatus
     served: tuple[str, ...] = ()
     result: ArtifactInput
+    delivery: NativeEvidenceDelivery | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AgentPhaseOutput(ContractModel):
@@ -626,6 +631,7 @@ class _Loop:
         messages: list[ModelMessage] = []
         for position, call in enumerate(calls):
             served: tuple[str, ...] = ()
+            delivery = None
             if self.executed >= self.profile.budget.tool_calls:
                 status: ToolStatus = "refused"
                 result: JsonValue = "tool budget exhausted; not executed"
@@ -675,7 +681,9 @@ class _Loop:
                         )
                 if status == "refused":
                     served = ()
-            self.tools.append(self._save_tool(position, call, status, result, served))
+                else:
+                    delivery = self.pages.last_delivery
+            self.tools.append(self._save_tool(position, call, status, result, served, delivery))
             messages.append(
                 _tool_message(call, {"status": status, "result": result, "citations": list(served)})
             )
@@ -727,6 +735,7 @@ class _Loop:
         status: ToolStatus,
         result: JsonValue,
         served: tuple[str, ...],
+        delivery: NativeEvidenceDelivery | None = None,
     ) -> AgentToolRecord:
         """Persist one tool result, reusing an identical saved result on resume."""
         store = self.project.artifacts
@@ -740,6 +749,8 @@ class _Loop:
             "served": list(served),
             "result": result,
         }
+        if delivery is not None:
+            body["delivery"] = delivery.model_dump(mode="json")
         if store.exists(artifact_id):
             if json.loads(store.read_bytes(artifact_id, "result.json")) != body:
                 raise ValueError("saved rules tool result differs from the frozen material")
@@ -765,6 +776,7 @@ class _Loop:
             status=status,
             served=served,
             result=reference,
+            delivery=delivery,
         )
 
 

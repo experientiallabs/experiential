@@ -48,6 +48,7 @@ from exp.optimize.evaluation.variance.bootstrap import (
     run_bootstrap,
     task_identity,
 )
+from exp.optimize.evaluation.variance.bootstrap_admission import validate_preparation_admission
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     MAX_REVEAL_PROBES,
     BootstrapBinding,
@@ -505,6 +506,52 @@ def plan_bootstrap_preparation(
     )
 
 
+def admit_bootstrap_preparation(
+    project: ProjectStore,
+    spec: BootstrapPreparationSpec,
+    *,
+    code_revision: str,
+    approval: BootstrapApproval | None = None,
+    resume_binding: ArtifactInput | None = None,
+) -> BootstrapPlan:
+    """Admit a fresh full cumulative native plan under its unchanged finite authority.
+
+    This provider-free boundary is also used by execution. It creates no client, grant, claim,
+    environment or completion record. The result is cost/lifecycle admission, not runtime QA.
+    """
+    binding = (
+        None
+        if resume_binding is None
+        else load_bootstrap_resume(
+            project,
+            resume_binding,
+            spec=spec,
+            code_revision=code_revision,
+        )
+    )
+    plan = plan_bootstrap_preparation(
+        project,
+        spec,
+        code_revision=code_revision,
+        resume_binding=resume_binding,
+    )
+    with CoordinationLock(
+        project.artifacts.project_directory / (plan.identity + ".lock"), timeout=0
+    ):
+        current = plan_bootstrap_preparation(
+            project,
+            spec,
+            code_revision=code_revision,
+            resume_binding=resume_binding,
+        )
+        if current.digest != plan.digest:
+            raise ValueError(
+                "bootstrap preparation changed during cost admission; inspect its plan"
+            )
+        validate_preparation_admission(current, binding, approval, now=datetime.now(UTC))
+        return current
+
+
 def run_bootstrap_preparation(
     project: ProjectStore,
     spec: BootstrapPreparationSpec,
@@ -535,34 +582,13 @@ def run_bootstrap_preparation(
         return BootstrapPreparationReport.model_validate_json(
             project.artifacts.read_bytes(result_id, "report.json")
         )
-    if binding is not None:
-        if datetime.now(UTC) >= binding.stop:
-            raise ValueError(
-                "bootstrap preparation execution deadline expired; register a finite renewal"
-            )
-        if (
-            plan.known_usd > binding.preparation_usd
-            or plan.unpriced_attempts > binding.preparation_unpriced_attempts
-        ):
-            raise ValueError(
-                "bootstrap resume inventory exceeds the original preparation authority"
-            )
-        if approval is not None and (
-            approval.plan_sha256 != plan.digest
-            or approval.ceiling_usd != binding.preparation_usd
-            or approval.unpriced_attempts != binding.preparation_unpriced_attempts
-        ):
-            raise ValueError("bootstrap resume approval cannot change original authority")
-    elif not plan.complete:
-        if approval is None or approval.plan_sha256 != plan.digest:
-            raise ValueError(
-                "bootstrap preparation needs explicit approval of its exact current plan"
-            )
-        if (
-            approval.ceiling_usd < plan.known_usd
-            or approval.unpriced_attempts < plan.unpriced_attempts
-        ):
-            raise ValueError("bootstrap approval does not cover its priced and unpriced inventory")
+    plan = admit_bootstrap_preparation(
+        project,
+        spec,
+        code_revision=code_revision,
+        approval=approval,
+        resume_binding=resume_binding,
+    )
     if dependencies.tagger is not None:
         injected = ModelSnapshot.model_validate(dependencies.tagger.model_identity)
         expected = (
@@ -617,6 +643,7 @@ def run_bootstrap_preparation(
             raise ValueError(
                 "bootstrap preparation changed during admission; review its current plan"
             )
+        validate_preparation_admission(current, binding, approval, now=datetime.now(UTC))
         ceiling = operation_spend_ceiling(project, plan.identity)
         if approval is not None and binding is None:
             ceiling.authorize(

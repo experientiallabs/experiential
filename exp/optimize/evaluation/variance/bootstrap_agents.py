@@ -69,6 +69,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
+from exp.optimize.evaluation.variance.bootstrap_reads import read_trace_steps, read_whole_trace
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.rules.contracts import trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
@@ -198,11 +199,9 @@ class StartMaterial:
         value: JsonValue
         served: tuple[str, ...]
         if call.name == "read_trace":
-            trace_id = str(arguments.get("trace_id", ""))
-            if trace_id not in self.views:
-                return "refused", f"no readable trace {trace_id!r}", ()
-            view, locators = self.views[trace_id]
-            value, served = view, tuple(sorted(locators))
+            return read_whole_trace(self.views, arguments, maximum_bytes)
+        elif call.name == "read_trace_steps":
+            return read_trace_steps(self.views, arguments, maximum_bytes)
         elif call.name == "read_contract":
             tool = str(arguments.get("tool", ""))
             contract = self.knowledge.contracts.get(tool)

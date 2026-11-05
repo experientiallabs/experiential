@@ -84,7 +84,7 @@ from exp.simulation.rules.memory_set import (
 )
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook, ToolContract
 
-MEMORY_STAGE_PROTOCOL = "jev-memory-stage-v2"
+MEMORY_STAGE_PROTOCOL = "jev-memory-stage-v3"
 """Version of the stage sequence and seed, weighing and gap bookkeeping."""
 
 WEIGHER = "weigher"
@@ -140,10 +140,13 @@ class ResearchCoverage(ContractModel):
         planned_topics: Topics planned.
         researched_topics: Topics with at least one usable draw.
         failed_draws: Draw identity mapped to why it failed.
-        objectives: Objectives System One answered.
+        objectives: Objectives with unique validated, completely delivered findings.
         regions_judged: Regions judged across objectives.
-        passages_returned: Original passages returned.
-        leads: Leads discovered.
+        passages_returned: Original passages in completely delivered findings.
+        leads: Leads in completely delivered findings.
+        attempted_objectives: Every raw findings objective, including refused replies.
+        attempted_passages: All raw attempted passages, including undelivered ones.
+        attempted_leads: All raw proposed leads, including undelivered ones.
         decisions_bought: Decisions this run paid for.
         decisions_replayed: Decisions replayed from the cache.
         decision_usd: Reported cost of the bought decisions.
@@ -156,6 +159,9 @@ class ResearchCoverage(ContractModel):
     regions_judged: int = Field(default=0, ge=0)
     passages_returned: int = Field(default=0, ge=0)
     leads: int = Field(default=0, ge=0)
+    attempted_objectives: int = Field(default=0, ge=0)
+    attempted_passages: int = Field(default=0, ge=0)
+    attempted_leads: int = Field(default=0, ge=0)
     decisions_bought: int = Field(default=0, ge=0)
     decisions_replayed: int = Field(default=0, ge=0)
     decision_usd: float = Field(default=0.0, ge=0.0)
@@ -260,6 +266,22 @@ def memory_to_rulebook(memory: MemorySet, contracts: Mapping[str, ToolContract])
     )
 
 
+def lead_research_units(
+    records: Sequence[TopicResearch], topics: Sequence[tuple[str, str | None]]
+) -> list[tuple[str, str | None, tuple[Objective, ...], tuple[str, ...]]]:
+    """Seed only qualified delivered leads, retaining the existing per-topic bound."""
+    leads: dict[str, list[Objective]] = {}
+    for record in records:
+        for lead in record.leads:
+            leads.setdefault(lead.topic, []).append(lead)
+    tools = dict(topics)
+    return [
+        (topic, tools[topic], tuple(dict.fromkeys(rows))[:4], ())
+        for topic, rows in sorted(leads.items())
+        if topic in tools
+    ]
+
+
 def build_memory_set(
     project: ProjectStore,
     author: AuthorSettings,
@@ -336,19 +358,7 @@ def build_memory_set(
 
     found = research([(topic, tool, (), ()) for topic, tool in topics], 0)
     if settings.follow_leads:
-        leads: dict[str, list[Objective]] = {}
-        for item in found:
-            for lead in item.leads:
-                leads.setdefault(lead.topic, []).append(lead)
-        tool_of = dict(topics)
-        found += research(
-            [
-                (topic, tool_of.get(topic), tuple(dict.fromkeys(rows))[:4], ())
-                for topic, rows in sorted(leads.items())
-                if topic in tool_of
-            ],
-            1,
-        )
+        found += research(lead_research_units(found, topics), 1)
     seed = MemorySet(tools=tuple(sorted(contracts)), sources=corpus.trace_ids)
     seed, built = merge_proposals(
         seed, research_proposals(found), passages, cycle=-1, permissions=PERMISSIONS
@@ -450,6 +460,9 @@ def build_memory_set(
             regions_judged=sum(r.regions_judged for r in found),
             passages_returned=sum(r.passages_returned for r in found),
             leads=sum(len(r.leads) for r in found),
+            attempted_objectives=sum(len(r.attempted_objectives) for r in found),
+            attempted_passages=sum(r.attempted_passages for r in found),
+            attempted_leads=sum(len(r.attempted_leads) for r in found),
             decisions_bought=sum(r.decisions_bought for r in found),
             decisions_replayed=sum(r.decisions_replayed for r in found),
             decision_usd=sum(r.decision_usd for r in found),

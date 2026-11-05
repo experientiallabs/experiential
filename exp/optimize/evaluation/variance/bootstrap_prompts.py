@@ -29,8 +29,9 @@ from exp.optimize.evaluation.rules.evidence_pages import (
     PAGE_INSTRUCTION,
 )
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
+from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v2"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v3"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -128,6 +129,7 @@ instruction and facts still describe the world the actor sees.""",
 _STRINGS: JsonObject = {"type": "array", "items": {"type": "string"}}
 
 READ_TOOLS: tuple[ToolSchema, ...] = (
+    STEP_READ_TOOL,
     tool_schema(
         "read_trace",
         "Read one recorded trajectory's ordered tool steps and their locators.",

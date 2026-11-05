@@ -8,14 +8,14 @@ from typing import Literal
 
 from pydantic import JsonValue
 
-from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.models import ToolCall
 from exp.common.tasks import ToolSchema
 
-EVIDENCE_DELIVERY_PROTOCOL = "evidence-pages-v1"
+EVIDENCE_DELIVERY_PROTOCOL = "evidence-pages-v2"
 PAGE_CHARACTERS = 8192
 PAGE_INSTRUCTION = """
-An unpaged successful read is complete. Paged reads use evidence-pages-v1. Each page contains
+An unpaged successful read is complete. Paged reads use evidence-pages-v2. Each page contains
 an exact chunk of one JSON-text document, its SHA256, Unicode-codepoint offset, total_characters
 and next_cursor. Concatenate chunks in offset order
 and JSON-decode only when complete=true; partial documents are not citable. Use
@@ -34,6 +34,24 @@ CONTINUE_EVIDENCE = ToolSchema(
 )
 
 
+class NativeEvidenceDelivery(ContractModel):
+    """Host-issued identity of the original value, separate from untrusted result content.
+
+    Attributes:
+        value_sha256: Digest of the exact original compact JSON value, not its page envelope.
+        complete: Whether the complete original value was delivered successfully.
+    """
+
+    value_sha256: Sha256
+    complete: bool
+
+
+def evidence_value_sha256(value: JsonValue) -> Sha256:
+    """Hash the exact original value serialization used by native evidence delivery."""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 @dataclass
 class _Document:
     """One trusted result, kept unchanged until all sequential pages are delivered.
@@ -50,11 +68,17 @@ class _Document:
 
 
 class EvidencePages:
-    """Deliver exact values without granting partial or undelivered references."""
+    """Deliver exact values without granting partial or undelivered references.
+
+    Attributes:
+        documents: This draw's started immutable documents and their cursors.
+        last_delivery: Native metadata of the most recent successful value/page, or None.
+    """
 
     def __init__(self) -> None:
         """Start with no pending documents or cursors."""
         self.documents: dict[str, _Document] = {}
+        self.last_delivery: NativeEvidenceDelivery | None = None
 
     @property
     def incomplete(self) -> bool:
@@ -75,6 +99,7 @@ class EvidencePages:
         The complete-value check is a necessary capacity check, not a promise that unknown
         future assistant outputs and page envelopes will fit. Every page is checked again.
         """
+        self.last_delivery = None
         if not accepts(value, references):
             return (
                 "refused",
@@ -86,6 +111,9 @@ class EvidencePages:
             len(text) <= PAGE_CHARACTERS
             or (len(text) + PAGE_CHARACTERS - 1) // PAGE_CHARACTERS > maximum_pages
         ):
+            self.last_delivery = NativeEvidenceDelivery(
+                value_sha256=hashlib.sha256(text.encode()).hexdigest(), complete=True
+            )
             return "ok", value, references
         identity = sha256_json(
             {"call": call.model_dump(mode="json"), "text": text, "references": list(references)}
@@ -104,6 +132,7 @@ class EvidencePages:
         accepts: Callable[[JsonValue, tuple[str, ...]], bool],
     ) -> tuple[Literal["ok", "refused"], JsonValue, tuple[str, ...]]:
         """Deliver only the exact next cursor of a document owned by this draw."""
+        self.last_delivery = None
         if not isinstance(cursor, str):
             return "refused", "cursor must be an exact returned string", ()
         identity, separator, offset = cursor.partition(":")
@@ -137,6 +166,9 @@ class EvidencePages:
             }
             if accepts(body, refs):
                 doc.offset = end
+                self.last_delivery = NativeEvidenceDelivery(
+                    value_sha256=hashlib.sha256(doc.text.encode()).hexdigest(), complete=complete
+                )
                 return "ok", body, refs
             end = doc.offset + (end - doc.offset) // 2
         return (

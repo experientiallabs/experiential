@@ -32,6 +32,7 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    Sha256,
     sha256_json,
 )
 from exp.common.core.locks import CoordinationLock
@@ -53,6 +54,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
     CONTINUE_EVIDENCE,
     EVIDENCE_DELIVERY_PROTOCOL,
     PAGE_INSTRUCTION,
+    evidence_value_sha256,
 )
 from exp.optimize.evaluation.rules.memory_edits import RuleDraft
 from exp.optimize.evaluation.rules.system_one import (
@@ -65,7 +67,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ToolContract
 
-SYSTEM_TWO_PROTOCOL = "jev-system-two-v3"
+SYSTEM_TWO_PROTOCOL = "jev-system-two-v4"
 """Version of the planner prompts, tools and answer schema."""
 
 TOPIC_RESEARCH_TYPE = "topic-research"
@@ -135,15 +137,20 @@ class TopicResearch(ContractModel):
     """One System Two draw over one topic under one variant.
 
     Attributes:
+        protocol_sha256: Exact producing reader/delivery protocol, absent in historical records.
         topic: The topic.
         tool: Its tool, or None.
         variant: Planning stance.
         round: Research round; later rounds answer auditors' objectives.
         identity: Draw identity.
         transcript: Saved loop transcript, when the loop ran.
-        objectives: Every objective the draw set, in order.
-        findings: Saved findings of every objective.
-        leads: Leads System One discovered.
+        objectives: Objectives of unique validated, completely delivered findings.
+        findings: References of those delivered findings, never attempted-only results.
+        leads: Leads from validated, completely delivered findings.
+        attempted_findings: Every raw findings reference, including refused or invalid replies.
+        attempted_objectives: Every returned findings objective, including invalid replies.
+        attempted_passages: Passage count across all raw attempts, not delivered evidence.
+        attempted_leads: All raw proposed leads, never automatically seeded as research.
         served: Locators the draw was served.
         answer: The validated answer, when usable.
         failure: Why the draw is unusable, when it is.
@@ -155,6 +162,7 @@ class TopicResearch(ContractModel):
     """
 
     topic: str
+    protocol_sha256: Sha256 | None = None
     tool: str | None = None
     variant: str
     round: int = Field(default=0, ge=0)
@@ -163,6 +171,10 @@ class TopicResearch(ContractModel):
     objectives: tuple[Objective, ...] = ()
     findings: tuple[ArtifactInput, ...] = ()
     leads: tuple[Objective, ...] = ()
+    attempted_findings: tuple[ArtifactInput, ...] = ()
+    attempted_objectives: tuple[Objective, ...] = ()
+    attempted_passages: int = Field(default=0, ge=0)
+    attempted_leads: tuple[Objective, ...] = ()
     served: tuple[str, ...] = ()
     answer: TopicAnswer | None = None
     failure: str | None = None
@@ -242,6 +254,7 @@ class _Reader:
         self.topic, self.tool, self.maximum_bytes = topic, tool, maximum_bytes
         self.findings: list[ObjectiveFindings] = []
         self.references: list[ArtifactInput] = []
+        self.candidates: dict[str, tuple[ObjectiveFindings, ArtifactInput]] = {}
 
     def run(self, call: ToolCall) -> tuple[ToolStatus, JsonValue, tuple[str, ...]]:
         """Answer one read-only call."""
@@ -256,10 +269,10 @@ class _Reader:
                     topic=self.topic, tool=tool, question=str(arguments["question"])
                 )
                 findings, reference = self.system_one.answer(objective)
-                if findings.objective != objective:
-                    return "refused", "findings belong to a different objective", ()
                 self.findings.append(findings)
                 self.references.append(reference)
+                if findings.objective != objective:
+                    return "refused", "findings belong to a different objective", ()
                 for item in findings.passages:
                     native = self.corpus.by_locator.get(item.passage.locator)
                     if native is None or item.passage != native.passage():
@@ -271,7 +284,10 @@ class _Reader:
                         for ref in self._citations(item.passage.locator)
                     )
                 )
-                return self._ok(findings.brief(), served)
+                status, value, returned = self._ok(findings.brief(), served)
+                if status == "ok":
+                    self.candidates.setdefault(evidence_value_sha256(value), (findings, reference))
+                return status, value, returned
             if call.name == "read_region":
                 region = self.corpus.by_locator.get(str(arguments["locator"]))
                 if region is None:
@@ -403,11 +419,27 @@ def research_topic(
     store = project.artifacts
     record_id = identity + "-topic"
     if store.exists(record_id):
-        return TopicResearch.model_validate_json(store.read_bytes(record_id, "research.json"))
+        saved = TopicResearch.model_validate_json(store.read_bytes(record_id, "research.json"))
+        if saved.protocol_sha256 != system_two_protocol_sha256():
+            raise ValueError("saved topic research differs from the current delivery protocol")
+        return saved
+    if store.exists(identity + "-transcript"):
+        raise ValueError(
+            "saved research transcript has no attempt summary; preserve and reconcile its "
+            "immutable findings before resuming"
+        )
     corpus = system_one.corpus
     reader = _Reader(system_one, corpus, contracts, topic, tool, profile.maximum_result_bytes)
     tools = frozenset(contracts)
-    record = TopicResearch(topic=topic, tool=tool, variant=variant, round=round_, identity=identity)
+    record = TopicResearch(
+        topic=topic,
+        tool=tool,
+        variant=variant,
+        round=round_,
+        identity=identity,
+        protocol_sha256=system_two_protocol_sha256(),
+    )
+    delivered: frozenset[str] = frozenset()
 
     def check(draft: JsonObject, read: frozenset[str]) -> str | None:
         """Show the host's structural check of a draft."""
@@ -449,6 +481,11 @@ def research_topic(
     except (ValueError, ProviderTransportError, DispatchCapExhaustedError, TimeoutError) as error:
         record = record.model_copy(update={"failure": reason(error)})
     else:
+        delivered = frozenset(
+            row.delivery.value_sha256
+            for row in transcript.tools
+            if row.status == "ok" and row.delivery is not None and row.delivery.complete
+        )
         served = transcript.served()
         record = record.model_copy(
             update={"transcript": reference, "served": tuple(sorted(served))}
@@ -464,16 +501,22 @@ def research_topic(
                 record = record.model_copy(update={"failure": reason(error)})
             else:
                 record = record.model_copy(update={"answer": answer})
-    found = reader.findings
+    attempted = reader.findings
+    qualified = [pair for digest, pair in reader.candidates.items() if digest in delivered]
+    found = [finding for finding, _ in qualified]
     record = record.model_copy(
         update={
             "objectives": tuple(f.objective for f in found),
-            "findings": tuple(reader.references),
+            "findings": tuple(reference for _, reference in qualified),
             "leads": tuple(lead for f in found for lead in f.leads),
-            "decisions_bought": sum(f.bought for f in found),
-            "decisions_replayed": sum(f.replayed for f in found),
-            "decision_usd": sum(f.usd for f in found),
-            "regions_judged": sum(len(f.judgments) for f in found),
+            "attempted_findings": tuple(reader.references),
+            "attempted_objectives": tuple(f.objective for f in attempted),
+            "attempted_passages": sum(len(f.passages) for f in attempted),
+            "attempted_leads": tuple(lead for f in attempted for lead in f.leads),
+            "decisions_bought": sum(f.bought for f in attempted),
+            "decisions_replayed": sum(f.replayed for f in attempted),
+            "decision_usd": sum(f.usd for f in attempted),
+            "regions_judged": sum(len(f.judgments) for f in attempted),
             "passages_returned": sum(len(f.passages) for f in found),
         }
     )

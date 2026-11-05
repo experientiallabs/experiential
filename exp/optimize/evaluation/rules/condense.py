@@ -51,7 +51,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import RuleBook, RuleStatus
 
-CONDENSATION_PROTOCOL = "rule-condensation-v3"
+CONDENSATION_PROTOCOL = "rule-condensation-v4"
 """Version of the condenser prompt, tools, answer schema and memory format."""
 
 CONDENSE_TOOL = "write_memory"

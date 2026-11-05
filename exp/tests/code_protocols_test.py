@@ -314,18 +314,18 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.agent_loop:AGENT_LOOP_PROTOCOL",
-        "rules-agent-loop-v3",
+        "rules-agent-loop-v4",
         (
             "exp.optimize.evaluation.rules.agent_loop",
             "exp.optimize.evaluation.rules.evidence_pages",
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "0a84b27dd85a68436a36275ea306f02d5e66c29dc5494c747093e265152f1cbe",
+        "a2707fd55d6716fa215216164f25bf6ede30416ad14385c88e89107f50bfc1e6",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.research:RESEARCH_PROTOCOL",
-        "rule-research-v3",
+        "rule-research-v4",
         (
             "exp.optimize.evaluation.rules.research",
             "exp.optimize.evaluation.rules.agent_loop",
@@ -335,11 +335,11 @@ PROTOCOLS = (
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "20648f4d94e09004172cd278a9d2d8d6e9c386155c60cd1e4f218c74d62eb203",
+        "4b25031b15a3790076870be7b57f06caceaf009473aeb055f21802a0d455f4be",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.weighing:WEIGHING_PROTOCOL",
-        "rule-weighing-v3",
+        "rule-weighing-v4",
         (
             "exp.optimize.evaluation.rules.weighing",
             "exp.optimize.evaluation.rules.agent_loop",
@@ -349,11 +349,11 @@ PROTOCOLS = (
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "37d14a0dc6d4c83f3515eff424c6058c16536b4f954301ef528a0aa21fd83666",
+        "241b566b4fd44b0ce39ab7951e08e67f117db2f0604eeb6e3ad02d42650c8593",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.condense:CONDENSATION_PROTOCOL",
-        "rule-condensation-v3",
+        "rule-condensation-v4",
         (
             "exp.optimize.evaluation.rules.condense",
             "exp.optimize.evaluation.rules.agent_loop",
@@ -361,7 +361,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "68f75934e7df6c03f28e077979e17c545ba5f579569477d5a8692facd4387e3d",
+        "ac24e9edc249abe25dd880d2c48d58018778327d5aa530e8fb4cd45e6fa57e2d",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
@@ -633,7 +633,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.system_two:SYSTEM_TWO_PROTOCOL",
-        "jev-system-two-v3",
+        "jev-system-two-v4",
         (
             "exp.optimize.evaluation.rules.system_two",
             "exp.optimize.evaluation.rules.agent_loop",
@@ -642,11 +642,11 @@ PROTOCOLS = (
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "748c75445f34e465083e1090c1455a2660fe92240424728cdd4c2639ea58d7ef",
+        "ecb107ad6aa2d24d58cb5e186bb5333715b6d18a96cee1dd5418970585909caf",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.inspectors:INSPECTOR_PROTOCOL",
-        "rule-memory-inspectors-v3",
+        "rule-memory-inspectors-v4",
         (
             "exp.optimize.evaluation.rules.inspectors",
             "exp.optimize.evaluation.rules.memory_edits",
@@ -655,16 +655,13 @@ PROTOCOLS = (
             "exp.optimize.evaluation.factory.authoring:author_request_bytes",
             "exp.optimize.evaluation.factory.authoring:_effective_request",
         ),
-        "091b9294b8826597460f0787dbb682984c6b1360731c0197d78b8a109cf0c9cc",
+        "65a923081ce261bd672fcd82ceb320fbd1a46efc4be0d9c0fbe5fe0f95ef5503",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.memory_stage:MEMORY_STAGE_PROTOCOL",
-        "jev-memory-stage-v2",
-        (
-            "exp.optimize.evaluation.rules.memory_stage",
-            "exp.optimize.evaluation.rules.governance",
-        ),
-        "c96b72a6698d2ddad5b23b628218d5c9ff0bb9ce794db02d064cf57f7c083e9c",
+        "jev-memory-stage-v3",
+        ("exp.optimize.evaluation.rules.memory_stage", "exp.optimize.evaluation.rules.governance"),
+        "ff7ca2bfa4b4a3cfac5ef6f1e699be3b8129b6fe9d92a924a13de7c84cd2439b",
     ),
     Protocol(
         "exp.simulation.rules.recall:RECALL_PROTOCOL",
@@ -680,9 +677,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.evidence_pages:EVIDENCE_DELIVERY_PROTOCOL",
-        "evidence-pages-v1",
+        "evidence-pages-v2",
         ("exp.optimize.evaluation.rules.evidence_pages",),
-        "9c98c533bb5d6415104428cfeb4b0ea1901d704e90541ef051920defd9057670",
+        "33c5dd8c38c80be6def3d5619708850217d2935e65bb601ba1082875e4310dc2",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.locator_inventory:LOCATOR_PROTOCOL",
@@ -692,13 +689,41 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_prompts:BOOTSTRAP_PROTOCOL",
-        "start-bootstrap-v2",
+        "start-bootstrap-v3",
         (
             "exp.optimize.evaluation.variance.bootstrap_prompts",
             "exp.optimize.evaluation.variance.bootstrap_agents",
             "exp.optimize.evaluation.rules.locator_inventory",
+            "exp.optimize.evaluation.variance.bootstrap_reads",
         ),
-        "a7f35206a62f1d9c642974a333a64ce5b8e5d6a0c94f0872c71937557249e328",
+        "dae111ea429b5008f017d37a68f607cfdb3916abe05c49d61e8f1518f871e848",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.bootstrap_reads:BOOTSTRAP_READ_PROTOCOL",
+        "bootstrap-step-reads-v1",
+        ("exp.optimize.evaluation.variance.bootstrap_reads",),
+        "a43f000bfcf5592470e3f5919229db9d15d7ff640109594f81bfd3219dc4fbac",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
+        "bootstrap-source-revision-v1",
+        (
+            "exp.optimize.evaluation.variance.bootstrap_protocols",
+            "exp.optimize.evaluation.variance.bootstrap_resume",
+            "exp.optimize.evaluation.variance.bootstrap_plan",
+            "exp.optimize.evaluation.variance.bootstrap_admission",
+        ),
+        "f1ed76cf76b4aa402e859e7d5e4985e68b6937cb84c4163fa1f8e887abd51eb2",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",
+        "bootstrap-cost-admission-v1",
+        (
+            "exp.optimize.evaluation.variance.bootstrap_admission",
+            "exp.optimize.evaluation.variance.bootstrap_plan:admit_bootstrap_preparation",
+            "exp.optimize.evaluation.variance.bootstrap_plan:run_bootstrap_preparation",
+        ),
+        "d94589a4998e702cd77f75754e2a99029cdc48092a41d33a60f33aef75ec7f66",
     ),
 )
 

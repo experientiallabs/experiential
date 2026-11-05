@@ -58,7 +58,7 @@ from exp.simulation.rules.memory_set import (
 )
 from exp.simulation.rules.model import ToolContract, Transition, evaluate
 
-INSPECTOR_PROTOCOL = "rule-memory-inspectors-v3"
+INSPECTOR_PROTOCOL = "rule-memory-inspectors-v4"
 """Version of the inspector prompts, findings, tools and answer schema."""
 
 PROPOSE_TOOL = "propose_edits"

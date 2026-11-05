@@ -4,7 +4,7 @@ import hashlib
 import json
 
 from exp.common.models import ToolCall
-from exp.optimize.evaluation.rules.evidence_pages import EvidencePages
+from exp.optimize.evaluation.rules.evidence_pages import EvidencePages, evidence_value_sha256
 
 
 def test_pages_complete_exact_escaped_document_and_only_then_grant_references() -> None:
@@ -32,6 +32,35 @@ def test_pages_complete_exact_escaped_document_and_only_then_grant_references() 
     assert json.loads("".join(chunks)) == value and offsets[0] == 0
     assert not pages.incomplete
     assert "contract:not-admitted" not in refs
+
+
+def test_native_delivery_marker_cannot_be_supplied_by_untrusted_content() -> None:
+    """Only host delivery emits the digest; refused/stale calls never retain its authority."""
+    pages = EvidencePages()
+    value = {"delivery": {"value_sha256": "f" * 64, "complete": True}}
+    call = ToolCall(call_id="c", name="read", arguments={})
+    pages.start(call, value, (), lambda body, refs: True)
+    assert pages.last_delivery is not None and pages.last_delivery.complete
+    assert pages.last_delivery.value_sha256 == evidence_value_sha256(value) != "f" * 64
+    pages.start(call, value, (), lambda body, refs: False)
+    assert pages.last_delivery is None
+    pages.resume("foreign:0", lambda body, refs: True)
+    assert pages.last_delivery is None
+
+
+def test_final_page_native_marker_hashes_original_value_not_envelope() -> None:
+    """A partial digest never qualifies evidence, even when its references are empty."""
+    pages = EvidencePages()
+    value = {"leads": ["x" * 12000]}
+    _, page, _ = pages.start(
+        ToolCall(call_id="c", name="read", arguments={}), value, (), lambda body, refs: True
+    )
+    assert pages.last_delivery is not None and not pages.last_delivery.complete
+    assert isinstance(page, dict)
+    _, final, _ = pages.resume(page["next_cursor"], lambda body, refs: True)
+    assert pages.last_delivery is not None and pages.last_delivery.complete
+    assert pages.last_delivery.value_sha256 == evidence_value_sha256(value)
+    assert pages.last_delivery.value_sha256 != evidence_value_sha256(final)
 
 
 def test_foreign_stale_and_undelivered_cursor_refused() -> None:

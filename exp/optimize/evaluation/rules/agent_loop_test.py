@@ -22,6 +22,7 @@ from exp.optimize.evaluation.rules.agent_loop import (
     _Loop,
     run_agent,
 )
+from exp.optimize.evaluation.rules.evidence_pages import NativeEvidenceDelivery
 from exp.optimize.evaluation.rules.locator_inventory import LocatorInventory, encode_inventory
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceBudget, MeasuredUsage
 from exp.optimize.evaluation.variance.evidence_tools_test import _ANSWER, _loop_fixture, _reply
@@ -246,7 +247,7 @@ def test_native_delivery_accounts_for_escaping_schemas_and_refused_results(
     monkeypatch.setattr(
         loop,
         "_save_tool",
-        lambda position, call, status, result, served: AgentToolRecord(
+        lambda position, call, status, result, served, delivery=None: AgentToolRecord(
             call=0,
             name=call.name,
             arguments=call.arguments,
@@ -285,6 +286,7 @@ def test_native_loop_completes_pages_before_admitting_citations(
         status: ToolStatus,
         result: JsonValue,
         served: tuple[str, ...],
+        delivery: NativeEvidenceDelivery | None = None,
     ) -> AgentToolRecord:
         """Record delivery metadata in memory without any artifact publication."""
         return AgentToolRecord(
@@ -294,6 +296,7 @@ def test_native_loop_completes_pages_before_admitting_citations(
             status=status,
             served=served,
             result=fake,
+            delivery=delivery,
         )
 
     def respond(request: ModelRequest, index: int) -> ModelResponse:

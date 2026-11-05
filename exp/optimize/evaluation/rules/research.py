@@ -70,7 +70,7 @@ from exp.simulation.rules.model import (
     TrajectoryRules,
 )
 
-RESEARCH_PROTOCOL = "rule-research-v3"
+RESEARCH_PROTOCOL = "rule-research-v4"
 """Version of the research prompts, tools and answer schema; change it whenever any changes."""
 
 RESEARCH_TOOL = "submit_research"
