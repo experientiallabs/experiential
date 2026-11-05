@@ -193,12 +193,16 @@ def test_source_snapshot_binds_complete_bounded_review_implementation() -> None:
     snapshot = current_bootstrap_source()
     assert {
         "exp/optimize/evaluation/variance/build.py",
+        "exp/optimize/evaluation/variance/build_clients.py",
+        "exp/optimize/evaluation/variance/baseline_execution.py",
+        "exp/optimize/evaluation/variance/bootstrap_history.py",
+        "exp/optimize/evaluation/variance/pipeline_review.py",
         "exp/simulation/mining/environment_candidates.py",
         "exp/simulation/mining/environment_families.py",
         "exp/simulation/mining/environment_review.py",
         "exp/simulation/rules/contracts.py",
     } <= snapshot.files.keys()
-    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v5"
+    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v6"
     assert snapshot.protocols["environment_candidates"] == candidate_protocol_sha256()
     assert snapshot.protocols["environment_review"] == review_protocol_sha256()
 

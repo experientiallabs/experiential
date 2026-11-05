@@ -1,6 +1,7 @@
 """One bounded author draw with durable intent, exact response replay and no implicit redraw."""
 
 import json
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Literal, Self
@@ -248,6 +249,7 @@ def author_response(
     code_revision: str,
     retry_authorization: ArtifactInput | None = None,
     execution_window: ArtifactInput | None = None,
+    before_claim: Callable[[], None] | None = None,
 ) -> tuple[ArtifactInput, ModelResponse]:
     """Save one draw under the caller's exclusive operation lease; replay requires exact pins.
 
@@ -296,6 +298,8 @@ def author_response(
     if not store.exists(response_id):
         if store.exists(intent_id):
             raise ValueError("author dispatch has an unknown outcome; no implicit redraw")
+        if before_claim is not None:
+            before_claim()
         deadline = (
             spec.deadline
             if execution_window is None
@@ -327,6 +331,8 @@ def author_response(
 
         def check_execution_window() -> None:
             """Recheck explicit operational authority at every physical attempt boundary."""
+            if before_claim is not None:
+                before_claim()
             if execution_window is not None:
                 author_execution_deadline(project, spec, execution_window)
 
@@ -335,7 +341,7 @@ def author_response(
             artifacts=store,
             code_revision=code_revision,
             deadline=deadline,
-            before_claim=check_execution_window if execution_window is not None else None,
+            before_claim=check_execution_window,
             ledger=DispatchLedger(
                 store.project_directory / (identity + ".sqlite"),
                 spec.maximum_physical_attempts,

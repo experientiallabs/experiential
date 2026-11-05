@@ -6,7 +6,11 @@ from typing import Literal
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.variance.bootstrap_plan import BootstrapPreparationSpec
+from exp.optimize.evaluation.variance.bootstrap_plan import (
+    BootstrapPlan,
+    BootstrapPreparationSpec,
+    _bound_bootstrap_plan,
+)
 from exp.optimize.evaluation.variance.bootstrap_protocols import read_historical_bootstrap_protocol
 from exp.optimize.evaluation.variance.bootstrap_resume import (
     BootstrapResumeBinding,
@@ -54,7 +58,12 @@ def read_bootstrap_preparation_provenance(
     source_ref: ArtifactInput
     source_sha256: Sha256
     source_type: PreparationSourceType
-    if binding.embedding_revision is not None:
+    current_protocol = (
+        binding.protocol_revision is not None
+        and project.artifacts.read(binding.protocol_revision.artifact_id).manifest.code_revision
+        == binding.producer_revision
+    )
+    if binding.embedding_revision is not None and not current_protocol:
         _, completion = load_family_embedding_completion(
             project, binding.embedding_revision, historical=True
         )
@@ -95,3 +104,18 @@ def read_bootstrap_preparation_provenance(
         source_ref=source_ref,
         source_type=source_type,
     )
+
+
+def read_bootstrap_preparation_plan(
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    spec: BootstrapPreparationSpec,
+) -> BootstrapPlan:
+    """Price genuine still-required historical work without granting current execution.
+
+    The native planner uses the saved pilot, exact family embedding revision and original
+    producer for outcome lookup. Source provenance and original authority remain verified.
+    """
+    proof = read_bootstrap_preparation_provenance(project, reference, spec=spec)
+    return _bound_bootstrap_plan(project, spec, proof.producer_revision, reference, proof.binding)

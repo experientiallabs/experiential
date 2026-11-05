@@ -63,6 +63,7 @@ from exp.common.tasks import TaskCase
 from exp.common.tasks.store import load_task_set
 from exp.common.traces import Trace, load_trace_dataset
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
+from exp.optimize.evaluation.variance.build_clients import _admitted_tagger
 from exp.optimize.evaluation.variance.build_records import (
     BINDING_TYPE,
     EXPOSURE_TYPE,
@@ -94,14 +95,11 @@ from exp.optimize.evaluation.variance.exposure import (
 from exp.optimize.evaluation.variance.family_scopes import require_family_review, scope_families
 from exp.optimize.evaluation.variance.saved_vectors import saved_vector_embedder
 from exp.optimize.evaluation.variance.tag_retrieval import index_tag_view, query_task_tags
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import (
-    HttpxJsonTransport,
     ProviderTransportError,
     RetryPolicy,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
-from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.dispatch import dispatch_tagging
@@ -126,7 +124,6 @@ from exp.simulation.mining.tag_selection import (
     select_traces,
 )
 from exp.simulation.mining.tagging import (
-    DecisionCache,
     TagMatrix,
     TagRow,
     TraceTaggingError,
@@ -242,6 +239,8 @@ def run_variance_build(
     constructor: Constructor | None = None,
     namer: ClusterNamer | None = None,
     reviewer: CompatibilityReviewer | None = None,
+    execution_deadline: datetime | None = None,
+    before_claim: Callable[[], None] | None = None,
 ) -> VarianceBuildReport:
     """Run, or replay, the variance build over the project's completed build.
 
@@ -303,7 +302,14 @@ def run_variance_build(
         exposure = save_artifact(
             store, EXPOSURE_TYPE, {"exposure.json": prepared.plan}, (build.task_set,), code_revision
         )
-        active = tagger or _admitted_tagger(project, spec, prepared.summary, code_revision)
+        active = tagger or _admitted_tagger(
+            project,
+            spec,
+            prepared.summary,
+            code_revision,
+            execution_deadline=execution_deadline,
+            before_claim=before_claim,
+        )
         tagging, matrices = _tag(store, prepared, active, code_revision)
         errors = _tag_errors(store, prepared, active, code_revision)
         clusters = _cluster(store, spec, prepared, matrices, errors, namer, code_revision)
@@ -520,51 +526,6 @@ def _embedding_reuse(
         project.paths, serving.embedder, maximum_chunk_bytes=serving.embedding_chunk_bytes
     )
     return len(texts), len(checkpoint.load(texts))
-
-
-def _admitted_tagger(
-    project: ProjectStore, spec: VarianceBuildSpec, summary: VarianceBuildPlan, code_revision: str
-) -> DecisionsTraceTagger:
-    """Resolve the decision alias and post its decisions through the admitted transport.
-
-    Every physical attempt is claimed in this run's dispatch ledger and, under a consented
-    operation ceiling, reserves its cost priced as the decision alias.
-
-    Args:
-        project: Project owning the catalog, cache and receipts.
-        spec: The registration.
-        summary: The plan whose identity names the ledger and whose attempts bound it.
-        code_revision: Producing source identity, recorded on attempt receipts.
-
-    Returns:
-        A tagger over the project's decision cache.
-
-    Raises:
-        TraceTaggingError: The alias is not a native decision alias.
-        ValueError: Its resolved identity differs from the summarized one.
-    """
-    catalog = load_model_catalog(project.model_catalog_path)
-    resolved = RuntimeModelCatalog(catalog).resolve(spec.decision_alias)
-    if resolved.snapshot != summary.decision_model:
-        raise ValueError(f"decision alias {spec.decision_alias!r} changed since it was planned")
-    identity = summary.identity
-    transport = AdmittedJsonTransport(
-        HttpxJsonTransport(),
-        ledger=DispatchLedger(
-            project.artifacts.project_directory / (identity + "-physical.sqlite"),
-            max(1, summary.decision_attempts),
-            sha256_json(identity),
-        ),
-        artifacts=project.artifacts,
-        code_revision=code_revision,
-        deadline=datetime.now(UTC) + timedelta(hours=spec.tagging_deadline_hours),
-    ).priced_as(spec.decision_alias)
-    return DecisionsTraceTagger.for_alias(
-        resolved,
-        transport=transport,
-        cache=DecisionCache(project.paths),
-        maximum_concurrency=spec.concurrency,
-    )
 
 
 def _tag(

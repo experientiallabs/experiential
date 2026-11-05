@@ -362,6 +362,17 @@ def plan_bootstrap_preparation(
         if resume_binding is None
         else load_bootstrap_resume(project, resume_binding, spec=spec, code_revision=code_revision)
     )
+    return _bound_bootstrap_plan(project, spec, code_revision, resume_binding, binding)
+
+
+def _bound_bootstrap_plan(
+    project: ProjectStore,
+    spec: BootstrapPreparationSpec,
+    code_revision: str,
+    resume_binding: ArtifactInput | None,
+    binding: BootstrapResumeBinding | None,
+) -> BootstrapPlan:
+    """Price the exact verified binding, with unchanged native selection and outcome owners."""
     execution = spec if binding is None else bootstrap_execution_spec(project, binding, spec)
     identity_revision = code_revision if binding is None else binding.build_revision
     if (
