@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.family_embedding import FamilyEmbeddingIntent
 
 REVISION_TYPE = "family-embedding-executor-revision"
+OWNER_TYPE = "family-embedding-physical-owner"
 _ALLOWED_SOURCE = frozenset(
     {
         "optimize/evaluation/variance/family_embedding.py",
@@ -68,7 +69,7 @@ class FamilyEmbeddingExecutorRevision(ContractModel):
         wire_contract: Canonical native request-model semantics; response echoes stay separate.
     """
 
-    protocol: Literal["family-embedding-executor-v1"] = "family-embedding-executor-v1"
+    protocol: Literal["family-embedding-executor-v2"] = "family-embedding-executor-v2"
     intent: ArtifactInput
     original_operation: str
     ledger_sha256: Sha256
@@ -86,6 +87,89 @@ class FamilyEmbeddingExecutorRevision(ContractModel):
     retained_attempts: tuple[str, ...] = Field(min_length=1)
     wire_contract: Literal["native-openai-embedding-record-model-v1"] = (
         "native-openai-embedding-record-model-v1"
+    )
+
+
+class FamilyEmbeddingPhysicalOwner(ContractModel):
+    """One immutable original child owner across every executor revision of an intent."""
+
+    protocol: Literal["family-embedding-physical-owner-v1"] = "family-embedding-physical-owner-v1"
+    intent: ArtifactInput
+    original_operation: str
+    ledger_sha256: Sha256
+    physical_ledger: Path
+    physical_cap: int = Field(ge=1, le=100000)
+    phase_config_sha256: Sha256
+    retained_attempts: tuple[str, ...] = Field(min_length=1)
+    producer_revision: str
+
+
+def _owner_id(intent: ArtifactInput) -> str:
+    """Bind original physical ownership to the intent, independently of source revisions."""
+    return stable_id(OWNER_TYPE, intent)
+
+
+def _owner(project: ProjectStore, intent: ArtifactInput) -> FamilyEmbeddingPhysicalOwner | None:
+    """Read the exact immutable original owner, without admitting another child path."""
+    identity = _owner_id(intent)
+    if not project.artifacts.exists(identity):
+        return None
+    stored = project.artifacts.read(identity)
+    value = FamilyEmbeddingPhysicalOwner.model_validate_json(stored.payloads["owner.json"])
+    if (
+        stored.manifest.artifact_type != OWNER_TYPE
+        or stored.manifest.artifact_id != identity
+        or stored.manifest.code_revision != value.producer_revision
+        or stored.manifest.inputs != (intent,)
+        or value.intent != intent
+        or value.physical_ledger != value.physical_ledger.resolve()
+    ):
+        raise ValueError("original embedding physical owner identity or provenance changed")
+    return value
+
+
+def _require_owner(
+    project: ProjectStore,
+    revision: FamilyEmbeddingExecutorRevision,
+) -> FamilyEmbeddingPhysicalOwner | None:
+    """Reject copied/backup counters, even with identical registration and old claim prefix."""
+    owner = _owner(project, revision.intent)
+    if owner is not None and (
+        owner.original_operation != revision.original_operation
+        or owner.ledger_sha256 != revision.ledger_sha256
+        or owner.physical_ledger != revision.physical_ledger.resolve()
+        or owner.physical_cap != revision.physical_cap
+        or owner.phase_config_sha256 != revision.phase_config_sha256
+        or owner.retained_attempts != revision.retained_attempts
+    ):
+        raise ValueError("executor revision changes the original physical owner")
+    return owner
+
+
+def _bind_owner(project: ProjectStore, revision: FamilyEmbeddingExecutorRevision) -> None:
+    """Register once while the caller holds the original operation's native lock."""
+    if _require_owner(project, revision) is not None:
+        return
+    owner = FamilyEmbeddingPhysicalOwner(
+        intent=revision.intent,
+        original_operation=revision.original_operation,
+        ledger_sha256=revision.ledger_sha256,
+        physical_ledger=revision.physical_ledger.resolve(),
+        physical_cap=revision.physical_cap,
+        phase_config_sha256=revision.phase_config_sha256,
+        retained_attempts=revision.retained_attempts,
+        producer_revision=revision.producer_revision,
+    )
+    project.artifacts.write_json(
+        artifact_id=_owner_id(revision.intent),
+        artifact_type=OWNER_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=datetime.now(UTC),
+            code_revision=revision.producer_revision,
+            inputs=(revision.intent,),
+        ),
+        files={"owner.json": owner},
     )
 
 
@@ -225,6 +309,7 @@ def _validate(
     from exp.optimize.evaluation.executable import grounded
 
     intent = _original(project, revision.intent)
+    _require_owner(project, revision)
     old_package = intent.runtime_file.parents[3]
     new_package = Path(__file__).resolve().parents[3]
     ledger = operation_spend_ceiling(project, intent.original_operation)
@@ -272,7 +357,7 @@ def _validate(
         raise ValueError("executor revision changes the retained physical claim prefix")
     if child.used() != len(actual):
         raise ValueError("executor revision physical accounting changed")
-    ledger.require_accounted_attempts(revision.retained_attempts)
+    ledger.require_accounted_attempts(actual)
     for attempt in revision.retained_attempts:
         manifest = project.artifacts.read("provider-attempt-" + attempt + "-intent").manifest
         if (
@@ -297,12 +382,17 @@ def propose_family_embedding_executor_revision(
     from exp.optimize.evaluation.executable import grounded
 
     original = _original(project, intent)
+    physical_ledger = physical_ledger.resolve()
+    owner = _owner(project, intent)
+    if owner is not None and owner.physical_ledger != physical_ledger:
+        raise ValueError("executor proposal changes the original physical owner")
     with sqlite3.connect(f"file:{physical_ledger}?mode=ro", uri=True) as database:
         cap, phase = database.execute("SELECT cap,phase_config_sha256 FROM registration").fetchone()
-        retained = tuple(
+        current = tuple(
             row[0]
             for row in database.execute("SELECT attempt_id FROM invocation_slots ORDER BY seq")
         )
+        retained = current if owner is None else owner.retained_attempts
     ledger = operation_spend_ceiling(project, original.original_operation)
     revision = FamilyEmbeddingExecutorRevision(
         intent=intent,
@@ -329,8 +419,15 @@ def register_family_embedding_executor_revision(
     project: ProjectStore,
     revision: FamilyEmbeddingExecutorRevision,
 ) -> ArtifactInput:
-    """Append exact compatibility evidence without changing grants or ledgers."""
+    """Append exact compatibility under the caller-held original-operation lock.
+
+    The same lock must cover proposal and registration. The deterministic original-owner
+    artifact is also published atomically, so a competing copied counter never replaces it.
+    """
     _validate(project, revision)
+    _bind_owner(project, revision)
+    _require_owner(project, revision)
+    owner_ref = artifact_input(project.artifacts.read(_owner_id(revision.intent)).manifest)
     identity = stable_id(REVISION_TYPE, revision)
     if not project.artifacts.exists(identity):
         project.artifacts.write_json(
@@ -340,7 +437,7 @@ def register_family_embedding_executor_revision(
                 schema_version=1,
                 created_at=datetime.now(UTC),
                 code_revision=revision.producer_revision,
-                inputs=(revision.intent,),
+                inputs=(revision.intent, owner_ref),
             ),
             files={"revision.json": revision},
         )
@@ -360,12 +457,16 @@ def load_family_embedding_executor_revision(
     revision = FamilyEmbeddingExecutorRevision.model_validate_json(
         project.artifacts.read_bytes(reference.artifact_id, "revision.json")
     )
+    owner = _owner(project, revision.intent)
+    if owner is None:
+        raise ValueError("executor revision has no original physical owner registration")
+    owner_ref = artifact_input(project.artifacts.read(_owner_id(revision.intent)).manifest)
     if (
         artifact_input(manifest) != reference
         or manifest.artifact_type != REVISION_TYPE
         or reference.artifact_id != stable_id(REVISION_TYPE, revision)
         or manifest.code_revision != revision.producer_revision
-        or manifest.inputs != (revision.intent,)
+        or manifest.inputs != (revision.intent, owner_ref)
     ):
         raise ValueError("executor revision artifact identity or provenance changed")
     _validate(project, revision, historical=historical)

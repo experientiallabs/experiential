@@ -1,12 +1,14 @@
 """Executor compatibility preserves the old intent, exact source delta and physical history."""
 
 import shutil
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from exp.common.core.artifacts import ArtifactEnvelope, sha256_bytes, sha256_json, stable_id
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelCapabilities, load_model_catalog
 from exp.common.project import artifact_input
 from exp.common.release_revision import _package_source_digest, installed_release_revision
@@ -173,15 +175,37 @@ def test_executor_revision_keeps_original_intent_ledger_and_closed_source(
             )
     before = ceiling.summary()
     original_bytes = project.artifacts.read_bytes(reference.artifact_id, "intent.json")
-    revision = propose_family_embedding_executor_revision(
-        project,
-        intent=reference,
-        physical_ledger=tmp_path / "original-physical.sqlite",
-        code_revision=installed_release_revision(),
-    )
-    successor = register_family_embedding_executor_revision(project, revision)
-    assert register_family_embedding_executor_revision(project, revision) == successor
+    with CoordinationLock(
+        project.artifacts.project_directory / (intent.original_operation + ".lock"),
+        timeout=0,
+    ):
+        revision = propose_family_embedding_executor_revision(
+            project,
+            intent=reference,
+            physical_ledger=tmp_path / "original-physical.sqlite",
+            code_revision=installed_release_revision(),
+        )
+        successor = register_family_embedding_executor_revision(project, revision)
+        assert register_family_embedding_executor_revision(project, revision) == successor
     assert load_family_embedding_executor_revision(project, successor) == revision
+    copied = tmp_path / "backup-physical.sqlite"
+    with (
+        sqlite3.connect(tmp_path / "original-physical.sqlite") as source,
+        sqlite3.connect(copied) as backup,
+    ):
+        source.backup(backup)
+    copied_revision = revision.model_copy(update={"physical_ledger": copied})
+    with pytest.raises(ValueError, match="original physical owner"):
+        _validate(project, copied_revision)
+    with pytest.raises(ValueError, match="original physical owner"):
+        register_family_embedding_executor_revision(project, copied_revision)
+    with pytest.raises(ValueError, match="original physical owner"):
+        propose_family_embedding_executor_revision(
+            project,
+            intent=reference,
+            physical_ledger=copied,
+            code_revision=installed_release_revision(),
+        )
     assert revision.intent == reference and revision.physical_cap == cap
     assert (
         revision.phase_config_sha256 == sha256_json(intent) and len(revision.retained_attempts) == 1
@@ -213,3 +237,34 @@ def test_executor_revision_keeps_original_intent_ledger_and_closed_source(
     ):
         with pytest.raises(ValueError):
             _validate(project, bad)
+
+    # New-source physical growth preserves the original owner/prefix rather than refilling it.
+    progressed = AdmittedJsonTransport(
+        ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})]),
+        ledger=physical,
+        artifacts=project.artifacts,
+        code_revision=revision.producer_revision,
+        deadline=intent.deadline,
+        spend_ceiling=ceiling,
+    )
+    with canonical_call(reference):
+        progressed.post(
+            endpoint.rstrip("/") + "/embeddings",
+            headers={},
+            payload={"model": record.model, "input": list(texts)},
+            timeout_seconds=10,
+        )
+    with CoordinationLock(
+        project.artifacts.project_directory / (intent.original_operation + ".lock"),
+        timeout=0,
+    ):
+        advanced = propose_family_embedding_executor_revision(
+            project,
+            intent=reference,
+            physical_ledger=tmp_path / "original-physical.sqlite",
+            code_revision=installed_release_revision(),
+        )
+        assert advanced.retained_attempts == revision.retained_attempts
+        assert register_family_embedding_executor_revision(project, advanced) == successor
+    assert physical.used() == 2
+    assert len(ceiling.summary().authorizations) == len(before.authorizations)
