@@ -19,6 +19,13 @@ memory set that govern the current call (typed Jev decisions over the set's inde
 only those to the called tool. Its identity, which covers the memory set digest and the recall
 policy, joins the frozen definition only when present, and every step's recall receipt is part
 of that step's recorded intent.
+
+An optional state retrieval tags the live pre-turn state (the task, recent actions and results,
+and the visible domains) through the decision model and attaches the recorded transitions whose
+pre-turn state agreed best, excluding the task's own lineage. An optional state memory attaches a
+written description of the current task state, authored when the state changes and reused while
+it does not. Each joins the frozen definition only when present, and each step's receipt is part
+of that step's recorded intent.
 """
 
 import json
@@ -50,11 +57,17 @@ from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.state_policy import StateEditPolicy
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.engines.transition import Completion, ProposedObservation
+from exp.simulation.retrieval.state_rag import StateRAG, recalled_transition
+from exp.simulation.retrieval.state_tags import live_pre_turn_state
 from exp.simulation.rules.checker import TransitionVerdict, check_proposed_transition
 from exp.simulation.rules.model import RuleBook, Transition
 from exp.simulation.rules.recall import RuleRecall
 from exp.simulation.world_model.frozen_memory import TaskView
-from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
+from exp.simulation.world_model.grounded_session import (
+    STATE_PRECEDENTS_GUIDANCE,
+    GroundedTransitionEngine,
+)
+from exp.simulation.world_model.state_memory import StateMemory
 
 
 class PredictorEvent(ContractModel):
@@ -90,6 +103,8 @@ class GroundedWorldFactory:
             allowing verdict of a committed proposal is recorded as a ``verdict`` event.
         rule_memory: Optional per-step recall over a pinned rule memory set; only the recalled
             rule files reach each prediction.
+        state_recall: Optional retrieval of recorded transitions by pre-turn state agreement.
+        state_memory: Optional written description of the current task state.
     """
 
     def __init__(
@@ -104,6 +119,8 @@ class GroundedWorldFactory:
         maximum_reasks: int = 0,
         rule_book: RuleBook | None = None,
         rule_memory: RuleRecall | None = None,
+        state_recall: StateRAG | None = None,
+        state_memory: StateMemory | None = None,
     ) -> None:
         """Bind one task without retrieving, loading credentials or calling a provider."""
         if engine.output_protocol != "json-tool":
@@ -118,6 +135,9 @@ class GroundedWorldFactory:
         self._rule_book_identity = None if rule_book is None else sha256_json(rule_book)
         self.rule_memory = rule_memory
         self._rule_memory_identity = None if rule_memory is None else rule_memory.identity
+        self.state_recall, self.state_memory = state_recall, state_memory
+        self._state_recall_identity = None if state_recall is None else state_recall.identity
+        self._state_memory_identity = None if state_memory is None else state_memory.identity
         self._identity = engine.identity
         self._memory_identity = None if memory is None else memory.identity
         self._facts_bound = engine.facts is not None
@@ -154,6 +174,20 @@ class GroundedWorldFactory:
                 if self._rule_memory_identity is not None
                 else {}
             ),
+            # Bound only when state precedents or a state description are attached.
+            **(
+                {
+                    "state_rag_sha256": self._state_recall_identity,
+                    "state_precedents_prompt_sha256": sha256_json(STATE_PRECEDENTS_GUIDANCE),
+                }
+                if self._state_recall_identity is not None
+                else {}
+            ),
+            **(
+                {"state_memory_sha256": self._state_memory_identity}
+                if self._state_memory_identity is not None
+                else {}
+            ),
         }
 
     def _check_state(self, state: JsonObject) -> None:
@@ -182,6 +216,14 @@ class GroundedWorldFactory:
             or (
                 self.rule_memory is not None
                 and self.rule_memory.identity != self._rule_memory_identity
+            )
+            or (
+                self.state_recall is not None
+                and self.state_recall.identity != self._state_recall_identity
+            )
+            or (
+                self.state_memory is not None
+                and self.state_memory.identity != self._state_memory_identity
             )
         ):
             raise ValueError("grounded executable predictor or memory changed after freezing")
@@ -321,6 +363,30 @@ class _GroundedWorldBackend:
                 ],
             )
             recall = receipt.model_dump(mode="json")
+        steps: JsonObject = {}
+        precedents: list[JsonObject] = []
+        task = self.factory.engine.task
+        if self.factory.state_recall is not None:
+            rag = self.factory.state_recall
+            live = live_pre_turn_state(
+                task=task.instruction,
+                initial_context=task.initial_context,
+                history=list(self.history),
+                environment=visible,
+                history_steps=rag.policy.history_steps,
+                observation_characters=rag.policy.observation_characters,
+            )
+            matched, state_receipt = rag.retrieve(live, (task.lineage_group_id,))
+            precedents = [
+                recalled_transition(transition, match)
+                for transition, match in zip(matched, state_receipt.selected, strict=True)
+            ]
+            steps["state_recall"] = state_receipt.model_dump(mode="json")
+        description = None
+        if self.factory.state_memory is not None:
+            described = self.factory.state_memory.describe(task.instruction, visible)
+            description = described.text
+            steps["state_memory"] = described.model_dump(mode="json")
         prepared = self.factory.engine.prepare(
             state,
             self.history,
@@ -329,6 +395,8 @@ class _GroundedWorldBackend:
             current_facts=current_facts,
             operation_id=operation,
             learned_rules=learned,
+            state_precedents=precedents,
+            state_description=description,
             state_policy=state_policy,
             state_schemas={
                 row.name: row.state_schema
@@ -353,6 +421,7 @@ class _GroundedWorldBackend:
                         "operation": operation,
                         "refused_proposals": attempt,
                         **({} if recall is None else {"rule_recall": recall}),
+                        **steps,
                     },
                 )
             )

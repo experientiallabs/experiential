@@ -29,6 +29,12 @@ prediction a native Jev recall selects only the rule files that govern the curre
 a byte budget. Recall decisions go through the project decision cache, so a replayed step makes
 no call, and every step's receipt (scores, selection, cost) is retained. The binding is part of
 the definition, so the runtime identity and the world digest cover the exact memory set.
+
+A state memory policy is bound the same way: before each prediction an admitted open-weight
+author describes the task's current visible state, once per distinct state, and the description
+is attached beside the recalled rules within the policy's byte budget. Its completions are bought
+once through the project decision cache, so a replayed step makes no call. The policy is part of
+the definition, so the runtime identity and the world digest cover it.
 """
 
 import json
@@ -100,6 +106,7 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
 )
+from exp.simulation.world_model.state_memory import StateMemory, StateMemoryPolicy
 
 _PREDICTOR_PART = "predictor.json"
 
@@ -156,6 +163,10 @@ class GroundedRuntimeDefinition(ContractModel):
         rule_memory: Optional pinned rule memory set with its recall policy. Each prediction
             receives only the rule files recalled for its call, alongside the task memory.
             Absent, the definition and every derived identity are unchanged.
+        state_memory: Optional per-task state description policy, naming an admitted
+            completion alias. Each prediction receives the description of the current visible
+            state, refreshed when it changes. Absent, the definition and every derived identity
+            are unchanged.
     """
 
     task: TaskCase
@@ -184,6 +195,9 @@ class GroundedRuntimeDefinition(ContractModel):
     )
     programs: InducedCoverage | None = Field(default=None, exclude_if=lambda value: value is None)
     rule_memory: RuleMemoryBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    state_memory: StateMemoryPolicy | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -445,6 +459,16 @@ def _checked(
         if alias is None or catalog.connections[alias.connection].provider != "typesafe":
             raise ValueError("rule memory recall requires the admitted native decision wire")
         rule_memory = load_memory_set(project.artifacts, spec.rule_memory.memory_set)
+    if spec.state_memory is not None:
+        alias = catalog.models.get(spec.state_memory.author_alias)
+        if alias is None or catalog.connections[alias.connection].provider == "typesafe":
+            raise ValueError(
+                "state memory needs an admitted completion alias, not a decision-only model; "
+                "name an open-weight chat model in state_memory.author_alias"
+            )
+        require_admitted_transport(
+            catalog, spec.state_memory.author_alias, consumer="executable simulator"
+        )
     return catalog, artifact, embedder_alias, rule_book, tag_retrieval, rule_memory
 
 
@@ -647,6 +671,24 @@ def _runtime(
             record=receipt_recorder(project, identity, revision, lambda: datetime.now(UTC)),
         )
 
+    state_memory = None
+    if spec.state_memory is not None:
+        author = registry.resolve(spec.state_memory.author_alias)
+        descriptions = DecisionCache(project.paths)
+
+        def author_text(request: ModelRequest) -> str:
+            """Write one state description draft through the shared admitted transport."""
+            with call_consumer("analyst"):
+                return author.client.complete(request).output.content or ""
+
+        state_memory = StateMemory(
+            spec.state_memory,
+            complete=author_text,
+            model=author.snapshot.model_dump(mode="json"),
+            purchase=descriptions.purchase,
+            record=receipt_recorder(project, identity, revision, lambda: datetime.now(UTC)),
+        )
+
     grounded_factory = GroundedWorldFactory(
         GroundedTransitionEngine(
             runtime,
@@ -666,6 +708,7 @@ def _runtime(
         maximum_reasks=spec.maximum_reasks,
         rule_book=rule_book,
         rule_memory=recall,
+        state_memory=state_memory,
     )
     factory: WorldBackendFactory = grounded_factory
     sandbox = None
