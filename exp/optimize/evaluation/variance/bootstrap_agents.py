@@ -264,6 +264,15 @@ def assemble_start_proposal(answer: JsonObject) -> StartDraft:
     state = proposal.get("initial_state")
     if not isinstance(state, dict):
         raise ValueError("initial_state must map each domain name to its state")
+    roots = domain_state_roots(tuple(state))
+    probes = proposal.get("probe_paths")
+    if not isinstance(probes, dict) or any(
+        not isinstance(pointer, str) or pointer not in roots.values() for pointer in probes.values()
+    ):
+        raise ValueError(
+            f"generated probe_paths select only full domain roots {roots}; "
+            "do not select scalar notes, leaf fields or wildcard paths"
+        )
     proposal["tools"] = [
         tool.model_dump(mode="json", exclude={"reads", "writes"}) for tool in tools
     ]

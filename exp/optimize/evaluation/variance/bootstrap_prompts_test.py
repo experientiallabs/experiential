@@ -93,8 +93,10 @@ def test_author_pointer_schema_uses_escaped_domain_roots() -> None:
     pointer = probes["additionalProperties"]
     assert isinstance(pointer, dict)
     validator = Draft202012Validator(pointer)
-    assert validator.is_valid("/Python~1pytest toolchain/note")
-    assert validator.is_valid("/Workspace filesystem (~1workspace)/files")
+    assert validator.is_valid("/Python~1pytest toolchain")
+    assert validator.is_valid("/Workspace filesystem (~1workspace)")
+    assert not validator.is_valid("/Python~1pytest toolchain/note")
+    assert not validator.is_valid("/Workspace filesystem (~1workspace)/files")
     assert not validator.is_valid("/Workspace filesystem (/workspace)/files")
     assert not validator.is_valid("/Python/pytest toolchain/note")
     assert not validator.is_valid("/workspace/files")

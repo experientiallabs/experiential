@@ -155,3 +155,14 @@ def test_authored_start_cannot_pass_without_any_actor_action() -> None:
     draft["initial_state"] = {"tickets": {"outcome": "right"}}
     with pytest.raises(ValueError, match="no-action"):
         validate_draft(draft, material(), frozenset())
+
+
+def test_generated_probe_selects_a_full_domain_root() -> None:
+    """An author cannot select a scalar note instead of its mutable domain."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import assemble_start_proposal
+    from exp.optimize.evaluation.variance.bootstrap_test import _author_answer
+
+    answer = _author_answer("auth", {"findings": []})
+    answer["probe_paths"] = {"tickets": "/tickets/status"}
+    with pytest.raises(ValueError, match="full domain roots"):
+        assemble_start_proposal(answer)

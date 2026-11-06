@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v12"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v13"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -65,8 +65,10 @@ probe_paths key names the value selected by its pointer into the state. Verifier
 start /final_state/<projection-key>/... . Do not require invented outcome fields such as passed;
 the verifier itself computes pass/fail.
 Use the smallest sufficient subset of supplied tools to keep the draft compact.
-Project the full mutable state domains needed to verify results, rather than an initial empty
-marker or note that never captures the actor's work. For example, probe_paths={"workspace":
+probe_paths values must select exact full-domain roots from family.domain_state_roots.
+Leaf fields, scalar notes and wildcard paths are not accepted. Put file/status predicates below
+the domain projection, so grading sees the actor's future work.
+For example, probe_paths={"workspace":
 "/Workspace filesystem (~1workspace)"} exposes that domain under /final_state/workspace.
 A rule can then test /final_state/workspace/pytest_exit_code equals 0; the start must define
 where tool execution stores that result. A required_paths check alone does not assert success.
@@ -238,7 +240,11 @@ def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
         escapes = {ord(char): "\\" + char for char in r"\.^$|?*+()[]{}"}
         pattern = "^(?:" + "|".join(root.translate(escapes) for root in roots.values()) + ")(?:/|$)"
         pointer = {"type": "string", "pattern": pattern, "examples": list(roots.values())}
-        properties["probe_paths"]["additionalProperties"] = pointer
+        properties["probe_paths"]["additionalProperties"] = {
+            "type": "string",
+            "enum": list(roots.values()),
+            "description": "Select a full domain root. Leaf fields and wildcards are invalid.",
+        }
         schema["$defs"]["FactClaim"]["properties"]["state_paths"]["items"] = pointer
         state = properties["initial_state"]
         value = state["additionalProperties"]
