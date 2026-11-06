@@ -383,7 +383,27 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.rubric_items",
             "exp.optimize.evaluation.variance.rubric_grading",
         ),
-        "51a8545b7917d16061f90ac3705acf17dc1487d12af50509adbc5536eb2e5ce4",
+        "bb443860b090f62905099d2d1d3853971db5871b8036b0771b411d1af51290dd",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.tag_monitor_contracts:TAG_MONITOR_PROTOCOL",
+        "tag-monitor-v1",
+        (
+            "exp.optimize.evaluation.variance.tag_monitor",
+            "exp.optimize.evaluation.variance.tag_monitor_contracts",
+            "exp.optimize.evaluation.variance.tag_monitor_stats",
+            "exp.optimize.evaluation.variance.tag_monitor_reward_stats",
+            "exp.optimize.evaluation.variance.tag_monitor_review",
+            "exp.optimize.evaluation.variance.tag_monitor_states",
+            "exp.optimize.evaluation.variance.tag_monitor_epoch",
+        ),
+        "96a0ffedfc43cbcb4698d4afc28dfbf0243bb3988e38957103050dd8f6cc08cf",
+    ),
+    Protocol(
+        "exp.simulation.mining.tag_health:TAG_HEALTH_PROTOCOL",
+        "tag-health-v1",
+        ("exp.simulation.mining.tag_health",),
+        "1c82c7b87689f4168bad82bb8094d2112053f7f0a4a8789ae24734d86e21ad4d",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.briefing_review:BRIEFING_REVIEW_PROTOCOL",

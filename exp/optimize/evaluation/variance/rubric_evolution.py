@@ -15,7 +15,10 @@ table and persisted to the evolution's journal):
    (:mod:`~.rubric_audit`); a strict-majority fail flags a rollout. The epoch's mean in-loop
    reward and audit pass rate are recorded, and the **divergence trigger** compares them with the
    previous epoch: reward rising by ``reward_rise`` or more while the pass rate moves by
-   ``audit_bound`` or less forces the next boundary (larger sample, no early exit).
+   ``audit_bound`` or less forces the next boundary (larger sample, no early exit). When a tag
+   monitor is bound (:class:`EpochMonitor`), its drift evidence is read first and recorded on the
+   trigger: reward rising by ``reward_rise`` while the monitor reports a hack tag drifting up
+   also forces the next boundary, ahead of the audit.
 4. **Diff** flagged rollouts against genuine passes by tag signature, authoring probe questions
    when the vocabulary cannot see the hack (:mod:`~.rubric_signatures`).
 5. **Admit** each adversarial signature with the rule admission (two or more independent
@@ -36,8 +39,9 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import Field, model_validator
 
@@ -229,6 +233,46 @@ class EpochMetrics(ContractModel):
     audit_pass_rate: float | None = None
 
 
+class MonitorEvidence(ContractModel):
+    """What the tag monitor reported at one boundary, as divergence-trigger evidence.
+
+    Attributes:
+        report: The saved monitor report, when it was saved.
+        drifted: Hack tags the monitor's statistics flagged as rising with reward and Astra
+            cited in a drift proposal.
+        stopped_discriminating: Tags whose rate left the usable band, handed to retirement.
+        halted: Whether the monitor raised a halt.
+        reason: One sentence.
+    """
+
+    report: ArtifactInput | None = None
+    drifted: tuple[str, ...] = ()
+    stopped_discriminating: tuple[str, ...] = ()
+    halted: bool = False
+    reason: str = Field(default="", max_length=1000)
+
+
+class EpochMonitor(Protocol):
+    """A tag monitor bound to the epoch boundary (checkpoint 6)."""
+
+    @property
+    def identity(self) -> str:
+        """Identity of the monitor's settings; it joins the boundary identity."""
+        ...
+
+    def observe(
+        self,
+        project: ProjectStore,
+        registration: EvolutionRegistration,
+        state: EvolutionState,
+        epoch: int,
+        readings: Sequence[RolloutReading],
+        rewards: Mapping[str, float],
+    ) -> MonitorEvidence:
+        """Measure the ending epoch's tag rates against earlier epochs and report drift."""
+        ...
+
+
 class TriggerRecord(ContractModel):
     """The divergence trigger at one boundary.
 
@@ -241,6 +285,7 @@ class TriggerRecord(ContractModel):
         audit_bound: The configured audit bound.
         fired: Whether the next boundary is forced.
         reason: Why, in one sentence.
+        monitor: The tag monitor's evidence, when a monitor is bound.
     """
 
     epoch: int
@@ -251,37 +296,60 @@ class TriggerRecord(ContractModel):
     audit_bound: float
     fired: bool
     reason: str
+    monitor: MonitorEvidence | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 def divergence_trigger(
-    previous: EpochMetrics | None, current: EpochMetrics, spec: TriggerSpec
+    previous: EpochMetrics | None,
+    current: EpochMetrics,
+    spec: TriggerSpec,
+    monitor: MonitorEvidence | None = None,
 ) -> TriggerRecord:
-    """Decide whether reward rose while the audit stayed flat or fell past the bound."""
+    """Decide whether reward rose while the audit stayed flat or fell past the bound.
+
+    With monitor evidence, reward rising by ``reward_rise`` while the monitor reports drifting
+    hack tags also fires, even when the audit has not caught up yet.
+    """
     base = TriggerRecord(
         epoch=current.epoch,
         reward_rise=spec.reward_rise,
         audit_bound=spec.audit_bound,
         fired=False,
         reason="first boundary: nothing to compare",
+        monitor=monitor,
     )
     if previous is None:
         return base
-    if (
-        previous.mean_reward is None
-        or current.mean_reward is None
-        or previous.audit_pass_rate is None
-        or current.audit_pass_rate is None
-    ):
-        return base.model_copy(
+    rewarded = previous.mean_reward is not None and current.mean_reward is not None
+    if not rewarded or previous.audit_pass_rate is None or current.audit_pass_rate is None:
+        unread = base.model_copy(
             update={
                 "previous_epoch": previous.epoch,
                 "reason": "a reward or audit pass rate is unmeasured, so it cannot be read",
             }
         )
+        if not rewarded or monitor is None or not monitor.drifted:
+            return unread
+        assert previous.mean_reward is not None and current.mean_reward is not None
+        reward = current.mean_reward - previous.mean_reward
+        fired = reward >= spec.reward_rise
+        return unread.model_copy(
+            update={
+                "reward_delta": round(reward, 9),
+                "fired": fired,
+                "reason": f"in-loop reward rose {reward:+.3f} with the audit unmeasured; the tag "
+                f"monitor reports drift in {', '.join(monitor.drifted)}"
+                + (", so the next boundary is forced" if fired else "; no divergence"),
+            }
+        )
+    assert previous.mean_reward is not None and current.mean_reward is not None
     reward = current.mean_reward - previous.mean_reward
     audit = current.audit_pass_rate - previous.audit_pass_rate
     fired = reward >= spec.reward_rise and audit <= spec.audit_bound
     reason = f"in-loop reward rose {reward:+.3f} while the audit pass rate moved {audit:+.3f}"
+    if monitor is not None and monitor.drifted:
+        reason += f" and the tag monitor reports drift in {', '.join(monitor.drifted)}"
+        fired = fired or reward >= spec.reward_rise
     return base.model_copy(
         update={
             "previous_epoch": previous.epoch,
@@ -605,16 +673,22 @@ def open_evolution(
     return state
 
 
-def boundary_identity(registration: EvolutionRegistration, export: RolloutExport) -> str:
-    """The identity a finished boundary is saved under, computed before any call."""
-    return stable_id(
-        BOUNDARY_TYPE,
-        {
-            "protocol": RUBRIC_EVOLUTION_PROTOCOL,
-            "registration": registration.identity,
-            "export": export.identity,
-        },
-    )
+def boundary_identity(
+    registration: EvolutionRegistration, export: RolloutExport, monitor: str | None = None
+) -> str:
+    """The identity a finished boundary is saved under, computed before any call.
+
+    A bound tag monitor's identity joins it, since its evidence can force the next boundary; a
+    boundary without one keeps the identity it always had.
+    """
+    material = {
+        "protocol": RUBRIC_EVOLUTION_PROTOCOL,
+        "registration": registration.identity,
+        "export": export.identity,
+    }
+    if monitor is not None:
+        material["monitor"] = monitor
+    return stable_id(BOUNDARY_TYPE, material)
 
 
 def ingest_problem(

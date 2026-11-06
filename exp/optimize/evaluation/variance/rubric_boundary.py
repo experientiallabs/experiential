@@ -41,6 +41,7 @@ from exp.optimize.evaluation.variance.rubric_evolution import (
     BoundaryRecord,
     BoundaryWalk,
     EpochMetrics,
+    EpochMonitor,
     EpochRecord,
     EvolutionRegistration,
     EvolutionState,
@@ -132,6 +133,7 @@ def run_boundary(
     tagger: TraceTagger,
     code_revision: str,
     ledger: PhaseLedger | None = None,
+    monitor: EpochMonitor | None = None,
 ) -> BoundaryRecord:
     """Revise the rubric at the boundary that ends ``export.epoch``, or replay it.
 
@@ -143,6 +145,8 @@ def run_boundary(
         code_revision: Producing source identity.
         ledger: The cumulative front-door ledger to reserve the boundary's bound on; None when
             the caller already reserved it (a front-door phase).
+        monitor: The tag monitor (checkpoint 6), whose drift evidence the divergence trigger
+            reads; it reserves its own review on the ledger it was bound with.
 
     Returns:
         The boundary record; a refused boundary is returned unsaved with its reason.
@@ -153,7 +157,9 @@ def run_boundary(
     state = load_state(project, registration)
     if state is None:
         raise ValueError("open the evolution before running a boundary")
-    identity = boundary_identity(registration, export)
+    identity = boundary_identity(
+        registration, export, None if monitor is None else monitor.identity
+    )
     store = project.artifacts
     if store.exists(identity):
         reference = artifact_input(store.read(identity).manifest)
@@ -190,9 +196,9 @@ def run_boundary(
         )
     before = measure(project)
     try:
-        record = _Boundary(project, registration, state, export, tagger, code_revision, walk).run(
-            base
-        )
+        record = _Boundary(
+            project, registration, state, export, tagger, code_revision, walk, monitor
+        ).run(base)
     finally:
         if ledger is not None:
             ledger.settle(phase, before, measure(project))
@@ -230,8 +236,10 @@ class _Boundary:
         tagger: TraceTagger,
         code_revision: str,
         walk: BoundaryWalk,
+        monitor: EpochMonitor | None = None,
     ) -> None:
         """Bind the boundary's inputs."""
+        self.monitor = monitor
         self.project, self.registration, self.state = project, registration, state
         self.export, self.tagger, self.code_revision, self.walk = (
             export,
@@ -303,7 +311,17 @@ class _Boundary:
             audit_pass_rate=rate,
         )
         previous = self.state.epochs[-2].metrics if len(self.state.epochs) > 1 else None
-        trigger = divergence_trigger(previous, metrics, spec.trigger)
+        monitored = None
+        if self.monitor is not None:
+            monitored = self.monitor.observe(
+                self.project,
+                self.registration,
+                self.state,
+                export.epoch,
+                tuple(readings.values()),
+                {r.rollout_id: r.in_loop_reward for r in rollouts},
+            )
+        trigger = divergence_trigger(previous, metrics, spec.trigger, monitored)
         flagged = tuple(a.rollout_id for a in audits if a.verdict == "fail")
         genuine = tuple(a.rollout_id for a in audits if a.verdict == "pass")
         self.fields |= {
