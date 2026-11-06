@@ -304,9 +304,11 @@ def test_a_configured_slot_needs_its_owners_executor(
         slots={"tag-banks": slot},
     )
     plan = plan_front_door(run.project, spec, code_revision="test", dependencies=deps)
-    assert [row.stage for row in plan.stages][:3] == [
+    assert [row.stage for row in plan.stages][:4] == [
         "project-build",
+        "variance-build",
         "slot tag-banks",
         "bootstrap-preparation",
     ]
-    assert plan.stages[1].lines[1] == "banks 2"
+    assert plan.stages[1].status == "blocked"  # priced once the project build exists
+    assert plan.stages[2].lines[1] == "banks 2"
