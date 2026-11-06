@@ -28,17 +28,20 @@ refused and recorded.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.state_machine import Lifecycle, Refusal, Transition
-from exp.optimize.evaluation.variance.blast_radius import BlastRadius
 from exp.optimize.evaluation.variance.reward_states import POINT_MACHINE, PointState
 from exp.simulation.mining.questions import Question, QuestionBank
 from exp.simulation.mining.tag_selection import DEFAULT_AMBIGUITY_BAND, DEFAULT_FIRE_THRESHOLD
 from exp.simulation.mining.tagging import TagMatrix, TraceTaggingError
 from exp.simulation.mining.traceml import StepViewSpec, TraceTrajectory, step_units
+
+if TYPE_CHECKING:
+    from exp.optimize.evaluation.variance.blast_radius import BlastRadius
 
 BAR_FAMILY = "bar.meta"
 """Question family of every meta-rule."""

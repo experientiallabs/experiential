@@ -88,6 +88,7 @@ from exp.optimize.evaluation.variance.judged import (
     slot_coverage,
     slot_rewards,
 )
+from exp.optimize.evaluation.variance.point_selection import BarSelection
 from exp.optimize.evaluation.variance.rewards import (
     DEFAULT_SELECTOR_OBJECTIVE,
     JudgeScore,
@@ -653,7 +654,7 @@ class SelectorRecord(ContractModel):
     settings: AuthorSettings
     response: ArtifactInput | None
     transcript: ArtifactInput | None
-    selection: JudgeSelection | None
+    selection: JudgeSelection | BarSelection | None
     points: tuple[int, ...]
     score: SelectorScore | None
     advantage: float | None

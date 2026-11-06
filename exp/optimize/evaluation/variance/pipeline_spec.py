@@ -49,6 +49,7 @@ from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, Va
 from exp.optimize.evaluation.variance.behavior_curation import CuratorVariant
 from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
 from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
+from exp.optimize.evaluation.variance.blast_radius import BlastSpec
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
 from exp.optimize.evaluation.variance.build_records import VarianceBuildSpec
 from exp.optimize.evaluation.variance.decision_measure import DecisionMeasureSpec
@@ -71,6 +72,7 @@ from exp.optimize.evaluation.variance.pipeline_plan import StagePlan as StagePla
 from exp.optimize.evaluation.variance.pipeline_plan import StageRecord as StageRecord
 from exp.optimize.evaluation.variance.pipeline_plan import StageResult as StageResult
 from exp.optimize.evaluation.variance.pipeline_plan import StageUsage as StageUsage
+from exp.optimize.evaluation.variance.point_bar import DEFAULT_BAR, QualificationBar
 from exp.optimize.evaluation.variance.point_options import PointOptionsSpec
 from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.rubric_agent import RubricAuthoringProfile
@@ -242,20 +244,28 @@ class TraceMLSettings(ContractModel):
 class PointQualification(ContractModel):
     """A point qualification bar in place of the fixed per-selector point cap.
 
-    Its owner (``point_bar``) adopts the tag author's bank as the bar (``from_bank``), puts
-    ``bar_instruction`` in the selector prompts, refuses failing picks (``check_picks``) and
-    runs qualified points in blast-radius order with ``schedule_points``, deferring the rest
-    across phases under the front door's cumulative ledger; the mining plan then reserves per
-    phase from ``schedule_points``. Until that owner's planner lands,
-    a registration that sets this is refused at planning rather than priced by the cap.
+    The TraceML stage has the decision model answer the bar over every step of every attempt
+    (the whole trajectory, no horizon); selectors read ``bar_instruction`` and justify each pick
+    (``check_picks`` refuses the rest); chosen points continue in blast-radius order while their
+    reservations fit ``phase_attempts`` (``schedule_points``), the rest deferred on the record.
+    After every tier, each continued point's blast radius is measured across tiers and judged.
 
     Attributes:
-        bar: The owner's bar settings.
-        defer: Keep a qualified point whose phase does not fit the remaining ceiling in the
-            deferral queue for a later phase, instead of dropping it.
+        bar: The meta-rules, unless ``bank`` names an authored one.
+        bank: A published authored bank adopted as the bar (``QualificationBar.from_bank``).
+        required: The adopted bank's required rules.
+        phase_attempts: Ledger attempts one tier's continuations may reserve this phase; None
+            reserves every qualified point of the full trajectory.
+        blast: Severity reviewers of each continued point's failures, or None to rank by
+            measured failure share and variance only.
+        defer: Keep a qualified point whose phase does not fit in the deferral queue.
     """
 
-    bar: JsonObject
+    bar: QualificationBar = DEFAULT_BAR
+    bank: str | None = Field(default=None, min_length=1)
+    required: tuple[str, ...] = ()
+    phase_attempts: int | None = Field(default=None, ge=0)
+    blast: BlastSpec | None = None
     defer: bool = True
 
 
@@ -747,6 +757,7 @@ class TraceMLOutputs(ContractModel):
         error_steps: Each tier's saved ``error-steps`` over its attempts' steps, when tagged.
         error_points: Each tier's saved ``error-points``: every attempt's points ranked by its
             step error tags, registered as that tier's selector and critic reference.
+        point_bars: Each tier's saved ``point-bar-records`` under ``mining.qualification``.
     """
 
     groups: dict[str, ArtifactInput] = Field(default_factory=dict)
@@ -754,6 +765,7 @@ class TraceMLOutputs(ContractModel):
     errors: dict[str, ArtifactInput] = Field(default_factory=dict)
     error_steps: dict[str, ArtifactInput] = Field(default_factory=dict)
     error_points: dict[str, ArtifactInput] = Field(default_factory=dict)
+    point_bars: dict[str, ArtifactInput] = Field(default_factory=dict)
 
 
 class TierMining(ContractModel):
@@ -785,12 +797,14 @@ class MiningOutputs(ContractModel):
         rubric: The mining-probe task's rubric every tier's judge applies.
         rubric_packet: The whole-task packet the rubric was authored from, when it was authored.
         tiers: One entry per actor tier, in spec order.
+        blast: Saved blast-radius ranking of every continued point, under qualification.
     """
 
     profile: JudgeProfile
     rubric: ArtifactInput
     rubric_packet: ArtifactInput | None = None
     tiers: tuple[TierMining, ...]
+    blast: ArtifactInput | None = None
 
 
 class FamilyOutcome(ContractModel):

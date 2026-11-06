@@ -85,6 +85,15 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     trace_search,
     world_learning_traces,
 )
+from exp.optimize.evaluation.variance.pipeline_points import (
+    bar_tag_costs,
+    blast_costs,
+    mine_blast_radius,
+    point_gate,
+    qualification_bar,
+    qualified_bound,
+    tag_tier_bar,
+)
 from exp.optimize.evaluation.variance.pipeline_schedule import (
     require_scheduled_plan,
     scheduled_line,
@@ -372,6 +381,7 @@ class _TraceMLStage:
                 row.scaled(judged) for row in evaluation_costs(project, settings.move_judge)
             )
         costs.extend(error_tag_costs(project, spec))
+        costs.extend(bar_tag_costs(project, spec))
         lines = (
             f"TraceML: {len(spec.mining.actors)} tier groups of G={spec.mining.attempts}, up to "
             f"{steps} steps each labelled with {bank.bank_id} on {settings.decision_alias}; "
@@ -401,6 +411,8 @@ class _TraceMLStage:
         errors: dict[str, ArtifactInput] = {}
         error_steps: dict[str, ArtifactInput] = {}
         error_points: dict[str, ArtifactInput] = {}
+        bars: dict[str, ArtifactInput] = {}
+        qualification = spec.mining.qualification
         points: JsonObject = {}
         error_bank = tier_error_bank(spec)
         limit = job.maximum_model_calls * spec.traceml.steps_per_call
@@ -456,12 +468,22 @@ class _TraceMLStage:
                 error_points[alias] = save_error_points(
                     project.artifacts, error_steps[alias], code_revision=revision
                 )
+            if qualification is not None:
+                bars[alias] = tag_tier_bar(
+                    project.artifacts,
+                    qualification_bar(qualification, spec.traceml.bank_root),
+                    trajectories,
+                    tagger,
+                    code_revision=revision,
+                    inputs=(reference,),
+                )
         outputs = TraceMLOutputs(
             groups=groups,
             labels=labels,
             errors=errors,
             error_steps=error_steps,
             error_points=error_points,
+            point_bars=bars,
         )
         summary: JsonObject = {
             "labels": {alias: ref.artifact_id for alias, ref in labels.items()},
@@ -473,6 +495,7 @@ class _TraceMLStage:
             *errors.values(),
             *error_steps.values(),
             *error_points.values(),
+            *bars.values(),
         )
         return StageRun(outputs, saved, summary)
 
@@ -505,12 +528,13 @@ class _MiningStage:
             draws = rubric_draws(spec.authoring.rubric_profile)
             author = spec.authoring.rubric_author
             costs.extend(row.scaled(draws) for row in evaluation_costs(project, author))
-        if mining.qualification is not None:
-            raise ValueError(
-                "mining.qualification needs its owner's per-phase planner (qualified points "
-                "continued phase by phase); remove it to plan with the point cap"
-            )
-        points = mining.selector_draws * mining.points
+        if mining.qualification is not None and not spec.traceml.enabled:
+            raise ValueError("mining.qualification needs traceml enabled to answer the bar")
+        points = (
+            mining.selector_draws * mining.points
+            if mining.qualification is None
+            else qualified_bound(spec)
+        )
         episodes = mining.attempts + points * mining.continuations
         for alias in mining.actors:
             if planned is not None and planned.actor_job.actor_alias == alias:
@@ -540,6 +564,7 @@ class _MiningStage:
             costs.extend(judge_costs(project, spec, episodes))
         costs.extend(retrieval_costs(project, spec))
         costs.extend(behavior_costs(project, spec))
+        costs.extend(blast_costs(project, spec))
         profile = mining_profile(spec)
         rubric = (
             f"saved rubric {mining.rubric.artifact_id}"
@@ -599,6 +624,7 @@ class _MiningStage:
                     alias,
                     labels.get(alias),
                     ranked.get(alias),
+                    traceml.point_bars.get(alias),
                 ),
                 build,
                 embedder,
@@ -607,8 +633,20 @@ class _MiningStage:
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))
             if tier.behavior_differences is not None:
                 references.append(tier.behavior_differences)
+        blast = None
+        if spec.mining.qualification is not None:
+            mined = mine_blast_radius(
+                project,
+                spec,
+                [load_report(project, tier.report) for tier in tiers],
+                code_revision=context.code_revision,
+                inputs=tuple(tier.report for tier in tiers),
+            )
+            if mined is not None:
+                blast = mined[0]
+                references.append(blast)
         outputs = MiningOutputs(
-            profile=profile, rubric=rubric, rubric_packet=packet, tiers=tuple(tiers)
+            profile=profile, rubric=rubric, rubric_packet=packet, tiers=tuple(tiers), blast=blast
         )
         summary: JsonObject = {
             "judge_profile": profile.prompt_version,
@@ -706,7 +744,14 @@ class _MiningStage:
             critic_profile=mining.critic_profile,
             references=references,
             actor_tier=alias,
-        ).model_copy(update={"retrieval": retrieval})
+        ).model_copy(
+            update={
+                "retrieval": retrieval,
+                "gate": None
+                if tier_inputs.point_bar is None
+                else point_gate(spec, tier_inputs.point_bar),
+            }
+        )
         if scheduled:
             assert plan is not None and plan.spec is not None
             registration = plan.spec
@@ -749,6 +794,7 @@ class _Tier:
         alias: The tier's actor alias.
         labels: The tier's TraceML labels, when labelled.
         error_points: The tier's error-ranked attempt points, when its attempts were tagged.
+        point_bar: The tier's saved per-attempt qualification, under the bar.
     """
 
     exposure: ExposurePlan
@@ -758,6 +804,7 @@ class _Tier:
     alias: str
     labels: ArtifactInput | None
     error_points: ArtifactInput | None = None
+    point_bar: ArtifactInput | None = None
 
 
 def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:

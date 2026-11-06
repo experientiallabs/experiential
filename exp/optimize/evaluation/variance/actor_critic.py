@@ -61,6 +61,11 @@ from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.variance.actor_critic_audit import (
+    audit_flags,
+    ineligible_reasons,
+    rank_points,
+)
 from exp.optimize.evaluation.variance.contracts import CriticAssessment, JudgeSelection
 from exp.optimize.evaluation.variance.evidence import (
     EvidencePacket,
@@ -87,6 +92,14 @@ from exp.optimize.evaluation.variance.exposure import (
     estimate_meaning,
 )
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study, slot_rewards
+from exp.optimize.evaluation.variance.point_bar import BarRecord, PointSchedule
+from exp.optimize.evaluation.variance.point_selection import (
+    BarSelection,
+    PointGate,
+    draw_bar_judge,
+    load_point_bar,
+    schedule_chosen,
+)
 from exp.optimize.evaluation.variance.rewards import (
     CriticScore,
     GroupAdvantage,
@@ -138,6 +151,8 @@ class ActorCriticSpec(ContractModel):
         actor_tier: Declared model-tier label of the actor policy; groups with different tiers
             are never pooled.
         episode_judge: The frozen episode judge whose verdicts label every continuation.
+        gate: The qualification bar selectors choose by instead of ``points``; chosen points
+            continue in blast order while they fit the phase. Absent, identities are unchanged.
     """
 
     initial: ContinuationJob
@@ -156,6 +171,7 @@ class ActorCriticSpec(ContractModel):
     retrieval: TraceSearchSpec | None = None
     references: tuple[ReferenceSource, ...] = Field(default=(), max_length=16)
     actor_tier: str = Field(default="default", pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+    gate: PointGate | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _distinct_references(self) -> Self:
@@ -362,7 +378,7 @@ class JudgeDraw(ContractModel):
 
     draw: int
     response: ArtifactInput | None
-    selection: JudgeSelection | None
+    selection: JudgeSelection | BarSelection | None
     failure: str | None
     score: JudgeScore | None = None
     transcript: ArtifactInput | None = None
@@ -439,6 +455,8 @@ class ActorCriticReport(ContractModel):
         group_tier: Policy tier of the group of attempts.
         group_cost: Measured cost of the group of attempts.
         usage: Measured usage per role: ``group``, ``selectors``, ``critics``, ``continuations``.
+        bar_record: The picked attempt's qualification with this phase persisted, when gated.
+        point_schedule: Continued and deferred points of this phase, when gated.
     """
 
     spec: ActorCriticSpec
@@ -457,6 +475,10 @@ class ActorCriticReport(ContractModel):
     group_tier: ActorTier | None = None
     group_cost: StudyCost | None = None
     usage: dict[str, MeasuredUsage] = Field(default_factory=dict)
+    bar_record: BarRecord | None = Field(default=None, exclude_if=lambda value: value is None)
+    point_schedule: PointSchedule | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def policy_groups(points: Sequence[PointResult]) -> dict[tuple[str, int], GroupAdvantage]:
@@ -532,8 +554,10 @@ def run_actor_critic(
             *packet.pool.points.values(),
             *{reference.artifact for reference in spec.references},
         )
+        gate = spec.gate
+        record = None if gate is None else load_point_bar(store, gate.records)[packet.pool.branch]
         judges = tuple(
-            _judge(project, spec, packet, j, identity, sources, code_revision, search)
+            _judge(project, spec, packet, j, identity, sources, code_revision, search, record)
             for j in range(len(spec.judges))
         )
         chosen = tuple(
@@ -541,6 +565,9 @@ def run_actor_critic(
         )
         if not chosen:
             raise ValueError("no judge produced a usable selection; inspect the saved draws")
+        schedule = None
+        if gate is not None and record is not None:
+            chosen, schedule, record = schedule_chosen(gate, record, chosen)
         critic_answers = tuple(
             _critic(project, spec, packet, chosen, c, identity, sources, code_revision, search)
             for c in range(len(spec.critics))
@@ -561,7 +588,7 @@ def run_actor_critic(
         judges = tuple(_reward_judge(draw, outcomes) for draw in judges)
         critics = tuple(_reward_critic(draw, outcomes) for draw in critic_answers)
         drops = decision_drops(outcomes)
-        audit = _audit(judges, critics)
+        audit = audit_flags(judges, critics)
         group_cost = _study_cost(project, spec.initial, group, catalog, code_revision)
         report = ActorCriticReport(
             spec=spec,
@@ -572,13 +599,15 @@ def run_actor_critic(
             points=points,
             drops=drops,
             audit=audit,
-            ranking=_rank(outcomes, drops),
+            ranking=rank_points(outcomes, drops),
             training_eligible=False,
-            ineligible_reasons=_ineligible(audit, critics),
+            ineligible_reasons=ineligible_reasons(audit, critics),
             pick=pick,
             counts=_counts(spec, group, pick, packet, judges, critics, points),
             group_tier=group_tier,
             group_cost=group_cost,
+            bar_record=record,
+            point_schedule=schedule,
             usage={
                 "group": group_cost.actor,
                 "selectors": total_usage([d.usage for d in judges if d.usage is not None]),
@@ -723,22 +752,27 @@ def _judge(
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
     search: TraceSearch | None,
+    record: BarRecord | None = None,
 ) -> JudgeDraw:
-    """Make or replay one point-selector draw under its assigned prompt variant."""
+    """Make or replay one point-selector draw under its assigned prompt variant and bar."""
     prompts = assign_prompts(spec.selector_prompts, seed=spec.seed, draws=len(spec.judges))
+    common = {
+        "identity": f"{identity}-judge-{draw}",
+        "sources": sources,
+        "code_revision": code_revision,
+        "profile": spec.selector_profile,
+        "prompt": prompts[draw],
+        "search": search,
+    }
     try:
-        reference, transcript, selection, failure = draw_judge(
-            project,
-            spec.judges[draw],
-            packet,
-            points=spec.points,
-            identity=f"{identity}-judge-{draw}",
-            sources=sources,
-            code_revision=code_revision,
-            profile=spec.selector_profile,
-            prompt=prompts[draw],
-            search=search,
-        )
+        if spec.gate is not None and record is not None:
+            reference, transcript, selection, failure = draw_bar_judge(
+                project, spec.judges[draw], packet, gate=spec.gate, record=record, **common
+            )
+        else:
+            reference, transcript, selection, failure = draw_judge(
+                project, spec.judges[draw], packet, points=spec.points, **common
+            )
     except ValueError as error:
         return JudgeDraw(draw=draw, response=None, selection=None, failure=str(error)[:2000])
     return JudgeDraw(
@@ -941,59 +975,3 @@ def _reward_critic(draw: CriticDraw, outcomes: tuple[PointOutcome, ...]) -> Crit
         return draw
     estimates = {f"point-{row.step}": row.probability for row in draw.assessment.estimates}
     return draw.model_copy(update={"score": critic_score(estimates, outcomes)})
-
-
-def _audit(
-    judges: tuple[JudgeDraw, ...], critics: tuple[CriticDraw, ...]
-) -> tuple[JsonObject, ...]:
-    """Collect every audit flag with the role and draw that raised it."""
-    flags: list[JsonObject] = []
-    for draw in judges:
-        if draw.selection is not None:
-            flags.extend(
-                {"role": "judge", "draw": draw.draw, **flag.model_dump(mode="json")}
-                for flag in draw.selection.audit
-            )
-    for draw in critics:
-        if draw.assessment is not None:
-            flags.extend(
-                {"role": "critic", "draw": draw.draw, **flag.model_dump(mode="json")}
-                for flag in draw.assessment.audit
-            )
-    return tuple(flags)
-
-
-def _ineligible(audit: tuple[JsonObject, ...], critics: tuple[CriticDraw, ...]) -> tuple[str, ...]:
-    """Explain why a run's records may not be trained on yet.
-
-    A screening run never qualifies on its own: no point has been shown to be a decision until
-    competing actions from the same checkpoint have been run under a frozen policy and budget.
-
-    Args:
-        audit: Every audit flag the run raised.
-        critics: Every critic draw.
-
-    Returns:
-        The reasons, most fundamental first.
-    """
-    reasons = [
-        "no chosen point has been tested with competing actions from the same checkpoint",
-    ]
-    if audit:
-        reasons.append(f"{len(audit)} audit findings have no recorded disposition")
-    unscored = [draw.draw for draw in critics if draw.score is None or draw.score.reward is None]
-    if unscored:
-        reasons.append(f"critic draws {unscored} have no scored estimate")
-    return tuple(reasons)
-
-
-def _rank(outcomes: tuple[PointOutcome, ...], drops: dict[str, float]) -> tuple[int, ...]:
-    """Order points by uncertainty of the measured rate, then by the drop that follows them."""
-
-    def key(outcome: PointOutcome) -> tuple[float, float, int]:
-        """Most informative first; unscored points last."""
-        rate = outcome.rate
-        uncertainty = -1.0 if rate is None else rate * (1.0 - rate)
-        return (-uncertainty, -drops.get(outcome.point_id, 0.0), outcome.step)
-
-    return tuple(outcome.step for outcome in sorted(outcomes, key=key))

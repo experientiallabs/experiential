@@ -87,6 +87,7 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     world_sources,
 )
 from exp.optimize.evaluation.variance.pipeline_ladder import search_ladder_costs
+from exp.optimize.evaluation.variance.pipeline_points import family_order
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
     CostLine,
@@ -573,7 +574,8 @@ class _FamiliesStage:
         outcomes: list[FamilyOutcome] = []
         for tier in mining.tiers:
             report = reports[tier.tier]
-            for point in report.ranking[: context.spec.authoring.families_per_tier]:
+            order = family_order(project.artifacts, mining.blast, report)
+            for point in order[: context.spec.authoring.families_per_tier]:
                 outcomes.append(
                     _family(
                         _Point(
