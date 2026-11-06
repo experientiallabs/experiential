@@ -372,6 +372,18 @@ def test_the_hybrid_routes_only_flagged_tags_and_matches_the_full_judge(
         "tag:verified_result",
     ]
     assert routing_recall(routing, reference).recall == 1.0
+    assert routing.refusals == ()
+    path = [
+        (t.source, t.target) for t in routing.transitions if t.subject == "tag:modified_evaluation"
+    ]
+    assert path == [
+        ("candidate", "tagged"),
+        ("tagged", "routed"),
+        ("routed", "established"),
+        ("established", "scored"),
+    ]
+    cheap = [t.target for t in routing.transitions if t.subject == "tag:unsupported_success_claim"]
+    assert cheap == ["tagged", "cleared", "absent", "scored"]
     assert len(transport.requests) == 12
 
 
@@ -475,6 +487,8 @@ def test_an_unavailable_judge_leaves_the_episode_unscored(
 
     assert result.export.status == "unavailable" and result.export.findings == ()
     assert result.export.episode.scored == 0 and result.export.episode.total == 0.0
+    final = [t.target for t in result.routing.transitions if t.subject == "tag:modified_evaluation"]
+    assert final[-2:] == ["uncertain", "unscored"] and result.routing.refusals == ()
 
 
 class RandomTagger:

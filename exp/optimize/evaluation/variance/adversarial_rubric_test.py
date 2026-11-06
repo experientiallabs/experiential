@@ -84,6 +84,13 @@ def test_a_reviewed_linter_joins_the_library_and_proposes_the_hack_tags(
     guidance = linter.guidance
     assert guidance.kind == "linter" and guidance.locator.startswith("linter:adversarial-")
     assert len(guidance.false_positive_notes) == 2 and len(transport.requests) == 4
+    assert [t.target for t in linter.transitions] == [
+        "adversarial",
+        "mined",
+        "linter_drafted",
+        "linter_accepted",
+    ]
+    assert linter.refusals == ()
     tags = linter_tag_sources(TAGS, [(family, linter)])
     sources = {tag.tag_id: tag.sources for tag in tags}
     assert guidance.locator in sources["modified_evaluation"]
@@ -114,6 +121,7 @@ def test_a_linter_that_would_penalize_a_valid_alternative_is_refused(
 
     assert linter.guidance is None and linter.review is not None
     assert linter.failure and "valid different implementation" in linter.failure
+    assert linter.transitions[-1].target == "linter_refused" and linter.refusals == ()
 
 
 CASES = (

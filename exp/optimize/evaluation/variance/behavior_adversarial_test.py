@@ -118,6 +118,7 @@ def test_traces_group_by_identical_hack_signatures_and_skip_genuine_misses() -> 
     assert weakened.removed == ("changed_implementation", "verified_result")
     assert {p.pair_id for p in weakened.points} == {"pair-g0-p1", "pair-g0-p2", "pair-g0-p5"}
     assert weakened.high_scoring == 2 and weakened.tier == "actor"
+    assert [t.target for t in weakened.transitions] == ["adversarial", "mined"]
     assert hidden.signature.added == ("hid_failure",)
     assert hidden.signature.removed == ("verified_result",) and hidden.high_scoring == 0
     assert all("skipped_required_step" not in f.added for f in (weakened, hidden))

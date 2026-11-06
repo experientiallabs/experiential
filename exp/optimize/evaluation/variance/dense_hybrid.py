@@ -57,6 +57,13 @@ from exp.optimize.evaluation.variance.dense_reward import (
 )
 from exp.optimize.evaluation.variance.dense_spans import ActorTrajectory, SampledTokens
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence
+from exp.optimize.evaluation.variance.reward_states import (
+    FINDING_MACHINE,
+    FindingState,
+    Lifecycle,
+    Refusal,
+    Transition,
+)
 from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tag_selection import DEFAULT_AMBIGUITY_BAND, DEFAULT_FIRE_THRESHOLD
 from exp.simulation.mining.tagging import TagMatrix, TraceTagger, TraceTaggingError
@@ -148,6 +155,8 @@ class HybridRouting(ContractModel):
     judge_draw_ceiling: int = Field(ge=0)
     recall: float | None = Field(default=None, ge=0.0, le=1.0)
     missed: tuple[str, ...] = ()
+    transitions: tuple[Transition, ...] = ()
+    refusals: tuple[Refusal, ...] = ()
 
 
 class HybridDense(ContractModel):
@@ -421,6 +430,7 @@ def judge_hybrid(
             judge_draw_ceiling=dense_model_calls(definition.profile),
         )
         available = judged is None or judged.status == "judged"
+        findings: tuple[DenseFinding, ...] = ()
         if available:
             merged = [*(() if judged is None else judged.findings), *_cleared(definition, routes)]
             order = {event.event_id: event.sequence for event in evidence.events}
@@ -430,7 +440,13 @@ def judge_hybrid(
             )
             findings, episode = aggregate(merged, definition)
         else:
-            findings, episode = (), _empty()
+            episode = _empty()
+        states = finding_lifecycle(
+            tagged=matrix is not None, routes=routes, candidates=candidates, findings=findings
+        )
+        routing = routing.model_copy(
+            update={"transitions": tuple(states.transitions), "refusals": tuple(states.refusals)}
+        )
         export = DenseRewardExport(
             episode_id=evidence.episode_id,
             evidence_sha256=evidence.identity,
@@ -459,6 +475,55 @@ def judge_hybrid(
         return artifact_input(manifest), result.model_copy(
             update={"export": export.model_copy(update={"outcome": outcome})}
         )
+
+
+def finding_lifecycle(
+    *,
+    tagged: bool,
+    routes: Sequence[TagRoute],
+    candidates: Sequence[DenseCandidate],
+    findings: Sequence[DenseFinding],
+) -> Lifecycle[FindingState]:
+    """Replay one hybrid judgment through :data:`~.reward_states.FINDING_MACHINE`.
+
+    Every frozen tag and every proposed candidate starts as a candidate, is tagged (when the
+    decision model answered), then cleared or routed. Each finding's decision is the next state,
+    and aggregation moves it to scored or unscored. A routed candidate with no finding (the
+    judge was unavailable) becomes uncertain and then unscored, and a cleared one absent and
+    then unscored, since an unavailable episode scores nothing. Any move the table forbids is
+    refused and recorded, never applied.
+    """
+    states = FINDING_MACHINE.lifecycle()
+    routed = {row.candidate_id for row in candidates}
+    cleared = {f"tag:{row.tag_id}" for row in routes if row.route == "cleared"}
+    subjects = [f"tag:{row.tag_id}" for row in routes]
+    subjects += [c for c in sorted(routed) if c not in subjects]
+    decided = {
+        candidate: row for row in findings for candidate in (row.finding_id, *row.candidate_ids)
+    }
+    for subject in subjects:
+        states.start(subject)
+        if tagged:
+            states.move(subject, FindingState.TAGGED, "decision-model step tags answered")
+        if subject in cleared:
+            states.move(subject, FindingState.CLEARED, "every step clear")
+        else:
+            states.move(subject, FindingState.ROUTED, "flagged, uncertain or proposed")
+        row = decided.get(subject)
+        if row is None and subject in cleared:
+            states.move(subject, FindingState.ABSENT, "every step clear")
+            states.move(subject, FindingState.UNSCORED, "the episode is unavailable")
+            continue
+        if row is None:
+            states.move(subject, FindingState.UNCERTAIN, "no judged finding")
+            states.move(subject, FindingState.UNSCORED, "the judge returned nothing")
+            continue
+        states.move(subject, FindingState(row.decision), row.rationale[:200])
+        if row.scored:
+            states.move(subject, FindingState.SCORED, f"reward {row.reward}")
+        else:
+            states.move(subject, FindingState.UNSCORED, row.unscored_reason or "unscored")
+    return states
 
 
 def routing_recall(routing: HybridRouting, full: DenseRewardExport) -> HybridRouting:

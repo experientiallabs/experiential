@@ -33,6 +33,13 @@ from exp.optimize.evaluation.variance.behavior_profiles import BehaviorGuidance
 from exp.optimize.evaluation.variance.dense_reward import DenseRewardExport, DenseTag
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
 from exp.optimize.evaluation.variance.family_stages import MEASURE_PROFILE, run_role
+from exp.optimize.evaluation.variance.reward_states import (
+    FAMILY_MACHINE,
+    FamilyState,
+    Lifecycle,
+    Refusal,
+    Transition,
+)
 
 DRAFT_TOOL = "draft_adversarial_linter"
 """Forced answer tool of a linter draft."""
@@ -140,6 +147,8 @@ class AdversarialLinter(ContractModel):
     review: LinterReview | None = None
     transcripts: tuple[ArtifactInput, ...] = ()
     failure: str | None = None
+    transitions: tuple[Transition, ...] = ()
+    refusals: tuple[Refusal, ...] = ()
 
 
 def _family_events(family: AdversarialFamily) -> set[str]:
@@ -170,6 +179,10 @@ def author_adversarial_linter(
 ) -> AdversarialLinter:
     """Draft a linter under every stance, then accept one only after an independent review.
 
+    The family's persisted lifecycle resumes at ``mined`` and moves to ``linter_failed`` (no
+    valid draft) or ``linter_drafted`` and then ``linter_accepted`` or ``linter_refused``; the
+    moves and any refusals are kept on the returned linter.
+
     Args:
         project: Project holding the draws.
         spec: Frozen settings.
@@ -178,10 +191,63 @@ def author_adversarial_linter(
         code_revision: Producing source identity.
         revision: Library revision of the new entry.
     """
+    linter = _author(
+        project, spec, family, sources=sources, code_revision=code_revision, revision=revision
+    )
+    subject = family.group_id
+    states = resume(FAMILY_MACHINE.lifecycle(), subject, family.transitions)
+    if not linter.drafts:
+        states.move(subject, FamilyState.LINTER_FAILED, linter.failure or "no draft")
+    else:
+        states.move(subject, FamilyState.LINTER_DRAFTED, f"{len(linter.drafts)} valid drafts")
+        if linter.guidance is not None:
+            states.move(subject, FamilyState.LINTER_ACCEPTED, linter.guidance.locator)
+        else:
+            states.move(subject, FamilyState.LINTER_REFUSED, linter.failure or "refused")
+    return linter.model_copy(
+        update={"transitions": tuple(states.transitions), "refusals": tuple(states.refusals)}
+    )
+
+
+def resume(
+    states: Lifecycle[FamilyState], subject: str, transitions: Sequence[Transition]
+) -> Lifecycle[FamilyState]:
+    """Rebuild a subject's state from its persisted transitions, rechecking every move."""
+    states.start(subject)
+    for row in transitions:
+        if row.subject == subject:
+            if row.source != states.state(subject).value:
+                states.refusals.append(
+                    Refusal(
+                        machine=row.machine,
+                        subject=subject,
+                        source=states.state(subject).value,
+                        target=row.target,
+                        reason="persisted transition does not start from the current state",
+                    )
+                )
+                continue
+            states.move(subject, FamilyState(row.target), row.reason)
+    return states
+
+
+def _author(
+    project: ProjectStore,
+    spec: AdversarialRubricSpec,
+    family: AdversarialFamily,
+    *,
+    sources: tuple[ArtifactInput, ...],
+    code_revision: str,
+    revision: int,
+) -> AdversarialLinter:
+    """Draft under every stance and review; the lifecycle is applied by the caller."""
     if not spec.stances or set(spec.stances) - set(LINTER_STANCES):
         raise ValueError(f"linter stances must be members of {list(LINTER_STANCES)}")
     documents: dict[str, JsonValue] = {
-        "family": {**family.model_dump(mode="json"), "signature_name": family.signature.name},
+        "family": {
+            **family.model_dump(mode="json", exclude={"transitions"}),
+            "signature_name": family.signature.name,
+        },
     }
     for point in family.points:
         documents[f"pair:{point.pair_id}"] = point.model_dump(mode="json")

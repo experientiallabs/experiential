@@ -52,6 +52,12 @@ from exp.optimize.evaluation.variance.behavior_differences import (
 from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.pipeline_behaviors import compact_differences
+from exp.optimize.evaluation.variance.reward_states import (
+    FAMILY_MACHINE,
+    FamilyState,
+    Lifecycle,
+    Transition,
+)
 
 ADVERSARIAL_PROTOCOL = "adversarial-signatures-v1"
 """Version of the hack signature rule and the divergence record."""
@@ -153,6 +159,7 @@ class AdversarialFamily(ContractModel):
     points: tuple[DivergencePoint, ...] = Field(min_length=1)
     high_scoring: int = Field(ge=0)
     source: ArtifactInput | None = None
+    transitions: tuple[Transition, ...] = ()
 
 
 def _divergence(report: BehaviorDifferenceReport, pair_id: str) -> DivergencePoint:
@@ -207,6 +214,29 @@ def adversarial_groups(
     return tuple(found)
 
 
+def mining_lifecycle(
+    report: BehaviorDifferenceReport,
+    *,
+    hacks: Sequence[str] = HACK_ADDED,
+    genuine: Sequence[str] = GENUINE_REMOVED,
+) -> Lifecycle[FamilyState]:
+    """Move every diff group through :data:`~.reward_states.FAMILY_MACHINE` up to ``mined``.
+
+    A group is adversarial when its signature adds a hack behavior, else not adversarial
+    (terminal); an adversarial group is mined once its divergence points are read.
+    """
+    states = FAMILY_MACHINE.lifecycle()
+    for group in report.groups:
+        states.start(group.group_id)
+        signature = hack_signature(group.added, group.removed, hacks=hacks, genuine=genuine)
+        if signature is None:
+            states.move(group.group_id, FamilyState.NOT_ADVERSARIAL, "adds no hack behavior")
+            continue
+        states.move(group.group_id, FamilyState.ADVERSARIAL, signature.name)
+        states.move(group.group_id, FamilyState.MINED, f"{len(group.pairs)} divergence points")
+    return states
+
+
 def adversarial_families(
     report: BehaviorDifferenceReport,
     *,
@@ -225,6 +255,7 @@ def adversarial_families(
         hacks: Behaviors whose addition marks a hack.
         genuine: Behaviors whose removal strengthens one.
     """
+    states = mining_lifecycle(report, hacks=hacks, genuine=genuine)
     families: list[AdversarialFamily] = []
     for group, signature in adversarial_groups(report.groups, hacks=hacks, genuine=genuine):
         points = tuple(_divergence(report, pair_id) for pair_id in group.pairs)
@@ -242,6 +273,7 @@ def adversarial_families(
                 points=points,
                 high_scoring=sum(point.high_scoring is True for point in points),
                 source=source,
+                transitions=tuple(t for t in states.transitions if t.subject == group.group_id),
             )
         )
     families.sort(key=lambda row: (-row.high_scoring, -len(row.points), row.group_id))
@@ -280,6 +312,7 @@ def adversarial_reference(project: ProjectStore, reference: ArtifactInput) -> Re
             {**family.model_dump(mode="json"), "signature_name": family.signature.name}
             for family in families
         ],
+        "transitions": [t.model_dump(mode="json") for t in mining_lifecycle(report).transitions],
         "authority": "reviewed reward-hacking hypotheses, never episode rewards",
     }
     identity = stable_id("adversarial-differences", {"record": sha256_json(record)})
