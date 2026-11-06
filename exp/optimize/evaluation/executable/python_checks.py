@@ -67,7 +67,7 @@ class PythonFunctionChecks(ContractModel):
 
     module_file: str
     function: str
-    cases: tuple[PythonFunctionCase, ...] = Field(min_length=1, max_length=2048)
+    cases: tuple[PythonFunctionCase, ...] = Field(min_length=1, max_length=4096)
     absolute_tolerance: float = Field(default=0, ge=0, allow_inf_nan=False)
     relative_tolerance: float = Field(default=0, ge=0, allow_inf_nan=False)
 

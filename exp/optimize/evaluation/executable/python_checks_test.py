@@ -76,3 +76,20 @@ def test_native_function_checks_reject_incorrect_and_forged_success(
         assert world.capture() == initial
     finally:
         world.close()
+
+
+def test_check_budget_covers_mined_geometry_cases_and_stays_finite() -> None:
+    """The expanded source-backed star checks fit while unbounded batches remain refused."""
+    case = PythonFunctionCase(arguments=(1,), expected=2)
+    checks = PythonFunctionChecks(
+        module_file="solution.py",
+        function="solve",
+        cases=(case,) * 3792,
+    )
+    assert len(checks.cases) == 3792
+    with pytest.raises(ValueError):
+        PythonFunctionChecks(
+            module_file="solution.py",
+            function="solve",
+            cases=(case,) * 4097,
+        )
