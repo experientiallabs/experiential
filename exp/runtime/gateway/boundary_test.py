@@ -134,3 +134,70 @@ def test_a_typed_refusal_is_not_logged_as_unclassified(caplog: pytest.LogCapture
     with caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.boundary"):
         boundary_protocol_error(AliasNotGrantedError("not granted"))
     assert not caplog.records
+
+
+def _psycopg_class(
+    name: str, base: type[Exception], module: str, sqlstate: str | None
+) -> type[Exception]:
+    """A stand-in for a psycopg 3 error class (the engine does not depend on psycopg)."""
+    return type(name, (base,), {"__module__": module, "sqlstate": sqlstate})
+
+
+_PsycopgError = _psycopg_class("Error", Exception, "psycopg", None)
+_OperationalError = _psycopg_class("OperationalError", _PsycopgError, "psycopg", None)
+_PoolTimeout = _psycopg_class("PoolTimeout", _OperationalError, "psycopg_pool", None)
+
+
+@pytest.mark.parametrize(
+    "exception",
+    [
+        _psycopg_class("AdminShutdown", _OperationalError, "psycopg.errors", "57P01")(
+            "terminating connection due to administrator command"
+        ),
+        _psycopg_class("CrashShutdown", _OperationalError, "psycopg.errors", "57P02")("crash"),
+        _psycopg_class("CannotConnectNow", _OperationalError, "psycopg.errors", "57P03")("boot"),
+        _psycopg_class("ConnectionFailure", _OperationalError, "psycopg.errors", "08006")("gone"),
+        _OperationalError("consuming input failed: server closed the connection unexpectedly"),
+        _PoolTimeout("couldn't get a connection after 30.00 sec"),
+    ],
+    ids=lambda exception: type(exception).__name__,
+)
+def test_a_lost_database_connection_is_a_retryable_503(
+    exception: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dropped Postgres connection is the retryable unavailable class, never a 500."""
+    with caplog.at_level(logging.WARNING, logger="exp.runtime.gateway.boundary"):
+        error = boundary_protocol_error(exception)
+    assert error.status_code == 503
+    assert error.detail.code == "gateway_unavailable"
+    assert error.retry_after_seconds == 1
+    assert "unclassified" not in caplog.text
+    assert str(exception) not in caplog.text
+
+
+def test_a_wrapped_lost_database_connection_is_a_retryable_503() -> None:
+    """A host wrapper raised from a dropped connection keeps the retryable mapping."""
+    shutdown = _psycopg_class("AdminShutdown", _OperationalError, "psycopg.errors", "57P01")()
+    try:
+        raise RuntimeError("authorize failed") from shutdown
+    except RuntimeError as wrapped:
+        error = boundary_protocol_error(wrapped)
+    assert error.status_code == 503
+    assert error.detail.code == "gateway_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("name", "sqlstate"), [("QueryCanceled", "57014"), ("LockNotAvailable", "55P03")]
+)
+def test_other_operational_sqlstates_stay_unclassified(name: str, sqlstate: str) -> None:
+    """A statement or lock timeout is not a lost connection and keeps the logged 500."""
+    error = boundary_protocol_error(
+        _psycopg_class(name, _OperationalError, "psycopg.errors", sqlstate)("timeout")
+    )
+    assert error.status_code == 500
+
+
+def test_a_non_psycopg_operational_error_stays_unclassified() -> None:
+    """Only psycopg's OperationalError is matched, not any class of that name."""
+    foreign = _psycopg_class("OperationalError", Exception, "sqlite3", None)("disk I/O error")
+    assert boundary_protocol_error(foreign).status_code == 500

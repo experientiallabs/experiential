@@ -32,6 +32,13 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failu
 
 _DRAINING_RETRY_AFTER_SECONDS = 10
 _AUTHORITY_RETRY_AFTER_SECONDS = 5
+_DATABASE_RETRY_AFTER_SECONDS = 1
+# Server-side SQLSTATEs that mean the backend went away: admin_shutdown
+# (pg_terminate_backend, a pooler restart), crash_shutdown and
+# cannot_connect_now (a failover or restart in progress). Class 08 is the
+# whole connection_exception family.
+_LOST_CONNECTION_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
+_CAUSE_DEPTH_LIMIT = 8
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -192,6 +199,28 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             error_type="api_error",
             retry_after_seconds=_DRAINING_RETRY_AFTER_SECONDS,
         )
+    elif _is_lost_database_connection(exception):
+        # A host store's Postgres connection was dropped under the request
+        # (2026-11-06 02:17Z: one backend termination answered 22 requests
+        # across ~16 orgs as anonymous 500s). The connection is gone, not the
+        # request: the pool reconnects on the next checkout, so this is the
+        # retryable unavailable class, never an internal error. Only the type
+        # is logged; the driver message can quote the statement.
+        _LOGGER.warning(
+            "gateway boundary answered a lost database connection (%s) as a 503",
+            type(exception).__name__,
+            extra={"operation": "boundary", "exception_type": type(exception).__name__},
+        )
+        error = OpenAIProtocolError(
+            status_code=503,
+            code="gateway_unavailable",
+            message=(
+                "The gateway lost its database connection while handling this request. "
+                "Retry after the delay in the Retry-After header."
+            ),
+            error_type="api_error",
+            retry_after_seconds=_DATABASE_RETRY_AFTER_SECONDS,
+        )
     else:
         # Nothing typed claimed it, so the caller gets an anonymous 500 and,
         # before admission, no request id: the log is the only witness
@@ -220,6 +249,40 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             error_type="api_error",
         )
     return error
+
+
+def _is_lost_database_connection(exception: BaseException) -> bool:
+    """Whether a psycopg failure (or its cause chain) is a dropped server connection.
+
+    The engine does not depend on psycopg, so the driver's classes are matched
+    structurally: a class from a ``psycopg`` module named ``OperationalError``
+    in the MRO, and either a lost-connection SQLSTATE or none at all (the
+    client-side "server closed the connection unexpectedly" and a pool
+    checkout timeout carry no SQLSTATE). Other operational SQLSTATEs, such as
+    a statement timeout or a lock timeout, are left unclassified.
+    """
+    current: BaseException | None = exception
+    for _ in range(_CAUSE_DEPTH_LIMIT):
+        if current is None:
+            return False
+        if _is_psycopg_operational_error(current):
+            sqlstate = getattr(current, "sqlstate", None)
+            if sqlstate is None or (
+                isinstance(sqlstate, str)
+                and (sqlstate.startswith("08") or sqlstate in _LOST_CONNECTION_SQLSTATES)
+            ):
+                return True
+        current = current.__cause__
+    return False
+
+
+def _is_psycopg_operational_error(exception: BaseException) -> bool:
+    """Whether ``exception`` is a psycopg ``OperationalError``, matched without importing it."""
+    return any(
+        klass.__name__ == "OperationalError"
+        and (klass.__module__ == "psycopg" or klass.__module__.startswith("psycopg."))
+        for klass in type(exception).__mro__
+    )
 
 
 def _raising_frame(exception: BaseException) -> str:
