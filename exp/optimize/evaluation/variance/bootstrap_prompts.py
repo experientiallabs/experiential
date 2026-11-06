@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v5"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v6"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -46,9 +46,19 @@ recorded-state for a recorded environment snapshot. Cite only references in the 
 AUTHOR_INSTRUCTION = (
     """You author the starting state of one executable task from recorded agent traces.
 
-Produce the task's public instruction, the tool schemas the actor sees, the world manifest (every
-state domain simulated), the exact initial state, the evaluator projection (probe_paths, JSON
-pointers into the initial state), a verifier over the final state, and a ledger of facts.
+Produce the task's public instruction, exact initial state, tool_effects, evaluator projection
+(probe_paths, JSON pointers into the initial state), executable verifier and fact ledger.
+Declare each tool once in tools, including name, description, input_schema, reads and writes.
+Use the supplied task tool schemas when they support the task. The host derives the manifest
+from those declarations and initial_state; do not submit manifest. Each read/write effect names
+domains in initial_state. When family.state_domains is supplied, initial_state
+must contain exactly those keys, including their exact spelling. Every domain is simulated.
+A verifier's description is explanatory; only outcome_schema, required_paths and rules execute.
+Encode required behavior and verification in those checks, rather than describing checks that
+will never run. final_state in the episode outcome is the evaluator projection: each
+probe_paths key names the value selected by its pointer into the state. Verifier state paths
+start /final_state/<projection-key>/... . Do not require invented outcome fields such as passed;
+the verifier itself computes pass/fail.
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
 or rules) or unknown (nothing recorded decides it). Mark a fact deciding when the right course
 of action depends on it. Never present an inferred or unknown fact as observed.
@@ -72,7 +82,9 @@ REVIEW_INSTRUCTION = (
 
 Decide whether the start is coherent (state, manifest, tools, instruction and verifier agree),
 sufficiently specified (every deciding fact is settled, not unknown or guessed) and supports the
-task (an actor can succeed or fail on its own decisions). Answer accept, research or refuse.
+task (an actor can succeed or fail on its own decisions). Inspect the executable verifier's
+rules, required_paths and outcome_schema, not only its description. When the task requires
+behavior or tests, file presence alone is insufficient. Answer accept, research or refuse.
 Choose research when a deciding fact is missing and the family's evidence could settle it: name
 each missing fact as a research item with the question and why it decides. Choose refuse, with a
 diagnosis, when the start cannot be made sound from the evidence. Cite what supports each finding.
@@ -161,14 +173,41 @@ READ_TOOLS: tuple[ToolSchema, ...] = (
 """Read-only tools every bootstrap role may call."""
 
 
-def author_answer_tool() -> ToolSchema:
-    """Expose the complete accepted start contract, including nested world and verifier fields."""
-    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft
+def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
+    """Expose state and a single schema-and-effects declaration for each authored tool."""
+    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft, StartTool
 
+    schema = StartDraft.model_json_schema()
+    schema["title"] = "StartProposal"
+    schema["description"] = (
+        "State, facts and verification with each tool's schema and effects declared together. "
+        "The host derives the manifest from these tools and initial-state domain keys."
+    )
+    properties = schema["properties"]
+    del properties["manifest"]
+    schema["required"].remove("manifest")
+    tool = StartTool.model_json_schema()
+    schema["$defs"].update(tool.pop("$defs", {}))
+    if domain_names:
+        for field in ("reads", "writes"):
+            tool["properties"][field]["items"] = {"type": "string", "enum": list(domain_names)}
+        state = properties["initial_state"]
+        value = state["additionalProperties"]
+        state.update(
+            properties={name: value for name in domain_names},
+            required=list(domain_names),
+            additionalProperties=False,
+        )
+    schema["$defs"]["StartTool"] = tool
+    properties["tools"]["items"] = {"$ref": "#/$defs/StartTool"}
+    properties["probe_paths"]["description"] = (
+        "JSON pointers into initial_state. Escape each domain-key segment: "
+        "escape '~' as '~0', then '/' as '~1'."
+    )
     return ToolSchema(
         name="submit_start",
-        description="Submit the complete starting state.",
-        input_schema=StartDraft.model_json_schema(),
+        description="Submit state, tool declarations, facts and executable verification.",
+        input_schema=schema,
     )
 
 

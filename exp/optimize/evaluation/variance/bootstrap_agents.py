@@ -51,6 +51,7 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     ReviewAnswer,
     RoleDraw,
     StartDraft,
+    StartTool,
     Verdict,
 )
 from exp.optimize.evaluation.variance.bootstrap_prompts import (
@@ -248,6 +249,39 @@ class StartMaterial:
         return status, result, served if status == "ok" else ()
 
 
+def assemble_start_proposal(answer: JsonObject) -> StartDraft:
+    """Expand one authored declaration into the canonical executable start contract."""
+    if "manifest" in answer:
+        raise ValueError("manifest is host-derived; declare schema, reads and writes per tool")
+    proposal = dict(answer)
+    declarations = proposal.pop("tools", None)
+    if not isinstance(declarations, list):
+        raise ValueError("tools must contain schema-and-effects declarations")
+    tools = tuple(StartTool.model_validate(tool) for tool in declarations)
+    state = proposal.get("initial_state")
+    if not isinstance(state, dict):
+        raise ValueError("initial_state must map each domain name to its state")
+    proposal["tools"] = [
+        tool.model_dump(mode="json", exclude={"reads", "writes"}) for tool in tools
+    ]
+    proposal["manifest"] = {
+        "domains": [{"name": name, "owner": "simulated"} for name in sorted(state)],
+        "tools": [
+            {"name": tool.name, "reads": list(tool.reads), "writes": list(tool.writes)}
+            for tool in tools
+        ],
+    }
+    return StartDraft.model_validate(proposal)
+
+
+def validate_author_answer(
+    answer: JsonObject, material: StartMaterial, read: frozenset[str]
+) -> StartDraft:
+    """Expand the proposal and verify its state, capabilities and delivered fact evidence."""
+    draft = assemble_start_proposal(answer)
+    return validate_draft(draft.model_dump(mode="json"), material, read)
+
+
 def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[str]) -> StartDraft:
     """Check a draft's structure, delivered citations and claimed provenance.
 
@@ -404,7 +438,7 @@ def author_start(
     task_index = sum(ord(ch) for ch in material.task.task.task_id)
     variant = spec.author_variants[(task_index + round_) % len(spec.author_variants)]
     opening = {**material.context(), "round": round_, "feedback": feedback}
-    return _draw(
+    draw, draft = _draw(
         project,
         spec.author,
         spec.author_profile,
@@ -415,11 +449,15 @@ def author_start(
         identity=_draw_id(identity, "start_author", variant, round_, 0, opening),
         system=instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant),
         opening=opening,
-        answer=author_answer_tool(),
-        validate=lambda answer, read: validate_draft(answer, material, read),
+        answer=author_answer_tool(material.knowledge.state_domains),
+        validate=lambda answer, read: validate_author_answer(answer, material, read),
         sources=sources,
         code_revision=code_revision,
     )
+
+    if draft is not None:
+        draw = draw.model_copy(update={"answer": draft.model_dump(mode="json")})
+    return draw, draft
 
 
 def review_start(

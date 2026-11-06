@@ -209,6 +209,26 @@ def _draft(task_id: str, opening: JsonObject) -> JsonObject:
     }
 
 
+def _author_answer(task_id: str, opening: JsonObject) -> JsonObject:
+    """Script one tool declaration list; the host derives its capability manifest."""
+    draft = _draft(task_id, opening)
+    manifest = draft.pop("manifest")
+    assert isinstance(manifest, dict) and isinstance(manifest["tools"], list)
+    entries = draft["tools"]
+    assert isinstance(entries, list)
+    policies = {str(row["name"]): row for row in manifest["tools"] if isinstance(row, dict)}
+    draft["tools"] = [
+        {
+            **entry,
+            "reads": policies[str(entry["name"])]["reads"],
+            "writes": policies[str(entry["name"])]["writes"],
+        }
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+    return draft
+
+
 def _research_answer(trace_id: str) -> JsonObject:
     """A research answer citing the trajectory's own tier check."""
     return {
@@ -251,7 +271,7 @@ def answers(role: str, opening: JsonObject) -> JsonObject:
         return {"consistent": True, "summary": "check_sla shows the authored high tier."}
     task = _task_id(opening)
     if role == "start_author":
-        return _draft(task, opening)
+        return _author_answer(task, opening)
     if role == "start_researcher":
         return {
             "status": "resolved",

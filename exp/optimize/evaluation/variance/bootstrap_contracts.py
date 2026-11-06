@@ -480,6 +480,18 @@ class RevealProbe(ContractModel):
     arguments: JsonObject = Field(default_factory=dict)
 
 
+class StartTool(ToolSchema):
+    """One authored tool schema together with its executable state effects.
+
+    Attributes:
+        reads: State domain names this tool may read.
+        writes: State domain names this tool may change.
+    """
+
+    reads: tuple[str, ...]
+    writes: tuple[str, ...]
+
+
 class StartDraft(ContractModel):
     """The author's starting state for one task.
 

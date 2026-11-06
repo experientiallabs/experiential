@@ -231,6 +231,22 @@ class PreparationScript(ScriptedJsonTransport):
                 assert isinstance(facts, list) and isinstance(facts[0], dict)
                 inventory = LocatorInventory.model_validate(opening["inventory"]).decode()
                 facts[0]["references"] = [inventory[0]]
+                manifest = body.pop("manifest")
+                assert isinstance(manifest, dict) and isinstance(manifest["tools"], list)
+                entries = body["tools"]
+                assert isinstance(entries, list)
+                policies = {
+                    str(row["name"]): row for row in manifest["tools"] if isinstance(row, dict)
+                }
+                body["tools"] = [
+                    {
+                        **entry,
+                        "reads": policies[str(entry["name"])]["reads"],
+                        "writes": policies[str(entry["name"])]["writes"],
+                    }
+                    for entry in entries
+                    if isinstance(entry, dict)
+                ]
             elif role == "reveal_checker":
                 body = {"consistent": True, "summary": "Observed tier matches the authored fact."}
             else:

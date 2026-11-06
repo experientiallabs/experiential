@@ -720,14 +720,14 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_prompts:BOOTSTRAP_PROTOCOL",
-        "start-bootstrap-v5",
+        "start-bootstrap-v6",
         (
             "exp.optimize.evaluation.variance.bootstrap_prompts",
             "exp.optimize.evaluation.variance.bootstrap_agents",
             "exp.optimize.evaluation.rules.locator_inventory",
             "exp.optimize.evaluation.variance.bootstrap_reads",
         ),
-        "a6bc2707ca14ccf969c65059ca0e665e154c21a9d546392dff274efbc5af1568",
+        "55eca0db3c091cca63e06c83747a1573a680a4f02a2dbe6f10cd644561a66761",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_reads:BOOTSTRAP_READ_PROTOCOL",
@@ -737,7 +737,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_protocols:BOOTSTRAP_SOURCE_PROTOCOL",
-        "bootstrap-source-revision-v8",
+        "bootstrap-source-revision-v9",
         (
             "exp.optimize.evaluation.variance.bootstrap_protocols",
             "exp.optimize.evaluation.variance.bootstrap_resume",
@@ -746,7 +746,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.bootstrap_selection",
             "exp.optimize.evaluation.variance.pipeline_inputs",
         ),
-        "407ebbf37b6e9c0a2510032fde7831a6ae10d30155e843a3fc0e5df91492da51",
+        "0c40dce462c0b0295dae778fb5e0d04c23e48d78d5f5ba1af8b1b780268eedb0",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.bootstrap_admission:BOOTSTRAP_ADMISSION_PROTOCOL",

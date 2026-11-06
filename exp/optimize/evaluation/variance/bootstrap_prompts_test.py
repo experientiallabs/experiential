@@ -9,7 +9,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     reveal_answer_tool,
     review_answer_tool,
 )
-from exp.optimize.evaluation.variance.bootstrap_test import _draft
+from exp.optimize.evaluation.variance.bootstrap_test import _author_answer
 
 
 @pytest.mark.parametrize(
@@ -19,10 +19,10 @@ from exp.optimize.evaluation.variance.bootstrap_test import _draft
         {"domains": [{"name": "tickets", "owner": "simulated"}], "tools": ["bash"]},
     ],
 )
-def test_author_schema_rejects_untyped_manifest_records(manifest: JsonObject) -> None:
-    """The model receives structural constraints for domains and tool effects."""
+def test_author_schema_does_not_ask_for_host_manifest_records(manifest: JsonObject) -> None:
+    """The model cannot redefine the host-owned capability manifest."""
     validator = Draft202012Validator(author_answer_tool().input_schema)
-    valid = _draft("auth", {"findings": []})
+    valid = _author_answer("auth", {"findings": []})
     assert validator.is_valid(valid)
     assert not validator.is_valid({**valid, "manifest": manifest})
 
@@ -55,3 +55,26 @@ def test_reveal_schema_requires_structured_conflicts() -> None:
         }
     )
     assert not validator.is_valid({**base, "conflicts": ["The runtime was missing."]})
+
+
+def test_author_schema_binds_exact_family_state_keys() -> None:
+    """A readable family label remains the exact executable initial-state domain key."""
+    validator = Draft202012Validator(author_answer_tool(domain_names=("tickets",)).input_schema)
+    valid = _author_answer("auth", {"findings": []})
+    assert validator.is_valid(valid)
+    assert not validator.is_valid({**valid, "initial_state": {"workspace": {}}})
+
+
+def test_author_schema_requires_effects_on_each_tool_declaration() -> None:
+    """There is no second model-generated tool list to disagree with the schemas."""
+    validator = Draft202012Validator(author_answer_tool().input_schema)
+    valid = _author_answer("auth", {"findings": []})
+    assert validator.is_valid(valid)
+    assert not validator.is_valid(
+        {
+            **valid,
+            "tools": [
+                {"name": "read_ticket", "description": "Read", "input_schema": {"type": "object"}}
+            ],
+        }
+    )

@@ -16,6 +16,7 @@ from exp.optimize.evaluation.executable.grounded import (
 )
 from exp.optimize.evaluation.rules.agent_loop import TRANSCRIPT_TYPE, AgentTranscript
 from exp.optimize.evaluation.variance.bootstrap import frozen_report, registration_entry
+from exp.optimize.evaluation.variance.bootstrap_agents import assemble_start_proposal
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     REGISTRATION_TYPE,
     BootstrapBinding,
@@ -155,8 +156,11 @@ def _native_start(
         transcript = AgentTranscript.model_validate_json(
             project.artifacts.read_bytes(draw.transcript.artifact_id, "transcript.json")
         )
+        answer = transcript.answer
+        if draw.role == "start_author" and answer is not None and "manifest" not in answer:
+            answer = assemble_start_proposal(answer).model_dump(mode="json")
         if (
-            transcript.answer != draw.answer
+            answer != draw.answer
             or transcript.stop != "answered"
             or transcript.failure is not None
             or transcript.role != draw.role
