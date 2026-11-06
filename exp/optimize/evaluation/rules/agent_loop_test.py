@@ -449,3 +449,51 @@ def test_forced_phase_offers_only_its_required_tool(
     assert tuple(tool.name for tool in forced.tools) == (_ANSWER.name,)
     free = loop._request(messages, tools, None)
     assert free.tools == tools
+
+
+@pytest.mark.parametrize("repair", [True, False])
+def test_invalid_draft_returns_to_investigation_before_self_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair: bool
+) -> None:
+    """Structural feedback is actionable while the bounded evidence phase is still open."""
+    loop = _native_loop(tmp_path, monkeypatch)
+    loop.profile = AgentProfile(budget=EvidenceBudget(model_calls=8, tool_calls=1))
+    drafts = 0
+
+    def respond(request: ModelRequest, index: int) -> ModelResponse:
+        nonlocal drafts
+        names = {tool.name for tool in request.tools}
+        if "record_plan" in names:
+            return _model_reply(loop, [("record_plan", {"hypotheses": [], "planned_reads": []})])
+        if "submit_draft" in names:
+            drafts += 1
+            return _model_reply(
+                loop, [("submit_draft", {"value": -1 if drafts == 1 or not repair else 2})]
+            )
+        if "record_self_check" in names:
+            return _model_reply(loop, [("record_self_check", {"issues": [], "revise": False})])
+        return _model_reply(loop, [("submit", {"value": 2})])
+
+    _script_loop(loop, monkeypatch, respond)
+    transcript = loop.run(
+        "Evidence",
+        {},
+        (),
+        lambda call: ("refused", "none", ()),
+        _ANSWER,
+        lambda answer, refs: "value must be positive" if answer.get("value") == -1 else None,
+    )
+    assert transcript.stop == "answered"
+    recorded = [output for output in transcript.outputs if output.phase == "draft"]
+    assert len(transcript.calls) <= loop.profile.budget.model_calls
+    if not repair:
+        assert "self_check" in transcript.skipped
+        assert all(output.host_validation == "value must be positive" for output in recorded)
+        return
+    assert [output.host_validation for output in recorded] == ["value must be positive", "valid"]
+    assert [output.phase for output in transcript.outputs] == [
+        "plan",
+        "draft",
+        "draft",
+        "self_check",
+    ]

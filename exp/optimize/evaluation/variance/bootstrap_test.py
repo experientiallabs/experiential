@@ -356,14 +356,28 @@ class BootScript(ScriptedJsonTransport):
         if self.fail(role, opening):
             raise ProviderTransportError("scripted provider outage")
         plan: JsonObject = {"hypotheses": ["the tier decides"], "planned_reads": ["traces"]}
-        script: list[tuple[str, JsonObject]] = [
-            ("record_plan", plan),
-            _reads(role, opening),
-            ("submit_draft", answers(role, opening)),
-            ("record_self_check", {"issues": [], "revise": False}),
-            (FINALS[role], answers(role, opening)),
-        ]
-        return _reply([script[min(turns, len(script) - 1)]])
+        offered: set[str] = set()
+        tool_rows = payload["tools"]
+        assert isinstance(tool_rows, list)
+        for tool in tool_rows:
+            assert isinstance(tool, dict)
+            function = tool["function"]
+            assert isinstance(function, dict)
+            offered.add(str(function["name"]))
+        selected: tuple[str, JsonObject]
+        if "record_plan" in offered:
+            selected = ("record_plan", plan)
+        elif "submit_draft" in offered:
+            selected = (
+                _reads(role, opening) if turns == 1 else ("submit_draft", answers(role, opening))
+            )
+            if selected[0] not in offered:
+                selected = ("submit_draft", answers(role, opening))
+        elif "record_self_check" in offered:
+            selected = ("record_self_check", {"issues": [], "revise": False})
+        else:
+            selected = (FINALS[role], answers(role, opening))
+        return _reply([selected])
 
     def tasks(self, role: str) -> list[str | None]:
         """Tasks of every draw of one role."""

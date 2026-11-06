@@ -68,7 +68,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v6"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v7"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"
@@ -710,12 +710,19 @@ class _Loop:
                 host_validation=validation,
             )
         )
-        following = _NEXT[recorded]
+        invalid = recorded == "draft" and validation != "valid"
+        following: Phase = "investigate" if invalid else _NEXT[recorded]
         text = phase_prompt(following, answer)
-        if recorded == "draft":
+        if invalid:
+            text = (
+                "DRAFT REJECTED. Correct every host_validation error; read the missing evidence "
+                "while the budget permits. Submit the corrected answer fields directly as "
+                "submit_draft arguments, not a JSON string nested in another field."
+            )
+        elif recorded == "draft":
             text = phase_prompt("draft", answer) + "\n" + text
         body: JsonObject = {
-            "status": "recorded",
+            "status": "rejected" if invalid else "recorded",
             "next_phase": following,
             "phase_instruction": text,
         }
