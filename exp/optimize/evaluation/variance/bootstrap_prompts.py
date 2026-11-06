@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v7"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v8"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -61,6 +61,15 @@ will never run. final_state in the episode outcome is the evaluator projection: 
 probe_paths key names the value selected by its pointer into the state. Verifier state paths
 start /final_state/<projection-key>/... . Do not require invented outcome fields such as passed;
 the verifier itself computes pass/fail.
+Use the smallest sufficient subset of supplied tools to keep the draft compact.
+Project the full mutable state domains needed to verify results, rather than an initial empty
+marker or note that never captures the actor's work. For example, probe_paths={"workspace":
+"/Workspace filesystem (~1workspace)"} exposes that domain under /final_state/workspace.
+A rule can then test /final_state/workspace/pytest_exit_code equals 0; the start must define
+where tool execution stores that result. A required_paths check alone does not assert success.
+An authored start must include at least one read-only reveal_probes call.
+Task requirements already appear in the public instruction: they are objectives, not
+environment facts. Do not duplicate them in the fact ledger or cite task.instruction.
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
 or rules) or unknown (nothing recorded decides it). Mark a fact deciding when the right course
 of action depends on it. Never present an inferred or unknown fact as observed.
@@ -192,6 +201,15 @@ def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
     properties = schema["properties"]
     del properties["manifest"]
     schema["required"].remove("manifest")
+    schema["allOf"] = [
+        {
+            "if": {"properties": {"provenance": {"const": "authored"}}},
+            "then": {
+                "required": ["reveal_probes"],
+                "properties": {"reveal_probes": {"minItems": 1}},
+            },
+        }
+    ]
     tool = StartTool.model_json_schema()
     schema["$defs"].update(tool.pop("$defs", {}))
     if domain_names:

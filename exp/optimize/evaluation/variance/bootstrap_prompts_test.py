@@ -97,3 +97,13 @@ def test_author_pointer_schema_uses_escaped_domain_roots() -> None:
     assert not validator.is_valid("/Workspace filesystem (/workspace)/files")
     assert not validator.is_valid("/Python/pytest toolchain/note")
     assert not validator.is_valid("/workspace/files")
+
+
+def test_authored_start_schema_requires_a_first_reveal() -> None:
+    """An authored state cannot reach final submission without a read-only reveal plan."""
+    validator = Draft202012Validator(author_answer_tool().input_schema)
+    valid = _author_answer("auth", {"findings": []})
+    assert validator.is_valid(valid)
+    assert not validator.is_valid({**valid, "reveal_probes": []})
+    without = {key: value for key, value in valid.items() if key != "reveal_probes"}
+    assert not validator.is_valid(without)
