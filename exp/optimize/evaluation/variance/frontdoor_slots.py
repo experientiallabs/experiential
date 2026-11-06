@@ -11,14 +11,30 @@ owner, so it joins the sequence without a second runner:
 - ``task-types`` (after the families review): ``task_types`` over the admitted families, each
   type consumed as ``task_type_family`` wherever a family is consumed.
 - ``rule-admission`` (after preparation): rules compiled to decision tags, admitted at two or
-  more agreeing trajectories.
-- ``state-rag`` (after preparation): pre-turn state-tag retrieval and per-task state memory.
-- ``blast-radius`` (after the pipelines): error-point blast radius across tiers.
+  more agreeing trajectories; its owner sets ``MemorySetSettings.admission`` to ``rule_tags``,
+  passes the family's trajectories to ``memory_stage_costs`` and ``family=`` to
+  ``run_rules_stage``, and served worlds enforce ``load_guard_table`` through
+  ``guard_rulebook`` and ``check_proposed_transition``.
+- ``state-rag`` (after preparation): a per-family stage authoring state-tag banks and tagging
+  the corpus, priced with ``plan_state_rag_calls``; served runtimes bind state recall (Clef
+  decisions over the fit index and the local embedder) through
+  ``GroundedRuntimeDefinition.state_memory`` (``StateMemoryPolicy``), ``GroundedWorldFactory``
+  and ``GroundedTransitionEngine.prepare``.
+- ``blast-radius`` (after the pipelines): error-point blast radius across tiers. The point
+  qualification bar and its deferral queue that replace the fixed per-selector cap are the
+  pipeline field ``MiningSettings.qualification``: a question-bank bar adopted with
+  ``from_bank``, ``bar_instruction`` in the selector prompts (in a new selector-side module,
+  since the actor-critic module is at its line limit), ``check_picks`` refusing failing picks,
+  ``schedule_points`` running qualified points in blast order (``order_by_blast`` over the
+  ``blast-radius`` error-points reference) and deferring the rest across phases, and the
+  mining planner reserving per phase from ``schedule_points``.
 - ``curriculum`` (after the pipelines): ``judged_attempts`` per task and tier, an
   ``ActorLadder`` weak to strong, ``difficulty_tiers`` and ``merge_curriculum``, saved with
   ``persist_difficulty_curriculum``; its owner also replaces the records stage's schedule plan
   with ``curriculum_plan``, which is a records-stage change rather than a front-door stage.
-- ``dense-hybrid`` (after the pipelines): decision-tag dense reward, judge on flagged steps.
+- ``dense-hybrid`` (after the pipelines): decision-tag dense reward, judge on flagged steps
+  (``dense_hybrid``), with adversarial families from ``behavior_adversarial`` and
+  ``adversarial_rubric`` joining the coalition and selectors.
 
 ``after-families`` slots run once the preparation's variance build has saved the reviewed
 families and before any start is authored: the front door runs that build first (the
@@ -67,9 +83,29 @@ SLOT_POSITIONS: dict[SlotName, SlotPosition] = {
 SLOT_CALLS: dict[SlotName, tuple[str, ...]] = {
     "tag-banks": ("corpus_tag_bank", "authored_bank_for_view"),
     "task-types": ("task_types", "task_type_family"),
-    "rule-admission": (),
-    "state-rag": (),
-    "blast-radius": (),
+    "rule-admission": (
+        "MemorySetSettings.admission",
+        "memory_stage_costs",
+        "run_rules_stage",
+        "load_guard_table",
+        "guard_rulebook",
+        "check_proposed_transition",
+    ),
+    "state-rag": (
+        "GroundedRuntimeDefinition.state_memory",
+        "StateMemoryPolicy",
+        "GroundedWorldFactory",
+        "GroundedTransitionEngine.prepare",
+        "plan_state_rag_calls",
+    ),
+    "blast-radius": (
+        "MiningSettings.qualification",
+        "from_bank",
+        "bar_instruction",
+        "check_picks",
+        "schedule_points",
+        "order_by_blast",
+    ),
     "curriculum": (
         "judged_attempts",
         "ActorLadder",
@@ -79,7 +115,7 @@ SLOT_CALLS: dict[SlotName, tuple[str, ...]] = {
         "curriculum_plan",
         "with_task_type_difficulty",
     ),
-    "dense-hybrid": (),
+    "dense-hybrid": ("dense_hybrid", "behavior_adversarial", "adversarial_rubric"),
 }
 """The owner entry points each slot's executor calls, where the owner has published them."""
 

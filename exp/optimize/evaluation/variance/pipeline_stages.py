@@ -503,6 +503,11 @@ class _MiningStage:
             draws = rubric_draws(spec.authoring.rubric_profile)
             author = spec.authoring.rubric_author
             costs.extend(row.scaled(draws) for row in evaluation_costs(project, author))
+        if mining.qualification is not None:
+            raise ValueError(
+                "mining.qualification needs its owner's per-phase planner (qualified points "
+                "continued phase by phase); remove it to plan with the point cap"
+            )
         points = mining.selector_draws * mining.points
         episodes = mining.attempts + points * mining.continuations
         for alias in mining.actors:

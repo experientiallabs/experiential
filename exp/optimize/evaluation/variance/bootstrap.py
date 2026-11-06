@@ -54,6 +54,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.state_machine import TransitionJournal
 from exp.common.traces import Trace
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
@@ -103,6 +104,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     BOOTSTRAP_PROTOCOL,
     bootstrap_prompts_sha256,
 )
+from exp.optimize.evaluation.variance.bootstrap_states import TASK_MACHINE, TaskState
 from exp.optimize.evaluation.variance.evidence import TraceSearch
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.simulation.mining.decisions import DecisionsTraceTagger
@@ -293,11 +295,20 @@ def run_bootstrap(
         code_revision=code_revision,
     )
     guard = threading.Lock()
+    journal = TransitionJournal(_manifest_path(project, batch).with_suffix(".transitions.jsonl"))
     order = [row.task.task_id for family in spec.families for row in family.tasks]
 
     def record(entry: ManifestEntry) -> None:
         nonlocal manifest
         with guard:
+            previous = manifest.entry(entry.task_id)
+            if previous is None or previous.status != entry.status or entry.status == "failed":
+                TASK_MACHINE.move(
+                    entry.task_id,
+                    None if previous is None else TaskState(previous.status),
+                    entry.status,
+                    journal,
+                )
             rows = {row.task_id: row for row in manifest.entries} | {entry.task_id: entry}
             manifest = manifest.model_copy(
                 update={"entries": tuple(rows[task] for task in order if task in rows)}
@@ -608,6 +619,14 @@ def _bootstrap_task(
         if missing:
             raise ValueError(f"source traces of {task.task.task_id} were not supplied: {missing}")
         exposure.require(task.source_traces, "mining_probes")
+        turns = max(
+            (
+                sum(span.model is not None for span in traces[trace].spans)
+                for trace in task.source_traces
+            ),
+            default=0,
+        )
+        spec = spec.model_copy(update={"job": spec.job.with_horizon(turns)})
         recorded = _recorded_state(project, task.recorded_state)
         material = StartMaterial(
             knowledge, task, {trace: traces[trace] for trace in task.source_traces}, recorded

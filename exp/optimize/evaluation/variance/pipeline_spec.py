@@ -239,6 +239,26 @@ class TraceMLSettings(ContractModel):
         return self
 
 
+class PointQualification(ContractModel):
+    """A point qualification bar in place of the fixed per-selector point cap.
+
+    Its owner (``point_bar``) adopts the tag author's bank as the bar (``from_bank``), puts
+    ``bar_instruction`` in the selector prompts, refuses failing picks (``check_picks``) and
+    runs qualified points in blast-radius order with ``schedule_points``, deferring the rest
+    across phases under the front door's cumulative ledger; the mining plan then reserves per
+    phase from ``schedule_points``. Until that owner's planner lands,
+    a registration that sets this is refused at planning rather than priced by the cap.
+
+    Attributes:
+        bar: The owner's bar settings.
+        defer: Keep a qualified point whose phase does not fit the remaining ceiling in the
+            deferral queue for a later phase, instead of dropping it.
+    """
+
+    bar: JsonObject
+    defer: bool = True
+
+
 class MiningSettings(ContractModel):
     """The ``error-mining`` stage: one actor-critic run per actor tier.
 
@@ -265,7 +285,7 @@ class MiningSettings(ContractModel):
         attempts: Group size ``G``.
         selector_draws: Point-selector draws ``J``.
         critic_draws: Critic draws ``C``.
-        points: Most points per selector ``K``.
+        points: Most points per selector ``K``; with ``qualification`` the bar decides instead.
         continuations: Suffixes per distinct point ``M``.
         seed: Trajectory pick seed.
         group_physical_attempts: Transport ceiling of each group, or None to keep the job's.
@@ -277,6 +297,8 @@ class MiningSettings(ContractModel):
         retrieval: Give selectors and critics tag-aware search over the build's scoped
             world-learning index; never held-out traces.
         retrieval_top_k: Most matches one search returns.
+        behaviors: Paired behavioral differences mined before selection, when set.
+        qualification: Point qualification bar and deferral queue replacing ``K``, when set.
     """
 
     job: ContinuationJob | None = None
@@ -302,6 +324,9 @@ class MiningSettings(ContractModel):
     retrieval: bool = True
     retrieval_top_k: int = Field(default=5, ge=1, le=20, strict=True)
     behaviors: BehaviorDifferenceSpec | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    qualification: PointQualification | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 

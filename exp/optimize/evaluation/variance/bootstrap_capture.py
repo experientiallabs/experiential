@@ -172,7 +172,7 @@ def capture_start(
         runtime_sha256=template.runtime_sha256,
         configuration=definition.model_dump(mode="json"),
         probe_sha256=definition.probe_sha256,
-        maximum_model_calls=spec.job.maximum_model_calls,
+        maximum_model_calls=spec.job.horizon,
         system_prompt=spec.job.system_prompt,
     )
     return capture_initial_world(project, capture, code_revision=code_revision)
@@ -501,7 +501,7 @@ def mining_job(
         configuration=definition.model_dump(mode="json"),
         actor_alias=template.actor_alias,
         catalog_sha256=sha256_json(catalog.model_dump(mode="json")),
-        maximum_model_calls=template.maximum_model_calls,
+        maximum_model_calls=template.horizon,
         system_prompt=template.system_prompt,
         maximum_physical_attempts=template.maximum_physical_attempts,
         deadline=template.deadline,

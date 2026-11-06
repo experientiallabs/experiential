@@ -340,7 +340,11 @@ class JobTemplate(ContractModel):
 
     Attributes:
         actor_alias: Catalog alias of the actor.
-        maximum_model_calls: Actor policy ceiling.
+        maximum_model_calls: Actor horizon (policy call ceiling); None uses the full length of
+            the task's longest source trajectory (its model calls), so decision points can be
+            found anywhere in a long trajectory.
+        horizon_ceiling: Most calls a source-length horizon may grant; an authored start with no
+            source trajectory gets this ceiling.
         system_prompt: Actor policy instruction.
         maximum_physical_attempts: Provider attempt ceiling of the job.
         deadline: Deadline of every actor call.
@@ -350,13 +354,37 @@ class JobTemplate(ContractModel):
     """
 
     actor_alias: str = Field(min_length=1)
-    maximum_model_calls: int = Field(default=20, ge=1, le=1000)
+    maximum_model_calls: int | None = Field(default=None, ge=1, le=1000)
+    horizon_ceiling: int = Field(default=1000, ge=1, le=1000, strict=True)
     system_prompt: str | None = None
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
     repeats: int = Field(default=4, ge=1, le=100, strict=True)
     temperature: float = Field(default=1.0, ge=0, le=2)
     maximum_output_tokens: int = Field(default=1024, gt=0)
+
+    def with_horizon(self, source_calls: int) -> JobTemplate:
+        """Return the template with its horizon resolved for one task.
+
+        Args:
+            source_calls: Model calls in the task's longest source trajectory; zero when it has
+                none.
+
+        Returns:
+            The template with ``maximum_model_calls`` set: the explicit value, else the source
+            length within the ceiling, else the ceiling.
+        """
+        if self.maximum_model_calls is not None:
+            return self
+        calls = min(self.horizon_ceiling, source_calls) if source_calls else self.horizon_ceiling
+        return self.model_copy(update={"maximum_model_calls": calls})
+
+    @property
+    def horizon(self) -> int:
+        """The resolved horizon; only a template resolved for a task has one."""
+        if self.maximum_model_calls is None:
+            raise ValueError("the job horizon is resolved per task from its source trajectory")
+        return self.maximum_model_calls
 
 
 class BootstrapSettings(ContractModel):
