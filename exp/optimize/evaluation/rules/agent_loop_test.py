@@ -497,3 +497,50 @@ def test_invalid_draft_returns_to_investigation_before_self_check(
         "draft",
         "self_check",
     ]
+
+
+@pytest.mark.parametrize("repair", [True, False])
+def test_final_answer_validation_can_repair_only_within_frozen_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair: bool
+) -> None:
+    """A new final-answer error receives feedback without resetting the draw allowance."""
+    loop = _native_loop(tmp_path, monkeypatch)
+    finals = 0
+
+    def respond(request: ModelRequest, index: int) -> ModelResponse:
+        """Introduce an error only after the structurally valid draft."""
+        nonlocal finals
+        names = {tool.name for tool in request.tools}
+        if "record_plan" in names:
+            return _model_reply(loop, [("record_plan", {"hypotheses": [], "planned_reads": []})])
+        if "submit_draft" in names:
+            return _model_reply(loop, [("submit_draft", {"value": 2})])
+        if "record_self_check" in names:
+            return _model_reply(loop, [("record_self_check", {"issues": [], "revise": False})])
+        finals += 1
+        return _model_reply(loop, [("submit", {"value": 2 if repair and finals > 1 else -1})])
+
+    captured = _script_loop(loop, monkeypatch, respond)
+    transcript = loop.run(
+        "Evidence",
+        {},
+        (),
+        lambda call: ("refused", "none", ()),
+        _ANSWER,
+        lambda answer, refs: "value must be positive" if answer.get("value") == -1 else None,
+    )
+    assert len(transcript.calls) <= loop.profile.budget.model_calls
+    assert finals > 1
+    assert any(
+        "value must be positive" in (message.content or "")
+        for request in captured[4:]
+        for message in request.messages
+        if message.role == "tool"
+    )
+    if repair:
+        assert transcript.stop == "answered"
+        assert transcript.answer == {"value": 2}
+    else:
+        assert transcript.stop == "answered"
+        assert transcript.answer == {"value": -1}
+        assert len(transcript.calls) == loop.profile.budget.model_calls

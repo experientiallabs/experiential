@@ -202,7 +202,7 @@ def test_source_snapshot_binds_complete_bounded_review_implementation() -> None:
         "exp/simulation/mining/environment_review.py",
         "exp/simulation/rules/contracts.py",
     } <= snapshot.files.keys()
-    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v15"
+    assert snapshot.protocols["native_successor"] == "bootstrap-source-revision-v16"
     assert snapshot.protocols["environment_candidates"] == candidate_protocol_sha256()
     assert snapshot.protocols["environment_review"] == review_protocol_sha256()
 

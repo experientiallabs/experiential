@@ -46,7 +46,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.merge import check_weighing, locator_trace
 from exp.simulation.rules.model import Rule, RuleBook, RuleWeighing
 
-WEIGHING_PROTOCOL = "rule-weighing-v7"
+WEIGHING_PROTOCOL = "rule-weighing-v8"
 """Version of the weighing prompt, tools and answer schema; change it whenever any changes."""
 
 WEIGH_TOOL = "weigh_rule"

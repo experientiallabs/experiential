@@ -68,7 +68,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v7"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v8"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"
@@ -580,7 +580,35 @@ class _Loop:
             response = self._call(assembled, phase=phase, forced=forced)
             calls = response.output.tool_calls
             if own is answer:
-                return self._answered(response, answer.name)
+                finished = self._answered(response, answer.name)
+                if finished.stop != "answered" or finished.answer is None:
+                    return finished
+                failure = check(finished.answer, self._served())
+                if failure is None or self._short(assembled, 1):
+                    return finished
+                self.outputs.append(
+                    AgentPhaseOutput(
+                        phase="final",
+                        call=len(self.calls) - 1,
+                        arguments=finished.answer,
+                        host_validation=failure,
+                    )
+                )
+                messages.append(ModelMessage(role="assistant", assistant_action=response.output))
+                submitted = next(call for call in calls if call.name == answer.name)
+                messages.append(
+                    _tool_message(
+                        submitted,
+                        {
+                            "status": "rejected",
+                            "host_validation": failure,
+                            "next_phase": "final",
+                            "phase_instruction": "Correct every host_validation error and resubmit "
+                            "the final answer. The original draw budget still applies.",
+                        },
+                    )
+                )
+                continue
             mine = [call for call in calls if call.name == own.name]
             if forced and not mine:
                 return self._finish(

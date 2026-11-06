@@ -67,7 +67,7 @@ from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ToolContract
 
-SYSTEM_TWO_PROTOCOL = "jev-system-two-v7"
+SYSTEM_TWO_PROTOCOL = "jev-system-two-v8"
 """Version of the planner prompts, tools and answer schema."""
 
 TOPIC_RESEARCH_TYPE = "topic-research"
