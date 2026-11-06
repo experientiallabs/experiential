@@ -853,3 +853,50 @@ def test_a_frozen_family_runtime_is_kept_and_only_the_start_is_replaced(
     ) == frozen.model_dump(exclude={"task", "manifest", "initial_state", "probe_paths", "facts"})
     assert (definition.task.task_id, definition.initial_state) == ("recon", HIGH)
     assert definition.facts is None and definition.maximum_reasks == 2
+
+
+@pytest.mark.parametrize("repair", [True, False])
+def test_rejected_complete_author_answers_use_only_the_remaining_bounded_rounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair: bool
+) -> None:
+    """Invalid starts remain rejected; a later corrected answer still needs full start QA."""
+    setup = _setup(tmp_path, monkeypatch)
+    original = answers
+
+    def proposal(role: str, opening: JsonObject) -> JsonObject:
+        result = original(role, opening)
+        if role == "start_author" and (not repair or opening.get("round") == 0):
+            result["probe_paths"] = {"tickets": "/missing"}
+            facts = result["facts"]
+            assert isinstance(facts, list)
+            facts.append(
+                {
+                    "fact_id": "unread",
+                    "status": "observed",
+                    "statement": "An unsupported claim.",
+                    "deciding": False,
+                    "references": [],
+                }
+            )
+        return result
+
+    monkeypatch.setattr(__name__ + ".answers", proposal)
+    script = BootScript()
+    manifest = setup.run(script, monkeypatch, tasks={"auth"})
+    outcome = load_outcome(setup.project, _row(manifest, "auth").identity)
+    assert isinstance(outcome, (BootstrapRegistration, BootstrapRefusal))
+    assert len(outcome.rounds) == setup.spec.research_rounds + 1
+    assert outcome.rounds[0].author.answer is None
+    assert outcome.rounds[0].reviews == ()
+    assert "/missing" in (outcome.rounds[0].author.failure or "")
+    assert "observed fact unread" in (outcome.rounds[0].author.failure or "")
+    assert script.tasks("start_author") == ["auth", "auth"]
+    if repair:
+        assert isinstance(outcome, BootstrapRegistration)
+        assert outcome.validation.passed
+        assert outcome.rounds[-1].verdict == "accept"
+        assert outcome.draft.probe_paths == {"tickets": "/tickets"}
+    else:
+        assert isinstance(outcome, BootstrapRefusal)
+        assert outcome.kind == "author_unusable"
+        assert manifest.by_status("registered") == ()

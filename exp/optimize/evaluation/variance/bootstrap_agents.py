@@ -324,9 +324,10 @@ def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[
             resolve(draft.initial_state, pointer)
         except ValueError:
             unresolved.append(f"{location}={pointer!r}")
+    issues: list[str] = []
     if unresolved:
         roots = domain_state_roots(tuple(draft.initial_state))
-        raise ValueError(
+        issues.append(
             f"Unresolved initial_state pointers: {'; '.join(unresolved)}. "
             f"Valid domain root pointers: {roots}"
         )
@@ -334,7 +335,12 @@ def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")
     opening_refs = {f"finding:{row.finding_id}" for row in material.findings}
-    _check_facts(draft, material.inventory & (read | opening_refs))
+    try:
+        _check_facts(draft, material.inventory & (read | opening_refs))
+    except ValueError as error:
+        issues.append(str(error))
+    if issues:
+        raise ValueError("\n".join(issues))
     if draft.provenance not in material.allowed():
         raise ValueError(
             f"provenance {draft.provenance!r} is not supported by the evidence; allowed: "
@@ -742,20 +748,21 @@ def _draw[Answer: ContractModel](
 def _check_facts(draft: StartDraft, inventory: frozenset[str]) -> None:
     """Refuse repeated facts, citations outside the inventory and unsupported known facts."""
     ids = [fact.fact_id for fact in draft.facts]
+    issues: list[str] = []
     if len(set(ids)) != len(ids):
-        raise ValueError("fact identities repeat")
+        issues.append("fact identities repeat")
     for fact in draft.facts:
         if outside := sorted(set(fact.references) - inventory):
-            raise ValueError(
-                f"fact {fact.fact_id} cites references outside the inventory: {outside}"
-            )
+            issues.append(f"fact {fact.fact_id} cites unavailable or unread references: {outside}")
         recorded = [
             ref for ref in fact.references if ref.startswith("trace:") or ref == RECORDED_STATE_REF
         ]
         if fact.status == "observed" and not recorded:
-            raise ValueError(f"observed fact {fact.fact_id} cites no recorded evidence")
+            issues.append(f"observed fact {fact.fact_id} cites no recorded evidence")
         if fact.status == "inferred" and not fact.references:
-            raise ValueError(f"inferred fact {fact.fact_id} cites nothing it is inferred from")
+            issues.append(f"inferred fact {fact.fact_id} cites nothing it is inferred from")
+    if issues:
+        raise ValueError("\n".join(issues))
 
 
 def _finding_view(row: Finding) -> JsonObject:

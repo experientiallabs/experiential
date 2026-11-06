@@ -57,7 +57,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
-from exp.optimize.evaluation.rules.agent_loop import run_bounded
+from exp.optimize.evaluation.rules.agent_loop import AgentTranscript, run_bounded
 from exp.optimize.evaluation.rules.stage import (
     REPORT_TYPE,
     RulesStageReport,
@@ -635,6 +635,25 @@ def _bootstrap_task(
             )  # fmt: skip
             if draft is None:
                 rounds.append(ReviewRound(round=round_, author=author))
+                if author.transcript is None:
+                    return refuse("author_unusable", f"no usable draft: {author.failure}", findings)
+                saved = store.read(author.transcript.artifact_id)
+                if artifact_input(saved.manifest) != author.transcript:
+                    raise ValueError("rejected author transcript differs from its saved reference")
+                transcript = AgentTranscript.model_validate_json(saved.payloads["transcript.json"])
+                if (
+                    round_ < spec.research_rounds
+                    and transcript.stop == "answered"
+                    and transcript.answer is not None
+                ):
+                    feedback = {
+                        "rejected_draft": transcript.answer,
+                        "author_failure": author.failure,
+                    }
+                    sources = tuple(
+                        sorted({*sources, author.transcript}, key=lambda ref: ref.artifact_id)
+                    )
+                    continue
                 return refuse("author_unusable", f"no usable draft: {author.failure}", findings)
             reviews = review_start(
                 project, spec, material, draft, identity=identity, round_=round_,

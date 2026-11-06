@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v8"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v9"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -48,6 +48,8 @@ AUTHOR_INSTRUCTION = (
 
 Produce the task's public instruction, exact initial state, tool_effects, evaluator projection
 (probe_paths, JSON pointers into the initial state), executable verifier and fact ledger.
+For submit_draft and submit_start, pass the proposal fields directly as tool arguments,
+not a JSON string nested inside draft or answer.
 Declare each tool once in tools, including name, description, input_schema, reads and writes.
 Use the supplied task tool schemas when they support the task. The host derives the manifest
 from those declarations and initial_state; do not submit manifest. Each read/write effect names
