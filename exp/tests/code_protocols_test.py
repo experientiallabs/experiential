@@ -54,7 +54,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.behavior_pairs",
             "exp.optimize.evaluation.variance.pipeline_behaviors",
         ),
-        "d1b011791ca26ab487e40d63bad8a9120a04fdce89b6f6f16a568365095198a2",
+        "cb3a77644e7d4f623d0c4220ed04e55d156e4932154a29d9ee88a6ab53c79bd5",
     ),
     Protocol(
         "exp.simulation.mining.descriptors:DESCRIPTOR_EMBEDDING",
@@ -658,7 +658,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.rules.agent_loop",
             "exp.simulation.rules.rule_lifecycle",
         ),
-        "92e12f09e4a89c5bd72af76845420a9ac0231a9ea52fb2eaa4973d75248beae5",
+        "12aa595aa08d3812622114870437cfce7f543ca5186098453043932bf1367bf0",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.rule_consolidation:CONSOLIDATION_PROTOCOL",
