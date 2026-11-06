@@ -338,7 +338,7 @@ PROTOCOLS = (
             "exp.simulation.rules.merge:check_weighing",
             "exp.simulation.rules.model",
         ),
-        "9cae095c6bad0a4cb5f0698baaf97547bc62900738862e0222e206effcf53f3e",
+        "35aba72f231764d877f5db88799215a0705c8fe2077bc385e22acf7fc3591e94",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.condense:CONDENSATION_PROTOCOL",
@@ -642,12 +642,38 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.rules.memory_stage:MEMORY_STAGE_PROTOCOL",
-        "jev-memory-stage-v2",
+        "jev-memory-stage-v3",
         (
             "exp.optimize.evaluation.rules.memory_stage",
             "exp.optimize.evaluation.rules.governance",
+            "exp.optimize.evaluation.rules.memory_admission",
         ),
-        "c96b72a6698d2ddad5b23b628218d5c9ff0bb9ce794db02d064cf57f7c083e9c",
+        "932fcfcf599f8a90e28cfc333e4860ef06d79bd2e317b7c1c145110acf46ca80",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.rule_tags:RULE_TAGS_PROTOCOL",
+        "rule-tags-v1",
+        (
+            "exp.optimize.evaluation.rules.rule_tags",
+            "exp.optimize.evaluation.rules.agent_loop",
+            "exp.simulation.rules.rule_lifecycle",
+        ),
+        "92e12f09e4a89c5bd72af76845420a9ac0231a9ea52fb2eaa4973d75248beae5",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.rules.rule_consolidation:CONSOLIDATION_PROTOCOL",
+        "rule-consolidation-admitted-v1",
+        (
+            "exp.optimize.evaluation.rules.rule_consolidation",
+            "exp.optimize.evaluation.rules.memory_edits",
+        ),
+        "bc1cb0828436c4a94b9714d807151907137439d11cb8715548138ec7de4a5a39",
+    ),
+    Protocol(
+        "exp.simulation.rules.admission:ADMISSION_PROTOCOL",
+        "rule-tag-admission-v1",
+        ("exp.simulation.rules.admission",),
+        "6eb1cb832fbe277d664e4a2dc47d5a3d99740a875c5b51543e6c233b29473a36",
     ),
     Protocol(
         "exp.simulation.rules.recall:RECALL_PROTOCOL",

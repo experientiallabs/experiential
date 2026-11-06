@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -65,8 +66,10 @@ def answers(role: str, opening: JsonObject) -> JsonObject:
     return {"inspector": role, "no_change_reason": "nothing for this job"}
 
 
-def spec(settings: AuthorSettings) -> RulesStageSpec:
-    """A jev_memory registration with small budgets."""
+def spec(
+    settings: AuthorSettings, admission: Literal["rule_tags", "weighing"] = "weighing"
+) -> RulesStageSpec:
+    """A jev_memory registration with small budgets, under the weighing admission by default."""
     return RulesStageSpec.model_validate(
         {
             "author": settings,
@@ -79,6 +82,7 @@ def spec(settings: AuthorSettings) -> RulesStageSpec:
                 reading=ReadingPolicy(first_batch=3, enough_passages=2),
                 planner=SMALL,
                 governance=GovernanceSettings(cycles=3, profile=SMALL),
+                admission=admission,
             ),
         }
     )
