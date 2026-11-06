@@ -96,7 +96,7 @@ Missing context or unsupported output is excluded with a reason, not repaired.
 Unrelated chats are not joined by matching their prompt text. Ingestion reads the complete
 retained identity snapshot in pages, with no total-record cutoff.
 
-This collection path covers JSON and SSE on Chat Completions, Responses and Messages.
-WebSocket, batch, image and embedding traffic are not captured by this
+This collection path covers JSON and SSE on Chat Completions, Responses and Messages,
+plus Responses over WebSocket. Batch, image and embedding traffic are not captured by this
 local collector. An exchange is not a complete external-agent episode: tool
 implementations and effects absent from subsequent traffic cannot be reconstructed.

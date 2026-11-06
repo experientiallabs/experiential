@@ -54,7 +54,10 @@ boundary is the native HTTP listener, which may feed a hosted relay; it does not
 prove that an end user consumed every byte. `truncated` and
 `client_disconnected` explicitly distinguish a prefix from complete evidence.
 Output and settlement may arrive in either order. Keyed replays do not attach a
-second response tap. WebSocket and batch response capture are not added here.
+second response tap. Responses WebSocket frames reuse the same native capture
+tap and settlement permissions. They complete without waiting for outer HTTP
+relay metadata, even when `relay_metadata=True`; HTTP requests still await that
+metadata when configured. Batch response capture is not supported.
 
 The winning rung's provider-returned plaintext reasoning is retained separately
 in `provider_reasoning` when that rung explicitly permits reasoning exposure.
