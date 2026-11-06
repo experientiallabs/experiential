@@ -66,7 +66,12 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
     plan_bootstrap_preparation,
     run_bootstrap_preparation,
 )
-from exp.optimize.evaluation.variance.build import run_variance_build
+from exp.optimize.evaluation.variance.frontdoor_executors import (
+    PIPELINE_SETTINGS,
+    SlotContext,
+    review_families,
+    state_rag_preparation,
+)
 from exp.optimize.evaluation.variance.frontdoor_ledger import PhaseLedger, measure
 from exp.optimize.evaluation.variance.frontdoor_slots import (
     SLOT_POSITIONS,
@@ -82,7 +87,6 @@ from exp.optimize.evaluation.variance.pipeline import (
     plan_decision_variance,
     run_decision_variance,
 )
-from exp.optimize.evaluation.variance.pipeline_review import family_reviewer
 from exp.optimize.evaluation.variance.pipeline_spec import (
     AuthoringSettings,
     CostLine,
@@ -173,9 +177,21 @@ class FrontDoorSpec(ContractModel):
 
     @model_validator(mode="after")
     def _rules(self) -> Self:
-        """Require a rules registration for the pipeline."""
+        """Require a rules registration, and the template setting each in-pipeline slot runs by."""
         if self.pipeline.rules is None and self.preparation.bootstrap.rules is None:
             raise ValueError("give pipeline.rules when the preparation registers no rules")
+        enabled = {
+            "blast-radius": self.pipeline.mining.qualification is not None
+            and self.pipeline.mining.qualification.blast is not None,
+            "curriculum": self.pipeline.records.schedule,
+            "dense-hybrid": self.pipeline.records.dense is not None
+            and self.pipeline.records.dense.hybrid is not None,
+        }
+        for name in self.slots:
+            if name in enabled and not enabled[name]:
+                raise ValueError(
+                    f"slot {name} runs inside each pipeline; set {PIPELINE_SETTINGS[name][1]}"
+                )
         return self
 
     def pipeline_spec(
@@ -295,6 +311,7 @@ class PipelineOutcome(ContractModel):
         run: The saved run registration, once it ran.
         complete: Whether every stage is saved.
         stopped: Why it stopped, when it did.
+        stages: Each finished stage's saved record, by stage.
     """
 
     task_id: str
@@ -302,6 +319,7 @@ class PipelineOutcome(ContractModel):
     run: ArtifactInput | None = None
     complete: bool = False
     stopped: str | None = None
+    stages: dict[str, ArtifactInput] = Field(default_factory=dict)
 
 
 class FrontDoorReport(ContractModel):
@@ -397,7 +415,19 @@ def plan_front_door(
     stages = [built]
     stages.extend(_slot_stages(project, spec, "after-families", code_revision, dependencies))
     report: BootstrapPreparationReport | None = None
-    if built.status == StageState.DONE:
+    effective = effective_spec(project, spec, code_revision)
+    if effective is None:
+        preparation = FrontDoorStage(
+            stage="bootstrap-preparation",
+            status=StageState.BLOCKED,
+            lines=_PREPARATION_LINES,
+            notes=(
+                "Priced once the state-rag slot saved each family's state-tag index, which "
+                "every start's simulator binds.",
+            ),
+        )
+    elif built.status == StageState.DONE:
+        spec = effective
         preparation, report = _preparation_stage(project, spec, code_revision)
     else:
         preparation = FrontDoorStage(
@@ -492,6 +522,21 @@ def run_front_door(
     return report
 
 
+def effective_spec(
+    project: ProjectStore, spec: FrontDoorSpec, code_revision: str
+) -> FrontDoorSpec | None:
+    """Return the registration with each family's saved state recall bound into its starts.
+
+    Unchanged without a ``state-rag`` slot; None until that slot's index is saved.
+    """
+    settings = spec.slots.get("state-rag")
+    if settings is None:
+        return spec
+    context = SlotContext(project, spec.preparation, code_revision)
+    preparation = state_rag_preparation(context, settings)
+    return None if preparation is None else spec.model_copy(update={"preparation": preparation})
+
+
 def run_directory(project: ProjectStore, spec: FrontDoorSpec) -> Path:
     """Return the directory holding a registration's transition journal and phase ledger."""
     identity = f"front-door-{sha256_json(spec)[:16]}"
@@ -534,6 +579,15 @@ class _Runner:
             if reason is not None:
                 return report.model_copy(update={"stopped": reason})
             report = report.model_copy(update={"source": source})
+        if any(SLOT_POSITIONS[name] == "after-families" for name in spec.slots):
+            review_families(project, spec.preparation, self.code_revision, deps.bootstrap)
+            report = self.slots("after-families", report)
+            if report.stopped is not None:
+                return report
+        effective = effective_spec(project, spec, self.code_revision)
+        if effective is None:
+            raise ValueError("the state-rag slot finished without a saved state-tag index")
+        self.spec = spec = effective
         preparation = plan_bootstrap_preparation(
             project, spec.preparation, code_revision=self.code_revision
         )
@@ -542,9 +596,6 @@ class _Runner:
         if self.tracker.stages[stage] == StageState.BLOCKED:
             done = project.artifacts.exists(result_id)
             self.tracker.stage(stage, "replayed" if done else "priced")
-        if any(SLOT_POSITIONS[name] == "after-families" for name in spec.slots):
-            _review_families(project, spec, self.code_revision, deps)
-            report = self.slots("after-families", report)
 
         def prepare() -> BootstrapPreparationReport:
             """Run or replay the preparation under its own share of the ceiling."""
@@ -592,6 +643,16 @@ class _Runner:
                 )
         report = report.model_copy(update={"pipelines": tuple(outcomes)})
         return self.slots("after-pipeline", report)
+
+    def context(self, report: FrontDoorReport) -> SlotContext:
+        """Return what a slot executor reads: earlier slots, the preparation, every pipeline."""
+        results: dict[str, ArtifactInput] = {str(k): v for k, v in report.slots.items()}
+        if report.preparation is not None:
+            results["preparation"] = report.preparation
+        for outcome in report.pipelines:
+            for stage_name, record in outcome.stages.items():
+                results[f"pipeline:{outcome.task_id}:{stage_name}"] = record
+        return SlotContext(self.project, self.spec.preparation, self.code_revision, results)
 
     def phase[Result](
         self,
@@ -667,7 +728,7 @@ class _Runner:
                 stage,
                 costs.get(stage, ()),
                 lambda executor=executor, settings=settings: executor.run(
-                    self.project, settings, self.code_revision
+                    self.context(report.model_copy(update={"slots": results})), settings
                 ),
             )
             if result is None:
@@ -715,6 +776,7 @@ class _Runner:
             run=result.run,
             complete=result.complete,
             stopped=result.stopped,
+            stages={row.stage: row.record for row in result.stages},
         )
 
 
@@ -861,9 +923,8 @@ def _slot_stages(
     for name, settings in spec.slots.items():
         if SLOT_POSITIONS[name] != position:
             continue
-        saved, costs, lines = slot_executor(name, dependencies.slots).plan(
-            project, settings, code_revision
-        )
+        context = SlotContext(project, spec.preparation, code_revision)
+        saved, costs, lines = slot_executor(name, dependencies.slots).plan(context, settings)
         rows.append(
             FrontDoorStage(
                 stage=f"slot {name}",
@@ -873,32 +934,6 @@ def _slot_stages(
             )
         )
     return tuple(rows)
-
-
-def _review_families(
-    project: ProjectStore,
-    spec: FrontDoorSpec,
-    code_revision: str,
-    dependencies: FrontDoorDependencies,
-) -> None:
-    """Run the preparation's own variance build first, so its saved families exist.
-
-    The call is the one the preparation makes, with the same collaborators, so the preparation
-    replays it with no call. It runs only when an ``after-families`` slot needs the families.
-    """
-    collaborators = dependencies.bootstrap
-    build = spec.preparation.build
-    reviewer = collaborators.reviewer or family_reviewer(
-        project, build, code_revision=code_revision
-    )
-    run_variance_build(
-        project,
-        build.spec,
-        code_revision=code_revision,
-        tagger=collaborators.tagger,
-        reviewer=reviewer,
-        namer=collaborators.namer,
-    )
 
 
 def _ensure_build(

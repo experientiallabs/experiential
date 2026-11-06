@@ -138,6 +138,12 @@ def start_definition(
             "rule_memory": None
             if not bind or knowledge.rule_memory is None
             else knowledge.rule_memory.model_dump(mode="json"),
+            "state_recall": None
+            if (recall := template.state_recall.get(family.family_id)) is None
+            else recall.model_dump(mode="json"),
+            "state_memory": None
+            if template.state_memory is None
+            else template.state_memory.model_dump(mode="json"),
         }
     )
 

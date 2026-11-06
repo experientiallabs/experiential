@@ -32,6 +32,7 @@ from exp.optimize.evaluation.variance.frontdoor import (
     run_directory,
     run_front_door,
 )
+from exp.optimize.evaluation.variance.frontdoor_executors import SlotContext
 from exp.optimize.evaluation.variance.frontdoor_ledger import PhaseLedger
 from exp.optimize.evaluation.variance.pipeline_spec import (
     AuthoringSettings,
@@ -276,15 +277,15 @@ class ScriptedSlot:
     runs: list[JsonObject] = field(default_factory=list)
 
     def plan(
-        self, project: ProjectStore, settings: JsonObject, code_revision: str
+        self, context: SlotContext, settings: JsonObject
     ) -> tuple[bool, tuple[CostLine, ...], tuple[str, ...]]:
         """Price nothing."""
-        del project, code_revision
+        del context
         return bool(self.runs), (), (f"banks {settings['banks']}",)
 
-    def run(self, project: ProjectStore, settings: JsonObject, code_revision: str) -> ArtifactInput:
+    def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Count the run."""
-        del project, code_revision
+        del context
         self.runs.append(settings)
         return ArtifactInput(artifact_id="authored-banks", sha256="0" * 64)
 
@@ -292,11 +293,9 @@ class ScriptedSlot:
 def test_a_configured_slot_needs_its_owners_executor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A slot is refused before any call until its owner registers an executor, then planned."""
+    """A configured slot is planned at its fixed position through its executor."""
     run = front_door(tmp_path, monkeypatch)
     spec = run.spec.model_copy(update={"slots": {"tag-banks": {"banks": 2}}})
-    with pytest.raises(ValueError, match="has no executor yet"):
-        plan_front_door(run.project, spec, code_revision="test", dependencies=run.dependencies)
     slot = ScriptedSlot()
     deps = FrontDoorDependencies(
         builder=run.builder,

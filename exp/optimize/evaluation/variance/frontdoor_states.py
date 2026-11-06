@@ -11,6 +11,15 @@ from __future__ import annotations
 from enum import StrEnum
 
 from exp.common.state_machine import StateMachine, TransitionJournal
+from exp.optimize.evaluation.variance.bootstrap_states import TASK_MACHINE
+from exp.optimize.evaluation.variance.reward_states import (
+    FAMILY_MACHINE,
+    FINDING_MACHINE,
+    POINT_MACHINE,
+)
+from exp.simulation.retrieval.state_rag import RECALL_MACHINE
+from exp.simulation.rules.rule_lifecycle import RULE_MACHINE
+from exp.simulation.world_model.state_memory import MEMORY_MACHINE
 
 
 class StageState(StrEnum):
@@ -135,3 +144,23 @@ def statecharts() -> str:
         f"Front-door run states:\n{RUN_MACHINE.mermaid()}\n\n"
         f"Front-door phase states:\n{STAGE_MACHINE.mermaid()}"
     )
+
+
+def all_statecharts() -> dict[str, str]:
+    """Return every declared machine of the decision-variance pipeline as Mermaid, by name.
+
+    The tables are the one source the runtime checks every move against; the charts are their
+    review surface.
+    """
+    machines = (
+        RUN_MACHINE,
+        STAGE_MACHINE,
+        TASK_MACHINE,
+        RULE_MACHINE,
+        RECALL_MACHINE,
+        MEMORY_MACHINE,
+        POINT_MACHINE,
+        FINDING_MACHINE,
+        FAMILY_MACHINE,
+    )
+    return {machine.name: machine.mermaid() for machine in machines}

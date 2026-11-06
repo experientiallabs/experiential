@@ -51,12 +51,14 @@ from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_res
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller
 from exp.optimize.evaluation.rules.memory_admission import load_guard_table
 from exp.optimize.evaluation.variance.bootstrap_plan import (
+    BootstrapDependencies,
     BootstrapPreparationReport,
     BootstrapPreparationSpec,
 )
-from exp.optimize.evaluation.variance.build import plan_variance_build
+from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import VarianceBuildReport, load_tag_matrix
 from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
+from exp.optimize.evaluation.variance.pipeline_review import family_reviewer
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
@@ -100,6 +102,7 @@ from exp.simulation.retrieval.state_tags import (
 )
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.rules.admission import guard_rulebook
+from exp.simulation.world_model.state_memory import StateMemoryPolicy
 
 SLOT_RECORD_TYPE = "front-door-slot"
 """Artifact type of one slot stage's saved result (``slot.json``)."""
@@ -169,15 +172,33 @@ def saved_corpus(context: SlotContext) -> Corpus | None:
     return Corpus(report=report, families=families, traces=traces)
 
 
-def slot_identity(name: str, settings: JsonObject, context: SlotContext, corpus: Corpus) -> str:
-    """Return the identity a slot's result is saved under, computed before any call."""
+def slot_identity(
+    name: str,
+    settings: JsonObject,
+    context: SlotContext,
+    corpus: Corpus,
+    depends: tuple[str, ...] = (),
+) -> str:
+    """Return the identity a slot's result is saved under, computed before any call.
+
+    Args:
+        name: The slot.
+        settings: Its settings.
+        context: The front-door context.
+        corpus: The saved build and families.
+        depends: Earlier results it reads; only these join the identity.
+    """
     return stable_id(
         SLOT_RECORD_TYPE,
         {
             "slot": name,
             "settings": sha256_json(settings),
             "build": corpus.report.identity,
-            "inputs": {key: ref.model_dump(mode="json") for key, ref in context.results.items()},
+            "inputs": {
+                key: context.results[key].model_dump(mode="json")
+                for key in depends
+                if key in context.results
+            },
             "code": context.code_revision,
         },
     )
@@ -211,6 +232,31 @@ def read_slot[Record: ContractModel](
     if artifact_input(stored.manifest) != reference:
         raise ValueError(f"slot result {reference.artifact_id} changed")
     return model.model_validate_json(stored.payloads["slot.json"])
+
+
+def review_families(
+    project: ProjectStore,
+    preparation: BootstrapPreparationSpec,
+    code_revision: str,
+    collaborators: BootstrapDependencies,
+) -> None:
+    """Run the preparation's own variance build first, so its saved families exist.
+
+    The call is the one the preparation makes, with the same collaborators, so the preparation
+    replays it with no call. It runs only when an ``after-families`` slot needs the families.
+    """
+    build = preparation.build
+    reviewer = collaborators.reviewer or family_reviewer(
+        project, build, code_revision=code_revision
+    )
+    run_variance_build(
+        project,
+        build.spec,
+        code_revision=code_revision,
+        tagger=collaborators.tagger,
+        reviewer=reviewer,
+        namer=collaborators.namer,
+    )
 
 
 def admitted(
@@ -410,7 +456,7 @@ class TaskTypeExecutor:
             corpus is not None
             and "tag-banks" in context.results
             and context.project.artifacts.exists(
-                slot_identity("task-types", settings, context, corpus)
+                slot_identity("task-types", settings, context, corpus, ("tag-banks",))
             )
         ):
             return True, (), ("Saved: task types per family; replays with no call.",)
@@ -428,7 +474,7 @@ class TaskTypeExecutor:
         banks_ref = context.results.get("tag-banks")
         if corpus is None or banks_ref is None:
             raise ValueError("the task-types slot needs the families and the tag-banks slot")
-        identity = slot_identity("task-types", settings, context, corpus)
+        identity = slot_identity("task-types", settings, context, corpus, ("tag-banks",))
         project = context.project
         if project.artifacts.exists(identity):
             return artifact_input(project.artifacts.read(identity).manifest)
@@ -502,6 +548,7 @@ class StateRagSlot(ContractModel):
         decision_alias: Native decision alias tagging every fit step and every live state.
         samples: Pre-turn states the author samples per family.
         live_steps: Live steps a served family runtime may tag, for pricing.
+        memory: Per-task state description policy bound into every start's simulator.
     """
 
     author_alias: str = Field(min_length=1)
@@ -510,6 +557,32 @@ class StateRagSlot(ContractModel):
     decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
     samples: int = Field(default=24, ge=2, le=512)
     live_steps: int = Field(default=0, ge=0)
+    memory: StateMemoryPolicy | None = None
+
+
+def state_rag_preparation(
+    context: SlotContext, settings: JsonObject
+) -> BootstrapPreparationSpec | None:
+    """Return the preparation with each family's saved state recall bound, or None unsaved.
+
+    The bindings and the state memory policy enter the runtime template every start is
+    captured in, so every served world of a family retrieves by its own state-tag index.
+    """
+    corpus = saved_corpus(context)
+    if corpus is None:
+        return None
+    identity = slot_identity("state-rag", settings, context, corpus)
+    store = context.project.artifacts
+    if not store.exists(identity):
+        return None
+    record = read_slot(context, artifact_input(store.read(identity).manifest), FamilyStateIndexes)
+    slot = StateRagSlot.model_validate(settings)
+    preparation = context.preparation
+    runtime = preparation.bootstrap.runtime.model_copy(
+        update={"state_recall": record.bindings, "state_memory": slot.memory}
+    )
+    bootstrap = preparation.bootstrap.model_copy(update={"runtime": runtime})
+    return preparation.model_copy(update={"bootstrap": bootstrap})
 
 
 @dataclass
@@ -703,7 +776,7 @@ class RuleAdmissionExecutor:
             table = load_guard_table(project, memory.guards)
             guards[simulator.family_id] = memory.guards
             checkable[simulator.family_id] = len(guard_rulebook(table).rules)
-        identity = slot_identity("rule-admission", {}, context, corpus)
+        identity = slot_identity("rule-admission", {}, context, corpus, ("preparation",))
         record = FamilyGuards(guards=guards, checkable=checkable)
         return save_slot(context, identity, record, (prepared, *guards.values()))
 

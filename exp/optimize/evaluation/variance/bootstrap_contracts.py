@@ -41,6 +41,7 @@ from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
     RuleMemoryBinding,
 )
+from exp.optimize.evaluation.executable.state_recall import StateRecallBinding
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.agent_loop import AgentProfile
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
@@ -57,6 +58,7 @@ from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.rules.model import ToolContract
+from exp.simulation.world_model.state_memory import StateMemoryPolicy
 
 Provenance = Literal["observed", "reconstructed", "authored"]
 """How a start relates to the original environment."""
@@ -143,6 +145,9 @@ class RuntimeTemplate(ContractModel):
         maximum_reasks: Extra proposals after known contract refusals.
         maximum_physical_attempts: Provider attempt ceiling of each served world.
         deadline: Deadline of every simulator call.
+        state_recall: Each family's pinned state-tag index and policy, by family; a start of a
+            listed family retrieves recorded transitions by pre-turn state agreement.
+        state_memory: Per-task state description policy every start's simulator uses.
     """
 
     runtime_file: Path
@@ -157,6 +162,12 @@ class RuntimeTemplate(ContractModel):
     maximum_reasks: int = Field(default=0, ge=0, le=3, strict=True)
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
+    state_recall: dict[str, StateRecallBinding] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    state_memory: StateMemoryPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class FamilyInput(ContractModel):

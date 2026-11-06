@@ -1,50 +1,31 @@
-"""Explicit stage slots of the decision-variance front door for stages other owners add.
+"""Explicit stage slots of the decision-variance front door, each bound to its owner's executor.
 
 The front door (:mod:`~exp.optimize.evaluation.variance.frontdoor`) runs a fixed sequence:
 project build, bootstrap preparation (variance build, tags, clusters, environment families,
-family rules and registered starts), then one six-stage pipeline per registered start. Several
-stages are being built separately. Each has a named slot here with a fixed position and an
-owner, so it joins the sequence without a second runner:
+family rules and registered starts), then one six-stage pipeline per registered start. Each
+slot has a fixed position and a real executor (:mod:`~.frontdoor_executors`):
 
 - ``tag-banks`` (after the families review): corpus-authored tag banks per family
-  (``corpus_tag_bank``), then every member tagged with ``authored_bank_for_view`` per view.
-- ``task-types`` (after the families review): ``task_types`` over the admitted families, each
-  type consumed as ``task_type_family`` wherever a family is consumed.
-- ``rule-admission`` (after preparation): rules compiled to decision tags, admitted at two or
-  more agreeing trajectories; its owner sets ``MemorySetSettings.admission`` to ``rule_tags``,
-  passes the family's trajectories to ``memory_stage_costs`` and ``family=`` to
-  ``run_rules_stage``, and served worlds enforce ``load_guard_table`` through
-  ``guard_rulebook`` and ``check_proposed_transition``.
-- ``state-rag`` (after preparation): a per-family stage authoring state-tag banks and tagging
-  the corpus, priced with ``plan_state_rag_calls``; served runtimes bind state recall (Clef
-  decisions over the fit index and the local embedder) through
-  ``GroundedRuntimeDefinition.state_memory`` (``StateMemoryPolicy``), ``GroundedWorldFactory``
-  and ``GroundedTransitionEngine.prepare``.
-- ``blast-radius`` (after the pipelines): error-point blast radius across tiers. The point
-  qualification bar and its deferral queue that replace the fixed per-selector cap are the
-  pipeline field ``MiningSettings.qualification``: a question-bank bar adopted with
-  ``from_bank``, ``bar_instruction`` in the selector prompts (in a new selector-side module,
-  since the actor-critic module is at its line limit), ``check_picks`` refusing failing picks,
-  ``schedule_points`` running qualified points in blast order (``order_by_blast`` over the
-  ``blast-radius`` error-points reference) and deferring the rest across phases, and the
-  mining planner reserving per phase from ``schedule_points``.
-- ``curriculum`` (after the pipelines): ``judged_attempts`` per task and tier, an
-  ``ActorLadder`` weak to strong, ``difficulty_tiers`` and ``merge_curriculum``, saved with
-  ``persist_difficulty_curriculum``; its owner also replaces the records stage's schedule plan
-  with ``curriculum_plan``, which is a records-stage change rather than a front-door stage.
-- ``dense-hybrid`` (after the pipelines): decision-tag dense reward, judge on flagged steps
-  (``dense_hybrid``), with adversarial families from ``behavior_adversarial`` and
-  ``adversarial_rubric`` joining the coalition and selectors.
+  (``corpus_tag_bank``), every member tagged with ``authored_bank_for_view`` per view.
+- ``task-types`` (after the families review, reads ``tag-banks``): ``task_types`` over the
+  admitted families; ``task_type_family`` narrows a family to one type.
+- ``state-rag`` (after the families review): a state-tag bank authored per family and every fit
+  step tagged; the saved index and the state memory policy are bound into the runtime template
+  every start of that family is captured in, so the preparation waits for it.
+- ``rule-admission`` (after the preparation): the family rules were admitted by corpus-wide
+  decision tags inside the preparation (``MemorySetSettings.admission`` defaults to
+  ``rule_tags``); the executor records and checks every family's guard table, which served
+  worlds enforce through ``guard_rulebook`` and ``check_proposed_transition``.
+- ``blast-radius``, ``curriculum`` and ``dense-hybrid`` (after the pipelines): they run inside
+  every start's pipeline (``mining.qualification`` with blast reviewers; ``records.schedule``;
+  ``records.dense.hybrid`` with ``authoring.adversarial``), priced in each pipeline's plan; the
+  slot collects every start's saved results into one record. A slot whose template setting is
+  missing is refused when the registration is validated.
 
 ``after-families`` slots run once the preparation's variance build has saved the reviewed
 families and before any start is authored: the front door runs that build first (the
-preparation then replays it with no call). Feeding a slot's output into the bootstrap (for
-example ``task_type_family`` in place of a family) is the slot owner's integration.
-
-A slot's settings are the owner's own JSON (the owner replaces ``JsonObject`` with its typed
-settings when the stage lands). A configured slot without an executor is refused at planning,
-before any call, so a spec never silently skips a stage it asked for. An executor prices its
-work credential-free and runs or replays it, like every other front-door stage.
+preparation then replays it with no call). An executor prices its work credential-free and
+runs or replays it, like every other front-door stage.
 """
 
 from __future__ import annotations
@@ -52,7 +33,14 @@ from __future__ import annotations
 from typing import Literal, Protocol
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
-from exp.common.project import ProjectStore
+from exp.optimize.evaluation.variance.frontdoor_executors import (
+    PipelineSlotExecutor,
+    RuleAdmissionExecutor,
+    SlotContext,
+    StateRagExecutor,
+    TagBankExecutor,
+    TaskTypeExecutor,
+)
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine
 
 SlotName = Literal[
@@ -73,7 +61,7 @@ SLOT_POSITIONS: dict[SlotName, SlotPosition] = {
     "tag-banks": "after-families",
     "task-types": "after-families",
     "rule-admission": "after-preparation",
-    "state-rag": "after-preparation",
+    "state-rag": "after-families",
     "blast-radius": "after-pipeline",
     "curriculum": "after-pipeline",
     "dense-hybrid": "after-pipeline",
@@ -135,18 +123,26 @@ class SlotExecutor(Protocol):
     """Prices and runs one slot's stage through its owner."""
 
     def plan(
-        self, project: ProjectStore, settings: JsonObject, code_revision: str
+        self, context: SlotContext, settings: JsonObject
     ) -> tuple[bool, tuple[CostLine, ...], tuple[str, ...]]:
         """Return whether the stage is saved, its upper-bound costs and its plan lines."""
         ...
 
-    def run(self, project: ProjectStore, settings: JsonObject, code_revision: str) -> ArtifactInput:
+    def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Run, or replay, the stage and return its saved result."""
         ...
 
 
-DEFAULT_SLOT_EXECUTORS: dict[SlotName, SlotExecutor] = {}
-"""Owner-bound executors of the slots that have landed; empty until an owner registers one."""
+DEFAULT_SLOT_EXECUTORS: dict[SlotName, SlotExecutor] = {
+    "tag-banks": TagBankExecutor(),
+    "task-types": TaskTypeExecutor(),
+    "state-rag": StateRagExecutor(),
+    "rule-admission": RuleAdmissionExecutor(),
+    "blast-radius": PipelineSlotExecutor("blast-radius"),
+    "curriculum": PipelineSlotExecutor("curriculum"),
+    "dense-hybrid": PipelineSlotExecutor("dense-hybrid"),
+}
+"""The owner-bound executor of every slot."""
 
 
 def slot_executor(
