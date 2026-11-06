@@ -54,6 +54,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
 )
 from exp.runtime.environments.world_contracts import WorldManifest
 from exp.simulation.evaluation.tasks import TaskVerifier
+from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.rules.model import ToolContract
 
@@ -150,7 +151,7 @@ class RuntimeTemplate(ContractModel):
     catalog_sha256: Sha256
     tag_retrieval: ArtifactInput | None = None
     bind_rule_book: bool = True
-    jev_alias: str = Field(default="jev", min_length=1)
+    jev_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
     seed: int = 0
     maximum_output_tokens: int = Field(default=4096, ge=1, le=65536)
     maximum_reasks: int = Field(default=0, ge=0, le=3, strict=True)

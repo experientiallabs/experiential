@@ -70,6 +70,7 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     StartDraft,
     StartValidation,
 )
+from exp.optimize.evaluation.variance.family_simulators import derive_definition
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.runtime.environments.worlds import ExecutableWorld, ExecutableWorldRuntime
@@ -86,9 +87,10 @@ def start_definition(
 ) -> GroundedRuntimeDefinition:
     """Return the grounded runtime of an accepted draft over the family's frozen knowledge.
 
-    A family with a frozen runtime keeps it exactly (world model, index binding, rule book,
-    rule memory, limits) and replaces only the task, manifest, initial state and evaluator
-    projection; instance facts of the template's own task never carry over to another task.
+    A family with a frozen runtime derives the start through the families owner's one start
+    derivation (:func:`~exp.optimize.evaluation.variance.family_simulators.derive_definition`):
+    every frozen field is kept and only the task, manifest, initial state and evaluator
+    projection are replaced; instance facts of the template's own task never carry over.
     Otherwise the definition is built from the template with the family's rule book and rule
     memory bound. The selected task keeps its identity, lineage, partition and
     sources; its instruction and tools are the draft's.
@@ -104,15 +106,20 @@ def start_definition(
         The definition.
     """
     public = task.task.model_copy(update={"instruction": draft.instruction, "tools": draft.tools})
+    if family.runtime is not None:
+        return derive_definition(
+            family.runtime,
+            public,
+            draft.initial_state,
+            manifest=draft.manifest,
+            probe_paths=draft.probe_paths,
+        )
     start = {
         "task": public.model_dump(mode="json"),
         "manifest": draft.manifest.model_dump(mode="json"),
         "initial_state": draft.initial_state,
         "probe_paths": draft.probe_paths,
     }
-    if family.runtime is not None:
-        frozen = family.runtime.model_dump(mode="json", exclude={"facts"})
-        return GroundedRuntimeDefinition.model_validate({**frozen, **start})
     bind = template.bind_rule_book
     return GroundedRuntimeDefinition.model_validate(
         {

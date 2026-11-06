@@ -735,10 +735,11 @@ def test_a_frozen_family_reaches_the_pipeline_with_no_rules_learning(
     )
     with pytest.raises(ValueError, match="unresolved"):
         _ = bootstrapped.mining.registered
+    unbound = MiningSettings.model_validate(
+        {**mining.model_dump(mode="json"), "bootstrap": None, "job": None}
+    )
     with pytest.raises(ValueError, match="register a mining job"):
-        MiningSettings.model_validate(
-            {**mining.model_dump(mode="json"), "bootstrap": None, "job": None}
-        )
+        resolve_bootstrap(project, bootstrapped.model_copy(update={"mining": unbound}))
     resolved = resolve_bootstrap(project, bootstrapped)
     assert resolved.mining.registered == recon.job
     assert RULES_STAGE.plan(project, resolved, "test") == ((), (PLAN_LINE,))

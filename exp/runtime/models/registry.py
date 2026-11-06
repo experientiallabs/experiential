@@ -397,6 +397,19 @@ class RuntimeModelCatalog:
                 bedrock_client if capabilities.supports_embeddings is not False else None,
                 served_model_id=record.served_model_id,
             )
+        if connection.self_hosted and connection.base_url is not None:
+            # An operator-run loopback decisions server takes a credential only when one is named.
+            key = None
+            if connection.api_key_env is not None:
+                key = read_connection_credential(
+                    connection, connection_id=record.connection, environment=self._environment
+                ).value
+            client = TypeSafeClient(
+                model=snapshot, api_key=key, base_url=connection.base_url, self_hosted=True
+            )
+            return ResolvedModel(
+                alias, snapshot, capabilities, client, None, served_model_id=record.served_model_id
+            )
         credential = read_connection_credential(
             connection, connection_id=record.connection, environment=self._environment
         )

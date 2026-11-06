@@ -69,6 +69,11 @@ from exp.common.models.nano_usd_upgrade import (
     upgrade_legacy_billing_source,
     upgrade_model_catalog_document,
 )
+from exp.common.models.self_hosted import (
+    require_pinned_revision,
+    require_self_hosted_connection,
+    self_hosted_identity,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -161,6 +166,8 @@ class ConnectionConfig(ContractModel):
     failure into one opaque error and holds its socket to the tenant destination policy."""
     subscription: SubscriptionKind | None = None
     """Consumer plan sign-in this connection dispatches on, instead of an API key."""
+    self_hosted: bool = False
+    """A loopback server the operator runs (see :mod:`exp.common.models.self_hosted`)."""
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -203,7 +210,15 @@ class ConnectionConfig(ContractModel):
             self.base_url is None or urlsplit(self.base_url).scheme != "https"
         ):
             raise ValueError("tenant_origin requires an explicit https base_url")
-        if self.trusted_custom_origin:
+        if self.self_hosted:
+            require_self_hosted_connection(
+                provider=self.provider,
+                base_url=self.base_url,
+                trusted_custom_origin=self.trusted_custom_origin,
+                tenant_origin=self.tenant_origin,
+                subscription=self.subscription,
+            )
+        elif self.trusted_custom_origin:
             if self.provider not in _FIXED_ORIGIN_PROVIDERS:
                 raise ValueError("trusted_custom_origin applies only to a native provider")
             if self.base_url is None:
@@ -337,6 +352,8 @@ class ConnectionConfig(ContractModel):
             A SHA-256 digest over the provider, normalized endpoint, and any Azure API version or
             Bedrock region. Credential values and credential-environment metadata are excluded.
         """
+        if self.self_hosted:
+            return sha256_json(self_hosted_identity(self.provider))
         identity: JsonObject = {
             "provider": self.provider,
             "base_url": _normalize_connection_base_url(self),
@@ -400,6 +417,8 @@ class ConnectionConfig(ContractModel):
             serialized.pop("tenant_origin", None)
         if self.subscription is None:
             serialized.pop("subscription", None)
+        if not self.self_hosted:
+            serialized.pop("self_hosted", None)
         return serialized
 
 
@@ -885,6 +904,8 @@ class ModelCatalog(ContractModel):
                     f"model alias {alias!r} names unknown connection {record.connection!r}"
                 )
             connection = self.connections[record.connection]
+            if connection.self_hosted:
+                require_pinned_revision(alias, record.revision)
             if (
                 connection.provider in _EXPLICIT_CAPABILITY_PROVIDERS
                 and record.capabilities is None

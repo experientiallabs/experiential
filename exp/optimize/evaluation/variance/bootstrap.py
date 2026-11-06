@@ -535,10 +535,16 @@ def resolve_bootstrap(project: ProjectStore, spec: DecisionVarianceSpec) -> Deci
         binding.
 
     Raises:
-        ValueError: The binding does not resolve, or a job given beside it differs.
+        ValueError: Neither a job nor a binding is given, the binding does not resolve, or a job
+            given beside it differs.
     """
     binding = spec.mining.bootstrap
     if binding is None:
+        if spec.mining.job is None:
+            raise ValueError(
+                "register a mining job or bind a task's start-bootstrap batch; the front door "
+                "binds every start its preparation registers"
+            )
         return spec
     job = registered_job(project, binding)
     if spec.mining.job is not None and spec.mining.job != job:
