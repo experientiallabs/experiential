@@ -71,6 +71,7 @@ from exp.optimize.evaluation.variance.tests.decision_variance_end_to_end_test im
     measured_spec,
 )
 from exp.optimize.evaluation.variance.tests.grounded_world_test import grounded_fixture
+from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tagging import TagMatrix, TagRow, TraceTagger
 from exp.simulation.mining.views import Unit
@@ -318,7 +319,18 @@ def test_five_tiers_reach_qualified_packages_through_the_bar_blast_radius_and_hy
         assert load_executable_qualification(project, row.qualification).qualified
         task = load_executable_task(project, row.task)
         assert task.dense is not None and task.judge is not None
-        assert verify_executable_package(project, Path(row.path)) == row.task
+        package = Path(row.path)
+        assert verify_executable_package(project, package, require_provenance=True) == row.task
+        provenance = task.provenance
+        assert provenance is not None and provenance.step == row.point
+        assert provenance.tier == row.tier and set(provenance.tier_pass_rates) == set(TIERS)
+        # The fixture's start is authored, so its task names no source trace; the record keeps
+        # exactly what the start's task holds.
+        start = load_continuation_checkpoint(project.artifacts, task.job.study.checkpoint)
+        assert provenance.source_trace_ids == start.task.source_trace_ids
+        assert provenance.blast_radius is not None and provenance.blast_rank is not None
+        binding = json.loads((package / "frozen-binding.json").read_text())
+        assert binding["provenance"] == provenance.model_dump(mode="json")
     for alias in TIERS:
         schedule = records.schedules[alias]
         assert schedule.failure is None and schedule.difficulty is not None

@@ -24,11 +24,14 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
-from exp.common.core.artifacts import ArtifactInput
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
+from exp.optimize.evaluation.executable.task import MiningProvenance
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
+from exp.optimize.evaluation.variance.behavior_adversarial import hack_signature
+from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.blast_radius import (
     BlastRadius,
     blast_radius,
@@ -41,11 +44,17 @@ from exp.optimize.evaluation.variance.blast_radius import (
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence, episode_reward
 from exp.optimize.evaluation.variance.family_stages import slot_evidence
 from exp.optimize.evaluation.variance.judge import load_assessment
-from exp.optimize.evaluation.variance.pipeline_spec import DecisionVarianceSpec, PointQualification
+from exp.optimize.evaluation.variance.pipeline_spec import (
+    DecisionVarianceSpec,
+    MiningOutputs,
+    PointQualification,
+    StageContext,
+)
 from exp.optimize.evaluation.variance.point_bar import BarRecord, QualificationBar, qualify_points
 from exp.optimize.evaluation.variance.point_selection import PointGate, save_point_bar
 from exp.optimize.evaluation.variance.records import load_judged_study
 from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
+from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.questions import resolve_question_bank
 from exp.simulation.mining.tagging import TraceTagger, TraceTaggingError
 from exp.simulation.mining.traceml import TraceTrajectory, step_units
@@ -131,16 +140,63 @@ def qualified_bound(spec: DecisionVarianceSpec) -> int:
     return bound
 
 
-def point_gate(spec: DecisionVarianceSpec, records: ArtifactInput) -> PointGate:
-    """Return one tier's gate over its saved qualification records."""
+def point_gate(
+    spec: DecisionVarianceSpec, records: ArtifactInput, allowance: int | None = None
+) -> PointGate:
+    """Return one tier's gate over its saved qualification records.
+
+    Args:
+        spec: The registration.
+        records: The tier's saved qualification records.
+        allowance: The tier's share of the live cumulative ledger; the registered
+            ``phase_attempts`` applies without a live ledger.
+    """
     settings = spec.mining.qualification
     assert settings is not None
     return PointGate(
         bar=qualification_bar(settings, spec.traceml.bank_root),
         records=records,
         cost_per_point=cost_per_point(spec),
-        phase_attempts=settings.phase_attempts,
+        phase_attempts=settings.phase_attempts if allowance is None else allowance,
     )
+
+
+def _deferred_path(project: ProjectStore, spec: DecisionVarianceSpec) -> Path:
+    """Return the file recording each tier's deferred points for one mining registration."""
+    digest = sha256_json(
+        {
+            "mining": spec.mining.model_dump(mode="json"),
+            "traceml": spec.traceml.model_dump(mode="json"),
+        }
+    )[:24]
+    return project.paths.runtime_directory / "decision-variance" / "deferred" / f"{digest}.json"
+
+
+def read_deferred(project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
+    """Return each tier's deferred points as last recorded; empty before the first phase.
+
+    The mining stage's identity reads it, so a phase that deferred points runs the stage again
+    on the next pass and carries them into that phase automatically.
+    """
+    path = _deferred_path(project, spec)
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text())
+    return value if isinstance(value, dict) else {}
+
+
+def write_deferred(
+    project: ProjectStore, spec: DecisionVarianceSpec, reports: Sequence[ActorCriticReport]
+) -> None:
+    """Record each tier's still-deferred points after a mining phase."""
+    record: JsonObject = {
+        report.spec.actor_tier: list(report.point_schedule.deferred)
+        for report in reports
+        if report.point_schedule is not None
+    }
+    path = _deferred_path(project, spec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, sort_keys=True))
 
 
 def _failures(project: ProjectStore, judged: ArtifactInput | None) -> list[EpisodeEvidence]:
@@ -214,6 +270,13 @@ def blast_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[Cost
     return tuple(row.scaled(draws * points) for row in evaluation_costs(project, review.reviewer))
 
 
+def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:
+    """Read one saved actor-critic report."""
+    return ActorCriticReport.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "report.json")
+    )
+
+
 def load_blast_ranking(store: ArtifactStore, reference: ArtifactInput) -> tuple[BlastRadius, ...]:
     """Read a saved blast-radius ranking, refusing a changed artifact.
 
@@ -234,3 +297,71 @@ def family_order(
     if blast is None:
         return report.ranking
     return order_by_blast(report.ranking, load_blast_ranking(store, blast), attempt=report.picked)
+
+
+def mining_provenance(
+    project: ProjectStore, mining: MiningOutputs, tier_name: str, point: int
+) -> MiningProvenance:
+    """Return where one mined family's point came from, for its exported tasks.
+
+    Args:
+        project: Project holding the mining records.
+        mining: The error-mining outputs.
+        tier_name: The tier whose run chose the point.
+        point: The point.
+
+    Returns:
+        The source traces, step, every tier's measured pass rate at the point's checkpoint, its
+        blast radius and the reviewed difference group whose pairs diverge there.
+    """
+    tiers = {tier.tier: tier for tier in mining.tiers}
+    tier = tiers[tier_name]
+    reports = [load_report(project, row.report) for row in mining.tiers]
+    chosen = next(r for r, row in zip(reports, mining.tiers, strict=True) if row.tier == tier_name)
+    checkpoint = next(
+        (row.checkpoint.artifact_id for row in chosen.points if row.point == point), None
+    )
+    start = load_continuation_checkpoint(project.artifacts, tier.job.study.checkpoint)
+    measured = tier_outcomes(reports).get(checkpoint or "")
+    rates: dict[str, float | None] = {row.tier: None for row in mining.tiers}
+    if measured is not None:
+        for outcome in measured.tiers:
+            graded = outcome.successes + outcome.failures
+            rates[outcome.tier] = None if graded == 0 else outcome.successes / graded
+    blast = None
+    if mining.blast is not None and checkpoint is not None:
+        ranked = load_blast_ranking(project.artifacts, mining.blast)
+        blast = next((row for row in ranked if row.point_id == checkpoint), None)
+    kind = group = signature = None
+    if tier.behavior_differences is not None:
+        report = load_behavior_differences(project, tier.behavior_differences)
+        pairs = {pair.pair_id for pair in report.pairs if pair.point == point}
+        for candidate in report.groups:
+            if pairs & set(candidate.pairs):
+                hack = hack_signature(candidate.added, candidate.removed)
+                kind = "adversarial" if hack is not None else "behavior"
+                group = candidate.group_id
+                signature = " ".join(
+                    (*(f"+{tag}" for tag in candidate.added), *(f"-{t}" for t in candidate.removed))
+                )
+                break
+    return MiningProvenance(
+        task_id=start.task.task_id,
+        source_trace_ids=tuple(start.task.source_trace_ids),
+        step=point,
+        tier=tier_name,
+        tier_pass_rates=rates,
+        blast_radius=None if blast is None else blast.score,
+        blast_rank=None if blast is None or blast.score is None else blast.rank,
+        signature_kind=kind,
+        signature_group=group,
+        signature=signature,
+    )
+
+
+def tier_allowance(context: StageContext) -> int | None:
+    """Return one tier's share of the live cumulative ledger, or None without a ledger."""
+    live = context.dependencies.remaining_attempts
+    if live is None:
+        return None
+    return max(0, live()) // len(context.spec.mining.actors)

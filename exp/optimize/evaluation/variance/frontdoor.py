@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Self
 
@@ -65,6 +65,7 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
 from exp.optimize.evaluation.variance.frontdoor_executors import (
     PIPELINE_SETTINGS,
     SlotContext,
+    dense_slot_settings,
     families_review_plan,
     review_families,
     state_rag_preparation,
@@ -86,6 +87,11 @@ from exp.optimize.evaluation.variance.frontdoor_source import (
     recorded_build,
 )
 from exp.optimize.evaluation.variance.frontdoor_states import StageState, Tracker
+from exp.optimize.evaluation.variance.frontdoor_task_types import (
+    saved_slot,
+    saved_task_types,
+    task_type_preparation,
+)
 from exp.optimize.evaluation.variance.pipeline import (
     StageExecutor,
     plan_decision_variance,
@@ -164,8 +170,8 @@ class FrontDoorSpec(ContractModel):
             "blast-radius": self.pipeline.mining.qualification is not None
             and self.pipeline.mining.qualification.blast is not None,
             "curriculum": self.pipeline.records.schedule,
-            "dense-hybrid": self.pipeline.records.dense is not None
-            and self.pipeline.records.dense.hybrid is not None,
+            "dense-hybrid": self.pipeline.records.dense is None
+            or self.pipeline.records.dense.hybrid is not None,
         }
         for name in self.slots:
             if name in enabled and not enabled[name]:
@@ -385,10 +391,11 @@ def plan_front_door(
     dependencies = dependencies or FrontDoorDependencies()
     built = _build_stage(project, spec)
     stages = [built]
-    if any(SLOT_POSITIONS[name] == "after-families" for name in spec.slots):
+    if any(SLOT_POSITIONS[name] == "after-families" for name in configured_slots(spec)):
         stages.append(_review_stage(project, spec, code_revision, built.status))
     stages.extend(_slot_stages(project, spec, "after-families", code_revision, dependencies))
     report: BootstrapPreparationReport | None = None
+    saved: dict[str, ArtifactInput] = {}
     effective = effective_spec(project, spec, code_revision)
     if effective is None:
         preparation = FrontDoorStage(
@@ -396,8 +403,8 @@ def plan_front_door(
             status=StageState.BLOCKED,
             lines=_PREPARATION_LINES,
             notes=(
-                "Priced once the state-rag slot saved each family's state-tag index, which "
-                "every start's simulator binds.",
+                "Priced once the families slots saved what every start binds: each family's "
+                "state-tag index and, with task types, one start per task type.",
             ),
         )
     elif built.status == StageState.DONE:
@@ -432,7 +439,11 @@ def plan_front_door(
         for binding in report.bindings:
             pipeline = _pipeline_plan(project, spec, report, binding, code_revision, dependencies)
             stages.append(_pipeline_stage(binding, pipeline))
-    stages.extend(_slot_stages(project, spec, "after-pipeline", code_revision, dependencies))
+            if pipeline.complete:
+                for row in pipeline.stages:
+                    manifest = project.artifacts.read(row.identity + "-stage").manifest
+                    saved[f"pipeline:{binding.task_id}:{row.stage}"] = artifact_input(manifest)
+    stages.extend(_slot_stages(project, spec, "after-pipeline", code_revision, dependencies, saved))
     return FrontDoorPlan(
         spec_sha256=sha256_json(spec), code_revision=code_revision, stages=tuple(stages)
     )
@@ -496,19 +507,55 @@ def run_front_door(
     return report
 
 
+def configured_slots(spec: FrontDoorSpec) -> dict[SlotName, JsonObject]:
+    """Return the configured slots, with the dense-hybrid slot always on for the pipelines.
+
+    The rubric's decision-model part is part of every exported task, so its slot is configured
+    whenever a pipeline exists; the in-flow vocabulary is described in its settings.
+    """
+    slots = dict(spec.slots)
+    records = spec.pipeline.records
+    if "dense-hybrid" not in slots and records.dense is None:
+        traceml, job = spec.pipeline.traceml, spec.preparation.bootstrap.job
+        slots["dense-hybrid"] = dense_slot_settings(
+            records.behavior_bank,
+            traceml.error_bank,
+            traceml.bank_root,
+            spec.pipeline.authoring.rubric_author,
+            traceml.decision_alias,
+            (job.maximum_model_calls or job.horizon_ceiling) * traceml.steps_per_call,
+        )
+    return slots
+
+
 def effective_spec(
     project: ProjectStore, spec: FrontDoorSpec, code_revision: str
 ) -> FrontDoorSpec | None:
-    """Return the registration with each family's saved state recall bound into its starts.
+    """Return the registration with the families slots' results bound into its starts.
 
-    Unchanged without a ``state-rag`` slot; None until that slot's index is saved.
+    Each family's saved state recall enters the runtime template, and with task types one start
+    is registered per task type. Unchanged without those slots; None until a configured one of
+    them is saved, since every start depends on it.
     """
-    settings = spec.slots.get("state-rag")
-    if settings is None:
-        return spec
-    context = SlotContext(project, spec.preparation, code_revision)
-    preparation = state_rag_preparation(context, settings)
-    return None if preparation is None else spec.model_copy(update={"preparation": preparation})
+    preparation = spec.preparation
+    recall = spec.slots.get("state-rag")
+    if recall is not None:
+        bound = state_rag_preparation(SlotContext(project, preparation, code_revision), recall)
+        if bound is None:
+            return None
+        preparation = bound
+    typed = spec.slots.get("task-types")
+    if typed is not None:
+        context = SlotContext(project, preparation, code_revision)
+        banks = saved_slot(context, "tag-banks", spec.slots.get("tag-banks", {}))
+        if banks is None:
+            return None
+        context = SlotContext(project, preparation, code_revision, {"tag-banks": banks})
+        types = saved_task_types(context, typed)
+        if types is None:
+            return None
+        preparation = task_type_preparation(context, types)
+    return spec.model_copy(update={"preparation": preparation})
 
 
 def run_directory(project: ProjectStore, spec: FrontDoorSpec) -> Path:
@@ -553,7 +600,7 @@ class _Runner:
             if reason is not None:
                 return report.model_copy(update={"stopped": reason})
             report = report.model_copy(update={"source": source})
-        if any(SLOT_POSITIONS[name] == "after-families" for name in spec.slots):
+        if any(SLOT_POSITIONS[name] == "after-families" for name in configured_slots(spec)):
             context = SlotContext(project, spec.preparation, self.code_revision)
             _, costs, _ = families_review_plan(context)
             if self.tracker.stages.get("variance-build") == StageState.BLOCKED:
@@ -572,7 +619,7 @@ class _Runner:
                 return report
         effective = effective_spec(project, spec, self.code_revision)
         if effective is None:
-            raise ValueError("the state-rag slot finished without a saved state-tag index")
+            raise ValueError("the families slots finished without their saved results")
         self.spec = spec = effective
         preparation = plan_bootstrap_preparation(
             project, spec.preparation, code_revision=self.code_revision
@@ -705,7 +752,7 @@ class _Runner:
         """Run or replay the configured slots at one position."""
         results = dict(report.slots)
         costs = {row.stage: row.costs for row in self.plan.stages}
-        for name, settings in self.spec.slots.items():
+        for name, settings in configured_slots(self.spec).items():
             if SLOT_POSITIONS[name] != position:
                 continue
             executor = slot_executor(name, self.dependencies.slots)
@@ -750,7 +797,9 @@ class _Runner:
                 code_revision=self.code_revision,
                 approval=approval,
                 executors=deps.executors,
-                dependencies=deps.pipeline,
+                dependencies=replace(
+                    deps.pipeline, remaining_attempts=lambda: self.ledger.allowance(name)
+                ),
             ),
             stopped=lambda result: result.stopped,
         )
@@ -898,13 +947,14 @@ def _slot_stages(
     position: SlotPosition,
     code_revision: str,
     dependencies: FrontDoorDependencies,
+    results: dict[str, ArtifactInput] | None = None,
 ) -> tuple[FrontDoorStage, ...]:
     """Plan the configured slots at one position, refusing a slot without an executor."""
     rows = []
-    for name, settings in spec.slots.items():
+    for name, settings in configured_slots(spec).items():
         if SLOT_POSITIONS[name] != position:
             continue
-        context = SlotContext(project, spec.preparation, code_revision)
+        context = SlotContext(project, spec.preparation, code_revision, results or {})
         saved, costs, lines = slot_executor(name, dependencies.slots).plan(context, settings)
         rows.append(
             FrontDoorStage(

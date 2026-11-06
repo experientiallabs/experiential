@@ -44,6 +44,7 @@ from exp.optimize.evaluation.variance.actor_critic_costs import (
     actor_critic_costs,
     point_option_costs,
 )
+from exp.optimize.evaluation.variance.actor_critic_phases import carry_deferred
 from exp.optimize.evaluation.variance.bootstrap_stage import PLAN_LINE, run_bootstrapped_rules
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
@@ -93,7 +94,10 @@ from exp.optimize.evaluation.variance.pipeline_points import (
     point_gate,
     qualification_bar,
     qualified_bound,
+    read_deferred,
     tag_tier_bar,
+    tier_allowance,
+    write_deferred,
 )
 from exp.optimize.evaluation.variance.pipeline_schedule import (
     require_scheduled_plan,
@@ -505,8 +509,11 @@ class _MiningStage:
     """The ``error-mining`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """An authored mining rubric also reads the rubric author's settings and profile."""
-        del project
+        """An authored mining rubric also reads the rubric author's settings and profile.
+
+        Under the qualification bar it also reads each tier's deferred points, so a phase that
+        deferred points runs again on the next pass and carries them forward.
+        """
         bank = behavior_bank(spec)
         return {
             **(
@@ -515,6 +522,11 @@ class _MiningStage:
                 else {"rubric_author": rubric_author_sha256(spec)}
             ),
             **({} if bank is None else {"behavior_bank": sha256_json(bank)}),
+            **(
+                {}
+                if spec.mining.qualification is None
+                else {"deferred": read_deferred(project, spec)}
+            ),
         }
 
     def plan(
@@ -641,6 +653,7 @@ class _MiningStage:
                 references.append(tier.behavior_differences)
         blast = None
         if spec.mining.qualification is not None:
+            write_deferred(project, spec, [load_report(project, tier.report) for tier in tiers])
             mined = mine_blast_radius(
                 project,
                 spec,
@@ -756,7 +769,7 @@ class _MiningStage:
                 "retrieval": retrieval,
                 "gate": None
                 if tier_inputs.point_bar is None
-                else point_gate(spec, tier_inputs.point_bar),
+                else point_gate(spec, tier_inputs.point_bar, tier_allowance(context)),
             }
         )
         if scheduled:
@@ -772,6 +785,10 @@ class _MiningStage:
             embedder=embedder if registration.retrieval is not None else None,
         )
         saved = _report_reference(project, registration, revision)
+        if registration.gate is not None:
+            saved, report = carry_deferred(
+                project, registration, registration.gate.phase_attempts, revision
+            )
         if scheduled:
             assert schedule is not None
             complete_rollout(project, schedule, saved, code_revision=revision)

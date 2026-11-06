@@ -23,6 +23,37 @@ from exp.simulation.continuations import ContinuationCheckpoint, load_continuati
 from exp.simulation.development_scope import require_development_task
 
 
+class MiningProvenance(ContractModel):
+    """Where a decision-variance task was mined from, as its package records it.
+
+    Attributes:
+        task_id: The mined start's task.
+        source_trace_ids: The recorded traces the start's task came from; empty only for an
+            authored start with no source trace.
+        step: The decision point (the step boundary) the task starts before.
+        tier: The actor tier whose run chose the point.
+        tier_pass_rates: Each tier's measured continuation pass rate at that point; None when no
+            continuation of the tier was graded there.
+        blast_radius: The point's blast-radius score, or None when unscored.
+        blast_rank: Its rank among the scored points, or None.
+        signature_kind: ``behavior`` or ``adversarial`` for the difference group it was mined
+            from, or None when no reviewed group names it.
+        signature_group: That group's identity.
+        signature: Its Added/Removed signature, such as ``+modified_evaluation -verified_result``.
+    """
+
+    task_id: str = Field(min_length=1)
+    source_trace_ids: tuple[str, ...] = ()
+    step: int = Field(ge=0)
+    tier: str = Field(min_length=1)
+    tier_pass_rates: dict[str, float | None] = Field(min_length=1)
+    blast_radius: float | None = None
+    blast_rank: int | None = Field(default=None, ge=0)
+    signature_kind: Literal["behavior", "adversarial"] | None = None
+    signature_group: str | None = None
+    signature: str | None = None
+
+
 class ExecutableTask(ContractModel):
     """Executable world and observable grading contract without a second actor framework.
 
@@ -42,6 +73,8 @@ class ExecutableTask(ContractModel):
         dense: The frozen dense error-mode reward judged over the same ledger after the episode,
             a training signal separate from the judge's outcome reward. Its tag definitions and
             grading instructions are part of the task identity and never reach the actor.
+        provenance: Where a mined task came from (trace, step, tier pass rates, blast radius,
+            signature group); part of the task identity and recorded in its package.
     """
 
     intent: str = Field(min_length=1)
@@ -54,6 +87,9 @@ class ExecutableTask(ContractModel):
     )
     judge: EpisodeJudge | None = Field(default=None, exclude_if=lambda value: value is None)
     dense: DenseRewardJudge | None = Field(default=None, exclude_if=lambda value: value is None)
+    provenance: MiningProvenance | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     known_limits: tuple[str, ...] = (
         "Observable predicates do not certify unobserved effects or host containment.",
         "Authored or simulated behavior does not establish fidelity to a native production system.",

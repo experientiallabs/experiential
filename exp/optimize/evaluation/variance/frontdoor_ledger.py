@@ -104,6 +104,19 @@ class PhaseLedger:
         """Unpriced attempts left of the cumulative allowance."""
         return self.state.unpriced_attempts - sum(row.charged_attempts for row in self.state.phases)
 
+    def allowance(self, phase: str) -> int:
+        """Return the attempts a running phase may still spend: its reservation plus what is left.
+
+        Args:
+            phase: The running phase.
+        """
+        reserved = sum(
+            row.reserved_attempts
+            for row in self.state.phases
+            if row.phase == phase and row.measured_attempts is None
+        )
+        return self.remaining_attempts + reserved
+
     def admit(self, phase: str, usd: float, attempts: int) -> str | None:
         """Reserve one phase's bound, or return why it is refused before it starts.
 

@@ -57,6 +57,8 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
 )
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import VarianceBuildReport, load_tag_matrix
+from exp.optimize.evaluation.variance.dense_prompt import dense_model_calls
+from exp.optimize.evaluation.variance.dense_vocabulary import inflow_dense, vocabulary
 from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
 from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
@@ -71,6 +73,7 @@ from exp.simulation.mining.environment_families import (
     admitted_families,
     load_environment_families,
 )
+from exp.simulation.mining.questions import resolve_question_bank
 from exp.simulation.mining.tag_authoring import (
     TagAuthor,
     TagAuthoringSpec,
@@ -565,10 +568,10 @@ class TaskTypeExecutor:
             inputs=(banks_ref,),
         )
         del record
-        return save_slot(context, identity, _Reference(reference=saved), (saved, banks_ref))
+        return save_slot(context, identity, SlotReference(reference=saved), (saved, banks_ref))
 
 
-class _Reference(ContractModel):
+class SlotReference(ContractModel):
     """A slot result that is one saved owner record.
 
     Attributes:
@@ -836,7 +839,7 @@ class RuleAdmissionExecutor:
 PIPELINE_SETTINGS: dict[str, tuple[str, str]] = {
     "blast-radius": ("error-mining", "pipeline.mining.qualification (with its blast reviewers)"),
     "curriculum": ("records", "pipeline.records.schedule"),
-    "dense-hybrid": ("records", "pipeline.records.dense with hybrid, and authoring.adversarial"),
+    "dense-hybrid": ("records", "in-flow dense vocabulary, or pipeline.records.dense with hybrid"),
 }
 """The pipeline stage that runs each in-pipeline slot and the template setting that enables it."""
 
@@ -883,13 +886,30 @@ class PipelineSlotExecutor:
         self, context: SlotContext, settings: JsonObject
     ) -> tuple[bool, tuple[CostLine, ...], tuple[str, ...]]:
         """Name the pipeline stage that runs it; its calls are priced in each pipeline."""
-        del context, settings
         stage, setting = PIPELINE_SETTINGS[self.slot]
-        return False, (), (f"Runs inside each start's {stage} stage ({setting}); collected here.",)
+        lines = [f"Runs inside each start's {stage} stage ({setting}); collected here."]
+        if self.slot == "dense-hybrid" and settings:
+            lines.append(
+                f"In-flow vocabulary: {settings['tags']} tags frozen from {settings['banks']} "
+                "plus each family's mined adversarial linters; per confirmation episode at most "
+                f"{settings['decisions_per_episode']} step decisions with "
+                f"{settings['decision_alias']} and {settings['judge_calls_per_episode']} judge "
+                f"calls with {settings['judge']} on routed tags only."
+            )
+        done = any(key.startswith("pipeline:") for key in context.results)
+        if done:
+            identity, _, _ = self.collect(context)
+            done = context.project.artifacts.exists(identity)
+        return done, (), tuple(lines)
 
     def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Save every start's results for the slot as one record."""
         del settings
+        identity, record, inputs = self.collect(context)
+        return save_slot(context, identity, record, inputs)
+
+    def collect(self, context: SlotContext) -> tuple[str, ContractModel, tuple[ArtifactInput, ...]]:
+        """Return the record of every start's results and the identity it is saved under."""
         starts: dict[str, tuple[ArtifactInput, ...]] = {}
         tasks = sorted(
             {key.split(":")[1] for key in context.results if key.startswith("pipeline:")}
@@ -919,4 +939,34 @@ class PipelineSlotExecutor:
         )
         record = PipelineCollection(slot=self.slot, starts=starts)
         inputs = tuple(ref for refs in starts.values() for ref in refs)
-        return save_slot(context, identity, record, inputs)
+        return identity, record, inputs
+
+
+def dense_slot_settings(
+    behavior_bank: str,
+    error_bank: str | None,
+    bank_root: Path | None,
+    author: AuthorSettings,
+    decision_alias: str,
+    maximum_steps: int,
+) -> JsonObject:
+    """Describe the in-flow dense vocabulary every exported task binds, for the dense slot.
+
+    Raises:
+        QuestionBankError: A vocabulary bank is not published.
+    """
+    banks = [resolve_question_bank(behavior_bank, root=bank_root)]
+    if error_bank is not None:
+        banks.append(resolve_question_bank(error_bank, root=bank_root))
+    tags, step = vocabulary(banks)
+    dense = inflow_dense(tags, step, author, decision_alias)
+    chunks = math.ceil(len(step.questions) / MAX_DECISION_QUESTIONS)
+    return {
+        "tags": len(tags),
+        "banks": [bank.bank_id for bank in banks],
+        "step_bank": step.bank_id,
+        "decision_alias": decision_alias,
+        "judge": author.model_alias,
+        "decisions_per_episode": maximum_steps * chunks,
+        "judge_calls_per_episode": dense_model_calls(dense.profile),
+    }

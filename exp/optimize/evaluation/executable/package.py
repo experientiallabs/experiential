@@ -7,7 +7,7 @@ from pathlib import Path
 from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
-from exp.optimize.evaluation.executable.task import load_executable_task
+from exp.optimize.evaluation.executable.task import MiningProvenance, load_executable_task
 from exp.optimize.evaluation.harbor.export import (
     preflight_harbor_destination,
     verify_harbor_export,
@@ -82,6 +82,11 @@ def export_executable_harbor(
                 }
             ),
             **({} if curriculum is None else {"curriculum": curriculum}),
+            **(
+                {}
+                if task.provenance is None
+                else {"provenance": task.provenance.model_dump(mode="json")}
+            ),
         },
         qualified=qualified,
         output_paths=task.output_paths,
@@ -98,22 +103,36 @@ def export_executable_harbor(
     )
 
 
-def verify_executable_package(project: ProjectStore, directory: Path) -> ArtifactInput:
+def verify_executable_package(
+    project: ProjectStore, directory: Path, *, require_provenance: bool = False
+) -> ArtifactInput:
     """Reproduce the package from trusted artifacts before importing its runtime.
 
     The local binding JSON is not a trust root. Both its references and all public files must
     reproduce the same export, so editing a binding cannot attach different grading or state.
+    A recorded mining provenance must be complete: source traces, step, tier, every tier's pass
+    rate, blast radius and the signature group, exactly as the trusted task holds them.
 
     Args:
         project: Project holding the trusted task and qualification artifacts.
         directory: Package directory to verify.
+        require_provenance: Refuse a package without mining provenance (decision-variance
+            exports always record it).
 
     Returns:
         The executable task the package reproduces.
+
+    Raises:
+        ValueError: The package does not reproduce, or its provenance is missing or incomplete.
     """
     binding = verify_harbor_export(directory)
     if binding.get("backend") != "executable-checkpoint":
         raise ValueError("package does not name the executable checkpoint backend")
+    recorded = binding.get("provenance")
+    if recorded is None and require_provenance:
+        raise ValueError("package records no mining provenance")
+    if recorded is not None:
+        MiningProvenance.model_validate(recorded)
     task = ArtifactInput.model_validate(binding.get("task"))
     raw = binding.get("qualification_evidence")
     qualification = None if raw is None else ArtifactInput.model_validate(raw)

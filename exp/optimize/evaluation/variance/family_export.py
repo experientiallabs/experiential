@@ -24,7 +24,11 @@ from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.package import export_executable_harbor
-from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
+from exp.optimize.evaluation.executable.task import (
+    ExecutableTask,
+    MiningProvenance,
+    persist_executable_task,
+)
 from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings, bind_dense_task
 from exp.optimize.evaluation.variance.records import bound_job
 
@@ -46,6 +50,7 @@ def export_family_harbor(
     code_revision: str,
     qualification: ArtifactInput | None = None,
     dense: DenseSettings | None = None,
+    provenance: MiningProvenance | None = None,
 ) -> Path:
     """Package one variant's checkpoint as a Harbor environment that starts there.
 
@@ -71,7 +76,9 @@ def export_family_harbor(
     Raises:
         ValueError: The scenario has no decision checkpoint in this family.
     """
-    task = family_executable_task(family_report, scenario_id, intent=intent, dense=dense)
+    task = family_executable_task(
+        family_report, scenario_id, intent=intent, dense=dense, provenance=provenance
+    )
     confirmed = family_report.confirmation is not None and any(
         verdict.scenario_id == scenario_id and verdict.status == "separated_matches"
         for verdict in family_report.confirmation.variants
@@ -96,6 +103,7 @@ def family_executable_task(
     *,
     intent: str,
     dense: DenseSettings | None = None,
+    provenance: MiningProvenance | None = None,
 ) -> ExecutableTask:
     """Return the executable task that starts at one variant's decision checkpoint.
 
@@ -125,11 +133,16 @@ def family_executable_task(
     judging = (family_report.judging or {}).get(scenario_id)
     if judging is None or row is None:
         raise ValueError(f"scenario {scenario_id} has no frozen judge binding in this family")
-    return _variant_task(family_report.job, row, checkpoint, judging, intent, dense)
+    return _variant_task(family_report.job, row, checkpoint, judging, intent, dense, provenance)
 
 
 def rung_executable_task(
-    family_report: FamilyReport, rung: RungTask, *, intent: str, dense: DenseSettings | None = None
+    family_report: FamilyReport,
+    rung: RungTask,
+    *,
+    intent: str,
+    dense: DenseSettings | None = None,
+    provenance: MiningProvenance | None = None,
 ) -> ExecutableTask:
     """Return the executable task that starts at one nudge-ladder rung's decision checkpoint.
 
@@ -152,7 +165,9 @@ def rung_executable_task(
     checkpoint = rung.variant.decision_checkpoint
     if checkpoint is None:
         raise ValueError(f"rung {rung.scenario_id} has no persisted decision checkpoint")
-    return _variant_task(family_report.job, rung.variant, checkpoint, rung.judging, intent, dense)
+    return _variant_task(
+        family_report.job, rung.variant, checkpoint, rung.judging, intent, dense, provenance
+    )
 
 
 def _variant_task(
@@ -162,13 +177,16 @@ def _variant_task(
     judging: VariantJudging,
     intent: str,
     dense: DenseSettings | None,
+    provenance: MiningProvenance | None = None,
 ) -> ExecutableTask:
-    """Bind the family job to one variant's checkpoint, frozen runtime and frozen judge."""
+    """Bind the family job to one variant's checkpoint, frozen runtime, judge and provenance."""
     if row.frozen is not None:
         if judging.runtime is None:
             raise ValueError(f"frozen scenario {row.scenario_id} has no frozen runtime definition")
         job = variant_job(job, (row.frozen, judging.runtime))
-    task = ExecutableTask(intent=intent, job=bound_job(job, checkpoint), judge=judging.judge)
+    task = ExecutableTask(
+        intent=intent, job=bound_job(job, checkpoint), judge=judging.judge, provenance=provenance
+    )
     return task if dense is None else bind_dense_task(task, dense)
 
 
@@ -194,6 +212,7 @@ def export_rung_harbor(
     ladder: str,
     dense: DenseSettings | None = None,
     qualification: ArtifactInput | None = None,
+    provenance: MiningProvenance | None = None,
 ) -> Path:
     """Package one nudge-ladder rung as a Harbor environment starting at its checkpoint.
 
@@ -217,7 +236,9 @@ def export_rung_harbor(
     Returns:
         The published package directory.
     """
-    task = rung_executable_task(family_report, rung, intent=intent, dense=dense)
+    task = rung_executable_task(
+        family_report, rung, intent=intent, dense=dense, provenance=provenance
+    )
     qualified = family_report.eligibility.eligible and qualification is not None
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=code_revision

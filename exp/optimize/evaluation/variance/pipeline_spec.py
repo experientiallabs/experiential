@@ -23,7 +23,7 @@ Stage outputs are typed models saved inside one ``decision-variance-stage`` arti
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
@@ -550,6 +550,8 @@ class RecordsSettings(ContractModel):
             the nudge curriculum of its admitted families, saved and written as a spec file the
             ``variance-schedule`` action starts from; it makes no model call.
         rollouts_per_tier: Rollouts each nudged strength tier of an emitted schedule lasts.
+        behavior_bank: Base behavior bank the in-flow dense vocabulary is frozen from when
+            ``dense`` is not given (with the error bank and the mined adversarial linters).
     """
 
     intent: str = Field(min_length=1, max_length=400)
@@ -566,6 +568,7 @@ class RecordsSettings(ContractModel):
     option_profile: EvidenceToolProfile = MEASURE_PROFILE
     schedule: bool = True
     rollouts_per_tier: int = Field(default=4, ge=1, le=1000, strict=True)
+    behavior_bank: str = Field(default="behavior-base-v1", min_length=1)
 
 
 class DecisionVarianceSpec(ContractModel):
@@ -669,6 +672,8 @@ class StageDependencies:
         traceml_tagger: Tagger for TraceML labels, or None for the admitted decision tagger.
         rules_decisions: System One decisions client of the rules memory, or None for the
             admitted ``rules.jev_alias`` tagger.
+        remaining_attempts: Live unpriced attempts left on the front door's cumulative ledger;
+            gated mining reserves each phase's continuations from it.
         harbor_root: Directory receiving Harbor exports, or None for the project runtime
             directory.
     """
@@ -680,6 +685,7 @@ class StageDependencies:
     traceml_tagger: TraceTagger | None = None
     rules_decisions: DecisionsTraceTagger | None = None
     harbor_root: Path | None = None
+    remaining_attempts: Callable[[], int] | None = None
 
 
 @dataclass(frozen=True)

@@ -44,8 +44,9 @@ def test_the_dry_run_separates_completed_remaining_and_unpriced_work(
     assert "1. project-build: up to $0.000000" in output
     assert "2. bootstrap-preparation: waiting on an earlier stage" in output
     assert "3. pipelines: waiting on an earlier stage" in output
+    assert "4. slot dense-hybrid: up to $0.000000" in output
     assert "Completed work: none." in output
-    assert "Remaining calls: up to $0.000000 priced across 1 pending stages" in output
+    assert "Remaining calls: up to $0.000000 priced across 2 pending stages" in output
     assert "Unpriced components:" in output and "exp build's own preflight" in output
     assert "priced once the preparation registers it" in output
     assert "Dry run: front-door plan" in output

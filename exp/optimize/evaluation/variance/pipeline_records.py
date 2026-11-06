@@ -64,6 +64,7 @@ from exp.optimize.evaluation.executable.qualification import (
 )
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
+    MiningProvenance,
     load_executable_task,
     persist_executable_task,
 )
@@ -86,9 +87,16 @@ from exp.optimize.evaluation.variance.nudge_ladder import (
     load_ladder,
     nudge_curriculum,
 )
-from exp.optimize.evaluation.variance.pipeline_dense import attach_family_dense, dense_costs
+from exp.optimize.evaluation.variance.pipeline_dense import (
+    DenseSettings,
+    attach_family_dense,
+    dense_costs,
+)
+from exp.optimize.evaluation.variance.pipeline_points import mining_provenance
 from exp.optimize.evaluation.variance.pipeline_rewards import (
+    dense_inputs,
     difficulty_plan,
+    family_dense,
     hybrid_inputs,
     tier_difficulty,
 )
@@ -151,21 +159,21 @@ class _RecordsStage:
             f"their confirmed variants ({exports}).",
         ]
         costs: list[CostComponent] = []
-        if records.dense is not None:
-            authoring = spec.authoring
-            # Decision authors may emit at most six executable options.
-            episodes = (
-                len(spec.mining.actors)
-                * authoring.families_per_tier
-                * (authoring.maximum_variants + 1)
-                * (len(authoring.actions) or 6)
-                * authoring.confirmation_repeats
-            )
-            costs.extend(dense_costs(project, records.dense, episodes))
-            lines.append(
-                f"Dense training signal: up to {episodes} confirmation episodes, bounded "
-                "separately from outcome rewards; recorded actor actions only."
-            )
+        dense, _ = dense_inputs(spec)
+        authoring = spec.authoring
+        # Decision authors may emit at most six executable options.
+        episodes = (
+            len(spec.mining.actors)
+            * authoring.families_per_tier
+            * (authoring.maximum_variants + 1)
+            * (len(authoring.actions) or 6)
+            * authoring.confirmation_repeats
+        )
+        costs.extend(dense_costs(project, dense, episodes))
+        lines.append(
+            f"Dense training signal: up to {episodes} confirmation episodes, bounded "
+            "separately from outcome rewards; recorded actor actions only."
+        )
         options = spec.point_options()
         if options is not None:
             populations = []
@@ -244,17 +252,14 @@ class _RecordsStage:
             report = reports[key]
             assert row.report is not None
             if report.records is not None:
-                records = report.records
-                refs = ()
-                if spec.records.dense is not None:
-                    records, refs = attach_family_dense(
-                        project,
-                        report,
-                        spec.records.dense,
-                        code_revision=context.code_revision,
-                        tagger=tagger,
-                        bank=bank,
-                    )
+                records, refs = attach_family_dense(
+                    project,
+                    report,
+                    _dense(context, report),
+                    code_revision=context.code_revision,
+                    tagger=tagger,
+                    bank=bank,
+                )
                 training[key] = _save(context, "training", key, records, (row.report, *refs))
         selectors: dict[str, ArtifactInput] = {}
         derived: dict[str, tuple[ArtifactInput, ...]] = {}
@@ -388,6 +393,7 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
     Returns:
         One export per confirmed variant, qualified or diagnostic.
     """
+    provenance = _provenance(context, row)
     root = context.dependencies.harbor_root
     if root is None:
         root = context.project.paths.runtime_directory / "decision-variance"
@@ -403,7 +409,8 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
                 report,
                 scenario,
                 intent=context.spec.records.intent,
-                dense=context.spec.records.dense,
+                dense=_dense(context, report),
+                provenance=provenance,
             )
             export = _qualify(context, task, export)
         if not destination.exists():
@@ -416,7 +423,8 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
                 intent=context.spec.records.intent,
                 code_revision=context.code_revision,
                 qualification=None if export.diagnostic else export.qualification,
-                dense=context.spec.records.dense,
+                dense=_dense(context, report),
+                provenance=provenance,
             )
         exports.append(export)
     return exports
@@ -435,6 +443,7 @@ def _export_rungs(
     Returns:
         One export per rung, qualified or diagnostic, recording its strength and position.
     """
+    provenance = _provenance(context, row)
     if not isinstance(report.ladder, ArtifactInput) or not report.rungs:
         return []
     root = context.dependencies.harbor_root
@@ -456,7 +465,7 @@ def _export_rungs(
         )
         try:
             task = rung_executable_task(
-                report, rung, intent=intent, dense=context.spec.records.dense
+                report, rung, intent=intent, dense=_dense(context, report), provenance=provenance
             )
         except ValueError as error:
             exports.append(export.model_copy(update={"failure": f"not exported: {error}"}))
@@ -464,13 +473,18 @@ def _export_rungs(
         if context.spec.records.qualification is not None:
             export = _qualify(context, task, export)
         if not destination.exists():
-            _package_rung(context, report, rung, export, name)
+            _package_rung(context, report, rung, export, name, provenance)
         exports.append(export)
     return exports
 
 
 def _package_rung(
-    context: StageContext, report: FamilyReport, rung: RungTask, export: HarborExport, name: str
+    context: StageContext,
+    report: FamilyReport,
+    rung: RungTask,
+    export: HarborExport,
+    name: str,
+    provenance: MiningProvenance,
 ) -> None:
     """Write one rung's Harbor package, qualified only when its qualification passed."""
     assert export.ladder is not None
@@ -483,8 +497,9 @@ def _package_rung(
         intent=context.spec.records.intent,
         code_revision=context.code_revision,
         ladder=export.ladder,
-        dense=context.spec.records.dense,
+        dense=_dense(context, report),
         qualification=None if export.diagnostic else export.qualification,
+        provenance=provenance,
     )
 
 
@@ -687,3 +702,15 @@ def _slug(value: str) -> str:
 
 RECORDS_STAGE = _RecordsStage()
 """The owner-bound ``records`` executor."""
+
+
+def _dense(context: StageContext, report: FamilyReport) -> DenseSettings:
+    """Return the family's frozen dense settings, with its mined adversarial linters."""
+    judges = [binding.judge for binding in (report.judging or {}).values()]
+    return family_dense(context.project, context.spec, judges)
+
+
+def _provenance(context: StageContext, row: FamilyOutcome) -> MiningProvenance:
+    """Return where one admitted family's point was mined from."""
+    mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
+    return mining_provenance(context.project, mining, row.tier, row.point)

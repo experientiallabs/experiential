@@ -8,7 +8,8 @@ slot has a fixed position and a real executor (:mod:`~.frontdoor_executors`):
 - ``tag-banks`` (after the families review): corpus-authored tag banks per family
   (``corpus_tag_bank``), every member tagged with ``authored_bank_for_view`` per view.
 - ``task-types`` (after the families review, reads ``tag-banks``): ``task_types`` over the
-  admitted families; ``task_type_family`` narrows a family to one type.
+  admitted families; the preparation then registers one start per task type, and the
+  ``curriculum`` slot fills each type's judged difficulty.
 - ``state-rag`` (after the families review): a state-tag bank authored per family and every fit
   step tagged; the saved index and the state memory policy are bound into the runtime template
   every start of that family is captured in, so the preparation waits for it.
@@ -41,6 +42,7 @@ from exp.optimize.evaluation.variance.frontdoor_executors import (
     TagBankExecutor,
     TaskTypeExecutor,
 )
+from exp.optimize.evaluation.variance.frontdoor_task_types import CurriculumSlotExecutor
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine
 
 SlotName = Literal[
@@ -109,7 +111,7 @@ SLOT_CALLS: dict[SlotName, tuple[str, ...]] = {
 
 SLOT_STAGES: dict[SlotName, str] = {
     "tag-banks": "corpus_tag_bank per family, members tagged with authored_bank_for_view",
-    "task-types": "task_types over admitted families, consumed through task_type_family",
+    "task-types": "task_types over admitted families; one start per task type",
     "rule-admission": "rule-to-tag compilation and admission at two or more trajectories",
     "state-rag": "pre-turn state-tag retrieval and per-task state memory",
     "blast-radius": "blast radius of every error point across tiers",
@@ -139,7 +141,7 @@ DEFAULT_SLOT_EXECUTORS: dict[SlotName, SlotExecutor] = {
     "state-rag": StateRagExecutor(),
     "rule-admission": RuleAdmissionExecutor(),
     "blast-radius": PipelineSlotExecutor("blast-radius"),
-    "curriculum": PipelineSlotExecutor("curriculum"),
+    "curriculum": CurriculumSlotExecutor(),
     "dense-hybrid": PipelineSlotExecutor("dense-hybrid"),
 }
 """The owner-bound executor of every slot."""

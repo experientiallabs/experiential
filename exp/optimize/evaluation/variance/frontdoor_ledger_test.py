@@ -20,3 +20,13 @@ def test_the_ledger_is_cumulative_across_runs_and_refuses_before_a_phase(tmp_pat
     assert reopened.admit("b", 0.1, 80) is not None
     assert reopened.admit("b", 0.1, 70) is None
     assert [row.phase for row in PhaseLedger(path).state.phases] == ["a", "b"]
+
+
+def test_a_running_phase_may_spend_its_reservation_plus_what_is_left(tmp_path: Path) -> None:
+    """The live allowance a gated pipeline reads is its own reservation plus the free balance."""
+    ledger = PhaseLedger(tmp_path / "ledger.json", ceiling_usd=1.0, unpriced_attempts=100)
+    assert ledger.admit("pipeline a", 0.0, 30) is None
+    assert ledger.remaining_attempts == 70
+    assert ledger.allowance("pipeline a") == 100
+    assert ledger.admit("pipeline b", 0.0, 50) is None
+    assert ledger.allowance("pipeline b") == 70 and ledger.allowance("pipeline a") == 50

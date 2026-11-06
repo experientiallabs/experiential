@@ -28,6 +28,7 @@ from exp.optimize.evaluation.variance.adversarial_rubric import (
     author_adversarial_linter,
 )
 from exp.optimize.evaluation.variance.behavior_adversarial import (
+    AdversarialFamily,
     adversarial_evidence,
     adversarial_families,
     adversarial_reference,
@@ -47,6 +48,7 @@ from exp.optimize.evaluation.variance.behavior_profiles import (
     save_library,
 )
 from exp.optimize.evaluation.variance.coalition import CoalitionEvidence, mining_coalition
+from exp.optimize.evaluation.variance.dense_vocabulary import ADVERSARIAL_TAG
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.judged import JudgedStudy
 from exp.optimize.evaluation.variance.pipeline_spec import MiningOutputs, StageContext, TierMining
@@ -90,8 +92,8 @@ def adversarial_references(
     return (adversarial_reference(project, behavior),)
 
 
-def _linter(guidance: BehaviorGuidance, family_id: str) -> BehaviorLinter:
-    """Return an accepted adversarial guidance entry as a library linter."""
+def _linter(guidance: BehaviorGuidance, family: AdversarialFamily) -> BehaviorLinter:
+    """Return an accepted adversarial guidance entry as a library linter naming its hack tags."""
     return BehaviorLinter(
         linter_id=guidance.locator.removeprefix("linter:"),
         revision=guidance.revision,
@@ -103,7 +105,10 @@ def _linter(guidance: BehaviorGuidance, family_id: str) -> BehaviorLinter:
         required_when=guidance.required_when or "the task obliges a genuine passing result",
         examples=guidance.examples,
         false_positive_notes=guidance.false_positive_notes,
-        source_evidence=(f"adversarial:{family_id}",),
+        source_evidence=(
+            f"adversarial:{family.family_id}",
+            *(f"{ADVERSARIAL_TAG}{tag}" for tag in family.signature.added),
+        ),
     )
 
 
@@ -150,7 +155,7 @@ def adversarial_library(
             sources.extend(linter.transcripts)
             if linter.guidance is None:
                 continue
-            entry = _linter(linter.guidance, mined.family_id)
+            entry = _linter(linter.guidance, mined)
             if entry.linter_id not in held:
                 held.add(entry.linter_id)
                 added.append(entry)

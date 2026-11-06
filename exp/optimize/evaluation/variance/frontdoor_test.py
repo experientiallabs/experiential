@@ -47,6 +47,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     StageRun,
     TraceMLSettings,
 )
+from exp.optimize.evaluation.variance.pipeline_test import write_bank
 
 
 class Seen(ContractModel):
@@ -154,7 +155,7 @@ def front_door(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fixture:
         traces=TraceSource(path=traces),
         preparation=preparation,
         pipeline=PipelineTemplate(
-            traceml=TraceMLSettings(enabled=False),
+            traceml=TraceMLSettings(enabled=False, bank_root=write_bank(tmp_path)),
             mining=MiningSettings(
                 actors=(preparation.bootstrap.job.actor_alias,),
                 judge=author,
@@ -197,7 +198,8 @@ def test_a_trace_file_reaches_registered_mining_with_no_hand_registration(
     run = front_door(tmp_path, monkeypatch)
     project, spec = run.project, run.spec
     plan = plan_front_door(project, spec, code_revision="test", dependencies=run.dependencies)
-    assert [row.status for row in plan.stages] == ["planned", "blocked", "blocked"]
+    assert [row.status for row in plan.stages] == ["planned", "blocked", "blocked", "planned"]
+    assert plan.stages[-1].stage == "slot dense-hybrid"
     with pytest.raises(ValueError, match="consent"):
         run_front_door(project, spec, code_revision="test", dependencies=run.dependencies)
     approval = FrontDoorApproval(plan_sha256=plan.digest, ceiling_usd=10.0, unpriced_attempts=1_000)
@@ -258,7 +260,9 @@ def test_a_phase_priced_on_the_way_stops_beyond_the_consented_ceiling_and_resume
     ledger = PhaseLedger(run_directory(project, spec) / "ledger.json")
     phases = [row.phase for row in ledger.state.phases]
     assert phases[:2] == ["project-build", "bootstrap-preparation"]
-    assert sorted(phases[2:]) == sorted(f"pipeline {row.task_id}" for row in finished.bindings)
+    pipelines = [phase for phase in phases[2:] if phase.startswith("pipeline ")]
+    assert sorted(pipelines) == sorted(f"pipeline {row.task_id}" for row in finished.bindings)
+    assert phases[-1] == "slot dense-hybrid"
     assert all(row.measured_attempts is not None for row in ledger.state.phases)
     journal = TransitionJournal(run_directory(project, spec) / "transitions.jsonl").rows()
     refused = [row for row in journal if row["event"] == "refused"]

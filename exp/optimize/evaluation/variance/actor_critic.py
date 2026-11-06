@@ -251,9 +251,15 @@ class ActorCriticSpec(ContractModel):
 
     def identity(self, code_revision: str) -> str:
         """Bind the registration, role prompts and producing code."""
+        frozen = self
+        if self.gate is not None:
+            # The live allowance governs phases only; saved phases replay under any allowance.
+            frozen = self.model_copy(
+                update={"gate": self.gate.model_copy(update={"phase_attempts": None})}
+            )
         return stable_id(
             "actor-critic-run",
-            {"spec": sha256_json(self), "roles": role_protocol_sha256(), "code": code_revision},
+            {"spec": sha256_json(frozen), "roles": role_protocol_sha256(), "code": code_revision},
         )
 
 

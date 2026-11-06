@@ -13,6 +13,9 @@ from exp.cli.evaluation.decision_variance_action import DecisionVarianceAction
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.spending import SpendPolicy
 from exp.optimize.evaluation.variance import pipeline
+from exp.optimize.evaluation.variance.dense_prompt import dense_profile
+from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings
+from exp.optimize.evaluation.variance.pipeline_dense_test import TAG
 from exp.optimize.evaluation.variance.pipeline_spec import STAGE_TYPE, TraceMLSettings
 from exp.optimize.evaluation.variance.pipeline_test import FixtureBuild, Run, make_spec, wired
 
@@ -37,7 +40,25 @@ def _request(run: Run, root: Path, *, execute: bool) -> Path:
     # The CLI run has no injected System One client and the stand-in rules owner learns no
     # memory, so the rules stage keeps the research profile here.
     rules = spec.rules.model_copy(update={"jev_memory": False})
-    spec = spec.model_copy(update={"traceml": TraceMLSettings(enabled=False), "rules": rules})
+    traceml = TraceMLSettings(
+        enabled=False, bank_root=run.bank, decision_alias=spec.traceml.decision_alias
+    )
+    # The catalog has no typed decision alias to route dense steps, so this run freezes its own
+    # dense vocabulary judged in full rather than the in-flow hybrid one.
+    settings = run.fixture.settings
+    dense = DenseSettings(
+        tags=(TAG,),
+        settings=settings,
+        profile=dense_profile(
+            model_alias=settings.model_alias,
+            model=settings.model,
+            maximum_output_tokens=settings.output_tokens,
+            maximum_input_bytes=settings.maximum_input_bytes,
+            reasoning_effort=settings.reasoning_effort,
+        ),
+    )
+    records = spec.records.model_copy(update={"dense": dense})
+    spec = spec.model_copy(update={"traceml": traceml, "rules": rules, "records": records})
     spec_path = root / "decision-variance.json"
     spec_path.write_text(spec.model_dump_json())
     command = ContinuationCommand(

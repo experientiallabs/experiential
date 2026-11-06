@@ -18,6 +18,13 @@ from datetime import UTC, datetime, timedelta
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.models import load_model_catalog
+from exp.common.project import ProjectStore
+from exp.optimize.evaluation.variance.dense_vocabulary import (
+    family_linters,
+    inflow_dense,
+    vocabulary,
+    with_adversarial_sources,
+)
 from exp.optimize.evaluation.variance.difficulty_curriculum import (
     ActorLadder,
     TaskDifficultyRecord,
@@ -28,9 +35,16 @@ from exp.optimize.evaluation.variance.difficulty_curriculum import (
     merge_curriculum,
     persist_difficulty_curriculum,
 )
+from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.nudge_ladder import CurriculumPlan, CurriculumStage
+from exp.optimize.evaluation.variance.pipeline_dense import DenseSettings
+from exp.optimize.evaluation.variance.pipeline_errors import tier_error_bank
 from exp.optimize.evaluation.variance.pipeline_inputs import admitted_transport
-from exp.optimize.evaluation.variance.pipeline_spec import MiningOutputs, StageContext
+from exp.optimize.evaluation.variance.pipeline_spec import (
+    DecisionVarianceSpec,
+    MiningOutputs,
+    StageContext,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.decisions import DecisionsTraceTagger
@@ -38,13 +52,46 @@ from exp.simulation.mining.questions import QuestionBank, resolve_question_bank
 from exp.simulation.mining.tagging import DecisionCache, TraceTagger
 
 
+def dense_inputs(spec: DecisionVarianceSpec) -> tuple[DenseSettings, QuestionBank | None]:
+    """Return the dense settings every exported task binds and the step bank routing uses.
+
+    A registration's own ``records.dense`` wins. Otherwise the vocabulary is frozen in flow
+    from the base behavior bank and the error bank, with hybrid routing on.
+    """
+    root = spec.traceml.bank_root
+    dense = spec.records.dense
+    if dense is not None:
+        bank = (
+            None if dense.hybrid is None else resolve_question_bank(dense.hybrid.bank_id, root=root)
+        )
+        return dense, bank
+    banks = [resolve_question_bank(spec.records.behavior_bank, root=root)]
+    errors = tier_error_bank(spec)
+    if errors is not None:
+        banks.append(errors)
+    tags, step = vocabulary(banks)
+    author = spec.authoring.rubric_author
+    return inflow_dense(tags, step, author, spec.traceml.decision_alias), step
+
+
+def family_dense(
+    project: ProjectStore, spec: DecisionVarianceSpec, judges: Sequence[EpisodeJudge]
+) -> DenseSettings:
+    """Return one family's frozen dense settings: the mined adversarial linters join the tags."""
+    dense, _ = dense_inputs(spec)
+    if spec.records.dense is not None:
+        return dense
+    linters = {row.linter_id: row for judge in judges for row in family_linters(project, judge)}
+    tags = with_adversarial_sources(dense.tags, tuple(linters.values()))
+    return dense.model_copy(update={"tags": tags})
+
+
 def hybrid_inputs(context: StageContext) -> tuple[TraceTagger | None, QuestionBank | None]:
-    """Return the decision tagger and step bank of hybrid dense routing, when registered."""
-    dense = context.spec.records.dense
-    if dense is None or dense.hybrid is None:
+    """Return the decision tagger and step bank of hybrid dense routing."""
+    dense, bank = dense_inputs(context.spec)
+    if dense.hybrid is None or bank is None:
         return None, None
     hybrid = dense.hybrid
-    bank = resolve_question_bank(hybrid.bank_id, root=context.spec.traceml.bank_root)
     injected = context.dependencies.traceml_tagger
     if injected is not None:
         return injected, bank
