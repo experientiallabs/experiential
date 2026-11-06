@@ -480,6 +480,11 @@ class RevealProbe(ContractModel):
     arguments: JsonObject = Field(default_factory=dict)
 
 
+def domain_state_roots(names: Sequence[str]) -> dict[str, str]:
+    """Return exact RFC 6901 root pointers for the supplied executable domain names."""
+    return {name: "/" + name.replace("~", "~0").replace("/", "~1") for name in names}
+
+
 class StartTool(ToolSchema):
     """One authored tool schema together with its executable state effects.
 

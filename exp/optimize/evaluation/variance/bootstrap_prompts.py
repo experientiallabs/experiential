@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v6"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v7"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -52,7 +52,9 @@ Declare each tool once in tools, including name, description, input_schema, read
 Use the supplied task tool schemas when they support the task. The host derives the manifest
 from those declarations and initial_state; do not submit manifest. Each read/write effect names
 domains in initial_state. When family.state_domains is supplied, initial_state
-must contain exactly those keys, including their exact spelling. Every domain is simulated.
+must contain exactly those keys, including their exact spelling. family.domain_state_roots gives
+their valid pointer prefixes. Use these for probe_paths and concrete fact state_paths; leave a
+fact's state_paths empty when it names no concrete state field. Every domain is simulated.
 A verifier's description is explanatory; only outcome_schema, required_paths and rules execute.
 Encode required behavior and verification in those checks, rather than describing checks that
 will never run. final_state in the episode outcome is the evaluator projection: each
@@ -175,7 +177,11 @@ READ_TOOLS: tuple[ToolSchema, ...] = (
 
 def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
     """Expose state and a single schema-and-effects declaration for each authored tool."""
-    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft, StartTool
+    from exp.optimize.evaluation.variance.bootstrap_contracts import (
+        StartDraft,
+        StartTool,
+        domain_state_roots,
+    )
 
     schema = StartDraft.model_json_schema()
     schema["title"] = "StartProposal"
@@ -191,6 +197,12 @@ def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
     if domain_names:
         for field in ("reads", "writes"):
             tool["properties"][field]["items"] = {"type": "string", "enum": list(domain_names)}
+        roots = domain_state_roots(domain_names)
+        escapes = {ord(char): "\\" + char for char in r"\.^$|?*+()[]{}"}
+        pattern = "^(?:" + "|".join(root.translate(escapes) for root in roots.values()) + ")(?:/|$)"
+        pointer = {"type": "string", "pattern": pattern, "examples": list(roots.values())}
+        properties["probe_paths"]["additionalProperties"] = pointer
+        schema["$defs"]["FactClaim"]["properties"]["state_paths"]["items"] = pointer
         state = properties["initial_state"]
         value = state["additionalProperties"]
         state.update(

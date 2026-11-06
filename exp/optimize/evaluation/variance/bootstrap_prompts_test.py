@@ -78,3 +78,22 @@ def test_author_schema_requires_effects_on_each_tool_declaration() -> None:
             ],
         }
     )
+
+
+def test_author_pointer_schema_uses_escaped_domain_roots() -> None:
+    """Slash-containing semantic labels cannot be mistaken for nested object paths."""
+    schema = author_answer_tool(
+        ("Python/pytest toolchain", "Workspace filesystem (/workspace)")
+    ).input_schema
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    probes = properties["probe_paths"]
+    assert isinstance(probes, dict)
+    pointer = probes["additionalProperties"]
+    assert isinstance(pointer, dict)
+    validator = Draft202012Validator(pointer)
+    assert validator.is_valid("/Python~1pytest toolchain/note")
+    assert validator.is_valid("/Workspace filesystem (~1workspace)/files")
+    assert not validator.is_valid("/Workspace filesystem (/workspace)/files")
+    assert not validator.is_valid("/Python/pytest toolchain/note")
+    assert not validator.is_valid("/workspace/files")

@@ -53,6 +53,7 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     StartDraft,
     StartTool,
     Verdict,
+    domain_state_roots,
 )
 from exp.optimize.evaluation.variance.bootstrap_prompts import (
     AUTHOR_INSTRUCTION,
@@ -190,6 +191,7 @@ class StartMaterial:
                 "member_traces": sorted(self.knowledge.traces),
                 "tools": sorted(self.knowledge.contracts),
                 "state_domains": list(self.knowledge.state_domains),
+                "domain_state_roots": domain_state_roots(self.knowledge.state_domains),
                 "rules": len(self.knowledge.book.rules),
                 "open_questions": [
                     row.model_dump(mode="json") for row in self.knowledge.book.questions
@@ -308,8 +310,26 @@ def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[
     shared = set(material.knowledge.state_domains)
     if shared and domains != shared:
         raise ValueError(f"a start declares exactly the family's shared domains {sorted(shared)}")
-    for pointer in (*draft.probe_paths.values(), *(p for f in draft.facts for p in f.state_paths)):
-        resolve(draft.initial_state, pointer)
+    pointers = [
+        *((f"probe_paths[{key!r}]", value) for key, value in draft.probe_paths.items()),
+        *(
+            (f"fact[{fact.fact_id!r}].state_paths", path)
+            for fact in draft.facts
+            for path in fact.state_paths
+        ),
+    ]
+    unresolved: list[str] = []
+    for location, pointer in pointers:
+        try:
+            resolve(draft.initial_state, pointer)
+        except ValueError:
+            unresolved.append(f"{location}={pointer!r}")
+    if unresolved:
+        roots = domain_state_roots(tuple(draft.initial_state))
+        raise ValueError(
+            f"Unresolved initial_state pointers: {'; '.join(unresolved)}. "
+            f"Valid domain root pointers: {roots}"
+        )
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")
