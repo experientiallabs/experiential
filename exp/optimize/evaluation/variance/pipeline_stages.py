@@ -777,6 +777,7 @@ class _MiningStage:
             registration = plan.spec
             judge = registration.episode_judge
             tier = registration.initial
+        carried = project.artifacts.exists(registration.identity(revision) + "-result")
         report = run_actor_critic(
             project,
             registration,
@@ -785,7 +786,7 @@ class _MiningStage:
             embedder=embedder if registration.retrieval is not None else None,
         )
         saved = _report_reference(project, registration, revision)
-        if registration.gate is not None:
+        if registration.gate is not None and carried:
             saved, report = carry_deferred(
                 project, registration, registration.gate.phase_attempts, revision
             )

@@ -22,6 +22,7 @@ from exp.optimize.evaluation.continuations.job import saved_continuation_job
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
     ActorCriticSpec,
+    CriticDraw,
     _continue,
     _pick,
     _reward_critic,
@@ -30,7 +31,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
 from exp.optimize.evaluation.variance.actor_critic_audit import rank_points
 from exp.optimize.evaluation.variance.evidence import load_references
 from exp.optimize.evaluation.variance.point_bar import PointSchedule, advance, schedule_points
-from exp.optimize.evaluation.variance.rewards import decision_drops
+from exp.optimize.evaluation.variance.rewards import PointOutcome, decision_drops
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 
 if TYPE_CHECKING:
@@ -111,7 +112,8 @@ def carry_deferred(
         _reward_judge(draw.model_copy(update={"score": None}), outcomes) for draw in report.judges
     )
     critics = tuple(
-        _reward_critic(draw.model_copy(update={"score": None}), outcomes) for draw in report.critics
+        _reward_critic(draw.model_copy(update={"score": None}), _estimated(draw, outcomes))
+        for draw in report.critics
     )
     drops = decision_drops(outcomes)
     merged = PointSchedule(
@@ -153,3 +155,15 @@ def carry_deferred(
         files={"report.json": carried},
     )
     return artifact_input(store.read(key).manifest), carried
+
+
+def _estimated(draw: CriticDraw, outcomes: tuple[PointOutcome, ...]) -> tuple[PointOutcome, ...]:
+    """Return the outcomes of the points a critic estimated before any continuation.
+
+    A critic estimates the points continued in the first phase; points carried later are
+    measured, but never scored against estimates the critic did not make.
+    """
+    if draw.assessment is None:
+        return outcomes
+    steps = {row.step for row in draw.assessment.estimates}
+    return tuple(outcome for outcome in outcomes if outcome.step in steps)
