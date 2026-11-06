@@ -1,15 +1,53 @@
-"""Checkpoint 3 statistics: dead rule tags, and state tags whose neighbours act differently."""
+"""Checkpoint 1 bank kinds, and checkpoint 3: dead rule tags and state tags' neighbours."""
 
 from __future__ import annotations
 
 from exp.optimize.evaluation.variance.tag_monitor_contracts import MonitorSpec
 from exp.optimize.evaluation.variance.tag_monitor_stats import (
+    CorpusInputs,
     RuleEvidence,
     RuleInputs,
     StateStep,
+    corpus_stats,
     rule_stats,
 )
+from exp.simulation.mining.tagging import TagMatrix, TagRow
 from exp.simulation.rules.admission import AdmissionVerdict, RuleTagMatrix, TrajectoryTags
+
+
+def _matrix(bank: str, columns: dict[str, list[float]]) -> TagMatrix:
+    """An observations matrix over traces t0, t1, ... from per-question columns."""
+    names = list(columns)
+    return TagMatrix(
+        bank_id=bank,
+        bank_version=1,
+        question_ids=tuple(names),
+        view="observations",
+        rows=tuple(
+            TagRow(trace_id=f"t{i}", unit_hash=f"h{i}", values=tuple(columns[q][i] for q in names))
+            for i in range(len(columns[names[0]]))
+        ),
+    )
+
+
+def test_only_descriptive_banks_halt_on_their_always_no_share() -> None:
+    """Two banks with 2 of 3 questions always-no: the declared detector is flagged, not halted."""
+    columns = {"rare.a": [0.05] * 6, "rare.b": [0.02] * 6, "live": [0.9, 0.1] * 3}
+    inputs = CorpusInputs(matrices=(_matrix("shape", columns), _matrix("errors", columns)))
+    subjects, halts, _ = corpus_stats(inputs, MonitorSpec(bank_kinds={"errors": "detector"}))
+    rows = {row.subject: row for row in subjects}
+    assert [(h.subject, h.condition) for h in halts] == [
+        ("bank:shape.observations", "bank_uninformative")
+    ]
+    assert rows["bank:shape.observations"].flags == ("uninformative",)
+    detector = rows["bank:errors.observations"]
+    assert detector.flags == ("detector_rare",)
+    assert detector.values["detector_rare_questions"] == 2.0
+    assert "always_no" in rows["question:errors.observations/rare.a"].flags
+    undeclared, _, _ = corpus_stats(inputs, MonitorSpec())
+    assert "detector_rare_questions" not in {
+        key for row in undeclared if row.kind == "bank" for key in row.values
+    }
 
 
 def _rule(rule: str, value: float, contradicting: tuple[str, ...] = ()) -> RuleEvidence:

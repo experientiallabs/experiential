@@ -44,6 +44,15 @@ CHECKPOINT_NUMBERS: dict[CheckpointName, int] = {
 }
 """The plan's number of every checkpoint."""
 
+BankKind = Literal["descriptive", "detector"]
+"""What a question bank is for, declared in :attr:`MonitorSpec.bank_kinds`, never inferred.
+
+A ``descriptive`` bank (the task and observation capability banks) describes every trace, so a
+bank whose questions mostly answer the same way everywhere carries little information and halts
+checkpoint 1. A ``detector`` bank (error banks, behavior and reward-hacking banks) asks about rare
+events, so questions that almost never fire are expected: they are flagged for the tag author's
+review but never halt by their share."""
+
 SubjectKind = Literal[
     "question",
     "pair",
@@ -124,8 +133,12 @@ class MonitorSpec(ContractModel):
 
     Attributes:
         health: Question, pair and bank thresholds (checkpoint 1, reused by every tag rate).
-        max_uninformative_share: Largest share of a bank's questions that are always-yes or
-            always-no before checkpoint 1 halts.
+        max_uninformative_share: Largest share of a descriptive bank's questions that are
+            always-yes or always-no before checkpoint 1 halts.
+        bank_kinds: The declared kind of each bank, by bank identity. A bank not named here is
+            ``descriptive``. Detector banks are exempt from ``max_uninformative_share``: their
+            always-yes and always-no questions stay flagged, and the bank is flagged
+            ``detector_rare``, for the tag author to judge.
         min_bank_coverage: Smallest bank coverage before checkpoint 1 halts.
         separating_delta: Fire-rate difference at or above which a tag separates two groups.
         min_split_members: Fewest members on each side of a family split candidate.
@@ -151,6 +164,9 @@ class MonitorSpec(ContractModel):
 
     health: HealthThresholds = HealthThresholds()
     max_uninformative_share: float = Field(default=0.5, ge=0.0, le=1.0)
+    bank_kinds: dict[str, BankKind] = Field(
+        default_factory=dict, exclude_if=lambda kinds: not kinds
+    )
     min_bank_coverage: float = Field(default=0.2, ge=0.0, le=1.0)
     separating_delta: float = Field(default=0.5, gt=0.0, le=1.0)
     min_split_members: int = Field(default=2, ge=1)

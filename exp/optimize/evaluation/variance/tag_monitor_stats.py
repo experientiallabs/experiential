@@ -6,7 +6,9 @@ the bank, family or rule is Astra's judgment, never this module's.
 
 - :func:`corpus_stats` (checkpoint 1): per question fire rate, always-yes / always-no,
   near-constant and low-confidence flags, near-duplicate pairs by answer agreement and fire-set
-  overlap, per bank coverage and the views excluded at the credential boundary.
+  overlap, per bank coverage and the views excluded at the credential boundary. The always-yes /
+  always-no share halts descriptive banks only; a bank declared ``detector`` in
+  ``MonitorSpec.bank_kinds`` keeps its rare questions flagged for review instead.
 - :func:`family_stats` (checkpoint 2): per family tag profile, the tags separating it from the
   rest of the corpus, families held together by weak tags only, a two-way split candidate inside
   each family (two-means over its members' fired tags) with the tags separating the halves and
@@ -154,9 +156,14 @@ def corpus_stats(
         }
         if bank.excluded is not None:
             values["credential_excluded"] = float(bank.excluded)
+        detector = spec.bank_kinds.get(bank.bank_id, "descriptive") == "detector"
         flags = []
         name = f"bank:{key}"
-        if share > spec.max_uninformative_share:
+        if detector:
+            values["detector_rare_questions"] = float(uninformative)
+            if uninformative:
+                flags.append("detector_rare")
+        elif share > spec.max_uninformative_share:
             flags.append("uninformative")
             halts.append(
                 halt(
