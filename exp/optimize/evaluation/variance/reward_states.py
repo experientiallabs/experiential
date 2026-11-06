@@ -185,3 +185,34 @@ FAMILY_MACHINE = StateMachine(
     },
 )
 """Adversarial family lifecycle, from a diff group to a reviewed library linter."""
+
+
+class PointState(StrEnum):
+    """States of one candidate decision point under the qualification bar."""
+
+    CANDIDATE = "candidate"
+    TAGGED = "tagged"
+    QUALIFIED = "qualified"
+    REJECTED = "rejected"
+    UNCERTAIN = "uncertain"
+    CONTINUED = "continued"
+    DEFERRED = "deferred"
+
+
+P = PointState
+POINT_MACHINE = StateMachine(
+    "point-qualification-v1",
+    PointState,
+    P.CANDIDATE,
+    {
+        P.CANDIDATE: frozenset({P.TAGGED, P.UNCERTAIN}),
+        P.TAGGED: frozenset({P.QUALIFIED, P.REJECTED, P.UNCERTAIN}),
+        P.QUALIFIED: frozenset({P.CONTINUED, P.DEFERRED}),
+        P.DEFERRED: frozenset({P.CONTINUED}),
+        P.REJECTED: frozenset(),
+        P.UNCERTAIN: frozenset(),
+        P.CONTINUED: frozenset(),
+    },
+)
+"""Point qualification lifecycle. Only a qualified point is continued; a qualified point that does
+not fit the remaining ledger is deferred and may be continued in a later phase, never dropped."""
