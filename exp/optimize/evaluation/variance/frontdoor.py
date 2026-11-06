@@ -39,23 +39,19 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol, Self
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
-    ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
     JsonObject,
     Sha256,
-    sha256_bytes,
     sha256_json,
-    stable_id,
 )
-from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
 from exp.optimize.evaluation.variance.bootstrap_plan import (
@@ -69,6 +65,7 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
 from exp.optimize.evaluation.variance.frontdoor_executors import (
     PIPELINE_SETTINGS,
     SlotContext,
+    families_review_plan,
     review_families,
     state_rag_preparation,
 )
@@ -80,6 +77,13 @@ from exp.optimize.evaluation.variance.frontdoor_slots import (
     SlotName,
     SlotPosition,
     slot_executor,
+)
+from exp.optimize.evaluation.variance.frontdoor_source import (
+    FRONT_DOOR_PROTOCOL,
+    ProjectBuilder,
+    TraceSource,
+    ensure_build,
+    recorded_build,
 )
 from exp.optimize.evaluation.variance.frontdoor_states import StageState, Tracker
 from exp.optimize.evaluation.variance.pipeline import (
@@ -102,30 +106,6 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
 )
 
 logger = logging.getLogger(__name__)
-
-FRONT_DOOR_PROTOCOL = "decision-variance-front-door-v1"
-"""Version of the front-door sequence and its source record."""
-
-SOURCE_TYPE = "front-door-source"
-"""Artifact type binding one trace source's digest to the project build it produced."""
-
-
-class TraceSource(ContractModel):
-    """The trace file the front door is pointed at.
-
-    Attributes:
-        path: Local canonical trace export, or the gateway capture file with ``identity``.
-        source: Canonical trace source format, as ``exp build --source`` takes it.
-        identity: Gateway identity whose captures supply the build, with ``source`` gateway.
-    """
-
-    path: Path
-    source: str = Field(default="otlp", min_length=1, max_length=64)
-    identity: str | None = Field(default=None, min_length=1)
-
-    def sha256(self) -> Sha256:
-        """Return the digest of the trace file's exact bytes."""
-        return sha256_bytes(self.path.read_bytes())
 
 
 class PipelineTemplate(ContractModel):
@@ -358,14 +338,6 @@ class FrontDoorReport(ContractModel):
         )
 
 
-class ProjectBuilder(Protocol):
-    """Makes the project's completed build come from exactly one trace source."""
-
-    def __call__(self, project: ProjectStore, source: TraceSource) -> None:
-        """Build, or replay, the project from the source; raise when it cannot."""
-        ...
-
-
 @dataclass(frozen=True)
 class FrontDoorDependencies:
     """Collaborators the front door passes to its owners.
@@ -413,6 +385,8 @@ def plan_front_door(
     dependencies = dependencies or FrontDoorDependencies()
     built = _build_stage(project, spec)
     stages = [built]
+    if any(SLOT_POSITIONS[name] == "after-families" for name in spec.slots):
+        stages.append(_review_stage(project, spec, code_revision, built.status))
     stages.extend(_slot_stages(project, spec, "after-families", code_revision, dependencies))
     report: BootstrapPreparationReport | None = None
     effective = effective_spec(project, spec, code_revision)
@@ -574,13 +548,25 @@ class _Runner:
             source, reason = self.phase(
                 "project-build",
                 (),
-                lambda: _ensure_build(project, traces, deps, self.code_revision),
+                lambda: ensure_build(project, traces, deps.builder, self.code_revision),
             )
             if reason is not None:
                 return report.model_copy(update={"stopped": reason})
             report = report.model_copy(update={"source": source})
         if any(SLOT_POSITIONS[name] == "after-families" for name in spec.slots):
-            review_families(project, spec.preparation, self.code_revision, deps.bootstrap)
+            context = SlotContext(project, spec.preparation, self.code_revision)
+            _, costs, _ = families_review_plan(context)
+            if self.tracker.stages.get("variance-build") == StageState.BLOCKED:
+                self.tracker.stage("variance-build", "priced")
+            _, reason = self.phase(
+                "variance-build",
+                costs,
+                lambda: review_families(
+                    project, spec.preparation, self.code_revision, deps.bootstrap
+                ),
+            )
+            if reason is not None:
+                return report.model_copy(update={"stopped": reason})
             report = self.slots("after-families", report)
             if report.stopped is not None:
                 return report
@@ -789,31 +775,6 @@ _PREPARATION_LINES = (
 )
 
 
-def _source_identity(source: TraceSource, build: ProjectBuildArtifacts) -> str:
-    """Return the record identity binding one trace source's exact content to one build."""
-    return stable_id(
-        SOURCE_TYPE,
-        {
-            "protocol": FRONT_DOOR_PROTOCOL,
-            "sha256": source.sha256(),
-            "source": source.source,
-            "identity": source.identity,
-            "build": sha256_json(build),
-        },
-    )
-
-
-def _recorded_build(project: ProjectStore, source: TraceSource) -> ArtifactInput | None:
-    """Return the source record when the project's current build came from this source."""
-    build = project.load_project().build
-    if build is None:
-        return None
-    identity = _source_identity(source, build)
-    if not project.artifacts.exists(identity):
-        return None
-    return artifact_input(project.artifacts.read(identity).manifest)
-
-
 def _build_stage(project: ProjectStore, spec: FrontDoorSpec) -> FrontDoorStage:
     """Plan the project build: saved for this exact source, or pending through ``exp build``."""
     if spec.traces is None:
@@ -825,7 +786,7 @@ def _build_stage(project: ProjectStore, spec: FrontDoorSpec) -> FrontDoorStage:
             lines=("Uses the project's completed build as it is.",),
         )
     source = spec.traces
-    if _recorded_build(project, source) is not None:
+    if recorded_build(project, source) is not None:
         return FrontDoorStage(
             stage="project-build",
             status=StageState.DONE,
@@ -911,6 +872,26 @@ def _pipeline_stage(binding: BootstrapBinding, plan: PipelinePlan) -> FrontDoorS
     )
 
 
+def _review_stage(
+    project: ProjectStore, spec: FrontDoorSpec, code_revision: str, built: StageState
+) -> FrontDoorStage:
+    """Plan the variance build the ``after-families`` slots read, as its own priced phase."""
+    if built != StageState.DONE:
+        return FrontDoorStage(
+            stage="variance-build",
+            status=StageState.BLOCKED,
+            notes=("Priced once the project build exists.",),
+        )
+    context = SlotContext(project, spec.preparation, code_revision)
+    saved, costs, lines = families_review_plan(context)
+    return FrontDoorStage(
+        stage="variance-build",
+        status=StageState.DONE if saved else StageState.PLANNED,
+        costs=() if saved else costs,
+        lines=lines,
+    )
+
+
 def _slot_stages(
     project: ProjectStore,
     spec: FrontDoorSpec,
@@ -934,45 +915,3 @@ def _slot_stages(
             )
         )
     return tuple(rows)
-
-
-def _ensure_build(
-    project: ProjectStore,
-    source: TraceSource,
-    dependencies: FrontDoorDependencies,
-    code_revision: str,
-) -> ArtifactInput:
-    """Build the project from the source unless its record is current, then save the record.
-
-    Raises:
-        ValueError: The build is pending without a builder, or the builder left no build.
-    """
-    recorded = _recorded_build(project, source)
-    if recorded is not None:
-        return recorded
-    if dependencies.builder is None:
-        raise ValueError("the project build is pending and no project builder was given")
-    logger.info("front door: building project from %s", source.path)
-    dependencies.builder(project, source)
-    build = project.load_project().build
-    if build is None:
-        raise ValueError("the project builder finished without a completed build")
-    identity = _source_identity(source, build)
-    if not project.artifacts.exists(identity):
-        project.artifacts.write_json(
-            artifact_id=identity,
-            artifact_type=SOURCE_TYPE,
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=datetime.now(UTC),
-                code_revision=code_revision,
-                inputs=tuple(
-                    sorted(
-                        (build.trace_dataset, build.task_set, build.world_model),
-                        key=lambda ref: ref.artifact_id,
-                    )
-                ),
-            ),
-            files={"build.json": build, "source.json": source},
-        )
-    return artifact_input(project.artifacts.read(identity).manifest)

@@ -573,10 +573,15 @@ class _MiningStage:
             else f"rubric authored by {spec.authoring.rubric_author.model_alias} over a "
             "whole-task packet after the judge profile is fixed"
         )
+        selection = (
+            f"K={mining.points}"
+            if mining.qualification is None
+            else "points by the qualification bar over the whole trajectory, no fixed K"
+        )
         lines = (
             f"Error mining: {len(mining.actors)} tiers ({', '.join(mining.actors)}), each "
             f"G={mining.attempts} J={mining.selector_draws} C={mining.critic_draws} "
-            f"K={mining.points} M={mining.continuations}; at most {points} points and "
+            f"{selection} M={mining.continuations}; at most {points} points and "
             f"{episodes} judged episodes per tier; never pooled across tiers.",
             f"Episode judge: {profile.prompt_version} on {profile.model_alias}, up to "
             f"{judge_model_calls(profile)} draws per judgment, profile fixed before any rubric; "

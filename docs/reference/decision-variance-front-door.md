@@ -146,23 +146,21 @@ stateDiagram-v2
     failed --> refused: refused
 ```
 
-## Slots for other stages
+## Slots
 
-`frontdoor_slots.py` names where new stages join, each with a fixed position and the owner
-entry points it calls. A configured slot without a registered `SlotExecutor` is refused at
-planning, before any call.
+`frontdoor_slots.py` gives every slot a fixed position and binds it to its owner's executor
+(`frontdoor_executors.py`). Each executor prices its work credential-free and runs or replays
+it against the preparation's saved families.
 
-| Slot | Position | Owner entry points |
+| Slot | Position | What runs |
 |---|---|---|
-| `tag-banks` | after the families review | `corpus_tag_bank`, `authored_bank_for_view` |
-| `task-types` | after the families review | `task_types`, `task_type_family` |
-| `rule-admission` | after preparation | `MemorySetSettings.admission`, `memory_stage_costs`, `run_rules_stage`, `load_guard_table`, `guard_rulebook`, `check_proposed_transition` |
-| `state-rag` | after preparation | `plan_state_rag_calls`, `GroundedRuntimeDefinition.state_memory` (`StateMemoryPolicy`), `GroundedWorldFactory`, `GroundedTransitionEngine.prepare` |
-| `blast-radius` | after the pipelines | `MiningSettings.qualification` (`PointQualification`): `from_bank`, `bar_instruction`, `check_picks`, `schedule_points`, `order_by_blast` |
-| `curriculum` | after the pipelines | `judged_attempts`, `ActorLadder`, `difficulty_tiers`, `merge_curriculum`, `persist_difficulty_curriculum`, `curriculum_plan` |
-| `dense-hybrid` | after the pipelines | `dense_hybrid`, `behavior_adversarial`, `adversarial_rubric` |
+| `tag-banks` | after the families review | per family, `corpus_tag_bank` (author, select, publish), then every member tagged with `authored_bank_for_view` per view by the decision model |
+| `task-types` | after the families review | `task_types` over the families, the task-view matrix and the authored matrices; `task_type_family` narrows a family to one type |
+| `state-rag` | after the families review | per family, `authored_state_tags` over sampled pre-turn states and `build_state_tag_index` over every fit step; each family's index (`state_recall`) and the `state_memory` policy enter the runtime template every start is captured in, so the preparation waits for this slot |
+| `rule-admission` | after preparation | the family rules were admitted by corpus-wide decision tags inside the preparation (`admission = "rule_tags"` by default, `family=` passed to the rules stage, trajectories priced); the slot records and checks each family's guard table, which served worlds enforce through `guard_rulebook` and `check_proposed_transition` |
+| `blast-radius` | after the pipelines | runs inside error mining under `pipeline.mining.qualification` with blast reviewers: the bar answered over every step, justified picks (`check_picks`), `schedule_points` without a fixed K, blast radius across tiers, families ordered by `order_by_blast`; the slot collects each start's ranking |
+| `curriculum` | after the pipelines | runs inside records under `pipeline.records.schedule`: `judged_attempts` per tier, `difficulty_tiers`, `merge_curriculum`, `curriculum_plan` in every tier's schedule; the slot collects each start's curricula |
+| `dense-hybrid` | after the pipelines | runs inside records under `pipeline.records.dense.hybrid` (and `authoring.adversarial` for reviewed reward-hacking linters); the slot collects each start's training records |
 
-`after-families` slots run once the preparation's variance build has saved the reviewed
-families, before any start is authored; the preparation then replays that build.
-`MiningSettings.qualification` is refused at planning until its owner's per-phase planner
-lands, so a registration never silently falls back to the per-selector point cap.
+An in-pipeline slot whose template setting is missing is refused when the registration is
+validated, so a registration never silently skips a stage it asked for.

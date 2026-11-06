@@ -58,7 +58,7 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import VarianceBuildReport, load_tag_matrix
 from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
-from exp.optimize.evaluation.variance.pipeline_review import family_reviewer
+from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
@@ -143,9 +143,25 @@ class Corpus:
     traces: Mapping[str, Trace]
 
 
+_CORPORA: dict[str, Corpus] = {}
+"""Saved corpora already read in this process, by build plan identity and project root."""
+
+
 def saved_corpus(context: SlotContext) -> Corpus | None:
-    """Return the saved build and its admitted families, or None before family review."""
+    """Return the saved build and its admitted families, or None before family review.
+
+    A saved build is immutable, so it is read once per process and plan identity.
+    """
     build = context.preparation.build
+    early = sha256_json(
+        {
+            "build": build.model_dump(mode="json"),
+            "code": context.code_revision,
+            "project": str(context.project.artifacts.project_directory),
+        }
+    )
+    if early in _CORPORA:
+        return _CORPORA[early]
     reviewer = build.reviewer
     plan = plan_variance_build(
         context.project,
@@ -156,6 +172,10 @@ def saved_corpus(context: SlotContext) -> Corpus | None:
     )
     key = plan.identity + "-result"
     store = context.project.artifacts
+    memo = f"{store.project_directory}:{key}"
+    if memo in _CORPORA:
+        _CORPORA[early] = _CORPORA[memo]
+        return _CORPORA[memo]
     if not store.exists(key):
         return None
     report = VarianceBuildReport.model_validate_json(store.read_bytes(key, "report.json"))
@@ -169,7 +189,8 @@ def saved_corpus(context: SlotContext) -> Corpus | None:
     }
     record = load_environment_families(store, scoping.families)
     families = admitted_families(record, settings.admit_uncertain, traces=traces)
-    return Corpus(report=report, families=families, traces=traces)
+    _CORPORA[memo] = _CORPORA[early] = Corpus(report=report, families=families, traces=traces)
+    return _CORPORA[memo]
 
 
 def slot_identity(
@@ -257,6 +278,37 @@ def review_families(
         reviewer=reviewer,
         namer=collaborators.namer,
     )
+
+
+def families_review_plan(
+    context: SlotContext,
+) -> tuple[bool, tuple[CostLine, ...], tuple[str, ...]]:
+    """Price the preparation's variance build that ``after-families`` slots need saved first.
+
+    Returns:
+        Whether it is saved, its decision and review costs, and its plan line.
+    """
+    build = context.preparation.build
+    reviewer = build.reviewer
+    plan = plan_variance_build(
+        context.project,
+        build.spec,
+        code_revision=context.code_revision,
+        reviewer_model=None if reviewer is None else reviewer.model,
+        reviewer_configuration_sha256=None if reviewer is None else sha256_json(reviewer),
+    )
+    if plan.saved:
+        return True, (), (f"Variance build {plan.identity}: saved, replays with no call.",)
+    alias = build.spec.decision_alias
+    costs = (
+        decision_cost(context.project, alias, plan.decision_attempts),
+        *review_costs(context.project, build, plan),
+    )
+    line = (
+        f"Variance build {plan.identity}: {plan.decision_calls} decision calls with {alias} "
+        f"and {plan.review_calls} compatibility-review calls, before the families slots."
+    )
+    return False, cost_lines(costs), (line,)
 
 
 def admitted(
