@@ -431,6 +431,9 @@ def run_rules_stage(
         if boundary is None:
             raise ValueError("the jev_memory profile needs a System One decisions client")
         fields["decisions"] = boundary.identity
+        fields["lineages"] = {
+            trace.trace_id: exposure.traces.get(trace.trace_id) for trace in traces
+        }
         if fidelity is not None:
             fields["fidelity"] = fidelity.identity
     identity = stable_id(
@@ -482,6 +485,11 @@ def run_rules_stage(
                 code_revision=code_revision,
                 sources=spec.sources,
                 fidelity=fidelity,
+                lineages={
+                    trace.trace_id: exposure.traces[trace.trace_id]
+                    for trace in traces
+                    if trace.trace_id in exposure.traces
+                },
             )
             weighings = staged.weighings
             responses = staged.transcripts()

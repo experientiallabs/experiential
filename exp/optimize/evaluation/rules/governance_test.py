@@ -38,7 +38,12 @@ from exp.simulation.rules.memory_set import MemorySet, Passage, load_memory_set,
 Answerer = Callable[[str, JsonObject], JsonObject]
 Reader = Callable[[str, JsonObject], list[tuple[str, JsonObject]]]
 
-FINAL = {"system_two": "submit_topic_rules", "weighing": "weigh_rule"}
+FINAL = {
+    "system_two": "submit_topic_rules",
+    "weighing": "weigh_rule",
+    "rule_compiler": "compile_rule_questions",
+    "rule_consolidator": "consolidate_rule",
+}
 SMALL = AgentProfile(budget=EvidenceBudget(model_calls=6, tool_calls=4))
 
 
@@ -51,6 +56,10 @@ def role_of(payload: JsonObject) -> str:
         return "system_two"
     if system.startswith("You weigh the evidence"):
         return "weighing"
+    if system.startswith("You compile one learned rule"):
+        return "rule_compiler"
+    if system.startswith("You consolidate the research"):
+        return "rule_consolidator"
     found = re.search(r"YOUR JOB \((\w+)\)", system)
     assert found is not None, "request from an unknown role"
     return found.group(1)
@@ -64,6 +73,10 @@ def default_reads(role: str, opening: JsonObject) -> list[tuple[str, JsonObject]
         rule = opening["rule"]
         assert isinstance(rule, dict) and isinstance(rule["evidence"], list)
         return [("read_evidence", {"locator": rule["evidence"][0]})]
+    if role == "rule_compiler":
+        return [("list_trajectories", {})]
+    if role == "rule_consolidator":
+        return [("read_admission", {})]
     return [("read_findings", {})]
 
 
