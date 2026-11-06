@@ -28,8 +28,10 @@ from exp.optimize.evaluation.variance.behavior_differences import (
     BEHAVIOR_DIFFERENCES_PROTOCOL,
     BEHAVIOR_DIFFERENCES_TYPE,
     BehaviorAttempt,
+    BehaviorDifferenceEvidence,
     BehaviorDifferenceReport,
     BehaviorDifferenceSpec,
+    BehaviorPairEvidence,
     PairAlignment,
     PairAudit,
     PairDifference,
@@ -542,3 +544,59 @@ def load_behavior_differences(
     if report.groups != difference_groups(report.pairs, bank_sha256=sha256_json(report.bank)):
         raise ValueError("saved behavioral groups differ from their accepted pair signatures")
     return report
+
+
+def compact_differences(
+    project: ProjectStore, reference: ArtifactInput
+) -> tuple[BehaviorDifferenceEvidence, ...]:
+    """Preserve signatures, paired steps, citations and checkpoints without duplicating episodes."""
+    report = load_behavior_differences(project, reference)
+    pairs = {pair.pair_id: pair for pair in report.pairs}
+    attempts = {attempt.attempt: attempt for attempt in report.attempts}
+    groups: list[BehaviorDifferenceEvidence] = []
+    for group in report.groups:
+        rows: list[BehaviorPairEvidence] = []
+        for identity in group.pairs:
+            pair = pairs[identity]
+            alignment = pair.alignment
+            assert (
+                alignment is not None
+                and alignment.good_window is not None
+                and alignment.poor_window is not None
+            )
+            assert pair.point is not None and pair.checkpoint is not None and pair.audit is not None
+            good, poor = attempts[pair.good], attempts[pair.poor]
+            rows.append(
+                BehaviorPairEvidence(
+                    pair_id=identity,
+                    good_attempt=f"{report.tier}.g{pair.good}",
+                    poor_attempt=f"{report.tier}.g{pair.poor}",
+                    good_steps=tuple(
+                        s.locator
+                        for s in good.trajectory.steps[
+                            alignment.good_window.start : alignment.good_window.stop
+                        ]
+                    ),
+                    poor_steps=tuple(
+                        s.locator
+                        for s in poor.trajectory.steps[
+                            alignment.poor_window.start : alignment.poor_window.stop
+                        ]
+                    ),
+                    good_events=pair.audit.good_events,
+                    poor_events=pair.audit.poor_events,
+                    point=pair.point,
+                    checkpoint=pair.checkpoint,
+                    mechanism=alignment.mechanism,
+                )
+            )
+        groups.append(
+            BehaviorDifferenceEvidence(
+                source=reference,
+                group_id=group.group_id,
+                added=group.added,
+                removed=group.removed,
+                pairs=tuple(rows),
+            )
+        )
+    return tuple(groups)

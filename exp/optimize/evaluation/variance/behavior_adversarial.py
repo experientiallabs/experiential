@@ -50,9 +50,11 @@ from exp.optimize.evaluation.variance.behavior_differences import (
     BehaviorDifferenceGroup,
     BehaviorDifferenceReport,
 )
-from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
+from exp.optimize.evaluation.variance.behavior_pairs import (
+    compact_differences,
+    load_behavior_differences,
+)
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
-from exp.optimize.evaluation.variance.pipeline_behaviors import compact_differences
 from exp.optimize.evaluation.variance.reward_states import FAMILY_MACHINE, FamilyState
 
 ADVERSARIAL_PROTOCOL = "adversarial-signatures-v1"

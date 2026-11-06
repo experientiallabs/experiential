@@ -73,7 +73,8 @@ from exp.optimize.evaluation.variance.family_search import RUNGS_KEPT, Registere
 from exp.optimize.evaluation.variance.judge import EVIDENCE_TYPE, load_assessment
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedStudy
-from exp.optimize.evaluation.variance.pipeline_behaviors import (
+from exp.optimize.evaluation.variance.pipeline_adversarial import (
+    adversarial_library,
     behavior_authoring_coalition,
     coalition_differences,
 )
@@ -363,10 +364,22 @@ class _Point:
             code_revision=context.code_revision,
             variant=authoring.curator_variant,
         )
-        if curation.library is None:
-            return base
-        return LibraryBinding(
-            reference=curation.library, library=load_library(project, curation.library)
+        curated = base
+        if curation.library is not None:
+            curated = LibraryBinding(
+                reference=curation.library, library=load_library(project, curation.library)
+            )
+        if authoring.adversarial is None:
+            return curated
+        mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
+        return adversarial_library(
+            project,
+            authoring.adversarial,
+            mining.tiers,
+            curated,
+            library_id=library_id,
+            family=prefix,
+            code_revision=context.code_revision,
         )
 
     def binding(

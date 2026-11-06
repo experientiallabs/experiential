@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from exp.common.core.artifacts import (
@@ -23,26 +22,20 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
-from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.behavior_differences import (
     BEHAVIOR_DIFFERENCES_TYPE,
-    BehaviorDifferenceEvidence,
-    BehaviorPairEvidence,
 )
 from exp.optimize.evaluation.variance.behavior_pairs import (
-    load_behavior_differences,
+    compact_differences,
     run_behavior_differences,
 )
-from exp.optimize.evaluation.variance.coalition import CoalitionEvidence, mining_coalition
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
-from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedStudy, judge_study
+from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
 from exp.optimize.evaluation.variance.pipeline_inputs import admitted_transport
 from exp.optimize.evaluation.variance.pipeline_spec import (
     DecisionVarianceSpec,
-    MiningOutputs,
     StageContext,
-    TierMining,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -144,62 +137,6 @@ def prepare_behavior_reference(
     return ref
 
 
-def compact_differences(
-    project: ProjectStore, reference: ArtifactInput
-) -> tuple[BehaviorDifferenceEvidence, ...]:
-    """Preserve signatures, paired steps, citations and checkpoints without duplicating episodes."""
-    report = load_behavior_differences(project, reference)
-    pairs = {pair.pair_id: pair for pair in report.pairs}
-    attempts = {attempt.attempt: attempt for attempt in report.attempts}
-    groups: list[BehaviorDifferenceEvidence] = []
-    for group in report.groups:
-        rows: list[BehaviorPairEvidence] = []
-        for identity in group.pairs:
-            pair = pairs[identity]
-            alignment = pair.alignment
-            assert (
-                alignment is not None
-                and alignment.good_window is not None
-                and alignment.poor_window is not None
-            )
-            assert pair.point is not None and pair.checkpoint is not None and pair.audit is not None
-            good, poor = attempts[pair.good], attempts[pair.poor]
-            rows.append(
-                BehaviorPairEvidence(
-                    pair_id=identity,
-                    good_attempt=f"{report.tier}.g{pair.good}",
-                    poor_attempt=f"{report.tier}.g{pair.poor}",
-                    good_steps=tuple(
-                        s.locator
-                        for s in good.trajectory.steps[
-                            alignment.good_window.start : alignment.good_window.stop
-                        ]
-                    ),
-                    poor_steps=tuple(
-                        s.locator
-                        for s in poor.trajectory.steps[
-                            alignment.poor_window.start : alignment.poor_window.stop
-                        ]
-                    ),
-                    good_events=pair.audit.good_events,
-                    poor_events=pair.audit.poor_events,
-                    point=pair.point,
-                    checkpoint=pair.checkpoint,
-                    mechanism=alignment.mechanism,
-                )
-            )
-        groups.append(
-            BehaviorDifferenceEvidence(
-                source=reference,
-                group_id=group.group_id,
-                added=group.added,
-                removed=group.removed,
-                pairs=tuple(rows),
-            )
-        )
-    return tuple(groups)
-
-
 def behavior_reference(project: ProjectStore, reference: ArtifactInput) -> ReferenceSource:
     """Create a compact, typed read-only selector reference with the full report as provenance."""
     groups = compact_differences(project, reference)
@@ -227,48 +164,4 @@ def behavior_reference(project: ProjectStore, reference: ArtifactInput) -> Refer
         name="behavior-differences",
         artifact=artifact_input(store.read(identity).manifest),
         file="mining.json",
-    )
-
-
-def coalition_differences(
-    project: ProjectStore, tiers: Sequence[TierMining]
-) -> tuple[BehaviorDifferenceEvidence, ...]:
-    """Read each tier's differences without pooling its actor policy or judge labels."""
-    groups: list[BehaviorDifferenceEvidence] = []
-    for tier in tiers:
-        if tier.behavior_differences is not None:
-            report = load_behavior_differences(project, tier.behavior_differences)
-            if (
-                report.tier != tier.tier
-                or report.judged != tier.judged_group
-                or report.judge != tier.judge.identity
-            ):
-                raise ValueError("behavior differences belong to another mining tier or judge")
-            groups.extend(compact_differences(project, tier.behavior_differences))
-    return tuple(groups)
-
-
-def behavior_authoring_coalition(context: StageContext) -> CoalitionEvidence | None:
-    """Give the early decision-state author the same reviewed contrasts and judged attempts."""
-    mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
-    if not any(tier.behavior_differences is not None for tier in mining.tiers):
-        return None
-    project = context.project
-    reports = tuple(
-        ActorCriticReport.model_validate_json(
-            project.artifacts.read_bytes(tier.report.artifact_id, "report.json")
-        )
-        for tier in mining.tiers
-    )
-    judged = {
-        tier.tier: JudgedStudy.model_validate_json(
-            project.artifacts.read_bytes(tier.judged_group.artifact_id, "judged.json")
-        )
-        for tier in mining.tiers
-    }
-    return mining_coalition(
-        project,
-        reports,
-        judged_groups=judged,
-        behavior_differences=coalition_differences(project, mining.tiers),
     )

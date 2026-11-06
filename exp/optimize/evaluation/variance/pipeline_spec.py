@@ -46,6 +46,7 @@ from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.memory_stage import MemorySetSettings
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, VariantJudging
+from exp.optimize.evaluation.variance.adversarial_rubric import AdversarialRubricSpec
 from exp.optimize.evaluation.variance.behavior_curation import CuratorVariant
 from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
 from exp.optimize.evaluation.variance.behavior_labeling import LabelerVariant
@@ -417,6 +418,8 @@ class AuthoringSettings(ContractModel):
             every family. They never re-key an authored draw.
         maximum_episodes: Most observed replay episodes, from world-learning traces calling the
             task's tools, put in each authoring packet for program validation.
+        adversarial: Linter author and reviewer for mined reward-hacking families; accepted
+            linters join the library version each rubric is authored from (needs library_id).
     """
 
     decision_author: AuthorSettings
@@ -456,6 +459,8 @@ class AuthoringSettings(ContractModel):
     admission: FamilyAdmissionPolicy = FamilyAdmissionPolicy()
     dispositions: tuple[AuditDisposition, ...] = ()
     maximum_episodes: int = Field(default=16, ge=0, le=256, strict=True)
+
+    adversarial: AdversarialRubricSpec | None = None
 
     @model_validator(mode="after")
     def _actions(self) -> Self:

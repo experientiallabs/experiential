@@ -58,6 +58,7 @@ from exp.optimize.evaluation.variance.evidence import (
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
+from exp.optimize.evaluation.variance.pipeline_adversarial import adversarial_references
 from exp.optimize.evaluation.variance.pipeline_behaviors import (
     behavior_bank,
     behavior_costs,
@@ -708,6 +709,7 @@ class _MiningStage:
         labels = tier_inputs.labels
         references = (
             *((behavior_reference(project, behavior),) if behavior is not None else ()),
+            *adversarial_references(project, behavior),
             *(
                 ()
                 if labels is None
