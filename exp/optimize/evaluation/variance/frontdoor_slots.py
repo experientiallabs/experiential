@@ -22,6 +22,10 @@ slot has a fixed position and a real executor (:mod:`~.frontdoor_executors`):
   ``records.dense.hybrid`` with ``authoring.adversarial``), priced in each pipeline's plan; the
   slot collects every start's saved results into one record. A slot whose template setting is
   missing is refused when the registration is validated.
+- ``rubric-evolution`` (after the pipelines): the evolving rubric of a training run
+  (:mod:`~.rubric_evo_slot`). Its plan prices opening the evolution and every epoch boundary at
+  the forced bound, so the cumulative ledger reserves them before the external trainer's epochs;
+  its run opens the evolution and runs each boundary whose export is present.
 
 ``after-families`` slots run once the preparation's variance build has saved the reviewed
 families and before any start is authored: the front door runs that build first (the
@@ -44,6 +48,7 @@ from exp.optimize.evaluation.variance.frontdoor_executors import (
 )
 from exp.optimize.evaluation.variance.frontdoor_task_types import CurriculumSlotExecutor
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine
+from exp.optimize.evaluation.variance.rubric_evo_slot import RubricEvolutionExecutor
 
 SlotName = Literal[
     "tag-banks",
@@ -53,6 +58,7 @@ SlotName = Literal[
     "blast-radius",
     "curriculum",
     "dense-hybrid",
+    "rubric-evolution",
 ]
 """One front-door slot."""
 
@@ -67,6 +73,7 @@ SLOT_POSITIONS: dict[SlotName, SlotPosition] = {
     "blast-radius": "after-pipeline",
     "curriculum": "after-pipeline",
     "dense-hybrid": "after-pipeline",
+    "rubric-evolution": "after-pipeline",
 }
 """The fixed position of every slot."""
 
@@ -106,6 +113,7 @@ SLOT_CALLS: dict[SlotName, tuple[str, ...]] = {
         "with_task_type_difficulty",
     ),
     "dense-hybrid": ("dense_hybrid", "behavior_adversarial", "adversarial_rubric"),
+    "rubric-evolution": ("open_evolution", "run_boundary", "boundary_costs"),
 }
 """The owner entry points each slot's executor calls, where the owner has published them."""
 
@@ -117,6 +125,7 @@ SLOT_STAGES: dict[SlotName, str] = {
     "blast-radius": "blast radius of every error point across tiers",
     "curriculum": "judged_attempts, ActorLadder, merge_curriculum, persist_difficulty_curriculum",
     "dense-hybrid": "hybrid dense reward: decision tags per step, judge on flagged steps",
+    "rubric-evolution": "evolving rubric: revise both rubric parts at each epoch boundary",
 }
 """What each slot's stage does, printed in the plan."""
 
@@ -143,6 +152,7 @@ DEFAULT_SLOT_EXECUTORS: dict[SlotName, SlotExecutor] = {
     "blast-radius": PipelineSlotExecutor("blast-radius"),
     "curriculum": CurriculumSlotExecutor(),
     "dense-hybrid": PipelineSlotExecutor("dense-hybrid"),
+    "rubric-evolution": RubricEvolutionExecutor(),
 }
 """The owner-bound executor of every slot."""
 
