@@ -360,6 +360,32 @@ PROTOCOLS = (
         "6910fc1b9046dfea05b195e235fb0ecbe008fce4b69c317d0c13597af6cc3c64",
     ),
     Protocol(
+        "exp.optimize.evaluation.variance.rollout_ingest:ROLLOUT_INGEST_CONTRACT",
+        "rollout-ingest-v1",
+        ("exp.optimize.evaluation.variance.rollout_ingest",),
+        "5d7de906e889047ec69f95e127e8599ca3279379eb67ddaa515ca3ed3e5382c8",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.rubric_versions:RUBRIC_VERSION_PROTOCOL",
+        "rubric-version-v1",
+        ("exp.optimize.evaluation.variance.rubric_versions",),
+        "ec562621199d804e4954eefd622767e1aa47c26e31538bcc6cf1d27de75c2e61",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.rubric_evolution:RUBRIC_EVOLUTION_PROTOCOL",
+        "rubric-evolution-v1",
+        (
+            "exp.optimize.evaluation.variance.rubric_evolution",
+            "exp.optimize.evaluation.variance.rubric_boundary",
+            "exp.optimize.evaluation.variance.rubric_evo_states",
+            "exp.optimize.evaluation.variance.rubric_audit",
+            "exp.optimize.evaluation.variance.rubric_signatures",
+            "exp.optimize.evaluation.variance.rubric_items",
+            "exp.optimize.evaluation.variance.rubric_grading",
+        ),
+        "51a8545b7917d16061f90ac3705acf17dc1487d12af50509adbc5536eb2e5ce4",
+    ),
+    Protocol(
         "exp.optimize.evaluation.variance.briefing_review:BRIEFING_REVIEW_PROTOCOL",
         "briefing-leak-review-v2",
         ("exp.optimize.evaluation.variance.briefing_review",),

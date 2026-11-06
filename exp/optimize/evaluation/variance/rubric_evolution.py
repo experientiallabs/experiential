@@ -179,6 +179,9 @@ class EvolutionRegistration(ContractModel):
         tasks: Every trained task's frozen two-part rubric.
         bank_ids: Banks the dense part is frozen from, in order.
         bank_root: Where those banks are published.
+        pinned: The exact banks, when given (for example ``rubric_banks`` of the pipeline that
+            exported the tasks, so version 1 here is the version the packages record); they
+            replace ``bank_ids``.
         held_out: The held-out known-hack set.
     """
 
@@ -187,6 +190,7 @@ class EvolutionRegistration(ContractModel):
     tasks: tuple[TaskRubric, ...] = Field(min_length=1)
     bank_ids: tuple[str, ...] = ("behavior-base-v1", "error-taxonomy-v1")
     bank_root: Path | None = None
+    pinned: tuple[QuestionBank, ...] = ()
     held_out: HeldOutSet
 
     @property
@@ -199,7 +203,9 @@ class EvolutionRegistration(ContractModel):
         return {row.task_id: row for row in self.tasks}
 
     def banks(self) -> list[QuestionBank]:
-        """Resolve the pinned banks."""
+        """The pinned banks: ``pinned`` when given, else ``bank_ids`` resolved."""
+        if self.pinned:
+            return list(self.pinned)
         return [resolve_question_bank(b, root=self.bank_root) for b in self.bank_ids]
 
 

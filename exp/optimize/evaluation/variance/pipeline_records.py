@@ -96,6 +96,7 @@ from exp.optimize.evaluation.variance.pipeline_points import mining_provenance
 from exp.optimize.evaluation.variance.pipeline_rewards import (
     dense_inputs,
     difficulty_plan,
+    export_rubric,
     family_dense,
     hybrid_inputs,
     tier_difficulty,
@@ -124,6 +125,7 @@ from exp.optimize.evaluation.variance.pipeline_stages import (
 from exp.optimize.evaluation.variance.point_options import point_decisions
 from exp.optimize.evaluation.variance.records import selector_records
 from exp.optimize.evaluation.variance.rewards import SelectorObjectiveV2
+from exp.optimize.evaluation.variance.rubric_versions import RUBRIC_VERSION_PROTOCOL
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec, save_schedule
 
 __all__ = ["RECORDS_STAGE"]
@@ -136,9 +138,9 @@ class _RecordsStage:
     """The ``records`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """The stage reads only its spec and the earlier stages."""
+        """The stage reads its spec and the earlier stages; exports record the rubric version."""
         del project, spec
-        return {}
+        return {"rubric": RUBRIC_VERSION_PROTOCOL}
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
@@ -711,6 +713,8 @@ def _dense(context: StageContext, report: FamilyReport) -> DenseSettings:
 
 
 def _provenance(context: StageContext, row: FamilyOutcome) -> MiningProvenance:
-    """Return where one admitted family's point was mined from."""
+    """Return where one admitted family's point was mined from and its frozen rubric version."""
     mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
-    return mining_provenance(context.project, mining, row.tier, row.point)
+    provenance = mining_provenance(context.project, mining, row.tier, row.point)
+    rubric = export_rubric(context.spec, context.identity)
+    return provenance.model_copy(update={"rubric": rubric})

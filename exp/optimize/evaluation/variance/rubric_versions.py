@@ -263,19 +263,33 @@ def version_banks(version: RubricVersion, banks: Sequence[QuestionBank]) -> list
 def versioned_dense(
     version: RubricVersion, banks: Sequence[QuestionBank], base: DenseRewardJudge
 ) -> tuple[DenseRewardJudge, QuestionBank]:
-    """Rebind a task's frozen dense judge to the version's vocabulary and step bank.
+    """Rebind a task's frozen dense judge to the version: its tags plus the active items'.
+
+    The task's own frozen tags are kept exactly (including any adversarial linter sources the
+    flow added); each active item's dense question becomes one more tag, and the step bank the
+    decision model tags every step with is the version's pinned banks plus the item bank.
 
     Args:
         version: The rubric version.
         banks: The pinned banks.
-        base: The task's frozen dense judge (bounds, profile, task and world digests).
+        base: The task's frozen dense judge (tags, bounds, profile, task and world digests).
 
     Returns:
-        The dense judge whose tags are the version's vocabulary, and the step bank the decision
-        model tags every step with.
+        The rebound dense judge and the version's step bank.
+
+    Raises:
+        ValueError: An item's tag repeats a frozen tag.
     """
-    tags, step = vocabulary(version_banks(version, banks))
-    definition = base.definition.model_copy(update={"tags": tags})
+    _, step = vocabulary(version_banks(version, banks))
+    extra = item_bank(version)
+    if extra is None:
+        return base, step
+    added, _ = vocabulary([extra])
+    known = {tag.tag_id for tag in base.definition.tags}
+    repeated = sorted(known & {tag.tag_id for tag in added})
+    if repeated:
+        raise ValueError(f"item tags {repeated} repeat frozen dense tags")
+    definition = base.definition.model_copy(update={"tags": (*base.definition.tags, *added)})
     return base.model_copy(update={"definition": definition}), step
 
 

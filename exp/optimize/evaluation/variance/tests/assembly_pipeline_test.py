@@ -314,6 +314,7 @@ def test_five_tiers_reach_qualified_packages_through_the_bar_blast_radius_and_hy
     assert hybrid > 0
     qualified = [row for row in records.harbor if not row.diagnostic]
     assert any(row.strength is not None for row in qualified)
+    versions: dict[str, str] = {}
     for row in qualified:
         assert row.task is not None and row.qualification is not None
         assert load_executable_qualification(project, row.qualification).qualified
@@ -323,6 +324,15 @@ def test_five_tiers_reach_qualified_packages_through_the_bar_blast_radius_and_hy
         assert verify_executable_package(project, package, require_provenance=True) == row.task
         provenance = task.provenance
         assert provenance is not None and provenance.step == row.point
+        rubric = provenance.rubric
+        assert rubric is not None and (rubric.version, rubric.epoch, rubric.parent_sha256) == (
+            1,
+            1,
+            None,
+        )
+        assert rubric.items == () and rubric.version_sha256 == versions.setdefault(
+            "v1", rubric.version_sha256
+        )
         assert provenance.tier == row.tier and set(provenance.tier_pass_rates) == set(TIERS)
         # The fixture's start is authored, so its task names no source trace; the record keeps
         # exactly what the start's task holds.

@@ -9,6 +9,9 @@
   order is the ladder, weakest first (:func:`tier_difficulty`). Per tier, the merged curriculum
   orders the task's qualified nudge rungs by difficulty and strength and becomes the schedule's
   curriculum plan (:func:`difficulty_plan`), saved and summarized.
+- **Rubric version**: every exported variant and rung records the evolving rubric version it
+  is frozen under (:func:`export_rubric`): version 1 of the training run, pinned to the banks
+  its dense part is tagged with (:func:`rubric_banks`).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.executable.task import RubricProvenance
 from exp.optimize.evaluation.variance.dense_vocabulary import (
     family_linters,
     inflow_dense,
@@ -45,11 +49,38 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     MiningOutputs,
     StageContext,
 )
+from exp.optimize.evaluation.variance.rubric_versions import first_version, rubric_provenance
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.questions import QuestionBank, resolve_question_bank
 from exp.simulation.mining.tagging import DecisionCache, TraceTagger
+
+
+def rubric_banks(spec: DecisionVarianceSpec) -> list[QuestionBank]:
+    """The banks the exported tasks' dense part is tagged with, which version 1 pins.
+
+    In flow: the base behavior bank and the error bank. A registration's own ``records.dense``
+    pins its hybrid step bank, or the base behavior bank when it judges every candidate.
+    """
+    root = spec.traceml.bank_root
+    dense = spec.records.dense
+    if dense is not None:
+        bank_id = spec.records.behavior_bank if dense.hybrid is None else dense.hybrid.bank_id
+        return [resolve_question_bank(bank_id, root=root)]
+    banks = [resolve_question_bank(spec.records.behavior_bank, root=root)]
+    errors = tier_error_bank(spec)
+    return banks if errors is None else [*banks, errors]
+
+
+def export_rubric(spec: DecisionVarianceSpec, run: str) -> RubricProvenance:
+    """The rubric version every export of this pipeline records: the training run's version 1.
+
+    Args:
+        spec: The registration.
+        run: The pipeline run identity, used when ``records.rubric_run`` names no training run.
+    """
+    return rubric_provenance(first_version(spec.records.rubric_run or run, rubric_banks(spec)))
 
 
 def dense_inputs(spec: DecisionVarianceSpec) -> tuple[DenseSettings, QuestionBank | None]:

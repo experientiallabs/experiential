@@ -552,6 +552,8 @@ class RecordsSettings(ContractModel):
         rollouts_per_tier: Rollouts each nudged strength tier of an emitted schedule lasts.
         behavior_bank: Base behavior bank the in-flow dense vocabulary is frozen from when
             ``dense`` is not given (with the error bank and the mined adversarial linters).
+        rubric_run: The training run whose evolving rubric every export records as version 1;
+            None names the pipeline run itself.
     """
 
     intent: str = Field(min_length=1, max_length=400)
@@ -569,6 +571,7 @@ class RecordsSettings(ContractModel):
     schedule: bool = True
     rollouts_per_tier: int = Field(default=4, ge=1, le=1000, strict=True)
     behavior_bank: str = Field(default="behavior-base-v1", min_length=1)
+    rubric_run: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class DecisionVarianceSpec(ContractModel):

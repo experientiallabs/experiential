@@ -111,7 +111,8 @@ def verify_executable_package(
     The local binding JSON is not a trust root. Both its references and all public files must
     reproduce the same export, so editing a binding cannot attach different grading or state.
     A recorded mining provenance must be complete: source traces, step, tier, every tier's pass
-    rate, blast radius and the signature group, exactly as the trusted task holds them.
+    rate, blast radius and the signature group, exactly as the trusted task holds them; with
+    ``require_provenance`` it must also record the frozen rubric version the package trains under.
 
     Args:
         project: Project holding the trusted task and qualification artifacts.
@@ -132,7 +133,9 @@ def verify_executable_package(
     if recorded is None and require_provenance:
         raise ValueError("package records no mining provenance")
     if recorded is not None:
-        MiningProvenance.model_validate(recorded)
+        provenance = MiningProvenance.model_validate(recorded)
+        if require_provenance and provenance.rubric is None:
+            raise ValueError("package provenance records no frozen rubric version")
     task = ArtifactInput.model_validate(binding.get("task"))
     raw = binding.get("qualification_evidence")
     qualification = None if raw is None else ArtifactInput.model_validate(raw)

@@ -109,3 +109,31 @@ def test_recall_lowering_is_read_per_part_on_one_held_out_set() -> None:
     assert base.lowered_by(same) == () and base.lowered_by(lower) == ("dense",)
     with pytest.raises(ValueError, match="different held-out"):
         base.lowered_by(base.model_copy(update={"held_out_sha256": "b" * 64}))
+
+
+def test_a_version_keeps_the_frozen_tags_and_their_linter_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item tags are added beside the frozen tags, never in place of them."""
+    _, registration, _, _ = world(tmp_path, monkeypatch)
+    banks = registration.banks()
+    task = registration.tasks[0]
+    tags = tuple(
+        tag.model_copy(update={"sources": (*tag.sources, "linter:adversarial-x")})
+        if tag.tag_id == "modified_evaluation"
+        else tag
+        for tag in task.dense.definition.tags
+    )
+    base = task.dense.model_copy(
+        update={"definition": task.dense.definition.model_copy(update={"tags": tags})}
+    )
+    v1 = first_version(registration.run_id, banks)
+    assert versioned_dense(v1, banks, base)[0] == base
+    v2 = v1.model_copy(update={"version": 2, "items": (item("fixture"),)})
+    dense, _ = versioned_dense(v2, banks, base)
+    assert dense.definition.tags[: len(tags)] == tags
+    assert dense.definition.tag("modified_evaluation").sources[-1] == "linter:adversarial-x"
+    assert [t.tag_id for t in dense.definition.tags[len(tags) :]] == ["rubric.fixture"]
+    clash = base.definition.model_copy(update={"tags": (*tags, *dense.definition.tags[-1:])})
+    with pytest.raises(ValueError, match="repeat frozen dense tags"):
+        versioned_dense(v2, banks, base.model_copy(update={"definition": clash}))
