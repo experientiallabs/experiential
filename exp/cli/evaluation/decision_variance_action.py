@@ -7,16 +7,20 @@ asks spend consent once for the whole plan (the operation's ceiling then holds e
 admitted requests), runs or resumes the pipeline through
 :func:`~exp.optimize.evaluation.variance.pipeline.run_decision_variance` and prints each stage's
 replay status and measured usage. A run whose stages are all saved replays with no consent and no
-call.
+call. With a ``front_door`` file instead, the action runs the whole sequence from a trace source
+(:mod:`~exp.cli.evaluation.front_door_action`).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Self
 
+from pydantic import model_validator
 from rich.text import Text
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
+from exp.cli.evaluation.front_door_action import handle_front_door
 from exp.cli.evaluation.learning_summary import save_details
 from exp.cli.evaluation.spend import review_components
 from exp.common.core.artifacts import ContractModel
@@ -34,16 +38,26 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
 
 
 class DecisionVarianceAction(ContractModel):
-    """One decision-variance run.
+    """One decision-variance run, from a registered spec or from traces through the front door.
 
     Attributes:
-        spec: ``DecisionVarianceSpec`` JSON file.
-        execute: Run after spend consent; otherwise only the stage plan and its cost bounds are
+        spec: ``DecisionVarianceSpec`` JSON file of one registered start's pipeline.
+        front_door: ``FrontDoorSpec`` JSON file pointed at a trace source: build, tagging,
+            environment families, registered starts and every start's pipeline, in one run.
+        execute: Run after spend consent; otherwise only the plan and its cost bounds are
             printed.
     """
 
-    spec: Path
+    spec: Path | None = None
+    front_door: Path | None = None
     execute: bool = False
+
+    @model_validator(mode="after")
+    def _one_source(self) -> Self:
+        """Require exactly one of a pipeline spec and a front-door spec."""
+        if (self.spec is None) == (self.front_door is None):
+            raise ValueError("give exactly one of spec and front_door")
+        return self
 
 
 def handle_decision_variance(context: ContinuationContext, action: DecisionVarianceAction) -> None:
@@ -56,6 +70,10 @@ def handle_decision_variance(context: ContinuationContext, action: DecisionVaria
     Returns:
         None. The plan, any consent question and the result are printed to the console.
     """
+    if action.front_door is not None:
+        handle_front_door(context, action.front_door, action.execute)
+        return
+    assert action.spec is not None
     store, console, revision = context.store, context.console, context.revision
     spec = DecisionVarianceSpec.model_validate_json(action.spec.read_bytes())
     plan = plan_decision_variance(store, spec, code_revision=revision)

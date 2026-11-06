@@ -51,6 +51,7 @@ from exp.optimize.evaluation.executable.grounded import (
 )
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
 from exp.optimize.evaluation.variance.build_records import FamilyScope
+from exp.runtime.environments.world_contracts import WorldManifest
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.mining.environment_families import (
     EnvironmentFamily,
@@ -290,7 +291,7 @@ def definition_for(
     *,
     facts: ReplayFacts | None = None,
 ) -> GroundedRuntimeDefinition:
-    """Derive one task's runtime definition from the family's frozen template.
+    """Derive one of the family's tasks' runtime definition from its frozen template.
 
     The task, its initial state and its own instance facts (none unless given) differ between
     the family's tasks; nothing task-specific is carried over from the template's task.
@@ -302,10 +303,47 @@ def definition_for(
     simulator.task(task.task_id)
     if simulator.runtime is None:
         raise ValueError(f"family {simulator.family_id} has no bound runtime template")
-    return GroundedRuntimeDefinition.model_validate(
-        simulator.runtime.model_dump()
-        | {"task": task, "initial_state": initial_state, "facts": facts}
-    )
+    return derive_definition(simulator.runtime, task, initial_state, facts=facts)
+
+
+def derive_definition(
+    runtime: GroundedRuntimeDefinition,
+    task: TaskCase,
+    initial_state: JsonObject,
+    *,
+    facts: ReplayFacts | None = None,
+    manifest: WorldManifest | None = None,
+    probe_paths: dict[str, str] | None = None,
+) -> GroundedRuntimeDefinition:
+    """Derive a task's runtime from a family's frozen runtime: the one start derivation.
+
+    Every frozen field (world model, index and tag binding, rule book, rule memory, programs,
+    limits) is kept exactly. The task, its initial state and its instance facts are always
+    replaced, so the template task's facts never carry over. An authored start (the bootstrap)
+    also replaces the world manifest and the evaluator projection; with frozen programs the
+    manifest must still equal the family's, which the definition itself enforces.
+
+    Args:
+        runtime: The family's frozen runtime.
+        task: The task.
+        initial_state: Its initial state.
+        facts: Its own instance facts, or None.
+        manifest: An authored world manifest, or None to keep the family's.
+        probe_paths: An authored evaluator projection, or None to keep the family's.
+
+    Returns:
+        The task's definition.
+    """
+    start: JsonObject = {
+        "task": task.model_dump(mode="json"),
+        "initial_state": initial_state,
+        "facts": None if facts is None else facts.model_dump(mode="json"),
+    }
+    if manifest is not None:
+        start["manifest"] = manifest.model_dump(mode="json")
+    if probe_paths is not None:
+        start["probe_paths"] = dict(probe_paths)
+    return GroundedRuntimeDefinition.model_validate(runtime.model_dump(mode="json") | start)
 
 
 class AttemptSlot(ContractModel):

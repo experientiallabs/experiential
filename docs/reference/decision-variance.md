@@ -29,7 +29,7 @@ declared world-learning traces; held-out traces can never enter a scoped index o
 
 1. `plan_exposure` splits the build's lineage bindings before any tag is bought; the plan is saved
    as a `variance-exposure-plan` artifact and written to `exposure.json` for the actions below.
-2. `DecisionsTraceTagger`, resolved from the catalog decision alias (default `jev`, on a typesafe
+2. `DecisionsTraceTagger`, resolved from the catalog decision alias (default `clef`, on a typesafe
    connection), answers a local question bank (default `capability-shape-task-v1`, read from
    `EXP_QUESTION_BANK_ROOT` or `.exp/question_banks`) over the task view of world-learning and
    mining-probe traces. An optional `observations_bank` tags world-learning observations views

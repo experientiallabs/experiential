@@ -206,16 +206,16 @@ def variance_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Project
                     **catalog.connections,
                     "decisions": ConnectionConfig(
                         provider="typesafe",
-                        base_url="https://fixture.invalid/v1",
-                        api_key_env="DECISION_TEST_KEY",
-                        trusted_custom_origin=True,
+                        base_url="http://127.0.0.1:30001/v1",
+                        self_hosted=True,
                     ),
                 },
                 "models": {
                     **catalog.models,
-                    "jev": ModelRecord(
+                    "clef": ModelRecord(
                         connection="decisions",
-                        model="jev-fixture",
+                        model="Cloudflare/clef",
+                        revision="cfddda043dd190ef3b01cff449d5ee8cff1e8ec6",
                         billing_source=BillingSource.CUSTOMER_MANAGED,
                         capabilities=ModelCapabilities(supports_completions=False),
                     ),
@@ -229,7 +229,6 @@ def variance_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Project
     (banks / f"{OBSERVATIONS_BANK}.toml").write_text(_bank_toml(OBSERVATIONS_BANK, "obs"))
     (banks / f"{ERROR_BANK_ID}.toml").write_text(_error_bank_toml())
     monkeypatch.setenv(LOCAL_BANK_ROOT_VARIABLE, str(banks))
-    monkeypatch.setenv("DECISION_TEST_KEY", "fixture-only")
     return project
 
 
@@ -238,7 +237,7 @@ def _tagger(
 ) -> DecisionsTraceTagger:
     """A cached tagger over the fake boundary, identified as the catalog's decision alias."""
     catalog = load_model_catalog(project.model_catalog_path)
-    snapshot, _ = RuntimeModelCatalog(catalog, environment={}).snapshot("jev")
+    snapshot, _ = RuntimeModelCatalog(catalog, environment={}).snapshot("clef")
     return DecisionsTraceTagger(decide, snapshot, cache=DecisionCache(project.paths))
 
 

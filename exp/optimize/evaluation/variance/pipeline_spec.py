@@ -78,6 +78,7 @@ from exp.optimize.evaluation.variance.rubric_critic import DesignCriticProfile
 from exp.optimize.evaluation.variance.schedule import TrainingScheduleSpec
 from exp.optimize.evaluation.variance.variant_search import VariantSearchSpec
 from exp.optimize.evaluation.variance.world_agent import DEFAULT_PROMPT_SETS
+from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS
 from exp.simulation.mining.environment_review import CompatibilityReviewer
 from exp.simulation.mining.error_tags import TaskErrorRank
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
@@ -175,7 +176,7 @@ class RulesSettings(ContractModel):
     challenge: bool = True
     bind_rule_book: bool = True
     jev_memory: bool = True
-    jev_alias: str = Field(default="jev", min_length=1)
+    jev_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
 
     def stage_spec(self) -> RulesStageSpec:
         """Return the registration the stage runs: ``jev_memory`` by default."""
@@ -215,7 +216,7 @@ class TraceMLSettings(ContractModel):
     """
 
     enabled: bool = True
-    decision_alias: str = Field(default="jev", min_length=1)
+    decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
     bank_root: Path | None = None
     concurrency: int = Field(default=4, ge=1, le=64, strict=True)
     steps_per_call: int = Field(default=4, ge=1, le=64, strict=True)
@@ -238,13 +239,35 @@ class TraceMLSettings(ContractModel):
         return self
 
 
+class PointQualification(ContractModel):
+    """A point qualification bar in place of the fixed per-selector point cap.
+
+    Its owner (``point_bar``) adopts the tag author's bank as the bar (``from_bank``), puts
+    ``bar_instruction`` in the selector prompts, refuses failing picks (``check_picks``) and
+    runs qualified points in blast-radius order with ``schedule_points``, deferring the rest
+    across phases under the front door's cumulative ledger; the mining plan then reserves per
+    phase from ``schedule_points``. Until that owner's planner lands,
+    a registration that sets this is refused at planning rather than priced by the cap.
+
+    Attributes:
+        bar: The owner's bar settings.
+        defer: Keep a qualified point whose phase does not fit the remaining ceiling in the
+            deferral queue for a later phase, instead of dropping it.
+    """
+
+    bar: JsonObject
+    defer: bool = True
+
+
 class MiningSettings(ContractModel):
     """The ``error-mining`` stage: one actor-critic run per actor tier.
 
     Attributes:
         job: Mining-probe job every tier copies; only its actor alias and snapshot change. None
             when ``bootstrap`` names it: the pipeline entry then resolves the bootstrap's
-            registered job into this field before any stage plans or runs.
+            registered job into this field before any stage plans or runs. A template with
+            neither is valid only as the front door's pipeline template, which binds each
+            prepared start; the pipeline entry refuses it.
         bootstrap: A task's registered start in a frozen start-bootstrap batch
             (:mod:`~exp.optimize.evaluation.variance.bootstrap`), in place of a hand-registered
             job.
@@ -262,7 +285,7 @@ class MiningSettings(ContractModel):
         attempts: Group size ``G``.
         selector_draws: Point-selector draws ``J``.
         critic_draws: Critic draws ``C``.
-        points: Most points per selector ``K``.
+        points: Most points per selector ``K``; with ``qualification`` the bar decides instead.
         continuations: Suffixes per distinct point ``M``.
         seed: Trajectory pick seed.
         group_physical_attempts: Transport ceiling of each group, or None to keep the job's.
@@ -274,6 +297,8 @@ class MiningSettings(ContractModel):
         retrieval: Give selectors and critics tag-aware search over the build's scoped
             world-learning index; never held-out traces.
         retrieval_top_k: Most matches one search returns.
+        behaviors: Paired behavioral differences mined before selection, when set.
+        qualification: Point qualification bar and deferral queue replacing ``K``, when set.
     """
 
     job: ContinuationJob | None = None
@@ -301,6 +326,9 @@ class MiningSettings(ContractModel):
     behaviors: BehaviorDifferenceSpec | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    qualification: PointQualification | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @property
     def registered(self) -> ContinuationJob:
@@ -311,9 +339,7 @@ class MiningSettings(ContractModel):
 
     @model_validator(mode="after")
     def _tiers(self) -> Self:
-        """Require a job source and distinct actor aliases that are valid tier labels."""
-        if self.job is None and self.bootstrap is None:
-            raise ValueError("register a mining job or bind a task's start-bootstrap batch")
+        """Require distinct actor aliases that are valid tier labels."""
         if self.behaviors is not None and self.schedule is not None:
             raise ValueError(
                 "mine behavior differences before registering a frozen training schedule"

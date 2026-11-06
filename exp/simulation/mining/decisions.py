@@ -68,6 +68,12 @@ logger = logging.getLogger(__name__)
 NATIVE_DECISION_DIALECT = "typesafe_systemone"
 """The one wire dialect that serves typed decisions."""
 
+DEFAULT_DECISION_ALIAS = "clef"
+"""Catalog alias every decision-variance role uses by default: tagging, TraceML, rule-memory
+System One reads and recall, error tags and behavioral differences. Clef is an open-weight
+(Apache-2.0) native decision model, normally self-hosted on the SystemOne wire; there is no
+fallback to another decision model, so a catalog without this alias fails before any call."""
+
 DEFAULT_DECISION_TIMEOUT_SECONDS = 300.0
 """Per-attempt ceiling for one decision call.
 

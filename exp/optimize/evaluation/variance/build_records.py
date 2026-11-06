@@ -34,6 +34,7 @@ from exp.common.project import (
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role, world_learning_scope
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
+from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS
 from exp.simulation.mining.dispatch import DEFAULT_TAGGING_CONCURRENCY
 from exp.simulation.mining.environment_families import EnvironmentFamilySpec, FamilyStatus
 from exp.simulation.mining.error_tags import (
@@ -147,7 +148,7 @@ class VarianceBuildSpec(ContractModel):
             out of every identity.
     """
 
-    decision_alias: str = Field(default="jev", min_length=1)
+    decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
     task_bank: str = DEFAULT_TASK_BANK
     task_families: tuple[str, ...] = ()
     observations_bank: str | None = None
