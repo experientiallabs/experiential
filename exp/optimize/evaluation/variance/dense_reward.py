@@ -535,7 +535,8 @@ class DenseRewardExport(ContractModel):
         outcome: The separate outcome reward, when known.
         findings: Every finding, scored and unscored, with rewards and spans.
         episode: The bounded episode total.
-        trajectory: Trajectory the spans index (``continuation-branch`` or ``harbor-ledger``).
+        trajectory: Trajectory the spans index (``continuation-branch``, ``harbor-ledger`` or
+            ``trainer-rollout``).
         tool_call_rendering: How tool-call span text is rendered.
         sampled_tokens: Identity of the bound sampled-token record, or None when no sampled
             tokens were bound and every span is action-level.

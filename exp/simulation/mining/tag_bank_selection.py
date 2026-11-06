@@ -402,6 +402,33 @@ def corpus_tag_bank(
     return AuthoredBank(authoring=authored, selection=selected, bank=bank, path=str(path))
 
 
+def score_candidates(
+    candidate: QuestionBank,
+    columns: Mapping[str, Mapping[str, float]],
+    views: Mapping[str, str],
+    spec: BankSelectionSpec | None = None,
+) -> tuple[QuestionScore, ...]:
+    """Measure already bought answers with the selection rules, without asking anything.
+
+    The same discrimination, answerability and redundancy rules :func:`select_tag_bank` applies,
+    for a caller that already holds the decision model's answers (for example a rubric that
+    re-checks whether its questions still split the latest rollouts).
+
+    Args:
+        candidate: The questions to measure, in candidate order.
+        columns: Each question's answers by trace identity.
+        views: The view each question was answered over.
+        spec: Selection rules; defaults apply when omitted.
+
+    Returns:
+        Every question's measurements and verdict, in candidate order.
+
+    Raises:
+        KeyError: A candidate question has no column or view.
+    """
+    return _scores(candidate, columns, views, spec or BankSelectionSpec())
+
+
 def _check(matrix: TagMatrix, asked: QuestionBank) -> None:
     """Refuse a matrix that does not answer exactly the asked questions."""
     if matrix.question_ids != asked.question_ids() or not matrix.rows:

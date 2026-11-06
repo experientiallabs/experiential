@@ -23,6 +23,32 @@ from exp.simulation.continuations import ContinuationCheckpoint, load_continuati
 from exp.simulation.development_scope import require_development_task
 
 
+class RubricProvenance(ContractModel):
+    """The evolving rubric version a decision-variance package was bound under.
+
+    Attributes:
+        version: The rubric version number, from one.
+        version_sha256: Identity of the version (its items and pinned banks).
+        epoch: First training epoch the version is frozen for.
+        parent_sha256: Identity of the version it was revised from, None for the first.
+        items: Identity of every active rubric item, in version order.
+        retired: Identity of every item retired by this or an earlier revision.
+        outcome_recall: Held-out known-hack recall of its outcome judge, when measured.
+        dense_recall: Held-out known-hack recall of its dense part, when measured.
+        held_out_sha256: Identity of the held-out known-hack set the recall was measured on.
+    """
+
+    version: int = Field(ge=1)
+    version_sha256: str = Field(min_length=64, max_length=64)
+    epoch: int = Field(ge=1)
+    parent_sha256: str | None = None
+    items: tuple[str, ...] = ()
+    retired: tuple[str, ...] = ()
+    outcome_recall: float | None = Field(default=None, ge=0.0, le=1.0)
+    dense_recall: float | None = Field(default=None, ge=0.0, le=1.0)
+    held_out_sha256: str | None = None
+
+
 class MiningProvenance(ContractModel):
     """Where a decision-variance task was mined from, as its package records it.
 
@@ -40,6 +66,8 @@ class MiningProvenance(ContractModel):
             from, or None when no reviewed group names it.
         signature_group: That group's identity.
         signature: Its Added/Removed signature, such as ``+modified_evaluation -verified_result``.
+        rubric: The evolving rubric version the package's judge and dense reward were bound
+            under, when the task is trained with a revised rubric.
     """
 
     task_id: str = Field(min_length=1)
@@ -52,6 +80,7 @@ class MiningProvenance(ContractModel):
     signature_kind: Literal["behavior", "adversarial"] | None = None
     signature_group: str | None = None
     signature: str | None = None
+    rubric: RubricProvenance | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ExecutableTask(ContractModel):

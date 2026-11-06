@@ -27,7 +27,10 @@ Two trajectories are supported. :func:`trajectory_from_branch` reads a saved con
 branch: turn ``i`` is the actor's model call ``i``. :func:`trajectory_from_ledger` reads a Harbor
 trial ledger, where the external actor's own turns are not visible to the host: each actor
 action (a message, a tool call or the submission) is its own turn, and the trainer realigns
-spans with its own trajectory by ``call_id`` or exact message text.
+spans with its own trajectory by ``call_id`` or exact message text. A third kind,
+``trainer-rollout``, is a rollout an external trainer exported
+(:func:`~exp.optimize.evaluation.variance.rollout_ingest.rollout_evidence`): turn ``i`` is the
+trainer's own actor turn ``i``.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from exp.optimize.evaluation.executable.ledger import TrialLedgerEntry
 from exp.optimize.evaluation.variance.dense_reward import DenseSpan, SampledTokenSpan
 from exp.optimize.evaluation.variance.episodes import EpisodeEvent, EpisodeEvidence
 
-TrajectoryKind = Literal["continuation-branch", "harbor-ledger"]
+TrajectoryKind = Literal["continuation-branch", "harbor-ledger", "trainer-rollout"]
 """Which trajectory a span's turn index refers to."""
 
 

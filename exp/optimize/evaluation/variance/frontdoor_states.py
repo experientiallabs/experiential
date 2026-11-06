@@ -17,6 +17,7 @@ from exp.optimize.evaluation.variance.reward_states import (
     FINDING_MACHINE,
     POINT_MACHINE,
 )
+from exp.optimize.evaluation.variance.rubric_evo_states import BOUNDARY_MACHINE
 from exp.simulation.retrieval.state_rag import RECALL_MACHINE
 from exp.simulation.rules.rule_lifecycle import RULE_MACHINE
 from exp.simulation.world_model.state_memory import MEMORY_MACHINE
@@ -162,5 +163,6 @@ def all_statecharts() -> dict[str, str]:
         POINT_MACHINE,
         FINDING_MACHINE,
         FAMILY_MACHINE,
+        BOUNDARY_MACHINE,
     )
     return {machine.name: machine.mermaid() for machine in machines}
