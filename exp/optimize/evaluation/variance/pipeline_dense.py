@@ -20,7 +20,7 @@ from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
 from exp.optimize.evaluation.continuations.intervention import ActionIntervention
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.executable.costs import evaluation_costs
-from exp.optimize.evaluation.executable.model_costs import CostComponent
+from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.executable.task import ExecutableTask
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.behavior_profiles import BehaviorGuidance
@@ -30,6 +30,11 @@ from exp.optimize.evaluation.variance.dense_candidates import (
     error_tag_candidates,
     linter_candidates,
     merge_candidates,
+)
+from exp.optimize.evaluation.variance.dense_hybrid import (
+    RoutingSpec,
+    judge_hybrid,
+    tag_episode_steps,
 )
 from exp.optimize.evaluation.variance.dense_judge import DenseRewardJudge, judge_dense
 from exp.optimize.evaluation.variance.dense_prompt import (
@@ -53,9 +58,30 @@ from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.records import ContinuationGroup, TrainingRecords
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.error_tags import ErrorTraceTags
+from exp.simulation.mining.questions import QuestionBank
+from exp.simulation.mining.tagging import TraceTagger
+
+MAX_STEP_QUESTIONS = 32
+"""Questions the decision model answers per step in one call."""
 
 if TYPE_CHECKING:
     from exp.optimize.evaluation.variance.family import FamilyReport
+
+
+class HybridDenseSettings(ContractModel):
+    """Hybrid routing: decision tags on every step, the dense judge only on routed tags.
+
+    Attributes:
+        bank_id: Step bank the tags' ``sources`` name, answered by the decision model.
+        decision_alias: Admitted native decision alias answering it (Clef).
+        routing: Fire threshold, ambiguity band and step rendering.
+        maximum_steps: Most actor steps one confirmation episode can have, for pricing.
+    """
+
+    bank_id: str = Field(default="behavior-base-v1", min_length=1)
+    decision_alias: str = Field(default="clef", min_length=1)
+    routing: RoutingSpec = RoutingSpec()
+    maximum_steps: int = Field(default=1000, ge=1, le=100_000)
 
 
 class DenseSettings(ContractModel):
@@ -66,12 +92,14 @@ class DenseSettings(ContractModel):
         bounds: Bounded credit and episode aggregation settings.
         profile: Exact dense prompts, model and request limits.
         settings: Admitted per-call settings matching the profile.
+        hybrid: Hybrid routing of every step through decision tags; None judges every candidate.
     """
 
     tags: tuple[DenseTag, ...] = Field(min_length=1, max_length=64)
     bounds: DenseBounds = DenseBounds()
     profile: DenseJudgeProfile
     settings: AuthorSettings
+    hybrid: HybridDenseSettings | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def _bound(self) -> Self:
@@ -130,7 +158,13 @@ def dense_costs(
     if not episodes:
         return ()
     calls = episodes * dense_model_calls(settings.profile)
-    return tuple(row.scaled(calls) for row in evaluation_costs(project, settings.settings))
+    costs = [row.scaled(calls) for row in evaluation_costs(project, settings.settings)]
+    if settings.hybrid is not None:
+        questions = len({source for tag in settings.tags for source in tag.sources}) or 1
+        per_step = -(-questions // MAX_STEP_QUESTIONS)
+        steps = episodes * settings.hybrid.maximum_steps * per_step
+        costs.append(decision_cost(project, settings.hybrid.decision_alias, steps))
+    return tuple(costs)
 
 
 @dataclass(frozen=True)
@@ -157,6 +191,8 @@ def attach_family_dense(
     *,
     code_revision: str,
     error_tags: Mapping[str, ErrorTraceTags] | None = None,
+    tagger: TraceTagger | None = None,
+    bank: QuestionBank | None = None,
 ) -> tuple[TrainingRecords, tuple[ArtifactInput, ...]]:
     """Judge confirmation episodes and attach their dense signal beside unchanged advantages.
 
@@ -166,6 +202,8 @@ def attach_family_dense(
         settings: Vocabulary and admitted dense judge settings fixed before this records stage.
         code_revision: Producing revision used by the dense assessment owner.
         error_tags: Optional saved error-tag summaries keyed by the exact episode identity.
+        tagger: Decision tagger of every actor step, under ``settings.hybrid``.
+        bank: The step bank the tags' sources name, under ``settings.hybrid``.
 
     Returns:
         Updated training records and every dense assessment reference they cite.
@@ -186,15 +224,31 @@ def attach_family_dense(
         candidates = _candidates(
             project, judge, outcome, (error_tags or {}).get(item.evidence.episode_id)
         )
-        reference, _ = judge_dense(
-            project,
-            judge,
-            item.evidence,
-            candidates,
-            item.trajectory,
-            code_revision=code_revision,
-            outcome=item.outcome,
-        )
+        if settings.hybrid is not None:
+            if tagger is None or bank is None:
+                raise ValueError("hybrid dense routing needs the decision tagger and step bank")
+            routing = settings.hybrid.routing
+            reference, _ = judge_hybrid(
+                project,
+                judge,
+                item.evidence,
+                item.trajectory,
+                tag_episode_steps(item.evidence, tagger, bank, routing),
+                code_revision=code_revision,
+                spec=routing,
+                proposed=candidates,
+                outcome=item.outcome,
+            )
+        else:
+            reference, _ = judge_dense(
+                project,
+                judge,
+                item.evidence,
+                candidates,
+                item.trajectory,
+                code_revision=code_revision,
+                outcome=item.outcome,
+            )
         refs[item.evidence.episode_id] = reference
     groups: dict[str, tuple[ContinuationGroup, ...]] = {}
     for tier, rows in records.groups.items():

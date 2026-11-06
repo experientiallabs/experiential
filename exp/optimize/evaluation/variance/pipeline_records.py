@@ -73,6 +73,7 @@ from exp.optimize.evaluation.variance.crosstalk import (
     ProbeTarget,
     run_crosstalk_probe,
 )
+from exp.optimize.evaluation.variance.difficulty_curriculum import ActorLadder, TaskDifficultyRecord
 from exp.optimize.evaluation.variance.family import (
     FamilyReport,
     export_family_harbor,
@@ -82,11 +83,15 @@ from exp.optimize.evaluation.variance.family import (
 from exp.optimize.evaluation.variance.family_export import export_rung_harbor, rung_executable_task
 from exp.optimize.evaluation.variance.family_search import RungTask
 from exp.optimize.evaluation.variance.nudge_ladder import (
-    CurriculumPlan,
     load_ladder,
     nudge_curriculum,
 )
 from exp.optimize.evaluation.variance.pipeline_dense import attach_family_dense, dense_costs
+from exp.optimize.evaluation.variance.pipeline_rewards import (
+    difficulty_plan,
+    hybrid_inputs,
+    tier_difficulty,
+)
 from exp.optimize.evaluation.variance.pipeline_spec import (
     CostLine,
     DecisionVarianceSpec,
@@ -233,6 +238,7 @@ class _RecordsStage:
         admitted = [row for row in families.families if row.admitted and row.report is not None]
         reports = {family_key(row.tier, row.point): _family(project, row) for row in admitted}
         training: dict[str, ArtifactInput] = {}
+        tagger, bank = hybrid_inputs(context)
         for row in admitted:
             key = family_key(row.tier, row.point)
             report = reports[key]
@@ -242,7 +248,12 @@ class _RecordsStage:
                 refs = ()
                 if spec.records.dense is not None:
                     records, refs = attach_family_dense(
-                        project, report, spec.records.dense, code_revision=context.code_revision
+                        project,
+                        report,
+                        spec.records.dense,
+                        code_revision=context.code_revision,
+                        tagger=tagger,
+                        bank=bank,
                     )
                 training[key] = _save(context, "training", key, records, (row.report, *refs))
         selectors: dict[str, ArtifactInput] = {}
@@ -276,11 +287,13 @@ class _RecordsStage:
         curriculum = nudge_curriculum(
             [load_ladder(project, row.ladder) for row in admitted if row.ladder is not None]
         )
-        schedules = (
-            {tier.tier: _schedule(context, tier, admitted, exports) for tier in mining.tiers}
-            if spec.records.schedule
-            else {}
-        )
+        schedules = {}
+        if spec.records.schedule and mining.tiers:
+            difficulty = tier_difficulty(context, mining)
+            schedules = {
+                tier.tier: _schedule(context, tier, admitted, exports, difficulty)
+                for tier in mining.tiers
+            }
         outputs = RecordsOutputs(
             training=training,
             selectors=selectors,
@@ -480,6 +493,7 @@ def _schedule(
     tier: TierMining,
     admitted: list[FamilyOutcome],
     exports: list[HarborExport],
+    difficulty: tuple[ActorLadder, tuple[TaskDifficultyRecord, ...]],
 ) -> TierSchedule:
     """Emit one tier's training schedule over its qualified curriculum rungs.
 
@@ -495,11 +509,13 @@ def _schedule(
         tier: The tier's error mining.
         admitted: Every admitted family.
         exports: Every Harbor export of this stage, curriculum rungs included.
+        difficulty: The actor ladder and the task's judged difficulty across every tier; the
+            rungs are ordered by difficulty and strength into the schedule's curriculum plan.
 
     Returns:
         The saved schedule and its spec file, or why none could be built.
     """
-    project, records = context.project, context.spec.records
+    project = context.project
     ladders = [row.ladder for row in admitted if row.tier == tier.tier and row.ladder is not None]
     qualified = {
         (row.ladder, row.scenario_id): row
@@ -521,10 +537,9 @@ def _schedule(
                     }
                 )
             )
-    plan = (
-        CurriculumPlan(stages=tuple(stages), rollouts_per_tier=records.rollouts_per_tier)
-        if stages
-        else None
+    ladder, tiers = difficulty
+    plan, curriculum, _ = difficulty_plan(
+        context, stages, ladder, tiers, inputs=(tier.judged_group, *ladders)
     )
     scored: JsonObject = {
         "curriculum": None if plan is None else plan.model_dump(mode="json"),
@@ -558,7 +573,13 @@ def _schedule(
     path = root / context.identity / "schedules" / f"{_slug(tier.tier)}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(spec.model_dump_json(indent=2) + "\n")
-    return TierSchedule(tier=tier.tier, schedule=reference, path=str(path), stages=len(stages))
+    return TierSchedule(
+        tier=tier.tier,
+        schedule=reference,
+        path=str(path),
+        stages=len(stages),
+        difficulty=curriculum,
+    )
 
 
 def _qualify(context: StageContext, task: ExecutableTask, export: HarborExport) -> HarborExport:

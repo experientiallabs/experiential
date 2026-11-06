@@ -143,14 +143,23 @@ class DenseInspection(ContractModel):
     inspected: dict[str, tuple[str, ...]]
 
 
+HYBRID_ASSESSMENT_TYPE = "dense-hybrid-assessment"
+"""Artifact type of a saved hybrid judgment, whose ``hybrid.json`` holds the merged export."""
+
+
 def load_dense(project: ProjectStore, reference: ArtifactInput) -> DenseRewardExport:
-    """Load one saved dense export by its exact reference.
+    """Load one saved dense export by its exact reference, full or hybrid judgment.
 
     Raises:
         ValueError: The reference does not name an unchanged dense assessment.
     """
     manifest = project.artifacts.read(reference.artifact_id).manifest
-    if artifact_input(manifest) != reference or manifest.artifact_type != DENSE_ASSESSMENT_TYPE:
+    if artifact_input(manifest) != reference:
+        raise ValueError(f"{reference.artifact_id} is not the referenced dense assessment")
+    if manifest.artifact_type == HYBRID_ASSESSMENT_TYPE:
+        hybrid = json.loads(project.artifacts.read_bytes(reference.artifact_id, "hybrid.json"))
+        return DenseRewardExport.model_validate(hybrid["export"])
+    if manifest.artifact_type != DENSE_ASSESSMENT_TYPE:
         raise ValueError(f"{reference.artifact_id} is not the referenced dense assessment")
     return DenseRewardExport.model_validate_json(
         project.artifacts.read_bytes(reference.artifact_id, "dense.json")

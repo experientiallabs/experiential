@@ -903,10 +903,12 @@ class TierSchedule(ContractModel):
         path: The spec file the ``variance-schedule`` action reads, when one was written.
         stages: Curriculum stages the schedule carries; zero when the tier has no ladder.
         failure: Why no schedule could be built, when none could.
+        difficulty: The saved difficulty curriculum the schedule's plan was ordered by.
     """
 
     tier: str
     schedule: ArtifactInput | None = None
+    difficulty: ArtifactInput | None = None
     path: str | None = None
     stages: int = Field(default=0, ge=0)
     failure: str | None = None
