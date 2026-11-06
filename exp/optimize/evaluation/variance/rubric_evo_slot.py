@@ -8,6 +8,10 @@ dry-run plan; the front door reserves the total against the single cumulative le
 runs. Its run opens the evolution and runs every boundary whose export is present, in epoch
 order (``<exports>/epoch-<n>.json``), stopping at the first missing or refused export; finished
 boundaries replay with no call.
+
+With ``monitor`` set, the tag monitor's checkpoint 6 (:class:`~.tag_monitor_epoch.TagEpochMonitor`)
+runs at every boundary before the divergence trigger, and its review is priced with each
+boundary, inside this slot's reservation.
 """
 
 from __future__ import annotations
@@ -41,6 +45,8 @@ from exp.optimize.evaluation.variance.rubric_evolution import (
     open_evolution,
     opening_costs,
 )
+from exp.optimize.evaluation.variance.tag_monitor_epoch import TagEpochMonitor
+from exp.optimize.evaluation.variance.tag_monitor_review import TagMonitorSettings, review_costs
 from exp.simulation.mining.tagging import TraceTagger
 
 
@@ -51,11 +57,13 @@ class RubricEvolutionSlot(ContractModel):
         registration: The run's evolving rubric.
         exports: Directory the trainer writes ``epoch-<n>.json`` exports into.
         epochs: Boundaries to price and reserve.
+        monitor: The tag monitor's epoch checkpoint settings, or None to run without it.
     """
 
     registration: EvolutionRegistration
     exports: Path
     epochs: int = Field(ge=1, le=10_000)
+    monitor: TagMonitorSettings | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class EvolutionProgress(ContractModel):
@@ -85,6 +93,8 @@ def slot_costs(
     remaining = max(0, slot.epochs - finished)
     for _ in range(remaining):
         costs.extend(boundary_costs(project, registration, forced=True))
+        if slot.monitor is not None and slot.monitor.astra is not None:
+            costs.extend(review_costs(project, slot.monitor.astra))
     return tuple(costs), remaining
 
 
@@ -117,6 +127,13 @@ class RubricEvolutionExecutor:
             f"{len(slot.registration.held_out.hacks)} known hacks under each candidate.",
             f"Requests: at most {sum(row.attempts for row in costs)} physical requests.",
         )
+        if slot.monitor is not None:
+            reviewer = (
+                "statistics only"
+                if slot.monitor.astra is None
+                else (f"reviewed by {slot.monitor.astra.author.model_alias}")
+            )
+            lines += (f"Tag monitor checkpoint 6 at every boundary, {reviewer}.",)
         return False, cost_lines(costs), lines
 
     def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
@@ -135,6 +152,13 @@ class RubricEvolutionExecutor:
             project, registration, tagger=tagger, code_revision=context.code_revision
         )
         progress = EvolutionProgress(run_id=registration.run_id)
+        monitor = None
+        if slot.monitor is not None:
+            monitor = TagEpochMonitor(
+                astra=slot.monitor.astra,
+                spec=slot.monitor.spec,
+                code_revision=context.code_revision,
+            )
         for epoch in range(1, slot.epochs + 1):
             path = slot.exports / f"epoch-{epoch}.json"
             if not path.exists():
@@ -146,6 +170,7 @@ class RubricEvolutionExecutor:
                 load_rollout_export(path),
                 tagger=tagger,
                 code_revision=context.code_revision,
+                monitor=monitor,
             )
             boundaries = {**progress.boundaries, str(epoch): record.state}
             progress = progress.model_copy(update={"boundaries": boundaries})

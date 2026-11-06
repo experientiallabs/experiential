@@ -40,17 +40,8 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Self
 
-from pydantic import Field, model_validator
-
-from exp.common.core.artifacts import (
-    ArtifactInput,
-    ContractModel,
-    JsonObject,
-    Sha256,
-    sha256_json,
-)
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
@@ -58,12 +49,19 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapApproval,
     BootstrapDependencies,
     BootstrapPreparationReport,
-    BootstrapPreparationSpec,
     plan_bootstrap_preparation,
     run_bootstrap_preparation,
 )
+from exp.optimize.evaluation.variance.frontdoor_contracts import (
+    FrontDoorApproval,
+    FrontDoorPlan,
+    FrontDoorReport,
+    FrontDoorSpec,
+    FrontDoorStage,
+    PipelineOutcome,
+    PipelineTemplate,
+)
 from exp.optimize.evaluation.variance.frontdoor_executors import (
-    PIPELINE_SETTINGS,
     SlotContext,
     dense_slot_settings,
     families_review_plan,
@@ -72,15 +70,16 @@ from exp.optimize.evaluation.variance.frontdoor_executors import (
 )
 from exp.optimize.evaluation.variance.frontdoor_ledger import PhaseLedger, measure
 from exp.optimize.evaluation.variance.frontdoor_slots import (
+    SLOT_ORDER,
     SLOT_POSITIONS,
     SLOT_STAGES,
+    HaltingExecutor,
     SlotExecutor,
     SlotName,
     SlotPosition,
     slot_executor,
 )
 from exp.optimize.evaluation.variance.frontdoor_source import (
-    FRONT_DOOR_PROTOCOL,
     ProjectBuilder,
     TraceSource,
     ensure_build,
@@ -98,250 +97,31 @@ from exp.optimize.evaluation.variance.pipeline import (
     run_decision_variance,
 )
 from exp.optimize.evaluation.variance.pipeline_spec import (
-    AuthoringSettings,
     CostLine,
-    DecisionVarianceSpec,
-    MiningSettings,
     PipelineApproval,
     PipelinePlan,
-    RecordsSettings,
-    RulesSettings,
     StageDependencies,
     StageName,
-    TraceMLSettings,
 )
 
+__all__ = [
+    "FrontDoorApproval",
+    "FrontDoorDependencies",
+    "FrontDoorPlan",
+    "FrontDoorReport",
+    "FrontDoorSpec",
+    "FrontDoorStage",
+    "PipelineOutcome",
+    "PipelineTemplate",
+    "TraceSource",
+    "configured_slots",
+    "effective_spec",
+    "plan_front_door",
+    "run_directory",
+    "run_front_door",
+]
+
 logger = logging.getLogger(__name__)
-
-
-class PipelineTemplate(ContractModel):
-    """Every pipeline setting except the build and the start, which the front door supplies.
-
-    Attributes:
-        rules: Rules-stage settings, or None for the preparation's own rules registration. A
-            bootstrapped pipeline reuses the family's frozen rules with no call either way.
-        traceml: TraceML settings.
-        mining: Error-mining settings with neither ``job`` nor ``bootstrap``: each registered
-            start fills ``bootstrap``.
-        authoring: Family settings.
-        records: Records settings.
-    """
-
-    rules: RulesSettings | None = None
-    traceml: TraceMLSettings
-    mining: MiningSettings
-    authoring: AuthoringSettings
-    records: RecordsSettings
-
-    @model_validator(mode="after")
-    def _unbound(self) -> Self:
-        """Refuse a hand-registered job or start; the preparation registers them."""
-        if self.mining.job is not None or self.mining.bootstrap is not None:
-            raise ValueError(
-                "the front door binds every start its preparation registers; leave "
-                "pipeline.mining.job and pipeline.mining.bootstrap empty"
-            )
-        return self
-
-
-class FrontDoorSpec(ContractModel):
-    """One front-door registration: a trace source and every downstream setting.
-
-    Attributes:
-        traces: The trace source, or None to use the project's completed build as it is.
-        preparation: Variance build, environment families, bootstrap roles and finite limits.
-        pipeline: Pipeline settings applied to every registered start.
-        slots: Settings of the slot stages to run, by slot; each needs a registered executor.
-        protocol: Front-door protocol.
-    """
-
-    traces: TraceSource | None = None
-    preparation: BootstrapPreparationSpec
-    pipeline: PipelineTemplate
-    slots: dict[SlotName, JsonObject] = Field(default_factory=dict)
-    protocol: Literal["decision-variance-front-door-v1"] = FRONT_DOOR_PROTOCOL
-
-    @model_validator(mode="after")
-    def _rules(self) -> Self:
-        """Require a rules registration, and the template setting each in-pipeline slot runs by."""
-        if self.pipeline.rules is None and self.preparation.bootstrap.rules is None:
-            raise ValueError("give pipeline.rules when the preparation registers no rules")
-        enabled = {
-            "blast-radius": self.pipeline.mining.qualification is not None
-            and self.pipeline.mining.qualification.blast is not None,
-            "curriculum": self.pipeline.records.schedule,
-            "dense-hybrid": self.pipeline.records.dense is None
-            or self.pipeline.records.dense.hybrid is not None,
-        }
-        for name in self.slots:
-            if name in enabled and not enabled[name]:
-                raise ValueError(
-                    f"slot {name} runs inside each pipeline; set {PIPELINE_SETTINGS[name][1]}"
-                )
-        return self
-
-    def pipeline_spec(
-        self, report: BootstrapPreparationReport, binding: BootstrapBinding
-    ) -> DecisionVarianceSpec:
-        """Return one registered start's pipeline registration.
-
-        Args:
-            report: The saved preparation.
-            binding: One of its registered starts.
-
-        Returns:
-            The template with the preparation's saved build pinned and the start bound.
-        """
-        rules = self.pipeline.rules
-        if rules is None:
-            assert self.preparation.bootstrap.rules is not None
-            rules = RulesSettings(spec=self.preparation.bootstrap.rules)
-        return DecisionVarianceSpec(
-            build=self.preparation.build.model_copy(update={"saved_report": report.build_report}),
-            rules=rules,
-            traceml=self.pipeline.traceml,
-            mining=self.pipeline.mining.model_copy(update={"bootstrap": binding}),
-            authoring=self.pipeline.authoring,
-            records=self.pipeline.records,
-        )
-
-
-class FrontDoorStage(ContractModel):
-    """One front-door stage before it runs.
-
-    Attributes:
-        stage: Its name (``project-build``, ``slot <name>``, ``bootstrap-preparation`` or
-            ``pipeline <task>``).
-        status: Saved, priced and runnable, or waiting on an earlier stage.
-        costs: Upper-bound cost inventory of a pending stage.
-        lines: What it does, or did.
-        notes: Work without a known bound yet, and what will bound it.
-    """
-
-    stage: str
-    status: StageState
-    costs: tuple[CostLine, ...] = ()
-    lines: tuple[str, ...] = ()
-    notes: tuple[str, ...] = ()
-
-    @property
-    def known_usd(self) -> float:
-        """Sum of the priced components."""
-        return sum(row.usd for row in self.costs if row.usd is not None)
-
-    @property
-    def unpriced(self) -> tuple[CostLine, ...]:
-        """Components with physical requests but no known price."""
-        return tuple(row for row in self.costs if row.usd is None and row.attempts > 0)
-
-
-class FrontDoorPlan(ContractModel):
-    """Every front-door stage, credential-free.
-
-    Attributes:
-        spec_sha256: Digest of the registration.
-        code_revision: Producing source identity.
-        stages: Every stage in order.
-    """
-
-    spec_sha256: Sha256
-    code_revision: str
-    stages: tuple[FrontDoorStage, ...]
-
-    @property
-    def digest(self) -> Sha256:
-        """Digest a consent binds."""
-        return sha256_json(self)
-
-    @property
-    def known_usd(self) -> float:
-        """Priced upper bound of every pending stage."""
-        return sum(row.known_usd for row in self.stages if row.status == StageState.PLANNED)
-
-    @property
-    def unpriced(self) -> tuple[CostLine, ...]:
-        """Unpriced components of every pending stage, named by stage."""
-        return tuple(
-            line.model_copy(update={"name": f"{row.stage}: {line.name}"})
-            for row in self.stages
-            if row.status == StageState.PLANNED
-            for line in row.unpriced
-        )
-
-    @property
-    def complete(self) -> bool:
-        """Whether every stage is saved, so a run replays without consent or calls."""
-        return all(row.status == StageState.DONE for row in self.stages)
-
-
-class FrontDoorApproval(ContractModel):
-    """One consent for the whole front-door run.
-
-    Attributes:
-        plan_sha256: The consented plan.
-        ceiling_usd: Dollar ceiling across every phase, including phases priced later.
-        unpriced_attempts: Physical attempts allowed to unpriced components across the run.
-    """
-
-    plan_sha256: Sha256
-    ceiling_usd: float = Field(ge=0)
-    unpriced_attempts: int = Field(default=0, ge=0)
-
-
-class PipelineOutcome(ContractModel):
-    """One registered start's pipeline.
-
-    Attributes:
-        task_id: The start's task.
-        binding: Its registered start.
-        run: The saved run registration, once it ran.
-        complete: Whether every stage is saved.
-        stopped: Why it stopped, when it did.
-        stages: Each finished stage's saved record, by stage.
-    """
-
-    task_id: str
-    binding: BootstrapBinding
-    run: ArtifactInput | None = None
-    complete: bool = False
-    stopped: str | None = None
-    stages: dict[str, ArtifactInput] = Field(default_factory=dict)
-
-
-class FrontDoorReport(ContractModel):
-    """What one front-door run did.
-
-    Attributes:
-        plan: The plan it ran under.
-        source: The saved trace-source record, when a trace source was given.
-        preparation: The saved preparation, once it completed.
-        bindings: Every registered start.
-        failed_tasks: Starts whose preparation failed and that a rerun retries.
-        refused_tasks: Starts refused with a saved diagnostic.
-        pipelines: One outcome per registered start that was reached.
-        slots: Saved result of every slot stage that ran.
-        stopped: Why the run stopped early, when it did.
-    """
-
-    plan: FrontDoorPlan
-    source: ArtifactInput | None = None
-    preparation: ArtifactInput | None = None
-    bindings: tuple[BootstrapBinding, ...] = ()
-    failed_tasks: tuple[str, ...] = ()
-    refused_tasks: tuple[str, ...] = ()
-    pipelines: tuple[PipelineOutcome, ...] = ()
-    slots: dict[SlotName, ArtifactInput] = Field(default_factory=dict)
-    stopped: str | None = None
-
-    @property
-    def complete(self) -> bool:
-        """Whether every start's pipeline is complete and nothing stopped or failed."""
-        return (
-            self.stopped is None
-            and not self.failed_tasks
-            and len(self.pipelines) == len(self.bindings)
-            and all(row.complete for row in self.pipelines)
-        )
 
 
 @dataclass(frozen=True)
@@ -393,9 +173,11 @@ def plan_front_door(
     stages = [built]
     if any(SLOT_POSITIONS[name] == "after-families" for name in configured_slots(spec)):
         stages.append(_review_stage(project, spec, code_revision, built.status))
-    stages.extend(_slot_stages(project, spec, "after-families", code_revision, dependencies))
+    saved = _saved_family_slots(project, spec, code_revision)
+    stages.extend(
+        _slot_stages(project, spec, "after-families", code_revision, dependencies, dict(saved))
+    )
     report: BootstrapPreparationReport | None = None
-    saved: dict[str, ArtifactInput] = {}
     effective = effective_spec(project, spec, code_revision)
     if effective is None:
         preparation = FrontDoorStage(
@@ -409,7 +191,9 @@ def plan_front_door(
         )
     elif built.status == StageState.DONE:
         spec = effective
-        preparation, report = _preparation_stage(project, spec, code_revision)
+        preparation, report, prepared = _preparation_stage(project, spec, code_revision)
+        if prepared is not None:
+            saved["preparation"] = prepared
     else:
         preparation = FrontDoorStage(
             stage="bootstrap-preparation",
@@ -421,7 +205,9 @@ def plan_front_door(
             ),
         )
     stages.append(preparation)
-    stages.extend(_slot_stages(project, spec, "after-preparation", code_revision, dependencies))
+    stages.extend(
+        _slot_stages(project, spec, "after-preparation", code_revision, dependencies, dict(saved))
+    )
     if report is None:
         stages.append(
             FrontDoorStage(
@@ -508,10 +294,11 @@ def run_front_door(
 
 
 def configured_slots(spec: FrontDoorSpec) -> dict[SlotName, JsonObject]:
-    """Return the configured slots, with the dense-hybrid slot always on for the pipelines.
+    """Return the configured slots in their fixed order, with the dense-hybrid slot always on.
 
     The rubric's decision-model part is part of every exported task, so its slot is configured
-    whenever a pipeline exists; the in-flow vocabulary is described in its settings.
+    whenever a pipeline exists; the in-flow vocabulary is described in its settings. Slots at one
+    position run in ``SLOT_ORDER``, so a tag monitor checkpoint follows the stage it monitors.
     """
     slots = dict(spec.slots)
     records = spec.pipeline.records
@@ -525,7 +312,7 @@ def configured_slots(spec: FrontDoorSpec) -> dict[SlotName, JsonObject]:
             traceml.decision_alias,
             (job.maximum_model_calls or job.horizon_ceiling) * traceml.steps_per_call,
         )
-    return slots
+    return {name: slots[name] for name in SLOT_ORDER if name in slots}
 
 
 def effective_spec(
@@ -664,6 +451,8 @@ class _Runner:
             }
         )
         report = self.slots("after-preparation", report)
+        if report.stopped is not None:
+            return report
         if self.tracker.stages.get("pipelines") == StageState.BLOCKED:
             self.tracker.stage("pipelines", "replayed")
         outcomes: list[PipelineOutcome] = []
@@ -749,7 +538,12 @@ class _Runner:
         )
 
     def slots(self, position: SlotPosition, report: FrontDoorReport) -> FrontDoorReport:
-        """Run or replay the configured slots at one position."""
+        """Run or replay the configured slots at one position.
+
+        A slot whose executor reports an unacknowledged halt (a tag monitor checkpoint) stops the
+        run after it, so no later phase is admitted until the halt is acknowledged or the
+        monitored stage re-authored; a rerun replays the saved slot and stops there again.
+        """
         results = dict(report.slots)
         costs = {row.stage: row.costs for row in self.plan.stages}
         for name, settings in configured_slots(self.spec).items():
@@ -767,6 +561,10 @@ class _Runner:
             if result is None:
                 return report.model_copy(update={"slots": results, "stopped": reason})
             results[name] = result
+            if isinstance(executor, HaltingExecutor):
+                halted = executor.halt(self.context(report), result)
+                if halted is not None:
+                    return report.model_copy(update={"slots": results, "stopped": halted})
         return report.model_copy(update={"slots": results})
 
     def pipeline(
@@ -855,10 +653,24 @@ def _build_stage(project: ProjectStore, spec: FrontDoorSpec) -> FrontDoorStage:
     )
 
 
+def _saved_family_slots(
+    project: ProjectStore, spec: FrontDoorSpec, code_revision: str
+) -> dict[str, ArtifactInput]:
+    """The saved results of the families slots, as later slots' plans read them."""
+    saved: dict[str, ArtifactInput] = {}
+    for name, depends in (("tag-banks", ()), ("task-types", ("tag-banks",)), ("state-rag", ())):
+        if name in spec.slots:
+            context = SlotContext(project, spec.preparation, code_revision, dict(saved))
+            found = saved_slot(context, name, spec.slots[name], depends)
+            if found is not None:
+                saved[name] = found
+    return saved
+
+
 def _preparation_stage(
     project: ProjectStore, spec: FrontDoorSpec, code_revision: str
-) -> tuple[FrontDoorStage, BootstrapPreparationReport | None]:
-    """Plan the preparation and return its saved report once it completed."""
+) -> tuple[FrontDoorStage, BootstrapPreparationReport | None, ArtifactInput | None]:
+    """Plan the preparation and return its saved report and artifact once it completed."""
     plan = plan_bootstrap_preparation(project, spec.preparation, code_revision=code_revision)
     result_id = plan.identity + "-result"
     if project.artifacts.exists(result_id):
@@ -869,19 +681,26 @@ def _preparation_stage(
             f"Saved: {len(report.bindings)} registered starts, {len(report.refused_tasks)} "
             f"refused with diagnostics, {len(report.simulators)} frozen family simulators.",
         )
-        return FrontDoorStage(
-            stage="bootstrap-preparation", status=StageState.DONE, lines=lines
-        ), report
+        saved = artifact_input(project.artifacts.read(result_id).manifest)
+        return (
+            FrontDoorStage(stage="bootstrap-preparation", status=StageState.DONE, lines=lines),
+            report,
+            saved,
+        )
     progress = (
         f"Tasks completed {len(plan.completed_tasks)}, remaining {plan.task_bound}; families "
         f"learning rules {plan.family_bound}.",
     )
-    return FrontDoorStage(
-        stage="bootstrap-preparation",
-        status=StageState.PLANNED,
-        costs=plan.costs,
-        lines=(*_PREPARATION_LINES, *progress, *plan.lines),
-    ), None
+    return (
+        FrontDoorStage(
+            stage="bootstrap-preparation",
+            status=StageState.PLANNED,
+            costs=plan.costs,
+            lines=(*_PREPARATION_LINES, *progress, *plan.lines),
+        ),
+        None,
+        None,
+    )
 
 
 def _pipeline_plan(

@@ -27,15 +27,22 @@ slot has a fixed position and a real executor (:mod:`~.frontdoor_executors`):
   the forced bound, so the cumulative ledger reserves them before the external trainer's epochs;
   its run opens the evolution and runs each boundary whose export is present.
 
-``after-families`` slots run once the preparation's variance build has saved the reviewed
-families and before any start is authored: the front door runs that build first (the
-preparation then replays it with no call). An executor prices its work credential-free and
-runs or replays it, like every other front-door stage.
+- ``tag-monitor-corpus``, ``tag-monitor-families``, ``tag-monitor-rules``, ``tag-monitor-mining``
+  and ``tag-monitor-dense``: the tag monitor's checkpoints 1 to 5 (:mod:`~.tag_monitor_slot`),
+  each right after the stage it monitors. Statistics come from saved records; Astra reviews a
+  bounded summary, priced in the plan. A checkpoint that raises a halt stops the run after it
+  until the halt is acknowledged or the monitored stage re-authored. Checkpoint 6 runs inside
+  ``rubric-evolution`` at every epoch boundary when its settings name a ``monitor``.
+
+Slots at one position run in :data:`SLOT_ORDER`. ``after-families`` slots run once the
+preparation's variance build has saved the reviewed families and before any start is authored:
+the front door runs that build first (the preparation then replays it with no call). An executor
+prices its work credential-free and runs or replays it, like every other front-door stage.
 """
 
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.optimize.evaluation.variance.frontdoor_executors import (
@@ -49,6 +56,7 @@ from exp.optimize.evaluation.variance.frontdoor_executors import (
 from exp.optimize.evaluation.variance.frontdoor_task_types import CurriculumSlotExecutor
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine
 from exp.optimize.evaluation.variance.rubric_evo_slot import RubricEvolutionExecutor
+from exp.optimize.evaluation.variance.tag_monitor_slot import TagMonitorExecutor
 
 SlotName = Literal[
     "tag-banks",
@@ -59,8 +67,30 @@ SlotName = Literal[
     "curriculum",
     "dense-hybrid",
     "rubric-evolution",
+    "tag-monitor-corpus",
+    "tag-monitor-families",
+    "tag-monitor-rules",
+    "tag-monitor-mining",
+    "tag-monitor-dense",
 ]
 """One front-door slot."""
+
+SLOT_ORDER: tuple[SlotName, ...] = (
+    "tag-banks",
+    "tag-monitor-corpus",
+    "task-types",
+    "state-rag",
+    "tag-monitor-families",
+    "rule-admission",
+    "tag-monitor-rules",
+    "blast-radius",
+    "tag-monitor-mining",
+    "curriculum",
+    "dense-hybrid",
+    "tag-monitor-dense",
+    "rubric-evolution",
+)
+"""The order slots at one position run in: each tag monitor checkpoint after what it monitors."""
 
 SlotPosition = Literal["after-families", "after-preparation", "after-pipeline"]
 """Where in the front-door sequence a slot runs."""
@@ -74,6 +104,11 @@ SLOT_POSITIONS: dict[SlotName, SlotPosition] = {
     "curriculum": "after-pipeline",
     "dense-hybrid": "after-pipeline",
     "rubric-evolution": "after-pipeline",
+    "tag-monitor-corpus": "after-families",
+    "tag-monitor-families": "after-families",
+    "tag-monitor-rules": "after-preparation",
+    "tag-monitor-mining": "after-pipeline",
+    "tag-monitor-dense": "after-pipeline",
 }
 """The fixed position of every slot."""
 
@@ -113,7 +148,17 @@ SLOT_CALLS: dict[SlotName, tuple[str, ...]] = {
         "with_task_type_difficulty",
     ),
     "dense-hybrid": ("dense_hybrid", "behavior_adversarial", "adversarial_rubric"),
-    "rubric-evolution": ("open_evolution", "run_boundary", "boundary_costs"),
+    "rubric-evolution": ("open_evolution", "run_boundary", "boundary_costs", "TagEpochMonitor"),
+    **{
+        name: ("run_checkpoint", "review_costs", "blocking_halts", "acknowledge_halt")
+        for name in (
+            "tag-monitor-corpus",
+            "tag-monitor-families",
+            "tag-monitor-rules",
+            "tag-monitor-mining",
+            "tag-monitor-dense",
+        )
+    },
 }
 """The owner entry points each slot's executor calls, where the owner has published them."""
 
@@ -126,6 +171,11 @@ SLOT_STAGES: dict[SlotName, str] = {
     "curriculum": "judged_attempts, ActorLadder, merge_curriculum, persist_difficulty_curriculum",
     "dense-hybrid": "hybrid dense reward: decision tags per step, judge on flagged steps",
     "rubric-evolution": "evolving rubric: revise both rubric parts at each epoch boundary",
+    "tag-monitor-corpus": "tag monitor 1: question fire rates, duplicates, abstains, coverage",
+    "tag-monitor-families": "tag monitor 2: family profiles, separating tags, split candidates",
+    "tag-monitor-rules": "tag monitor 3: rule-tag support and state-tag recall quality",
+    "tag-monitor-mining": "tag monitor 4: bar meta-rules, qualified points by tag, blast dominance",
+    "tag-monitor-dense": "tag monitor 5: Clef and judge disagreement, routing, tier tag rates",
 }
 """What each slot's stage does, printed in the plan."""
 
@@ -144,6 +194,15 @@ class SlotExecutor(Protocol):
         ...
 
 
+@runtime_checkable
+class HaltingExecutor(Protocol):
+    """A slot executor whose saved result can block the next phase (a tag monitor checkpoint)."""
+
+    def halt(self, context: SlotContext, result: ArtifactInput) -> str | None:
+        """Return why the next phase is refused, or None when nothing blocks it."""
+        ...
+
+
 DEFAULT_SLOT_EXECUTORS: dict[SlotName, SlotExecutor] = {
     "tag-banks": TagBankExecutor(),
     "task-types": TaskTypeExecutor(),
@@ -153,6 +212,11 @@ DEFAULT_SLOT_EXECUTORS: dict[SlotName, SlotExecutor] = {
     "curriculum": CurriculumSlotExecutor(),
     "dense-hybrid": PipelineSlotExecutor("dense-hybrid"),
     "rubric-evolution": RubricEvolutionExecutor(),
+    "tag-monitor-corpus": TagMonitorExecutor("corpus"),
+    "tag-monitor-families": TagMonitorExecutor("families"),
+    "tag-monitor-rules": TagMonitorExecutor("rules"),
+    "tag-monitor-mining": TagMonitorExecutor("mining"),
+    "tag-monitor-dense": TagMonitorExecutor("dense"),
 }
 """The owner-bound executor of every slot."""
 
