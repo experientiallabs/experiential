@@ -342,3 +342,39 @@ def test_completed_author_output_exhaustion_is_one_known_draw_and_replays_offlin
             code_revision="test",
         )
     assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("capacity", [8192, 32768])
+def test_larger_author_reply_remains_bounded_by_frozen_model_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: int
+) -> None:
+    """A reasoning author can reserve answer headroom only when its model permits it."""
+    project, spec, transport = proposal_fixture(tmp_path, monkeypatch)
+    catalog = load_model_catalog(project.model_catalog_path)
+    record = catalog.models[spec.model_alias]
+    assert record.capabilities is not None
+    record = record.model_copy(
+        update={
+            "capabilities": record.capabilities.model_copy(
+                update={"maximum_output_tokens": capacity, "context_window_tokens": 1048576}
+            )
+        }
+    )
+    catalog = catalog.model_copy(update={"models": {**catalog.models, spec.model_alias: record}})
+    write_model_catalog(project.model_catalog_path, catalog)
+    model, _ = RuntimeModelCatalog(catalog, environment={}).snapshot(spec.model_alias)
+    spec = TaskProposalSpec.model_validate(
+        {
+            **spec.model_dump(mode="json"),
+            "output_tokens": 16384,
+            "catalog_sha256": sha256_json(catalog.model_dump(mode="json")),
+            "model": model.model_dump(mode="json"),
+        }
+    )
+    request = proposal_request(project, spec)
+    if capacity < 16384:
+        with pytest.raises(ValueError, match="output exceeds model capacity"):
+            preflight_author(project, spec, request)
+    else:
+        preflight_author(project, spec, request)
+    assert not transport.requests
