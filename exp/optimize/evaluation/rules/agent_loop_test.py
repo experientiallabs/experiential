@@ -271,14 +271,14 @@ def test_native_delivery_accounts_for_escaping_schemas_and_refused_results(
     assert "cumulative" in str(messages[0].content)
 
 
-def test_native_loop_completes_pages_before_admitting_citations(
+def test_native_loop_delivers_complete_values_without_automatic_paging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Real phase/read assembly retains every page and grants only completed trusted evidence."""
+    """An admitted complete result stays in one message with its exact citation authority."""
     loop = _native_loop(tmp_path, monkeypatch)
     fake = ArtifactInput(artifact_id="synthetic", sha256="a" * 64)
     value = {"quote": '"\\雪' * 2200}
-    seen: list[str] = []
+    seen: list[JsonValue] = []
 
     def save(
         position: int,
@@ -310,14 +310,8 @@ def test_native_loop_completes_pages_before_admitting_citations(
             content = request.messages[-1].content
             assert isinstance(content, str)
             envelope = json.loads(content)
-            if isinstance(envelope.get("result"), dict) and "chunk" in envelope["result"]:
-                page = envelope["result"]
-                seen.append(page["chunk"])
-                if not page["complete"]:
-                    assert loop._served() == frozenset()
-                    return _model_reply(
-                        loop, [("continue_evidence", {"cursor": page["next_cursor"]})]
-                    )
+            if envelope.get("status") == "ok" and "result" in envelope:
+                seen.append(envelope["result"])
                 assert loop._served() == frozenset({"trace:t:span:one"})
         if "submit_draft" in names:
             return _model_reply(loop, [("submit_draft", {"value": 2})])
@@ -335,7 +329,9 @@ def test_native_loop_completes_pages_before_admitting_citations(
         _ANSWER,
         lambda draft, refs: None,
     )
-    assert transcript.stop == "answered" and json.loads("".join(seen)) == value
+    assert transcript.stop == "answered" and seen == [value]
+    assert len(transcript.tools) == 1
+    assert transcript.tools[0].delivery is not None and transcript.tools[0].delivery.complete
     assert transcript.tools[-1].served == ("trace:t:span:one",)
     assert all(tool.served == () for tool in transcript.tools[:-1])
     assert all(author_request_bytes(loop.settings, request) <= 128000 for request in requests)
@@ -360,3 +356,82 @@ def test_native_final_refuses_unfinished_evidence_document(
     final = loop._answered(_model_reply(loop, [("submit", {"value": 2})]), "submit")
     assert final.stop == "protocol_failure" and final.answer is None
     assert final.failure and "incomplete" in final.failure
+
+
+def test_native_optional_reads_leave_capacity_for_mandatory_phase_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Complete evidence reads cannot consume the space needed to finish the draw."""
+    loop = _native_loop(tmp_path, monkeypatch)
+    loop.profile = AgentProfile(
+        budget=EvidenceBudget(model_calls=7, tool_calls=16, maximum_usd=None)
+    )
+    fake = ArtifactInput(artifact_id="synthetic-reserved", sha256="a" * 64)
+    answer = ToolSchema(
+        name="submit",
+        description="Submit the answer.",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}, "rationale": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+
+    def save(
+        position: int,
+        call: ToolCall,
+        status: ToolStatus,
+        result: JsonValue,
+        served: tuple[str, ...],
+        delivery: NativeEvidenceDelivery | None = None,
+    ) -> AgentToolRecord:
+        """Keep exact delivery metadata without publishing synthetic provider artifacts."""
+        return AgentToolRecord(
+            call=len(loop.calls) - 1,
+            name=call.name,
+            arguments=call.arguments,
+            status=status,
+            served=served,
+            result=fake,
+            delivery=delivery,
+        )
+
+    def respond(request: ModelRequest, index: int) -> ModelResponse:
+        """Return bounded phase outputs after three complete evidence requests."""
+        if index == 1:
+            return _model_reply(loop, [("record_plan", {"hypotheses": [], "planned_reads": []})])
+        if index <= 4:
+            return _model_reply(loop, [("read_region", {})])
+        if index == 5:
+            return _model_reply(loop, [("submit_draft", {"value": 2, "rationale": "d" * 22000})])
+        if index == 6:
+            return _model_reply(
+                loop, [("record_self_check", {"issues": ["s" * 14000], "revise": False})]
+            )
+        return _model_reply(loop, [("submit", {"value": 2})])
+
+    monkeypatch.setattr(loop, "_save_tool", save)
+    requests = _script_loop(loop, monkeypatch, respond)
+    transcript = loop.run(
+        "Read evidence and finish.",
+        {"context": "c" * 5000},
+        (ToolSchema(name="read_region", description="Read", input_schema={"type": "object"}),),
+        lambda call: ("ok", {"text": "e" * 31000}, ("trace:source:span:evidence",)),
+        answer,
+        lambda draft, refs: None,
+    )
+    assert transcript.stop == "answered", transcript.failure
+    assert transcript.answer == {"value": 2} and len(requests) == 7
+    assert [call.phase for call in transcript.calls][-3:] == ["investigate", "self_check", "final"]
+    assert any(tool.status == "refused" for tool in transcript.tools)
+    assert all(
+        tool.delivery is not None and tool.delivery.complete
+        for tool in transcript.tools
+        if tool.status == "ok"
+    )
+    assert all(author_request_bytes(loop.settings, request) <= 128000 for request in requests)
+    assert all(
+        current.messages[: len(previous.messages)] == previous.messages
+        for previous, current in zip(requests, requests[1:], strict=False)
+    )

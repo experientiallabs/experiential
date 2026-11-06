@@ -58,7 +58,6 @@ from exp.optimize.evaluation.factory.authoring import (
 )
 from exp.optimize.evaluation.rules.evidence_pages import (
     CONTINUE_EVIDENCE,
-    PAGE_INSTRUCTION,
     EvidencePages,
     NativeEvidenceDelivery,
 )
@@ -69,7 +68,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v4"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v5"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"
@@ -86,6 +85,12 @@ ToolStatus = Literal["ok", "refused"]
 
 ToolRunner = Callable[[ToolCall], tuple[ToolStatus, JsonValue, tuple[str, ...]]]
 """Answer one read-only call: status, result, and the evidence locators the result served."""
+
+READ_INSTRUCTION = """
+Successful evidence reads deliver the complete requested JSON value and its native citations.
+A refused read delivers no evidence. Narrow an oversized read with the role's range tools;
+never infer omitted contents. The host reserves context capacity for mandatory answer phases.
+"""
 
 LOOP_INSTRUCTION = """
 
@@ -337,7 +342,7 @@ def agent_instruction(instruction: str, profile: AgentProfile, answer: str) -> s
     return (
         instruction
         + "\n"
-        + PAGE_INSTRUCTION
+        + READ_INSTRUCTION
         + LOOP_INSTRUCTION.replace("{budget}", budget).replace("{answer}", answer)
     )
 
@@ -420,6 +425,11 @@ class _Loop:
             AgentCall(index=index, response=reference, phase=phase, forced=forced, usage=usage)
         )
         return response
+
+    def _reading_limit(self) -> int:
+        """Leave bounded request capacity for mandatory draft and self-check output growth."""
+        reserve = min(32_768, self.settings.maximum_input_bytes // 4)
+        return self.settings.maximum_input_bytes - reserve
 
     def _short(self, request: ModelRequest, count: int) -> tuple[str, ...]:
         """Return the budget dimensions without room for ``count`` more calls like ``request``."""
@@ -525,7 +535,7 @@ class _Loop:
                 ),
             ),
         ]
-        read_tools = (*tools, CONTINUE_EVIDENCE)
+        read_tools = tools
         schemas = tuple((*read_tools, item) for item in own_tool.values())
         while True:
             own = own_tool[phase]
@@ -535,6 +545,7 @@ class _Loop:
             free = (
                 reading
                 and self.executed < self.profile.budget.tool_calls
+                and author_request_bytes(self.settings, probe) <= self._reading_limit()
                 and not self._short(probe, _MANDATORY[phase] + 1)
             )
             short = self._short(probe, _MANDATORY[phase])
@@ -588,7 +599,6 @@ class _Loop:
                     runner,
                     history=messages,
                     schemas=schemas,
-                    remaining_mandatory=_MANDATORY[phase],
                 )
             )
             if mine:
@@ -625,7 +635,6 @@ class _Loop:
         *,
         history: list[ModelMessage],
         schemas: tuple[tuple[ToolSchema, ...], ...],
-        remaining_mandatory: int = 3,
     ) -> list[ModelMessage]:
         """Execute read calls within the tool budget, persisting each result."""
         messages: list[ModelMessage] = []
@@ -652,7 +661,7 @@ class _Loop:
                                 [*history, *messages, pending], offered, offered[-1].name
                             ),
                         )
-                        <= self.settings.maximum_input_bytes
+                        <= self._reading_limit()
                         for offered in schemas
                     )
 
@@ -663,21 +672,12 @@ class _Loop:
                 else:
                     status, result, served = runner(call)
                     if status == "ok":
-                        maximum_pages = 1 + max(
-                            0,
-                            min(
-                                self.profile.budget.model_calls
-                                - len(self.calls)
-                                - remaining_mandatory,
-                                self.profile.budget.tool_calls - self.executed,
-                            ),
-                        )
                         status, result, served = self.pages.start(
                             call,
                             result,
                             served,
                             accepts,
-                            maximum_pages=maximum_pages,
+                            maximum_pages=1,
                         )
                 if status == "refused":
                     served = ()
