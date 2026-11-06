@@ -277,7 +277,14 @@ def assemble_start_proposal(answer: JsonObject) -> StartDraft:
         tool.model_dump(mode="json", exclude={"reads", "writes"}) for tool in tools
     ]
     proposal["manifest"] = {
-        "domains": [{"name": name, "owner": "simulated"} for name in sorted(state)],
+        "domains": [
+            {
+                "name": name,
+                "owner": "simulated",
+                "state_schema": _state_container_schema(state[name], domain_root=True),
+            }
+            for name in sorted(state)
+        ],
         "tools": [
             {"name": tool.name, "reads": list(tool.reads), "writes": list(tool.writes)}
             for tool in tools
@@ -287,6 +294,19 @@ def assemble_start_proposal(answer: JsonObject) -> StartDraft:
         RuleVerifierDraft.model_validate(proposal.get("verifier")).compile().model_dump(mode="json")
     )
     return StartDraft.model_validate(proposal)
+
+
+def _state_container_schema(value: JsonValue, *, domain_root: bool = False) -> JsonObject:
+    """Keep authored state containers intact while allowing values and contents to evolve."""
+    if isinstance(value, dict):
+        return {
+            "type": "object",
+            "properties": {key: _state_container_schema(item) for key, item in value.items()},
+            **({"required": sorted(value)} if domain_root and value else {}),
+        }
+    if isinstance(value, list):
+        return {"type": "array"}
+    return {}
 
 
 def validate_author_answer(

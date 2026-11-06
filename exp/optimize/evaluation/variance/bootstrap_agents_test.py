@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.models import ModelRequest, ToolCall
 from exp.optimize.evaluation.factory.authoring import author_request_bytes
@@ -166,3 +167,33 @@ def test_generated_probe_selects_a_full_domain_root() -> None:
     answer["probe_paths"] = {"tickets": "/tickets/status"}
     with pytest.raises(ValueError, match="full domain roots"):
         assemble_start_proposal(answer)
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "file contents",
+        {"exit_code": 0, "passed": 4},
+        {"files": "file contents", "pytest_last_run": None},
+    ],
+)
+def test_generated_domain_rejects_clobbered_state(broken: JsonValue) -> None:
+    """A file write or test result cannot replace the domain's state containers."""
+    from exp.common.core.artifacts import JsonObject
+    from exp.optimize.evaluation.variance.bootstrap_agents import assemble_start_proposal
+    from exp.optimize.evaluation.variance.bootstrap_test import _author_answer
+    from exp.runtime.environments.world_responses import validate_state_projection
+
+    answer = _author_answer("auth", {"findings": []})
+    answer["initial_state"] = {"tickets": {"files": {}, "pytest_last_run": None}}
+    answer["probe_paths"] = {"tickets": "/tickets"}
+    draft = assemble_start_proposal(answer)
+    schemas: dict[str, JsonObject] = {
+        row.name: row.state_schema for row in draft.manifest.domains if row.state_schema is not None
+    }
+    valid: JsonObject = {
+        "tickets": {"files": {"myre.py": "code"}, "pytest_last_run": {"exit_code": 0}}
+    }
+    validate_state_projection(valid, schemas)
+    with pytest.raises(ValueError, match="state violates schema"):
+        validate_state_projection({"tickets": broken}, schemas)
