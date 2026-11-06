@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v9"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v10"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -83,7 +83,8 @@ complete evidence reads, or research findings supplied in the opening.
 
 Provenance: observed only when the start restores a recorded state snapshot unchanged;
 reconstructed when it is rebuilt from recorded evidence and the recorded prefix of a source trace
-must replay to the same observations (name replay_trace and prefix_steps); authored when it is
+must replay to the same observations (name replay_trace and prefix_steps). Declare every tool
+used by that recorded prefix; its source schema is in task.tools. A start is authored when it is
 generated. An authored start is never the original environment; give reveal_probes (read-only
 calls whose first answers show the facts the task depends on).
 """

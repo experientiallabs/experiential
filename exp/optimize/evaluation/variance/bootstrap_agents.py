@@ -357,6 +357,16 @@ def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[
                 f"a reconstructed start replays 1 to {recorded} recorded steps of "
                 f"{draft.replay_trace}"
             )
+        required: set[str] = set()
+        for step in material.recorded_prefix(draft.replay_trace)[: draft.prefix_steps]:
+            action = step["action"]
+            assert isinstance(action, dict)
+            required.add(str(action["name"]))
+        if missing := sorted(required - set(names)):
+            raise ValueError(
+                f"a reconstructed start must declare its recorded prefix tools: {missing}; "
+                "their schemas are available in task.tools"
+            )
     if draft.provenance == "authored" and not draft.reveal_probes:
         raise ValueError("an authored start names reveal probes for its first-reveal check")
     for probe in draft.reveal_probes:

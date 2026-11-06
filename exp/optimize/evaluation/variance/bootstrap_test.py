@@ -914,3 +914,33 @@ def test_rejected_complete_author_answers_use_only_the_remaining_bounded_rounds(
         assert isinstance(outcome, BootstrapRefusal)
         assert outcome.kind == "author_unusable"
         assert manifest.by_status("registered") == ()
+
+
+def test_reconstruction_requires_each_recorded_prefix_tool_before_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing replay capability is an authoring error, before review or runtime dispatch."""
+    setup = _setup(tmp_path, monkeypatch)
+    original = answers
+
+    def proposal(role: str, opening: JsonObject) -> JsonObject:
+        result = original(role, opening)
+        if role == "start_author":
+            tools = result["tools"]
+            assert isinstance(tools, list)
+            result["tools"] = [
+                tool
+                for tool in tools
+                if isinstance(tool, dict) and tool.get("name") != "read_ticket"
+            ]
+        return result
+
+    monkeypatch.setattr(__name__ + ".answers", proposal)
+    script = BootScript()
+    manifest = setup.run(script, monkeypatch, tasks={"recon"})
+    outcome = load_outcome(setup.project, _row(manifest, "recon").identity)
+    assert isinstance(outcome, BootstrapRefusal)
+    assert outcome.kind == "author_unusable"
+    assert "recorded prefix tools" in outcome.diagnosis
+    assert "read_ticket" in outcome.diagnosis
+    assert script.tasks("start_reviewer") == []
