@@ -1,7 +1,7 @@
 """A frozen learned predictor shares the executable kernel's rollback and restore rules."""
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
@@ -9,6 +9,7 @@ from exp.common.core.artifacts import JsonObject, canonical_json_bytes, sha256_j
 from exp.common.models import (
     AssistantAction,
     ModelCapabilities,
+    ModelRequest,
     ModelResponse,
     OperationEconomics,
     ToolCall,
@@ -33,11 +34,22 @@ from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.evidence_reading import EvidenceReader, ReadingPolicy
+from exp.simulation.retrieval.state_rag import StateRAG, StateRetrievalPolicy
+from exp.simulation.retrieval.state_rag_test import served
+from exp.simulation.retrieval.state_tags_test import ERROR, bank
 from exp.simulation.rules.model import Predicate, Rule, RuleBook
 from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
-from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
+from exp.simulation.world_model.grounded_session import (
+    STATE_PRECEDENTS_GUIDANCE,
+    GroundedTransitionEngine,
+)
 from exp.simulation.world_model.prediction_reading import PredictionResolver
 from exp.simulation.world_model.runtime_test import _runtime
+from exp.simulation.world_model.state_memory import (
+    STATE_MEMORY_GUIDANCE,
+    StateMemory,
+    StateMemoryPolicy,
+)
 
 
 def world_fixture(
@@ -52,6 +64,8 @@ def world_fixture(
     facts: InstanceFacts | None = None,
     facts_version: int = 0,
     rule_book: RuleBook | None = None,
+    state_recall: StateRAG | None = None,
+    state_memory: StateMemory | None = None,
 ) -> tuple[ExecutableWorldRuntime, list[PredictorEvent], list[JsonObject]]:
     """Use the real grounded prompt/parser with scripted provider responses, never native truth."""
     predictor, _, _ = _runtime("", capabilities=ModelCapabilities(supports_tools=True))
@@ -123,6 +137,8 @@ def world_fixture(
         record=events.append,
         maximum_reasks=maximum_reasks,
         rule_book=rule_book,
+        state_recall=state_recall,
+        state_memory=state_memory,
     )
     return ExecutableWorldRuntime(manifest, factory, owner="simulated"), events, requests
 
@@ -920,3 +936,82 @@ def test_adopted_transitions_join_state_and_history_without_a_prediction() -> No
     with pytest.raises(ValueError, match="exactly its simulated domains"):
         backend.adopt(action, observation, {"tickets": {}})
     assert not events and not requests
+
+
+def test_state_precedents_and_state_description_reach_the_prompt_and_bind_the_definition() -> None:
+    """Both attach to the called tool, record per step, refresh on change and bind identity."""
+
+    def every_step_failed(request: DecisionRequest) -> JsonObject:
+        """Answer that the last result reported an error, for recorded and live states alike."""
+        return {"answers": {key: {"type": "noul", "noul": 0.95} for key in request.questions}}
+
+    rag, receipts, _ = served(
+        bank(ERROR), policy=StateRetrievalPolicy(top_k=2), decide=every_step_failed
+    )
+    saved: dict[str, JsonObject] = {}
+    authored: list[str] = []
+    moves: list[JsonObject] = []
+
+    def purchase(key: str, request: object, dispatch: Callable[[], JsonObject]) -> JsonObject:
+        """Buy each description draft once."""
+        del request
+        if key not in saved:
+            saved[key] = dispatch()
+        return saved[key]
+
+    def author(request: ModelRequest) -> str:
+        """Describe the ticket status shown in the prompt."""
+        prompt = request.messages[-1].content
+        assert isinstance(prompt, str)
+        authored.append(prompt)
+        status = "escalated" if '"escalated"' in prompt else "open"
+        return f"The ticket is {status}."
+
+    states = StateMemory(
+        StateMemoryPolicy(author_alias="author"),
+        complete=author,
+        model={"model": "author"},
+        purchase=purchase,
+        record=moves.append,
+    )
+    world, events, requests = world_fixture(
+        [status_edit("escalated")] * 3, state_recall=rag, state_memory=states
+    )
+    plain, _, _ = world_fixture([status_edit("escalated")])
+    assert isinstance(world.factory, GroundedWorldFactory)
+    assert isinstance(plain.factory, GroundedWorldFactory)
+    assert world.factory.definition == {
+        **plain.factory.definition,
+        "state_rag_sha256": rag.identity,
+        "state_precedents_prompt_sha256": sha256_json(STATE_PRECEDENTS_GUIDANCE),
+        "state_memory_sha256": states.identity,
+    }
+    with world.open(_task("escalate")) as session:
+        for _ in range(3):
+            session.execute(ToolCall(name="escalate", call_id="call", arguments={}))
+    prompt = json.dumps(requests[0])
+    assert "The ticket is open." in prompt and STATE_MEMORY_GUIDANCE.strip()[:40] in prompt
+    assert "Recorded steps whose environment state" in prompt
+    assert "The ticket is escalated." in json.dumps(requests[1])
+    assert len(authored) == 2 * StateMemoryPolicy(author_alias="a").calls_per_refresh
+    intents = [event.payload for event in events if event.stage == "intent"]
+    lifecycle = []
+    for intent in intents:
+        described = intent["state_memory"]
+        assert isinstance(described, dict)
+        rows = described["transitions"]
+        assert isinstance(rows, list)
+        lifecycle.append([row["event"] for row in rows if isinstance(row, dict)])
+    assert lifecycle == [
+        ["author", "described"],
+        ["state_changed", "refresh", "described"],
+        ["reuse"],
+    ], "described again only after the state changed"
+    assert len(moves) == 6
+    recall = intents[0]["state_recall"]
+    assert isinstance(recall, dict)
+    selected, excluded = recall["selected"], recall["excluded_lineage_ids"]
+    assert isinstance(selected, list) and len(selected) == 2
+    assert isinstance(excluded, list) and _task("escalate").lineage_group_id in excluded
+    assert len([row for row in receipts if "selected" in row]) == 3
+    assert any("transition" in row for row in receipts), "recall moves are recorded too"

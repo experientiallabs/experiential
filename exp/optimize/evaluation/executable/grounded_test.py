@@ -1167,3 +1167,91 @@ def test_bound_rule_memory_recalls_only_relevant_files_and_replays(
                 }
             ),
         )
+
+
+class _DescribingWire:
+    """One shared physical wire: state descriptions and scripted predictions."""
+
+    def __init__(self) -> None:
+        """Start with no recorded requests."""
+        self.descriptions: list[JsonObject] = []
+        self.predictions: list[JsonObject] = []
+
+    def post(
+        self, url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Describe the records state for author requests; predict everything else."""
+        del url, headers, timeout_seconds
+        system, _ = wire_messages(payload)
+        if system.startswith("You describe the current state"):
+            self.descriptions.append(payload)
+            return JsonHttpResponse(
+                status_code=200,
+                body={
+                    "id": f"describe-{len(self.descriptions)}",
+                    "model": "fixture-v1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "One record, status pending.",
+                            },
+                        }
+                    ],
+                },
+            )
+        self.predictions.append(payload)
+        return _prediction("read")
+
+
+def test_bound_state_memory_describes_the_state_replays_and_binds_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The description reaches the prompt, a replay buys nothing, and the policy binds identity."""
+    from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
+    from exp.simulation.world_model.state_memory import StateMemoryPolicy
+
+    project, fidelity = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    base = _record_spec(project, fidelity).model_copy(update={"maximum_physical_attempts": 20})
+    policy = StateMemoryPolicy(author_alias="model")
+    spec = base.model_copy(update={"state_memory": policy})
+    assert "state_memory" not in base.model_dump(mode="json")
+    wire = _DescribingWire()
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: wire)
+
+    def first_step(definition: GroundedRuntimeDefinition) -> WorldCheckpoint:
+        with (
+            continuation_runtime(project, definition.model_dump(mode="json")) as runtime,
+            runtime.world.open(definition.task) as world,
+        ):
+            assert world.execute(ToolCall(name="inspect", call_id="read", arguments={})).content
+            return world.checkpoint()
+
+    saved = first_step(spec)
+    assert len(wire.descriptions) == policy.calls_per_refresh
+    assert "One record, status pending." in json.dumps(wire.predictions[-1])
+    assert '"pending"' in wire_messages(wire.descriptions[0])[1]
+    intents = [
+        json.loads(project.artifacts.read_bytes(key, "event.json"))
+        for key in project.artifacts.list_ids(artifact_type="grounded-world-prediction")
+    ]
+    (intent,) = [event for event in intents if event["stage"] == "intent"]
+    assert intent["payload"]["state_memory"]["state"] == "current"
+
+    first_step(spec)
+    assert len(wire.descriptions) == policy.calls_per_refresh, "a replayed step buys nothing"
+
+    narrower = spec.model_copy(
+        update={"state_memory": policy.model_copy(update={"byte_budget": 512})}
+    )
+    changed = first_step(narrower)
+    assert isinstance(saved, ExecutableCheckpoint) and isinstance(changed, ExecutableCheckpoint)
+    assert changed.backend_sha256 != saved.backend_sha256
+    assert sha256_json(narrower) != sha256_json(spec) != sha256_json(base)
+    with pytest.raises(ValueError, match="completion alias"):
+        preflight_grounded_runtime(
+            project, spec.model_copy(update={"state_memory": StateMemoryPolicy(author_alias="jev")})
+        )
