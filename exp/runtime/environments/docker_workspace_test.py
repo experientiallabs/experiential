@@ -154,3 +154,62 @@ def test_real_workspace_execution_restore_and_false_green_control() -> None:
             )
         )
         assert result.is_error and json.loads(result.content)["exit_code"] != 0
+
+
+def test_starter_files_define_the_base_and_restore_does_not_reseed() -> None:
+    """Fresh worlds copy public starters; restoring retains the actual edited bytes."""
+    image = os.environ.get("EXP_TEST_WORKSPACE_IMAGE")
+    if image is None:
+        pytest.skip("requires an explicitly selected local Docker workspace image")
+    from exp.runtime.environments.worlds import WorldContext
+
+    configuration = DockerWorkspaceConfig(
+        image=image,
+        docker=tuple(shlex.split(os.environ.get("EXP_TEST_DOCKER", "docker"))),
+    )
+    factory = DockerWorkspaceFactory(configuration, files={"src/main.py": "value = 'λ'\n"})
+    assert factory.definition != DockerWorkspaceFactory(configuration).definition
+    with pytest.raises(ValueError):
+        DockerWorkspaceFactory(configuration, files={"../outside.py": "bad"})
+    task = TaskCase(
+        task_id="starter-control",
+        lineage_group_id="starter-control",
+        partition="fit",
+        instruction="Repair the starter.",
+        workload_weight=1,
+        origin="authored",
+    )
+    world = factory.create(task)
+    try:
+        first = world.capture()
+        reply = world.execute(
+            ToolCall(call_id="read", name="Read", arguments={"path": "src/main.py"}),
+            WorldContext.__new__(WorldContext),
+        )
+        assert json.loads(reply.content)["content"] == "value = 'λ'\n"
+        world.execute(
+            ToolCall(
+                call_id="write",
+                name="Write",
+                arguments={"path": "src/main.py", "content": "value = 2\n"},
+            ),
+            WorldContext.__new__(WorldContext),
+        )
+        changed = world.capture()
+        assert changed != first
+        restored = factory.restore(changed)
+        try:
+            assert restored.capture() == changed
+        finally:
+            restored.close()
+        fresh = factory.create(task)
+        try:
+            reply = fresh.execute(
+                ToolCall(call_id="fresh", name="Read", arguments={"path": "src/main.py"}),
+                WorldContext.__new__(WorldContext),
+            )
+            assert json.loads(reply.content)["content"] == "value = 'λ'\n"
+        finally:
+            fresh.close()
+    finally:
+        world.close()

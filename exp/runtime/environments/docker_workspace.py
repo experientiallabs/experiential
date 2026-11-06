@@ -11,9 +11,15 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
-from exp.common.core.artifacts import JsonObject, Sha256, sha256_bytes
+from exp.common.core.artifacts import (
+    JsonObject,
+    Sha256,
+    sha256_bytes,
+    validate_artifact_file_path,
+)
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import Observation
@@ -156,27 +162,52 @@ def _command(
 class DockerWorkspaceFactory:
     """Create isolated workspaces or restore detached native filesystem images."""
 
-    def __init__(self, configuration: DockerWorkspaceConfig) -> None:
-        """Bind the operator-selected image and Docker authority."""
+    def __init__(
+        self, configuration: DockerWorkspaceConfig, *, files: Mapping[str, str] | None = None
+    ) -> None:
+        """Bind the selected image and public UTF-8 starter files, never private answers."""
         self.configuration = configuration
+        self._files = dict(files or {})
+        for path in self._files:
+            if validate_artifact_file_path(path).as_posix() != path:
+                raise ValueError("starter files require canonical relative paths")
 
     @property
     def definition(self) -> JsonObject:
         """Bind checkpoint compatibility to image, resources and executable semantics."""
         config = self.configuration
         return {
-            "protocol": "docker-workspace-v1",
+            "protocol": "docker-workspace-v2",
             "image": config.image,
             "maximum_seconds": config.maximum_seconds,
             "memory_mb": config.memory_mb,
             "workspace_mb": config.workspace_mb,
             "file_script_sha256": sha256_bytes(_FILE_SCRIPT.encode()),
+            "files": {
+                path: sha256_bytes(content.encode())
+                for path, content in sorted(self._files.items())
+            },
         }
 
     def create(self, task: TaskCase) -> DockerWorkspace:
-        """Create an empty workspace without copying private task answers."""
+        """Create a private copy of this base's public starter files."""
         del task
-        return DockerWorkspace(self.configuration)
+        workspace = DockerWorkspace(self.configuration)
+        try:
+            for path, content in self._files.items():
+                result = workspace._exec(
+                    ("python", "-c", _FILE_SCRIPT),
+                    payload=json.dumps(
+                        {"operation": "write", "path": path, "content": content}
+                    ).encode(),
+                    check=False,
+                )
+                if result.returncode:
+                    raise ValueError("workspace starter file could not be written")
+        except BaseException:
+            workspace.close()
+            raise
+        return workspace
 
     def restore(self, image: NativeImage) -> DockerWorkspace:
         """Restore an isolated workspace, refusing altered or unknown image parts."""
