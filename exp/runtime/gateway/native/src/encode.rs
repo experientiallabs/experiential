@@ -803,7 +803,23 @@ pub fn completed_chat_body_with_carrier(
         })
         .collect();
     let logprobs = crate::logprobs::aggregate(events);
-    let reasoning = reasoning_carrier_candidate(events)?;
+    // Only a completing terminal seals a reasoning carrier (the sealer and the
+    // carrier slot below both require one). A turn the output budget cut
+    // (Incomplete) can end mid tool call: the truncated call was started but
+    // never completed, so building a candidate would fail "requires complete
+    // unique tool calls" and turn the provider's honest `length` into a 502.
+    // Every non-streaming Fireworks glm-5.3-flash tool turn that hit
+    // max_tokens mid call failed this way (production, 2026-11-05). The
+    // events are still validated; only the candidate is skipped.
+    let reasoning = if matches!(terminal, Event::Completed | Event::StoppedAtSequence(_)) {
+        reasoning_carrier_candidate(events)?
+    } else {
+        let mut state = ReasoningCarrierState::default();
+        for event in events {
+            state.observe(event)?;
+        }
+        None
+    };
     let incomplete = matches!(terminal, Event::Incomplete);
     let finish_reason = if incomplete {
         "length"

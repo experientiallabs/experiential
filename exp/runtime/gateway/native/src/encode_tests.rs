@@ -199,6 +199,55 @@ fn fireworks_chat_reasoning_fails_closed_without_carrier_or_unique_completion() 
     assert!(reasoning_carrier_candidate(&duplicate).is_err());
 }
 
+/// A reasoning tool turn cut by the output budget mid call (the call started,
+/// never completed, the dialect dropped it and settled `length`) answers as a
+/// non-streaming `finish_reason: "length"` with no carrier, never a 502
+/// (Fireworks glm-5.3-flash at max_tokens=4096, production 2026-11-05).
+#[test]
+fn fireworks_chat_reasoning_cut_mid_tool_call_is_incomplete_not_malformed() {
+    let mut events = fireworks_tool_events();
+    // Drop the completion and the Completed terminal: the call stays open.
+    events.truncate(3);
+    events.push(Event::Usage(Usage {
+        input_tokens: Some(8_000),
+        output_tokens: Some(4_096),
+        reasoning_tokens: Some(1_900),
+        ..Usage::default()
+    }));
+    events.push(Event::Incomplete);
+
+    let completed = completed_chat_body_with_carrier(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        &events,
+        &[],
+        None,
+        false,
+    )
+    .expect("a budget-truncated reasoning tool turn must encode");
+    assert!(completed.incomplete);
+    assert!(completed.failure.is_none());
+    let choice = &completed.body["choices"][0];
+    assert_eq!(choice["finish_reason"], json!("length"));
+    assert!(choice["message"].get("tool_calls").is_none());
+    assert!(choice["message"].get("reasoning_content").is_none());
+
+    // The events are still validated: a duplicated tool start fails closed.
+    let mut duplicate = events.clone();
+    duplicate.insert(2, events[1].clone());
+    assert!(completed_chat_body_with_carrier(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        &duplicate,
+        &[],
+        None,
+        false,
+    )
+    .is_err());
+}
+
 #[test]
 fn reasoning_carrier_preserves_provider_tool_start_order() {
     let events = vec![
