@@ -1,5 +1,7 @@
 """One executable write boundary for prompt construction and proposal admission."""
 
+import json
+
 from jsonschema import Draft202012Validator
 from pydantic import Field, StrictStr
 
@@ -69,6 +71,28 @@ class StateEditPolicy(ContractModel):
                 ],
             },
         }
+
+    def generation_schema(self) -> JsonObject:
+        """Use plain path arrays on the wire; native admission retains exact scope checks."""
+        schema = self.edit_schema()
+        if not self.roots:
+            return schema
+        item = schema["items"]
+        assert isinstance(item, dict)
+        properties = item["properties"]
+        assert isinstance(properties, dict)
+        item.pop("allOf")
+        for name, roots in (("path", self.roots), ("from", (*self.roots, *self.read_roots))):
+            properties[name] = {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": ["string", "integer"]},
+                "description": (
+                    "Start with one of these roots and append child keys or indexes as needed: "
+                    + json.dumps(roots)
+                ),
+            }
+        return schema
 
     def require(self, proposal: ProposedTransition) -> None:
         """Refuse forbidden writes even when their net effect would be unchanged."""

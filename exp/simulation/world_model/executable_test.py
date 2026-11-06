@@ -621,8 +621,8 @@ def test_prediction_reader_failure_cannot_commit_or_silently_fall_back(failure: 
     assert any("questions" in str(row) for row in receipts)
 
 
-def test_executable_predictor_receives_manifest_derived_write_boundaries() -> None:
-    """The actual provider schema excludes clock and unrelated-domain edits."""
+def test_provider_path_proposals_remain_subject_to_native_write_boundaries() -> None:
+    """Plain wire paths cannot grant clock, ancestor or unrelated-domain write authority."""
     from jsonschema import Draft202012Validator
 
     runtime, _, requests = world_fixture([[]])
@@ -639,8 +639,15 @@ def test_executable_predictor_receives_manifest_derived_write_boundaries() -> No
     }
     assert validator.is_valid(proposal)
     for path in (["environment", "logical_time"], ["domains", "archive"], ["domains"]):
-        proposal["effect"]["edits"] = [{"op": "set", "path": path, "value": {}}]
-        assert not validator.is_valid(proposal)
+        edits: list[JsonObject] = [{"op": "set", "path": path, "value": {}}]
+        proposal["effect"]["edits"] = edits
+        assert validator.is_valid(proposal)
+        restricted, _, _ = world_fixture([edits])
+        with restricted.open(_task("escalate")) as world:
+            before = world.checkpoint()
+            with pytest.raises(ValueError, match="writable state paths"):
+                world.execute(ToolCall(name="escalate", call_id="call", arguments={}))
+            assert world.checkpoint() == before
     assert "runtime alone advances environment.logical_time" in json.dumps(requests[0])
 
 

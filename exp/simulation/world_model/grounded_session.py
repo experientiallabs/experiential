@@ -101,7 +101,7 @@ def frame_grounded_output(
     if output_protocol == "json-tool":
         schema = _GroundedJsonProposal.model_json_schema()
         if state_policy is not None:
-            schema["$defs"]["ApplyEdits"]["properties"]["edits"] = state_policy.edit_schema()
+            schema["$defs"]["ApplyEdits"]["properties"]["edits"] = state_policy.generation_schema()
         framed = framed.model_copy(
             update={
                 "tools": (
@@ -194,7 +194,7 @@ class GroundedTransitionEngine:
                 "output_tokens": self.maximum_output_tokens,
                 "json_object_output": self.json_object_output,
                 "output_protocol": self.output_protocol,
-                "protocol": "grounded-typed-response-v4",
+                "protocol": "grounded-typed-response-v5",
                 **(
                     {}
                     if self.prediction_reader is None

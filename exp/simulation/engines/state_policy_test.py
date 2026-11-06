@@ -20,7 +20,7 @@ from exp.simulation.engines.transition import ApplyEdits, ProposedObservation, P
         ([], False),
     ],
 )
-def test_advertised_paths_match_admission(path: list[str | int], allowed: bool) -> None:
+def test_native_paths_match_admission(path: list[str | int], allowed: bool) -> None:
     """Every unsupported path is rejected regardless of its proposed value."""
     policy = StateEditPolicy(roots=(("domains", "tickets"),))
     edit: JsonObject = {"op": "set", "path": path, "value": 0}
@@ -53,3 +53,24 @@ def test_copy_requires_both_read_authority_and_write_authority() -> None:
     assert not validator.is_valid([{**edit, "from": ["domains"]}])
     assert not validator.is_valid([{**edit, "path": ["domains", "input"]}])
     assert not validator.is_valid([{**edit, "value": "invented"}])
+
+
+def test_generation_schema_does_not_grant_native_write_authority() -> None:
+    """Provider-compatible proposals stay untrusted at the native scope boundary."""
+    policy = StateEditPolicy(roots=(("domains", "output"),), read_roots=(("call_arguments",),))
+    validator = Draft202012Validator(policy.generation_schema())
+    for path, allowed in (
+        (["domains", "output", "file"], True),
+        (["call_arguments", "content"], False),
+    ):
+        edit: JsonObject = {"op": "copy", "from": ["call_arguments", "content"], "path": path}
+        assert validator.is_valid([edit])
+        proposal = ProposedTransition(
+            effect=ApplyEdits(edits=[edit]),
+            observations=(ProposedObservation(call_id="c", reply={}, encoding="json"),),
+        )
+        if allowed:
+            policy.require(proposal)
+        else:
+            with pytest.raises(ValueError, match="writable state paths"):
+                policy.require(proposal)
