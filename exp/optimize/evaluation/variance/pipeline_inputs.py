@@ -162,7 +162,9 @@ def rules_costs(
     author = spec.author
     if spec.profile == "jev_memory" and spec.memory is not None:
         topics = min(tools + 1, spec.memory.maximum_topics)
-        return memory_stage_costs(project, author, spec.weighing, spec.memory, topics=topics)
+        return memory_stage_costs(
+            project, author, spec.weighing, spec.memory, topics=topics, trajectories=traces
+        )
     per_call = evaluation_costs(project, author)
     if spec.profile == "single_draw":
         line = f"{traces} extraction draws with {author.model_alias}"

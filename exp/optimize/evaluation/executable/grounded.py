@@ -61,10 +61,16 @@ from exp.common.release_revision import installed_execution_revision
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
+from exp.optimize.evaluation.executable.state_recall import (
+    StateRecallBinding,
+    bind_state_recall,
+    check_state_recall,
+)
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
+from exp.optimize.evaluation.rules.memory_admission import load_guard_table
 from exp.optimize.evaluation.variance.build_records import load_tag_retrieval_binding
 from exp.runtime.environments.world_contracts import (
     ExecutableCheckpoint,
@@ -94,6 +100,7 @@ from exp.simulation.reconstruction.models import resolve
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
 from exp.simulation.retrieval.tags import TagRetrievalBinding
+from exp.simulation.rules.admission import GuardTable, guard_rulebook
 from exp.simulation.rules.memory_set import MemorySet, load_memory_set
 from exp.simulation.rules.model import RuleBook
 from exp.simulation.rules.recall import RECALL_PROTOCOL, RecallPolicy, RuleRecall
@@ -117,10 +124,15 @@ class RuleMemoryBinding(ContractModel):
     Attributes:
         memory_set: Saved ``rule-memory-set`` artifact; its manifest digests every file.
         recall: Frozen recall policy, naming the admitted native decision alias.
+        guards: The family's saved ``rule-guard-table`` from tag admission. Its checkable
+            entries join the rule book every proposal must satisfy before it commits (through
+            ``guard_rulebook`` and ``check_proposed_transition``). Absent, the binding and
+            every derived identity are unchanged.
     """
 
     memory_set: ArtifactInput
     recall: RecallPolicy
+    guards: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class GroundedRuntimeDefinition(ContractModel):
@@ -167,6 +179,10 @@ class GroundedRuntimeDefinition(ContractModel):
             completion alias. Each prediction receives the description of the current visible
             state, refreshed when it changes. Absent, the definition and every derived identity
             are unchanged.
+        state_recall: Optional pinned state-tag index and policy. Each prediction receives the
+            recorded transitions whose pre-turn state agrees best with the live one, tagged by
+            the native decision alias through the decision cache. Absent, the definition and
+            every derived identity are unchanged.
     """
 
     task: TaskCase
@@ -198,6 +214,9 @@ class GroundedRuntimeDefinition(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     state_memory: StateMemoryPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    state_recall: StateRecallBinding | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -448,6 +467,8 @@ def _checked(
     rule_book = (
         None if spec.rule_book is None else load_rule_book(project.artifacts, spec.rule_book)
     )
+    if spec.rule_memory is not None and spec.rule_memory.guards is not None:
+        rule_book = guarded_rule_book(rule_book, load_guard_table(project, spec.rule_memory.guards))
     tag_retrieval = None
     if spec.tag_retrieval is not None:
         tag_retrieval = load_tag_retrieval_binding(project, spec.tag_retrieval)
@@ -469,7 +490,28 @@ def _checked(
         require_admitted_transport(
             catalog, spec.state_memory.author_alias, consumer="executable simulator"
         )
+    if spec.state_recall is not None:
+        check_state_recall(catalog, spec.state_recall)
     return catalog, artifact, embedder_alias, rule_book, tag_retrieval, rule_memory
+
+
+def guarded_rule_book(rule_book: RuleBook | None, table: GuardTable) -> RuleBook:
+    """Return the rule book with the guard table's checkable entries enforced alongside it.
+
+    Args:
+        rule_book: The learned rule book, or None.
+        table: The family's admitted action guards, postconditions and invariants.
+
+    Returns:
+        One book the runtime checker enforces; a guard whose rule id the book already holds
+        keeps the book's rule.
+    """
+    guards = guard_rulebook(table)
+    if rule_book is None:
+        return guards
+    held = {rule.rule_id for rule in rule_book.rules}
+    extra = tuple(rule for rule in guards.rules if rule.rule_id not in held)
+    return rule_book.model_copy(update={"rules": (*rule_book.rules, *extra)})
 
 
 def recall_decider(
@@ -649,7 +691,13 @@ def _runtime(
                         + (() if provider_grant is None else (provider_grant.registration,))
                         + (() if spec.rule_book is None else (spec.rule_book,))
                         + (() if spec.tag_retrieval is None else (spec.tag_retrieval,))
-                        + (() if spec.rule_memory is None else (spec.rule_memory.memory_set,)),
+                        + (() if spec.rule_memory is None else (spec.rule_memory.memory_set,))
+                        + (
+                            ()
+                            if spec.rule_memory is None or spec.rule_memory.guards is None
+                            else (spec.rule_memory.guards,)
+                        )
+                        + (() if spec.state_recall is None else (spec.state_recall.index,)),
                         key=lambda reference: reference.artifact_id,
                     )
                 ),
@@ -689,6 +737,20 @@ def _runtime(
             record=receipt_recorder(project, identity, revision, lambda: datetime.now(UTC)),
         )
 
+    state_recall = None
+    if spec.state_recall is not None:
+        state_recall = bind_state_recall(
+            project,
+            spec.state_recall,
+            world_model=spec.world_model,
+            registry=registry,
+            transport=transport,
+            deadline=deadline,
+            clock=lambda: datetime.now(UTC),
+            record=receipt_recorder(project, identity, revision, lambda: datetime.now(UTC)),
+            embedding=embedding,
+        )
+
     grounded_factory = GroundedWorldFactory(
         GroundedTransitionEngine(
             runtime,
@@ -709,6 +771,7 @@ def _runtime(
         rule_book=rule_book,
         rule_memory=recall,
         state_memory=state_memory,
+        state_recall=state_recall,
     )
     factory: WorldBackendFactory = grounded_factory
     sandbox = None

@@ -273,7 +273,9 @@ class _RulesStage:
             None
             if report.memory_set is None
             else RuleMemoryBinding(
-                memory_set=report.memory_set, recall=RecallPolicy(jev_alias=spec.rules.jev_alias)
+                memory_set=report.memory_set,
+                recall=RecallPolicy(jev_alias=spec.rules.jev_alias),
+                guards=None if report.memory_stage is None else report.memory_stage.guards_artifact,
             )
         )
         job = spec.mining.registered

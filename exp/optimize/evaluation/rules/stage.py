@@ -366,6 +366,7 @@ def run_rules_stage(
     search: TraceSearch | None = None,
     decisions: DecisionsTraceTagger | DecisionBoundary | None = None,
     fidelity: FidelityReplay | None = None,
+    family: str | None = None,
 ) -> RulesStageReport:
     """Run, or replay, the learned-rules stage over world-learning traces.
 
@@ -387,6 +388,8 @@ def run_rules_stage(
         decisions: The System One decisions client (``jev_memory``); its model joins the identity.
         fidelity: Held-in replay for the fidelity auditor (``jev_memory``); the call-free
             predicate replay when None. Its identity joins the run identity.
+        family: Environment family the ``jev_memory`` guard table is named for; it joins the
+            run identity. None names the table by the run identity.
 
     Returns:
         The report, also saved as a ``rules-stage-report`` artifact.
@@ -436,6 +439,8 @@ def run_rules_stage(
         }
         if fidelity is not None:
             fields["fidelity"] = fidelity.identity
+        if family is not None:
+            fields["family"] = family
     identity = stable_id(
         "rules-stage",
         {
@@ -490,6 +495,7 @@ def run_rules_stage(
                     for trace in traces
                     if trace.trace_id in exposure.traces
                 },
+                family=family,
             )
             weighings = staged.weighings
             responses = staged.transcripts()

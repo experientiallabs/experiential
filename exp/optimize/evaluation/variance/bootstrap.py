@@ -225,12 +225,18 @@ def family_knowledge(
             code_revision=code_revision,
             search=search,
             decisions=decisions,
+            family=adapter.family_id,
         )
         report = artifact_input(project.artifacts.read(learned.identity + "-result").manifest)
         rulebook, memory = learned.rulebook, None
         if learned.memory_set is not None:
             recall = RecallPolicy(jev_alias=spec.runtime.jev_alias)
-            memory = RuleMemoryBinding(memory_set=learned.memory_set, recall=recall)
+            staged = learned.memory_stage
+            memory = RuleMemoryBinding(
+                memory_set=learned.memory_set,
+                recall=recall,
+                guards=None if staged is None else staged.guards_artifact,
+            )
     book = load_rulebook(project, rulebook)
     return FamilyKnowledge(
         family_id=adapter.family_id,
