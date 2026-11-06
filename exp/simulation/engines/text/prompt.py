@@ -76,7 +76,7 @@ RECONSTRUCTED_TEXT_SYSTEM_PROMPT = (
 RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT = (
     _WORLD_MODEL_INSTRUCTIONS.replace(
         "Protocol version: text-world-model-v3.",
-        "Protocol version: grounded-json-transition-v2.",
+        "Protocol version: grounded-json-transition-v3.",
     )
     + """Submit exactly one submit_transition proposal. This answer tool only records your
 proposed consequences; it does not execute the requested environment action.
@@ -87,7 +87,10 @@ ordered ops. set {"op":"set","path":[...],"value":...} creates or replaces an ob
 (missing parent objects are created) or an existing list index; delete removes a key or index;
 append adds to an existing list; remove_value removes the first equal list element.
 copy {"op":"copy","from":[...],"path":[...]} deep-copies an existing source to a set-compatible
-destination, preserving its values and types exactly. Later edits can change that copy. Paths are
+destination, preserving its values and types exactly. Executable state also exposes the current
+call's read-only call_arguments. To transfer supplied values exactly, use copy from
+["call_arguments", <argument key>, ...] instead of regenerating their literal content.
+Later edits can change the destination copy, but never the read-only call_arguments. Paths are
 lists of object keys and list indexes. Use an empty edits list when the state does not change;
 never restate unchanged state. terminal is false.
 The external observation is serialized by code; you decide every reply value and state effect.

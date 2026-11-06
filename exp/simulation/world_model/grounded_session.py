@@ -194,7 +194,7 @@ class GroundedTransitionEngine:
                 "output_tokens": self.maximum_output_tokens,
                 "json_object_output": self.json_object_output,
                 "output_protocol": self.output_protocol,
-                "protocol": "grounded-typed-response-v3",
+                "protocol": "grounded-typed-response-v4",
                 **(
                     {}
                     if self.prediction_reader is None

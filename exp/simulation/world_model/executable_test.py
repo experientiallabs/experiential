@@ -920,3 +920,41 @@ def test_adopted_transitions_join_state_and_history_without_a_prediction() -> No
     with pytest.raises(ValueError, match="exactly its simulated domains"):
         backend.adopt(action, observation, {"tickets": {}})
     assert not events and not requests
+
+
+def test_argument_copy_preserves_literal_bytes_without_persisting_input_state() -> None:
+    """A proposed copy can transfer a supplied payload exactly through restore."""
+    literal = 'λ"\\\\\n' * 1024
+    runtime, _, _ = world_fixture(
+        [
+            [
+                {
+                    "op": "copy",
+                    "from": ["call_arguments", "content"],
+                    "path": ["domains", "tickets", "payload"],
+                }
+            ]
+        ]
+    )
+    task = _task("escalate")
+    with runtime.open(task) as world:
+        world.execute(ToolCall(name="escalate", call_id="call", arguments={"content": literal}))
+        checkpoint = world.checkpoint()
+        wire = json.loads(checkpoint.image.parts["predictor.json"])
+        assert wire["state"] == {"tickets": {"status": "open", "payload": literal}, "archive": {}}
+    with runtime.restore(task, checkpoint) as restored:
+        assert restored.checkpoint() == checkpoint
+
+
+def test_call_arguments_are_read_only_and_a_refusal_rolls_back() -> None:
+    """The predictor may copy current arguments but cannot rewrite them."""
+    runtime, _, _ = world_fixture(
+        [[{"op": "set", "path": ["call_arguments", "content"], "value": "changed"}]]
+    )
+    with runtime.open(_task("escalate")) as world:
+        before = world.checkpoint()
+        with pytest.raises(ValueError, match="writable state paths"):
+            world.execute(
+                ToolCall(name="escalate", call_id="call", arguments={"content": "original"})
+            )
+        assert world.checkpoint() == before

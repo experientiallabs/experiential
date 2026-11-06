@@ -129,7 +129,7 @@ class GroundedWorldFactory:
     def definition(self) -> JsonObject:
         """Freeze all predictor semantics that an executable checkpoint may resume."""
         return {
-            "implementation": "grounded-domain-world-v2",
+            "implementation": "grounded-domain-world-v3",
             "engine": self._identity,
             "memory": self._memory_identity,
             "manifest": self.manifest.model_dump(mode="json"),
@@ -255,7 +255,11 @@ class _GroundedWorldBackend:
         policy = self.factory.manifest.tool(action.name)
         clock: JsonObject = {"logical_time": context.now}
         visible = {name: deepcopy(self.state[name]) for name in sorted(policy.domains())}
-        state: JsonObject = {"domains": visible, "environment": clock}
+        state: JsonObject = {
+            "domains": visible,
+            "environment": clock,
+            "call_arguments": deepcopy(action.arguments),
+        }
         memory = None
         if self.factory.memory is not None:
             messages = []
@@ -306,7 +310,10 @@ class _GroundedWorldBackend:
             )
         state_policy = StateEditPolicy(
             roots=tuple(("domains", name) for name in policy.writes),
-            read_roots=tuple(("domains", name) for name in sorted(policy.domains())),
+            read_roots=(
+                ("call_arguments",),
+                *(("domains", name) for name in sorted(policy.domains())),
+            ),
         )
         operation = "grounded-world-" + uuid4().hex
         learned: tuple[JsonObject, ...] = ()
@@ -466,10 +473,13 @@ class _GroundedWorldBackend:
         state_policy.require(proposal)
         next_state = proposal.next_state(state)
         if (
-            set(next_state) != {"domains", "environment"}
+            set(next_state) != {"domains", "environment", "call_arguments"}
             or next_state["environment"] != state["environment"]
+            or next_state["call_arguments"] != state["call_arguments"]
         ):
-            raise ValueError("predictor cannot change the environment-owned logical clock")
+            raise ValueError(
+                "predictor cannot change the environment-owned logical clock or call arguments"
+            )
         domains = next_state["domains"]
         if not isinstance(domains, dict):
             raise ValueError("simulated domains must remain an object")
