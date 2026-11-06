@@ -435,3 +435,17 @@ def test_native_optional_reads_leave_capacity_for_mandatory_phase_outputs(
         current.messages[: len(previous.messages)] == previous.messages
         for previous, current in zip(requests, requests[1:], strict=False)
     )
+
+
+def test_forced_phase_offers_only_its_required_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forced draft cannot advertise another evidence read after that budget is spent."""
+    loop = _native_loop(tmp_path, monkeypatch)
+    read = ToolSchema(name="read_trace", description="Read", input_schema={"type": "object"})
+    tools = (read, _ANSWER)
+    messages = [ModelMessage(role="user", content="Finish the draft.")]
+    forced = loop._request(messages, tools, _ANSWER.name)
+    assert tuple(tool.name for tool in forced.tools) == (_ANSWER.name,)
+    free = loop._request(messages, tools, None)
+    assert free.tools == tools

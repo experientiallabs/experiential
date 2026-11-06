@@ -68,7 +68,7 @@ from exp.optimize.evaluation.variance.evidence_tools import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PLAN_TOOL, SELF_CHECK_TOOL, draft_tool
 
-AGENT_LOOP_PROTOCOL = "rules-agent-loop-v5"
+AGENT_LOOP_PROTOCOL = "rules-agent-loop-v6"
 """Version of the loop phases, phase prompts and budget rules; change it whenever any changes."""
 
 TRANSCRIPT_TYPE = "rules-agent-transcript"
@@ -503,7 +503,7 @@ class _Loop:
         """Build one loop request, forcing ``forced`` when it is set."""
         return ModelRequest(
             messages=tuple(messages),
-            tools=tools,
+            tools=tuple(tool for tool in tools if forced is None or tool.name == forced),
             tool_choice=ToolChoice(name=forced) if forced else "required",
             maximum_output_tokens=self.settings.output_tokens,
         )
