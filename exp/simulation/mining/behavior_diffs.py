@@ -14,11 +14,20 @@ class BehaviorStep(ContractModel):
         step_id: Immutable locator of the action or completion boundary.
         tags: Confident positive question identities; uncertain labels stay upstream.
         observed_error: Whether native evidence records an error at this boundary.
+        unknown_tags: Questions whose evidence is unresolved, never treated as negative.
     """
 
     step_id: str = Field(min_length=1)
     tags: frozenset[str]
     observed_error: bool = False
+    unknown_tags: frozenset[str] = frozenset()
+
+    @model_validator(mode="after")
+    def disjoint_answers(self) -> "BehaviorStep":
+        """Refuse simultaneously positive and unresolved labels."""
+        if self.tags & self.unknown_tags:
+            raise ValueError("positive and unresolved tags must be disjoint")
+        return self
 
 
 class MatchedBehavior(ContractModel):
@@ -123,8 +132,10 @@ def mine_behavior_differences(
         if right.goal_verified is True and left.goal_verified is not True:
             left, right = right, left
         left_tags, right_tags = _evidence(left), _evidence(right)
-        added = tuple(sorted(right_tags.keys() - left_tags.keys()))
-        removed = tuple(sorted(left_tags.keys() - right_tags.keys()))
+        left_unknown = {tag for step in left.steps for tag in step.unknown_tags}
+        right_unknown = {tag for step in right.steps for tag in step.unknown_tags}
+        added = tuple(sorted(right_tags.keys() - left_tags.keys() - left_unknown))
+        removed = tuple(sorted(left_tags.keys() - right_tags.keys() - right_unknown))
         if not added and not removed:
             continue
         difference = BehaviorDifference(

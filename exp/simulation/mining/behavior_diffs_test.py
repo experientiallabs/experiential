@@ -90,3 +90,21 @@ def test_duplicate_evidence_and_duplicate_runs_are_refused() -> None:
                 "steps": [BehaviorStep(step_id="same", tags=frozenset())] * 2,
             }
         )
+
+
+def test_unresolved_answer_never_becomes_a_symbolic_removal() -> None:
+    """A confident positive versus an unknown is not evidence of a behavioral difference."""
+    left = _run("left", frozenset({"verified_result"}), goal_verified=True)
+    right = _run("right", frozenset())
+    right = right.model_copy(
+        update={
+            "steps": (
+                BehaviorStep(
+                    step_id="right/step/1",
+                    tags=frozenset(),
+                    unknown_tags=frozenset({"verified_result"}),
+                ),
+            )
+        }
+    )
+    assert not mine_behavior_differences((left, right))
