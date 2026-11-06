@@ -32,7 +32,7 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.models import ModelMessage, ModelRequest
-from exp.simulation.state_machines import MachineRun, StateMachine, TransitionRecord
+from exp.common.state_machine import MachineRun, StateMachine, TransitionRecord
 
 STATE_MEMORY_PROTOCOL = "task-state-memory-v1"
 """Version of the state memory prompts, keys and clipping; change it whenever any changes."""
@@ -151,19 +151,19 @@ class MemoryState(StrEnum):
 
 
 MEMORY_MACHINE = StateMachine(
-    "task-state-memory",
-    MemoryState,
-    MemoryState.ABSENT,
-    {
-        (MemoryState.ABSENT, "author"): MemoryState.AUTHORING,
-        (MemoryState.AUTHORING, "described"): MemoryState.CURRENT,
-        (MemoryState.AUTHORING, "unusable"): MemoryState.FAILED,
-        (MemoryState.CURRENT, "reuse"): MemoryState.CURRENT,
-        (MemoryState.FAILED, "reuse"): MemoryState.FAILED,
-        (MemoryState.CURRENT, "state_changed"): MemoryState.STALE,
-        (MemoryState.FAILED, "state_changed"): MemoryState.STALE,
-        (MemoryState.STALE, "refresh"): MemoryState.AUTHORING,
-    },
+    name="task-state-memory",
+    states=MemoryState,
+    initial=frozenset({MemoryState.ABSENT}),
+    transitions=(
+        (MemoryState.ABSENT, "author", MemoryState.AUTHORING),
+        (MemoryState.AUTHORING, "described", MemoryState.CURRENT),
+        (MemoryState.AUTHORING, "unusable", MemoryState.FAILED),
+        (MemoryState.CURRENT, "reuse", MemoryState.CURRENT),
+        (MemoryState.FAILED, "reuse", MemoryState.FAILED),
+        (MemoryState.CURRENT, "state_changed", MemoryState.STALE),
+        (MemoryState.FAILED, "state_changed", MemoryState.STALE),
+        (MemoryState.STALE, "refresh", MemoryState.AUTHORING),
+    ),
 )
 """The one transition table of a task's description: authored, current, stale, refreshed."""
 

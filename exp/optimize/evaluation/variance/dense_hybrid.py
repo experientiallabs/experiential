@@ -43,6 +43,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.state_machine import Lifecycle, Refusal, Transition
 from exp.optimize.evaluation.variance.behavior_pairs import behavior_trajectory
 from exp.optimize.evaluation.variance.dense_candidates import DenseCandidate
 from exp.optimize.evaluation.variance.dense_judge import DenseRewardJudge, judge_dense
@@ -57,13 +58,7 @@ from exp.optimize.evaluation.variance.dense_reward import (
 )
 from exp.optimize.evaluation.variance.dense_spans import ActorTrajectory, SampledTokens
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence
-from exp.optimize.evaluation.variance.reward_states import (
-    FINDING_MACHINE,
-    FindingState,
-    Lifecycle,
-    Refusal,
-    Transition,
-)
+from exp.optimize.evaluation.variance.reward_states import FINDING_MACHINE, FindingState
 from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tag_selection import DEFAULT_AMBIGUITY_BAND, DEFAULT_FIRE_THRESHOLD
 from exp.simulation.mining.tagging import TagMatrix, TraceTagger, TraceTaggingError

@@ -32,14 +32,9 @@ from collections.abc import Mapping, Sequence
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
+from exp.common.state_machine import Lifecycle, Refusal, Transition
 from exp.optimize.evaluation.variance.blast_radius import BlastRadius
-from exp.optimize.evaluation.variance.reward_states import (
-    POINT_MACHINE,
-    Lifecycle,
-    PointState,
-    Refusal,
-    Transition,
-)
+from exp.optimize.evaluation.variance.reward_states import POINT_MACHINE, PointState
 from exp.simulation.mining.questions import Question, QuestionBank
 from exp.simulation.mining.tag_selection import DEFAULT_AMBIGUITY_BAND, DEFAULT_FIRE_THRESHOLD
 from exp.simulation.mining.tagging import TagMatrix, TraceTaggingError

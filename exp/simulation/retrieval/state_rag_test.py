@@ -10,6 +10,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
 from exp.common.project.paths import ProjectPaths
+from exp.common.state_machine import IllegalTransition, MachineRun
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.simulation.mining.tagging import DecisionCache
 from exp.simulation.retrieval.contracts import RAGLineageBinding, RAGTransition
@@ -36,7 +37,6 @@ from exp.simulation.retrieval.state_tags import (
     pre_turn_steps,
 )
 from exp.simulation.retrieval.state_tags_test import ScriptedDecisions, bank, transition
-from exp.simulation.state_machines import IllegalTransition, MachineRun
 
 LIVE_TASK = "Update the budget workbook"
 

@@ -49,5 +49,5 @@ def test_a_run_consents_before_it_starts_and_ends_once() -> None:
         RUN_MACHINE.target(RunState.PLANNED, "started")
     with pytest.raises(IllegalTransition):
         RUN_MACHINE.target(RunState.REPLAYING, "stopped")
-    assert RunState.FINISHED in RUN_MACHINE.terminal
+    assert RunState.FINISHED in RUN_MACHINE.final
     assert "planned --> consented: consented" in statecharts()

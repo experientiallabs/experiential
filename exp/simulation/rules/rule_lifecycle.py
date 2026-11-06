@@ -1,10 +1,12 @@
 """The explicit lifecycle of one rule on the tag admission path.
 
 A rule moves through admission as a declared state machine, never an implied one. The states are
-an enum, every legal move is one row of :data:`TRANSITIONS`, :func:`move` refuses anything else,
-each move is kept in the rule's persisted history, and :func:`statechart` renders the same table
-as a Mermaid state diagram for review. The table is plain data, so a later model-checking
-specification can be generated from it unchanged.
+an enum, every legal move is one row of :data:`TRANSITIONS`, declared as :data:`RULE_MACHINE` with
+the one implementation (:class:`~exp.common.state_machine.StateMachine`); :func:`move` refuses
+anything else, each move is kept in the rule's persisted history, and :func:`statechart` renders
+the same table as a Mermaid state diagram for review. Compile and admit are choice events: the
+draws or the verdict name the target, and the table must contain that exact row. The table is
+plain data, so a later model-checking specification can be generated from it unchanged.
 
 States:
 
@@ -27,6 +29,7 @@ from enum import StrEnum
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
+from exp.common.state_machine import IllegalTransition, StateMachine
 
 
 class RuleState(StrEnum):
@@ -64,14 +67,20 @@ TRANSITIONS: tuple[tuple[RuleState, str, RuleState], ...] = (
 )
 """The one transition table: ``(source, event, target)``; every other move is illegal."""
 
-TERMINAL: frozenset[RuleState] = frozenset(
-    state for state in RuleState if not any(source == state for source, _, _ in TRANSITIONS)
+RULE_MACHINE = StateMachine(
+    name="rule-admission-lifecycle",
+    states=RuleState,
+    initial=frozenset({INITIAL}),
+    transitions=TRANSITIONS,
 )
+"""The rule lifecycle machine over :data:`TRANSITIONS`."""
+
+TERMINAL: frozenset[RuleState] = RULE_MACHINE.final
 """States with no outgoing move."""
 
 
-class IllegalTransitionError(ValueError):
-    """A move that is not a row of the transition table."""
+class IllegalTransitionError(IllegalTransition):
+    """A rule move that is not a row of the transition table."""
 
 
 class RuleTransition(ContractModel):
@@ -106,7 +115,7 @@ class RuleLifecycle(ContractModel):
 
 def is_legal(source: RuleState, event: str, target: RuleState) -> bool:
     """Whether a move is a row of the transition table."""
-    return (source, event, target) in TRANSITIONS
+    return RULE_MACHINE.allows(source, event, target)
 
 
 def move(lifecycle: RuleLifecycle, event: str, target: RuleState, note: str = "") -> RuleLifecycle:
@@ -142,7 +151,4 @@ def replay(rule_id: str, history: Sequence[RuleTransition]) -> RuleLifecycle:
 
 def statechart() -> str:
     """The transition table as a Mermaid state diagram."""
-    lines = ["stateDiagram-v2", f"    [*] --> {INITIAL.value}"]
-    lines += [f"    {s.value} --> {t.value}: {event}" for s, event, t in TRANSITIONS]
-    lines += [f"    {state.value} --> [*]" for state in RuleState if state in TERMINAL]
-    return "\n".join(lines) + "\n"
+    return RULE_MACHINE.mermaid() + "\n"

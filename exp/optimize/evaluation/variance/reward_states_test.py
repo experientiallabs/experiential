@@ -6,6 +6,7 @@ from enum import StrEnum
 
 import pytest
 
+from exp.common.state_machine import StateMachine, Transition, target_table
 from exp.optimize.evaluation.variance.adversarial_rubric import resume
 from exp.optimize.evaluation.variance.behavior_adversarial import mining_lifecycle
 from exp.optimize.evaluation.variance.behavior_adversarial_test import report
@@ -16,8 +17,6 @@ from exp.optimize.evaluation.variance.reward_states import (
     FINDING_MACHINE,
     FamilyState,
     FindingState,
-    StateMachine,
-    Transition,
 )
 
 F = FindingState
@@ -78,23 +77,36 @@ def test_statecharts_are_generated_from_the_tables() -> None:
     """Every edge and terminal of the table appears in the Mermaid chart, nothing else."""
     for machine in (FINDING_MACHINE, FAMILY_MACHINE):
         chart = machine.mermaid().splitlines()
-        assert chart[0] == "stateDiagram-v2" and chart[1] == f"    [*] --> {machine.initial}"
-        edges = {(s.value, t.value) for s, targets in machine.table.items() for t in targets}
+        assert chart[0] == "stateDiagram-v2" and chart[1] == f"    [*] --> {machine.start}"
+        edges = {(s.value, f"{t.value}: {e}") for s, e, t in machine.transitions}
         drawn = {tuple(line.strip().split(" --> ")) for line in chart[2:]}
-        assert drawn == edges | {(state.value, "[*]") for state in machine.terminal()}
+        assert drawn == edges | {(state.value, "[*]") for state in machine.final}
     assert "uncertain --> scored" not in FINDING_MACHINE.mermaid()
-    assert set(FINDING_MACHINE.terminal()) == {F.SCORED, F.UNSCORED}
+    assert set(FINDING_MACHINE.final) == {F.SCORED, F.UNSCORED}
 
 
 def test_a_table_with_undeclared_states_is_refused() -> None:
-    """The table is the only source of legal moves and must name every declared state."""
+    """The table is the only source of legal moves and every declared state must be reachable."""
 
     class Two(StrEnum):
         A = "a"
         B = "b"
 
-    with pytest.raises(ValueError, match="declared states"):
-        StateMachine("bad", Two, Two.A, {Two.A: frozenset({Two.B})})
+    class Three(StrEnum):
+        A = "a"
+        B = "b"
+        C = "c"
+
+    with pytest.raises(ValueError, match="unreachable"):
+        StateMachine(
+            name="bad",
+            states=Three,
+            initial=frozenset({Three.A}),
+            transitions=target_table({Three.A: frozenset({Three.B})}),
+        )
+    assert StateMachine(
+        name="ok", states=Two, initial=frozenset({Two.A}), transitions=((Two.A, "b", Two.B),)
+    ).final == frozenset({Two.B})
 
 
 def test_an_aggregation_that_scores_an_uncertain_finding_is_refused() -> None:

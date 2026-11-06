@@ -43,6 +43,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.state_machine import Lifecycle, Transition
 from exp.optimize.evaluation.variance.behavior_differences import (
     BEHAVIOR_DIFFERENCES_TYPE,
     BehaviorDifferenceEvidence,
@@ -52,12 +53,7 @@ from exp.optimize.evaluation.variance.behavior_differences import (
 from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.pipeline_behaviors import compact_differences
-from exp.optimize.evaluation.variance.reward_states import (
-    FAMILY_MACHINE,
-    FamilyState,
-    Lifecycle,
-    Transition,
-)
+from exp.optimize.evaluation.variance.reward_states import FAMILY_MACHINE, FamilyState
 
 ADVERSARIAL_PROTOCOL = "adversarial-signatures-v1"
 """Version of the hack signature rule and the divergence record."""

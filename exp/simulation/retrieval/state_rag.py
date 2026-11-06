@@ -37,6 +37,7 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.state_machine import MachineRun, StateMachine, TransitionRecord
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS, DecisionRequest
 from exp.simulation.mining.tag_clusters import read_record, write_record
 from exp.simulation.retrieval.contracts import RAGLineageBinding, RAGTransition
@@ -48,7 +49,6 @@ from exp.simulation.retrieval.state_tags import (
     response_usd,
     tag_state,
 )
-from exp.simulation.state_machines import MachineRun, StateMachine, TransitionRecord
 
 STATE_INDEX_TYPE = "state-tag-index"
 """Artifact type of a saved :class:`StateTagIndex` (``index.json``)."""
@@ -314,17 +314,17 @@ class RecallState(StrEnum):
 
 
 RECALL_MACHINE = StateMachine(
-    "pre-turn-state-recall",
-    RecallState,
-    RecallState.PENDING,
-    {
-        (RecallState.PENDING, "tagged"): RecallState.TAGGED,
-        (RecallState.PENDING, "tag_failed"): RecallState.FAILED,
-        (RecallState.TAGGED, "ranked"): RecallState.RANKED,
-        (RecallState.RANKED, "tie_broken"): RecallState.TIE_BROKEN,
-        (RecallState.RANKED, "recorded"): RecallState.RECORDED,
-        (RecallState.TIE_BROKEN, "recorded"): RecallState.RECORDED,
-    },
+    name="pre-turn-state-recall",
+    states=RecallState,
+    initial=frozenset({RecallState.PENDING}),
+    transitions=(
+        (RecallState.PENDING, "tagged", RecallState.TAGGED),
+        (RecallState.PENDING, "tag_failed", RecallState.FAILED),
+        (RecallState.TAGGED, "ranked", RecallState.RANKED),
+        (RecallState.RANKED, "tie_broken", RecallState.TIE_BROKEN),
+        (RecallState.RANKED, "recorded", RecallState.RECORDED),
+        (RecallState.TIE_BROKEN, "recorded", RecallState.RECORDED),
+    ),
 )
 """The one transition table of a step's retrieval: tagged, ranked, maybe tie-broken, recorded."""
 

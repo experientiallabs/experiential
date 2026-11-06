@@ -9,8 +9,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelRequest
 from exp.common.project.paths import ProjectPaths
+from exp.common.state_machine import IllegalTransition
 from exp.simulation.mining.tagging import DecisionCache
-from exp.simulation.state_machines import IllegalTransition
 from exp.simulation.world_model.state_memory import (
     MEMORY_MACHINE,
     STATE_MEMORY_GUIDANCE,

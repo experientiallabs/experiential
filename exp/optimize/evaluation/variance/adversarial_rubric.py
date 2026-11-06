@@ -26,6 +26,7 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, JsonValue
 from exp.common.project import ProjectStore
+from exp.common.state_machine import Lifecycle, Refusal, Transition
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.behavior_adversarial import AdversarialFamily
@@ -33,13 +34,7 @@ from exp.optimize.evaluation.variance.behavior_profiles import BehaviorGuidance
 from exp.optimize.evaluation.variance.dense_reward import DenseRewardExport, DenseTag
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
 from exp.optimize.evaluation.variance.family_stages import MEASURE_PROFILE, run_role
-from exp.optimize.evaluation.variance.reward_states import (
-    FAMILY_MACHINE,
-    FamilyState,
-    Lifecycle,
-    Refusal,
-    Transition,
-)
+from exp.optimize.evaluation.variance.reward_states import FAMILY_MACHINE, FamilyState
 
 DRAFT_TOOL = "draft_adversarial_linter"
 """Forced answer tool of a linter draft."""
