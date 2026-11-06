@@ -31,7 +31,7 @@ from exp.optimize.evaluation.rules.evidence_pages import (
 from exp.optimize.evaluation.rules.locator_inventory import LOCATOR_GRAMMAR
 from exp.optimize.evaluation.variance.bootstrap_reads import STEP_READ_TOOL
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v11"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v12"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = (
@@ -57,7 +57,8 @@ domains in initial_state. When family.state_domains is supplied, initial_state
 must contain exactly those keys, including their exact spelling. family.domain_state_roots gives
 their valid pointer prefixes. Use these for probe_paths and concrete fact state_paths; leave a
 fact's state_paths empty when it names no concrete state field. Every domain is simulated.
-A verifier's description is explanatory; only outcome_schema, required_paths and rules execute.
+A verifier's description is explanatory; its typed rules, required_paths and relations execute.
+The host compiles the observation schema. Do not supply outcome_schema.
 Encode required behavior and verification in those checks, rather than describing checks that
 will never run. final_state in the episode outcome is the evaluator projection: each
 probe_paths key names the value selected by its pointer into the state. Verifier state paths
@@ -69,7 +70,13 @@ marker or note that never captures the actor's work. For example, probe_paths={"
 "/Workspace filesystem (~1workspace)"} exposes that domain under /final_state/workspace.
 A rule can then test /final_state/workspace/pytest_exit_code equals 0; the start must define
 where tool execution stores that result. A required_paths check alone does not assert success.
-An authored start must include at least one read-only reveal_probes call.
+An authored start must include at least one read-only reveal_probes call. Its tool's declared
+writes must be empty; a read-only Bash command does not make a write-capable Bash tool read-only.
+The start must leave the task unfinished. Do not replay a completed solution into a new start
+for the same task, or seed completed answer files unless the task explicitly repairs those
+files. A reconstructed prefix must end before completion. If the initial state is unrecorded,
+author an unsolved start from supported environment facts rather than replaying the whole
+successful trajectory. Facts describe the selected start, not the source episode's later result.
 Task requirements already appear in the public instruction: they are objectives, not
 environment facts. Do not duplicate them in the fact ledger or cite task.instruction.
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
@@ -98,7 +105,10 @@ Decide whether the start is coherent (state, manifest, tools, instruction and ve
 sufficiently specified (every deciding fact is settled, not unknown or guessed) and supports the
 task (an actor can succeed or fail on its own decisions). Inspect the executable verifier's
 rules, required_paths and outcome_schema, not only its description. When the task requires
-behavior or tests, file presence alone is insufficient. Answer accept, research or refuse.
+behavior or tests, file presence alone is insufficient. The selected start, after any replay
+prefix, must leave the task unfinished; prefilled solution files and an already green result
+do not establish a useful task. Check probe value types against every verifier path.
+Answer accept, research or refuse.
 Choose research when a deciding fact is missing and the family's evidence could settle it: name
 each missing fact as a research item with the question and why it decides. Choose refuse, with a
 diagnosis, when the start cannot be made sound from the evidence. Cite what supports each finding.
@@ -194,6 +204,7 @@ def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
         StartTool,
         domain_state_roots,
     )
+    from exp.simulation.evaluation.tasks import RuleVerifierDraft
 
     schema = StartDraft.model_json_schema()
     schema["title"] = "StartProposal"
@@ -201,7 +212,12 @@ def author_answer_tool(domain_names: tuple[str, ...] = ()) -> ToolSchema:
         "State, facts and verification with each tool's schema and effects declared together. "
         "The host derives the manifest from these tools and initial-state domain keys."
     )
+    verifier = RuleVerifierDraft.model_json_schema()
+    schema["$defs"].update(verifier.pop("$defs", {}))
+    schema["$defs"].pop("TaskVerifier", None)
+    schema["$defs"]["RuleVerifierDraft"] = verifier
     properties = schema["properties"]
+    properties["verifier"] = {"$ref": "#/$defs/RuleVerifierDraft"}
     del properties["manifest"]
     schema["required"].remove("manifest")
     schema["allOf"] = [

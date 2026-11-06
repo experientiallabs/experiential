@@ -227,6 +227,9 @@ class PreparationScript(ScriptedJsonTransport):
             body: JsonObject
             if role == "start_author":
                 body = _draft("auth", opening)
+                verifier = body["verifier"]
+                assert isinstance(verifier, dict)
+                verifier.pop("outcome_schema")
                 facts = body["facts"]
                 assert isinstance(facts, list) and isinstance(facts[0], dict)
                 inventory = LocatorInventory.model_validate(opening["inventory"]).decode()

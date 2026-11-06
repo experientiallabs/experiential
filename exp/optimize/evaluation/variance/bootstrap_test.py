@@ -212,6 +212,9 @@ def _draft(task_id: str, opening: JsonObject) -> JsonObject:
 def _author_answer(task_id: str, opening: JsonObject) -> JsonObject:
     """Script one tool declaration list; the host derives its capability manifest."""
     draft = _draft(task_id, opening)
+    verifier = draft["verifier"]
+    assert isinstance(verifier, dict)
+    verifier.pop("outcome_schema")
     manifest = draft.pop("manifest")
     assert isinstance(manifest, dict) and isinstance(manifest["tools"], list)
     entries = draft["tools"]

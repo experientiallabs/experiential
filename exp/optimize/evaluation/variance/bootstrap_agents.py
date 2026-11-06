@@ -73,6 +73,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     review_answer_tool,
 )
 from exp.optimize.evaluation.variance.bootstrap_reads import read_trace_steps, read_whole_trace
+from exp.simulation.evaluation.tasks import RuleVerifierDraft, grade
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.rules.contracts import trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
@@ -273,6 +274,9 @@ def assemble_start_proposal(answer: JsonObject) -> StartDraft:
             for tool in tools
         ],
     }
+    proposal["verifier"] = (
+        RuleVerifierDraft.model_validate(proposal.get("verifier")).compile().model_dump(mode="json")
+    )
     return StartDraft.model_validate(proposal)
 
 
@@ -341,6 +345,7 @@ def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[
         issues.append(str(error))
     if issues:
         raise ValueError("\n".join(issues))
+    _check_verifier_projection(draft)
     if draft.provenance not in material.allowed():
         raise ValueError(
             f"provenance {draft.provenance!r} is not supported by the evidence; allowed: "
@@ -374,6 +379,64 @@ def validate_draft(answer: JsonObject, material: StartMaterial, read: frozenset[
         if policy is None or policy.writes:
             raise ValueError(f"reveal probe {probe.name!r} is not a declared read-only tool")
     return draft
+
+
+def _check_verifier_projection(draft: StartDraft) -> None:
+    """Require predicates to address produced outcome fields and compatible state probes."""
+    roots = {"initial_state", "final_state", "final_answer", "steps", "stop_reason"}
+    verifier = draft.verifier
+    required = verifier.outcome_schema.get("required", [])
+    if isinstance(required, list):
+        unsupported = {name for name in required if isinstance(name, str)} - roots
+        if unsupported:
+            raise ValueError(
+                f"the workflow outcome does not produce {sorted(unsupported)}; "
+                "put task-specific evidence under final_state through probe_paths"
+            )
+    paths = list(verifier.required_paths)
+    paths.extend(rule.path for rule in verifier.rules)
+    for relation in verifier.relations:
+        paths.extend((relation.left, relation.right))
+    for relation in verifier.table_relations:
+        paths.extend((relation.source, relation.target))
+    for pointer in paths:
+        if not pointer:
+            continue
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in pointer.split("/")[1:]]
+        if not parts or parts[0] not in roots:
+            raise ValueError(
+                f"{pointer!r} is not a produced workflow outcome path; "
+                "put task-specific evidence under /final_state/<probe-key>"
+            )
+        if parts[0] not in {"initial_state", "final_state"} or len(parts) < 2:
+            continue
+        alias = parts[1]
+        if alias not in draft.probe_paths:
+            raise ValueError(f"verifier path {pointer!r} names unknown probe key {alias!r}")
+        value = resolve(draft.initial_state, draft.probe_paths[alias])
+        if len(parts) > 2 and not isinstance(value, (dict, list)):
+            raise ValueError(
+                f"verifier path {pointer!r} descends into scalar probe {alias!r}; "
+                "project its full mutable state domain instead of a note or marker"
+            )
+
+    if draft.provenance == "authored":
+        projection = {
+            name: resolve(draft.initial_state, pointer)
+            for name, pointer in draft.probe_paths.items()
+        }
+        control: JsonObject = {
+            "initial_state": projection,
+            "final_state": projection,
+            "steps": [],
+            "final_answer": "",
+            "stop_reason": "completed",
+        }
+        if grade(verifier, control).status == "pass":
+            raise ValueError(
+                "the authored start passes a no-action control; leave the task unfinished "
+                "and make the verifier require the actor's actual result"
+            )
 
 
 def validate_review(

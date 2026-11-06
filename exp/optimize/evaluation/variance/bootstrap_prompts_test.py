@@ -4,6 +4,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from exp.common.core.artifacts import JsonObject
+from exp.optimize.evaluation.variance.bootstrap_agents import assemble_start_proposal
 from exp.optimize.evaluation.variance.bootstrap_prompts import (
     author_answer_tool,
     reveal_answer_tool,
@@ -107,3 +108,17 @@ def test_authored_start_schema_requires_a_first_reveal() -> None:
     assert not validator.is_valid({**valid, "reveal_probes": []})
     without = {key: value for key, value in valid.items() if key != "reveal_probes"}
     assert not validator.is_valid(without)
+
+
+def test_author_verifier_uses_host_compiled_observation_schema() -> None:
+    """The author selects predicates without inventing an unreachable outcome envelope."""
+    answer = _author_answer("auth", {"findings": []})
+    verifier = answer["verifier"]
+    assert isinstance(verifier, dict)
+    verifier.pop("outcome_schema", None)
+    compiled = assemble_start_proposal(answer)
+    assert compiled.verifier.outcome_schema == {"type": "object"}
+    verifier["outcome_schema"] = {"required": ["pytest_status"]}
+    assert not Draft202012Validator(author_answer_tool().input_schema).is_valid(answer)
+    with pytest.raises(ValueError, match="outcome_schema"):
+        assemble_start_proposal(answer)

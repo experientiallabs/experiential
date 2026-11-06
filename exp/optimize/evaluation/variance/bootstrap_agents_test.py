@@ -94,3 +94,64 @@ def test_start_facts_require_delivered_evidence_not_an_inventory_listing() -> No
     assert validate_draft(draft, source, frozenset({"trace:allowed:span:r1"})).facts[
         0
     ].references == ("trace:allowed:span:r1",)
+
+
+@pytest.mark.parametrize("projection", ["/tickets/note", "/tickets"])
+def test_verifier_state_paths_need_a_container_projection(projection: str) -> None:
+    """Future files are gradeable from an empty object, not from a scalar note."""
+    draft = _draft("auth", {"findings": []})
+    draft["facts"] = [
+        {
+            "fact_id": "unused",
+            "statement": "Unverified tier.",
+            "status": "unknown",
+            "deciding": False,
+        }
+    ]
+    draft["initial_state"] = {"tickets": {"note": "481-byte prompt file"}}
+    draft["probe_paths"] = {"tickets": projection}
+    draft["verifier"] = {
+        "description": "The actor creates the result file.",
+        "outcome_schema": {},
+        "required_paths": ["/final_state/tickets/result.py"],
+        "rules": [{"operator": "exists", "path": "/final_state/tickets/result.py"}],
+    }
+    if projection.endswith("/note"):
+        with pytest.raises(ValueError, match="scalar"):
+            validate_draft(draft, material(), frozenset())
+    else:
+        validate_draft(draft, material(), frozenset())
+
+
+def test_verifier_cannot_require_an_unproduced_outcome_field() -> None:
+    """Task-specific test results must come from the state projection."""
+    draft = _draft("auth", {"findings": []})
+    draft["facts"] = [
+        {
+            "fact_id": "unused",
+            "statement": "Unverified tier.",
+            "status": "unknown",
+            "deciding": False,
+        }
+    ]
+    verifier = draft["verifier"]
+    assert isinstance(verifier, dict)
+    verifier["required_paths"] = ["/pytest_status"]
+    with pytest.raises(ValueError, match="workflow outcome"):
+        validate_draft(draft, material(), frozenset())
+
+
+def test_authored_start_cannot_pass_without_any_actor_action() -> None:
+    """A precompleted state or trivial verifier fails the no-action control."""
+    draft = _draft("auth", {"findings": []})
+    draft["facts"] = [
+        {
+            "fact_id": "unused",
+            "statement": "Unverified tier.",
+            "status": "unknown",
+            "deciding": False,
+        }
+    ]
+    draft["initial_state"] = {"tickets": {"outcome": "right"}}
+    with pytest.raises(ValueError, match="no-action"):
+        validate_draft(draft, material(), frozenset())
