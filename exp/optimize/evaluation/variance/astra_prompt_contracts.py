@@ -26,7 +26,7 @@ from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, Sha2
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 
-ASTRA_PROMPT_PROTOCOL = "astra-prompt-refinement-v1"
+ASTRA_PROMPT_PROTOCOL = "astra-prompt-refinement-v2"
 """Version of the loop, its contracts, its forced tools and its host checks."""
 
 RECORD_TYPE = "astra-prompt-refinement"

@@ -585,17 +585,18 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.astra_prompt_contracts:ASTRA_PROMPT_PROTOCOL",
-        "astra-prompt-refinement-v1",
+        "astra-prompt-refinement-v2",
         (
             "exp.optimize.evaluation.variance.astra_prompt_contracts",
             "exp.optimize.evaluation.variance.astra_prompt_states",
+            "exp.optimize.evaluation.variance.astra_prompt_attempts",
             "exp.optimize.evaluation.variance.astra_prompt_draws",
             "exp.optimize.evaluation.variance.astra_prompt_leakage",
             "exp.optimize.evaluation.variance.astra_prompt_calibration",
             "exp.optimize.evaluation.variance.astra_prompt_loop",
             "exp.optimize.evaluation.variance.refined_prompts",
         ),
-        "8b4c2955dc62d2c0440c34058796b0df9f6b6d0c4bf171bafe806ec39c771695",
+        "925ee202d8397193038e2d85780527c1eb74e3dec10c3a8699c42c816296e470",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.variant_search:VARIANT_SEARCH_PROTOCOL",

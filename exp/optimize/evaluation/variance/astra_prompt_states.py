@@ -15,6 +15,10 @@ refinement makes is persisted in its journal; an undeclared move is refused and 
 - ``target_met`` / ``plateaued``: the loop stops; the best prompt is a candidate (``plateaued``
   straight from ``evaluated`` when the code prompt leaves no rewrite-set failure to cite).
 - ``approved`` / ``declined``: the human review; only an approved prompt is frozen.
+
+:data:`DRAW_MACHINE` follows each draw: ``pending`` -> ``answered``, or ``transient_failed`` /
+``refused`` (a Codex tool event) -> ``pending`` again on the next run; a failed attempt is a
+receipt, never an answer (:mod:`.astra_prompt_attempts`).
 """
 
 from __future__ import annotations
@@ -79,3 +83,32 @@ REFINEMENT_MACHINE = StateMachine(
 def statechart() -> str:
     """Render the refinement machine as Mermaid."""
     return REFINEMENT_MACHINE.mermaid()
+
+
+def draw_statechart() -> str:
+    """Render the draw machine as Mermaid."""
+    return DRAW_MACHINE.mermaid()
+
+
+class DrawState(StrEnum):
+    """One refinement draw's state."""
+
+    PENDING = "pending"
+    ANSWERED = "answered"
+    TRANSIENT_FAILED = "transient_failed"
+    REFUSED = "refused"
+
+
+DRAW_MACHINE = StateMachine(
+    name="astra_prompt_draw",
+    states=DrawState,
+    initial=frozenset({DrawState.PENDING}),
+    transitions=(
+        (DrawState.PENDING, "answered", DrawState.ANSWERED),
+        (DrawState.PENDING, "transient_failed", DrawState.TRANSIENT_FAILED),
+        (DrawState.PENDING, "refused", DrawState.REFUSED),
+        (DrawState.TRANSIENT_FAILED, "retried", DrawState.PENDING),
+        (DrawState.REFUSED, "retried", DrawState.PENDING),
+    ),
+)
+"""One draw: answered, or a transient or refused attempt retried on the next run."""

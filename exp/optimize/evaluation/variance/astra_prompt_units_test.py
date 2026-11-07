@@ -223,3 +223,15 @@ def test_no_live_path_can_reach_the_astra_alias(
             RefinementSettings.model_validate(
                 refinement.model_dump() | {role: settings(project, "astra").model_dump()}
             )
+
+
+def test_only_offline_entry_points_open_the_codex_scope() -> None:
+    """The codex-cli transport serves only inside ``offline_closed_model``; only the refinement
+    loop enters it, so no gateway, serving, training or front-door path can reach Codex."""
+    entries = []
+    for path in (ROOT / "exp").rglob("*.py"):
+        if path.name.endswith("_test.py") or path.name == "codex_cli.py":
+            continue
+        if "offline_closed_model(" in path.read_text():
+            entries.append(path.relative_to(ROOT).as_posix())
+    assert entries == ["exp/optimize/evaluation/variance/astra_prompt_loop.py"]

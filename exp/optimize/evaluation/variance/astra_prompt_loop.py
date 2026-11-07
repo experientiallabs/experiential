@@ -65,6 +65,7 @@ from exp.optimize.evaluation.variance.astra_prompt_states import (
 from exp.optimize.evaluation.variance.frontdoor_ledger import PhaseLedger, measure
 from exp.optimize.evaluation.variance.prompt_targets import PromptTarget
 from exp.optimize.evaluation.variance.refined_prompts import journal_of
+from exp.runtime.models.providers.codex_cli import offline_closed_model
 
 S = RefinementState
 
@@ -301,6 +302,8 @@ def refine_prompt(
     Raises:
         ValueError: The inputs belong to another target, a judge target has no labeled cases, or
             no held-out or rewrite input has a usable reference.
+        TransientDraw: A draw failed transiently or was refused; nothing is saved, and the next
+            run replays every answered draw and retries that one.
     """
     _validate(target, calibration, cases)
     identity = record_identity(target, calibration, settings, cases)
@@ -332,7 +335,8 @@ def refine_prompt(
         )
     before = measure(project)
     try:
-        record = _run(project, target, calibration, settings, cases, code_revision, walk, base)
+        with offline_closed_model(f"astra prompt refinement {target.target_id}"):
+            record = _run(project, target, calibration, settings, cases, code_revision, walk, base)
     finally:
         if ledger is not None:
             ledger.settle(phase, before, measure(project))
@@ -425,7 +429,7 @@ def _run(
             "round": number,
             "candidate": answer.prompt,
             "candidate_sha256": sha256_json(answer.prompt),
-            "changes": answer.changes,
+            "changes": [row.model_dump(mode="json") for row in answer.changes],
             "transcript": transcript,
         }
         if found:

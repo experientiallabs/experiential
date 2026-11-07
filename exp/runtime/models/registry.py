@@ -66,6 +66,7 @@ from exp.runtime.models.providers.chatgpt_subscription import (
     chatgpt_re_sign_in_hint,
     chatgpt_refresher,
 )
+from exp.runtime.models.providers.codex_cli import CODEX_CLI_PROVIDER, codex_cli_client
 from exp.runtime.models.providers.elevenlabs import ElevenLabsClient
 from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_BASE_URL
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
@@ -347,6 +348,11 @@ class RuntimeModelCatalog:
             return self._resolve_subscription(
                 alias, record.connection, connection, snapshot, capabilities, record.served_model_id
             )
+        if provider == CODEX_CLI_PROVIDER:
+            client = codex_cli_client(
+                snapshot, capabilities, self._bound_transport(provider, alias)
+            )
+            return ResolvedModel(alias, snapshot, capabilities, client, None)
         if provider == "bedrock":
             bearer_token = None
             access_key_id = (
@@ -943,6 +949,7 @@ _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
 }
 
 SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {
+    CODEX_CLI_PROVIDER,
     "azure",
     "bedrock",
     "openai",

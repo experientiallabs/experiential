@@ -38,7 +38,8 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
-from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
+from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.variance.astra_prompt_attempts import TransientDraw, attempt_draw
 from exp.optimize.evaluation.variance.astra_prompt_contracts import (
     ASTRA_PROMPT_PROTOCOL,
     Difference,
@@ -114,6 +115,18 @@ class DrawResult(ContractModel):
     reference: str | None = None
 
 
+class Change(ContractModel):
+    """One change of a rewrite.
+
+    Attributes:
+        failure_id: The shown failure it answers.
+        change: What changed.
+    """
+
+    failure_id: str
+    change: str = Field(max_length=2000)
+
+
 class RewriteAnswer(ContractModel):
     """Astra's forced rewrite.
 
@@ -124,7 +137,7 @@ class RewriteAnswer(ContractModel):
     """
 
     prompt: str = Field(min_length=1)
-    changes: list[dict[str, str]] = Field(min_length=1, max_length=64)
+    changes: list[Change] = Field(min_length=1, max_length=64)
     rationale: str = Field(default="", max_length=4000)
 
 
@@ -151,7 +164,11 @@ def forced_draw(
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
 ) -> DrawResult:
-    """Buy or replay one forced draw and return its answer arguments."""
+    """Buy or replay one forced draw and return its answer arguments.
+
+    Raises:
+        TransientDraw: The attempt failed transiently or was refused; nothing is an answer.
+    """
     identity = stable_id(
         f"astra-prompt-{kind}",
         {
@@ -172,10 +189,12 @@ def forced_draw(
         maximum_output_tokens=settings.output_tokens,
     )
     try:
-        reference, response = author_response(
+        reference, response = attempt_draw(
             project, settings, request, identity=identity, sources=sources,
             code_revision=code_revision,
         )  # fmt: skip
+    except TransientDraw:
+        raise
     except ValueError as error:
         return DrawResult(failure=f"{kind} draw failed: {str(error)[:400]}")
     calls = [call for call in response.output.tool_calls if call.name == answer.name]
@@ -303,7 +322,7 @@ def check_rewrite(answer: JsonObject, failures: set[str], maximum: int) -> str |
         return f"the rewrite does not match its schema: {str(error)[:300]}"
     if len(parsed.prompt) > maximum:
         return f"the rewrite has {len(parsed.prompt)} characters, more than {maximum}"
-    unknown = sorted({row.get("failure_id", "") for row in parsed.changes} - failures)
+    unknown = sorted({row.failure_id for row in parsed.changes} - failures)
     if unknown:
         return f"changes name failures that were not shown: {unknown[:5]}"
     return None
