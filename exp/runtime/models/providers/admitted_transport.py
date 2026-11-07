@@ -42,7 +42,7 @@ from exp.runtime.models.spend_ceiling import (
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 ADMITTED_TRANSPORT_PROVIDERS = frozenset(
-    {"anthropic", "azure", "gemini", "openai", "openai-compatible", "openrouter"}
+    {"anthropic", "azure", "codex-cli", "gemini", "openai", "openai-compatible", "openrouter"}
 )
 """Providers whose every completion and embedding request goes through the injected transport.
 
@@ -50,7 +50,9 @@ The registry builds these clients on its ``transport_factory``, so wrapping that
 :class:`AdmittedJsonTransport` admits, bounds and retains each physical request. The other
 registry providers fall outside it: ``bedrock`` and ``tinker`` dispatch through their own SDK
 runtimes, ``typesafe`` and ``elevenlabs`` serve no completion (the native gateway owns their
-wire), and ``vertex`` mints its OAuth bearer token over Google's own HTTP client.
+wire), and ``vertex`` mints its OAuth bearer token over Google's own HTTP client. ``codex-cli``
+is admitted the same way, with the local Codex CLI as the inner transport
+(:meth:`AdmittedJsonTransport.over`).
 """
 
 _EMBEDDED_TEXT_KEYS = frozenset({"input", "text"})
@@ -170,6 +172,12 @@ class AdmittedJsonTransport(JsonHttpTransport):
         """
         view = copy(self)
         view._priced_alias = alias
+        return view
+
+    def over(self, inner: JsonHttpTransport) -> AdmittedJsonTransport:
+        """Return a view sharing this ledger, deadline and admission over another transport."""
+        view = copy(self)
+        view._inner = inner
         return view
 
     def for_route(self, route: ProviderRoute) -> AdmittedJsonTransport:

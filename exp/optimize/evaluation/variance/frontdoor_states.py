@@ -11,6 +11,13 @@ from __future__ import annotations
 from enum import StrEnum
 
 from exp.common.state_machine import StateMachine, TransitionJournal
+from exp.optimize.evaluation.variance.astra_prompt_states import (
+    DRAW_MACHINE as ASTRA_DRAW_MACHINE,
+)
+from exp.optimize.evaluation.variance.astra_prompt_states import (
+    REFINEMENT_MACHINE,
+    TARGET_MACHINE,
+)
 from exp.optimize.evaluation.variance.bootstrap_states import TASK_MACHINE
 from exp.optimize.evaluation.variance.reward_states import (
     FAMILY_MACHINE,
@@ -172,5 +179,8 @@ def all_statecharts() -> dict[str, str]:
         CHECKPOINT_MACHINE,
         HALT_MACHINE,
         PROPOSAL_MACHINE,
+        REFINEMENT_MACHINE,
+        ASTRA_DRAW_MACHINE,
+        TARGET_MACHINE,
     )
     return {machine.name: machine.mermaid() for machine in machines}

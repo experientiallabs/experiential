@@ -62,8 +62,10 @@ from exp.optimize.evaluation.variance.dense_vocabulary import inflow_dense, voca
 from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
 from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
+from exp.optimize.evaluation.variance.refined_prompts import SLOT_ROLES, refined_identity
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.codex_cli import offline_closed_model
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -212,9 +214,11 @@ def slot_identity(
         corpus: The saved build and families.
         depends: Earlier results it reads; only these join the identity.
     """
+    refined = refined_identity(context.project, SLOT_ROLES.get(name, frozenset()))
     return stable_id(
         SLOT_RECORD_TYPE,
         {
+            **refined,
             "slot": name,
             "settings": sha256_json(settings),
             "build": corpus.report.identity,
@@ -428,6 +432,16 @@ class TagBankExecutor:
         return False, cost_lines(tuple(costs)), (line,)
 
     def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
+        """Run, or replay, every family's bank and member tagging.
+
+        Build-time tag authoring is the one offline role the closed Astra alias may fill, so
+        the slot runs inside :func:`offline_closed_model`; the front door's registration check
+        already refuses that alias on every other role.
+        """
+        with offline_closed_model("build-time tag authoring: tag-banks"):
+            return self._run(context, settings)
+
+    def _run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Run, or replay, every family's bank and member tagging."""
         slot = TagBankSlot.model_validate(settings)
         corpus = saved_corpus(context)
@@ -698,6 +712,16 @@ class StateRagExecutor:
         return False, cost_lines(costs), (line,)
 
     def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
+        """Run, or replay, every family's state-tag bank and index.
+
+        Build-time tag authoring is the one offline role the closed Astra alias may fill, so
+        the slot runs inside :func:`offline_closed_model`; the front door's registration check
+        already refuses that alias on every other role.
+        """
+        with offline_closed_model("build-time tag authoring: state-rag"):
+            return self._run(context, settings)
+
+    def _run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Run, or replay, every family's state-tag bank and index."""
         slot = StateRagSlot.model_validate(settings)
         corpus = saved_corpus(context)

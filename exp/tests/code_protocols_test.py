@@ -581,7 +581,22 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.family_stages:check_clarity",
             "exp.optimize.evaluation.variance.family_stages:review_clarity",
         ),
-        "4f5dc6d65df9534670205d41d3002819c0c530627bc15e71adcff08fc2ea0c3a",
+        "b151845a4b71fbb0e4178e1031af8278e2f8796a6c17f82aef449d490796207d",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.variance.astra_prompt_contracts:ASTRA_PROMPT_PROTOCOL",
+        "astra-prompt-refinement-v2",
+        (
+            "exp.optimize.evaluation.variance.astra_prompt_contracts",
+            "exp.optimize.evaluation.variance.astra_prompt_states",
+            "exp.optimize.evaluation.variance.astra_prompt_attempts",
+            "exp.optimize.evaluation.variance.astra_prompt_draws",
+            "exp.optimize.evaluation.variance.astra_prompt_leakage",
+            "exp.optimize.evaluation.variance.astra_prompt_calibration",
+            "exp.optimize.evaluation.variance.astra_prompt_loop",
+            "exp.optimize.evaluation.variance.refined_prompts",
+        ),
+        "c1ffacb6845f4da3428c584a806e4e6f0769fe0abf66fe47f495a21b1bd885fb",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.variant_search:VARIANT_SEARCH_PROTOCOL",
@@ -655,7 +670,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.pipeline:_identities",
             "exp.optimize.evaluation.variance.pipeline:_register",
         ),
-        "e44b4d9bfd3adbaeb7387cd875ae65483f7bf4779c8e62303b07e196a3caf8fa",
+        "96e3c2d58004e42a6af54858515f7be6ad8f8cd53057237515fcc0db138748e8",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.system_one:SYSTEM_ONE_PROTOCOL",

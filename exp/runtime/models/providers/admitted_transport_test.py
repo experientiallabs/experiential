@@ -404,7 +404,7 @@ def test_unadmitted_providers_refuse_with_the_remedy(provider: str) -> None:
         require_admitted_transport(_one_alias_catalog(provider), "fixture", consumer="critic")
     message = str(refused.value)
     assert f"critic alias 'fixture' uses provider {provider!r}" in message
-    assert "anthropic, azure, gemini, openai, openai-compatible, openrouter" in message
+    assert "anthropic, azure, codex-cli, gemini, openai, openai-compatible, openrouter" in message
 
 
 def _admitted(
