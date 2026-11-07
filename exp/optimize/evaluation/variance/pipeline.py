@@ -88,6 +88,7 @@ from exp.optimize.evaluation.variance.pipeline_stages import (
     RULES_STAGE,
     TRACEML_STAGE,
 )
+from exp.optimize.evaluation.variance.refined_prompts import refined_identity
 from exp.runtime.models.spend_ceiling import current_spend_ceiling
 
 logger = logging.getLogger(__name__)
@@ -340,13 +341,16 @@ def _identities(
     code_revision: str,
     executors: Mapping[StageName, StageExecutor],
 ) -> tuple[tuple[StageName, str], ...]:
-    """Chain every stage's identity onto the identities of the stages before it."""
+    """Chain every stage's identity onto the identities of the stages before it.
+
+    Approved refined prompts (:func:`~.refined_prompts.refined_identity`) join every stage's
+    identity, so approving one re-keys the stages; with none approved identities are unchanged.
+    """
     chain: list[str] = []
     rows: list[tuple[StageName, str]] = []
     for stage in STAGES:
-        identity = stage_identity(
-            stage, spec, tuple(chain), code_revision, executors[stage].keys(project, spec)
-        )
+        extra = {**executors[stage].keys(project, spec), **refined_identity(project)}
+        identity = stage_identity(stage, spec, tuple(chain), code_revision, extra)
         chain.append(identity)
         rows.append((stage, identity))
     return tuple(rows)

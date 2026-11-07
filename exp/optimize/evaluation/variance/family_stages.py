@@ -100,6 +100,7 @@ from exp.optimize.evaluation.variance.records import (
     confirmation_episodes,
     confirmation_job,
 )
+from exp.optimize.evaluation.variance.refined_prompts import refined_role_prompt
 from exp.optimize.evaluation.variance.replay import DecisionReplay, replay_to_decision
 from exp.optimize.evaluation.variance.rewards import OptionCounts
 from exp.optimize.evaluation.variance.variants import (
@@ -497,10 +498,12 @@ def run_role(
 ) -> tuple[ArtifactInput, AnalysisTranscript]:
     """Run, or replay, one stance-assigned role draw over frozen documents.
 
-    The documents back the read-only tools (``list_evidence`` and ``read_evidence`` by locator,
-    ``read_world_state`` for a ``world:N`` document); the forced profile sees them whole. The
-    stance name and text, the instruction, the answer schema, the documents and the frozen
-    settings key the draw, so any change is a new draw. The caller holds an operation lock.
+    An approved frozen prompt (:mod:`.refined_prompts`) replaces the code text it was refined
+    from before the draw is keyed. The documents back the read-only tools (``list_evidence`` and
+    ``read_evidence`` by locator, ``read_world_state`` for a ``world:N`` document); the forced
+    profile sees them whole. The stance name and text, the instruction, the answer schema, the
+    documents and the frozen settings key the draw, so any change is a new draw. The caller holds
+    an operation lock.
 
     Args:
         project: Project holding the draw.
@@ -519,6 +522,7 @@ def run_role(
     Returns:
         The saved transcript reference and the transcript.
     """
+    instruction, stance = refined_role_prompt(project, role, instruction, stance)
     material: JsonObject = {
         "protocol": ROLE_DRAWS_PROTOCOL,
         "role": role,
