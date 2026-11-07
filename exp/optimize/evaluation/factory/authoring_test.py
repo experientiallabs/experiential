@@ -1,6 +1,7 @@
 """Shared author calls retain exact requests and finite dispatch authority."""
 
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -9,13 +10,20 @@ import pytest
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import ModelRequest, ReasoningEffort, load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.factory.authoring import author_response, preflight_author
+from exp.optimize.evaluation.factory.authoring import (
+    NOT_DISPATCHED_TYPE,
+    author_dispatches,
+    author_response,
+    preflight_author,
+    record_not_dispatched,
+)
 from exp.optimize.evaluation.factory.proposals import (
     TaskProposalSpec,
     proposal_request,
     propose_tasks,
 )
 from exp.optimize.evaluation.factory.proposals_test import proposal_fixture
+from exp.runtime.models.credentials import MissingModelCredentialError
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -342,3 +350,54 @@ def test_completed_author_output_exhaustion_is_one_known_draw_and_replays_offlin
             code_revision="test",
         )
     assert len(transport.requests) == 1
+
+
+def test_a_missing_credential_leaves_no_intent_and_the_rerun_draws_with_no_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolving the client (and its credential) fails before any intent; the rerun just draws."""
+    project, spec, transport = proposal_fixture(tmp_path, monkeypatch)
+    catalog = load_model_catalog(project.model_catalog_path)
+    variable = catalog.connections[catalog.models[spec.model_alias].connection].api_key_env
+    assert variable is not None
+    value = os.environ[variable]
+    monkeypatch.delenv(variable)
+    with pytest.raises(MissingModelCredentialError):
+        propose_tasks(project, spec, code_revision="test")
+    assert not transport.requests
+    assert not project.artifacts.exists(spec.identity("test") + "-intent")
+    monkeypatch.setenv(variable, value)
+    propose_tasks(project, spec, code_revision="test")
+    assert len(transport.requests) == 1
+
+
+def test_a_certified_not_dispatched_intent_is_redispatched_under_the_same_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dangling intent blocks until its attempt is certified not dispatched, then redraws once."""
+    project, spec, transport = proposal_fixture(tmp_path, monkeypatch)
+    identity = spec.identity("test")
+    original = transport._answer
+
+    def refuse_before_sending() -> JsonHttpResponse:
+        """Fail inside the client before any request leaves (an older run's failure mode)."""
+        raise RuntimeError("client failed before sending")
+
+    monkeypatch.setattr(transport, "_answer", refuse_before_sending)
+    with pytest.raises(RuntimeError, match="before sending"):
+        propose_tasks(project, spec, code_revision="test")
+    monkeypatch.setattr(transport, "_answer", original)
+    with pytest.raises(ValueError, match="unknown outcome"):
+        propose_tasks(project, spec, code_revision="test")
+    receipt = record_not_dispatched(project, identity, reason="no request left", code_revision="t")
+    assert project.artifacts.read(receipt.artifact_id).manifest.artifact_type == (
+        NOT_DISPATCHED_TYPE
+    )
+    with pytest.raises(ValueError, match="already certified"):
+        record_not_dispatched(project, identity, reason="again", code_revision="t")
+    propose_tasks(project, spec, code_revision="test")
+    assert author_dispatches(project.artifacts, identity) == (2, 1)
+    assert project.artifacts.exists(identity + "-response")
+    count = len(transport.requests)
+    propose_tasks(project, spec, code_revision="test")
+    assert len(transport.requests) == count

@@ -3,6 +3,7 @@
 import json
 from copy import deepcopy
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import AwareDatetime, Field, model_validator
@@ -23,7 +24,8 @@ from exp.common.models import (
     ReasoningEffort,
     load_model_catalog,
 )
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
+from exp.common.state_machine import StateMachine
 from exp.runtime.models.call_evidence import canonical_call
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
@@ -33,6 +35,7 @@ from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.reasoning_view import reasoning_catalog
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 
@@ -261,29 +264,12 @@ def author_response(
             raise ValueError("author rejection lost its original allowance or provenance")
         raise rejection.error()
     if not store.exists(response_id):
-        if store.exists(intent_id):
+        dispatches, refused = author_dispatches(store, identity)
+        if dispatches > refused:
             raise ValueError("author dispatch has an unknown outcome; no implicit redraw")
         catalog = _prepare_author(project, spec, request)
         if datetime.now(UTC) >= spec.deadline:
             raise ValueError("author deadline expired before dispatch")
-        request_files: dict[str, ContractModel] = {"spec.json": spec, "request.json": request}
-        if spec.reasoning_effort is not None:
-            request_files["effective-request.json"] = effective
-            _, capability = RuntimeModelCatalog(catalog, environment={}).snapshot(spec.model_alias)
-            request_files["reasoning-profile.json"] = _reasoning_profile(
-                spec, request, effective, supports_reasoning=capability.supports_reasoning
-            )
-        intent = store.write_json(
-            artifact_id=intent_id,
-            artifact_type="author-intent",
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=datetime.now(UTC),
-                code_revision=code_revision,
-                inputs=sources,
-            ),
-            files=request_files,
-        )
         transport = AdmittedJsonTransport(
             HttpxJsonTransport(),
             artifacts=store,
@@ -296,9 +282,53 @@ def author_response(
             ),
         )
         registry = RuntimeModelCatalog(catalog, transport_factory=lambda: transport)
+        # Resolve the client, and with it the connection credential, before any intent exists:
+        # a failure here is pre-dispatch and leaves nothing that blocks the next run.
+        client = registry.resolve(spec.model_alias).client
+        if dispatches == 0:
+            request_files: dict[str, ContractModel] = {"spec.json": spec, "request.json": request}
+            if spec.reasoning_effort is not None:
+                request_files["effective-request.json"] = effective
+                _, capability = RuntimeModelCatalog(catalog, environment={}).snapshot(
+                    spec.model_alias
+                )
+                request_files["reasoning-profile.json"] = _reasoning_profile(
+                    spec, request, effective, supports_reasoning=capability.supports_reasoning
+                )
+            intent = artifact_input(
+                store.write_json(
+                    artifact_id=intent_id,
+                    artifact_type="author-intent",
+                    envelope=ArtifactEnvelope(
+                        schema_version=1,
+                        created_at=datetime.now(UTC),
+                        code_revision=code_revision,
+                        inputs=sources,
+                    ),
+                    files=request_files,
+                )
+            )
+        else:
+            intent = _verify_author_intent(project, spec, request, effective, sources, intent_id)
+            _write_marker(
+                store,
+                f"{identity}-dispatch-{dispatches + 1}",
+                DISPATCH_TYPE,
+                intent,
+                code_revision,
+                {"attempt": dispatches + 1},
+            )
         try:
-            with canonical_call(artifact_input(intent)):
-                response = registry.resolve(spec.model_alias).client.complete(effective)
+            with canonical_call(intent):
+                response = client.complete(effective)
+        except CompletionNotDispatched as error:
+            record_not_dispatched(
+                project,
+                identity,
+                reason=f"certified not dispatched: {type(error).__name__}",
+                code_revision=code_revision,
+            )
+            raise
         except ProviderRetryableResponseError as error:
             if not error.hit_length_limit:
                 raise
@@ -316,7 +346,7 @@ def author_response(
                     schema_version=1,
                     created_at=datetime.now(UTC),
                     code_revision=code_revision,
-                    inputs=(artifact_input(intent),),
+                    inputs=(intent,),
                 ),
                 files={"rejection.json": rejection},
             )
@@ -328,7 +358,7 @@ def author_response(
                 schema_version=1,
                 created_at=datetime.now(UTC),
                 code_revision=code_revision,
-                inputs=(artifact_input(intent),),
+                inputs=(intent,),
             ),
             files={"response.json": response},
         )
@@ -339,3 +369,115 @@ def author_response(
     return artifact_input(response_manifest), ModelResponse.model_validate_json(
         store.read_bytes(response_id, "response.json")
     )
+
+
+DISPATCH_TYPE = "author-dispatch"
+"""Artifact type of a redispatch marker, written before dispatch attempt ``n >= 2``."""
+
+NOT_DISPATCHED_TYPE = "author-not-dispatched"
+"""Artifact type of a receipt certifying that dispatch attempt ``n`` never reached a provider."""
+
+
+class AuthorDrawState(StrEnum):
+    """States of one author draw identity, each held by an immutable record.
+
+    ``intended`` (the intent, or a ``-dispatch-<n>`` marker, is written before attempt ``n``)
+    moves to ``answered`` (``-response``), ``rejected`` (``-rejection``, a known output stop) or
+    ``not_dispatched`` (``-not-dispatched-<n>``, certified pre-dispatch). ``not_dispatched`` may
+    be ``redispatched`` under the same intent. An ``intended`` attempt with no outcome record is
+    an unknown outcome and is never drawn again implicitly.
+    """
+
+    INTENDED = "intended"
+    ANSWERED = "answered"
+    REJECTED = "rejected"
+    NOT_DISPATCHED = "not_dispatched"
+
+
+AUTHOR_DRAW_MACHINE = StateMachine(
+    name="author-draw",
+    states=AuthorDrawState,
+    initial=frozenset({AuthorDrawState.INTENDED}),
+    transitions=(
+        (AuthorDrawState.INTENDED, "answered", AuthorDrawState.ANSWERED),
+        (AuthorDrawState.INTENDED, "rejected", AuthorDrawState.REJECTED),
+        (AuthorDrawState.INTENDED, "not_dispatched", AuthorDrawState.NOT_DISPATCHED),
+        (AuthorDrawState.NOT_DISPATCHED, "redispatched", AuthorDrawState.INTENDED),
+    ),
+)
+"""One author draw: answered, rejected, or certified not dispatched and redispatched."""
+
+
+def author_dispatches(store: ArtifactStore, identity: str) -> tuple[int, int]:
+    """Return the dispatch attempts begun and those certified not dispatched for one draw."""
+    if not store.exists(identity + "-intent"):
+        return 0, 0
+    begun = 1
+    while store.exists(f"{identity}-dispatch-{begun + 1}"):
+        begun += 1
+    refused = 0
+    while store.exists(f"{identity}-not-dispatched-{refused + 1}"):
+        refused += 1
+    return begun, refused
+
+
+def _write_marker(
+    store: ArtifactStore,
+    artifact_id: str,
+    kind: str,
+    intent: ArtifactInput,
+    code_revision: str,
+    body: JsonObject,
+) -> None:
+    """Write one immutable draw record citing the draw's intent."""
+    store.write_json(
+        artifact_id=artifact_id,
+        artifact_type=kind,
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=datetime.now(UTC),
+            code_revision=code_revision,
+            inputs=(intent,),
+        ),
+        files={"record.json": _DrawRecord(body=body)},
+    )
+
+
+class _DrawRecord(ContractModel):
+    """The body of a redispatch marker or a not-dispatched receipt."""
+
+    body: JsonObject
+
+
+def record_not_dispatched(
+    project: ProjectStore, identity: str, *, reason: str, code_revision: str
+) -> ArtifactInput:
+    """Certify that the latest dispatch attempt of a draw never reached a provider.
+
+    This is the ``not_dispatched`` move of :data:`AUTHOR_DRAW_MACHINE`. The next
+    :func:`author_response` for the same identity then dispatches again under the same intent.
+    Use it only with evidence that no request left the process (for example, a failure while the
+    client or its credential was resolved, with no physical attempt recorded).
+
+    Raises:
+        ValueError: The draw has no intent, already has an outcome, or its latest attempt is
+            already certified.
+    """
+    store = project.artifacts
+    begun, refused = author_dispatches(store, identity)
+    if begun == 0 or store.exists(identity + "-response") or store.exists(identity + "-rejection"):
+        raise ValueError(f"author draw {identity[:24]} has no open intent to certify")
+    if refused >= begun:
+        raise ValueError(f"author draw {identity[:24]} attempt {begun} is already certified")
+    AUTHOR_DRAW_MACHINE.move(identity, AuthorDrawState.INTENDED, "not_dispatched")
+    receipt = f"{identity}-not-dispatched-{begun}"
+    intent = artifact_input(store.read(identity + "-intent").manifest)
+    _write_marker(
+        store,
+        receipt,
+        NOT_DISPATCHED_TYPE,
+        intent,
+        code_revision,
+        {"attempt": begun, "reason": reason},
+    )
+    return artifact_input(store.read(receipt).manifest)
