@@ -24,6 +24,7 @@ from exp.common.models import (
     load_model_catalog,
 )
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.factory.prompt_overlay import overlay_request
 from exp.runtime.models.call_evidence import canonical_call
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
@@ -236,8 +237,11 @@ def author_response(
     receipt and replays as the same known budget stop. Other malformed output stays available.
     Logical requests remain unchanged for producer replay; explicit reasoning overrides add the
     exact dispatched request and its catalog-bound profile to the same immutable intent.
+    Human-approved refined prompts (:mod:`.prompt_overlay`) replace the code text they were
+    refined from in the system messages first, and suffix the identity, so they key a new draw.
     """
     store = project.artifacts
+    request, identity, _ = overlay_request(store, request, identity)
     effective = _effective_request(spec, request)
     sources = tuple(sorted(set(sources), key=lambda ref: ref.artifact_id))
     for source in sources:

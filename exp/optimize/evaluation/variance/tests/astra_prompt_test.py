@@ -19,10 +19,17 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.common.models import load_model_catalog, write_model_catalog
+from exp.common.models import (
+    ModelMessage,
+    ModelRequest,
+    ToolChoice,
+    load_model_catalog,
+    write_model_catalog,
+)
 from exp.common.project import ProjectStore
 from exp.common.state_machine import IllegalTransition
 from exp.common.tasks import ToolSchema
+from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.variance.astra_prompt_calibration import split
 from exp.optimize.evaluation.variance.astra_prompt_contracts import (
     CalibrationExample,
@@ -38,9 +45,12 @@ from exp.optimize.evaluation.variance.family_stages import run_role
 from exp.optimize.evaluation.variance.frontdoor_ledger import PhaseLedger
 from exp.optimize.evaluation.variance.prompt_targets import PromptTarget, target
 from exp.optimize.evaluation.variance.refined_prompts import (
+    SLOT_ROLES,
+    STAGE_ROLES,
     approve,
     approved_prompts,
     decline,
+    export_approved,
     journal_of,
     refined_identity,
 )
@@ -338,11 +348,19 @@ def test_cited_failures_drive_a_rewrite_past_the_target_and_the_prompt_is_frozen
     assert ASTRA_MODEL not in frozen.model_dump_json() and '"astra"' not in frozen.model_dump_json()
     assert approved_prompts(project)[STANCE].sha256 == sha256_json(record.prompt)
     assert set(refined_identity(project)) == {"refined_prompts"}
+    for stage, roles in STAGE_ROLES.items():
+        assert bool(refined_identity(project, roles)) is ("tag-epoch-monitor" in roles), stage
+    assert refined_identity(project, SLOT_ROLES["tag-monitor-corpus"])
+    assert not refined_identity(project, SLOT_ROLES["tag-banks"])
     with pytest.raises(IllegalTransition):
         approve(project, record.identity, by="raghav", code_revision="t")
     with pytest.raises(IllegalTransition):
         decline(project, record.identity)
     assert moves(project, record.identity)[-1] == "approved"
+    live = ProjectStore(tmp_path / "live", "live")
+    assert export_approved(project, live, code_revision="t") == 1
+    assert export_approved(project, live, code_revision="t") == 0
+    assert approved_prompts(live)[STANCE].sha256 == frozen.sha256
     refused = [r for r in journal_of(project).rows() if r["subject"] == record.identity]
     assert sum(1 for r in refused if r["refused"]) == 2
 
@@ -365,6 +383,28 @@ def test_cited_failures_drive_a_rewrite_past_the_target_and_the_prompt_is_frozen
     assert transcript.stop == "answered" and len(live) == 1
     assert {str(r["model"]) for r in live} == {RUNTIME_MODEL}
     assert FIX in json.dumps(live[0]["messages"])
+
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="system", content=system_of(found)),
+            ModelMessage(role="user", content='{"kind": "hard", "ticket": "t"}'),
+        ),
+        tools=(ANSWER,),
+        tool_choice=ToolChoice(name=ANSWER.name),
+        maximum_output_tokens=refinement.runtime.output_tokens,
+    )
+    reference, _ = author_response(
+        project, refinement.runtime, request, identity="role-direct-draw", sources=(),
+        code_revision="t",
+    )  # fmt: skip
+    assert reference.artifact_id.startswith("role-direct-draw-refined-")
+    assert FIX in json.dumps(wire.requests[-1]["messages"])
+    calls = len(wire.requests)
+    again, _ = author_response(
+        project, refinement.runtime, request, identity="role-direct-draw", sources=(),
+        code_revision="t",
+    )  # fmt: skip
+    assert again == reference and len(wire.requests) == calls
 
 
 def test_a_rewrite_that_leaks_a_held_out_input_is_refused(

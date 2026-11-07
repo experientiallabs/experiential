@@ -18,17 +18,17 @@ from exp.optimize.evaluation.variance.astra_prompt_batch import (
     target_state,
 )
 from exp.optimize.evaluation.variance.astra_prompt_cli import availability_lines, main
-from exp.optimize.evaluation.variance.astra_prompt_codex_test import Codex, codex_world
 from exp.optimize.evaluation.variance.astra_prompt_ledger import (
     DEFAULT_ALLOWANCE,
     default_ledger_path,
     refinement_ledger,
 )
-from exp.optimize.evaluation.variance.astra_prompt_test import ANSWER, STANCE
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
 from exp.optimize.evaluation.variance.family_stages import run_role
 from exp.optimize.evaluation.variance.prompt_targets import prompt_targets, target
 from exp.optimize.evaluation.variance.tag_monitor_review import INSTRUCTION, REVIEW_STANCES
+from exp.optimize.evaluation.variance.tests.astra_prompt_codex_test import Codex, codex_world
+from exp.optimize.evaluation.variance.tests.astra_prompt_test import ANSWER, STANCE
 
 
 def saved_draws(project: ProjectStore, settings: AuthorSettings, scopes: range) -> None:

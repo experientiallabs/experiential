@@ -12,6 +12,8 @@
 - ``run-all --consent [--workers N]``: prepare every target and refine every ready one in
   worker processes; the rest stay ``awaiting_inputs`` until a rerun finds their inputs.
 - ``show``, ``approve``, ``decline``: the human review; approval freezes the prompt.
+- ``export-approved --to-root R --to-project-id P``: copy approved versions into the live
+  project (refinement may run on a copy of the build root whose catalog declares Astra).
 
 By default every reservation goes to the refinement's own locked ledger
 (``<project runtime>/astra-prompts/ledger.json``, ``--allowance`` attempts, default 160,000);
@@ -49,7 +51,7 @@ from exp.optimize.evaluation.variance.astra_prompt_costs import (
 from exp.optimize.evaluation.variance.astra_prompt_ledger import refinement_ledger
 from exp.optimize.evaluation.variance.astra_prompt_loop import load_record
 from exp.optimize.evaluation.variance.prompt_targets import prompt_targets, roles, target
-from exp.optimize.evaluation.variance.refined_prompts import approve, decline
+from exp.optimize.evaluation.variance.refined_prompts import approve, decline, export_approved
 
 GATE_CASES = 3
 """Labeled cases a judge target runs per round in the dry run (weakened, genuine, alternative)."""
@@ -143,6 +145,10 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--workers", type=int, default=4)
     batch.add_argument("--role", action="append", default=[])
     _ledger_args(batch)
+    export = commands.add_parser("export-approved")
+    _project_args(export)
+    export.add_argument("--to-root", type=Path, required=True)
+    export.add_argument("--to-project-id", required=True)
     for name in ("show", "approve", "decline"):
         command = commands.add_parser(name)
         _project_args(command)
@@ -169,6 +175,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command in ("plan", "run", "run-all"):
         return _spend(project, args)
+    if args.command == "export-approved":
+        live = ProjectStore(args.to_root, args.to_project_id)
+        _say(f"{export_approved(project, live, code_revision='cli')} approved versions copied")
+        return 0
     return _review(project, args)
 
 

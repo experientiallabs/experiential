@@ -32,7 +32,6 @@ capabilities digest (which holds the reasoning effort).
 
 from __future__ import annotations
 
-import fcntl
 import json
 import shutil
 import subprocess
@@ -45,7 +44,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from filelock import Timeout
+
 from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelCapabilities, ModelSnapshot
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
@@ -175,25 +177,23 @@ def set_codex_concurrency(limit: int, directory: Path | None = None) -> None:
 
 @contextmanager
 def codex_slot(poll_seconds: float = 0.05) -> Iterator[int]:
-    """Hold one of the ``limit`` slot files (``flock``), waiting until one is free.
+    """Hold one of the ``limit`` slot locks, waiting until one is free.
 
-    The slots are files in a shared directory, so the bound holds across threads and processes.
+    The slots are lock files in a shared directory (:class:`CoordinationLock`), so the bound
+    holds across threads and processes of this machine.
     """
     limit, directory = int(str(_SLOTS["limit"])), Path(str(_SLOTS["directory"]))
-    directory.mkdir(parents=True, exist_ok=True)
     while True:
         for index in range(limit):
-            handle = (directory / f"slot-{index}.lock").open("a")
+            lock = CoordinationLock(str(directory / f"slot-{index}.lock"), thread_local=False)
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                handle.close()
+                lock.acquire(blocking=False)
+            except Timeout:
                 continue
             try:
                 yield index
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-                handle.close()
+                lock.release()
             return
         time.sleep(poll_seconds)
 

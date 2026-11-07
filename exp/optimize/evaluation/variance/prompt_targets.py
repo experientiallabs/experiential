@@ -17,9 +17,11 @@ Not targeted, by design:
   council actor aliases, so one open-weight runtime prompt cannot stand for them.
 
 ``runner_role`` names the label a role passes to the shared role runner
-(:func:`~.family_stages.run_role`). Those targets take an approved frozen prompt at runtime
-through :func:`~.refined_prompts.refined_role_prompt`; the others are refinable offline but read
-their code default at runtime until their call site is wired (listed by :func:`unwired_targets`).
+(:func:`~.family_stages.run_role`), which applies an approved prompt by role and stance
+(:func:`~.refined_prompts.refined_role_prompt`). Every role whose model calls go through the
+shared author-response owner takes approved prompts there; the roles in :data:`UNWIRED_ROLES`
+(injected model clients, the decisions wire) are refinable offline but run their code text
+until their call path is wired (:func:`unwired_targets`).
 """
 
 from __future__ import annotations
@@ -432,9 +434,31 @@ def target(target_id: str) -> PromptTarget:
     raise KeyError(f"no prompt target {target_id!r}")
 
 
+UNWIRED_ROLES: Mapping[str, str] = {  # fmt: skip
+    role: "calls its model through an injected ModelClient, not the author-response owner"
+    for role in (
+        "cluster-naming",
+        "task-type-naming",
+        "state-tag-author",
+        "state-memory-author",
+        "world-model",
+        "world-model-inspection",
+        "world-model-dreaming",
+        "world-model-memory",
+        "world-model-guidance",
+        "world-model-research",
+        "memory-analyst",
+        "evidence-reader",
+    )
+} | {"decision-tagger": "answers through the native decisions wire (Clef), not a chat prompt"}
+"""Roles whose runtime does not take an approved prompt yet, with the reason. Every other role
+calls its model through the shared author-response owner, which applies approved prompts
+(:mod:`~exp.optimize.evaluation.factory.prompt_overlay`)."""
+
+
 def unwired_targets() -> tuple[str, ...]:
-    """Targets refinable offline whose runtime call site does not yet read a frozen prompt."""
-    return tuple(row.target_id for row in prompt_targets() if row.runner_role is None)
+    """Targets refinable offline whose runtime does not yet take an approved prompt."""
+    return tuple(row.target_id for row in prompt_targets() if row.role in UNWIRED_ROLES)
 
 
 def roles() -> dict[str, tuple[str, ...]]:

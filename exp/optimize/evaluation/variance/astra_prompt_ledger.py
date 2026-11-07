@@ -6,17 +6,17 @@ ledger, with :data:`DEFAULT_ALLOWANCE` attempts: enough for every one of the 168
 default calibration size. Passing a front-door ledger path instead shares the pipeline ledger.
 
 :class:`LockedLedger` is a :class:`~.frontdoor_ledger.PhaseLedger` whose reservations and
-settlements re-read the file under an exclusive ``flock``, so several refinement workers can
+settlements re-read the file under the guarded cross-process lock, so several refinement workers can
 reserve on one file without overwriting each other's phases.
 """
 
 from __future__ import annotations
 
-import fcntl
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.variance.frontdoor_ledger import LedgerState, Measure, PhaseLedger
 
@@ -36,16 +36,12 @@ class LockedLedger(PhaseLedger):
     @contextmanager
     def _locked(self) -> Iterator[None]:
         """Hold the ledger's lock file and reload the saved phases."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with (self.path.parent / f"{self.path.name}.lock").open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                if self.path.exists():
-                    saved = LedgerState.model_validate_json(self.path.read_bytes())
-                    self.state = self.state.model_copy(update={"phases": saved.phases})
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        lock = CoordinationLock(str(self.path.parent / f"{self.path.name}.lock"))
+        with lock:
+            if self.path.exists():
+                saved = LedgerState.model_validate_json(self.path.read_bytes())
+                self.state = self.state.model_copy(update={"phases": saved.phases})
+            yield
 
     def admit(self, phase: str, usd: float, attempts: int) -> str | None:
         """Reserve under the lock."""

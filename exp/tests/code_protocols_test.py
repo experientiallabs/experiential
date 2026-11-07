@@ -596,7 +596,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.astra_prompt_loop",
             "exp.optimize.evaluation.variance.refined_prompts",
         ),
-        "e068d5fa0868157b7e3be7f10c3099665942981e98d7de81121aa1a982416546",
+        "c1ffacb6845f4da3428c584a806e4e6f0769fe0abf66fe47f495a21b1bd885fb",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.variant_search:VARIANT_SEARCH_PROTOCOL",
@@ -670,7 +670,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.pipeline:_identities",
             "exp.optimize.evaluation.variance.pipeline:_register",
         ),
-        "4232b59f988447f89fa1bfdced007568334dc2b3675242e9eae91d368f2eb53f",
+        "96e3c2d58004e42a6af54858515f7be6ad8f8cd53057237515fcc0db138748e8",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.system_one:SYSTEM_ONE_PROTOCOL",

@@ -26,7 +26,6 @@ from exp.optimize.evaluation.variance.astra_prompt_states import (
     RefinementState,
     statechart,
 )
-from exp.optimize.evaluation.variance.astra_prompt_test import ANSWER, STANCE, world
 from exp.optimize.evaluation.variance.evidence_tools import EvidenceToolProfile
 from exp.optimize.evaluation.variance.family_stages import run_role
 from exp.optimize.evaluation.variance.frontdoor_states import all_statecharts
@@ -39,8 +38,9 @@ from exp.optimize.evaluation.variance.prompt_targets import (
 )
 from exp.optimize.evaluation.variance.rubric_evolution_test import settings
 from exp.optimize.evaluation.variance.tag_monitor_review import INSTRUCTION, REVIEW_STANCES
+from exp.optimize.evaluation.variance.tests.astra_prompt_test import ANSWER, STANCE, world
 
-ROOT = Path(__file__).resolve().parents[4]
+ROOT = Path(__file__).resolve().parents[5]
 OFFLINE = (
     "astra_prompt_loop",
     "astra_prompt_draws",

@@ -12,9 +12,13 @@ The runtime reads approved prompts only:
   instruction or stance (matched by the role runner's label and the exact code text it replaced,
   so a changed code default stops matching instead of being silently overridden). The draw's
   identity keys on the text, so an approved prompt is a new draw.
-- :func:`refined_identity` is folded into every decision-variance stage identity once any prompt
-  is approved, so approving or re-approving a prompt re-keys the stages as usual; with nothing
-  approved it is empty and every identity is unchanged.
+- every draw through the shared author-response owner takes the approved text
+  (:mod:`~exp.optimize.evaluation.factory.prompt_overlay`), keyed as a new draw;
+- :func:`refined_identity` joins a decision-variance stage's identity with the approvals of the
+  roles that stage uses (:data:`STAGE_ROLES`), and a front-door slot's with its roles'
+  (:data:`SLOT_ROLES`), so an approval re-keys only the stages and slots that use the prompt
+  (and, through the stage chain, those after them); with nothing approved every identity is
+  unchanged.
 
 This module imports no model client and holds no Astra settings: a frozen prompt is text plus
 digests and provenance, and the role runs it on its own open-weight model.
@@ -36,6 +40,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
+from exp.optimize.evaluation.factory.prompt_overlay import FROZEN_TYPE
 from exp.optimize.evaluation.variance.astra_prompt_contracts import RECORD_TYPE, RefinementRecord
 from exp.optimize.evaluation.variance.astra_prompt_states import (
     REFINEMENT_MACHINE,
@@ -43,8 +48,50 @@ from exp.optimize.evaluation.variance.astra_prompt_states import (
 )
 from exp.optimize.evaluation.variance.prompt_targets import Part, target
 
-FROZEN_TYPE = "astra-frozen-prompt"
-"""Artifact type of one approved, frozen prompt version."""
+STAGE_ROLES: dict[str, frozenset[str]] = {
+    "variance-build": frozenset(
+        {"families-compatibility-reviewer", "tag-bank-author", "decision-tagger",
+         "cluster-naming", "task-type-naming", "world-model", "world-model-inspection",
+         "world-model-dreaming", "world-model-memory", "world-model-guidance",
+         "world-model-research", "memory-analyst", "evidence-reader"}
+    ),
+    "rules": frozenset(
+        {"rule-extraction", "rule-research", "rule-weighing", "rule-condense", "rule-planner",
+         "rule-tag-compiler", "rule-consolidation", "world-author"}
+    ),
+    "traceml": frozenset({"traceml-moves"}),
+    "error-mining": frozenset(
+        {"point-selector", "success-critic", "selector-critic-loop", "point-options",
+         "blast-severity", "behavior-labeler", "behavior-pairs", "behavior-curator",
+         "outcome-judge", "adversarial-linter", "adversarial-linter-review"}
+    ),
+    "families": frozenset(
+        {"scenario-author", "decision-state-author", "briefing-review", "variant-search",
+         "nudge-author", "nudge-realism", "choice-reader", "clarity-reviewer", "rubric-author",
+         "rubric-critic", "rubric-reviser", "state-tag-author", "state-memory-author"}
+    ),
+    "records": frozenset({"dense-judge"}),
+}  # fmt: skip
+"""Roles whose prompts each decision-variance stage first uses. Stage identities chain, so an
+approval re-keys the first stage using the role and every stage after it, and no stage before."""
+
+SLOT_ROLES: dict[str, frozenset[str]] = {
+    "tag-banks": frozenset({"tag-bank-author", "decision-tagger"}),
+    "task-types": frozenset({"task-type-naming"}),
+    "state-rag": frozenset({"state-tag-author", "state-memory-author", "decision-tagger"}),
+    "rule-admission": frozenset({"rule-tag-compiler", "rule-consolidation"}),
+    "blast-radius": frozenset({"blast-severity"}),
+    "dense-hybrid": frozenset({"dense-judge", "decision-tagger"}),
+    "curriculum": frozenset({"outcome-judge"}),
+    "rubric-evolution": frozenset(
+        {"rubric-evolution-author", "tag-epoch-monitor", "outcome-judge", "dense-judge"}
+    ),
+    **{
+        f"tag-monitor-{name}": frozenset({"tag-epoch-monitor"})
+        for name in ("corpus", "families", "rules", "mining", "dense")
+    },
+}
+"""Roles whose prompts each front-door slot uses; only those approvals join its identity."""
 
 
 class FrozenPrompt(ContractModel):
@@ -110,9 +157,9 @@ def approved_prompts(project: ProjectStore) -> dict[str, FrozenPrompt]:
     return current
 
 
-def refined_identity(project: ProjectStore) -> JsonObject:
-    """Identity content of the approved prompts; empty when nothing is approved."""
-    rows = approved_prompts(project).values()
+def refined_identity(project: ProjectStore, roles: frozenset[str] | None = None) -> JsonObject:
+    """Identity content of the approved prompts of ``roles`` (all when None); empty when none."""
+    rows = [row for row in approved_prompts(project).values() if roles is None or row.role in roles]
     if not rows:
         return {}
     return {
@@ -238,3 +285,38 @@ def decline(project: ProjectStore, record_id: str) -> None:
         IllegalTransition: The record is not a reviewable candidate; the refusal is journaled.
     """
     _review(project, _record(project, record_id), RefinementState.DECLINED)
+
+
+def export_approved(source: ProjectStore, destination: ProjectStore, *, code_revision: str) -> int:
+    """Copy every approved prompt version into another project; return how many were new.
+
+    Refinement can run on a copy of a build root (whose catalog declares the Astra alias) and
+    the approvals then move to the live project, where the author-response owner applies them.
+    A version already present is left as it is; a different one under the same id is refused.
+
+    Raises:
+        ValueError: The destination holds a different prompt under the same version.
+    """
+    copied = 0
+    for row in frozen_prompts(source):
+        artifact_id = stable_id(FROZEN_TYPE, {"target": row.target_id, "version": row.version})
+        if destination.artifacts.exists(artifact_id):
+            saved = FrozenPrompt.model_validate_json(
+                destination.artifacts.read_bytes(artifact_id, "frozen.json")
+            )
+            if saved.sha256 != row.sha256:
+                raise ValueError(f"{artifact_id} differs in the destination project")
+            continue
+        destination.artifacts.write_json(
+            artifact_id=artifact_id,
+            artifact_type=FROZEN_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+                inputs=(),
+            ),  # fmt: skip
+            files={"frozen.json": row},
+        )
+        copied += 1
+    return copied
