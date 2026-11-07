@@ -23,6 +23,7 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
+    ImageDetail,
     ImageMediaType,
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
@@ -87,9 +88,6 @@ class _TextPart(_WireModel):
         return value
 
 
-_ImageDetail = Literal["auto", "low", "high"]
-"""Caller fidelity hint forwarded verbatim to the wires that accept it."""
-
 _MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128
 """Room for the largest inline image plus its ``data:`` URL preamble."""
 
@@ -103,7 +101,7 @@ class _ChatImageUrl(_WireModel):
     """
 
     url: str = Field(min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS)
-    detail: _ImageDetail | None = None
+    detail: ImageDetail | None = None
     media_type: ImageMediaType | None = None
 
 
@@ -129,7 +127,7 @@ class _ResponsesImagePart(_WireModel):
     image_url: str | None = Field(
         default=None, min_length=1, max_length=_MAXIMUM_IMAGE_URL_CHARACTERS
     )
-    detail: _ImageDetail | None = None
+    detail: ImageDetail | None = None
     file_id: str | None = Field(default=None, min_length=1, max_length=_MAXIMUM_FILE_ID_CHARACTERS)
 
     @model_validator(mode="after")

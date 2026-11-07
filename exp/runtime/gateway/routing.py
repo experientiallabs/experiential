@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from concurrent.futures import Future, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from typing import Literal
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models import ModelRequest
@@ -36,14 +37,55 @@ from exp.runtime.gateway.model_plan import (
     project_stage_selection,
     stage_start_authorized,
 )
+from exp.runtime.gateway.project_activation import ProjectActivationError, SelectorActivation
 from exp.runtime.gateway.project_episode_identity import (
     project_episode_identity as project_episode_identity,
 )
 from exp.runtime.gateway.request_policy import RequestedRouteId
+from exp.runtime.gateway.tag_router import (
+    TAG_ROUTER_ROUTE_REASON,
+    TagRouterIntegrityError,
+    TagRulesActivation,
+    TagRulesSelector,
+)
+from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded, RequestDeadline
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
-from exp.runtime.router.runtime import RouterRuntime
+from exp.runtime.router.runtime import DecisionSink, RouterRuntime
 from exp.runtime.router.runtime import _PreparedSelection as PreparedSelection  # noqa: PLC2701
+
+type ProjectSelector = RouterRuntime | TagRulesSelector
+"""The runtime that chooses a project alias's candidate: learned kNN or tag rules."""
+
+
+def project_selector(
+    activation: SelectorActivation,
+    catalog: RuntimeModelCatalog,
+    *,
+    decision_sink: DecisionSink | None = None,
+) -> ProjectSelector:
+    """Bind one verified activation to the selector its policy kind names.
+
+    Args:
+        activation: Verified learned or tag-rules project activation.
+        catalog: Runtime catalog resolving the policy's pinned aliases.
+        decision_sink: Optional recorder for every routing decision.
+
+    Returns:
+        A learned ``RouterRuntime`` or a ``TagRulesSelector``.
+
+    Raises:
+        ProjectActivationError: A tag-rules candidate differs from its frozen identity.
+    """
+    if isinstance(activation, TagRulesActivation):
+        try:
+            return TagRulesSelector.from_activation(
+                activation, catalog, decision_sink=decision_sink
+            )
+        except TagRouterIntegrityError as exc:
+            raise ProjectActivationError(str(exc)) from exc
+    return RouterRuntime.from_activation(activation, catalog, decision_sink=decision_sink)
+
 
 _SELECTION_DRAIN_SECONDS = 5.0
 
@@ -340,7 +382,7 @@ class CatalogRouteResolver:
             view=view,
             authorization=authorization,
             pool=pool,
-            route_reason="learned_router",
+            route_reason=selection.route_reason,
             fallback_reason=selection.fallback_reason,
         )
 
@@ -708,11 +750,16 @@ class SelectionWorkerPool:
 
 
 class RouterProjectTargetResolver:
-    """Run synchronous ``RouterRuntime.select`` in a bounded selection worker lane."""
+    """Select a project alias's candidate: learned policies in a bounded worker lane.
+
+    A tag-rules selector classifies on the shared native-callback loop instead
+    and never enters the learned lane, so its decision-model call does not
+    compete with embedding work for the lane's bound.
+    """
 
     def __init__(
         self,
-        activations: Mapping[tuple[str, str, str], RouterRuntime],
+        activations: Mapping[tuple[str, str, str], ProjectSelector],
         exact_models_by_alias: Mapping[tuple[str, str, str, str], str],
         *,
         maximum_outstanding_selections: int = 4,
@@ -757,8 +804,11 @@ class RouterProjectTargetResolver:
         runtime = self._runtime(target)
         deadline = RequestDeadline(deadline_monotonic)
         deadline.attempt_timeout()
-        model_request = gateway_model_request(request)
         episode_id = project_episode_identity(episode_namespace)
+        if isinstance(runtime, TagRulesSelector):
+            decision = await runtime.select(request, episode_id=episode_id, deadline=deadline)
+            return self._selection(target, decision, route_reason=TAG_ROUTER_ROUTE_REASON)
+        model_request = gateway_model_request(request)
         decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
             model_request,
             episode_id=episode_id,
@@ -816,8 +866,11 @@ class RouterProjectTargetResolver:
         runtime = self._runtime(target)
         deadline = RequestDeadline(deadline_monotonic)
         deadline.attempt_timeout()
-        model_request = gateway_model_request(request)
         episode_id = project_episode_identity(episode_namespace)
+        if isinstance(runtime, TagRulesSelector):
+            decision = runtime.select_blocking(request, episode_id=episode_id, deadline=deadline)
+            return self._selection(target, decision, route_reason=TAG_ROUTER_ROUTE_REASON)
+        model_request = gateway_model_request(request)
         decision = runtime._reuse_sticky_selection(  # noqa: SLF001 - selection-only bridge.
             model_request,
             episode_id=episode_id,
@@ -863,8 +916,8 @@ class RouterProjectTargetResolver:
                 "reasoning continuation deployment is not a project activation candidate"
             )
 
-    def _runtime(self, target: ProjectTarget) -> RouterRuntime:
-        """Return the loaded frozen runtime for one activation or fail closed."""
+    def _runtime(self, target: ProjectTarget) -> ProjectSelector:
+        """Return the loaded frozen selector for one activation or fail closed."""
         runtime = self._activations.get(
             (target.project_ref, target.activation_ref, target.catalog_sha256)
         )
@@ -872,7 +925,13 @@ class RouterProjectTargetResolver:
             raise GatewayRoutingError("project activation is not loaded")
         return runtime
 
-    def _selection(self, target: ProjectTarget, decision: RoutingDecision) -> ProjectSelection:
+    def _selection(
+        self,
+        target: ProjectTarget,
+        decision: RoutingDecision,
+        *,
+        route_reason: Literal["learned_router", "tag_router"] = "learned_router",
+    ) -> ProjectSelection:
         """Project one routing decision onto its frozen exact-model identity."""
         exact_model_id = self._exact_models_by_alias.get(
             (
@@ -889,6 +948,7 @@ class RouterProjectTargetResolver:
             selected_alias=decision.selected_alias,
             activation_ref=target.activation_ref,
             fallback_reason=decision.fallback_reason,
+            route_reason=route_reason,
         )
 
 

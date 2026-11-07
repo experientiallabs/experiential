@@ -177,7 +177,7 @@ async fn serve(
                 .settle("completed", Some(&served.usage), &[], None, true)
                 .await
             {
-                return error_response(&PublicError::internal());
+                return error_response(&guard.settlement_error());
             }
             json_response(
                 StatusCode::OK,
@@ -352,7 +352,7 @@ async fn run_ladder(
                     .settle("failed", None, &[], Some(&boundary), !possible)
                     .await
                 {
-                    return Err(PublicError::internal());
+                    return Err(guard.settlement_error());
                 }
                 if !possible {
                     return Err(collection_public_error(&boundary));

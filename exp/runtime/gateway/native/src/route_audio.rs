@@ -272,7 +272,7 @@ async fn serve(
                 .await
             {
                 // Never hand out audio or a transcript the ledger did not record.
-                return error_response(&PublicError::internal());
+                return error_response(&guard.settlement_error());
             }
             let mut response_headers = served_headers(&admission, served.depth, client_request_id);
             response_headers.push((header::CONTENT_TYPE.to_string(), served.content_type));
@@ -430,7 +430,7 @@ async fn run_ladder(
                     .settle("failed", None, &[], Some(&boundary), !possible)
                     .await
                 {
-                    return Err(PublicError::internal());
+                    return Err(guard.settlement_error());
                 }
                 if possible {
                     current_depth = Some(depth);

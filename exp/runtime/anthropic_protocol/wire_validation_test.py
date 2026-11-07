@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -121,3 +123,91 @@ def test_tool_change_blocks_are_known_block_types() -> None:
     assert hint is not None
     assert hint[0] == "messages.0.content.0.tool.type"
     assert "mcp_tool_reference is not supported" in hint[1]
+
+
+class _Source(BaseModel):
+    """One media source carrying data.
+
+    Attributes:
+        data: The encoded payload, unbounded here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    data: str
+
+
+class _WideSource(_Source):
+    """A source admitting up to 16 characters.
+
+    Attributes:
+        data: The encoded payload, at most 16 characters.
+    """
+
+    data: str = Field(max_length=16)
+
+
+class _NarrowSource(_Source):
+    """A source admitting up to 4 characters.
+
+    Attributes:
+        data: The encoded payload, at most 4 characters.
+    """
+
+    data: str = Field(max_length=4)
+
+
+class _Picture(BaseModel):
+    """An image arm with the wider bound.
+
+    Attributes:
+        type: The ``image`` discriminator literal.
+        source: The image source, bounded at 16 characters.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["image"]
+    source: _WideSource
+
+
+class _Paper(BaseModel):
+    """A document arm with the narrower bound.
+
+    Attributes:
+        type: The ``document`` discriminator literal.
+        source: The document source, bounded at 4 characters.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["document"]
+    source: _NarrowSource
+
+
+class _Blocks(BaseModel):
+    """A body whose blocks are an undiscriminated union.
+
+    Attributes:
+        content: The blocks, each an image or a document arm.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    content: tuple[_Picture | _Paper, ...]
+
+
+def test_a_union_miss_reports_the_arm_its_type_selects() -> None:
+    """A sibling arm that rejected the block's type never names the error.
+
+    The document arm fails deeper (its narrower ``source.data`` bound) than
+    the image arm's real problem (an unknown key), so the deepest error alone
+    would tell an image caller about the document limit.
+    """
+    payload: JsonObject = {
+        "content": [{"type": "image", "source": {"data": "x" * 8}, "dimensions": "1x1"}]
+    }
+    with pytest.raises(OpenAIProtocolError) as info:
+        validate_wire(payload, _Blocks)
+    assert info.value.detail.param == "content.0.dimensions"
+    oversized: JsonObject = {"content": [{"type": "image", "source": {"data": "x" * 32}}]}
+    with pytest.raises(OpenAIProtocolError) as size:
+        validate_wire(oversized, _Blocks)
+    assert size.value.detail.param == "content.0.source.data"
+    assert "at most 16 characters" in size.value.detail.message

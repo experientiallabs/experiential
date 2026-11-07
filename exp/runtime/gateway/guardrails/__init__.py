@@ -22,6 +22,7 @@ from exp.runtime.gateway.guardrails.client import (
 )
 from exp.runtime.gateway.guardrails.config import load_guardrail_engine
 from exp.runtime.gateway.guardrails.contracts import (
+    CategoryScore,
     ClassifierCoverageError,
     ClassifierUncertainError,
     ClassifierVerdict,
@@ -34,6 +35,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
+    ScoredVerdict,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import (
@@ -41,10 +43,13 @@ from exp.runtime.gateway.guardrails.http_json import (
     HttpJsonClassifier,
 )
 from exp.runtime.gateway.guardrails.preset import STANDARD_PRESET_NAME
+from exp.runtime.gateway.guardrails.recording import ClassificationRecord
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 __all__ = [
+    "CategoryScore",
+    "ClassificationRecord",
     "ClassifierCoverageError",
     "ClassifierProtocolError",
     "ClassifierRegistry",
@@ -65,6 +70,7 @@ __all__ = [
     "GuardrailRecursionError",
     "GuardrailRejected",
     "GuardrailToolCall",
+    "ScoredVerdict",
     "HttpJsonClassifier",
     "InternalClassifierClient",
     "KeywordClassifier",

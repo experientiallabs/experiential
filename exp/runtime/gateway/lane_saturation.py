@@ -238,8 +238,13 @@ def overflow_target(
                 return _historical_target(route, depth, shed)
             return depth
         return None
-    depth = policy_sheds[0][0]
-    return _historical_target(route, depth, shed_records.get(depth))
+    # The first bypassed rung, past any the fleet gate capped (fleet_lanes):
+    # a fleet cap is hard, so its overflow goes to the next bypassed sibling.
+    for depth, _reason in policy_sheds:
+        shed = shed_records.get(depth)
+        if shed is None or not shed.fleet:
+            return _historical_target(route, depth, shed)
+    return None
 
 
 def _historical_target(route: GatewayRoute, depth: int, shed: RungShed | None) -> int | None:

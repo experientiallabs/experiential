@@ -80,8 +80,57 @@ def validate_wire[WireModelT: BaseModel](payload: JsonObject, wire: type[WireMod
         errors = exc.errors(include_url=False)
         if any(error["loc"] and error["loc"][0] == "gateway" for error in errors):
             raise validation_protocol_error(exc) from exc
-        first = max(errors, key=lambda error: len(error["loc"]))
+        first = max(_matching_arm_errors(errors), key=lambda error: len(error["loc"]))
         raise validation_error(first) from exc
+
+
+def _is_arm_label(part: str | int) -> bool:
+    """Return whether one Pydantic location part is a union arm label, not a field.
+
+    Arm labels are wire model class names (private or public), scalar type
+    names, and constrained-type spellings; real wire fields are snake_case.
+    """
+    if not isinstance(part, str):
+        return False
+    return (
+        part.startswith("_")
+        or "[" in part
+        or part[:1].isupper()
+        or part in ("str", "int", "float", "bool", "none", "list", "dict")
+    )
+
+
+def _matching_arm_errors(errors: list[ErrorDetails]) -> list[ErrorDetails]:
+    """Drop the errors of union arms whose ``type`` discriminator did not match.
+
+    A block that misses its own arm also misses every sibling arm, and a
+    sibling can fail deeper than the real problem: an image block too large
+    for the image arm also fails the document arm's narrower ``source.data``
+    bound, and that error is no answer for an image. An arm that rejected the
+    block's ``type`` literal is not the block's arm, so its errors are set
+    aside whenever another arm's remain.
+
+    Args:
+        errors: Every Pydantic error of one failed validation.
+
+    Returns:
+        The errors raised inside arms the block's ``type`` matched, or all of
+        them when no such arm remains.
+    """
+    mismatched = {
+        error["loc"][:-1]
+        for error in errors
+        if error["type"] == "literal_error"
+        and len(error["loc"]) >= 2
+        and error["loc"][-1] == "type"
+        and _is_arm_label(error["loc"][-2])
+    }
+    kept = [
+        error
+        for error in errors
+        if not any(error["loc"][: len(prefix)] == prefix for prefix in mismatched)
+    ]
+    return kept or errors
 
 
 def validation_error(first: ErrorDetails) -> OpenAIProtocolError:
@@ -95,18 +144,10 @@ def validation_error(first: ErrorDetails) -> OpenAIProtocolError:
     location = first["loc"]
     cleaned: list[str] = []
     for part in location:
-        text = str(part)
-        # Union arm labels in pydantic locations are noise for callers: wire
-        # model class names (private or public), scalar type names, and
-        # constrained-type spellings. Real wire fields are snake_case.
-        if isinstance(part, str) and (
-            part.startswith("_")
-            or "[" in text
-            or text[:1].isupper()
-            or text in ("str", "int", "float", "bool", "none", "list", "dict")
-        ):
+        # Union arm labels in pydantic locations are noise for callers.
+        if _is_arm_label(part):
             continue
-        cleaned.append(text)
+        cleaned.append(str(part))
     param = ".".join(cleaned) or "body"
     if first["type"] == "extra_forbidden":
         return invalid_field(

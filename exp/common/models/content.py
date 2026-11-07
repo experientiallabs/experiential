@@ -24,6 +24,13 @@ from exp.common.core.artifacts import ContractModel, JsonObject
 
 ImageMediaType = Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
 
+ImageDetail = Literal["auto", "low", "high", "original"]
+"""OpenAI's image fidelity hint (``ImageDetail`` in the OpenAI SDK, both surfaces).
+
+``original`` (full resolution, no downscaling) is forwarded only where the
+rung serves it; every other wire carries ``high`` with disclosure
+(``exp.runtime.models.providers.image_detail``)."""
+
 IMAGE_MEDIA_TYPES: dict[str, ImageMediaType] = {
     "image/png": "image/png",
     "image/jpeg": "image/jpeg",
@@ -144,13 +151,22 @@ PDF is the one document format that every wire carries natively (OpenAI
 Bedrock ``document``); other office formats differ per provider and are not
 forwarded."""
 
-MAXIMUM_DOCUMENT_BASE64_BYTES = 6 * 1024 * 1024
-"""Largest encoded document this gateway forwards.
+MAXIMUM_DOCUMENT_BYTES = 32 * 1024 * 1024
+"""Largest decoded document this gateway admits.
 
-Bedrock Converse caps one document at 4.5 MB of raw bytes, the narrowest
-provider cap (OpenAI and Gemini accept 50 MB, Anthropic a 32 MB request);
-6 MiB of base64 is that many raw bytes, so every declared rung can carry
-every admitted document."""
+The Anthropic Messages API sets no per-document limit, only a request-wide
+one (32 MB on Anthropic's cloud-platform deployments, 128 MB first party),
+and OpenAI accepts 50 MB per file; 32 MiB is the widest single document that
+still fits inside the gateway's own 64 MiB request-body bound once encoded."""
+
+MAXIMUM_DOCUMENT_BASE64_BYTES = 4 * -(-MAXIMUM_DOCUMENT_BYTES // 3)
+"""Largest encoded document this gateway forwards: the base64 length of a 32 MiB PDF.
+
+The cap is the widest provider's, not the narrowest, for the same reason as
+the image cap: a PDF a coding agent read is baked into its transcript, so a
+gateway ceiling below what the Anthropic and OpenAI rungs accept wedges
+sessions those rungs would serve. Narrower per-document limits (Bedrock
+Converse's 4.5 MB) surface as provider errors on those rungs."""
 
 MAXIMUM_DOCUMENTS_PER_REQUEST = 5
 """Largest number of documents one request may carry across all its messages.
@@ -336,7 +352,7 @@ class ImageContentPart(ContractModel):
     data: str | None = Field(default=None, max_length=MAXIMUM_IMAGE_BASE64_BYTES)
     url: str | None = Field(default=None, max_length=8_192)
     handle: MediaHandle | None = None
-    detail: Literal["auto", "low", "high"] | None = None
+    detail: ImageDetail | None = None
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Prompt-cache breakpoint the caller placed on this image, re-emitted
     verbatim on wires that cache a marked block natively and dropped
@@ -551,7 +567,7 @@ def audio_part_from_input_audio(data: str, audio_format: str) -> AudioContentPar
 def image_part_from_url(
     url: str,
     *,
-    detail: Literal["auto", "low", "high"] | None = None,
+    detail: ImageDetail | None = None,
 ) -> ImageContentPart:
     """Build one image part from a caller URL, inlining a data URL's bytes.
 

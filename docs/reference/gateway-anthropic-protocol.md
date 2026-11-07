@@ -63,6 +63,13 @@ production turns on 2026-09-11). The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
 
+Empty turn content follows Anthropic's own rule: every turn must carry content "except for the
+optional final assistant message". A trailing assistant turn whose content is `""` or only empty
+text blocks is an empty prefill, which Anthropic treats as no prefill; the decoder drops it with
+`messages.assistant->dropped(empty_final_prefill)` (both `/v1/messages` and
+`/v1/messages/count_tokens`). An empty turn anywhere else, any role, stays a typed 400 naming
+the turn (`messages.<n>`).
+
 ## Stream usage
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and

@@ -24,6 +24,7 @@ from exp.common.models import (
     ModelResponse,
     OperationEconomics,
 )
+from exp.common.models.capability_fit import requires_tool_protocol as _requires_tool_protocol
 from exp.common.project import ArtifactStore
 from exp.common.routing import (
     KnnRouterPolicy,
@@ -61,9 +62,6 @@ from exp.runtime.router.runtime_support import (
     embedding_economics as _embedding_economics,
 )
 from exp.runtime.router.runtime_support import fallback_decision as _fallback_decision
-from exp.runtime.router.runtime_support import (
-    requires_tool_protocol as _requires_tool_protocol,
-)
 from exp.runtime.router.runtime_support import (
     runtime_provider_operation as _runtime_provider_operation,
 )
@@ -210,6 +208,8 @@ class RouterRuntime:
             )
         except ValueError as exc:
             raise RouterRuntimeIntegrityError(f"router policy {policy_id} is invalid") from exc
+        if not isinstance(activation, ProjectActivation):
+            raise RouterRuntimeIntegrityError(f"router policy {policy_id} is not a learned policy")
         if pricing_snapshot_id != activation.pricing.pricing_snapshot_id:
             raise RouterRuntimeIntegrityError(f"router policy {policy_id} is invalid")
         return cls.from_activation(

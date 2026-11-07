@@ -123,6 +123,7 @@ def test_an_upload_that_spent_the_budget_is_refused_before_acceptance(
     """The data plane's remaining budget bounds admission; a spent one accepts nothing."""
     accepted: list[object] = []
     deadlines: list[float] = []
+    fenced_checks: list[str] = []
 
     def authorize_request(**fields: object) -> object:
         """Record the deadline the store would register and authorize the request."""
@@ -131,7 +132,7 @@ def test_an_upload_that_spent_the_budget_is_refused_before_acceptance(
 
     plane = SimpleNamespace(
         _request_timeout_seconds=600.0,
-        _accounting=SimpleNamespace(require_clear=lambda: None),
+        _accounting=SimpleNamespace(require_clear=fenced_checks.append),
         _components=SimpleNamespace(store=SimpleNamespace(authorize_request=authorize_request)),
         _guardrails=None,
         _write_ledger=SimpleNamespace(accept_request=lambda **fields: accepted.append(fields)),
@@ -150,5 +151,6 @@ def test_an_upload_that_spent_the_budget_is_refused_before_acceptance(
         cast(Any, plane), {"raw_key": "k", "remaining_milli": 30_000}, "voice", request, "speech"
     )
     assert len(accepted) == 1
+    assert fenced_checks == ["organization", "organization"]
     assert deadline == deadlines[-1]
     assert deadline - time.monotonic() <= 30

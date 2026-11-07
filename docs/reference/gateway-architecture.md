@@ -177,7 +177,7 @@ alias revision, and catalog digest used by authorization.
 An alias targets either:
 
 1. a direct exact-model pool, or
-2. one immutable project activation.
+2. one immutable project activation: a learned or [tag-rules](gateway-tag-routing.md) policy.
 
 A singleton alias creates a one-deployment pool. `exp config gateway pool certify` can replace that
 with an ordered pool only when every member has the same exact logical model identity and an
@@ -533,13 +533,9 @@ plus seconds per million approximate input tokens, both serving defaults with pe
 overrides), so a 1M-token prefill is not misread as a dead lane while small requests keep the
 fail-fast bound.
 
-Settlement replaces the reservation with observed integer nano-USD usage. A dispatched failure,
-cancellation, or crash without trustworthy usage retains its conservative reservation because it
-may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt,
-while keyed replay creates no new reservation. A period is the immutable UTC bucket beginning at
-`YYYY-MM-01T00:00:00+00:00`; rollover selects a new bucket and never clears or rewrites an earlier
-month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets
-dashboard.
+When the write ledger can price settlements (`SettlementPricer.price_attempt`: no write, no wait on settlement contention), a live stream's terminal is priced before it is settled: the data plane decides the attempt's settlement once and hands that exact argument to `price_attempt`, then flushes the terminal frames, closes the stream, and delivers the same argument to `finish_attempt` with the usual bounded retries, retained-write sweep, admission block and shutdown drain; a task cut short re-delivers it from the drop backstop, and the priced settlement is retained from the quote on, so the recovery sweep replays it instead of abandoning the request.
+A ledger without that capability (the local engine) or a failed quote keeps the stricter order (settlement lands before any terminal frame, else the stream ends without them); non-streaming bodies are always returned only after their settlement landed.
+Settlement replaces the reservation with observed integer nano-USD usage. A dispatched failure, cancellation, or crash without trustworthy usage retains its conservative reservation because it may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt, while keyed replay creates no new reservation. A period is the immutable UTC bucket beginning at `YYYY-MM-01T00:00:00+00:00`; rollover selects a new bucket and never clears or rewrites an earlier month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets dashboard.
 
 Media priced per character, second, or image settles its billed units on the unit card frozen
 at reservation ([gateway-media-surfaces.md](gateway-media-surfaces.md)).
@@ -586,7 +582,7 @@ Chat image references accept Copilot's optional `image_url.media_type` MIME hint
 (`image/png`, `image/jpeg`, `image/gif`, or `image/webp`): validated and discarded
 before dispatch and replay identity, while the `url` and `detail` stay
 authoritative. A data URL keeps its embedded MIME type and a remote URL is fetched
-by the provider; unknown image fields and malformed URLs or base64 stay rejected.
+by the provider; unknown image fields and malformed URLs or base64 stay rejected. Image `detail` accepts OpenAI's `ImageDetail` (`auto`, `low`, `high`, `original`) on Chat `image_url` and every Responses `input_image`, `function_call_output` included (Codex sends `original` on tool screenshots): OpenAI's own API and the ChatGPT Codex backend receive `original` verbatim and every other detail-carrying rung sends `high` and discloses `input.input_image.detail->translated(original:high)` (Chat: `messages.image_url.detail->translated(original:high)`).
 A Chat `role: "tool"` message accepts `image_url` parts beside its text (GitHub Copilot Chat,
 Codex Desktop and node agents report a screenshot inside the tool message that took it), and a
 Messages `tool_result` accepts image and PDF `document` sub-blocks (Claude Code's Read tool
@@ -991,6 +987,10 @@ not partition logical request counts. Estimated cost is attribution, not a provi
 The process owns readiness from preflight through bounded drain and rejects new work once drain starts.
 It owns and bounds admitted tasks, upstream streams, disconnect cleanup, replay, continuation state,
 and final ledger settlement. Stuck cancellation cannot stop content-free terminal flusher attempts.
+A failed terminal write stays owned by the recovery sweep and fences only the admitting organization
+(503 `accounting_unavailable`, counted by `accounting_fenced_organizations`) until it lands; other
+organizations keep serving, and readiness fails only while the durable writer cannot commit. A
+deliberate `AccountingRefusedError` answers a retryable 503 `accounting_refused` and fences no one.
 
 ## Certification boundary
 

@@ -32,8 +32,8 @@ use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
     emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
-    json_response, latin1_header, outward_event, read_body, settle_stream_end, sse_body_response,
-    stream_delivery::Delivery, with_app_identity,
+    json_response, latin1_header, outward_event, price_stream_end, read_body, settle_stream_end,
+    sse_body_response, stream_delivery::Delivery, with_app_identity,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -43,7 +43,11 @@ use crate::tool_search::{
     adopt_outcome, completed_responses_body_for, configure_responses_encoder,
     disclose_after_collection, encode_responses_sse,
 };
-use crate::waterfall::{CommittedAttempt, SettledAttempt, WaterfallContext, Won};
+use crate::waterfall::{CommittedAttempt, WaterfallContext, Won};
+
+#[path = "route_responses_settled.rs"]
+mod settled;
+use settled::settled_responses_response;
 
 pub(crate) async fn responses(
     State(state): State<AppState>,
@@ -53,6 +57,10 @@ pub(crate) async fn responses(
     let started = Instant::now();
     let deadline = started + state.request_timeout;
     let (parts, raw_body) = request.into_parts();
+    let websocket = parts
+        .extensions
+        .get::<crate::route_responses_ws::WebSocketRequest>()
+        .is_some();
     let headers = parts.headers;
     let body = match read_body(raw_body).await {
         Ok(body) => body,
@@ -255,6 +263,14 @@ pub(crate) async fn responses(
     let mut won =
         acquire_guarded_attempt(&context, &mut guard, admission.guardrail_input_pending).await;
     adopt_outcome(&mut admission, &mut won);
+    if websocket {
+        if let Some(capture) = state.capture.as_ref() {
+            // WebSocket frames never pass through the outer HTTP capture relay.
+            // Keep the native response tap and settlement policy, but do not wait
+            // for HTTP metadata that this transport cannot supply.
+            capture.without_relay(&admission.request_id);
+        }
+    }
     won = checkpoint_winner(
         state.capture.as_ref(),
         &admission,
@@ -330,84 +346,6 @@ pub(crate) async fn responses(
         }
     };
     crate::capture::response::capture_response(capture, &capture_request_id, response)
-}
-
-/// Answer one Responses attempt that the waterfall already settled: a
-/// terminal without semantics or an exhausted ladder flushing inspected refusals.
-async fn settled_responses_response(
-    admission: &Admission,
-    settled: SettledAttempt,
-    created_at: i64,
-    mut lease: Option<OwnerLease>,
-    client_request_id: Option<String>,
-) -> Response {
-    let served = settled.served();
-    let mut events = settled.events;
-    let refusal_completed = complete_visible_refusal(&mut events);
-    let failed = refusal_completed.is_none() && matches!(events.last(), Some(Event::Failed(_)));
-    if failed && !admission.stream {
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        if let Some(Event::Failed(failure)) = events.last() {
-            return error_response(&collection_public_error(&failure.clone().boundary()));
-        }
-    }
-    let headers = served_headers(admission, client_request_id.as_deref(), served.clone());
-    if admission.stream {
-        let body = match encode_responses_sse(admission, served.depth, created_at, &events, None) {
-            Ok(body) => body,
-            Err(error) => return error_response(&error),
-        };
-        if failed {
-            // A failed flush is not a replayable success.
-            if let Some(mut owner) = lease.take() {
-                owner.abandon().await;
-            }
-            return sse_body_response(&headers, body);
-        }
-        if let Some(mut owner) = lease.take() {
-            let mut sorted = headers.clone();
-            sorted.sort();
-            let cached = CachedResponse {
-                status_code: 200,
-                media_type: "text/event-stream; charset=utf-8".to_string(),
-                headers: sorted,
-                body: body.clone(),
-            };
-            return match owner.complete(cached.clone()).await {
-                Ok(()) => cached_response(&cached),
-                Err(error) => error_response(&error),
-            };
-        }
-        return sse_body_response(&headers, body);
-    }
-    let aggregated =
-        match completed_responses_body_for(admission, served.depth, created_at, &events, None) {
-            Ok(aggregated) => aggregated,
-            Err(error) => return error_response(&error),
-        };
-    if let Some(failure) = &aggregated.failure {
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        return error_response(&failure.clone().boundary().public_error());
-    }
-    if let Some(mut owner) = lease.take() {
-        let mut sorted = headers.clone();
-        sorted.sort();
-        let cached = CachedResponse {
-            status_code: 200,
-            media_type: "application/json".to_string(),
-            headers: sorted,
-            body: compact_json(&aggregated.body).into_bytes(),
-        };
-        return match owner.complete(cached.clone()).await {
-            Ok(()) => cached_response(&cached),
-            Err(error) => error_response(&error),
-        };
-    }
-    json_response(StatusCode::OK, &aggregated.body, &headers)
 }
 
 /// Aggregate one committed Responses attempt and answer it, retaining the
@@ -542,7 +480,7 @@ async fn respond_from_responses_events(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return error_response(&PublicError::internal());
+        return error_response(&guard.settlement_error());
     }
     let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
@@ -951,16 +889,13 @@ async fn stream_responses(
             )
             .await
             .is_ok();
-        // Settle every terminal once, including a failed continuation write.
-        let settled = settle_stream_end(
-            &mut guard,
-            terminal.as_ref(),
-            usage.as_ref(),
-            &tool_names,
-            false,
-        )
-        .await;
+        // Price each terminal once (even a failed continuation write); failed quotes settle here.
+        let settled = match terminal.as_ref() {
+            Some(event) => price_stream_end(&mut guard, event, usage.as_ref(), &tool_names).await,
+            None => true,
+        };
         if !retained || !settled {
+            guard.settle_priced().await;
             return;
         }
         if matches!(terminal, Some(Event::Failed(_))) {
@@ -978,6 +913,10 @@ async fn stream_responses(
             terminal_frames.into_iter().map(Bytes::from).collect(),
         )
         .await;
+        // Close the body before the durable write; the caller holds its terminal frames till then.
+        drop(delivery);
+        drop(sender);
+        guard.settle_priced().await;
     });
 
     let body = Body::from_stream(ReceiverStream::new(receiver));

@@ -31,8 +31,8 @@ use crate::reasoning_display::ReasoningOutput;
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
-    latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
-    sse_body_response, with_app_identity,
+    latin1_header_list, outward_event, price_stream_end, read_body, send_bounded,
+    settle_stream_end, sse_body_response, with_app_identity,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -367,7 +367,8 @@ async fn respond_from_messages_events(
     // A tool turn's hidden reasoning leaves only as the sealed carrier, so it
     // is sealed under the gateway authority before the body is assembled,
     // exactly like the Chat surface (`respond_from_chat_events`).
-    let carrier = if refusal_completed.is_some() {
+    let exposed = admission.reasoning_output_at(depth);
+    let carrier = if refusal_completed.is_some() || exposed.exposed {
         None
     } else {
         match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
@@ -380,7 +381,6 @@ async fn respond_from_messages_events(
             }
         }
     };
-    let exposed = admission.reasoning_output_at(depth);
     let aggregated =
         match completed_messages_body_for(&admission, &events, carrier.as_deref(), exposed) {
             Ok(aggregated) => aggregated,
@@ -465,7 +465,7 @@ async fn respond_from_messages_events(
     };
     if !settled {
         // Success is only reported once the terminal accounting write landed.
-        return messages_error_response(&PublicError::internal());
+        return messages_error_response(&guard.settlement_error());
     }
     let served = Served {
         empty_completion,
@@ -782,17 +782,19 @@ async fn stream_messages(
                             ))
                         }
                     };
-                    match seal_reasoning_candidate(
-                        &guard.bridge,
-                        &request_id,
-                        committed.depth,
-                        candidate,
-                    )
-                    .await
-                    {
-                        Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
-                        Ok(None) => {}
-                        Err(failure) => fail_stream!(failure),
+                    if !admission.reasoning_output_at(committed.depth).exposed {
+                        match seal_reasoning_candidate(
+                            &guard.bridge,
+                            &request_id,
+                            committed.depth,
+                            candidate,
+                        )
+                        .await
+                        {
+                            Ok(Some(carrier)) => encoder.set_reasoning_content_carrier(carrier),
+                            Ok(None) => {}
+                            Err(failure) => fail_stream!(failure),
+                        }
                     }
                     if !encoder.has_content_blocks()
                         && (billed_empty_completion(&event, usage.as_ref())
@@ -812,17 +814,15 @@ async fn stream_messages(
                 terminal = Some(event.clone());
                 let settled = if empty_completion {
                     guard
-                        .settle(
+                        .price_or_settle(
                             "failed",
                             usage.as_ref(),
                             &tool_names,
                             Some(&Failure::empty_completion()),
-                            true,
                         )
                         .await
                 } else {
-                    settle_stream_end(&mut guard, Some(&event), usage.as_ref(), &tool_names, false)
-                        .await
+                    price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await
                 };
                 if !settled {
                     log_stream_exit(&request_id, "settlement_unavailable");
@@ -834,8 +834,9 @@ async fn stream_messages(
                     Ok(encoded) => encoded,
                     Err(_) => {
                         if terminal.is_some() {
-                            // The attempt already settled by its provider
-                            // terminal; the stream simply ends short.
+                            // The provider terminal is already settled, or
+                            // priced and settled by the drop backstop; the
+                            // stream simply ends short.
                             log_stream_exit(&request_id, "terminal_encoding_failed");
                             return;
                         }
@@ -861,6 +862,11 @@ async fn stream_messages(
                     }
                 }
                 if outward.is_terminal() {
+                    // Close the body before the durable write: the caller
+                    // holds its terminal frames while settlement lands.
+                    drop(delivery);
+                    drop(sender);
+                    guard.settle_priced().await;
                     return;
                 }
             }

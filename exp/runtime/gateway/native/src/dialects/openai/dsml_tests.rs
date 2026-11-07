@@ -284,3 +284,76 @@ fn a_whole_body_drain_never_carries_markup_either() {
         .filter_map(|event| event["text"].as_str())
         .all(|text| !text.contains('｜')));
 }
+
+/// Every refusal names the parse step that refused it (the content-free
+/// `dsml_tool_call_rejected` log code), while the caller still sees only the
+/// one malformed-tool-call reason.
+#[test]
+fn each_refusal_names_its_parse_step() {
+    let step = |raw: &str| {
+        let mut calls = Vec::new();
+        parse_steps(raw, &mut calls).err().map(Reject::code)
+    };
+    let cases = [
+        (
+            "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"shell\">\n<｜DSML｜parameter",
+            "unclosed_tag",
+        ),
+        (
+            "<｜DSML｜function_calls><｜DSML｜invoke></｜DSML｜invoke></｜DSML｜function_calls>",
+            "invoke_name_missing",
+        ),
+        (
+            concat!(
+                "<｜DSML｜function_calls><｜DSML｜invoke name=\"f\">",
+                "<｜DSML｜parameter name=\"n\" string=\"false\">not json</｜DSML｜parameter>",
+                "</｜DSML｜invoke></｜DSML｜function_calls>",
+            ),
+            "parameter_not_json",
+        ),
+        (
+            concat!(
+                "<｜DSML｜function_calls><｜DSML｜invoke name=\"f\">",
+                "<｜DSML｜parameter name=\"n\">1",
+            ),
+            "parameter_unclosed",
+        ),
+        (
+            "<｜DSML｜function_calls></｜DSML｜function_calls>",
+            "expected_invoke",
+        ),
+        (
+            concat!(
+                "<｜DSML｜function_calls><｜DSML｜invoke name=\"f\">",
+                "<｜DSML｜other></｜DSML｜invoke></｜DSML｜function_calls>",
+            ),
+            "expected_parameter",
+        ),
+        (
+            "<｜DSML｜function_calls><｜DSML｜invoke name=f>",
+            "attribute_unquoted",
+        ),
+        (
+            concat!(
+                "<｜DSML｜function_calls><｜DSML｜invoke name=\"f\"></｜DSML｜invoke>",
+                "</｜DSML｜function_calls>tail",
+            ),
+            "trailing_after_close",
+        ),
+        (CANONICAL, ""),
+    ];
+    for (raw, expected) in cases {
+        let got = step(raw).unwrap_or("");
+        assert_eq!(got, expected, "step for {raw:?}");
+    }
+    // The public surface is unchanged: one reason, never the step.
+    assert_eq!(
+        parse_block("<｜DSML｜function_calls></｜DSML｜function_calls>", true),
+        Err(MALFORMED_TOOL_CALL)
+    );
+    assert_eq!(
+        Reject::SpanTooLarge.code(),
+        "span_too_large",
+        "the size refusal keeps its code"
+    );
+}

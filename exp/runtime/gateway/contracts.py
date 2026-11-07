@@ -916,12 +916,21 @@ class GatewayRequest(ContractModel):
 
 
 class ProjectSelection(ContractModel):
-    """One frozen learned-router selection resolved before provider execution."""
+    """One frozen project selection resolved before provider execution.
+
+    Attributes:
+        exact_model_id: Exact logical model the selected candidate serves.
+        selected_alias: Policy candidate alias the selector chose.
+        activation_ref: Project activation that made the selection.
+        fallback_reason: Why the selector fell back from its first choice, or None.
+        route_reason: ``learned_router`` for a learned policy, ``tag_router`` for tag rules.
+    """
 
     exact_model_id: ExactModelId
     selected_alias: ArtifactId
     activation_ref: ActivationRef
     fallback_reason: str | None = Field(default=None, max_length=512)
+    route_reason: Literal["learned_router", "tag_router"] = "learned_router"
 
 
 class AuthorizationSnapshot(ClientAttribution):

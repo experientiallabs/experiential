@@ -48,6 +48,7 @@ from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
 )
+from exp.runtime.gateway.native_accounting_recovery import settle_swept
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     InflightRequest,
@@ -200,6 +201,8 @@ class _RecordingLedger:
         self.request_search_meters: list[int] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
         self.fail_finishes = 0
+        self.priced: list[dict[str, object]] = []
+        self.fail_prices = 0
         self.fail_request_finishes = 0
         self.typed_rejection: GatewayFailure | None = None
         self._counter = 0
@@ -251,6 +254,13 @@ class _RecordingLedger:
             }
         )
         return attempt_id
+
+    def price_attempt(self, **settlement: object) -> None:
+        """Record one priced settlement's keywords, honoring scripted quote failures."""
+        if self.fail_prices > 0:
+            self.fail_prices -= 1
+            raise RuntimeError("scripted quote failure")
+        self.priced.append(dict(settlement))
 
     def finish_attempt(
         self,
@@ -1077,7 +1087,7 @@ def test_poison_recovery_item_retains_its_meter_without_stopping_later_recovery(
     assert first.pending_settlement == retained
     assert accounting.entry("healthy") is None
     with pytest.raises(NativeBridgeError):
-        accounting.require_clear()
+        accounting.require_clear("first")
     accounting.sweep_expired()
     assert accounting.entry("poison") is None
     assert len(ledger.finished) == 2
@@ -1099,7 +1109,7 @@ def test_host_scheduled_recovery_keeps_failed_close_owned_until_acknowledged() -
     assert not accounting.close(timeout_seconds=0)
     assert accounting.entry(entry.authorization.request_id) is entry
     with pytest.raises(NativeBridgeError):
-        accounting.require_clear()
+        accounting.require_clear("organization-one")
     accounting.sweep_expired()
     assert accounting.close(timeout_seconds=0)
     assert accounting.entry(entry.authorization.request_id) is None
@@ -4597,7 +4607,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         accounting.abandon(json.dumps({"request_id": "late-reservation"}))
         # Cancellation intent while reserve still owns the request lock is not
         # a failed ledger write and must not fence sibling admissions.
-        accounting.require_clear()
+        accounting.require_clear("organization-one")
         assert not accounting.accounting_healthy
         assert accounting.entry("late-reservation") is entry
         assert not ledger.finished_requests and not ledger.finished
@@ -4612,7 +4622,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         assert not results and accounting.entry("late-reservation") is entry
         assert entry.active_attempt_id is not None and not ledger.finished
         with pytest.raises(NativeBridgeError):
-            accounting.require_clear()
+            accounting.require_clear("organization-one")
         accounting.sweep_expired()
     else:
         assert not errors and results and results[0].get("exhausted") is True
@@ -4771,7 +4781,7 @@ def test_delayed_sweep_cannot_clear_a_newer_attempts_observed_meter(
     ledger.fail_finishes = 1
     with pytest.raises(NativeBridgeError):
         accounting.settle(json.dumps(newer))
-    assert not accounting._settle_swept("request-one", entry, selected)
+    assert not settle_swept(accounting, "request-one", entry, selected)
     assert entry.pending_settlement == newer
     accounting.sweep_expired()
     assert entry.pending_settlement is None
@@ -4954,7 +4964,7 @@ def test_observed_meter_owns_abandonment_before_waiting_for_execution_gate(
         """Run competing cleanup exactly before the observed callback takes its gate."""
 
         def __enter__(self) -> None:
-            accounting.require_clear()
+            accounting.require_clear("organization-one")
             assert accounting.accounting_healthy
             cleanups.append(
                 json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
@@ -5070,7 +5080,7 @@ def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
     try:
         assert entered.wait(5)
         assert accounting.accounting_healthy
-        accounting.require_clear()
+        accounting.require_clear("organization-one")
         if not request_only:
             entry.deadline_monotonic = time.monotonic() - 10
             assert json.loads(
@@ -5203,3 +5213,87 @@ def test_meter_arriving_during_abandonment_stays_owned_until_exact_ack(
     assert exact is not None and exact.kind is GatewayEventKind.COMPLETED
     assert exact.usage is not None
     assert (exact.usage.input_tokens, exact.usage.output_tokens) == (123, 12)
+
+
+def test_a_quote_prices_exactly_what_the_later_settlement_writes() -> None:
+    """The host prices the normalized terminal the settlement then writes; nothing is retained."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": {"input_tokens": 7, "output_tokens": 3},
+        "failure": {"failure_class": "cancelled", "safe_message": "caller disconnected"},
+        "finalize": True,
+        "opened": True,
+        "dispatched": True,
+        "usage_incomplete_due_to_disconnect": True,
+    }
+    encoded = json.dumps(payload)
+    assert registry.price(encoded) == "{}"
+    assert ledger.finished == []
+    # Priced means owned by recovery: the sweep replays it, never abandons it.
+    assert entry.pending_settlement == payload
+    assert registry.accounting_healthy
+    assert registry.entry(entry.authorization.request_id) is entry
+    registry.settle(encoded)
+    assert len(ledger.priced) == 1
+    priced = ledger.priced[0]
+    assert priced["attempt_id"] == started["attempt_id"]
+    assert priced["terminal_event"] == ledger.terminal_events[-1]
+    assert priced["finalize_request"] is True
+    assert ledger.finished[-1]["finalize"] is True
+    assert registry.entry(entry.authorization.request_id) is None
+
+
+def test_a_failed_quote_retains_nothing_and_the_settlement_still_lands() -> None:
+    """A quote failure is the data plane's cue to settle first; it leaves no recovery state."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    encoded = json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": started["attempt_id"],
+            "outcome": "completed",
+            "usage": {"input_tokens": 11, "output_tokens": 2},
+            "tool_names": [],
+            "failure": None,
+            "finalize": True,
+            "opened": True,
+        }
+    )
+    ledger.fail_prices = 1
+    with pytest.raises(NativeBridgeError):
+        registry.price(encoded)
+    assert entry.pending_settlement is None
+    assert registry.accounting_healthy
+    registry.settle(encoded)
+    assert len(ledger.finished) == 1
+
+
+def test_an_expired_priced_settlement_is_replayed_not_abandoned() -> None:
+    """A stream still flushing its priced terminal past its deadline settles as priced."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "completed",
+        "usage": {"input_tokens": 9, "output_tokens": 4},
+        "tool_names": [],
+        "failure": None,
+        "finalize": True,
+        "opened": True,
+    }
+    registry.price(json.dumps(payload))
+    entry.deadline_monotonic = time.monotonic() - 60
+    registry.sweep_expired()
+    assert registry.entry(entry.authorization.request_id) is None
+    assert ledger.finished == [
+        {"attempt_id": started["attempt_id"], "failure_class": None, "finalize": True}
+    ]
+    assert ledger.priced[0]["terminal_event"] == ledger.terminal_events[-1]
+    # The data plane's own delivery afterwards is a no-op, not a second write.
+    assert registry.settle(json.dumps(payload)) == "{}"
+    assert len(ledger.finished) == 1

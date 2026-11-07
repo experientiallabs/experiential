@@ -37,16 +37,14 @@ from exp.common.models.content import (
     TextContentPart,
 )
 from exp.common.models.model import ToolCall
+from exp.runtime.anthropic_protocol import passthrough_fields
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
     gateway_reasoning_block,
     merge_exposed_reasoning,
 )
-from exp.runtime.anthropic_protocol.manifest import (
-    MESSAGES_BETA_TOKENS_FIELD_BOUND,
-    MESSAGES_BETA_TOKENS_FORWARDED,
-    MESSAGES_MANIFEST,
-)
+from exp.runtime.anthropic_protocol.history_media import degrade_history_media
+from exp.runtime.anthropic_protocol.manifest import MESSAGES_MANIFEST
 from exp.runtime.anthropic_protocol.media_blocks import (
     AnthropicWireModel,
     CacheControl,
@@ -99,6 +97,7 @@ from exp.runtime.models.providers.cache_policy import (
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.history_documents import trim_history_documents
 from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
 from exp.runtime.openai_protocol.unknown_message_fields import drop_unknown_message_keys
@@ -218,6 +217,36 @@ class _Message(AnthropicWireModel):
 
 _MESSAGE_KEYS = frozenset(_Message.model_fields)
 """Keys an Anthropic turn object may carry."""
+
+EMPTY_FINAL_ASSISTANT_DROPPED = "messages.assistant->dropped(empty_final_prefill)"
+"""Disclosure for a trailing assistant turn with no content.
+
+Anthropic rejects empty content on every turn "except for the optional final
+assistant message": an empty final assistant turn is an empty prefill, which
+the provider treats as no prefill at all. The decoder drops that turn so the
+request is served exactly as Anthropic serves it."""
+
+
+def _is_empty_prefill(message: _Message) -> bool:
+    """Whether ``message`` is an assistant turn carrying no content at all.
+
+    An empty string, or only unmarked, uncited text blocks whose text is
+    empty. A block carrying ``cache_control`` is not dropped: the caller asked
+    for a breakpoint there, so it keeps the typed refusal (as Anthropic
+    refuses an empty text block) instead of losing the marker silently. An
+    empty block list is not a prefill and stays refused.
+    """
+    if message.role != "assistant":
+        return False
+    if isinstance(message.content, str):
+        return not message.content
+    return bool(message.content) and all(
+        isinstance(block, _TextBlock)
+        and not block.text
+        and not block.citations
+        and block.cache_control is None
+        for block in message.content
+    )
 
 
 class _ToolChoice(AnthropicWireModel):
@@ -389,10 +418,13 @@ def _decode(
     # turn defines is removed with disclosure rather than failing the whole
     # conversation. Content blocks and top-level fields stay strict.
     payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
+    # Media the gateway cannot forward fails every replay of a history that
+    # carries it, so history copies degrade to disclosed placeholders.
+    payload, media_disclosures = degrade_history_media(payload)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
-    forwarded_betas, dropped_beta_disclosures = _beta_tokens(anthropic_beta)
+    forwarded_betas, dropped_beta_disclosures = passthrough_fields.beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)
     if system_text:
@@ -403,7 +435,19 @@ def _decode(
                 provider_text_blocks=_marked_text_blocks(request.system),
             )
         )
+    prefill_disclosures: tuple[str, ...] = ()
+    last_index = len(request.messages) - 1
     for index, message in enumerate(request.messages):
+        if (
+            index == last_index
+            and _is_empty_prefill(message)
+            and any(turn.role != "system" for turn in request.messages[:index])
+        ):
+            # Anthropic accepts an empty final assistant turn as no prefill
+            # once a conversation turn precedes it; an empty turn anywhere
+            # else, or one that would leave no turn, still fails below.
+            prefill_disclosures = (EMPTY_FINAL_ASSISTANT_DROPPED,)
+            continue
         try:
             messages.extend(_gateway_messages(message, index))
         except ValidationError as exc:
@@ -419,6 +463,7 @@ def _decode(
                 + detail["msg"].removeprefix("Value error, ")
                 + ".",
             ) from exc
+    trimmed, document_disclosures = trim_history_documents(tuple(messages))
     tools, tool_change_disclosures = tools_after_changes(
         request.tools, [message.content for message in request.messages]
     )
@@ -439,7 +484,7 @@ def _decode(
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
-            messages=tuple(messages),
+            messages=trimmed,
             tools=tools,
             # Raw payload entries, mirroring thinking: the provider receives
             # each server tool byte-for-byte on Anthropic rungs.
@@ -464,9 +509,9 @@ def _decode(
             include_usage=request.stream,
             metadata=_gateway_metadata(request.metadata),
             provider_thinking_config=channels.thinking_config,
-            context_management=_context_management(payload),
-            diagnostics=_diagnostics(payload),
-            safeguards=_safeguards(payload),
+            context_management=passthrough_fields.context_management(payload),
+            diagnostics=passthrough_fields.diagnostics(payload),
+            safeguards=passthrough_fields.safeguards(payload),
             speed=request.speed,
             # Raw payload value, mirroring thinking: the provider receives the
             # caller's cache marker byte-for-byte on Anthropic rungs.
@@ -479,6 +524,9 @@ def _decode(
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(
                 *unknown_disclosures,
+                *media_disclosures,
+                *document_disclosures,
+                *prefill_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,
@@ -495,101 +543,6 @@ def _decode(
     except ValidationError as exc:
         raise validation_error(exc.errors(include_url=False)[0]) from exc
     return DecodedGatewayRequest(alias=request.model, request=canonical)
-
-
-def _context_management(payload: JsonObject) -> JsonObject | None:
-    """Validate the caller's context-editing config as an object, verbatim.
-
-    The nested shape is an evolving Anthropic beta the gateway forwards
-    byte-for-byte (with the required beta header), so validation is
-    deliberately shallow: a closed model here would recreate the
-    reject-what-real-clients-send incident class.
-
-    Raises:
-        OpenAIProtocolError: The field is present but not a JSON object.
-    """
-    value = payload.get("context_management")
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise invalid_field("context_management", "context_management must be a JSON object.")
-    return cast(JsonObject, value)
-
-
-def _diagnostics(payload: JsonObject) -> JsonObject | None:
-    """Validate the caller's diagnostics correlation as an object, verbatim.
-
-    Like ``context_management``, the nested shape is an evolving Anthropic
-    beta the gateway forwards byte-for-byte (with the required beta
-    header), so validation is deliberately shallow.
-
-    Raises:
-        OpenAIProtocolError: The field is present but not a JSON object.
-    """
-    value = payload.get("diagnostics")
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise invalid_field("diagnostics", "diagnostics must be a JSON object.")
-    return cast(JsonObject, value)
-
-
-def _safeguards(payload: JsonObject) -> tuple[JsonObject, ...] | None:
-    """Validate Claude Code's auto-mode safeguards as an array of objects.
-
-    Each entry is an evolving provider object forwarded byte-for-byte on
-    Anthropic rungs, so validation stays shallow.
-
-    Raises:
-        OpenAIProtocolError: The field is present but not an array of objects.
-    """
-    value = payload.get("safeguards")
-    if value is None:
-        return None
-    if not isinstance(value, list) or not all(isinstance(entry, dict) for entry in value):
-        raise invalid_field("safeguards", "safeguards must be an array of JSON objects.")
-    return tuple(cast(JsonObject, entry) for entry in value)
-
-
-def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Partition a caller ``anthropic-beta`` header into forward and drop sets.
-
-    Forwarding is an exact allowlist (:data:`MESSAGES_BETA_TOKENS_FORWARDED`):
-    a caller header is operator-trust surface and is never blind-forwarded.
-    Dropped tokens are disclosed per token, never rejected, because the
-    provider itself tolerates unknown beta tokens. Field-bound tokens
-    (:data:`MESSAGES_BETA_TOKENS_FIELD_BOUND`) land in neither set: the
-    gateway injects them itself beside their field.
-
-    Args:
-        header: Raw comma-separated header value, or ``None``.
-
-    Returns:
-        ``(forwarded_tokens, dropped_disclosures)`` in caller order, deduped.
-
-    Raises:
-        OpenAIProtocolError: The header carries a non-display-safe value.
-    """
-    if header is None:
-        return (), ()
-    if len(header) > 4_096 or any(ord(char) < 32 for char in header):
-        raise invalid_field("anthropic-beta", "anthropic-beta must be a display-safe header value.")
-    forwarded: list[str] = []
-    dropped: list[str] = []
-    for raw_token in header.split(","):
-        token = raw_token.strip()
-        if not token:
-            continue
-        if token in MESSAGES_BETA_TOKENS_FIELD_BOUND:
-            continue
-        if token in MESSAGES_BETA_TOKENS_FORWARDED:
-            if token not in forwarded:
-                forwarded.append(token)
-        else:
-            disclosure = f"anthropic-beta.{token}"
-            if disclosure not in dropped:
-                dropped.append(disclosure)
-    return tuple(forwarded), tuple(dropped)
 
 
 def _system_text(system: str | tuple[_TextBlock, ...] | None) -> str | None:

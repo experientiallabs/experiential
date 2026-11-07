@@ -25,6 +25,7 @@ from exp.runtime.gateway.native_execution import native_serving_blockers
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.project_activation import (
     LocalArtifactProjectActivationRepository,
+    ProjectActivation,
     ProjectActivationVerifier,
 )
 from exp.runtime.gateway.project_alias import prepare_project_gateway_alias
@@ -225,6 +226,11 @@ def load_project_router(
             policy_id,
             runtime_catalog=catalog,
         )
+        if not isinstance(activation, ProjectActivation):
+            raise RouterApplicationError(
+                f"router policy {activation.activation_ref} is a tag-rules policy; "
+                "serve it through a gateway alias"
+            )
         return RouterRuntime.from_activation(
             activation,
             catalog,

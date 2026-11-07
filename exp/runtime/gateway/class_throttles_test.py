@@ -23,6 +23,7 @@ from exp.runtime.gateway.class_throttles import (
     fast_reserve_slots,
     is_self_hosted_rung,
     output_pace,
+    priority_tier_attested,
     require_fast_path,
     rung_saturation,
     started_attempt_payload,
@@ -646,6 +647,44 @@ def test_tier_settlement_self_serves_only_a_fast_request_on_our_carded_gpu() -> 
         "self_served"
     ]
     untiered = tier_settlement(_entry(_FAST, _carded(_rung())), "attempt-unknown")
+    assert untiered == {"service_tier": None, "self_served": False}
+
+
+def _attested(*, billing: BillingSource = BillingSource.HOST_MANAGED) -> ExactModelDeployment:
+    """A third-party rung whose host attests it is the priority tier (no vLLM levers)."""
+    base = _deployment("parasail", "parasail")
+    policy = GatewayRungDispatchPolicy(priority_tier_attested=True)
+    return base.model_copy(
+        update={
+            "billing_source": billing,
+            "gateway": base.gateway.model_copy(update={"dispatch": policy}),
+        }
+    )
+
+
+def test_priority_tier_attested_needs_a_platform_funded_carded_rung() -> None:
+    """The attestation counts only with the priority card, and never on a customer's key."""
+    assert priority_tier_attested(_carded(_attested()))
+    assert not priority_tier_attested(_attested())
+    assert not priority_tier_attested(_carded(_attested(billing=BillingSource.CUSTOMER_MANAGED)))
+    assert not priority_tier_attested(_carded(_rung(self_hosted=False)))
+
+
+def test_an_attested_rung_is_not_self_hosted() -> None:
+    """Attesting the tier turns on none of the self-hosted levers (vLLM priority, pacing, caps)."""
+    rung = _carded(_attested())
+    assert not is_self_hosted_rung(rung)
+    assert not fast_on_rung(_FAST, rung)
+
+
+def test_tier_settlement_self_serves_a_fast_request_on_an_attested_rung() -> None:
+    """A :fast attempt on an attested carded rung settles at its card; nothing else changes."""
+    assert tier_settlement(_entry(_FAST, _carded(_attested())), "attempt-1")["self_served"]
+    assert not tier_settlement(_entry(_AUTHORIZATION, _carded(_attested())), "attempt-1")[
+        "self_served"
+    ]
+    assert not tier_settlement(_entry(_FAST, _attested()), "attempt-1")["self_served"]
+    untiered = tier_settlement(_entry(_FAST, _carded(_attested())), "attempt-unknown")
     assert untiered == {"service_tier": None, "self_served": False}
 
 

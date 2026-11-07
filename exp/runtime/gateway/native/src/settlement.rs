@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
-use crate::errors::{Failure, FailureClass};
+use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::replay::OwnerLease;
@@ -204,20 +204,30 @@ fn settle_argument(
 
 /// Deliver one control-plane write with bounded backoff; the control plane
 /// keeps the in-flight entry on a failed terminal write, so retries can
-/// still land. A persistent failure stays latched as accounting-unhealthy
-/// control-plane side and is reconciled at the next startup.
-async fn deliver(bridge: &Bridge, method: &'static str, argument: String) -> bool {
+/// still land. A persistent failure fences only the owning organization's
+/// admission control-plane side and is reconciled at the next startup.
+///
+/// A failed delivery returns the control plane's last public error, so a
+/// caller answers with what the ledger said (for example a retryable
+/// accounting refusal) instead of a generic internal error.
+async fn deliver(
+    bridge: &Bridge,
+    method: &'static str,
+    argument: String,
+) -> Result<(), PublicError> {
+    let mut last = PublicError::internal();
     for backoff_ms in [0u64, 100, 500, 2_000] {
         if backoff_ms > 0 {
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             METRICS.record_settlement_retry();
         }
-        if bridge.call(method, argument.clone()).await.is_ok() {
-            return true;
+        match bridge.call(method, argument.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => last = error,
         }
     }
     // The control plane keeps the in-flight entry; its sweep keeps retrying
-    // and latches readiness if the loss is durable. Leave an operator signal
+    // while the owning organization stays fenced. Leave an operator signal
     // as one structured, content-free stderr line beside the counter.
     METRICS.record_settlement_give_up();
     let parsed: Value = serde_json::from_str(&argument).unwrap_or(Value::Null);
@@ -229,7 +239,7 @@ async fn deliver(bridge: &Bridge, method: &'static str, argument: String) -> boo
         "outcome": parsed.get("outcome").cloned().unwrap_or(Value::Null),
     });
     eprintln!("exp-gateway-native: {line}");
-    false
+    Err(last)
 }
 
 /// Exactly-once settlement owner for one admitted request and its physical
@@ -262,6 +272,9 @@ pub struct AttemptGuard {
     /// task cancelled mid-write can neither downgrade the ledger outcome nor
     /// diverge from the recorded metric.
     decided_settlement: Option<String>,
+    /// The host priced `decided_settlement` and its terminal bytes may flush
+    /// before the durable write; [`AttemptGuard::settle_priced`] owes it.
+    priced: bool,
     pub started: Instant,
     /// Wall-clock time the winning attempt streamed its first output token,
     /// reported in the finalizing settlement so the control plane can derive
@@ -287,6 +300,8 @@ pub struct AttemptGuard {
     tool_search_requests: u32,
     observation: Observation,
     dispatch: Option<crate::dispatch_capacity::DispatchPermit>,
+    /// The control plane's public error from the last failed delivery.
+    settlement_error: Option<PublicError>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -336,6 +351,7 @@ impl AttemptGuard {
             opened: false,
             dispatched: false,
             decided_settlement: None,
+            priced: false,
             started,
             first_token_at: None,
             rate_limit_headers: None,
@@ -344,6 +360,7 @@ impl AttemptGuard {
             tool_search_requests: 0,
             observation: Observation::default(),
             dispatch: None,
+            settlement_error: None,
         }
     }
 
@@ -475,8 +492,74 @@ impl AttemptGuard {
         failure: Option<&Failure>,
         finalize: bool,
     ) -> bool {
-        if !self.armed {
+        if self.priced {
+            // A priced terminal settles exactly what the host priced.
+            return self.settle_priced().await;
+        }
+        match self
+            .decide(outcome, usage, tool_names, failure, finalize)
+            .await
+        {
+            Some((argument, finalize)) => self.deliver_decided(argument, finalize).await,
+            None => true,
+        }
+    }
+
+    /// Ask the host to price the active attempt's finalizing settlement
+    /// before its terminal bytes flush, without writing it.
+    ///
+    /// The settlement is decided here exactly once and kept verbatim: a
+    /// successful quote is followed by [`AttemptGuard::settle_priced`] (or,
+    /// if the task is cut short, by the drop backstop re-delivering the same
+    /// argument), so the durable write carries exactly the inputs the host
+    /// priced. A failed quote settles immediately instead, keeping the
+    /// settle-before-terminal order. Returns whether terminal bytes may flush:
+    /// true after a quote or a landed settlement, false when neither landed.
+    pub async fn price_or_settle(
+        &mut self,
+        outcome: &str,
+        usage: Option<&Usage>,
+        tool_names: &[String],
+        failure: Option<&Failure>,
+    ) -> bool {
+        let Some((argument, finalize)) =
+            self.decide(outcome, usage, tool_names, failure, true).await
+        else {
             return true;
+        };
+        if self.bridge.call("price", argument.clone()).await.is_ok() {
+            self.priced = true;
+            return true;
+        }
+        self.deliver_decided(argument, finalize).await
+    }
+
+    /// Durably deliver the settlement a successful quote priced, after its
+    /// terminal bytes flushed, through the same retried delivery as
+    /// [`AttemptGuard::settle`]. A no-op when nothing was priced.
+    pub async fn settle_priced(&mut self) -> bool {
+        if !self.priced || !self.armed {
+            return true;
+        }
+        self.priced = false;
+        let Some(argument) = self.decided_settlement.clone() else {
+            return true;
+        };
+        self.deliver_decided(argument, true).await
+    }
+
+    /// Decide the active attempt's settlement argument and record its
+    /// terminal outcome; `None` when nothing durable remains to close.
+    async fn decide(
+        &mut self,
+        outcome: &str,
+        usage: Option<&Usage>,
+        tool_names: &[String],
+        failure: Option<&Failure>,
+        finalize: bool,
+    ) -> Option<(String, bool)> {
+        if !self.armed {
+            return None;
         }
         let input_failure = match self.input_gate.clone() {
             Some(gate) => gate
@@ -497,7 +580,7 @@ impl AttemptGuard {
         let Some(attempt_id) = self.attempt_id.clone() else {
             // No active attempt: nothing durable to close here. The abandon
             // path owns request-only terminalization.
-            return true;
+            return None;
         };
         let observed = self.observation.snapshot();
         let usage = observed.usage.as_ref().or(usage);
@@ -565,7 +648,12 @@ impl AttemptGuard {
             self.record_terminal(outcome, cancelled);
         }
         self.decided_settlement = Some(argument.clone());
-        let delivered = deliver(&self.bridge, "settle", argument).await;
+        Some((argument, finalize))
+    }
+
+    /// Deliver one decided settlement and update the guard's ownership.
+    async fn deliver_decided(&mut self, argument: String, finalize: bool) -> bool {
+        let delivered = self.record_delivery(deliver(&self.bridge, "settle", argument).await);
         if finalize {
             // The control plane retained a failed terminal write verbatim,
             // so its sweep (not the drop backstop) owns the retry.
@@ -598,6 +686,11 @@ impl AttemptGuard {
         if !self.armed {
             return true;
         }
+        if self.priced {
+            // The provider terminal was already decided and priced; a later
+            // disconnect never downgrades it to a cancellation.
+            return self.settle_priced().await;
+        }
         if self.attempt_id.is_some() {
             let observed = self.observation.snapshot();
             self.record_first_token(observed.first_token_at);
@@ -628,7 +721,7 @@ impl AttemptGuard {
     pub async fn abandon(&mut self, failure: &Failure) -> bool {
         self.record_terminal("failed", failure.failure_class == FailureClass::Cancelled);
         self.armed = false;
-        deliver(
+        let delivered = deliver(
             &self.bridge,
             "abandon",
             compact_json(&json!({
@@ -639,7 +732,27 @@ impl AttemptGuard {
                 },
             })),
         )
-        .await
+        .await;
+        self.record_delivery(delivered)
+    }
+
+    /// Retain a failed delivery's public error and report whether it landed.
+    fn record_delivery(&mut self, delivered: Result<(), PublicError>) -> bool {
+        match delivered {
+            Ok(()) => true,
+            Err(error) => {
+                self.settlement_error = Some(error);
+                false
+            }
+        }
+    }
+
+    /// The public error a caller answers after a terminal write did not land:
+    /// the control plane's own error, or the shared internal error.
+    pub fn settlement_error(&self) -> PublicError {
+        self.settlement_error
+            .clone()
+            .unwrap_or_else(PublicError::internal)
     }
 
     /// Disarm the guard after the control plane itself finalized the request
@@ -813,7 +926,7 @@ impl Drop for AttemptGuard {
         pending.fetch_add(1, Ordering::SeqCst);
         handle.spawn(async move {
             let _dispatch = dispatch;
-            deliver(&bridge, method, argument).await;
+            let _ = deliver(&bridge, method, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -822,3 +935,7 @@ impl Drop for AttemptGuard {
 #[cfg(test)]
 #[path = "settlement_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "settlement_refusal_tests.rs"]
+mod refusal_tests;

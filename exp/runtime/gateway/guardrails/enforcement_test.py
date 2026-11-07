@@ -11,7 +11,7 @@ import weakref
 from collections.abc import Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Never
+from typing import Literal, Never
 
 import httpx
 import pytest
@@ -37,6 +37,7 @@ from exp.runtime.gateway.guardrails.classifiers import (
 )
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient, InspectingClassifier
 from exp.runtime.gateway.guardrails.contracts import (
+    CategoryScore,
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -48,11 +49,13 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailRejected,
     GuardrailToolCall,
     OutputGuardrailMode,
+    ScoredVerdict,
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
 from exp.runtime.gateway.guardrails.observation import ObservationAdmission, ObservationLease
+from exp.runtime.gateway.guardrails.recording import ClassificationRecord
 from exp.runtime.gateway.guardrails.regex import (
     BuiltinPattern,
     RegexAdapterDocument,
@@ -342,9 +345,10 @@ def test_observation_retains_the_subject_hashed_before_caller_mutation(
         request: GatewayRequest,
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
+        request_id: str | None = None,
     ) -> GatewayRequest:
         """Pause the real queued engine job before reading its complete input."""
-        del policy, deadline_monotonic
+        del policy, deadline_monotonic, request_id
         assert retention is not None
         started.set()
         await _wait_hold(release)
@@ -1942,3 +1946,80 @@ def test_stream_segment_never_releases_after_its_budget(deadline: float) -> None
             settled_bytes=0,
             deadline_monotonic=deadline,
         )
+
+
+def _scored(*, flagged: bool) -> ScoredVerdict:
+    """Return one decision-model verdict with two category scores."""
+    return ScoredVerdict(
+        flagged=flagged,
+        scores=(
+            CategoryScore(category="weapons", score=0.91 if flagged else 0.1, flagged=flagged),
+            CategoryScore(category="fraud", score=0.2, flagged=False),
+        ),
+        subject_sha256="c" * 64,
+        cached=False,
+    )
+
+
+def _scoring_engine(
+    verdict: ClassifierVerdict, *, mode: Literal["enforce", "observe"]
+) -> tuple[GuardrailEngine, list[ClassificationRecord]]:
+    """Compose one engine whose score sink collects every delivered record."""
+    records: list[ClassificationRecord] = []
+    policy = GuardrailPolicy(
+        policy_id="member-policy",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        mode=mode,
+        checks=(_check("classify"),),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"scripted": ScriptedClassifier(input_verdict=verdict)})
+        ),
+        monotonic=time.monotonic,
+        record_classification=records.append,
+    )
+    return engine, records
+
+
+def test_enforced_block_delivers_its_scores_with_the_request_identity() -> None:
+    """A blocked request still reports which categories fired, for the host to act on."""
+    engine, records = _scoring_engine(_scored(flagged=True), mode="enforce")
+    session = engine.open_request(_authorization(), deadline_monotonic=time.monotonic() + 5)
+    assert session is not None
+    with pytest.raises(GuardrailRejected):
+        session.inspect_input(_request("hello"))
+    engine.close(timeout_seconds=2)
+    [record] = records
+    assert record.request_id == "request-one"
+    assert (record.policy.policy_id, record.policy.mode) == ("member-policy", "enforce")
+    assert record.check.check_id == "classify"
+    assert record.outcome is GuardrailOutcome.FLAGGED
+    assert record.scores == _scored(flagged=True).scores
+    assert (record.subject_sha256, record.cached) == ("c" * 64, False)
+
+
+def test_observed_allow_delivers_scores_without_gating_the_request() -> None:
+    """Observation reports the same scores while the request proceeds unchanged."""
+    engine, records = _scoring_engine(_scored(flagged=False), mode="observe")
+    session = engine.open_request(_authorization(), deadline_monotonic=time.monotonic() + 5)
+    assert session is not None
+    request = _request("hello")
+    assert session.inspect_input(request) is request
+    engine.close(timeout_seconds=2)
+    [record] = records
+    assert (record.request_id, record.policy.mode) == ("request-one", "observe")
+    assert record.outcome is GuardrailOutcome.ALLOW
+
+
+def test_unscored_verdicts_deliver_no_score_record() -> None:
+    """Only a decision-model verdict carries scores; other adapters report nothing."""
+    engine, records = _scoring_engine(ClassifierVerdict(flagged=True), mode="enforce")
+    session = engine.open_request(_authorization(), deadline_monotonic=time.monotonic() + 5)
+    assert session is not None
+    with pytest.raises(GuardrailRejected):
+        session.inspect_input(_request("hello"))
+    engine.close(timeout_seconds=2)
+    assert records == []

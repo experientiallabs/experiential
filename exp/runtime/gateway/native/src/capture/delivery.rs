@@ -51,6 +51,16 @@ pub(crate) trait Sink: Send + 'static {
         0
     }
 
+    /// Upper bound retained outside the active batch's preparation workspace.
+    fn retained_prepared_bytes(&self, _prepared: &Self::Prepared, maximum: usize) -> usize {
+        Self::preparation_bytes(maximum)
+    }
+
+    /// Only monotonic, idempotent destinations may accept updates out of order.
+    fn independent_retries(&self) -> bool {
+        false
+    }
+
     /// One acknowledgement per record, in input order. False retains ownership.
     fn write_batch(&mut self, prepared: &[&Self::Prepared]) -> Vec<bool> {
         prepared
@@ -96,6 +106,7 @@ impl Limits {
 
 #[derive(Default)]
 struct Counters {
+    abandon_at: Mutex<Option<Instant>>,
     bytes: AtomicUsize,
     preparation_bytes: AtomicUsize,
     pending: AtomicUsize,
@@ -105,6 +116,15 @@ struct Counters {
     maintenance_failed: AtomicU64,
     capacity: Mutex<()>,
     available: Condvar,
+}
+
+impl Counters {
+    fn abandoned(&self) -> bool {
+        self.abandon_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() >= until)
+    }
 }
 
 struct Checkpoint {
@@ -129,6 +149,17 @@ struct Pending {
 struct Prepared<P> {
     item: Pending,
     value: Option<P>,
+    retry_delay: Duration,
+}
+
+impl<P> Prepared<P> {
+    fn new(item: Pending) -> Self {
+        Self {
+            item,
+            value: None,
+            retry_delay: Duration::from_millis(25),
+        }
+    }
 }
 
 /// Gather until a count, byte or oldest-item deadline is reached.
@@ -144,33 +175,72 @@ fn run_worker<S: Sink>(
 ) {
     let maximum_record_bytes = limits.maximum_record_bytes;
     let mut pending: Vec<Prepared<S::Prepared>> = Vec::new();
+    let mut deferred: VecDeque<(Instant, Prepared<S::Prepared>)> = VecDeque::new();
+    let mut prefer_retry = false;
     let mut maintained = Instant::now();
     let mut delay = Duration::from_millis(25);
     loop {
+        if counters.abandoned() {
+            break;
+        }
         if maintained.elapsed() >= Duration::from_secs(1) {
             if sink.maintain().is_err() {
                 counters.maintenance_failed.fetch_add(1, Ordering::Relaxed);
             }
             maintained = Instant::now();
         }
+        let mut retry_turn = false;
+        if pending.is_empty()
+            && prefer_retry
+            && deferred
+                .front()
+                .is_some_and(|(at, _)| *at <= Instant::now())
+        {
+            pending.push(deferred.pop_front().expect("retry present").1);
+            retry_turn = true;
+        }
         if pending.is_empty() {
             if let Some(item) =
                 admit_checkpoint(&checkpoints, &counters, &limits, maximum_queued_bytes)
             {
-                pending.push(Prepared { item, value: None });
+                pending.push(Prepared::new(item));
+            }
+        }
+        if pending.is_empty() && !deferred.is_empty() {
+            // Do not pay the idle receive timeout between retries when there
+            // is no fresh work. Still alternate whenever fresh work exists.
+            if let Ok(Some(item)) = receiver.try_recv() {
+                pending.push(Prepared::new(item));
+            } else if deferred
+                .front()
+                .is_some_and(|(at, _)| *at <= Instant::now())
+            {
+                pending.push(deferred.pop_front().expect("retry present").1);
+                retry_turn = true;
             }
         }
         if pending.is_empty() {
             #[cfg(test)]
             sink.before_receive();
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(Some(item)) => pending.push(Prepared { item, value: None }),
+            let idle_wait = Duration::from_millis(100);
+            let wait = deferred.front().map_or(idle_wait, |(at, _)| {
+                idle_wait.min(at.saturating_duration_since(Instant::now()))
+            });
+            match receiver.recv_timeout(wait) {
+                Ok(Some(item)) => pending.push(Prepared::new(item)),
                 Ok(None) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    prefer_retry = true;
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if checkpoints.lock().is_ok_and(|waiting| waiting.is_empty()) {
+                    if deferred.is_empty()
+                        && checkpoints.lock().is_ok_and(|waiting| waiting.is_empty())
+                    {
                         break;
                     }
+                    prefer_retry = true;
+                    std::thread::sleep(Duration::from_millis(25));
                     continue;
                 }
             }
@@ -184,6 +254,24 @@ fn run_worker<S: Sink>(
             .filter_map(|p| p.value.as_ref())
             .map(|value| sink.prepared_bytes(value))
             .sum::<usize>();
+        if retry_turn {
+            // Preserve batching during an outage: fairness must not turn one
+            // failed batch into a database call for every deferred record.
+            while pending.len() < sink.batch_records() && bytes < sink.batch_bytes() {
+                if !deferred
+                    .front()
+                    .is_some_and(|(at, _)| *at <= Instant::now())
+                {
+                    break;
+                }
+                let entry = deferred.pop_front().expect("retry present").1;
+                bytes += entry
+                    .value
+                    .as_ref()
+                    .map_or(0, |value| sink.prepared_bytes(value));
+                pending.push(entry);
+            }
+        }
         let mut index = 0;
         'prepare_batch: loop {
             while index < pending.len() {
@@ -249,14 +337,17 @@ fn run_worker<S: Sink>(
             if let Some(item) =
                 admit_checkpoint(&checkpoints, &counters, &limits, maximum_queued_bytes)
             {
-                pending.push(Prepared { item, value: None });
+                pending.push(Prepared::new(item));
                 continue;
             }
             match receiver.recv_timeout(batch_deadline.saturating_duration_since(Instant::now())) {
-                Ok(Some(item)) => pending.push(Prepared { item, value: None }),
+                Ok(Some(item)) => pending.push(Prepared::new(item)),
                 Ok(None) => continue,
                 Err(_) => break,
             }
+        }
+        if counters.abandoned() {
+            break;
         }
         let ready: Vec<_> = pending.iter().filter_map(|p| p.value.as_ref()).collect();
         let outcomes = if ready.is_empty() {
@@ -290,19 +381,108 @@ fn run_worker<S: Sink>(
         counters
             .maintenance_failed
             .fetch_add(sink.take_maintenance_failures(), Ordering::Relaxed);
+        let mut blocked = Vec::new();
+        for mut entry in pending.drain(..) {
+            let retained = entry
+                .value
+                .as_ref()
+                .map(|value| sink.retained_prepared_bytes(value, maximum_record_bytes));
+            if sink.independent_retries()
+                && retained
+                    .is_some_and(|bytes| entry.item.charge_retained(bytes, maximum_queued_bytes))
+            {
+                let retry_at = Instant::now() + entry.retry_delay;
+                entry.retry_delay = (entry.retry_delay * 2).min(Duration::from_secs(1));
+                let position = deferred.partition_point(|(at, _)| *at <= retry_at);
+                deferred.insert(position, (retry_at, entry));
+            } else {
+                // A prepared expansion that cannot be charged still owns the
+                // single scratch workspace. Do not rotate it aside and allocate
+                // a second workspace beyond the byte bound. Accepted neighbors
+                // may wait here until storage recovers; admission refusal alone
+                // does not imply fairness for already accepted work.
+                blocked.push(entry);
+            }
+        }
+        pending = blocked;
+        prefer_retry = !retry_turn;
         if pending.is_empty() {
             counters.preparation_bytes.store(0, Ordering::Release);
             delay = Duration::from_millis(25);
         } else {
             // Prepared strings and admission charges remain live across retries.
             // Keep the preparation charge visible while sleeping too.
-            std::thread::sleep(delay);
+            let until = Instant::now() + delay;
+            while !counters.abandoned() && Instant::now() < until {
+                std::thread::sleep(
+                    Duration::from_millis(25).min(until.saturating_duration_since(Instant::now())),
+                );
+            }
             delay = if acknowledged > 0 {
                 Duration::from_millis(25)
             } else {
                 (delay * 2).min(Duration::from_secs(1))
             };
         }
+    }
+
+    if counters.abandoned() {
+        // Destruction, unlike a close timeout, relinquishes the only recovery
+        // owner. Fail receipts explicitly and account for every unfinished item.
+        for entry in pending {
+            entry.item.abandon();
+        }
+        for (_, entry) in deferred {
+            entry.item.abandon();
+        }
+        for item in receiver.try_iter().flatten() {
+            item.abandon();
+        }
+        for checkpoint in checkpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            counters.dropped.fetch_add(1, Ordering::Relaxed);
+            if let Some(completed) = checkpoint.completed {
+                let _ = completed.send(false);
+            }
+        }
+        counters.preparation_bytes.store(0, Ordering::Release);
+    }
+}
+
+impl Pending {
+    fn abandon(mut self) {
+        self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        if let Some(completed) = self.completed.take() {
+            let _ = completed.send(false);
+        }
+        if let Some((_, Some(completed))) = self.checkpoint.take() {
+            let _ = completed.send(false);
+        }
+    }
+
+    /// Keep retries inside the existing queue budget before freeing batch scratch.
+    fn charge_retained(&mut self, retained: usize, maximum: usize) -> bool {
+        let extra = retained.saturating_sub(self.bytes);
+        let _guard = self
+            .counters
+            .capacity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self
+            .counters
+            .bytes
+            .load(Ordering::Acquire)
+            .saturating_add(extra)
+            > maximum
+        {
+            return false;
+        }
+        self.counters.bytes.fetch_add(extra, Ordering::AcqRel);
+        self.bytes += extra;
+        true
     }
 }
 
@@ -360,6 +540,27 @@ pub(crate) struct Delivery {
     worker: Mutex<Option<JoinHandle<()>>>,
     checkpoints: Arc<Mutex<VecDeque<Checkpoint>>>,
     counters: Arc<Counters>,
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        // close_until(false) retains work for recovery while this owner lives.
+        // Give accepted checkpoints one final bounded drain after owner loss.
+        // Two seconds exceeds the maximum one-second retry backoff, so even
+        // a fully backed-off record gets another attempt. No later caller can
+        // extend this deadline or recover the queue.
+        *self
+            .counters
+            .abandon_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(2));
+        if let Ok(sender) = self.sender.get_mut() {
+            if let Some(sender) = sender.take() {
+                let _ = sender.try_send(None);
+            }
+        }
+        // Never join here: a destination may be blocked in external I/O.
+    }
 }
 
 impl Delivery {

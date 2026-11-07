@@ -1,4 +1,192 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
+
+#[test]
+fn delayed_capture_does_not_block_ready_neighbor() {
+    struct DeferredSink {
+        release: Arc<std::sync::atomic::AtomicBool>,
+        attempted: mpsc::Sender<String>,
+    }
+    impl Sink for DeferredSink {
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, value: &String) -> Result<(), ()> {
+            self.attempted.send(value.clone()).unwrap();
+            if value == "waiting" && !self.release.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (attempted, observed) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        DeferredSink {
+            release: release.clone(),
+            attempted,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("waiting")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "waiting"
+    );
+    assert!(delivery.submit(record("ready")));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut progressed = false;
+    while Instant::now() < deadline {
+        if observed
+            .recv_timeout(Duration::from_millis(30))
+            .is_ok_and(|id| id == "ready")
+        {
+            progressed = true;
+            break;
+        }
+    }
+    release.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(3)));
+    assert!(
+        progressed,
+        "a retry blocked an independently writable capture"
+    );
+    assert_eq!(delivery.counts()[2], 2);
+}
+
+#[test]
+fn deferred_retries_keep_batching_and_drain_without_dropping() {
+    struct BatchRetry {
+        attempts: mpsc::Sender<usize>,
+        recovered: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Sink for BatchRetry {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            unreachable!()
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn batch_records(&self) -> usize {
+            4
+        }
+        fn batch_bytes(&self) -> usize {
+            1024
+        }
+        fn batch_delay(&self) -> Duration {
+            Duration::from_millis(100)
+        }
+        fn prepared_bytes(&self, value: &String) -> usize {
+            value.len()
+        }
+        fn write_batch(&mut self, values: &[&String]) -> Vec<bool> {
+            self.attempts.send(values.len()).unwrap();
+            vec![self.recovered.load(Ordering::Acquire); values.len()]
+        }
+    }
+    let (attempts, observed) = mpsc::channel();
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let delivery = Delivery::new(
+        Limits {
+            maximum_records: 4,
+            maximum_bytes: limits().maximum_bytes * 4,
+            ..limits()
+        },
+        BatchRetry {
+            attempts,
+            recovered: recovered.clone(),
+        },
+    )
+    .unwrap();
+    for id in ["a", "b", "c", "d"] {
+        assert!(delivery.submit(record(id)));
+    }
+    assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+    assert_eq!(observed.recv_timeout(Duration::from_secs(2)).unwrap(), 4);
+    assert!(!delivery.close_until(Instant::now()));
+    recovered.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    assert_eq!(delivery.counts()[0..3], [0, 0, 4]);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
+#[test]
+fn a_new_retry_does_not_wait_for_an_older_records_long_backoff() {
+    struct BackoffSink {
+        recovered: Arc<std::sync::atomic::AtomicBool>,
+        attempts: mpsc::Sender<String>,
+        new_attempts: usize,
+    }
+    impl Sink for BackoffSink {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn write(&mut self, id: &String) -> Result<(), ()> {
+            self.attempts.send(id.clone()).unwrap();
+            if id == "old" && !self.recovered.load(Ordering::Acquire) {
+                return Err(());
+            }
+            if id == "new" {
+                self.new_attempts += 1;
+                if self.new_attempts == 1 {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+    }
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (attempts, observed) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        BackoffSink {
+            recovered: recovered.clone(),
+            attempts,
+            new_attempts: 0,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("old")));
+    for _ in 0..7 {
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "old"
+        );
+    }
+    assert!(delivery.submit(record("new")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "new"
+    );
+    let next = observed.recv_timeout(Duration::from_millis(500));
+    recovered.store(true, Ordering::Release);
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(2)));
+    assert_eq!(next.unwrap(), "new");
+    assert_eq!(delivery.counts()[2], 2);
+}
 
 struct PausedSink {
     entered: mpsc::Sender<String>,
@@ -557,4 +745,195 @@ fn a_sink_that_refuses_only_the_probabilities_gets_the_exchange_without_them() {
 #[test]
 fn a_transient_preparation_failure_keeps_the_probabilities() {
     assert!(deliver_probabilities(Box::new(|_, call| call == 0)));
+}
+
+#[test]
+fn exhausted_retained_budget_keeps_accepted_neighbor_until_recovery() {
+    struct Expanded {
+        attempts: mpsc::Sender<String>,
+        resume: mpsc::Receiver<()>,
+        recovered: Arc<AtomicBool>,
+    }
+    impl Sink for Expanded {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn retained_prepared_bytes(&self, _: &String, _: usize) -> usize {
+            // Model expansion that fits scratch but cannot be retained beside
+            // both accepted records in the configured queue budget.
+            record("waiting").heap_bytes() + 512
+        }
+        fn write(&mut self, value: &String) -> Result<(), ()> {
+            self.attempts.send(value.clone()).unwrap();
+            self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
+            if value == "waiting" && !self.recovered.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let (attempts, observed) = mpsc::channel();
+    let (resume, proceed) = mpsc::channel();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let bound = limits().maximum_bytes;
+    let delivery = Delivery::new(
+        limits(),
+        Expanded {
+            attempts,
+            resume: proceed,
+            recovered: recovered.clone(),
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record("waiting")));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "waiting"
+    );
+    assert!(delivery.submit(record("ready")));
+    resume.send(()).unwrap();
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "waiting"
+    );
+    assert_eq!(delivery.counts()[0], 2);
+    assert!(delivery.counts()[1] <= bound as u64);
+    assert_eq!(delivery.counts()[4], 0);
+    recovered.store(true, Ordering::Release);
+    resume.send(()).unwrap();
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "ready"
+    );
+    resume.send(()).unwrap();
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+    assert_eq!(delivery.counts()[0..3], [0, 0, 2]);
+    assert_eq!(delivery.counts()[4], 0);
+}
+
+#[test]
+fn destroying_failed_delivery_stops_worker_and_accounts_for_undelivered_records() {
+    struct Outage {
+        attempts: mpsc::Sender<()>,
+        stopped: mpsc::Sender<()>,
+    }
+    impl Drop for Outage {
+        fn drop(&mut self) {
+            let _ = self.stopped.send(());
+        }
+    }
+    impl Sink for Outage {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            let _ = self.attempts.send(());
+            Err(())
+        }
+    }
+    let (attempts, observed) = mpsc::channel();
+    let (stopped, exited) = mpsc::channel();
+    let delivery = Delivery::new(
+        Limits {
+            maximum_records: 8,
+            maximum_bytes: limits().maximum_bytes * 8,
+            ..limits()
+        },
+        Outage { attempts, stopped },
+    )
+    .unwrap();
+    for id in ["a", "b", "c", "d"] {
+        assert!(delivery.submit(record(id)));
+    }
+    for _ in 0..4 {
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+    assert!(!delivery.close_until(Instant::now() + Duration::from_millis(50)));
+    assert_eq!(delivery.counts()[0], 4);
+    assert_eq!(delivery.counts()[4], 0);
+    let counters = delivery.counters.clone();
+    drop(delivery);
+    exited
+        .recv_timeout(Duration::from_secs(3))
+        .expect("retry worker survived its owner");
+    assert_eq!(counters.pending.load(Ordering::Acquire), 0);
+    assert_eq!(counters.bytes.load(Ordering::Acquire), 0);
+    assert_eq!(counters.preparation_bytes.load(Ordering::Acquire), 0);
+    assert_eq!(counters.dropped.load(Ordering::Acquire), 4);
+    assert_eq!(counters.persisted.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn owner_destruction_allows_recovery_after_maximum_retry_backoff() {
+    struct Recoverable {
+        attempts: mpsc::Sender<()>,
+        recovered: Arc<AtomicBool>,
+        exited: mpsc::Sender<()>,
+    }
+    impl Drop for Recoverable {
+        fn drop(&mut self) {
+            let _ = self.exited.send(());
+        }
+    }
+    impl Sink for Recoverable {
+        type Prepared = String;
+        fn preparation_bytes(_: usize) -> usize {
+            512
+        }
+        fn prepare(&self, record: &Record, _: usize) -> Result<String, ()> {
+            Ok(record.request.request_id.clone())
+        }
+        fn independent_retries(&self) -> bool {
+            true
+        }
+        fn write(&mut self, _: &String) -> Result<(), ()> {
+            let recovered = self.recovered.load(Ordering::Acquire);
+            self.attempts.send(()).unwrap();
+            if recovered {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+    let (attempts, observed) = mpsc::channel();
+    let (exited, stopped) = mpsc::channel();
+    let recovered = Arc::new(AtomicBool::new(false));
+    let delivery = Delivery::new(
+        limits(),
+        Recoverable {
+            attempts,
+            recovered: recovered.clone(),
+            exited,
+        },
+    )
+    .unwrap();
+    let counters = delivery.counters.clone();
+    assert!(delivery.submit(record("recover")));
+    // Initial attempt plus 25/50/100/200/400/800 ms retries: next delay is 1s.
+    for _ in 0..7 {
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    drop(delivery);
+    std::thread::sleep(Duration::from_millis(100));
+    recovered.store(true, Ordering::Release);
+    stopped.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(counters.persisted.load(Ordering::Acquire), 1);
+    assert_eq!(counters.dropped.load(Ordering::Acquire), 0);
+    assert_eq!(counters.pending.load(Ordering::Acquire), 0);
 }

@@ -36,7 +36,7 @@ from exp.common.models.discovery import (
     served_roles,
     serves_role,
 )
-from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+from exp.common.models.dispatch_policy import GatewayFleetLanePolicy, GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import (
     FIRST_NANO_USD_SNAPSHOT_SCHEMA_VERSION,
     GATEWAY_EXCLUDED_PROVIDERS,
@@ -144,6 +144,7 @@ __all__ = [
     "GatewayLongContextTier",
     "GatewayOffPeakPrices",
     "GatewayPriceWindow",
+    "GatewayFleetLanePolicy",
     "GatewayRungDispatchPolicy",
     "GatewayTokenPrices",
     "GatewayUnitPrices",
