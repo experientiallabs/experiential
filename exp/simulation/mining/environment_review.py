@@ -43,6 +43,7 @@ from exp.common.models import (
 )
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
+from exp.simulation.mining.review_states import TransientReviewFailure, is_transient
 from exp.simulation.rules.contracts import parse_tool_contracts, trace_locator, trajectory_view
 from exp.simulation.rules.model import ToolContract
 
@@ -469,6 +470,13 @@ def _loop(
         except ReviewerError as error:
             failure = _reason(error)
             break
+        except TransientReviewFailure:
+            raise
+        except Exception as error:
+            transient = is_transient(error)
+            if transient is None:
+                raise
+            raise TransientReviewFailure(identity, transient) from error
         calls = response.output.tool_calls
         if not calls:
             messages.append(

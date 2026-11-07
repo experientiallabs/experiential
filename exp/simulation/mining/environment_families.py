@@ -36,6 +36,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.state_machine import TransitionJournal
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace
 from exp.simulation.mining.environment_review import (
@@ -51,11 +52,20 @@ from exp.simulation.mining.environment_review import (
     review_protocol_sha256,
     review_variant,
 )
+from exp.simulation.mining.review_states import (
+    GROUP_MACHINE,
+    FamiliesPending,
+    GroupState,
+    TransientReviewFailure,
+)
 from exp.simulation.mining.tag_clusters import TagClustering, read_record, write_record
 from exp.simulation.rules.model import ToolContract
 
 FAMILIES_TYPE = "environment-families"
 """Artifact type of a saved :class:`EnvironmentFamilies` record (``families.json``)."""
+
+GROUP_TYPE = "environment-group-review"
+"""Artifact type of one cluster's completed review (``group.json``), saved in ``reviewed``."""
 
 FamilyStatus = Literal["compatible", "admitted_uncertain"]
 """How a family was formed: reviewed compatible, or an uncertain group the caller admitted."""
@@ -263,6 +273,23 @@ def families_identity(
     )
 
 
+class GroupOutcome(ContractModel):
+    """One cluster's completed review: what it became, whatever the verdict.
+
+    Saved only when the group reached ``reviewed`` in :data:`GROUP_MACHINE`; a group whose
+    review failed transiently stays ``pending`` and is never saved.
+
+    Attributes:
+        cluster_id: The reviewed cluster.
+        families: Compatible families it produced (before tasks are attached).
+        uncertain: Groups it left uncertain on the evidence, split depth or failed checks.
+    """
+
+    cluster_id: str
+    families: tuple[EnvironmentFamily, ...] = ()
+    uncertain: tuple[UncertainGroup, ...] = ()
+
+
 def review_environment_families(
     clustering: TagClustering,
     reviewer: CompatibilityReviewer,
@@ -272,8 +299,18 @@ def review_environment_families(
     held_out: Collection[str],
     tasks: Sequence[TaskCase] = (),
     spec: CompatibilitySpec | None = None,
+    store: ArtifactStore | None = None,
+    identity: str | None = None,
+    journal: TransitionJournal | None = None,
+    code_revision: str = "unknown",
 ) -> EnvironmentFamilies:
     """Review every cluster into compatible families and uncertain groups.
+
+    Each cluster walks :data:`GROUP_MACHINE`. A cluster whose every draw completed is
+    ``reviewed`` and, with a ``store``, saved under ``identity`` and its cluster, so a rerun
+    replays it with no call. A cluster with a draw that failed at the transport level is
+    ``transient_failed``: nothing of it is kept, every other cluster is still reviewed, and
+    :class:`FamiliesPending` is raised at the end so no families record is written.
 
     Args:
         clustering: The clustering whose clusters are reviewed.
@@ -284,10 +321,15 @@ def review_environment_families(
         tasks: World-learning tasks to attach; a task joins the family holding every one of its
             eligible source traces.
         spec: Review registration; defaults apply when omitted.
+        store: Where reviewed groups are saved and replayed from, or None to keep none.
+        identity: The families identity the saved groups are keyed under.
+        journal: Where every group move is recorded.
+        code_revision: Producing source identity of saved groups.
 
     Raises:
         ValueError: The clustering holds a held-out trace, a task is held out, or an eligible
             member's trace content is missing.
+        FamiliesPending: Some cluster failed transiently; it is retried on the next run.
     """
     spec = spec or CompatibilitySpec()
     leaked = sorted(set(clustering.trace_ids) & set(held_out))
@@ -297,6 +339,7 @@ def review_environment_families(
     families: list[EnvironmentFamily] = []
     uncertain: list[UncertainGroup] = []
     skipped: dict[str, str] = {}
+    pending: dict[str, str] = {}
     ident = clustering.identity()
     for cluster in clustering.clusters:
         members = tuple(sorted(t for t in cluster.members if t in allowed))
@@ -306,18 +349,45 @@ def review_environment_families(
         missing = [t for t in members if t not in traces]
         if missing:
             raise ValueError(f"trace content missing for eligible members {missing[:5]}")
-        _review_group(
-            reviewer,
-            spec,
-            traces,
-            ident,
-            cluster.cluster_id,
-            cluster.cluster_id,
-            members,
-            0,
-            families,
-            uncertain,
+        saved_id = (
+            None if identity is None else stable_id(GROUP_TYPE, [identity, cluster.cluster_id])
         )
+        if store is not None and saved_id is not None and store.exists(saved_id):
+            outcome = GroupOutcome.model_validate_json(store.read_bytes(saved_id, "group.json"))
+            families.extend(outcome.families)
+            uncertain.extend(outcome.uncertain)
+            continue
+        subject = f"{ident[:16]}/{cluster.cluster_id}"
+        state = GROUP_MACHINE.move(subject, None, GroupState.PENDING.value, journal)
+        found: list[EnvironmentFamily] = []
+        left: list[UncertainGroup] = []
+        try:
+            _review_group(
+                reviewer,
+                spec,
+                traces,
+                ident,
+                cluster.cluster_id,
+                cluster.cluster_id,
+                members,
+                0,
+                found,
+                left,
+            )
+        except TransientReviewFailure as failure:
+            GROUP_MACHINE.move(subject, state, "failed_transiently", journal)
+            pending[cluster.cluster_id] = failure.reason
+            continue
+        GROUP_MACHINE.move(subject, state, "reviewed", journal)
+        outcome = GroupOutcome(
+            cluster_id=cluster.cluster_id, families=tuple(found), uncertain=tuple(left)
+        )
+        if store is not None and saved_id is not None:
+            write_record(store, saved_id, GROUP_TYPE, "group.json", outcome, code_revision, ())
+        families.extend(found)
+        uncertain.extend(left)
+    if pending:
+        raise FamiliesPending(pending)
     attached = _attach(families, tasks, allowed)
     return EnvironmentFamilies(
         clustering=ident,
@@ -363,6 +433,10 @@ def environment_families(
         held_out=held_out,
         tasks=tasks,
         spec=spec,
+        store=store,
+        identity=identity,
+        journal=TransitionJournal(store.project_directory / "environment-review" / "moves.jsonl"),
+        code_revision=code_revision,
     )
     return record, write_record(
         store, identity, FAMILIES_TYPE, "families.json", record, code_revision, inputs

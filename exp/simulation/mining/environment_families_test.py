@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import JsonValue
 
-from exp.common.core.artifacts import JsonObject, SourceIdentity
+from exp.common.core.artifacts import ArtifactInput, JsonObject, SourceIdentity
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -24,8 +24,11 @@ from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.traces import Trace
 from exp.common.traces.trace import TraceOutcome, TraceSource
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.mining.environment_families import (
     FAMILIES_TYPE,
+    GROUP_TYPE,
+    EnvironmentFamilies,
     admitted_families,
     environment_families,
     review_environment_families,
@@ -39,6 +42,7 @@ from exp.simulation.mining.environment_review import (
     CompatibilitySpec,
     ReviewerError,
 )
+from exp.simulation.mining.review_states import FamiliesPending
 from exp.simulation.mining.tag_clusters import (
     ClusterCountScore,
     ClusteringSpec,
@@ -428,6 +432,52 @@ def test_saved_families_replay_without_any_call(tmp_path: Path) -> None:
         code_revision="test",
     )
     assert (replay, again) == (record, reference)
+
+
+def test_a_transient_503_leaves_the_group_pending_and_the_next_run_reviews_it(
+    tmp_path: Path,
+) -> None:
+    """A gateway 503 is never a verdict: the group stays pending and the record unwritten;
+    the next run reviews it and saves its verdict, replaying the reviewed group with no call."""
+    store = ProjectStore(tmp_path, "case").artifacts
+    fitted = clustering({"c00": ORDERS, "c01": FILES})
+    script, bound = reviewer(by_tools)
+    failing = {"f1"}
+
+    def flaky(request: ModelRequest, *, identity: str) -> ModelResponse:
+        """Fail every draw about the file group with a 503 on the first run."""
+        packet = json.loads(request.messages[1].content or "{}")
+        if failing & {row["trace_id"] for row in packet["members"]}:
+            raise ProviderTransportError("gateway busy", status_code=503)
+        return script(request, identity=identity)
+
+    def run(bound: CompatibilityReviewer) -> tuple[EnvironmentFamilies, ArtifactInput]:
+        """Review, or replay, both clusters."""
+        return environment_families(
+            store,
+            fitted,
+            bound,
+            traces=TRACES,
+            eligible=ORDERS + FILES,
+            held_out=(),
+            code_revision="test",
+        )
+
+    with pytest.raises(FamiliesPending) as caught:
+        run(CompatibilityReviewer(draw=flaky, model=SNAPSHOT))
+    assert set(caught.value.pending) == {"c01"} and caught.value.pending["c01"] == "http_503"
+    saved = {store.read(i).manifest.artifact_type for i in store.list_ids()}
+    assert FAMILIES_TYPE not in saved and GROUP_TYPE in saved
+    first = len(script.requests)
+
+    record, reference = run(bound)
+    assert store.read(reference.artifact_id).manifest.artifact_type == FAMILIES_TYPE
+    assert {f.cluster_id for f in record.families} == {"c00", "c01"} and not record.uncertain
+    reviewed_files = [r for r in script.requests[first:] if "f1" in (r.messages[1].content or "")]
+    assert reviewed_files and len(script.requests[first:]) == len(reviewed_files)
+
+    _, refusing = reviewer(by_tools, refuse=True)
+    assert run(refusing) == (record, reference)
 
 
 def test_traces_outside_the_fit_are_placed_by_the_mixture_over_their_answered_columns() -> None:
