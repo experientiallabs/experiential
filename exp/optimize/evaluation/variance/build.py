@@ -63,6 +63,12 @@ from exp.common.tasks import TaskCase
 from exp.common.tasks.store import load_task_set
 from exp.common.traces import Trace, load_trace_dataset
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
+from exp.optimize.evaluation.variance.build_errors import (
+    SavedErrors,
+    asked_error_bank,
+    tag_build_errors,
+    tag_units,
+)
 from exp.optimize.evaluation.variance.build_records import (
     BINDING_TYPE,
     EXPOSURE_TYPE,
@@ -96,22 +102,13 @@ from exp.optimize.evaluation.variance.tag_retrieval import index_tag_view, query
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import (
     HttpxJsonTransport,
-    ProviderTransportError,
     RetryPolicy,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
-from exp.simulation.mining.dispatch import dispatch_tagging
 from exp.simulation.mining.environment_review import CompatibilityReviewer
-from exp.simulation.mining.error_tags import (
-    ErrorTags,
-    bank_for_view,
-    error_bank,
-    persist_error_tags,
-    tag_errors,
-)
 from exp.simulation.mining.questions import QuestionBank, resolve_question_bank
 from exp.simulation.mining.tag_cluster_names import ClusterNamer, named_clusters
 from exp.simulation.mining.tag_clusters import (
@@ -127,10 +124,6 @@ from exp.simulation.mining.tag_selection import (
 from exp.simulation.mining.tagging import (
     DecisionCache,
     TagMatrix,
-    TagRow,
-    TraceTaggingError,
-    distinct_units,
-    tagged_view,
 )
 from exp.simulation.mining.views import Unit, observations_view, task_view
 from exp.simulation.retrieval.build import persist_trace_rag
@@ -307,7 +300,15 @@ def run_variance_build(
         )
         active = tagger or _admitted_tagger(project, spec, prepared.summary, code_revision)
         tagging, matrices = _tag(store, prepared, active, code_revision)
-        errors = _tag_errors(store, prepared, active, code_revision)
+        errors = tag_build_errors(
+            store,
+            spec,
+            prepared.summary,
+            prepared.errors,
+            active,
+            inputs=(build.trace_dataset,),
+            code_revision=code_revision,
+        )
         clusters = _cluster(store, spec, prepared, matrices, errors, namer, code_revision)
         report = _bind(
             project,
@@ -326,6 +327,7 @@ def run_variance_build(
         report = report.model_copy(
             update={
                 "errors": None if errors is None else errors[1],
+                "error_matrix": None if errors is None else errors[2],
                 "error_failures": failures,
                 "clustering": None if clusters is None else clusters[0],
                 "cluster_names": None if clusters is None else clusters[1],
@@ -351,7 +353,8 @@ def run_variance_build(
             report.tag_retrieval,
             report.control_retrieval,
             *(row.matrix for row in tagging),
-            *(ref for ref in (report.errors, report.clustering, report.cluster_names) if ref),
+            *(ref for ref in (report.errors, report.error_matrix, report.clustering) if ref),
+            *(() if report.cluster_names is None else (report.cluster_names,)),
             *(() if families is None else families.references()),
         }
         store.write_json(
@@ -440,10 +443,8 @@ def _prepare(
         )
     views = tuple(view_plan(view, banks[view], units[view], plan) for view in sorted(banks))
     errors = None
-    if spec.error_bank is not None:
-        asked = bank_for_view(
-            error_bank(spec.error_bank, families=spec.error_families), "observations"
-        )
+    asked = asked_error_bank(spec)
+    if asked is not None:
         errors = (asked, tuple(observations_view(traces[t]) for t in ordered if t in units_of))
     error_plan = None if errors is None else view_plan("observations", *errors, plan)
     calls = sum(
@@ -592,7 +593,7 @@ def _tag(
     model = prepared.summary.decision_model
     for planned in prepared.summary.views:
         view, bank = planned.view, prepared.banks[planned.view]
-        matrix, failed = _tag_units(tagger, prepared.units[view], bank)
+        matrix, failed = tag_units(tagger, prepared.units[view], bank)
         failures = tuple(
             TagFailure(trace_id=trace, role=prepared.plan.role_of(trace), view=view, error=error)
             for trace, error in failed
@@ -620,53 +621,6 @@ def _tag(
         rows.append(ViewTagging(plan=planned, matrix=saved, tagged=tagged, failures=failures))
         matrices[view] = matrix
     return tuple(rows), matrices
-
-
-def _tag_units(
-    tagger: DecisionsTraceTagger, units: tuple[Unit, ...], bank: QuestionBank
-) -> tuple[TagMatrix, tuple[tuple[str, str], ...]]:
-    """Tag independent units, keeping input failures apart from fatal refusals.
-
-    Args:
-        tagger: Decision client with its concurrency bound.
-        units: Rendered traces of one view.
-        bank: Questions to ask.
-
-    Returns:
-        Tagged rows and recoverable failures; fatal refusals propagate unchanged.
-    """
-    view = tagged_view(units)
-    decided = distinct_units(units)
-
-    def answer(unit: Unit) -> TagRow | str:
-        """Return one row or a recoverable failure, preserving fatal refusals."""
-        try:
-            return tagger.tag([unit], bank).rows[0]
-        except (TraceTaggingError, ProviderTransportError) as exc:
-            return str(exc)
-
-    outcomes = dispatch_tagging(decided, answer, maximum_concurrency=tagger.maximum_concurrency)
-    by_hash = {unit.unit_hash: result for unit, result in zip(decided, outcomes, strict=True)}
-    rows: dict[str, TagRow] = {}
-    failed: list[tuple[str, str]] = []
-    for unit in units:
-        result = by_hash[unit.unit_hash]
-        if isinstance(result, str):
-            failed.append((unit.trace_id, result))
-        else:
-            rows.setdefault(unit.trace_id, result.model_copy(update={"trace_id": unit.trace_id}))
-    if not rows:
-        raise TraceTaggingError(
-            f"every {units[0].view} unit failed tagging with bank {bank.bank_id}, for example "
-            f"trace {failed[0][0]}: {failed[0][1]}"
-        )
-    return TagMatrix(
-        bank_id=bank.bank_id,
-        bank_version=bank.version,
-        question_ids=bank.question_ids(),
-        view=view,
-        rows=tuple(rows.values()),
-    ), tuple(failed)
 
 
 def _bind(
@@ -817,34 +771,12 @@ def _bind(
     )
 
 
-def _tag_errors(
-    store: ArtifactStore,
-    prepared: _Prepared,
-    tagger: DecisionsTraceTagger,
-    code_revision: str,
-) -> tuple[ErrorTags, ArtifactInput] | None:
-    """Tag world-learning and mining-probe observations with the error bank and save them.
-
-    Returns:
-        The record and its artifact, or None when no error bank is named.
-    """
-    if prepared.errors is None:
-        return None
-    bank, units = prepared.errors
-    errors = tag_errors(
-        units, tagger=tagger, bank=bank, unit_concurrency=tagger.maximum_concurrency
-    )
-    return errors, persist_error_tags(
-        store, errors, code_revision=code_revision, inputs=(prepared.build.trace_dataset,)
-    )
-
-
 def _cluster(
     store: ArtifactStore,
     spec: VarianceBuildSpec,
     prepared: _Prepared,
     matrices: Mapping[TagView, TagMatrix],
-    errors: tuple[ErrorTags, ArtifactInput] | None,
+    errors: SavedErrors | None,
     namer: ClusterNamer | None,
     code_revision: str,
 ) -> tuple[ArtifactInput, ArtifactInput | None, ClusterAdmission] | None:

@@ -36,10 +36,10 @@ from exp.common.project.request_budget import validate_provider_response
 from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.variance.build import (
-    _tag_units,
     plan_variance_build,
     run_variance_build,
 )
+from exp.optimize.evaluation.variance.build_errors import tag_units as _tag_units
 from exp.optimize.evaluation.variance.build_records import (
     REPORT_TYPE,
     ConstructionSettings,
@@ -62,6 +62,7 @@ from exp.simulation.mining.questions import (
     LOCAL_BANK_ROOT_VARIABLE,
     Question,
     QuestionBank,
+    QuestionBankError,
     resolve_question_bank,
 )
 from exp.simulation.mining.tag_cluster_names import (
@@ -451,6 +452,43 @@ def test_clusters_choose_world_learning_and_error_tags_choose_probes(
         code_revision="test",
         tagger=_tagger(project, _refuse),
         namer=ClusterNamer(ScriptedNamer(refuse_naming), NAMER),
+    )
+    assert replay == report
+
+
+def test_consumed_error_families_ask_the_whole_bank_and_keep_the_declared_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every error question is asked in one request per unit; only declared families are kept."""
+    project = variance_project(tmp_path, monkeypatch)
+    families = ("error.check", "error.feedback")
+    spec = VarianceBuildSpec(task_bank=TASK_BANK, clustering=None, error_consumed_families=families)
+    with pytest.raises(QuestionBankError, match="no family"):
+        plan_variance_build(
+            project,
+            spec.model_copy(update={"error_consumed_families": ("missing",)}),
+            code_revision="test",
+        )
+    decide = FakeDecisions()
+    report = run_variance_build(
+        project, spec, code_revision="test", tagger=_tagger(project, decide)
+    )
+
+    every = tuple(question for question, _ in ERROR_QUESTIONS)
+    _, observations = _rendered(project)
+    error_asks = [asked for state, asked in decide.asked if state in observations.values()]
+    assert error_asks and set(error_asks) == {every}
+    assert report.plan.errors is not None and report.plan.errors.questions == len(every)
+    assert report.errors is not None and report.error_matrix is not None
+    errors = load_error_tags(project.artifacts, report.errors)
+    assert errors.matrix.question_ids == every[:2]
+    full = load_tag_matrix(project, report.error_matrix)
+    assert full.question_ids == every and len(full.rows) == len(errors.matrix.rows)
+    risk = {row.trace_id: row.values[2] for row in full.rows}
+    assert all(risk[t] == _probability(observations[t], every[2]) for t in risk)
+    assert report.probe_ranking
+    replay = run_variance_build(
+        project, spec, code_revision="test", tagger=_tagger(project, _refuse)
     )
     assert replay == report
 

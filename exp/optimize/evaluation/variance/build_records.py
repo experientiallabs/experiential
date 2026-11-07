@@ -119,6 +119,12 @@ class VarianceBuildSpec(ContractModel):
             and mining-probe trace (never final evaluation), or None to skip error tags. Error
             tags rank the mining probes and join the clustered tag space.
         error_families: Families of the error bank to ask; all when empty.
+        error_consumed_families: Families of the error bank whose columns the build consumes,
+            or None to ask only the bank's observations-view propositions. When set, every
+            selected question of the error bank (``error_families``) is asked over the
+            observations view, the full matrix is saved as ``error_matrix``, and only these
+            declared families' columns enter the error tags, the clustered tag space and the
+            probe ranking.
         clustering: How the world-learning tag space (every tagged view plus the error tags) is
             clustered, its cluster count chosen by the data; None skips clustering.
         cluster_admission: Which clusters, and how many traces of each, enter world learning.
@@ -157,6 +163,9 @@ class VarianceBuildSpec(ContractModel):
     probe_fraction: float = Field(default=0.3, gt=0.0, lt=1.0)
     error_bank: str | None = ERROR_BANK_ID
     error_families: tuple[str, ...] = ()
+    error_consumed_families: tuple[str, ...] | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
     clustering: ClusteringSpec | None = Field(default_factory=ClusteringSpec)
     cluster_admission: ClusterAdmissionSpec = Field(default_factory=ClusterAdmissionSpec)
     cluster_naming: ClusterNamingSpec | None = None
@@ -482,6 +491,8 @@ class VarianceBuildReport(ContractModel):
         next_steps: How the rules stage and actor-critic runs consume these artifacts.
         errors: Saved ``error-tags`` record over world-learning and mining-probe traces.
         error_failures: Traces whose error tags were refused; recorded, never redrawn.
+        error_matrix: Saved full error-bank matrix, every asked column, when the spec names
+            ``error_consumed_families``.
         clustering: Saved ``tag-clusters`` record over world learning.
         cluster_names: Saved ``tag-cluster-names`` record, when naming was requested.
         admission: The cluster admission, when clustering ran.
@@ -512,6 +523,7 @@ class VarianceBuildReport(ContractModel):
     next_steps: tuple[str, ...]
     errors: ArtifactInput | None = None
     error_failures: tuple[TagFailure, ...] = ()
+    error_matrix: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
     clustering: ArtifactInput | None = None
     cluster_names: ArtifactInput | None = None
     admission: ClusterAdmission | None = None
