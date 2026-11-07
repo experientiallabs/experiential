@@ -161,6 +161,19 @@ def test_an_output_with_a_tool_event_is_refused(item: str) -> None:
     assert parse_events(events([{"type": "exec_command_begin"}])).tools == ["exec_command_begin"]
 
 
+def test_startup_error_items_are_warnings_not_tools() -> None:
+    """The real smoke call's stream: three error notices before the turn, then the answer."""
+    stream = [
+        CLEAN[0],
+        *({"type": "item.completed", "item": {"type": "error", "message": "notice"}},) * 3,
+        *CLEAN[1:],
+    ]
+    summary = parse_events(events(stream))
+    assert summary.tools == [] and summary.errors == [] and len(summary.warnings) == 3
+    body = post(transport(Runner([answered({"label": "x"}, stream)])))
+    assert body["model"] == "gpt-6-astra"
+
+
 def test_timeouts_and_exits_are_transient_and_rate_limits_back_off() -> None:
     """A timeout and a non-zero exit classify as retryable; a rate limit reruns, then 429s."""
     with pytest.raises(TimeoutError) as timed_out:

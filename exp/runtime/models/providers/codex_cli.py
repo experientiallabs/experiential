@@ -124,6 +124,10 @@ ALLOWED_EVENTS = frozenset(
 ALLOWED_ITEMS = frozenset({"agent_message", "reasoning"})
 """Item types a tool-free answer may emit; any other item (a tool) refuses the output."""
 
+NOTICE_ITEMS = frozenset({"error"})
+"""Item types that are notices, not actions (Codex reports config or startup warnings as
+``error`` items before the turn); they are kept as warnings and never refuse or fail a call."""
+
 RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "429", "usage limit", "too many requests")
 """Lowercase markers of a rate-limited call in Codex's error events or stderr."""
 
@@ -352,12 +356,14 @@ class EventSummary:
         types: Every event type, with item types as ``item.completed:<type>``, in order.
         tools: Events that show a tool or command; non-empty refuses the output.
         errors: Error and failed-turn messages.
+        warnings: Notice items (``error`` items), kept for diagnosis.
         usage: Token usage of the completed turn.
     """
 
     types: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)
 
 
@@ -378,6 +384,8 @@ def parse_events(stdout: str) -> EventSummary:
         summary.types.append(kind if item_type is None else f"{kind}:{item_type}")
         if kind not in ALLOWED_EVENTS:
             summary.tools.append(kind or "untyped event")
+        elif item_type in NOTICE_ITEMS:
+            summary.warnings.append(json.dumps(item)[:400])
         elif item_type is not None and item_type not in ALLOWED_ITEMS:
             summary.tools.append(f"{kind}:{item_type}")
         if kind in ("error", "turn.failed"):
