@@ -920,14 +920,14 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.181"
+version = "0.3.182"
 source = { directory = "exp/runtime/gateway/native" }
 dependencies = [
     { name = "typing-extensions" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "typing-extensions", specifier = ">=4.15" }]
+requires-dist = [{ name = "typing-extensions", specifier = "==4.16.0" }]
 
 [[package]]
 name = "exp-mitmproxy"
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "experiential"
-version = "0.7.234"
+version = "0.7.235"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
