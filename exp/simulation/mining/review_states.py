@@ -5,7 +5,9 @@ A transport-level failure is never a review verdict. Two small machines say so e
 - :data:`DRAW_MACHINE`, per reviewer draw identity: ``pending`` moves to ``answered`` when a
   completed model response is saved, or to ``transient_failed`` when the draw failed at the
   transport level. A ``transient_failed`` draw is ``retried`` back to ``pending`` on the next run
-  under a fresh attempt identity; its failure is kept as a receipt, never as an answer.
+  under a fresh attempt identity; its failure is kept as a receipt, never as an answer. A draw
+  whose model exhausted its output allowance is ``refused``: a failed draw of that one review,
+  replayed as failed from its saved rejection, so its group goes on with its other variants.
 - :data:`GROUP_MACHINE`, per reviewed cluster: ``pending`` moves to ``reviewed`` when every draw
   of its review completed (whatever the verdict, a genuine ``uncertain`` included), or to
   ``transient_failed`` when one of them failed transiently. Only ``reviewed`` groups are saved;
@@ -31,6 +33,7 @@ class DrawState(StrEnum):
     PENDING = "pending"
     ANSWERED = "answered"
     TRANSIENT_FAILED = "transient_failed"
+    REFUSED = "refused"
 
 
 DRAW_MACHINE = StateMachine(
@@ -41,9 +44,11 @@ DRAW_MACHINE = StateMachine(
         (DrawState.PENDING, "answered", DrawState.ANSWERED),
         (DrawState.PENDING, "failed_transiently", DrawState.TRANSIENT_FAILED),
         (DrawState.TRANSIENT_FAILED, "retried", DrawState.PENDING),
+        (DrawState.PENDING, "refused", DrawState.REFUSED),
     ),
 )
-"""One reviewer draw: answered, or failed transiently and retried on the next run."""
+"""One reviewer draw: answered, refused (output allowance exhausted), or failed transiently and
+retried on the next run."""
 
 
 class GroupState(StrEnum):

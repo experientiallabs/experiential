@@ -11,7 +11,8 @@ from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.variance.build_records import VarianceBuildPlan
 from exp.optimize.evaluation.variance.pipeline_spec import BuildSettings
-from exp.simulation.mining.environment_review import CompatibilityReviewer
+from exp.runtime.models.providers.errors import ProviderRetryableResponseError
+from exp.simulation.mining.environment_review import CompatibilityReviewer, ReviewerError
 from exp.simulation.mining.review_states import (
     DRAW_MACHINE,
     DrawState,
@@ -71,23 +72,42 @@ def family_reviewer(
                 sources=(),
                 code_revision=code_revision,
             )
+        except ProviderRetryableResponseError as error:
+            if not error.hit_length_limit:
+                reason = is_transient(error)
+                if reason is None:
+                    raise
+                _transient(identity, failed, attempt, reason, error, state)
+            # The model used its whole output allowance without a complete answer. The rejection
+            # is saved and replays as this same failure; redrawing the same request at the same
+            # allowance would fail again, so this one review fails and its group continues.
+            DRAW_MACHINE.move(identity, state, "refused", journal)
+            raise ReviewerError(
+                f"the reviewer exhausted its {settings.output_tokens}-token output allowance"
+            ) from error
         except Exception as error:
             reason = is_transient(error)
             if reason is None:
                 raise
-            receipt = TransientReceipt(attempt=attempt, reason=reason, error=type(error).__name__)
-            store.write_json(
-                artifact_id=f"{identity}-transient-{failed + 1}",
-                artifact_type=TRANSIENT_TYPE,
-                envelope=ArtifactEnvelope(
-                    schema_version=1, created_at=datetime.now(UTC), code_revision=code_revision
-                ),
-                files={"receipt.json": receipt},
-            )
-            DRAW_MACHINE.move(identity, state, "failed_transiently", journal)
-            raise TransientReviewFailure(identity, reason) from error
+            _transient(identity, failed, attempt, reason, error, state)
         DRAW_MACHINE.move(identity, state, "answered", journal)
         return response
+
+    def _transient(
+        identity: str, failed: int, attempt: str, reason: str, error: Exception, state: str
+    ) -> None:
+        """Save a transport-level failure receipt and raise TransientReviewFailure."""
+        receipt = TransientReceipt(attempt=attempt, reason=reason, error=type(error).__name__)
+        store.write_json(
+            artifact_id=f"{identity}-transient-{failed + 1}",
+            artifact_type=TRANSIENT_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=datetime.now(UTC), code_revision=code_revision
+            ),
+            files={"receipt.json": receipt},
+        )
+        DRAW_MACHINE.move(identity, state, "failed_transiently", journal)
+        raise TransientReviewFailure(identity, reason) from error
 
     return CompatibilityReviewer(
         draw=draw, model=settings.model, configuration_sha256=sha256_json(settings)

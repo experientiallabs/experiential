@@ -159,3 +159,40 @@ def test_a_transient_draw_failure_is_a_receipt_and_the_next_run_draws_a_fresh_at
         project.artifacts.project_directory / "environment-review" / "draws.jsonl"
     ).rows()
     assert [row["event"] for row in rows] == ["failed_transiently", "answered", "answered"]
+
+
+def test_an_exhausted_output_allowance_fails_that_review_draw_without_aborting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A length-limit rejection is a refused draw (ReviewerError), not a transient abort."""
+    from exp.runtime.models.providers.errors import ProviderRetryableResponseError
+    from exp.simulation.mining.environment_review import ReviewerError
+
+    project = ProjectStore(tmp_path, "case")
+    _, original = reviewer(lambda members, _variant: answer("compatible", members))
+    settings = AuthorSettings(
+        model_alias="reviewer",
+        model=original.model,
+        catalog_sha256="0" * 64,
+        output_tokens=2000,
+        deadline=datetime(2099, 1, 1, tzinfo=UTC),
+    )
+
+    def offline_response(*_args: object, **_kwargs: object) -> tuple[None, ModelResponse]:
+        """Every draw ends at the output allowance, as a saved rejection replays."""
+        raise ProviderRetryableResponseError("length", hit_length_limit=True)
+
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.variance.pipeline_review.author_response", offline_response
+    )
+    bound = family_reviewer(
+        project, BuildSettings(spec=family_spec(), reviewer=settings), code_revision="test"
+    )
+    request = ModelRequest(messages=(ModelMessage(role="user", content="{}"),))
+    with pytest.raises(ReviewerError, match="2000-token output allowance"):
+        bound.draw(request, identity="draw-b")
+    assert not project.artifacts.exists("draw-b-transient-1")
+    rows = TransitionJournal(
+        project.artifacts.project_directory / "environment-review" / "draws.jsonl"
+    ).rows()
+    assert [row["event"] for row in rows] == ["refused"]
