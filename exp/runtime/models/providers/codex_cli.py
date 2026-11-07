@@ -315,37 +315,107 @@ def _text(content: JsonValue) -> str:
     return ""
 
 
-def codex_prompt(payload: JsonObject) -> tuple[str, JsonObject, str]:
-    """The stdin prompt, the output schema and the forced tool name of one chat request.
+def _rendered(message: JsonObject) -> str:
+    """One chat message as prompt text, including the tool calls it made or answered."""
+    role = message.get("role")
+    body = _text(message.get("content"))
+    calls = message.get("tool_calls")
+    if isinstance(calls, list):
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if isinstance(function, dict):
+                body += f"\n[called {function.get('name')} with {function.get('arguments')}]"
+    if role == "tool":
+        return f"<tool_result id={message.get('tool_call_id')}>\n{body}\n</tool_result>"
+    return f"<{role}>\n{body.strip()}\n</{role}>"
+
+
+@dataclass(frozen=True)
+class CodexRequest:
+    """One chat request as a Codex call.
+
+    Attributes:
+        prompt: The stdin prompt.
+        schema: The strict ``--output-schema``, or None for a plain-text reply (no tools).
+        names: The offered tool names; one name means that tool is forced; none, text.
+        optional: Per tool, the optional properties the strict schema made nullable.
+    """
+
+    prompt: str
+    schema: JsonObject | None
+    names: tuple[str, ...]
+    optional: Mapping[str, Mapping[str, set[str]]]
+
+
+def codex_prompt(payload: JsonObject) -> CodexRequest:
+    """The prompt and output schema of one chat request offering function tools.
+
+    A request offering one tool (or forcing one) is answered with that tool's arguments. A
+    request offering several unforced tools is answered with ``{"tool", "arguments"}``: the
+    schema enumerates the tool names and allows each tool's strict arguments, and the answer
+    becomes a call of the named tool. Codex itself never runs a tool; the caller executes the
+    chosen call and sends its result back in the next request, which renders it.
 
     Raises:
-        ProviderTransportError: The request forces no single function tool.
+        ProviderTransportError: The request offers no function tool.
     """
     tools = payload.get("tools")
-    if not isinstance(tools, list) or len(tools) != 1 or not isinstance(tools[0], dict):
+    functions = [
+        tool["function"]
+        for tool in tools if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+    ] if isinstance(tools, list) else []  # fmt: skip
+    choice = payload.get("tool_choice")
+    forced = choice.get("function", {}).get("name") if isinstance(choice, dict) else None
+    if forced is not None:
+        functions = [f for f in functions if f.get("name") == forced]
+    if forced is not None and not functions:
         raise ProviderTransportError(
-            "codex-cli serves forced single-tool answers only", status_code=400,
+            f"codex-cli request forces {forced!r}, which it does not offer", status_code=400,
             error_code="codex_unsupported_request",
         )  # fmt: skip
-    function = tools[0].get("function")
-    assert isinstance(function, dict)
-    name, parameters = str(function["name"]), function.get("parameters") or {}
-    assert isinstance(parameters, dict)
+    strict: dict[str, JsonObject] = {}
+    optional: dict[str, Mapping[str, set[str]]] = {}
+    for function in functions:
+        empty: JsonObject = {"type": "object", "properties": {}}
+        parameters = function.get("parameters") or empty
+        assert isinstance(parameters, dict)
+        strict[str(function["name"])], optional[str(function["name"])] = strict_schema(parameters)
+    names = tuple(strict)
     messages = payload.get("messages")
-    parts = []
-    for message in messages if isinstance(messages, list) else []:
-        if isinstance(message, dict):
-            parts.append(
-                f"<{message.get('role')}>\n{_text(message.get('content'))}\n</{message.get('role')}>"
-            )
-    prompt = (
+    parts = [_rendered(m) for m in messages if isinstance(m, dict)] if isinstance(
+        messages, list
+    ) else []  # fmt: skip
+    head = (
         "You are answering one structured request. Do not run commands, read files, browse, "
-        "or call any tool: answer from the text below only.\n\n"
-        + "\n\n".join(parts)
-        + f"\n\nReply with exactly one JSON object: the arguments of `{name}` "
-        f"({function.get('description', '')}), matching the output schema."
+        "or call any tool yourself: answer from the text below only.\n\n" + "\n\n".join(parts)
     )
-    return prompt, parameters, name
+    if not names:
+        prompt = head + "\n\nReply with your answer as plain text, in the format requested."
+        return CodexRequest(prompt, None, names, optional)
+    if len(names) == 1:
+        function = functions[0]
+        prompt = head + (
+            f"\n\nReply with exactly one JSON object: the arguments of `{names[0]}` "
+            f"({function.get('description', '')}), matching the output schema."
+        )
+        return CodexRequest(prompt, strict[names[0]], names, optional)
+    menu = "\n".join(f"- `{f.get('name')}`: {f.get('description', '')}" for f in functions)
+    prompt = head + (
+        "\n\nChoose exactly one of these functions; the caller runs it and replies with its "
+        f"result:\n{menu}\n\nReply with exactly one JSON object "
+        '{"tool": <function name>, "arguments": <that function\'s arguments>}, matching the '
+        "output schema."
+    )
+    schema: JsonObject = {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "enum": list(names)},
+            "arguments": {"anyOf": [strict[name] for name in names]},
+        },
+        "required": ["arguments", "tool"],
+        "additionalProperties": False,
+    }
+    return CodexRequest(prompt, schema, names, optional)
 
 
 @dataclass
@@ -442,12 +512,13 @@ class CodexCliTransport(JsonHttpTransport):
         """No metadata endpoint exists."""
         raise ProviderTransportError("codex-cli has no metadata endpoint", status_code=404)
 
-    def argv(self, schema_path: Path, out_path: Path) -> list[str]:
-        """The exact ``codex exec`` command line."""
+    def argv(self, schema_path: Path | None, out_path: Path) -> list[str]:
+        """The exact ``codex exec`` command line; no schema for a plain-text reply."""
         effort = [] if self.effort is None else ["-c", f'model_reasoning_effort="{self.effort}"']
+        schema = [] if schema_path is None else ["--output-schema", str(schema_path)]
         return [
             self.binary, "exec", "-m", self.model, *effort, *CODEX_FLAGS,
-            "--output-schema", str(schema_path), "-o", str(out_path), "-",
+            *schema, "-o", str(out_path), "-",
         ]  # fmt: skip
 
     def post(
@@ -476,8 +547,7 @@ class CodexCliTransport(JsonHttpTransport):
                 f"installed codex is not the pinned {self.version}", status_code=412,
                 error_code="codex_version_changed",
             )  # fmt: skip
-        prompt, parameters, name = codex_prompt(payload)
-        strict, optional = strict_schema(parameters)
+        request = codex_prompt(payload)
         attempt = 0
         while True:
             with codex_slot(), tempfile.TemporaryDirectory(prefix="codex-astra-") as scratch:
@@ -485,9 +555,13 @@ class CodexCliTransport(JsonHttpTransport):
                 work = root / "work"
                 work.mkdir()
                 schema_path, out_path = root / "schema.json", root / "out.json"
-                schema_path.write_text(json.dumps(strict))
+                if request.schema is not None:
+                    schema_path.write_text(json.dumps(request.schema))
                 run = self._runner(
-                    self.argv(schema_path, out_path), prompt, work, self.timeout_seconds
+                    self.argv(None if request.schema is None else schema_path, out_path),
+                    request.prompt,
+                    work,
+                    self.timeout_seconds,
                 )
                 if out_path.exists():
                     run = CodexRun(run.returncode, run.stdout, run.stderr, out_path.read_text())
@@ -506,12 +580,37 @@ class CodexCliTransport(JsonHttpTransport):
                         continue
                     raise ProviderTransportError("codex is rate limited", status_code=429)
                 raise ProviderTransportError(f"codex exec exited {run.returncode}")
-            return self._answer(run, events, name, optional)
+            return self._answer(run, events, request)
+
+    def _text_answer(self, run: CodexRun, events: EventSummary) -> JsonHttpResponse:
+        """The chat-completion body carrying Codex's final message as plain content."""
+        text = (run.output or "").strip()
+        if not text:
+            raise ProviderTransportError(
+                "codex wrote no answer", status_code=502, error_code="codex_no_answer"
+            )
+        return JsonHttpResponse(
+            status_code=200,
+            body={
+                "id": "codex-cli",
+                "model": self.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": text},
+                    }
+                ],
+                "usage": _usage(events),
+            },
+        )
 
     def _answer(
-        self, run: CodexRun, events: EventSummary, name: str, optional: Mapping[str, set[str]]
+        self, run: CodexRun, events: EventSummary, request: CodexRequest
     ) -> JsonHttpResponse:
-        """The chat-completion body carrying the answer as the forced tool's call."""
+        """The chat-completion body carrying the answer as a call of the chosen tool."""
+        if request.schema is None:
+            return self._text_answer(run, events)
         try:
             answer = json.loads(run.output or "")
         except ValueError as error:
@@ -522,7 +621,14 @@ class CodexCliTransport(JsonHttpTransport):
             raise ProviderTransportError(
                 "codex answer is not an object", status_code=502, error_code="codex_no_answer"
             )
-        arguments = drop_optional_nulls(answer, optional)
+        name = request.names[0]
+        if len(request.names) > 1:
+            name, answer = answer.get("tool"), answer.get("arguments")
+            if name not in request.names or not isinstance(answer, dict):
+                raise ProviderTransportError(
+                    "codex chose no offered tool", status_code=502, error_code="codex_no_answer"
+                )
+        arguments = drop_optional_nulls(answer, request.optional[name])
         prompt_tokens = events.usage.get("input_tokens", 0)
         completion = events.usage.get("output_tokens", 0)
         return JsonHttpResponse(
@@ -553,6 +659,17 @@ class CodexCliTransport(JsonHttpTransport):
                 },
             },
         )
+
+
+def _usage(events: EventSummary) -> JsonObject:
+    """The chat-completion usage of one Codex turn."""
+    prompt_tokens = events.usage.get("input_tokens", 0)
+    completion = events.usage.get("output_tokens", 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion,
+        "total_tokens": prompt_tokens + completion,
+    }
 
 
 def codex_cli_client(

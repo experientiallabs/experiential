@@ -225,3 +225,98 @@ def test_the_concurrency_limit_is_respected(tmp_path: Path) -> None:
         assert len(runner.calls) == 10 and runner.peak == 3
     finally:
         set_codex_concurrency(4)
+
+
+MULTI: JsonObject = {
+    "model": "gpt-6-astra",
+    "messages": [
+        {"role": "system", "content": "Author tags."},
+        {"role": "user", "content": "episodes"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_episode", "arguments": '{"trace_id": "t1"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "episode t1 body"},
+    ],
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_episode",
+                "description": "Read one episode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"trace_id": {"type": "string"}},
+                    "required": ["trace_id"],
+                },
+            },
+        },
+        cast(Any, PAYLOAD)["tools"][0],
+    ],
+}
+
+
+def post_multi(codex: CodexCliTransport) -> Any:  # noqa: ANN401
+    """Post the multi-tool payload inside the offline scope and return the body."""
+    with offline_closed_model("test"):
+        return codex.post(
+            "https://codex-cli.invalid/v1/chat/completions", headers={}, payload=MULTI,
+            timeout_seconds=10,
+        ).body  # fmt: skip
+
+
+def test_an_unforced_multi_tool_request_answers_with_the_chosen_tool() -> None:
+    """Several unforced tools: the schema enumerates them, the answer names one, and the
+    transcript's earlier call and its result are in the prompt."""
+    runner = Runner(
+        [answered({"tool": "submit_ticket", "arguments": {"label": "x", "note": None}})]
+    )
+    body = post_multi(transport(runner))
+    call = body["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "submit_ticket" and json.loads(call["arguments"]) == {"label": "x"}
+    argv, stdin, _ = runner.calls[0]
+    assert "[called read_episode with" in stdin and "episode t1 body" in stdin
+    assert "`read_episode`" in stdin and "`submit_ticket`" in stdin
+
+
+def test_a_multi_tool_answer_naming_no_offered_tool_is_refused() -> None:
+    """An answer whose tool is not offered is unusable, never guessed."""
+    runner = Runner([answered({"tool": "delete_everything", "arguments": {}})])
+    with pytest.raises(ProviderTransportError, match="no offered tool"):
+        post_multi(transport(runner))
+
+
+def test_a_forced_choice_among_several_tools_answers_that_tool_alone() -> None:
+    """tool_choice narrows the offered tools to the forced one."""
+    forced = {**MULTI, "tool_choice": {"type": "function", "function": {"name": "read_episode"}}}
+    runner = Runner([answered({"trace_id": "t2"})])
+    with offline_closed_model("test"):
+        body = transport(runner).post(
+            "https://codex-cli.invalid/v1/chat/completions", headers={}, payload=forced,
+            timeout_seconds=10,
+        ).body  # fmt: skip
+    call = body["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "read_episode" and json.loads(call["arguments"]) == {"trace_id": "t2"}
+
+
+def test_a_request_offering_no_tool_gets_a_plain_text_reply() -> None:
+    """No tools: no output schema is passed and the final message is the reply's content."""
+    text = {key: value for key, value in PAYLOAD.items() if key not in ("tools", "tool_choice")}
+    runner = Runner([CodexRun(0, events(CLEAN), "", '{"questions": []}\n')])
+    with offline_closed_model("test"):
+        body = transport(runner).post(
+            "https://codex-cli.invalid/v1/chat/completions", headers={}, payload=text,
+            timeout_seconds=10,
+        ).body  # fmt: skip
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == '{"questions": []}'
+    argv, stdin, _ = runner.calls[0]
+    assert "--output-schema" not in argv and "-o" in argv and "plain text" in stdin
