@@ -11,9 +11,13 @@ use crate::settlement::Observation;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Metrics {
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub started_at: f64,
+    #[serde(default, deserialize_with = "crate::lossless_json::deserialize")]
     pub first_token_at: Option<f64>,
+    #[serde(default, deserialize_with = "crate::lossless_json::deserialize")]
     pub terminal_at: Option<f64>,
+    #[serde(default, deserialize_with = "crate::lossless_json::deserialize")]
     pub duration_ms: Option<f64>,
     pub usage: Option<Usage>,
     /// False for interrupted, partial or noncredible all-zero finished meters.

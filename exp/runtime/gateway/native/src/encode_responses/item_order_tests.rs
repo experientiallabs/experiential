@@ -51,7 +51,7 @@ fn done_and_completed_order(events: &[Event]) -> (Vec<Value>, Vec<Value>) {
     let payloads: Vec<Value> = frames
         .iter()
         .filter_map(|frame| frame.split_once("data: ").map(|(_, data)| data.trim()))
-        .map(|data| serde_json::from_str(data).expect("frame data must be JSON"))
+        .map(|data| crate::lossless_json::from_str(data).expect("frame data must be JSON"))
         .collect();
     let identity = |item: &Value| item.get("call_id").unwrap_or(&item["id"]).clone();
     let done: Vec<Value> = payloads

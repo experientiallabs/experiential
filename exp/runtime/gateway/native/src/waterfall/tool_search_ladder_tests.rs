@@ -253,7 +253,7 @@ impl SearchHarness {
             .call("dump", "{}".to_string())
             .await
             .expect("dump succeeds");
-        serde_json::from_str(&text).expect("story parses")
+        crate::lossless_json::from_str(&text).expect("story parses")
     }
 }
 

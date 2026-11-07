@@ -73,6 +73,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_handoff import uses_native
 from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
@@ -547,6 +548,7 @@ def _admit_accepted(
     )
     response: JsonObject = {
         "request_id": authorization.request_id,
+        "native_accounting": uses_native(plane._accounting, str(authorization.request_id)),  # noqa: SLF001
         "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         "alias": authorization.alias,
         "alias_revision_id": authorization.alias_revision_id,

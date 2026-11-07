@@ -4,13 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "exp-gateway-native"
-version = "0.3.181"
+version = "0.3.182"
 description = "Rust data plane for the Experiential local gateway (compiled extension module)."
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
+dependencies = ["typing-extensions==4.16.0"]
 
 [tool.maturin]
 module-name = "exp_gateway_native"
+include = [{ path = "include/native_callbacks.h", format = ["sdist", "wheel"] }]
 
 [tool.uv]
 # Rebuild the extension whenever the crate changes, so `uv run` in a checkout

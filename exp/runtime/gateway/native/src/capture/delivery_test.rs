@@ -243,7 +243,7 @@ fn limits() -> Limits {
 }
 
 fn record(id: &str) -> Record {
-    serde_json::from_value(serde_json::json!({
+    crate::lossless_json::from_value(serde_json::json!({
         "schema_version":1,
         "request": {"request_id":id,
             "scope":{"organization_id":"org","identity_id":"identity","application_id":"app"},

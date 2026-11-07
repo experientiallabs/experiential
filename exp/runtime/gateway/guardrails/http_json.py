@@ -231,6 +231,41 @@ class HttpJsonClassifier:
         self._max_response_bytes = max_response_bytes
         self._client = client
 
+    def native_output_configuration(self) -> JsonObject:
+        """Export the endpoint and exact injected transport authority before handoff."""
+        from exp.runtime.gateway.guardrails.native_owner import (
+            NativeClassifierTransport,  # noqa: PLC0415
+        )
+
+        transport: JsonObject = {"public_only": False, "headers": {}}
+        if self._client is not None:
+            if not isinstance(self._client, NativeClassifierTransport):
+                message = "The classifier transport has no native egress contract"
+                raise ValueError(message)
+            transport = self._client.native_classifier_transport()
+        authorization = bearer_authorization_header(self._bearer_env)
+        return {
+            "kind": "http_json",
+            "url": self._url,
+            "max_response_bytes": self._max_response_bytes,
+            "authorization": authorization,
+            "transport": transport,
+        }
+
+    def native_input_configuration(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> JsonObject:
+        """Freeze the exact complete-request payload and transport at admission."""
+        return {
+            **self.native_output_configuration(),
+            "payload": _inspect_payload(check=check, request=request, completion=None),
+        }
+
+    def native_input_template(self, *, check: GuardrailCheck) -> JsonObject:
+        """Freeze transport authority independently of the evolving input subject."""
+        del check
+        return self.native_output_configuration()
+
     async def inspect_input(
         self,
         *,

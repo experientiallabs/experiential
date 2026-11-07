@@ -45,7 +45,7 @@ pub type NativeToolTranslation = HashMap<String, (String, Option<String>, bool)>
 /// The freeform text is returned verbatim. An invalid wrapper is a typed
 /// provider response failure, never a successful freeform call containing JSON.
 fn unwrap_custom_input(raw_arguments: &str) -> Result<String, Failure> {
-    if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(raw_arguments) {
+    if let Ok(Value::Object(mut map)) = crate::lossless_json::from_str::<Value>(raw_arguments) {
         if let Some(Value::String(input)) = map.remove("input") {
             return Ok(input);
         }

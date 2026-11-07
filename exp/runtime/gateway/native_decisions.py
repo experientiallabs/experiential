@@ -49,6 +49,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_handoff import uses_native
 from exp.runtime.gateway.native_settlement import gateway_updating_failure, optional_text
 from exp.runtime.gateway.organization_tag import tagged_headers
 from exp.runtime.gateway.routing import GatewayRoutingError
@@ -311,7 +312,7 @@ def _admit_accepted(
         "maximum_total_attempts": depth,
         "maximum_same_deployment_attempts": 1,
     }
-    serialized = json.dumps(response, separators=(",", ":"))
+    json.dumps(response, separators=(",", ":"))  # Validate the wire before transferring ownership.
     plane._accounting.register(  # noqa: SLF001
         InflightRequest(
             authorization=authorization,
@@ -325,7 +326,8 @@ def _admit_accepted(
             throttle_redial_budgets=(0,) * depth,
         )
     )
-    return serialized
+    response["native_accounting"] = uses_native(plane._accounting, str(authorization.request_id))  # noqa: SLF001
+    return json.dumps(response, separators=(",", ":"))
 
 
 def _finish_unsupported(

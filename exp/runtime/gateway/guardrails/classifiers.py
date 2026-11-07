@@ -123,6 +123,24 @@ class KeywordClassifier:
         self.input_calls = 0
         self.output_calls = 0
 
+    def native_output_configuration(self) -> dict[str, object]:
+        """Freeze the same Unicode-casefolded needles for native output inspection."""
+        return {"kind": "keyword", "needles": list(self._needles)}
+
+    def native_input_configuration(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> dict[str, object]:
+        """Freeze the complete text this read-only keyword check examines."""
+        from exp.runtime.gateway.guardrails.native_owner import text_subjects  # noqa: PLC0415
+
+        del check
+        return {**self.native_output_configuration(), "subjects": text_subjects(request)}
+
+    def native_input_template(self, *, check: GuardrailCheck) -> dict[str, object]:
+        """Reuse the same keyword vocabulary for later native search rounds."""
+        del check
+        return self.native_output_configuration()
+
     async def inspect_input(
         self,
         *,

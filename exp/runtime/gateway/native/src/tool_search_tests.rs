@@ -74,7 +74,7 @@ fn frame_payload(frame: &str) -> Value {
         .lines()
         .find_map(|line| line.strip_prefix("data: "))
         .expect("data line");
-    serde_json::from_str(data).expect("frame payload is JSON")
+    crate::lossless_json::from_str(data).expect("frame payload is JSON")
 }
 
 fn frames_debug(events: &[Event]) -> Vec<String> {
@@ -96,7 +96,7 @@ fn web_search() -> WebSearchAdmission {
 
 #[test]
 fn admission_decodes_the_contract_shape_and_defaults_the_round_budget() {
-    let full: ToolSearchAdmission = serde_json::from_value(json!({
+    let full: ToolSearchAdmission = crate::lossless_json::from_value(json!({
         "tool_name": "tool_search",
         "max_rounds": 2,
         "deferred": 42,
@@ -107,11 +107,12 @@ fn admission_decodes_the_contract_shape_and_defaults_the_round_budget() {
     assert_eq!(full.deferred, 42);
     assert_eq!(full.surface_shape, "messages_bm25");
     let sparse: ToolSearchAdmission =
-        serde_json::from_value(json!({"tool_name": "gateway_tool_search"})).expect("defaults");
+        crate::lossless_json::from_value(json!({"tool_name": "gateway_tool_search"}))
+            .expect("defaults");
     assert_eq!(sparse.tool_name, "gateway_tool_search");
     assert_eq!(sparse.max_rounds, DEFAULT_MAX_ROUNDS);
     assert_eq!(sparse.deferred, 0);
-    assert!(serde_json::from_value::<ToolSearchAdmission>(json!({})).is_err());
+    assert!(crate::lossless_json::from_value::<ToolSearchAdmission>(json!({})).is_err());
 }
 
 #[test]
@@ -206,7 +207,7 @@ fn round_argument_carries_the_calls_verbatim_and_the_settle_shaped_usage() {
         raw_arguments: "{\"query\":\"weather\"}".to_string(),
     }];
     let argument: Value =
-        serde_json::from_str(&round_argument("req-1", 2, 1, &calls, Some(&usage())))
+        crate::lossless_json::from_str(&round_argument("req-1", 2, 1, &calls, Some(&usage())))
             .expect("argument is JSON");
     assert_eq!(
         argument,
@@ -226,14 +227,15 @@ fn round_argument_carries_the_calls_verbatim_and_the_settle_shaped_usage() {
         })
     );
     let unreported: Value =
-        serde_json::from_str(&round_argument("req-1", 0, 1, &[], None)).expect("argument is JSON");
+        crate::lossless_json::from_str(&round_argument("req-1", 0, 1, &[], None))
+            .expect("argument is JSON");
     assert_eq!(unreported["usage"], Value::Null);
     assert_eq!(unreported["calls"], json!([]));
 }
 
 #[test]
 fn round_reply_decodes_the_wire_the_rounds_and_the_exhausted_flag() {
-    let reply: ToolSearchRoundReply = serde_json::from_value(json!({
+    let reply: ToolSearchRoundReply = crate::lossless_json::from_value(json!({
         "wire": {
             "provider": "openai",
             "deployment_id": "a",
@@ -254,7 +256,7 @@ fn round_reply_decodes_the_wire_the_rounds_and_the_exhausted_flag() {
     assert_eq!(reply.rounds[0].matched, vec!["get_weather".to_string()]);
     assert!(reply.rounds[0].matched_tools.is_empty());
     assert!(reply.exhausted);
-    let sparse: ToolSearchRoundReply = serde_json::from_value(json!({"wire": {
+    let sparse: ToolSearchRoundReply = crate::lossless_json::from_value(json!({"wire": {
         "provider": "openai", "deployment_id": "a", "dialect": "openai_compatible",
         "url": "https://provider.test", "headers": {}, "timeout_seconds": 1.0, "idempotency_key": "k",
     }}))
@@ -302,7 +304,7 @@ fn messages_prelude_renders_each_round_as_server_tool_use_and_result_under_reser
     match &events[3] {
         Event::ServerToolResult { index, block } => {
             assert_eq!(*index, u32::MAX - 1);
-            let block: Value = serde_json::from_str(block).expect("block is JSON");
+            let block: Value = crate::lossless_json::from_str(block).expect("block is JSON");
             assert_eq!(
                 block,
                 json!({
@@ -330,7 +332,7 @@ fn messages_prelude_renders_each_round_as_server_tool_use_and_result_under_reser
             assert_eq!(*index, u32::MAX - 2);
             assert_eq!(name, TOOL_SEARCH_REGEX_TOOL_NAME);
             assert_eq!(delta, "{\"pattern\":\"^db_\"}");
-            let block: Value = serde_json::from_str(block).expect("block is JSON");
+            let block: Value = crate::lossless_json::from_str(block).expect("block is JSON");
             assert_eq!(block["content"]["tool_references"], json!([]));
         }
         other => panic!("unexpected regex round events {other:?}"),
@@ -778,7 +780,7 @@ fn usage_meters_extend_an_existing_server_tool_object_and_never_invent_one() {
 }
 
 fn admission() -> Admission {
-    serde_json::from_value(json!({
+    crate::lossless_json::from_value(json!({
         "request_id": "request-abc",
         "alias": "alias",
         "alias_revision_id": "rev",

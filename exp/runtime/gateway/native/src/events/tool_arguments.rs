@@ -10,7 +10,7 @@ use super::ToolAccumulator;
 /// category and line/column, never input bytes), so an unparsable shape is
 /// diagnosable from the boundary log without ever logging payload.
 pub fn require_json_object_text(raw: &str) -> Result<(), String> {
-    match serde_json::from_str::<Value>(raw) {
+    match crate::lossless_json::from_str::<Value>(raw) {
         Ok(Value::Object(_)) => Ok(()),
         Ok(_) => Err("streamed tool arguments must decode to an object".to_string()),
         Err(error) => Err(format!(

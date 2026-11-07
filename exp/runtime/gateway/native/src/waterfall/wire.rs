@@ -57,10 +57,12 @@ pub struct DeploymentWire {
     /// Set only on the overlaid wire, never by the host.
     #[serde(skip)]
     pub automatic_cache_written_tokens: Option<u64>,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub timeout_seconds: f64,
     /// Structured payload the data plane serializes itself; null for
     /// body-signing dialects, whose route entry carries `upstream_body`.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub upstream_payload: Value,
     /// Exact pre-serialized body for body-signing dialects (Bedrock SigV4).
     /// When present it is sent verbatim: the signature covers these exact
@@ -125,16 +127,19 @@ pub struct DeploymentWire {
     /// Deployment override for the flat first-byte allowance; the serving
     /// configuration's default applies when absent.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub time_to_first_byte_base_seconds: Option<f64>,
     /// Deployment override for the input-scaled first-byte allowance in
     /// seconds per million approximate input tokens; the serving
     /// configuration's default applies when absent.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub time_to_first_byte_seconds_per_million_input_tokens: Option<f64>,
     /// Deployment override for the flat first-TOKEN allowance (the wait from
     /// the dial to the first semantic event); the serving configuration's
     /// default applies when absent. Absent or null on older admissions.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub time_to_first_token_base_seconds: Option<f64>,
     /// How many post-backoff redials a throttle on this rung is worth on
     /// this request: the pool's `throttle_redial` schedule scaled by the

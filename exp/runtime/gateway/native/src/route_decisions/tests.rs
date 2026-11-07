@@ -605,7 +605,7 @@ fn admission_forwards_attribution_and_trusted_ip_but_not_idempotency() {
     headers.insert("idempotency-key", "caller-key".parse().unwrap());
     headers.insert("user-agent", "OpenAI/Python 2.8.1".parse().unwrap());
     let argument: Value =
-        serde_json::from_str(&admission_argument("gateway-key", "{}", &headers)).unwrap();
+        crate::lossless_json::from_str(&admission_argument("gateway-key", "{}", &headers)).unwrap();
     assert_eq!(argument["app_referer"], "https://a.invalid");
     assert_eq!(argument["app_title"], "Decision app");
     assert_eq!(argument["user_agent"], "OpenAI/Python 2.8.1");
@@ -614,10 +614,11 @@ fn admission_forwards_attribution_and_trusted_ip_but_not_idempotency() {
     assert!(argument.get("idempotency_key").is_none());
     headers.insert("x-real-ip", "198.51.100.4".parse().unwrap());
     let argument: Value =
-        serde_json::from_str(&admission_argument("gateway-key", "{}", &headers)).unwrap();
+        crate::lossless_json::from_str(&admission_argument("gateway-key", "{}", &headers)).unwrap();
     assert_eq!(argument["client_ip"], "198.51.100.4");
     let argument: Value =
-        serde_json::from_str(&admission_argument("gateway-key", "{}", &HeaderMap::new())).unwrap();
+        crate::lossless_json::from_str(&admission_argument("gateway-key", "{}", &HeaderMap::new()))
+            .unwrap();
     assert_eq!(argument["client_ip"], Value::Null);
 }
 
@@ -626,7 +627,7 @@ fn rejected_http(status: u16) -> Failure {
 }
 
 fn wire(customer_managed: bool) -> DeploymentWire {
-    serde_json::from_value(json!({
+    crate::lossless_json::from_value(json!({
         "provider": "typesafe", "deployment_id": "typesafe-1", "dialect": "typesafe_systemone",
         "url": "https://example.invalid/v1/systemone", "headers": {}, "timeout_seconds": 1.0,
         "idempotency_key": "attempt-1", "billing_customer_managed": customer_managed,
@@ -741,7 +742,7 @@ fn calls(object: &Py<PyAny>) -> Value {
             .unwrap()
             .extract::<String>()
             .unwrap();
-        serde_json::from_str(&text).unwrap()
+        crate::lossless_json::from_str(&text).unwrap()
     })
 }
 

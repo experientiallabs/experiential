@@ -23,7 +23,9 @@ enum Preparation {
     Ready {
         resource_name: String,
         resource_prefix: String,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         payload: Value,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         expires_at: f64,
         /// Host-granted extension of this reused resource (one lease per cache).
         #[serde(default)]
@@ -33,7 +35,9 @@ enum Preparation {
         operation_id: String,
         resource_prefix: String,
         url: String,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         payload: Value,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         expires_at: f64,
         #[serde(default)]
         measure_tokens: bool,
@@ -46,6 +50,7 @@ enum Preparation {
 #[derive(Deserialize)]
 struct RenewGrant {
     operation_id: String,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     expires_at: f64,
     expire_time: String,
 }
@@ -53,7 +58,12 @@ struct RenewGrant {
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum Completion {
-    Ready { payload: Value, expires_at: f64 },
+    Ready {
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
+        payload: Value,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
+        expires_at: f64,
+    },
     Unavailable,
 }
 
@@ -158,7 +168,8 @@ where
     ensure_remaining(deadline)?;
     let scope = json!({"request_id": request_id, "deployment_id": wire.deployment_id});
     let reply = callback(deadline, call("prepare_explicit_cache", scope.to_string())).await?;
-    let preparation: Preparation = serde_json::from_str(&reply).map_err(|_| internal())?;
+    let preparation: Preparation =
+        crate::lossless_json::from_str(&reply).map_err(|_| internal())?;
     match preparation {
         Preparation::Disabled | Preparation::Unavailable => {
             ensure_remaining(deadline)?;
@@ -307,7 +318,8 @@ where
             // No generation is permitted if this accounting acknowledgement fails.
             let reply =
                 callback(deadline, call("finish_explicit_cache", finish.to_string())).await?;
-            let completion: Completion = serde_json::from_str(&reply).map_err(|_| internal())?;
+            let completion: Completion =
+                crate::lossless_json::from_str(&reply).map_err(|_| internal())?;
             ensure_remaining(deadline)?;
             match completion {
                 Completion::Unavailable => Ok(None),
@@ -666,7 +678,7 @@ async fn bounded_json(mut response: reqwest::Response) -> Option<Value> {
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).ok()
+    crate::lossless_json::from_slice(&body).ok()
 }
 
 /// Extend one reused resource to the host-granted absolute expiry.

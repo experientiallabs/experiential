@@ -125,7 +125,7 @@ pub(crate) async fn messages_count_tokens(
         "anthropic_beta": anthropic_beta,
     }));
     match state.bridge.call("count_tokens", argument).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
             Err(_) => messages_error_response(&PublicError::internal()),
         },
@@ -182,7 +182,7 @@ pub(crate) async fn messages(
         Ok(text) => text,
         Err(error) => return messages_error_response(&error),
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
+    let admission_value: Value = match crate::lossless_json::from_str(&admission_text) {
         Ok(value) => value,
         Err(_) => return messages_error_response(&PublicError::internal()),
     };
@@ -192,7 +192,12 @@ pub(crate) async fn messages(
         // servability, so an escalation disposition fails closed here.
         return messages_error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
-    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let state = match crate::admission::bind_owner(&state, &admission_value) {
+        Ok(state) => state,
+        Err(error) => return messages_error_response(&error),
+    };
+
+    let mut admission: Admission = match crate::lossless_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             // The request is durably accepted; abandon it before failing so

@@ -256,7 +256,7 @@ mod tests {
                     Please check this guide to understand why this error code might have been returned \n\
                     https://docs.microsoft.com/en-us/azure/machine-learning/how-to-troubleshoot-online-endpoints#http-status-codes\n";
         assert!(
-            serde_json::from_str::<Value>(body).is_err(),
+            crate::lossless_json::from_str::<Value>(body).is_err(),
             "the fixture must reproduce the strict-parse failure"
         );
         let read = envelope(body);

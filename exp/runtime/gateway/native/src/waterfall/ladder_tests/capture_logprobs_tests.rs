@@ -128,7 +128,7 @@ fn injected_probabilities_leave_every_caller_encoding_byte_identical() {
             run_capture(&harness, &[capture_wire("inject-a", &rich.url)], true).await;
         let (injected, committed) = drain(finish(guard, won).await).await;
 
-        let sent: Value = serde_json::from_str(&rich.bodies.lock().unwrap()[0]).unwrap();
+        let sent: Value = crate::lossless_json::from_str(&rich.bodies.lock().unwrap()[0]).unwrap();
         assert_eq!(sent["logprobs"], json!(true));
         assert!(sent.get("top_logprobs").is_none());
         assert!(committed.relay.logprobs.injected);
@@ -157,7 +157,8 @@ fn injection_requires_the_request_capture_and_the_rung_eligibility() {
             wire.capture_logprobs = eligible;
             let (won, guard) = run_capture(&harness, &[wire], capture).await;
             let (_, committed) = drain(finish(guard, won).await).await;
-            let sent: Value = serde_json::from_str(&rung.bodies.lock().unwrap()[0]).unwrap();
+            let sent: Value =
+                crate::lossless_json::from_str(&rung.bodies.lock().unwrap()[0]).unwrap();
             assert!(sent.get("logprobs").is_none());
             assert!(!committed.relay.logprobs.injected);
         });
@@ -174,7 +175,7 @@ fn customer_managed_rungs_and_caller_controls_are_never_injected() {
         let (won, guard) = run_capture(&harness, &[wire], true).await;
         let (_, committed) = drain(finish(guard, won).await).await;
         assert!(!committed.relay.logprobs.injected);
-        let sent: Value = serde_json::from_str(&rung.bodies.lock().unwrap()[0]).unwrap();
+        let sent: Value = crate::lossless_json::from_str(&rung.bodies.lock().unwrap()[0]).unwrap();
         assert!(sent.get("logprobs").is_none());
     });
     assert!(crate::capture::logprobs::with_logprobs(&json!({"top_logprobs": 2})).is_none());
@@ -198,8 +199,8 @@ fn a_refusal_redials_plain_inside_one_attempt_and_is_remembered() {
         assert!(matches!(events.first(), Some(Event::TextDelta(text)) if text == "Hel"));
         {
             let bodies = rung.bodies.lock().unwrap();
-            let first: Value = serde_json::from_str(&bodies[0]).unwrap();
-            let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+            let first: Value = crate::lossless_json::from_str(&bodies[0]).unwrap();
+            let second: Value = crate::lossless_json::from_str(&bodies[1]).unwrap();
             assert_eq!(first["logprobs"], json!(true));
             assert!(second.get("logprobs").is_none());
             // The injected body never shares the plain payload's key.
@@ -223,7 +224,7 @@ fn a_refusal_redials_plain_inside_one_attempt_and_is_remembered() {
         let (won, guard) = run_capture(&harness, &route, true).await;
         let (_, committed) = drain(finish(guard, won).await).await;
         assert!(!committed.relay.logprobs.injected);
-        let third: Value = serde_json::from_str(&rung.bodies.lock().unwrap()[2]).unwrap();
+        let third: Value = crate::lossless_json::from_str(&rung.bodies.lock().unwrap()[2]).unwrap();
         assert!(third.get("logprobs").is_none());
     });
 }

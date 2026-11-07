@@ -60,7 +60,7 @@ fn payloads(frames: &[String]) -> Vec<Value> {
         .iter()
         .map(|frame| {
             let data = frame.split_once("data: ").expect("frame carries data").1;
-            serde_json::from_str(data.trim_end()).expect("frame data is JSON")
+            crate::lossless_json::from_str(data.trim_end()).expect("frame data is JSON")
         })
         .collect()
 }
@@ -187,7 +187,7 @@ fn unexposed_rung_keeps_the_reasoning_item_empty() {
 #[test]
 fn the_exposure_flag_is_never_read_from_the_request() {
     let envelope: ResponsesEnvelope =
-        serde_json::from_value(json!({"reasoning_output_exposed": true}))
+        crate::lossless_json::from_value(json!({"reasoning_output_exposed": true}))
             .expect("unknown request fields are ignored");
     assert!(!envelope.reasoning_output_exposed);
 }

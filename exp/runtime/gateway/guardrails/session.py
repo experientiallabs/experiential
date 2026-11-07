@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
@@ -29,6 +30,8 @@ from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
 if TYPE_CHECKING:
+    from exp_gateway_native import NativeInputInspection
+
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_execution import InflightRequest
 
@@ -75,6 +78,8 @@ class GuardrailSession:
     deadline_monotonic: float
     request_id: str | None = None
     detectors: Mapping[str, NativeDetector] = field(default_factory=dict, repr=False)
+    native_execution: bool = field(default=False, repr=False)
+    native_input: NativeInputInspection | None = field(default=None, init=False, repr=False)
     _input: Future[None] | None = field(default=None, init=False, repr=False)
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
     _input_approved_at: float | None = field(default=None, init=False, repr=False)
@@ -216,11 +221,23 @@ class GuardrailSession:
                 remaining.append(subject)
         if not remaining or not any(p.input_checks for p in self.enforcing_policies):
             return
-        if self._input is not None:
+        if self._input is not None or self.native_input is not None:
             raise RuntimeError("guardrail input execution already started")
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
+        if overlap and self.native_execution:
+            from exp_gateway_native import NativeInputInspection  # noqa: PLC0415
+
+            from exp.runtime.gateway.guardrails.native_owner import (  # noqa: PLC0415
+                input_registration,
+            )
+
+            self.native_input = NativeInputInspection(
+                json.dumps(input_registration(self, tuple(remaining)), ensure_ascii=False),
+                max(0.0, self.deadline_monotonic - time.monotonic()),
+            )
+            return
         self._input = start_on_native_loop(self._inspect_subjects(tuple(remaining)))
         if not overlap:
             try:
@@ -255,7 +272,7 @@ class GuardrailSession:
     @property
     def input_pending(self) -> bool:
         """Whether native delivery must await this session's input decision."""
-        return self._input is not None
+        return self._input is not None or self.native_input is not None
 
     def input_decision(self) -> JsonObject:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
@@ -263,6 +280,8 @@ class GuardrailSession:
             return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
         if not self.enforcing_policies:
             return {"action": "allow"}
+        if self.native_input is not None:
+            return json.loads(self.native_input.decision_json())
         future = self._input
         if self._closed or (future is None and not self._approved_before_deadline()):
             return {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
@@ -304,6 +323,8 @@ class GuardrailSession:
         if failure is not None:
             self._input_failure = denied_input_failure(failure)
         self._closed = True
+        if self.native_input is not None:
+            self.native_input.cancel(None if failure is None else failure.model_dump_json())
         if self._input is not None:
             self._input.cancel()
 
@@ -350,6 +371,8 @@ class GuardrailSession:
 
     def inspect_output(self, completion: GuardrailCompletion) -> GuardrailCompletion:
         """Enforce every output policy before releasing a buffered completion."""
+        if self.native_input is not None:
+            self.native_input.wait_json()
         if self._input is not None and not self._input.done():
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))

@@ -36,7 +36,6 @@ from exp.runtime.gateway.guardrails.native import (
 )
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
-    NativeAttemptAccounting,
     NativeBridgeError,
 )
 from exp.runtime.gateway.native_accounting import (
@@ -99,6 +98,12 @@ from exp.runtime.gateway.native_explicit_cache import (
     bind_explicit_cache,
     validate_cache_hosts,
 )
+from exp.runtime.gateway.native_handoff import (
+    NativeRequestAccounting,
+    NativeRequestFactory,
+    create_accounting,
+    uses_native,
+)
 from exp.runtime.gateway.native_images import NativeImagesMixin
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
 from exp.runtime.gateway.native_openai_decisions import NativeDecisionSurfacesMixin
@@ -125,6 +130,7 @@ from exp.runtime.gateway.native_settlement import (
     optional_text,
 )
 from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
+from exp.runtime.gateway.native_transactions import NativeTransactionsMixin
 from exp.runtime.gateway.native_videos import NativeVideosMixin
 from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
 from exp.runtime.gateway.provider_preferences import route_by_provider_preferences
@@ -161,6 +167,7 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 
 class NativeControlPlane(
+    NativeTransactionsMixin,
     NativeAuthenticationMixin,
     NativeGuardrailsMixin,
     NativeDecodeMixin,
@@ -203,6 +210,7 @@ class NativeControlPlane(
         automatic_cache: AutomaticCacheHost | None = None,
         background_recovery: bool = True,
         fleet_lane_gate: FleetLaneGate | None = None,
+        native_request_factory: NativeRequestFactory | None = None,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -233,6 +241,7 @@ class NativeControlPlane(
                 lets a host schedule serialized recover_accounting calls, including
                 after native execution stops until accounting_drained is true.
             fleet_lane_gate: Host fleet-wide lane admission (``fleet_lanes``).
+            native_request_factory: Explicit native ownership handoff at initial admission.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -268,8 +277,10 @@ class NativeControlPlane(
         reservation_encoder()
         self._bind_videos(start_poller=False)
         # Shared accounting owns reservations, health, recovery and deadline cleanup.
-        self._accounting = NativeAttemptAccounting(
+        self._accounting = create_accounting(
             self._write_ledger,
+            native_request_factory=native_request_factory,
+            capture=capture,
             budget_error_factory=budget_error_factory,
             cache_sample_gate=cache_sample_gate,
             recovery_host=recovery_host,
@@ -373,6 +384,7 @@ class NativeControlPlane(
         )
         if guardrails is not None:
             guardrails.detectors = self._guardrail_detectors
+            guardrails.native_execution = isinstance(self._accounting, NativeRequestAccounting)
         parallel_guardrail = isinstance(authorization.target, DirectTarget) and (
             guardrails is not None and guardrails.can_overlap_input(request)
         )
@@ -791,6 +803,7 @@ class NativeControlPlane(
         select_capture_model(self._capture, authorization.request_id, route.snapshot.exact_model_id)
         response: JsonObject = {
             "request_id": authorization.request_id,
+            "native_accounting": uses_native(self._accounting, str(authorization.request_id)),
             "alias": authorization.alias,
             "alias_revision_id": authorization.alias_revision_id,
             "stream": request.stream,
@@ -830,52 +843,6 @@ class NativeControlPlane(
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
         return json.dumps(response, separators=(",", ":"))
-
-    def start_attempt(self, argument: str) -> str:
-        """Reserve one physical dispatch through the accounting registry.
-
-        Args:
-            argument: JSON payload for ``NativeAttemptAccounting.start_attempt``.
-
-        Returns:
-            The registry's reservation or exhaustion disposition.
-
-        Raises:
-            NativeBridgeError: Reservation failed after finalizing the request.
-        """
-        return self._accounting.start_attempt(argument)
-
-    def settle(self, argument: str) -> str:
-        """Durably settle one reserved attempt through the accounting registry.
-
-        Args:
-            argument: JSON payload for ``NativeAttemptAccounting.settle``.
-
-        Returns:
-            An empty JSON object; repeated settlement is a no-op.
-
-        Raises:
-            NativeBridgeError: Write failed; the entry remains available for retry.
-        """
-        return self._accounting.settle(argument)
-
-    def price(self, argument: str) -> str:
-        """Price one decided settlement before terminal bytes flush; nothing is written."""
-        return self._accounting.price(argument)
-
-    def abandon(self, argument: str) -> str:
-        """Terminalize one accepted request through the accounting registry.
-
-        Args:
-            argument: JSON payload for ``NativeAttemptAccounting.abandon``.
-
-        Returns:
-            An empty JSON object; an unknown request is a no-op.
-
-        Raises:
-            NativeBridgeError: Write failed; the entry remains for the deadline sweep.
-        """
-        return self._accounting.abandon(argument)
 
     def seal_reasoning_content(self, argument: str) -> str:
         """Seal one winning Fireworks turn before terminal settlement."""

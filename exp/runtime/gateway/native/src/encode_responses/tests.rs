@@ -413,7 +413,7 @@ fn encrypted_reasoning_lands_on_the_completed_reasoning_item() {
         let payloads: Vec<Value> = frames
             .iter()
             .filter_map(|frame| frame.split_once("data: ").map(|(_, data)| data.trim()))
-            .map(|data| serde_json::from_str(data).expect("frame data must be JSON"))
+            .map(|data| crate::lossless_json::from_str(data).expect("frame data must be JSON"))
             .collect();
         let done = payloads
             .iter()
@@ -508,7 +508,7 @@ fn provider_item_starts_preserve_reasoning_tool_order_and_identity() {
     let added: Vec<Value> = frames
         .iter()
         .filter_map(|frame| frame.split_once("data: ").map(|(_, data)| data.trim()))
-        .map(|data| serde_json::from_str(data).expect("frame data must be JSON"))
+        .map(|data| crate::lossless_json::from_str(data).expect("frame data must be JSON"))
         .filter(|payload: &Value| payload["type"] == json!("response.output_item.added"))
         .collect();
     assert_eq!(added[0]["item"]["id"], json!("rs-provider-0"));

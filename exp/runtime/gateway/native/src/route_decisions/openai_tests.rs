@@ -119,7 +119,7 @@ fn openai_answers_that_do_not_match_the_questions_are_malformed() {
 
 #[test]
 fn openai_wire_admission_deserializes_its_question_list() {
-    let admission: DecisionsAdmission = serde_json::from_value(json!({
+    let admission: DecisionsAdmission = crate::lossless_json::from_value(json!({
         "request_id": "request-1", "alias": "a", "alias_revision_id": "r", "exact_model_id": "m",
         "route_reason": "direct", "route": [], "wire": "openai",
         "openai_questions": [{"type": "predicate", "name": "p", "instructions": "i"}],
@@ -174,7 +174,7 @@ fn openai_one_based_score_values_match_their_weighted_average() {
 
 #[test]
 fn an_admission_without_its_wire_is_refused_as_drift() {
-    let missing = serde_json::from_value::<DecisionsAdmission>(json!({
+    let missing = crate::lossless_json::from_value::<DecisionsAdmission>(json!({
         "request_id": "request-1", "alias": "a", "alias_revision_id": "r", "exact_model_id": "m",
         "route_reason": "direct", "route": [], "questions": {},
         "maximum_total_attempts": 1, "maximum_same_deployment_attempts": 1,

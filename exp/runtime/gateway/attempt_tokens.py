@@ -20,6 +20,7 @@ from typing import assert_never
 
 from pydantic import JsonValue
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
     AudioContentPart,
     DocumentContentPart,
@@ -34,7 +35,7 @@ from exp.runtime.gateway.audio_contracts import (
     SpeechRequest,
     TranscriptionRequest,
 )
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayRequest, GatewayToolDefinition
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
@@ -199,6 +200,20 @@ def _utf8_length(text: str) -> int:
 
 def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -> None:
     """Feed everything a provider reads for one chat/responses call to ``counter``."""
+    _count_completion_messages(request, counter)
+    if request.tools:
+        counter.fixed(TOOLS_PRESENT_TOKENS)
+    for tool in request.tools:
+        _count_tool(tool, counter)
+    _count_completion_suffix(request, counter)
+    # Excluded carriers are provider-read input, including verbatim arguments.
+    replay_envelope = provider_replay_authority(request)
+    if replay_envelope is not None:
+        counter.json(replay_envelope)
+
+
+def _count_completion_messages(request: GatewayRequest, counter: _PromptCounter) -> None:
+    """Count the message prefix independently from mutable tools and replay metadata."""
     for message in request.messages:
         counter.fixed(MESSAGE_FRAMING_TOKENS)
         if message.content is not None:
@@ -214,14 +229,19 @@ def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -
                 counter.json(call.arguments)
         for part in message.content_parts:
             _count_content_part(part, counter)
-    if request.tools:
-        counter.fixed(TOOLS_PRESENT_TOKENS)
-    for tool in request.tools:
-        counter.fixed(TOOL_FRAMING_TOKENS)
-        counter.text(tool.name)
-        if tool.description is not None:
-            counter.text(tool.description)
-        counter.json(tool.parameters)
+
+
+def _count_tool(tool: GatewayToolDefinition, counter: _PromptCounter) -> None:
+    """Count one provider-visible definition using the shared schema scrubber."""
+    counter.fixed(TOOL_FRAMING_TOKENS)
+    counter.text(tool.name)
+    if tool.description is not None:
+        counter.text(tool.description)
+    counter.json(tool.parameters)
+
+
+def _count_completion_suffix(request: GatewayRequest, counter: _PromptCounter) -> None:
+    """Count response-format instructions after the currently loaded tool definitions."""
     if request.json_object_output:
         # Every wire receives the object instruction, including native JSON
         # modes whose provider requires JSON to be named in the input.
@@ -232,12 +252,6 @@ def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -
         if request.structured_text.description is not None:
             counter.text(request.structured_text.description)
         counter.json(request.structured_text.json_schema)
-    # Excluded provider carriers (replayed reasoning, native items, verbatim
-    # configs, retained raw arguments) are provider-read input the plain
-    # message fields miss; the replay envelope holds exactly that set.
-    replay_envelope = provider_replay_authority(request)
-    if replay_envelope is not None:
-        counter.json(replay_envelope)
 
 
 def _count_content_part(
@@ -350,6 +364,14 @@ class _PromptCounter:
     def total(self) -> int:
         """The counted prompt scaled by the reservation headroom."""
         return (self.counted() * (100 + INPUT_TOKEN_HEADROOM_PERCENT) + 99) // 100
+
+    def configuration(self) -> JsonObject:
+        """Freeze uncounted components for a native request owner to extend."""
+        return {
+            "chunks": self._chunks.copy(),
+            "fixed": self._fixed,
+            "opaque_bytes": self._opaque_bytes,
+        }
 
 
 def worst_case_output_tokens(

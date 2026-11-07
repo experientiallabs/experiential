@@ -69,7 +69,7 @@ fn state() -> AppState {
 
 fn bound(base: &AppState, target: &Py<PyAny>) -> AppState {
     let handle = Python::attach(|py| {
-        ExecutionHandle::new(target.clone_ref(py), 1, 2, 1, &PyDict::new(py), None)
+        ExecutionHandle::new(target.clone_ref(py), 1, 2, 1, &PyDict::new(py), None, None)
     })
     .unwrap();
     let bindings = ExecutionBindings::new(1).unwrap();

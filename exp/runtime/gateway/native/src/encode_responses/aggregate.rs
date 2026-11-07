@@ -201,7 +201,7 @@ pub fn completed_responses_body_with_gateway_tools(
         .map(|(_, tail)| tail)
         .unwrap_or_default();
     let payload: Value =
-        serde_json::from_str(data.trim_end()).map_err(|_| PublicError::internal())?;
+        crate::lossless_json::from_str(data.trim_end()).map_err(|_| PublicError::internal())?;
     let body = payload
         .get("response")
         .cloned()

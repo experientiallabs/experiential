@@ -79,7 +79,12 @@ pub(crate) enum RungEligibility {
 
 /// Judge `wire` as a successor for `failure`.
 pub(crate) fn rung_eligibility(wire: &DeploymentWire, failure: &Failure) -> RungEligibility {
-    let Some(tokens) = wire.failover_only_on.as_deref() else {
+    eligibility(wire.failover_only_on.as_deref(), failure)
+}
+
+/// Shared by the native selector and the physical dispatch contract check.
+pub(crate) fn eligibility(tokens: Option<&[String]>, failure: &Failure) -> RungEligibility {
+    let Some(tokens) = tokens else {
         return RungEligibility::Unrestricted;
     };
     let token = failure_token(failure);

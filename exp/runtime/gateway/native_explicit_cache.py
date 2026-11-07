@@ -85,6 +85,7 @@ class NativeCacheState:
 
     Attributes:
         bindings: Admitted cache plan at each route depth, absent when unsupported.
+        automatic: Whether the host owns optional automatic prefix selection.
         offers: Create offers owned by this request, indexed by operation identifier.
         prepared_attempts: Attempt IDs whose prepare callback already ran.
         observed_results: Immutable first observations, including unacknowledged writes.
@@ -96,6 +97,7 @@ class NativeCacheState:
     """
 
     bindings: tuple[NativeCacheBinding | None, ...]
+    automatic: bool = False
     offers: dict[str, tuple[str, CacheOffer, NativeCacheBinding]] = field(default_factory=dict)
     prepared_attempts: set[str] = field(default_factory=set)
     observed_results: dict[str, CacheResult] = field(default_factory=dict)
@@ -170,7 +172,7 @@ def bind_explicit_cache(
     if not any(binding is not None for binding in bindings):
         return None, public_request
     if automatic:
-        return NativeCacheState(tuple(bindings)), public_request
+        return NativeCacheState(tuple(bindings), automatic=True), public_request
     disclosures = public_request.ignored_parameters
     if all(binding is not None for binding in bindings):
         disclosures = tuple(

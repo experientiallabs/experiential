@@ -30,10 +30,11 @@ pub(crate) async fn dispatch_headers(
         "body": body,
     }));
     let text = bridge.call("sign_dispatch", argument).await?;
-    let signed: HashMap<String, String> = serde_json::from_str::<Value>(&text)
+    let signed: HashMap<String, String> = crate::lossless_json::from_str::<Value>(&text)
         .ok()
         .and_then(|value| {
-            serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null)).ok()
+            crate::lossless_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null))
+                .ok()
         })
         .ok_or_else(PublicError::internal)?;
     headers.extend(signed);

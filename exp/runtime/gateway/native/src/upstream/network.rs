@@ -258,6 +258,36 @@ pub(super) fn restrict_tenant(
 
 struct SystemResolver;
 
+/// Classifier connections use the same vetted DNS answers as provider egress,
+/// while retaining the dedicated classifier contract's HTTP/HTTPS schemes.
+pub(super) fn classifier_restrict(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .no_proxy()
+        .dns_resolver(Arc::new(PublicResolver(SystemResolver)))
+}
+
+pub(crate) fn classifier_url(raw: &str, public_only: bool) -> Result<reqwest::Url, ()> {
+    let url = reqwest::Url::parse(raw).map_err(|_| ())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(());
+    }
+    let host = url.host_str().ok_or(())?;
+    if public_only {
+        let literal = host.trim_start_matches('[').trim_end_matches(']');
+        if literal
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| !public_address(ip))
+        {
+            return Err(());
+        }
+    }
+    Ok(url)
+}
+
 impl Resolve for SystemResolver {
     fn resolve(&self, name: Name) -> Resolving {
         Box::pin(async move {

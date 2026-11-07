@@ -7,11 +7,17 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Protocol, runtime_checkable
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailCheck,
     GuardrailCompletion,
+)
+from exp.runtime.gateway.guardrails.native_owner import (
+    NativeInputClassifier,
+    NativeInputTemplate,
+    NativeOutputClassifier,
 )
 from exp.runtime.gateway.guardrails.streaming import (
     StreamableClassifier,
@@ -142,6 +148,32 @@ class DirectClassifierClient:
             registry: Mapping from adapter_id to a callable classifier.
         """
         self._registry = registry
+
+    def native_output_configuration(self, *, check: GuardrailCheck) -> JsonObject:
+        """Export only the adapter resolved by this client's admitted registry."""
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, NativeOutputClassifier):
+            message = "The configured output classifier has no native execution contract"
+            raise ValueError(message)
+        return adapter.native_output_configuration()
+
+    def native_input_configuration(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> JsonObject:
+        """Freeze input using the exact adapter selected by the admitted registry."""
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, NativeInputClassifier):
+            message = "The configured input classifier has no native execution contract"
+            raise ValueError(message)
+        return adapter.native_input_configuration(request=request, check=check)
+
+    def native_input_template(self, *, check: GuardrailCheck) -> JsonObject:
+        """Keep dynamic input checks on the adapter bound at admission."""
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, NativeInputTemplate):
+            message = "The configured input classifier has no native execution contract"
+            raise ValueError(message)
+        return adapter.native_input_template(check=check)
 
     async def inspect_input(
         self,

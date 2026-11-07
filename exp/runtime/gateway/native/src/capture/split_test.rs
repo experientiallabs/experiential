@@ -37,7 +37,7 @@ pub(crate) fn record(context: Value, response: Option<Response>) -> Record {
 
 /// Splice every reference back in, the way a destination does.
 pub(crate) fn reassemble(split: &SplitRecord) -> Value {
-    let mut skeleton: Value = serde_json::from_str(&split.skeleton).unwrap();
+    let mut skeleton: Value = crate::lossless_json::from_str(&split.skeleton).unwrap();
     resolve(&mut skeleton, split);
     skeleton
 }
@@ -52,10 +52,10 @@ fn resolve(value: &mut Value, split: &SplitRecord) {
         let part = &split.parts[index as usize];
         let text = std::fs::read_to_string(part.file.path()).unwrap();
         *value = match part.kind {
-            PartKind::Json => serde_json::from_str(&text).unwrap(),
+            PartKind::Json => crate::lossless_json::from_str(&text).unwrap(),
             PartKind::Frames => Value::Array(
                 text.lines()
-                    .map(|line| serde_json::from_str(line).unwrap())
+                    .map(|line| crate::lossless_json::from_str(line).unwrap())
                     .collect(),
             ),
         };
@@ -90,7 +90,8 @@ fn messages_and_long_strings_leave_the_skeleton_and_reassemble_exactly() {
     // The messages part is the exact JSON of the list; the tool text is its own part.
     assert_eq!(split.parts[0].kind, PartKind::Json);
     let messages: Value =
-        serde_json::from_slice(&std::fs::read(split.parts[0].file.path()).unwrap()).unwrap();
+        crate::lossless_json::from_slice(&std::fs::read(split.parts[0].file.path()).unwrap())
+            .unwrap();
     assert_eq!(messages, original.request.context["request"]["messages"]);
     let expected = serde_json::to_value(&original).unwrap();
     assert_eq!(reassemble(&split), expected);
@@ -148,7 +149,7 @@ fn a_spilled_json_body_keeps_its_structure_with_long_strings_as_parts() {
     );
     let split = split(&original, &store, 64 * 1024).unwrap();
     // The destination annotates usage on the skeleton: it is still there.
-    let skeleton: Value = serde_json::from_str(&split.skeleton).unwrap();
+    let skeleton: Value = crate::lossless_json::from_str(&split.skeleton).unwrap();
     assert_eq!(skeleton["response"]["body"]["usage"]["total_tokens"], 5);
     assert_eq!(reassemble(&split)["response"]["body"], body);
 }

@@ -1,5 +1,6 @@
 //! Shared content capture, independent of destination and hosted tenancy policy.
 
+pub(crate) mod admission;
 mod bounds;
 pub(crate) mod budget;
 pub(crate) mod collector;

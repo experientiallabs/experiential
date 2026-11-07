@@ -11,9 +11,8 @@
 //! * RE2 word boundaries (`\b`, `\B`) are ASCII only, while the Rust crate
 //!   reads them as Unicode boundaries.
 //!
-//! A pattern this module cannot translate with certainty is rejected. A
-//! rejected pattern keeps running through the python adapter, so behavior is
-//! preserved and only the native fast path is declined.
+//! Byte atoms are emitted for the byte matcher. The UTF-8 detector rejects
+//! those atoms unless the caller uses the byte matcher explicitly.
 
 /// ASCII expansion of one RE2 perl class, outside and inside a class.
 struct PerlClass {
@@ -29,27 +28,27 @@ fn perl_class(letter: char) -> Option<PerlClass> {
     match letter {
         'd' => Some(PerlClass {
             outer: "[0-9]",
-            inner: Some("0-9"),
+            inner: Some("[0-9]"),
         }),
         'D' => Some(PerlClass {
             outer: "[^0-9]",
-            inner: None,
+            inner: Some("[^0-9]"),
         }),
         'w' => Some(PerlClass {
             outer: "[0-9A-Za-z_]",
-            inner: Some("0-9A-Za-z_"),
+            inner: Some("[0-9A-Za-z_]"),
         }),
         'W' => Some(PerlClass {
             outer: "[^0-9A-Za-z_]",
-            inner: None,
+            inner: Some("[^0-9A-Za-z_]"),
         }),
         's' => Some(PerlClass {
             outer: "[\\t\\n\\x0C\\r ]",
-            inner: Some("\\t\\n\\x0C\\r "),
+            inner: Some("[\\t\\n\\x0C\\r ]"),
         }),
         'S' => Some(PerlClass {
             outer: "[^\\t\\n\\x0C\\r ]",
-            inner: None,
+            inner: Some("[^\\t\\n\\x0C\\r ]"),
         }),
         _ => None,
     }
@@ -60,7 +59,12 @@ fn perl_class(letter: char) -> Option<PerlClass> {
 /// Returns the translated expression, or an error naming the untranslatable
 /// construct. An error is not an authoring failure: the caller declines the
 /// native fast path and keeps the python adapter for that rule.
-pub fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
+#[cfg(test)]
+fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
+    with_flags(pattern, false)
+}
+
+pub(crate) fn with_flags(pattern: &str, insensitive: bool) -> Result<String, &'static str> {
     let mut out = String::with_capacity(pattern.len() + 16);
     let mut chars = pattern.chars().peekable();
     let mut in_class = false;
@@ -74,10 +78,56 @@ pub fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
         match current {
             '\\' => {
                 let escaped = chars.next().ok_or("trailing escape")?;
-                if escaped.is_ascii_digit() && escaped != '0' {
-                    return Err("backreferences are not supported");
-                }
-                if let Some(expansion) = perl_class(escaped) {
+                if ('0'..='7').contains(&escaped) {
+                    let mut octal = String::from(escaped);
+                    while octal.len() < 3 && chars.peek().is_some_and(|c| ('0'..='7').contains(c)) {
+                        octal.push(chars.next().unwrap());
+                    }
+                    if octal.len() == 1 && escaped != '0' {
+                        return Err("backreferences are not supported");
+                    }
+                    let value =
+                        u32::from_str_radix(&octal, 8).map_err(|_| "invalid octal escape")?;
+                    out.push_str(&format!("\\x{{{value:x}}}"));
+                } else if escaped.is_ascii_digit() {
+                    return Err("invalid octal escape");
+                } else if escaped == 'Q' && !in_class {
+                    let mut literal = String::new();
+                    while let Some(next) = chars.next() {
+                        if next == '\\' && chars.peek() == Some(&'E') {
+                            chars.next();
+                            break;
+                        }
+                        literal.push(next);
+                    }
+                    out.push_str(&regex::escape(&literal));
+                } else if escaped == 'C' && !in_class {
+                    out.push_str("(?s-u:.)");
+                } else if escaped == 'p' || escaped == 'P' {
+                    let first = chars.next().ok_or("missing Unicode property")?;
+                    let mut name = String::new();
+                    if first == '{' {
+                        loop {
+                            let next = chars.next().ok_or("unterminated Unicode property")?;
+                            if next == '}' {
+                                break;
+                            }
+                            name.push(next);
+                        }
+                    } else {
+                        name.push(first);
+                    }
+                    let negate = (escaped == 'P') ^ name.starts_with('^');
+                    let name = name.strip_prefix('^').unwrap_or(&name);
+                    let class = unicode_class(name).ok_or("unknown RE2 Unicode property")?;
+                    if negate {
+                        out.push_str("[^");
+                        out.push_str(class);
+                        out.push(']');
+                    } else {
+                        out.push_str(class);
+                    }
+                } else if let Some(expansion) = perl_class(escaped) {
                     if in_class {
                         let inner = expansion.inner.ok_or("negated perl class inside a class")?;
                         out.push_str(inner);
@@ -94,6 +144,11 @@ pub fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
                         "(?-u:\\B)"
                     });
                 } else {
+                    if escaped.is_ascii_alphanumeric()
+                        && !matches!(escaped, 'a' | 'f' | 't' | 'n' | 'r' | 'v' | 'x' | 'A' | 'z')
+                    {
+                        return Err("invalid RE2 escape");
+                    }
                     out.push('\\');
                     out.push(escaped);
                 }
@@ -138,8 +193,50 @@ pub fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
                 out.push('\\');
                 out.push(current);
             }
-            '-' if in_class && chars.peek() == Some(&'-') => {
-                return Err("ambiguous class subtraction syntax");
+            '-' if in_class => {
+                let leading = class_len == 1
+                    || (class_len == 2 && out.as_bytes().get(class_start + 1) == Some(&b'^'));
+                if leading || chars.peek() == Some(&']') {
+                    out.push_str(r"\-");
+                } else {
+                    if chars.peek() == Some(&'-') && !out.ends_with(r"\-") {
+                        return Err("invalid RE2 character range");
+                    }
+                    out.push('-');
+                }
+            }
+            '(' if !in_class && chars.peek() == Some(&'?') => {
+                let mut suffix = chars.clone();
+                suffix.next();
+                // RE2 flags are exactly i,m,s,U. Rust additionally accepts
+                // x,u,R and their negations, which must not widen the language.
+                if !matches!(suffix.peek(), Some(':' | '<' | 'P')) {
+                    for flag in suffix {
+                        if flag == ':' || flag == ')' {
+                            break;
+                        }
+                        if !matches!(flag, 'i' | 'm' | 's' | 'U' | '-') {
+                            return Err("invalid RE2 flag");
+                        }
+                    }
+                }
+                out.push('(');
+            }
+            '{' if !in_class => {
+                let suffix: String = chars
+                    .clone()
+                    .take_while(|c| c.is_ascii_digit() || *c == ',')
+                    .collect();
+                let following = chars.clone().nth(suffix.len());
+                let valid = !suffix.is_empty()
+                    && !suffix.starts_with(',')
+                    && following == Some('}')
+                    && suffix.matches(',').count() <= 1
+                    && !suffix.split(',').any(|n| n.len() > 1 && n.starts_with('0'));
+                if !valid {
+                    out.push('\\');
+                }
+                out.push('{');
             }
             ']' if in_class => {
                 // A `]` in the first content position is a literal member in
@@ -159,7 +256,66 @@ pub fn to_rust_syntax(pattern: &str) -> Result<String, &'static str> {
     if in_class {
         return Err("unterminated character class");
     }
-    Ok(out)
+    let mut ast = regex_syntax::ast::parse::Parser::new()
+        .parse(&out)
+        .map_err(|_| "invalid regular expression")?;
+    repetition_size(&ast)?;
+    if super::folding::apply(&mut ast, insensitive)? {
+        Ok(ast.to_string())
+    } else {
+        Ok(out)
+    }
+}
+
+fn unicode_class(name: &str) -> Option<&'static str> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static GROUPS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    GROUPS
+        .get_or_init(|| {
+            crate::lossless_json::from_str(include_str!("../generated/re2_groups.json")).unwrap()
+        })
+        .get(name)
+        .map(String::as_str)
+}
+
+/// RE2 caps counted repeats, including the product of nested counted repeats.
+fn repetition_size(ast: &regex_syntax::ast::Ast) -> Result<u32, &'static str> {
+    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
+    let size = match ast {
+        Ast::Repetition(r) => {
+            let inner = repetition_size(&r.ast)?;
+            let count = match r.op.kind {
+                RepetitionKind::Range(
+                    RepetitionRange::Exactly(n) | RepetitionRange::AtLeast(n),
+                ) => n,
+                RepetitionKind::Range(RepetitionRange::Bounded(_, n)) => n,
+                _ => 1,
+            };
+            inner.saturating_mul(count.max(1))
+        }
+        Ast::Group(g) => repetition_size(&g.ast)?,
+        Ast::Concat(c) => c
+            .asts
+            .iter()
+            .map(repetition_size)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(1),
+        Ast::Alternation(a) => a
+            .asts
+            .iter()
+            .map(repetition_size)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(1),
+        _ => 1,
+    };
+    (size <= 1000)
+        .then_some(size)
+        .ok_or("RE2 repetition limit exceeded")
 }
 
 #[cfg(test)]
@@ -184,8 +340,8 @@ mod tests {
 
     #[test]
     fn perl_classes_inside_a_class_expand_to_members() {
-        assert_eq!(to_rust_syntax(r"[\d-]").unwrap(), "[0-9-]");
-        assert_eq!(to_rust_syntax(r"[a\w]").unwrap(), "[a0-9A-Za-z_]");
+        assert_eq!(to_rust_syntax(r"[\d-]").unwrap(), r"[[0-9]\-]");
+        assert_eq!(to_rust_syntax(r"[a\w]").unwrap(), "[a[0-9A-Za-z_]]");
     }
 
     #[test]
@@ -203,8 +359,16 @@ mod tests {
     #[test]
     fn untranslatable_constructs_are_declined() {
         assert!(to_rust_syntax(r"(a)\1").is_err());
-        assert!(to_rust_syntax(r"[\D]").is_err());
+        assert_eq!(to_rust_syntax(r"[\D]").unwrap(), "[[^0-9]]");
         assert!(to_rust_syntax(r"[abc").is_err());
+    }
+
+    #[test]
+    fn re2_octal_and_quoted_literals_keep_their_meaning() {
+        let pattern = to_rust_syntax(r"\123\12\0\Q[a].\E").unwrap();
+        assert!(regex::Regex::new(&pattern).unwrap().is_match("S\n\0[a]."));
+        let bytes = regex::bytes::Regex::new(&to_rust_syntax(r"\C\C").unwrap()).unwrap();
+        assert!(bytes.is_match("é".as_bytes()));
     }
 
     #[test]

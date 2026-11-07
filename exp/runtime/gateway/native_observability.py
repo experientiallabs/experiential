@@ -29,8 +29,8 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
-from exp.runtime.gateway.native_accounting_recovery import recovery_drained
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_handoff import accounting_drained
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
@@ -273,7 +273,7 @@ class NativeObservabilityMixin:
         Durable open video jobs still need this instance's poller. Explicit
         process close may preserve them for restart instead of waiting for renders.
         """
-        return recovery_drained(self._accounting) and (self._videos is None or self._videos.idle)
+        return accounting_drained(self._accounting) and (self._videos is None or self._videos.idle)
 
     def recover_accounting(self) -> None:
         """Run one bounded recovery pass when the host explicitly owns its scheduling.

@@ -86,6 +86,7 @@ pub struct ToolSearchRound {
     /// them; the Responses `tool_search_output.tools` array prefers these
     /// over names alone.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub matched_tools: Vec<Value>,
     /// The caller's own declaration name (a versioned Anthropic type keeps
     /// its version), rendered as the Messages `server_tool_use.name`.

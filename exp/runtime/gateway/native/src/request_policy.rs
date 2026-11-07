@@ -12,6 +12,7 @@ pub enum Backoff {
     Exponential {
         base_delay_ms: u64,
         max_delay_ms: u64,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         multiplier: f64,
     },
 }

@@ -9,9 +9,11 @@
 //! This module never logs request text, completions, or replacements.
 
 pub mod detector;
+mod folding;
 pub(crate) mod input;
+mod matcher;
 pub mod plan;
-mod syntax;
+pub(crate) mod syntax;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -490,7 +492,7 @@ impl StreamRedactor {
             .await
             .map_err(|_| closed_failure())?;
         let decision: SegmentDecision =
-            serde_json::from_str(&payload).map_err(|_| closed_failure())?;
+            crate::lossless_json::from_str(&payload).map_err(|_| closed_failure())?;
         if decision.action != "allow" {
             return Err(decision.failure.clone().unwrap_or_else(closed_failure));
         }
@@ -521,7 +523,8 @@ pub async fn enforce_collected_output(
         .call("enforce_output", argument)
         .await
         .map_err(|_| closed_failure())?;
-    let decision: OutputDecision = serde_json::from_str(&payload).map_err(|_| closed_failure())?;
+    let decision: OutputDecision =
+        crate::lossless_json::from_str(&payload).map_err(|_| closed_failure())?;
     match decision.action.as_str() {
         "allow" => Ok(events),
         "modify" => {
@@ -572,7 +575,8 @@ mod tests {
             },
             Event::Completed,
         ];
-        let payload: Value = serde_json::from_str(&output_argument("req-1", &events)).unwrap();
+        let payload: Value =
+            crate::lossless_json::from_str(&output_argument("req-1", &events)).unwrap();
         assert_eq!(payload["request_id"], "req-1");
         assert_eq!(payload["text"], "hello");
         assert_eq!(payload["refusal"], false);

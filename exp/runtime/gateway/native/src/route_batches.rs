@@ -40,7 +40,7 @@ async fn plane_call(state: &AppState, method: &'static str, payload: Value) -> R
 
 /// Map one rendered `{status, body}` envelope string onto an HTTP response.
 fn envelope_response(rendered: &str) -> Response {
-    let parsed: Value = match serde_json::from_str(rendered) {
+    let parsed: Value = match crate::lossless_json::from_str(rendered) {
         Ok(parsed) => parsed,
         Err(_) => return error_response(&PublicError::internal()),
     };
@@ -124,7 +124,7 @@ pub(crate) async fn batches_create(
         Ok(raw) => raw,
         Err(error) => return error_response(&error),
     };
-    let parsed: Value = match serde_json::from_slice(&raw) {
+    let parsed: Value = match crate::lossless_json::from_slice(&raw) {
         Ok(Value::Object(fields)) => Value::Object(fields),
         _ => {
             return error_response(&PublicError::new(
@@ -329,7 +329,7 @@ pub(crate) async fn files_content(
         Ok(rendered) => rendered,
         Err(error) => return error_response(&error),
     };
-    let parsed: Value = match serde_json::from_str(&rendered) {
+    let parsed: Value = match crate::lossless_json::from_str(&rendered) {
         Ok(parsed) => parsed,
         Err(_) => return error_response(&PublicError::internal()),
     };

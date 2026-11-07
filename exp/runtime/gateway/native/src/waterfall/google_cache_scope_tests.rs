@@ -233,7 +233,7 @@ async fn automatic_studio_preflight_counts_a_generate_content_request() {
         let requests = task.await.unwrap();
         assert!(requests[0].starts_with("POST /v1beta/models/gemini-test:countTokens "));
         let body: Value =
-            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            crate::lossless_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         // The Developer API refuses a top-level system instruction on countTokens.
         assert_eq!(
             body,
@@ -279,7 +279,8 @@ async fn automatic_studio_preflight_counts_a_system_only_prefix_with_a_minimal_t
     assert!(result.is_none());
     assert_eq!(host.calls()[1].1["outcome"], "not_created");
     let requests = task.await.unwrap();
-    let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let body: Value =
+        crate::lossless_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(
         body,
         json!({"generateContentRequest": {

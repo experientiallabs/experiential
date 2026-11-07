@@ -80,7 +80,7 @@ fn assert_encoded(events: &[Event], name: &str, custom: bool, expected: &str) {
         .iter()
         .flat_map(|frame| frame.lines())
         .filter_map(|line| line.strip_prefix("data: "))
-        .map(|data| serde_json::from_str(data).unwrap())
+        .map(|data| crate::lossless_json::from_str(data).unwrap())
         .collect();
     let item_type = if custom {
         "custom_tool_call"

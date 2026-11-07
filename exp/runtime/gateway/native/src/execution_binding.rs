@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use crate::capture::{collector::Collector, python::CaptureCollector};
 use crate::errors::PublicError;
 use crate::guardrails::plan::DetectorMap;
+use crate::native_callbacks::{NativeCallbacks, NativeTarget};
 
 // Zero belongs to individual process execution; handle identities are never reused.
 static NEXT_REPLAY_NAMESPACE: Mutex<u64> = Mutex::new(1);
@@ -19,6 +20,7 @@ static NEXT_REPLAY_NAMESPACE: Mutex<u64> = Mutex::new(1);
 /// Resources shared only by requests the host explicitly assigns to this handle.
 pub(crate) struct ExecutionResources {
     pub(crate) target: Py<PyAny>,
+    pub(crate) native: Option<Arc<NativeTarget>>,
     pub(crate) active: Arc<Semaphore>,
     pub(crate) serving: Arc<Semaphore>,
     pub(crate) settlement: Arc<Semaphore>,
@@ -37,7 +39,8 @@ pub struct ExecutionHandle {
 #[pymethods]
 impl ExecutionHandle {
     #[new]
-    #[pyo3(signature = (control_plane, *, max_active_requests, callback_permits, settlement_permits, guardrail_detectors, capture))]
+    #[pyo3(signature = (control_plane, *, max_active_requests, callback_permits, settlement_permits, guardrail_detectors, capture, native_callbacks=None))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         control_plane: Py<PyAny>,
         max_active_requests: usize,
@@ -45,6 +48,7 @@ impl ExecutionHandle {
         settlement_permits: usize,
         guardrail_detectors: &Bound<'_, PyDict>,
         capture: Option<&CaptureCollector>,
+        native_callbacks: Option<&NativeCallbacks>,
     ) -> PyResult<Self> {
         if !(1..=65_536).contains(&max_active_requests)
             || !(1..=256).contains(&callback_permits)
@@ -67,6 +71,7 @@ impl ExecutionHandle {
         Ok(Self {
             inner: Arc::new(ExecutionResources {
                 target: control_plane,
+                native: native_callbacks.map(|callbacks| callbacks.inner.clone()),
                 active: Arc::new(Semaphore::new(max_active_requests)),
                 serving: Arc::new(Semaphore::new(callback_permits)),
                 settlement: Arc::new(Semaphore::new(settlement_permits)),
@@ -177,14 +182,24 @@ pub(crate) mod tests {
 
     fn handle() -> ExecutionHandle {
         Python::initialize();
-        Python::attach(|py| ExecutionHandle::new(py.None(), 128, 32, 8, &PyDict::new(py), None))
-            .unwrap()
+        Python::attach(|py| {
+            ExecutionHandle::new(py.None(), 128, 32, 8, &PyDict::new(py), None, None)
+        })
+        .unwrap()
     }
 
     pub(crate) fn lease(active: usize, serving: usize, cleanup: usize) -> Arc<ExecutionLease> {
         Python::initialize();
         let handle = Python::attach(|py| {
-            ExecutionHandle::new(py.None(), active, serving, cleanup, &PyDict::new(py), None)
+            ExecutionHandle::new(
+                py.None(),
+                active,
+                serving,
+                cleanup,
+                &PyDict::new(py),
+                None,
+                None,
+            )
         })
         .unwrap();
         ExecutionLease::new(handle.inner)

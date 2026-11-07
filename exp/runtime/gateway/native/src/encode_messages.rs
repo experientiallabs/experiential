@@ -610,7 +610,7 @@ impl MessagesSseEncoder {
             ));
         }
         self.retain_buffered()?;
-        if serde_json::from_str::<Value>(citation).is_err() {
+        if crate::lossless_json::from_str::<Value>(citation).is_err() {
             return Err(invalid_provider_stream(
                 "Messages citation was not valid JSON.",
             ));
@@ -694,7 +694,7 @@ impl MessagesSseEncoder {
             ));
         }
         self.retain_buffered()?;
-        if serde_json::from_str::<Value>(block).is_err() {
+        if crate::lossless_json::from_str::<Value>(block).is_err() {
             return Err(invalid_provider_stream(
                 "Messages server tool result was not valid JSON.",
             ));
@@ -857,7 +857,7 @@ impl MessagesSseEncoder {
                     let raw = block.server_result_block.take().unwrap_or_default();
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(raw.len());
                     retention::release_buffered(&mut self.retained, self.buffered_bytes);
-                    serde_json::from_str(&raw)
+                    crate::lossless_json::from_str(&raw)
                         .expect("scheduled server result was validated as JSON")
                 }
             };
@@ -883,8 +883,8 @@ impl MessagesSseEncoder {
         for citation in block.pending_citations.drain(..) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(citation.len());
             retention::release_buffered(&mut self.retained, self.buffered_bytes);
-            let parsed: Value =
-                serde_json::from_str(&citation).expect("retained citation was validated as JSON");
+            let parsed: Value = crate::lossless_json::from_str(&citation)
+                .expect("retained citation was validated as JSON");
             frames.push(event_frame(
                 "content_block_delta",
                 &json!({

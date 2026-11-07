@@ -36,6 +36,7 @@ pub(crate) struct Request {
     pub scope: Scope,
     pub protocol: Protocol,
     pub model_id: Option<String>,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub context: Arc<Value>,
 }
 
@@ -75,12 +76,14 @@ impl Request {
 pub(crate) enum Response {
     Json {
         status: u16,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         body: Value,
         /// Exact JSON when text or numeric values need a queryable projection.
         source_json: Option<String>,
     },
     Sse {
         status: u16,
+        #[serde(deserialize_with = "crate::lossless_json::deserialize")]
         frames: Vec<Value>,
         truncated: bool,
         client_disconnected: bool,
@@ -144,6 +147,7 @@ pub(crate) struct Record<R = Response> {
     pub response: Option<R>,
     /// Caller-facing headers, timing and optional redacted wire request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub transport: Option<Value>,
     /// Provider-returned plaintext from an explicitly exposure-enabled winning rung.
     pub provider_reasoning: Option<String>,
@@ -153,8 +157,10 @@ pub(crate) struct Record<R = Response> {
     pub deployment_id: Option<String>,
     pub metrics: Option<super::metrics::Metrics>,
     /// Provider parts in order; `thought: true` text is a summary, never full CoT.
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub gemini_thought_parts: Vec<Arc<Value>>,
     pub gemini_thought_parts_source_json: Option<String>,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub captured_at: f64,
     /// Gateway-requested token probabilities of the winning attempt, present
     /// only when the dial injected them (see `super::logprobs`).

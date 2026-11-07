@@ -335,6 +335,7 @@ pub struct Failure {
     /// hoists them into the payload's `rate_limit_headers` map; they never
     /// reach the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub rate_limit_headers: Option<Box<serde_json::Map<String, serde_json::Value>>>,
     /// The provider refused a replayed reasoning item's `encrypted_content`
     /// (OpenAI `invalid_encrypted_content`: a payload sealed by another
@@ -787,7 +788,7 @@ mod tests {
             assert!(!body.to_string().contains("raw provider prose"));
             // The enum round-trips through its snake_case wire name.
             let back: RefusalReason =
-                serde_json::from_value(serde_json::Value::String(wire.to_string()))
+                crate::lossless_json::from_value(serde_json::Value::String(wire.to_string()))
                     .expect("round trip");
             assert_eq!(back, reason);
         }
@@ -803,7 +804,7 @@ mod tests {
             .get("refusal_reason")
             .is_none());
         // A boundary payload without the field still deserializes.
-        let legacy: PublicError = serde_json::from_value(serde_json::json!({
+        let legacy: PublicError = crate::lossless_json::from_value(serde_json::json!({
             "status_code": 400, "code": "refusal", "message": "m"
         }))
         .expect("field is optional");
@@ -889,7 +890,7 @@ mod tests {
             FailureClass::Unavailable,
         ] {
             let wire = serde_json::to_value(class).expect("serializable");
-            let back: FailureClass = serde_json::from_value(wire).expect("round trip");
+            let back: FailureClass = crate::lossless_json::from_value(wire).expect("round trip");
             assert_eq!(back.as_str(), class.as_str());
         }
     }
