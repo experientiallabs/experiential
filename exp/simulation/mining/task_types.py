@@ -281,7 +281,7 @@ def split_family(
 
     Args:
         family: The family to split.
-        matrices: Task-view, authored and outcome matrices over distinct views; only the
+        matrices: Task-view, authored and outcome matrices with distinct columns; only the
             family's members are clustered.
         namer: Injected naming model.
         questions: Column or question identity mapped to its proposition text.

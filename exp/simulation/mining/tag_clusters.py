@@ -248,7 +248,9 @@ def tag_space(
     """Join matrices by trace into one probability matrix.
 
     Args:
-        matrices: Matrices over distinct views; each column is prefixed with its view.
+        matrices: Matrices whose ``<view>:<question_id>`` columns are distinct. Two banks may
+            cover the same view (the fixed task bank and a family's authored task bank) as
+            long as their question identities differ.
         trace_ids: Keep only these traces; every trace of any matrix when None.
 
     Returns:
@@ -256,20 +258,21 @@ def tag_space(
         the ``(traces, columns)`` matrix.
 
     Raises:
-        ValueError: No matrix is given, two share a view, or no trace is in every matrix.
+        ValueError: No matrix is given, two matrices repeat a column, or no trace is in every
+            matrix.
     """
     if not matrices:
         raise ValueError("the tag space needs at least one matrix")
-    views = [matrix.view for matrix in matrices]
-    if len(set(views)) != len(views):
-        raise ValueError(f"tag space matrices must cover distinct views, got {views}")
+    columns = tuple(f"{m.view}:{q}" for m in matrices for q in m.question_ids)
+    if len(set(columns)) != len(columns):
+        repeated = sorted({c for c in columns if columns.count(c) > 1})
+        raise ValueError(f"tag space matrices repeat columns {repeated[:5]}")
     rows = [{row.trace_id: row.values for row in matrix.rows} for matrix in matrices]
     wanted = set(trace_ids) if trace_ids is not None else {t for r in rows for t in r}
     kept = tuple(sorted(t for t in wanted if all(t in r for r in rows)))
     dropped = tuple(sorted(wanted - set(kept)))
     if not kept:
         raise ValueError("no trace is tagged in every joined matrix; nothing can be clustered")
-    columns = tuple(f"{m.view}:{q}" for m in matrices for q in m.question_ids)
     values = np.array([[v for r in rows for v in r[t]] for t in kept], dtype=np.float64)
     return kept, dropped, columns, values
 

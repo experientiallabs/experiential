@@ -110,8 +110,13 @@ def test_tag_space_joins_views_and_drops_partially_tagged_traces() -> None:
     traces, dropped, columns, values = tag_space([task, errors])
     assert dropped == ("g0-00",) and "g0-00" not in traces
     assert columns[0] == "task:q0" and columns[12] == "errors:q0" and values.shape == (8, 24)
-    with pytest.raises(ValueError, match="distinct views"):
+    with pytest.raises(ValueError, match="repeat columns"):
         tag_space([task, task])
+    authored = task.model_copy(
+        update={"bank_id": "authored", "question_ids": tuple(f"a{q}" for q in task.question_ids)}
+    )
+    _, _, joined, both = tag_space([task, authored])
+    assert joined[0] == "task:q0" and joined[12] == "task:aq0" and both.shape == (9, 24)
     only, _, _, _ = tag_space([task], trace_ids={"g1-00", "g2-02"})
     assert only == ("g1-00", "g2-02")
 
