@@ -56,3 +56,31 @@ def test_review_and_reconcile_isolate_changed_reviewer_snapshots(field: str) -> 
         assert reconcile(reviewer, traces, (reviewed,), spec=spec, scope="one-group") == reconciled
         assert len(script.requests) == calls
     assert len(script.requests) == 6
+
+
+def test_a_large_group_is_shown_as_tool_set_buckets_and_split_by_bucket() -> None:
+    """Over max_listed_members, members are bucketed by declared tools; splits name buckets."""
+    from exp.simulation.mining.environment_families_test import file_trace
+    from exp.simulation.mining.environment_review import group_packet, validate_review
+
+    traces = [order_trace(f"o{i:02d}") for i in range(6)] + [file_trace(f"f{i:02d}") for i in range(3)]
+    packet, shown, buckets = group_packet(traces, max_listed=4)
+    assert "members" not in packet
+    assert [row["members"] for row in packet["member_buckets"]] == [6, 3]
+    assert buckets == {"b00": tuple(f"o{i:02d}" for i in range(6)), "b01": ("f00", "f01", "f02")}
+    assert group_packet(traces, max_listed=None)[2] == {}
+    members = sorted(t.trace_id for t in traces)
+    split = {
+        "verdict": "split",
+        "rationale": "chat has no tools; edit has a file surface",
+        "subgroups": [
+            {"members": ["b00"], "rationale": "no tools", "evidence": [sorted(shown)[0]]},
+            {"members": ["b01"], "rationale": "file edits", "evidence": [sorted(shown)[0]]},
+        ],
+        "evidence": [sorted(shown)[0]],
+    }
+    answer = validate_review(split, members, shown, buckets=buckets)
+    assert [row.members for row in answer.subgroups] == [buckets["b00"], buckets["b01"]]
+    split["subgroups"][1]["members"] = ["b00"]
+    with pytest.raises(ValueError, match="every bucket id exactly once"):
+        validate_review(split, members, shown, buckets=buckets)

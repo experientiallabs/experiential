@@ -17,6 +17,12 @@ contract notes and cited trace locators. A reconcile draw then reads every usabl
 writes the group's verdict; when it departs from a review's verdict it must say why for that
 variant. Code checks only structure: every cited locator was shown to that draw, sub-groups
 partition the group, an uncertain verdict names a question, a reconcile addresses each dissent.
+
+A group larger than ``max_listed_members`` is shown as member buckets instead of a member list:
+every member declaring exactly the same tool set shares a bucket, shown with its count, the tools
+its members called and a few example members. A split then names bucket ids, which code expands
+to their members, so a review's input and answer stay bounded however large the group is. A
+bucket is never divided: members with one declared tool surface share a simulator surface.
 A draft that fails is shown its problems and may be revised within ``repairs``.
 
 The reviewer is injected (:class:`CompatibilityReviewer`); it buys or replays each draw under the
@@ -47,7 +53,7 @@ from exp.simulation.mining.review_states import TransientReviewFailure, is_trans
 from exp.simulation.rules.contracts import parse_tool_contracts, trace_locator, trajectory_view
 from exp.simulation.rules.model import ToolContract
 
-ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v2"
+ENVIRONMENT_REVIEW_PROTOCOL = "environment-review-v3"
 """Version of the review prompts, variants, tools, packet and checks; bump when any changes."""
 
 REVIEW_TOOL = "submit_review"
@@ -146,6 +152,8 @@ class CompatibilitySpec(ContractModel):
         max_depth: Split levels whose sub-groups are re-reviewed; deeper ones stay uncertain.
         min_reviews: Usable variant reviews a group needs before it is reconciled.
         trace_characters: Characters of one trace's steps a read returns.
+        max_listed_members: Largest group shown member by member; a larger group is shown as
+            buckets of members that declare the same tool set.
         maximum_output_tokens: Output allowance per call.
         temperature: Sampling temperature, or None for a model that pins its own.
     """
@@ -156,6 +164,7 @@ class CompatibilitySpec(ContractModel):
     max_depth: int = Field(default=2, ge=0, le=4)
     min_reviews: int = Field(default=2, ge=1, le=8)
     trace_characters: int = Field(default=6_000, ge=500, le=100_000)
+    max_listed_members: int = Field(default=60, ge=2, le=100_000)
     maximum_output_tokens: int = Field(default=2_000, ge=128, le=16_000)
     temperature: float | None = 0.0
 
@@ -292,29 +301,89 @@ def group_contracts(traces: Sequence[Trace]) -> dict[str, ToolContract]:
     return parse_tool_contracts(sorted(traces, key=lambda trace: trace.trace_id))
 
 
-def group_packet(traces: Sequence[Trace]) -> tuple[JsonObject, frozenset[str]]:
-    """Render the members and parsed contracts every draw starts from, and their locators."""
+BUCKET_EXAMPLES = 3
+"""Example members shown per bucket when a group is shown as buckets."""
+
+
+def group_packet(
+    traces: Sequence[Trace], max_listed: int | None = None
+) -> tuple[JsonObject, frozenset[str], dict[str, tuple[str, ...]]]:
+    """Render the members and parsed contracts every draw starts from, and their locators.
+
+    Args:
+        traces: The group's traces.
+        max_listed: Largest group listed member by member; None lists every group.
+
+    Returns:
+        The packet, the locators it shows, and the buckets (bucket id to sorted members), empty
+        when members are listed one by one.
+    """
     contracts = group_contracts(traces)
-    members: list[JsonValue] = []
-    for trace in sorted(traces, key=lambda item: item.trace_id):
-        own = parse_tool_contracts([trace])
-        members.append(
-            {
-                "trace_id": trace.trace_id,
-                "locator": trace_locator(trace.trace_id),
-                "task": trace.task[:600],
-                "declared_tools": sorted(tool.name for tool in trace.tools),
-                "called_tools": sorted(name for name, row in own.items() if row.calls),
-                "outcome": None if trace.outcome is None else trace.outcome.status,
-            }
-        )
+    ordered = sorted(traces, key=lambda item: item.trace_id)
     shown = {trace_locator(trace.trace_id) for trace in traces}
     shown |= {ref for row in contracts.values() for ref in row.examples}
+    tool_contracts = {name: row.model_dump(mode="json") for name, row in contracts.items()}
+    if max_listed is None or len(ordered) <= max_listed:
+        members: list[JsonValue] = []
+        for trace in ordered:
+            own = parse_tool_contracts([trace])
+            members.append(
+                {
+                    "trace_id": trace.trace_id,
+                    "locator": trace_locator(trace.trace_id),
+                    "task": trace.task[:600],
+                    "declared_tools": sorted(tool.name for tool in trace.tools),
+                    "called_tools": sorted(name for name, row in own.items() if row.calls),
+                    "outcome": None if trace.outcome is None else trace.outcome.status,
+                }
+            )
+        return {"members": members, "tool_contracts": tool_contracts}, frozenset(shown), {}
+    grouped: dict[tuple[str, ...], list[Trace]] = {}
+    for trace in ordered:
+        grouped.setdefault(tuple(sorted(tool.name for tool in trace.tools)), []).append(trace)
+    ranked = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
+    width = max(2, len(str(len(ranked) - 1)))
+    buckets: dict[str, tuple[str, ...]] = {}
+    rendered: list[JsonValue] = []
+    for position, (declared, rows) in enumerate(ranked):
+        bucket_id = f"b{position:0{width}d}"
+        buckets[bucket_id] = tuple(trace.trace_id for trace in rows)
+        called = sorted(
+            {name for trace in rows for name, row in parse_tool_contracts([trace]).items() if row.calls}
+        )
+        outcomes: dict[str, int] = {}
+        for trace in rows:
+            status = "unknown" if trace.outcome is None else str(trace.outcome.status)
+            outcomes[status] = outcomes.get(status, 0) + 1
+        rendered.append(
+            {
+                "bucket_id": bucket_id,
+                "members": len(rows),
+                "declared_tools": list(declared),
+                "called_tools": called,
+                "outcomes": dict(sorted(outcomes.items())),
+                "examples": [
+                    {
+                        "trace_id": trace.trace_id,
+                        "locator": trace_locator(trace.trace_id),
+                        "task": trace.task[:300],
+                    }
+                    for trace in rows[:BUCKET_EXAMPLES]
+                ],
+            }
+        )
     packet: JsonObject = {
-        "members": members,
-        "tool_contracts": {name: row.model_dump(mode="json") for name, row in contracts.items()},
+        "group_size": len(ordered),
+        "member_buckets": rendered,
+        "bucket_rule": (
+            "This group is too large to list member by member. Each bucket holds every member "
+            "that declares exactly its tool set. A split names bucket ids (for example b00) in "
+            "each sub-group's members, and every bucket must appear in exactly one sub-group; a "
+            "bucket cannot be divided. You may read any member by its trace_id."
+        ),
+        "tool_contracts": tool_contracts,
     }
-    return packet, frozenset(shown)
+    return packet, frozenset(shown), buckets
 
 
 def validate_review(
@@ -324,6 +393,7 @@ def validate_review(
     *,
     variants: Sequence[str] = (),
     dissenting: Mapping[str, Verdict] | None = None,
+    buckets: Mapping[str, Sequence[str]] | None = None,
 ) -> ReviewAnswer:
     """Check one answer's structure against what its draw was shown.
 
@@ -333,12 +403,37 @@ def validate_review(
         shown: Locators shown to the draw.
         variants: For a reconcile, the variants whose reviews it read; empty for a variant draw.
         dissenting: For a reconcile, each usable review's verdict by variant.
+        buckets: Bucket id to members when the group was shown as buckets; a split then names
+            buckets, and the returned answer's sub-groups hold the expanded members.
 
     Raises:
         ValueError: The answer is malformed, cites something unshown, or its verdict lacks its
             required structure.
     """
     answer = ReviewAnswer.model_validate(arguments)
+    if buckets and answer.verdict == "split":
+        named = [token for row in answer.subgroups for token in row.members]
+        unknown = sorted(set(named) - set(buckets))
+        if unknown or sorted(named) != sorted(buckets):
+            detail = f"; unknown {unknown[:8]}" if unknown else ""
+            raise ValueError(
+                "sub-groups must name every bucket id exactly once "
+                f"({len(buckets)} buckets: {sorted(buckets)[:8]}...){detail}"
+            )
+        answer = answer.model_copy(
+            update={
+                "subgroups": tuple(
+                    row.model_copy(
+                        update={
+                            "members": tuple(
+                                sorted(trace for token in row.members for trace in buckets[token])
+                            )
+                        }
+                    )
+                    for row in answer.subgroups
+                )
+            }
+        )
     problems: list[str] = []
     unshown = sorted(answer.locators() - shown)
     if unshown:
@@ -384,14 +479,16 @@ def review_variant(
         spec: Review registration.
         scope: Stable identity of the group under review, bound into every draw identity.
     """
-    packet, shown = group_packet(traces)
+    packet, shown, buckets = group_packet(traces, spec.max_listed_members)
     by_id = {trace.trace_id: trace for trace in traces}
     system = REVIEW_PROMPT + "\n\n" + REVIEW_VARIANTS[variant]
     messages = [
         ModelMessage(role="system", content=system),
         ModelMessage(role="user", content=json.dumps(packet, sort_keys=True)),
     ]
-    return _loop(reviewer, messages, sorted(by_id), shown, by_id, variant, spec, scope, {})
+    return _loop(
+        reviewer, messages, sorted(by_id), shown, by_id, variant, spec, scope, {}, buckets
+    )
 
 
 def reconcile(
@@ -403,15 +500,23 @@ def reconcile(
     scope: str,
 ) -> GroupReview:
     """Reconcile the usable variant reviews of one group into its verdict (forced answer)."""
-    packet, shown = group_packet(traces)
+    packet, shown, buckets = group_packet(traces, spec.max_listed_members)
     usable = [row for row in reviews if row.answer is not None]
     cited = {ref for row in usable if row.answer for ref in row.answer.locators()}
+    home = {trace: bucket for bucket, rows in buckets.items() for trace in rows}
+
+    def shown_answer(answer: ReviewAnswer) -> JsonObject:
+        """Render a review's answer, naming buckets again when the group was bucketed."""
+        dumped = answer.model_dump(mode="json")
+        if home:
+            for row in dumped["subgroups"]:
+                row["members"] = sorted({home[trace] for trace in row["members"]})
+        return dumped
+
     body = {
         **packet,
         "reviews": [
-            {"variant": row.variant, **row.answer.model_dump(mode="json")}
-            for row in usable
-            if row.answer
+            {"variant": row.variant, **shown_answer(row.answer)} for row in usable if row.answer
         ],
     }
     messages = [
@@ -422,7 +527,16 @@ def reconcile(
     members = sorted(trace.trace_id for trace in traces)
     one_shot = spec.model_copy(update={"max_turns": 1})
     return _loop(
-        reviewer, messages, members, shown | cited, {}, "reconcile", one_shot, scope, verdicts
+        reviewer,
+        messages,
+        members,
+        shown | cited,
+        {},
+        "reconcile",
+        one_shot,
+        scope,
+        verdicts,
+        buckets,
     )
 
 
@@ -436,6 +550,7 @@ def _loop(
     spec: CompatibilitySpec,
     scope: str,
     verdicts: Mapping[str, Verdict],
+    buckets: Mapping[str, Sequence[str]] | None = None,
 ) -> GroupReview:
     """Drive one draw: read with tools, answer, and repair a failed answer within bounds."""
     seen, identities = set(shown), []
@@ -500,6 +615,7 @@ def _loop(
                 frozenset(seen),
                 variants=tuple(verdicts),
                 dissenting=verdicts,
+                buckets=buckets,
             )
         except ValueError as error:
             failure = _reason(error)
