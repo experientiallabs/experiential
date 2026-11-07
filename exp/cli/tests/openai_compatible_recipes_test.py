@@ -123,6 +123,7 @@ def test_fireworks_recipe_reaches_gateway_readiness_without_a_provider_call(
         alias="coding",
         capability_flags=(
             "--supports-tools",
+            "--supports-streaming-tool-arguments",
             "--supports-structured-output",
             "--input-price",
             "900000",

@@ -142,6 +142,17 @@ _ATTACHMENT_CAPABILITY_MESSAGES = {
         "and the gateway will not silently weaken it to 'auto'. Send tool_choice 'auto' "
         "(the model may still call the tool) or choose a different model alias."
     ),
+    "function_tools": (
+        "The selected model route is not declared to support tools. Choose a different "
+        "model alias, or ask the gateway operator to re-author this alias with "
+        "--supports-tools if its model supports function calling."
+    ),
+    "streaming_tool_arguments": (
+        "The selected model route is not declared to stream tool-call arguments, which "
+        "the gateway needs to serve tools on it. Choose a different model alias, or ask "
+        "the gateway operator to re-author this alias with "
+        "--supports-streaming-tool-arguments if its endpoint streams tool-call arguments."
+    ),
 }
 """Why an attachment was refused, since the field itself is the caller's message.
 
