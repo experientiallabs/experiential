@@ -184,3 +184,27 @@ def test_task_types_replay_from_their_artifacts(tmp_path: Path) -> None:
     calls = len(client.requests)
     again, same = run()
     assert again == first and same == reference and len(client.requests) == calls
+
+
+def test_another_familys_authored_bank_is_left_out_of_a_familys_space() -> None:
+    """A matrix tagging none of the family's members does not empty its tag space."""
+    joined, truth = matrices()
+    other, _ = planted(view="task", seed=5)
+    elsewhere = other.model_copy(
+        update={
+            "question_ids": tuple(f"other.{q}" for q in other.question_ids),
+            "rows": tuple(
+                row.model_copy(update={"trace_id": f"other-{row.trace_id}"}) for row in other.rows
+            ),
+        }
+    )
+    members = tuple(sorted(truth))
+    row, clustering, _ = split_family(
+        family(members),
+        [*joined, elsewhere],
+        ClusterNamer(ScriptedNamer(name_reply), SNAPSHOT),
+        questions=QUESTIONS,
+        exemplar_texts={t: f"episode {t}" for t in members},
+    )
+    assert len(row.task_types) == 3
+    assert not any(column.startswith("task:other.") for column in clustering.columns)

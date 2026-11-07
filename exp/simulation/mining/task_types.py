@@ -288,13 +288,16 @@ def split_family(
         exemplar_texts: Rendered text of member traces, by trace, shown to the namer.
         spec: Registration; defaults apply when omitted.
 
+    Matrices that tag none of the family's members (another family's authored bank) are left
+    out of its space, so each family is split over the shared banks and its own authored bank.
+
     Raises:
-        ValueError: No member is tagged in every matrix.
+        ValueError: No member is tagged in every matrix the family is tagged in.
     """
     spec = spec or TaskTypeSpec()
-    clustering = cluster_tags(
-        matrices, family_clustering_spec(family, spec), trace_ids=family.members
-    )
+    members = set(family.members)
+    own = [m for m in matrices if any(row.trace_id in members for row in m.rows)]
+    clustering = cluster_tags(own, family_clustering_spec(family, spec), trace_ids=family.members)
     names = name_clusters(
         clustering, namer, questions=questions, exemplar_texts=exemplar_texts, spec=spec.naming
     )

@@ -362,11 +362,16 @@ def author_draw(
     return draw
 
 
+MIN_AUTHORED_MEMBERS = 2
+"""Fewest members a family needs before questions are authored for it."""
+
+
 class FamilyBanks(ContractModel):
     """The ``tag-banks`` slot's result.
 
     Attributes:
-        banks: Each family's authored, selected and published bank.
+        banks: Each family's authored, selected and published bank; a family with fewer than
+            :data:`MIN_AUTHORED_MEMBERS` members has none.
         matrices: Each family's member matrices per view, as saved tag matrices.
     """
 
@@ -467,6 +472,10 @@ class TagBankExecutor:
         inputs: list[ArtifactInput] = [scoping.families]
         for family in corpus.families:
             rendered = [build_units(corpus.traces[t], AUTHORED_VIEWS) for t in family.members]
+            if len(rendered) < MIN_AUTHORED_MEMBERS:
+                # A question must hold in some members and fail in others, so a family this
+                # small cannot be authored; it keeps its fixed-bank tags and gets one task type.
+                continue
             units = [unit for row in rendered for unit in row.values()]
             authored = corpus_tag_bank(
                 project.artifacts,
