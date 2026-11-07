@@ -13,6 +13,7 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256, sha256_json
+from exp.optimize.evaluation.variance.astra_role import refuse_astra_outside_its_roles
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
 from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapPreparationReport,
@@ -71,6 +72,9 @@ class FrontDoorSpec(ContractModel):
         preparation: Variance build, environment families, bootstrap roles and finite limits.
         pipeline: Pipeline settings applied to every registered start.
         slots: Settings of the slot stages to run, by slot; each needs a registered executor.
+        astra_alias: The one approved closed alias, for the build-time tag roles only (the
+            tag-bank and state-tag authors and the tag-monitor reviewer at checkpoints 1 to 5);
+            refused in every other role (:mod:`~.astra_role`). None keeps every role open-weight.
         protocol: Front-door protocol.
     """
 
@@ -78,6 +82,9 @@ class FrontDoorSpec(ContractModel):
     preparation: BootstrapPreparationSpec
     pipeline: PipelineTemplate
     slots: dict[SlotName, JsonObject] = Field(default_factory=dict)
+    astra_alias: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
     protocol: Literal["decision-variance-front-door-v1"] = FRONT_DOOR_PROTOCOL
 
     @model_validator(mode="after")
@@ -97,6 +104,7 @@ class FrontDoorSpec(ContractModel):
                 raise ValueError(
                     f"slot {name} runs inside each pipeline; set {PIPELINE_SETTINGS[name][1]}"
                 )
+        refuse_astra_outside_its_roles(self.model_dump(mode="json"), self.astra_alias)
         return self
 
     def pipeline_spec(

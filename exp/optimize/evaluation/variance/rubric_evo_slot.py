@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactInput,
@@ -45,7 +46,10 @@ from exp.optimize.evaluation.variance.rubric_evolution import (
     open_evolution,
     opening_costs,
 )
-from exp.optimize.evaluation.variance.tag_monitor_epoch import TagEpochMonitor
+from exp.optimize.evaluation.variance.tag_monitor_epoch import (
+    TagEpochMonitor,
+    refuse_closed_epoch_author,
+)
 from exp.optimize.evaluation.variance.tag_monitor_review import TagMonitorSettings, review_costs
 from exp.simulation.mining.tagging import TraceTagger
 
@@ -64,6 +68,12 @@ class RubricEvolutionSlot(ContractModel):
     exports: Path
     epochs: int = Field(ge=1, le=10_000)
     monitor: TagMonitorSettings | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def _open_weight_monitor(self) -> Self:
+        """Refuse a closed epoch-monitor author: the boundary runs at training time."""
+        refuse_closed_epoch_author(None if self.monitor is None else self.monitor.astra)
+        return self
 
 
 class EvolutionProgress(ContractModel):

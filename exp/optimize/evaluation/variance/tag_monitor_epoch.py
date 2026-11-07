@@ -88,6 +88,19 @@ def epoch_inputs(
     return inputs, sources
 
 
+def refuse_closed_epoch_author(astra: AstraSettings | None) -> None:
+    """Refuse Astra settings whose author is not open-weight at the epoch boundary.
+
+    Raises:
+        ValueError: The settings declare an ``astra_alias`` or name a closed author.
+    """
+    if astra is not None and (astra.astra_alias is not None or not astra.open_weight):
+        raise ValueError(
+            "the epoch monitor (checkpoint 6) runs at training time and needs an open-weight "
+            f"author, not {astra.author.model_alias}"
+        )
+
+
 @dataclass(frozen=True)
 class TagEpochMonitor:
     """The tag monitor bound to the epoch boundary.
@@ -103,6 +116,10 @@ class TagEpochMonitor:
     spec: MonitorSpec = field(default_factory=MonitorSpec)
     code_revision: str = "unknown"
     ledger: PhaseLedger | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse a closed author: checkpoint 6 runs at training time, open-weight only."""
+        refuse_closed_epoch_author(self.astra)
 
     @property
     def identity(self) -> str:

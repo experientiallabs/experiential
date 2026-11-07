@@ -86,20 +86,35 @@ class AstraSettings(ContractModel):
     """Astra's frozen review settings.
 
     Attributes:
-        author: The open-weight author alias and its allowance.
+        author: The author alias and its allowance: open-weight, or the declared Astra alias.
         profile: How each draw reads its evidence; one forced response by default.
         stances: Review stances, each one draw; their accepted answers are pooled.
+        astra_alias: The approved closed Astra alias these settings may name as author, for the
+            build-time checkpoints 1 to 5 only; None admits open-weight authors only. The front
+            door requires it to equal its own ``astra_alias``, and the epoch monitor
+            (checkpoint 6, training time) refuses settings that name one.
     """
 
     author: AuthorSettings
     profile: EvidenceToolProfile = EvidenceToolProfile()
     stances: tuple[str, ...] = Field(default=("statistics_first",), min_length=1)
+    astra_alias: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
+
+    @property
+    def open_weight(self) -> bool:
+        """Whether the author is an open-weight alias."""
+        return AUTHOR_ALIASES.fullmatch(self.author.model_alias) is not None
 
     @model_validator(mode="after")
     def _open_weight(self) -> AstraSettings:
-        """Require an open-weight author alias and known stances."""
-        if AUTHOR_ALIASES.fullmatch(self.author.model_alias) is None:
-            raise ValueError(f"Astra must be an open-weight author, not {self.author.model_alias}")
+        """Require an open-weight author alias, or the declared Astra alias, and known stances."""
+        if not self.open_weight and self.author.model_alias != self.astra_alias:
+            raise ValueError(
+                f"Astra must be an open-weight author or the declared astra_alias, not "
+                f"{self.author.model_alias}"
+            )
         if set(self.stances) - set(REVIEW_STANCES):
             raise ValueError(f"review stances must be members of {sorted(REVIEW_STANCES)}")
         return self

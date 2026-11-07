@@ -397,7 +397,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.tag_monitor_states",
             "exp.optimize.evaluation.variance.tag_monitor_epoch",
         ),
-        "5797204c1e12a85f8bc5c2c21f8d1a0b86dbd6e6dcaecd2deb9226ffa55fcb1a",
+        "cee84b2903dd594855ce003eb0d15aa1b4b81f63610e6a4d8698ea282e159c9e",
     ),
     Protocol(
         "exp.simulation.mining.tag_health:TAG_HEALTH_PROTOCOL",
