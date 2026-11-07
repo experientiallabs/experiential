@@ -596,7 +596,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.astra_prompt_loop",
             "exp.optimize.evaluation.variance.refined_prompts",
         ),
-        "925ee202d8397193038e2d85780527c1eb74e3dec10c3a8699c42c816296e470",
+        "e068d5fa0868157b7e3be7f10c3099665942981e98d7de81121aa1a982416546",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.variant_search:VARIANT_SEARCH_PROTOCOL",

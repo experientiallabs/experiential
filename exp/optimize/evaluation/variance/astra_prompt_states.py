@@ -112,3 +112,25 @@ DRAW_MACHINE = StateMachine(
     ),
 )
 """One draw: answered, or a transient or refused attempt retried on the next run."""
+
+
+class TargetState(StrEnum):
+    """One target's place in the batch refinement."""
+
+    AWAITING_INPUTS = "awaiting_inputs"
+    INPUTS_READY = "inputs_ready"
+    CANDIDATE = "candidate"
+
+
+TARGET_MACHINE = StateMachine(
+    name="astra_prompt_target",
+    states=TargetState,
+    initial=frozenset({TargetState.AWAITING_INPUTS, TargetState.INPUTS_READY}),
+    transitions=(
+        (TargetState.AWAITING_INPUTS, "inputs_found", TargetState.INPUTS_READY),
+        (TargetState.INPUTS_READY, "refined", TargetState.CANDIDATE),
+        (TargetState.CANDIDATE, "inputs_changed", TargetState.INPUTS_READY),
+    ),
+)
+"""A target waits for real inputs, is refined once they exist, and is refined again when they
+change; a draw that fails transiently leaves it ``inputs_ready`` for the next run."""

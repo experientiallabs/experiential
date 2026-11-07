@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 
 from exp.common.state_machine import IllegalTransition, TransitionJournal
+from exp.optimize.evaluation.variance.astra_prompt_batch import RefinementConfig
 from exp.optimize.evaluation.variance.astra_prompt_calibration import sample_role_inputs, split
-from exp.optimize.evaluation.variance.astra_prompt_cli import RefinementConfig, dry_run, main
+from exp.optimize.evaluation.variance.astra_prompt_cli import dry_run, main
 from exp.optimize.evaluation.variance.astra_prompt_contracts import (
     CalibrationExample,
     CalibrationSet,
@@ -46,6 +47,9 @@ OFFLINE = (
     "astra_prompt_costs",
     "astra_prompt_calibration",
     "astra_prompt_cli",
+    "astra_prompt_batch",
+    "astra_prompt_inputs",
+    "astra_prompt_attempts",
 )
 """Modules that can reach Astra; only the refinement's own modules and tests may import them."""
 
@@ -155,7 +159,7 @@ def test_the_dry_run_bounds_every_role_with_astra_dollars(
     assert bound.attempts == (148 + 120 + 40) * 3
     config = RefinementConfig(
         astra_alias="astra", runtime_alias="glm-5.3-flash", reviewer_alias="kimi-k3",
-        output_tokens=1024,
+        output_tokens=1024, deadline=refinement.astra.deadline,
     )  # fmt: skip
     bounds, lines = dry_run(project, config, only=("outcome-judge", "tag-epoch-monitor"))
     assert set(bounds) == {"outcome-judge", "tag-epoch-monitor"}

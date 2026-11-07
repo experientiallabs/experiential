@@ -11,6 +11,7 @@ usable calibration example for a target when:
   its tools, which is not an agentic phase tool (``record_plan``, ``submit_draft``,
   ``record_self_check``): a plan is not the role's answer, so those are not used;
 - its system prompt holds the target's code text exactly once;
+- it is not one of the refinement's own draws (``astra-prompt-...``);
 - neither its sources nor its user content name a final-evaluation (held-out build) trace: the
   traces every saved ``variance-exposure-plan`` assigns to ``final_evaluation``.
 
@@ -44,6 +45,9 @@ INTENT_TYPE = "author-intent"
 
 EXPOSURE_TYPE = "variance-exposure-plan"
 """Artifact type of a saved exposure plan."""
+
+OWN_PREFIX = "astra-prompt-"
+"""Intent prefix of the refinement's own draws, which are never calibration inputs."""
 
 PHASE_TOOLS = frozenset({"record_plan", "submit_draft", "record_self_check"})
 """Agentic phase tools; a request forcing one is not the role's answer."""
@@ -112,6 +116,8 @@ def saved_requests(project: ProjectStore) -> tuple[SavedRequest, ...]:
     store = project.artifacts
     rows: list[SavedRequest] = []
     for intent in sorted(store.list_ids(artifact_type=INTENT_TYPE)):
+        if intent.startswith(OWN_PREFIX):
+            continue
         request = ModelRequest.model_validate_json(store.read_bytes(intent, "request.json"))
         if not request.messages or request.messages[0].role != "system":
             continue
