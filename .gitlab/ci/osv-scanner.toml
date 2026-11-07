@@ -31,15 +31,15 @@ reason = "Same brotli 1.2.0 advisory as GHSA-9v8h-qqgm-4m35, published separatel
 
 [[IgnoredVulns]]
 id = "GHSA-pcg2-g6cj-q92c"
-ignoreUntil = 2026-11-07
+ignoreUntil = 2026-11-14
 reason = "tornado 6.5.10, capture extra only (via exp-mitmproxy). The fix (6.6) needs a relock, which currently fails on the mitmproxy_rs GitHub/GitLab URL conflict; fix the relock, take tornado 6.6 and delete this entry and the next two."
 
 [[IgnoredVulns]]
 id = "GHSA-pw9p-v7r6-gx4p"
-ignoreUntil = 2026-11-07
+ignoreUntil = 2026-11-14
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
 
 [[IgnoredVulns]]
 id = "GHSA-r4j5-9xpp-3985"
-ignoreUntil = 2026-11-07
+ignoreUntil = 2026-11-14
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
