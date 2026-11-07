@@ -66,13 +66,14 @@ def corpus(count: int = 24) -> tuple[Unit, ...]:
 
 
 def question(slug: str, text: str, sample: Sequence[str]) -> JsonObject:
-    """One proposal citing the first sampled episode as yes and the second as no."""
+    """One proposal citing the first half of the sample as yes and the second half as no."""
+    half = len(sample) // 2
     return {
         "slug": slug,
         "text": text,
         "rationale": "splits the sample",
-        "holds_in": [sample[0]],
-        "fails_in": [sample[1]],
+        "holds_in": list(sample[:half]),
+        "fails_in": list(sample[half:]),
     }
 
 
@@ -266,3 +267,26 @@ def test_authored_questions_replay_from_their_artifact(tmp_path: Path) -> None:
         code_revision="test",
     )
     assert again == first and same == reference
+
+
+def test_a_question_citing_too_few_episodes_on_a_side_is_refused() -> None:
+    """A question true of one episode names a single task; the share floor refuses it."""
+    sample = tuple(f"t{i:02d}" for i in range(10))
+    narrow = {
+        "questions": [
+            {
+                "slug": "one_task",
+                "text": "Does the request ask to implement an SMTP server?",
+                "rationale": "only one episode",
+                "holds_in": ["t00"],
+                "fails_in": list(sample[1:]),
+            }
+        ]
+    }
+    with pytest.raises(ValueError, match="at least 2 sampled episodes"):
+        validate_proposals(narrow, sample=sample, taken={}, variant="task_shape", limit=4, minimum=2)
+    broad = narrow["questions"][0] | {"holds_in": ["t00", "t01", "t02"], "fails_in": list(sample[3:])}
+    answer = validate_proposals(
+        {"questions": [broad]}, sample=sample, taken={}, variant="task_shape", limit=4, minimum=2
+    )
+    assert answer.questions[0].slug == "one_task"
