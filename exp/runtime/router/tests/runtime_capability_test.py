@@ -188,7 +188,10 @@ def test_capability_fallback_replaces_the_sticky_episode_model() -> None:
     assert first.selected_alias == "cheap"
     assert fallback.selected_alias == "baseline"
     assert fallback.fallback_reason == "capability_eligibility"
+    assert fallback.switch_outcome == "switched"
     assert later.selected_alias == "baseline"
+    # The later turn weighs a fresh cheap proposal; no pricing rows keep it sticky.
+    assert later.switch_outcome == "switch_suppressed_cache"
     assert replayed_first.selected_alias == "baseline"
 
     result = runtime.complete(_request(tool_name="read"), episode_id="eligible")
