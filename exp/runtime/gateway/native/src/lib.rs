@@ -6,6 +6,7 @@
 //! normalizer and failure taxonomy to the Python SDK-conformance and taxonomy
 //! tests.
 
+mod accounting;
 mod admission;
 mod audio_duration;
 mod audio_elevenlabs;
@@ -30,8 +31,10 @@ mod image_output;
 mod logprobs;
 #[cfg(test)]
 mod logprobs_tests;
+mod lossless_json;
 mod memory;
 mod metrics;
+mod native_callbacks;
 mod output_pacing;
 mod param_attribution;
 mod permit_queue;
@@ -133,7 +136,7 @@ impl RegexDetector {
     /// `replacement`.
     #[new]
     fn new(spec_json: &str) -> PyResult<Self> {
-        let spec: DetectorSpec = serde_json::from_str(spec_json)
+        let spec: DetectorSpec = crate::lossless_json::from_str(spec_json)
             .map_err(|error| PyValueError::new_err(format!("invalid detector spec: {error}")))?;
         let detector = Detector::compile(&spec).map_err(PyValueError::new_err)?;
         Ok(Self {
@@ -209,7 +212,7 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `RegexDetector`, so an admission whose output chain is deterministic runs
 /// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None, execution_bindings=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None, execution_bindings=None, native_callbacks=None))]
 // Keep the public Python positional ABI; Python is an implicit eighth argument.
 #[allow(clippy::too_many_arguments)]
 fn serve(
@@ -221,13 +224,16 @@ fn serve(
     guardrail_detectors: Option<&Bound<'_, PyDict>>,
     capture: Option<&capture::python::CaptureCollector>,
     execution_bindings: Option<&execution_binding::ExecutionBindings>,
+    native_callbacks: Option<&native_callbacks::NativeCallbacks>,
 ) -> PyResult<()> {
-    let config: ServeConfig = serde_json::from_str(config_json)
+    let config: ServeConfig = crate::lossless_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
     retained::configure(config.maximum_retained_output_bytes);
     let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let bridge = Arc::new(
-        Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
+        Bridge::new(control_plane, config.callback_permits)
+            .map_err(PyRuntimeError::new_err)?
+            .with_native(native_callbacks.map(|callbacks| callbacks.inner.clone())),
     );
     let execution_bindings = execution_bindings.cloned();
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
@@ -305,8 +311,9 @@ fn encode_responses_fixture(
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<Vec<String>> {
-    let envelope: encode_responses::ResponsesEnvelope = serde_json::from_str(envelope_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid envelope: {error}")))?;
+    let envelope: encode_responses::ResponsesEnvelope =
+        crate::lossless_json::from_str(envelope_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid envelope: {error}")))?;
     let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
     let mut encoder =
         encode_responses::ResponsesSseEncoder::new(request_id, model, created_at, envelope);
@@ -333,8 +340,9 @@ fn completed_responses_fixture(
     envelope_json: &str,
     events_json: &str,
 ) -> PyResult<String> {
-    let envelope: encode_responses::ResponsesEnvelope = serde_json::from_str(envelope_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid envelope: {error}")))?;
+    let envelope: encode_responses::ResponsesEnvelope =
+        crate::lossless_json::from_str(envelope_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid envelope: {error}")))?;
     let events = parse_fixture_events(events_json).map_err(PyValueError::new_err)?;
     let aggregated = encode_responses::completed_responses_body(
         request_id, model, created_at, envelope, &events,
@@ -355,7 +363,7 @@ fn completed_responses_fixture(
 fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String> {
     let dialect = dialects::Dialect::from_str(dialect)
         .ok_or_else(|| PyValueError::new_err(format!("unknown dialect: {dialect}")))?;
-    let chunks: Vec<String> = serde_json::from_str(chunks_json)
+    let chunks: Vec<String> = crate::lossless_json::from_str(chunks_json)
         .map_err(|error| PyValueError::new_err(format!("invalid chunks: {error}")))?;
     let bytes: Vec<Vec<u8>> = chunks
         .iter()
@@ -376,17 +384,18 @@ fn normalize_stream_fixture(dialect: &str, chunks_json: &str) -> PyResult<String
 /// taxonomy parity tests against `public_failure_error`.
 #[pyfunction]
 fn failure_public_error_fixture(failure_class: &str, safe_message: &str) -> PyResult<String> {
-    let parsed: errors::FailureClass = serde_json::from_value(serde_json::Value::String(
-        failure_class.to_string(),
-    ))
-    .map_err(|_| PyValueError::new_err(format!("unknown failure class: {failure_class}")))?;
+    let parsed: errors::FailureClass =
+        crate::lossless_json::from_value(serde_json::Value::String(failure_class.to_string()))
+            .map_err(|_| {
+                PyValueError::new_err(format!("unknown failure class: {failure_class}"))
+            })?;
     let failure = errors::Failure::new(parsed, safe_message);
     Ok(error_payload(&failure.public_error()))
 }
 
 fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String> {
-    let raw: Vec<serde_json::Value> =
-        serde_json::from_str(events_json).map_err(|error| format!("invalid events: {error}"))?;
+    let raw: Vec<serde_json::Value> = crate::lossless_json::from_str(events_json)
+        .map_err(|error| format!("invalid events: {error}"))?;
     let mut parsed = Vec::with_capacity(raw.len());
     for value in raw {
         let object = value.as_object().ok_or("event must be an object")?;
@@ -695,6 +704,10 @@ const MODEL_STAGE_CONTRACT_VERSION: u32 = 1;
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
     module.add_class::<execution_binding::ExecutionHandle>()?;
+    module.add_class::<native_callbacks::NativeCallbacks>()?;
+    module.add_class::<accounting::NativeAccounting>()?;
+    module.add_class::<accounting::NativeSessionRecovery>()?;
+    module.add_class::<accounting::NativeInputInspection>()?;
     module.add_class::<execution_binding::ExecutionBindings>()?;
     module.add_class::<RegexDetector>()?;
     module.add_class::<capture::python::CaptureCollector>()?;

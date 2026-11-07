@@ -341,7 +341,7 @@ class _RecordingLedger:
 
 
 def _registry(
-    *, background_recovery: bool = True
+    *, background_recovery: bool = True, register: bool = True
 ) -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
     """Compose one registry over a two-deployment certified route."""
     ledger = _RecordingLedger()
@@ -357,7 +357,8 @@ def _registry(
         request=_request(),
         deadline_monotonic=time.monotonic() + 30,
     )
-    registry.register(entry)
+    if register:
+        registry.register(entry)
     return registry, ledger, entry
 
 
@@ -5028,7 +5029,9 @@ def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
     """A first commit failing after close starts still has an owner to retry its meter."""
     from unittest.mock import DEFAULT, Mock
 
-    accounting, ledger, entry = _registry()
+    # Request-only writes can precede engine registration. An unrelated live
+    # entry would correctly keep shutdown open until its admission deadline.
+    accounting, ledger, entry = _registry(register=not request_only)
     attempt_id = "" if request_only else str(_start(accounting, ordinal=0)["attempt_id"])
     entered, release = threading.Event(), threading.Event()
     failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")

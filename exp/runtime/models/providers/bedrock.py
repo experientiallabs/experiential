@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import JsonValue
 
@@ -688,6 +688,41 @@ class BedrockClient:
         auth_factory(frozen, "bedrock", bedrock_signing_region(region)).add_auth(request)
         return {str(name): str(value) for name, value in dict(request.headers).items()}
 
+    def native_gateway_signing(self, *, url: str) -> JsonObject:
+        """Bind native signing authority to the exact regional endpoint.
+
+        This sensitive payload is handed only to the retained native request;
+        it is never included in wire admission or accounting receipts.
+        """
+        region = self._region_name()
+        if url == self.converse_stream_url():
+            accept = "application/vnd.amazon.eventstream"
+        elif url == self.invoke_url():
+            accept = "application/json"
+        else:
+            message = "Bedrock signing endpoint differs from the admitted model"
+            raise ProviderTransportError(message)
+        if self._bearer_token is not None:
+            return {"kind": "bearer", "token": self._bearer_token, "accept": accept}
+        ambient = self._aws_access_key_id is None
+        frozen = None if ambient else self._resolved_signing_credentials().get_frozen_credentials()
+        environment = os.environ if self._environment is None else self._environment
+        endpoint = urlsplit(url)
+        return {
+            "kind": "sigv4",
+            "default_chain": ambient,
+            "profile": environment.get("AWS_PROFILE") or environment.get("AWS_DEFAULT_PROFILE"),
+            "access_key": "" if frozen is None else frozen.access_key,
+            "secret_key": "" if frozen is None else frozen.secret_key,
+            "session_token": None if frozen is None else frozen.token,
+            "region": bedrock_signing_region(region),
+            "service": "bedrock",
+            "host": endpoint.netloc,
+            "path": quote(endpoint.path, safe="/~"),
+            "query": endpoint.query,
+            "accept": accept,
+        }
+
     def _call_with_retry(
         self,
         operation: Callable[[], Mapping[str, object]],
@@ -785,6 +820,10 @@ class BoundedBedrockClient(BoundedSyncModelClientAdapter):
             SigV4 headers the data plane sends verbatim.
         """
         return self._bedrock_client.sign_gateway_dispatch(url=url, body=body)
+
+    def native_gateway_signing(self, *, url: str) -> JsonObject:
+        """Export this exact client's admitted native signing authority."""
+        return self._bedrock_client.native_gateway_signing(url=url)
 
 
 def _boto_session_region() -> str | None:

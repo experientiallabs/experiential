@@ -276,6 +276,14 @@ class RegexClassifier:
             separators=(",", ":"),
         )
 
+    def native_output_configuration(self) -> dict[str, object]:
+        """Export the exact deterministic detector, with no caller text."""
+        return {
+            "kind": "regex",
+            "specification": json.loads(self.native_specification()),
+            "stream_window": self._stream_window,
+        }
+
     def _redact(self, text: str) -> tuple[bool, str]:
         """Union matched spans before replacement so overlapping rules cannot leak tails."""
         if len(text.encode("utf-8")) > _MAX_TEXT_BYTES:
@@ -315,6 +323,21 @@ class RegexClassifier:
             position = end
         pieces.append(text[position:])
         return True, "".join(pieces)
+
+    def native_input_configuration(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> dict[str, object]:
+        """Freeze read-only text checks; admission handles every modifying input check."""
+        from exp.runtime.gateway.guardrails.native_owner import text_subjects  # noqa: PLC0415
+
+        if check.action is GuardrailAction.MODIFY:
+            raise ValueError("Input modifications must finish before native dispatch")
+        return {**self.native_output_configuration(), "subjects": text_subjects(request)}
+
+    def native_input_template(self, *, check: GuardrailCheck) -> dict[str, object]:
+        """Export the detector for native reinspection and input redaction."""
+        del check
+        return self.native_output_configuration()
 
     async def inspect_input(
         self, *, request: GatewayRequest, check: GuardrailCheck

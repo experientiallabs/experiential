@@ -15,12 +15,12 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-certifi = "2026-10-21T00:00:00Z"
 exp-gateway-native = false
 exp-mitmproxy = false
-exp-mitmproxy-rs = false
+certifi = "2026-10-21T00:00:00Z"
 experiential = false
 filelock = "2026-10-18T00:00:00Z"
+exp-mitmproxy-rs = false
 pyasn1 = "2026-10-28T00:00:00Z"
 
 [[package]]
@@ -922,6 +922,12 @@ wheels = [
 name = "exp-gateway-native"
 version = "0.3.181"
 source = { directory = "exp/runtime/gateway/native" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "typing-extensions", specifier = ">=4.15" }]
 
 [[package]]
 name = "exp-mitmproxy"

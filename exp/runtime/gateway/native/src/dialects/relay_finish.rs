@@ -24,7 +24,7 @@ pub(in crate::dialects) fn arguments_end_mid_fragment(raw: &str) -> bool {
     // array or scalar could never have become the required arguments object,
     // so its early end is corruption and keeps the strict contract.
     raw.trim_start().starts_with('{')
-        && matches!(serde_json::from_str::<Value>(raw), Err(error) if error.is_eof())
+        && matches!(crate::lossless_json::from_str::<Value>(raw), Err(error) if error.is_eof())
 }
 
 /// Drop one open call whose arguments end mid-fragment, returning whether it
@@ -123,7 +123,7 @@ pub(in crate::dialects) fn finish_open_tools_relay(
 fn argues_nothing(raw_arguments: &str) -> bool {
     let trimmed = raw_arguments.trim();
     trimmed.is_empty()
-        || serde_json::from_str::<serde_json::Value>(trimmed)
+        || crate::lossless_json::from_str::<serde_json::Value>(trimmed)
             .ok()
             .and_then(|value| value.as_object().map(serde_json::Map::is_empty))
             .unwrap_or(false)

@@ -155,7 +155,7 @@ fn exposed_tool_reasoning_is_plaintext_not_concatenated_with_a_carrier() {
         .iter()
         .filter_map(|frame| {
             let payload = frame.strip_prefix("data: ")?.trim();
-            serde_json::from_str::<Value>(payload).ok()
+            crate::lossless_json::from_str::<Value>(payload).ok()
         })
         .filter_map(|frame| {
             frame["choices"][0]["delta"]["reasoning_content"]
@@ -505,7 +505,8 @@ fn chat_frames(
 }
 
 fn chat_payload(frame: &str) -> Value {
-    serde_json::from_str(frame.trim_start_matches("data: ").trim_end()).expect("chunk JSON")
+    crate::lossless_json::from_str(frame.trim_start_matches("data: ").trim_end())
+        .expect("chunk JSON")
 }
 
 #[test]
@@ -812,7 +813,7 @@ fn chat_reports_an_estimated_reasoning_count_when_the_provider_publishes_none() 
     let usage_frame = frames
         .iter()
         .filter_map(|frame| frame.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .filter_map(|data| crate::lossless_json::from_str::<Value>(data.trim()).ok())
         .find(|payload| payload.get("usage").is_some_and(|usage| !usage.is_null()))
         .expect("include_usage emits a usage chunk");
     assert_eq!(
@@ -891,7 +892,7 @@ fn gemini_thought_signatures_ride_chat_tool_calls_as_extra_content() {
     let starts: Vec<Value> = frames
         .iter()
         .filter_map(|frame| frame.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .filter_map(|data| crate::lossless_json::from_str::<Value>(data.trim()).ok())
         .filter_map(|chunk| {
             chunk["choices"][0]["delta"]["tool_calls"][0]
                 .as_object()

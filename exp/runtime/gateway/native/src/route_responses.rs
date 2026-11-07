@@ -104,7 +104,7 @@ pub(crate) async fn responses(
             Ok(text) => text,
             Err(error) => return error_response(&error),
         };
-        let scope_value: Value = match serde_json::from_str(&scope_text) {
+        let scope_value: Value = match crate::lossless_json::from_str(&scope_text) {
             Ok(value) => value,
             Err(_) => return error_response(&PublicError::internal()),
         };
@@ -114,7 +114,7 @@ pub(crate) async fn responses(
             // servability, so an escalation disposition fails closed here.
             return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
         }
-        let key: ReplayKey = match serde_json::from_value(scope_value) {
+        let key: ReplayKey = match crate::lossless_json::from_value(scope_value) {
             Ok(key) => key,
             Err(_) => return error_response(&PublicError::internal()),
         };
@@ -158,7 +158,7 @@ pub(crate) async fn responses(
             return error_response(&error);
         }
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
+    let admission_value: Value = match crate::lossless_json::from_str(&admission_text) {
         Ok(value) => value,
         Err(_) => return error_response(&PublicError::internal()),
     };
@@ -171,7 +171,12 @@ pub(crate) async fn responses(
         }
         return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
-    let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
+    let state = match crate::admission::bind_owner(&state, &admission_value) {
+        Ok(state) => state,
+        Err(error) => return error_response(&error),
+    };
+
+    let mut admission: Admission = match crate::lossless_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => {
             if let Some(mut owner) = lease.take() {

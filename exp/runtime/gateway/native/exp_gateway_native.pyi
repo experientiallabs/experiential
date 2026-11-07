@@ -3,6 +3,8 @@
 from collections.abc import Callable, Mapping
 from typing import Literal, Protocol, overload
 
+from typing_extensions import CapsuleType
+
 __version__: str
 MODEL_STAGE_CONTRACT_VERSION: int
 AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION: int
@@ -98,6 +100,58 @@ class CaptureCollector:
     def counts(self) -> tuple[int, int, int, int, int, int]: ...
     def maintenance_failures(self) -> int: ...
 
+class NativeCallbacks:
+    """Accounting callbacks supplied by a compiled extension through the native C ABI."""
+
+    def __init__(self, capsule: CapsuleType) -> None: ...
+
+class NativeSessionRecovery:
+    def __init__(
+        self,
+        maximum: int = 65536,
+        max_age: float = 3600.0,
+        observation_lifetime: float = 60.0,
+        cooldown: float = 5.0,
+    ) -> None: ...
+    def state_json(self, operation: str, arguments: str) -> str: ...
+    def choose_json(
+        self,
+        arguments: str,
+        eligible: Callable[[str], bool],
+        capacity: Callable[[str], bool] | None = None,
+    ) -> str: ...
+
+class NativeAccounting:
+    """Shared native policies and retained request owners handed off at admission."""
+
+    def __init__(
+        self,
+        health_policy_json: str = "{}",
+        default_bound: int | None = None,
+        activity_window_seconds: float = 10.0,
+        sticky_maximum: int = 65_536,
+        background_recovery: bool = True,
+        recovery: NativeSessionRecovery | None = None,
+    ) -> None: ...
+    def callbacks(self) -> NativeCallbacks: ...
+    def register(
+        self,
+        configuration_json: str,
+        ledger: NativeCallbacks,
+        *,
+        input: NativeInputInspection | None = None,
+        capture: CaptureCollector | None = None,
+        pending_capture: bytes | None = None,
+    ) -> None: ...
+    def is_clear(self, organization_id: str | None = None) -> bool: ...
+    def drained(self) -> bool: ...
+    def owns_request(self, request_id: str) -> bool: ...
+    def fenced_organizations(self) -> list[str]: ...
+    def inflight(self) -> int: ...
+    def recover(self) -> int: ...
+    def close(self, timeout_seconds: float = 5.0) -> bool: ...
+    def state_json(self, operation: str, argument: str) -> str: ...
+
 class ExecutionHandle:
     """Callback target with explicit capacity, capture, detectors and private replay identity."""
 
@@ -110,6 +164,7 @@ class ExecutionHandle:
         settlement_permits: int,
         guardrail_detectors: Mapping[str, _DeterministicDetector],
         capture: CaptureCollector | None,
+        native_callbacks: NativeCallbacks | None = None,
     ) -> None: ...
     @property
     def in_use(self) -> bool: ...
@@ -130,6 +185,7 @@ def serve(
     guardrail_detectors: Mapping[str, _DeterministicDetector] | None = None,
     capture: CaptureCollector | None = None,
     execution_bindings: ExecutionBindings | None = None,
+    native_callbacks: NativeCallbacks | None = None,
 ) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(
@@ -155,3 +211,11 @@ def completed_responses_fixture(
 ) -> str: ...
 def normalize_stream_fixture(dialect: str, chunks_json: str) -> str: ...
 def failure_public_error_fixture(failure_class: str, safe_message: str) -> str: ...
+
+class NativeInputInspection:
+    """Request-owned native input decisions and cancellation."""
+
+    def __init__(self, checks_json: str, remaining_seconds: float) -> None: ...
+    def decision_json(self) -> str: ...
+    def wait_json(self) -> str: ...
+    def cancel(self, failure_json: str | None = None) -> None: ...

@@ -48,7 +48,7 @@ fn structured_response_is_encoded_only_at_the_destination() {
     let first = record.encode(4096).unwrap();
     let second = record.encode(4096).unwrap();
     assert_eq!(first, second);
-    let decoded: Record = serde_json::from_str(&first).unwrap();
+    let decoded: Record = crate::lossless_json::from_str(&first).unwrap();
     let Response::Json { body, .. } = decoded.response.unwrap() else {
         panic!()
     };
@@ -85,7 +85,7 @@ fn hosted_completion_references_checkpoint_without_encoding_prompt_again() {
     assert!(full.len() > 512 * 1024);
     item.checkpointed = true;
     let encoded = item.encode_update(4096).unwrap();
-    let value: Value = serde_json::from_str(&encoded).unwrap();
+    let value: Value = crate::lossless_json::from_str(&encoded).unwrap();
     assert_eq!(value["schema_version"], 2);
     assert_eq!(value["request"]["request_id"], "request");
     assert!(value["request"].get("context").is_none());
@@ -160,12 +160,13 @@ fn exceptional_reasoning_borrows_the_record_and_serializes_the_response_once() {
         record.provider_reasoning.as_deref(),
         Some("first\0second雪")
     );
-    let decoded: Record = serde_json::from_str(&encoded).unwrap();
+    let decoded: Record = crate::lossless_json::from_str(&encoded).unwrap();
     assert_eq!(
         decoded.provider_reasoning.as_deref(),
         Some("first\u{fffd}second雪")
     );
     let source: String =
-        serde_json::from_str(decoded.provider_reasoning_source_json.as_deref().unwrap()).unwrap();
+        crate::lossless_json::from_str(decoded.provider_reasoning_source_json.as_deref().unwrap())
+            .unwrap();
     assert_eq!(source, "first\0second雪");
 }

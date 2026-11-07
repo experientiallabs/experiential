@@ -23,24 +23,32 @@ fn default_reasoning() -> Value {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesEnvelope {
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub metadata: Value,
     #[serde(default = "default_true")]
     pub parallel_tool_calls: bool,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub temperature: Value,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub top_p: Value,
     #[serde(default = "default_reasoning")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub reasoning: Value,
     #[serde(default)]
     pub ignored_parameters: Vec<String>,
     #[serde(default = "default_tool_choice")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub tool_choice: Value,
     #[serde(default = "default_tools")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub tools: Value,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub max_output_tokens: Value,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub previous_response_id: Value,
     #[serde(default)]
     pub include_encrypted_reasoning: bool,

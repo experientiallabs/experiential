@@ -202,7 +202,7 @@ fn the_normalizer_turns_streamed_dsml_into_a_completed_tool_call() {
         })
         .collect();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+        crate::lossless_json::from_str::<serde_json::Value>(&arguments).unwrap(),
         json!({"command": "ls", "timeoutMs": 1_260_000})
     );
     assert!(events.iter().any(Event::is_terminal));

@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from hashlib import sha256
 
-from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -131,6 +131,58 @@ class GuardrailEngine:
     def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
         """Resolve all applicable scopes through the single policy store contract."""
         return self._store.policies_for(authorization)
+
+    def native_output_configuration(self, *, check: GuardrailCheck) -> JsonObject:
+        """Resolve the exact native adapter while Python still owns admission."""
+        from exp.runtime.gateway.guardrails.native_owner import (
+            NativeClassifierClient,  # noqa: PLC0415
+        )
+
+        if not isinstance(self._client, NativeClassifierClient):
+            message = "The classifier client has no native execution contract"
+            raise ValueError(message)
+        return self._client.native_output_configuration(check=check)
+
+    def native_input_configuration(
+        self, *, policy: GuardrailPolicy, check: GuardrailCheck, request: GatewayRequest
+    ) -> JsonObject:
+        """Freeze the exact bounded subject before native overlapping execution starts."""
+        from exp.runtime.gateway.guardrails.native_owner import NativeInputClient  # noqa: PLC0415
+
+        if not isinstance(self._client, NativeInputClient):
+            message = "The classifier client has no native input contract"
+            raise ValueError(message)
+        # Ordered execution evaluates a single check with its original scope.
+        bound = self._input_limit(policy.model_copy(update={"checks": (check,)}))
+        if bound is not None and request_exceeds_inspection_limit(request, bound):
+            adapter: JsonObject = {"kind": "coverage_error", "oversized": True}
+        else:
+            try:
+                adapter = self._client.native_input_configuration(request=request, check=check)
+            except ClassifierCoverageError:
+                adapter = {"kind": "coverage_error"}
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "check": check.model_dump(mode="json"),
+            "adapter": adapter,
+        }
+
+    def native_input_template(
+        self, *, policy: GuardrailPolicy, check: GuardrailCheck
+    ) -> JsonObject:
+        """Freeze scoped adapter authority and the bound for one ordered native check."""
+        from exp.runtime.gateway.guardrails.native_owner import NativeInputTemplate  # noqa: PLC0415
+
+        if not isinstance(self._client, NativeInputTemplate):
+            message = "The classifier client has no native input contract"
+            raise ValueError(message)
+        adapter = self._client.native_input_template(check=check)
+        adapter["input_limit"] = self._input_limit(policy.model_copy(update={"checks": (check,)}))
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "check": check.model_dump(mode="json"),
+            "adapter": adapter,
+        }
 
     def open_request(
         self, authorization: AuthorizationSnapshot, *, deadline_monotonic: float

@@ -97,7 +97,7 @@ pub(super) fn assemble(frames: &[Value], input_sources: bool) -> (Value, bool) {
     for (index, argument) in arguments {
         let block = blocks.get_mut(&index).unwrap();
         if !argument.is_empty() {
-            match serde_json::from_str::<Value>(&argument) {
+            match crate::lossless_json::from_str::<Value>(&argument) {
                 Ok(value) => {
                     valid &= value.is_object();
                     // Desktop decodes exact inputs before redaction; gateway retains raw frames separately.

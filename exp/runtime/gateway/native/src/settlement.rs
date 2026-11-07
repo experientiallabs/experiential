@@ -230,7 +230,7 @@ async fn deliver(
     // while the owning organization stays fenced. Leave an operator signal
     // as one structured, content-free stderr line beside the counter.
     METRICS.record_settlement_give_up();
-    let parsed: Value = serde_json::from_str(&argument).unwrap_or(Value::Null);
+    let parsed: Value = crate::lossless_json::from_str(&argument).unwrap_or(Value::Null);
     let line = json!({
         "event": "settlement_give_up",
         "method": method,
@@ -256,6 +256,8 @@ async fn deliver(
 /// accepted request when no attempt is active.
 pub struct AttemptGuard {
     pub bridge: Arc<Bridge>,
+    // Response hooks may run after durable settlement removed the recovery owner.
+    _native_request: Option<Arc<dyn Send + Sync>>,
     pub(crate) input_gate: Option<Arc<crate::guardrails::input::InputGate>>,
     request_id: String,
     attempt_id: Option<String>,
@@ -340,8 +342,10 @@ impl AttemptGuard {
     ) -> Self {
         METRICS.record_served();
         METRICS.enter_request();
+        let native_request = bridge.retain_native_request(&request_id);
         Self {
             bridge,
+            _native_request: native_request,
             input_gate: None,
             request_id,
             attempt_id: None,
@@ -774,7 +778,8 @@ impl AttemptGuard {
 /// the data plane predates the field, and the control plane keeps the
 /// unknown policy.
 fn tier_provenance(argument: String, tier: &crate::service_tier::ServiceTierObservation) -> String {
-    let mut payload: Value = serde_json::from_str(&argument).expect("locally encoded settlement");
+    let mut payload: Value =
+        crate::lossless_json::from_str(&argument).expect("locally encoded settlement");
     payload["service_tier"] = json!(tier);
     compact_json(&payload)
 }
@@ -786,7 +791,7 @@ fn disconnect_provenance(
     streamed: &StreamedOutput,
 ) -> String {
     let mut payload: Value =
-        serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
+        crate::lossless_json::from_str(&argument).expect("settlement JSON was encoded locally");
     payload["dispatched"] = json!(dispatched);
     payload["usage_incomplete_due_to_disconnect"] = json!(incomplete);
     if incomplete {
@@ -816,7 +821,7 @@ fn unreported_truncation_provenance(
         return argument;
     }
     let mut payload: Value =
-        serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
+        crate::lossless_json::from_str(&argument).expect("settlement JSON was encoded locally");
     let streamed = &observed.streamed_output;
     payload["usage_unreported_truncation"] = json!(true);
     payload["streamed_output"] = json!({

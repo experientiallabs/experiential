@@ -1391,3 +1391,24 @@ def test_only_a_stability_model_carries_the_images_wire(model_id: str, wire: str
         assert profile.images_wire == wire
     assert profile.url == client.converse_stream_url()
     assert profile.signs_request_body
+
+
+def test_native_signing_exports_refreshable_ambient_authority_without_python_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient role refresh belongs to Rust after admission, including retry signatures."""
+    client = BedrockClient(
+        model=_snapshot(), region="us-west-2", environment={"AWS_PROFILE": "fixture-profile"}
+    )
+
+    def unexpected() -> None:
+        """Any attempt to resolve credentials here violates the native handoff."""
+        pytest.fail("native admission must not freeze Python ambient credentials")
+
+    monkeypatch.setattr(client, "_resolved_signing_credentials", unexpected)
+    authority = client.native_gateway_signing(url=client.converse_stream_url())
+    assert authority["default_chain"] is True
+    assert authority["profile"] == "fixture-profile"
+    assert authority["access_key"] == ""
+    assert authority["secret_key"] == ""
+    assert authority["session_token"] is None

@@ -274,7 +274,7 @@ async fn handle_frame(
     deadline: Instant,
     text: &str,
 ) -> Result<(), ()> {
-    let mut value: Value = match serde_json::from_str(text) {
+    let mut value: Value = match crate::lossless_json::from_str(text) {
         Ok(Value::Object(entries)) => Value::Object(entries),
         _ => return send_public_error(socket, deadline, &PublicError::invalid_json()).await,
     };
@@ -436,7 +436,7 @@ async fn relay_response(
         Ok(body) => body,
         Err(_) => return send_public_error(socket, deadline, &PublicError::internal()).await,
     };
-    let error = serde_json::from_slice::<Value>(&body)
+    let error = crate::lossless_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|mut envelope| {
             envelope
@@ -460,7 +460,8 @@ async fn send_prewarm_ack(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let envelope: ResponsesEnvelope = serde_json::from_value(request.clone()).unwrap_or_default();
+    let envelope: ResponsesEnvelope =
+        crate::lossless_json::from_value(request.clone()).unwrap_or_default();
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)

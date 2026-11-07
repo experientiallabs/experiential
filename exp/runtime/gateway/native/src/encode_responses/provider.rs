@@ -243,7 +243,7 @@ impl ResponsesSseEncoder {
                 "Responses hosted tool item was started twice.",
             ));
         }
-        let parsed: Value = serde_json::from_str(item).map_err(|_| {
+        let parsed: Value = crate::lossless_json::from_str(item).map_err(|_| {
             invalid_provider_stream("Responses hosted tool item is not valid JSON.")
         })?;
         let item_id = parsed
@@ -292,7 +292,7 @@ impl ResponsesSseEncoder {
             }
             state.output_index
         };
-        let mut fields = match serde_json::from_str::<Value>(payload) {
+        let mut fields = match crate::lossless_json::from_str::<Value>(payload) {
             Ok(Value::Object(fields)) => fields,
             _ => {
                 return Err(invalid_provider_stream(
@@ -313,7 +313,7 @@ impl ResponsesSseEncoder {
         provider_output_index: u32,
         item: &str,
     ) -> Result<Vec<String>, PublicError> {
-        let parsed: Value = serde_json::from_str(item).map_err(|_| {
+        let parsed: Value = crate::lossless_json::from_str(item).map_err(|_| {
             invalid_provider_stream("Responses hosted tool item is not valid JSON.")
         })?;
         let output_index = {
@@ -369,7 +369,7 @@ impl ResponsesSseEncoder {
         let key = MessageKey::Provider(provider_output_index);
         let mut frames = Vec::new();
         self.ensure_message(key, Some(item_id), &mut frames)?;
-        let parsed: Value = serde_json::from_str(annotation)
+        let parsed: Value = crate::lossless_json::from_str(annotation)
             .map_err(|_| invalid_provider_stream("Responses text annotation is not valid JSON."))?;
         let (item_id, output_index, annotation_index, start_part) = {
             let state = self.messages.get_mut(&key).expect("message just ensured");

@@ -105,7 +105,7 @@ fn admit(module: &Py<PyModule>, fixture: &Py<PyAny>) -> (String, DeploymentWire)
             .unwrap()
             .extract()
             .unwrap();
-        (request_id, serde_json::from_str(&wire).unwrap())
+        (request_id, crate::lossless_json::from_str(&wire).unwrap())
     })
 }
 
@@ -129,7 +129,7 @@ async fn loopback(resource: &'static str) -> (String, tokio::task::JoinHandle<Ve
         for index in 0..3 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let body = crate::waterfall::ladder_tests::read_request_body(&mut socket).await;
-            let body: Value = serde_json::from_str(&body).unwrap();
+            let body: Value = crate::lossless_json::from_str(&body).unwrap();
             let response = if index == 0 {
                 assert!(body.get("ttl").is_none());
                 assert!(body.get("expireTime").is_some());

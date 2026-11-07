@@ -16,7 +16,7 @@ import json
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -37,7 +37,9 @@ from exp.runtime.gateway.contracts import (
     OpaqueReasoningContentBlock,
     SealedReasoningContentBlock,
 )
-from exp.runtime.models.providers.base import GatewayWireProfile
+
+if TYPE_CHECKING:
+    from exp.runtime.models.providers.base import GatewayWireProfile
 
 MAXIMUM_REASONING_CONTENT_BYTES = 8 * 1024 * 1024
 """Maximum decrypted provider reasoning retained for one tool continuation."""

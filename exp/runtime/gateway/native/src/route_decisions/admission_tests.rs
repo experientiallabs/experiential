@@ -9,7 +9,8 @@ use super::*;
 fn the_argument_carries_the_body_and_its_utf8_byte_length() {
     let body = r#"{"state":"café"}"#;
     let argument: Value =
-        serde_json::from_str(&admission_argument("gateway-key", body, &HeaderMap::new())).unwrap();
+        crate::lossless_json::from_str(&admission_argument("gateway-key", body, &HeaderMap::new()))
+            .unwrap();
     assert_eq!(argument["body"], body);
     assert_eq!(argument["body_bytes"], body.len());
     assert_ne!(body.len(), body.chars().count());

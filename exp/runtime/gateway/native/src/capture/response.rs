@@ -109,7 +109,7 @@ impl WireResponse {
                     unreachable!()
                 };
                 if let Some(source) = source_json {
-                    reduced = serde_json::from_str(&source).unwrap_or(reduced);
+                    reduced = crate::lossless_json::from_str(&source).unwrap_or(reduced);
                 }
                 if reduced.is_empty() {
                     break None;
@@ -119,7 +119,7 @@ impl WireResponse {
                 truncated = true;
             }
         } else if !self.truncated && !self.disconnected {
-            serde_json::from_slice::<Value>(&self.bytes)
+            crate::lossless_json::from_slice::<Value>(&self.bytes)
                 .ok()
                 .map(|mut body| {
                     let wide = contains_wide_number(&body);
@@ -382,7 +382,7 @@ pub(super) fn data_frames_with_sources(bytes: &[u8]) -> (Vec<Value>, Vec<(usize,
         if line.is_empty() {
             if !data.is_empty() {
                 let payload = data.join(&b'\n');
-                let value = serde_json::from_slice(&payload).unwrap_or_else(|_| {
+                let value = crate::lossless_json::from_slice(&payload).unwrap_or_else(|_| {
                     Value::String(String::from_utf8_lossy(&payload).into_owned())
                 });
                 if contains_wide_number(&value) {

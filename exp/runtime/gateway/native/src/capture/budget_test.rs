@@ -56,7 +56,7 @@ fn node_heavy_trees_and_spare_vectors_are_charged() {
 
 #[test]
 fn small_ordered_maps_include_minimum_entry_and_index_allocations() {
-    let value: Value = serde_json::from_str(r#"{"x":null}"#).unwrap();
+    let value: Value = crate::lossless_json::from_str(r#"{"x":null}"#).unwrap();
     let entry =
         std::mem::size_of::<String>() + std::mem::size_of::<Value>() + std::mem::size_of::<usize>();
     let minimum_allocation = 3 * entry + 4 * std::mem::size_of::<usize>() + 16;
@@ -71,6 +71,9 @@ fn final_encoding_capacity_stays_inside_its_payload_reservation() {
         let encoded = encode(&value, limit).unwrap();
         assert_eq!(encoded.len(), limit);
         assert!(encoded.capacity() <= limit);
-        assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), value);
+        assert_eq!(
+            crate::lossless_json::from_str::<Value>(&encoded).unwrap(),
+            value
+        );
     }
 }

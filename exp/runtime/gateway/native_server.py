@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Protocol, cast
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
 
 if TYPE_CHECKING:
-    from exp_gateway_native import CaptureCollector, ExecutionBindings, ShutdownHandle
+    from exp_gateway_native import (
+        CaptureCollector,
+        ExecutionBindings,
+        NativeCallbacks,
+        ShutdownHandle,
+    )
 
     from exp.runtime.gateway.native_bridge import NativeControlPlane
 
@@ -27,6 +32,11 @@ class NativeServerControlPlane(Protocol):
     @property
     def guardrail_detectors(self) -> dict[str, NativeDetector]:
         """Return the compiled deterministic guardrail rules, keyed by adapter."""
+        ...
+
+    @property
+    def native_callbacks(self) -> NativeCallbacks | None:
+        """Return the explicitly configured native request owner registry."""
         ...
 
 
@@ -244,6 +254,7 @@ def serve_native_gateway(
             control_plane.guardrail_detectors,
             capture,
             execution_bindings,
+            control_plane.native_callbacks,
         )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.

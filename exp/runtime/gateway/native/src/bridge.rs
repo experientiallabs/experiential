@@ -24,6 +24,7 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
 use crate::execution_binding::ExecutionLease;
+use crate::native_callbacks::NativeTarget;
 
 /// One queued control-plane call and the responder that hands its outcome
 /// back to the awaiting request task.
@@ -45,6 +46,8 @@ struct Job {
 pub struct Bridge {
     pool: Arc<WorkerPool>,
     pub(crate) execution: Option<Arc<ExecutionLease>>,
+    native: Option<Arc<NativeTarget>>,
+    request_owner: Option<Arc<dyn Send + Sync>>,
 }
 
 /// One process owns the workers; bound request views share them without adding threads.
@@ -97,6 +100,56 @@ impl Bridge {
                 permits: Arc::new(Semaphore::new(worker_count)),
             }),
             execution: None,
+            native: None,
+            request_owner: None,
+        })
+    }
+
+    /// Install an explicitly supplied native target for this process bridge.
+    pub(crate) fn with_native(mut self, native: Option<Arc<NativeTarget>>) -> Self {
+        self.native = native;
+        self
+    }
+
+    pub(crate) fn retain_native_request(&self, request_id: &str) -> Option<Arc<dyn Send + Sync>> {
+        self.request_owner.clone().or_else(|| {
+            self.native
+                .as_ref()
+                .and_then(|target| target.retain_request(request_id))
+        })
+    }
+
+    /// The admitted contract selects its owner once. Missing native ownership
+    /// fails closed; a failed callback never changes the selected backend.
+    pub(crate) fn admitted(&self, value: &serde_json::Value) -> Result<Self, PublicError> {
+        let selected = match value.get("native_accounting") {
+            Some(value) => value.as_bool().ok_or_else(PublicError::internal)?,
+            None if self.native.is_none() => false,
+            None => return Err(PublicError::internal()),
+        };
+        let request_id = value["request_id"]
+            .as_str()
+            .ok_or_else(PublicError::internal)?;
+        let request_owner = self
+            .native
+            .as_ref()
+            .and_then(|target| target.retain_request(request_id));
+        if (!selected && request_owner.is_some())
+            || (selected && self.native.is_none())
+            || (selected
+                && request_owner.is_none()
+                && self
+                    .native
+                    .as_ref()
+                    .is_some_and(|n| n.requires_request_owner()))
+        {
+            return Err(PublicError::internal());
+        }
+        Ok(Self {
+            pool: self.pool.clone(),
+            execution: self.execution.clone(),
+            native: selected.then(|| self.native.clone()).flatten(),
+            request_owner,
         })
     }
 
@@ -104,6 +157,9 @@ impl Bridge {
     pub(crate) fn bind(&self, execution: Arc<ExecutionLease>) -> Self {
         Self {
             pool: self.pool.clone(),
+            // A bound owner never inherits the process owner's native context.
+            native: execution.resources.native.clone(),
+            request_owner: None,
             execution: Some(execution),
         }
     }
@@ -162,6 +218,25 @@ impl Bridge {
         // Latency is measured from permit grant so it reflects the python
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
+        if let Some(native) = self.native.as_ref().filter(|native| native.handles(method)) {
+            let native = native.clone();
+            let execution = self.execution.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // These leases outlive a cancelled waiter, just as queued Python
+                // jobs do. No interpreter attachment occurs on this path.
+                let _ownership = (permit, execution_permit, execution);
+                native.call(method, &argument)
+            })
+            .await
+            .unwrap_or_else(|_| Err(PublicError::internal()));
+            crate::metrics::METRICS
+                .bridge_call_ms
+                .record(call_started.elapsed());
+            return result;
+        }
+        if self.native.is_some() && crate::native_callbacks::post_admission(method) {
+            return Err(PublicError::internal());
+        }
         let (responder, outcome) = oneshot::channel();
         let submitted = match queue.lock() {
             Ok(guard) => match guard.as_ref() {
@@ -302,7 +377,7 @@ fn public_error_from_pyerr(py: Python<'_>, error: &PyErr) -> PublicError {
     let value = error.value(py);
     if let Ok(payload) = value.getattr("public_error_json") {
         if let Ok(text) = payload.extract::<String>() {
-            if let Ok(public) = serde_json::from_str::<PublicError>(&text) {
+            if let Ok(public) = crate::lossless_json::from_str::<PublicError>(&text) {
                 return public;
             }
         }
@@ -491,7 +566,7 @@ class Plane:
         let target = plane();
         let observer = Python::attach(|py| target.clone_ref(py));
         let handle = Python::attach(|py| {
-            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None, None)
         })
         .unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();
@@ -607,7 +682,7 @@ class DatabasePlane:
             });
             let observer = Python::attach(|py| target.clone_ref(py));
             let handle = Python::attach(|py| {
-                ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+                ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None, None)
             })
             .unwrap();
             let token = format!("{index:032}");
@@ -653,7 +728,7 @@ class DatabasePlane:
         Python::attach(|py| target.bind(py).setattr("fail_close", true).unwrap());
         let observer = Python::attach(|py| target.clone_ref(py));
         let handle = Python::attach(|py| {
-            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None, None)
         })
         .unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();

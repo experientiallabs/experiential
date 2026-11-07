@@ -35,6 +35,7 @@ def test_host_passes_the_serve_configuration(
         guardrail_detectors: object,
         capture: object,
         execution_bindings: object,
+        native_callbacks: object,
     ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
@@ -44,12 +45,15 @@ def test_host_passes_the_serve_configuration(
         captured["guardrail_detectors"] = guardrail_detectors
         captured["capture"] = capture
         captured["execution_bindings"] = execution_bindings
+        captured["native_callbacks"] = native_callbacks
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
     monkeypatch.setenv(PRE_FIRST_BYTE_RESERVE_ENV, "20")
     monkeypatch.setenv(PRE_FIRST_BYTE_MAX_ENV, "480")
-    control = SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=37.0)
+    control = SimpleNamespace(
+        native_callbacks=None, guardrail_detectors={}, request_timeout_seconds=37.0
+    )
     scopes = cast("native_server.ExecutionBindings", object())
 
     serve_native_gateway(
@@ -68,6 +72,7 @@ def test_host_passes_the_serve_configuration(
 
     assert captured["control_plane"] is control
     assert captured["execution_bindings"] is scopes
+    assert captured["native_callbacks"] is control.native_callbacks
     assert captured["shutdown"] is None
     config = cast("dict[str, object]", captured["config"])
     assert config["host"] == "0.0.0.0"
@@ -101,6 +106,7 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
         guardrail_detectors: object,
         capture: object,
         execution_bindings: object,
+        native_callbacks: object,
     ) -> None:
         """Capture the extension boundary call."""
         del control_plane, config_json, on_listening, guardrail_detectors, capture
@@ -111,7 +117,9 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
     handle = object()
 
     serve_native_gateway(
-        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=12.0),
+        SimpleNamespace(
+            native_callbacks=None, guardrail_detectors={}, request_timeout_seconds=12.0
+        ),
         host="127.0.0.1",
         port=8080,
         shutdown=cast("native_server.ShutdownHandle", handle),
@@ -127,7 +135,9 @@ def test_host_maps_native_runtime_failures(monkeypatch: pytest.MonkeyPatch) -> N
 
     with pytest.raises(NativeGatewayServerError, match="bind failed"):
         serve_native_gateway(
-            SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
+            SimpleNamespace(
+                native_callbacks=None, guardrail_detectors={}, request_timeout_seconds=10.0
+            ),
             host="127.0.0.1",
             port=8080,
         )
@@ -141,7 +151,9 @@ def test_host_treats_native_keyboard_interrupt_as_clean_shutdown(
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
 
     serve_native_gateway(
-        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
+        SimpleNamespace(
+            native_callbacks=None, guardrail_detectors={}, request_timeout_seconds=10.0
+        ),
         host="127.0.0.1",
         port=8080,
     )
@@ -157,7 +169,9 @@ def test_host_requires_the_extension(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(native_server.importlib, "import_module", missing)
     with pytest.raises(NativeGatewayServerError, match="not installed"):
         serve_native_gateway(
-            SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
+            SimpleNamespace(
+                native_callbacks=None, guardrail_detectors={}, request_timeout_seconds=10.0
+            ),
             host="127.0.0.1",
             port=8080,
         )

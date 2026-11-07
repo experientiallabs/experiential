@@ -14,7 +14,7 @@ use crate::events::{bedrock_usage, require_string, require_u64, Event, ToolAccum
 /// callers, so it reaches the ledger without widening the caller-facing
 /// sanitization boundary.
 fn bedrock_exception_detail(frame: &crate::sse::SseEvent) -> Option<String> {
-    let message = serde_json::from_str::<Value>(&frame.data)
+    let message = crate::lossless_json::from_str::<Value>(&frame.data)
         .ok()
         .and_then(|payload| {
             payload

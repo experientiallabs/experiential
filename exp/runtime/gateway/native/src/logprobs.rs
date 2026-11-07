@@ -11,6 +11,7 @@ pub const MAX_TOP_LOGPROBS: usize = 20;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogprobCandidate {
     pub token: String,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub logprob: f64,
     pub bytes: Option<Vec<u8>>,
 }
@@ -18,6 +19,7 @@ pub struct LogprobCandidate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenLogprob {
     pub token: String,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub logprob: f64,
     pub bytes: Option<Vec<u8>>,
     pub top_logprobs: Vec<LogprobCandidate>,
