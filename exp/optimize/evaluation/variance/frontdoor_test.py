@@ -9,6 +9,7 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.project import ProjectStore
+from exp.common.project.project import write_project_config
 from exp.common.state_machine import TransitionJournal
 from exp.optimize.evaluation.executable import grounded
 from exp.optimize.evaluation.variance.bootstrap_plan import (
@@ -316,3 +317,63 @@ def test_a_configured_slot_needs_its_owners_executor(
     ]
     assert plan.stages[1].status == "blocked"  # priced once the project build exists
     assert plan.stages[2].lines[1] == "banks 2"
+
+
+def test_a_project_with_no_build_plans_its_build_and_waits_for_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new pool plans: the build is pending and every later stage waits for it.
+
+    The families slots' saved lookups (task types among them) read the variance build, which
+    needs a completed build, so they must not be asked before one exists.
+    """
+    run = front_door(tmp_path, monkeypatch)
+    config = run.project.load_project()
+    write_project_config(run.project.paths, config.model_copy(update={"build": None}))
+    spec = run.spec.model_copy(
+        update={"slots": {"tag-banks": {"banks": 2}, "task-types": {"namer_alias": "author"}}}
+    )
+    plan = plan_front_door(run.project, spec, code_revision="test", dependencies=run.dependencies)
+    rows = [(row.stage, row.status) for row in plan.stages]
+    assert rows == [
+        ("project-build", "planned"),
+        ("variance-build", "blocked"),
+        ("slot tag-banks", "blocked"),
+        ("slot task-types", "blocked"),
+        ("bootstrap-preparation", "blocked"),
+        ("pipelines", "blocked"),
+        ("slot dense-hybrid", "blocked"),
+    ]
+    assert not plan.complete and plan.known_usd == 0
+
+
+def test_one_consent_over_a_pending_build_prices_each_waiting_stage_on_the_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consented before the build existed, the run builds, then prices and runs the slots."""
+    run = front_door(tmp_path, monkeypatch)
+    built = run.project.load_project()
+    write_project_config(run.project.paths, built.model_copy(update={"build": None}))
+
+    def build(project: ProjectStore, source: TraceSource) -> None:
+        """Make the completed build appear, as exp build would."""
+        run.builder.calls.append(source)
+        write_project_config(project.paths, built)
+
+    slot = ScriptedSlot()
+    deps = FrontDoorDependencies(
+        builder=build,
+        bootstrap=run.dependencies.bootstrap,
+        executors=run.dependencies.executors,
+        slots={"tag-banks": slot},
+    )
+    spec = run.spec.model_copy(update={"slots": {"tag-banks": {"banks": 2}}})
+    plan = plan_front_door(run.project, spec, code_revision="test", dependencies=deps)
+    assert plan.stages[2].stage == "slot tag-banks" and plan.stages[2].status == "blocked"
+    approval = FrontDoorApproval(plan_sha256=plan.digest, ceiling_usd=10.0, unpriced_attempts=1_000)
+    report = run_front_door(
+        run.project, spec, code_revision="test", approval=approval, dependencies=deps
+    )
+    assert len(run.builder.calls) == 1 and report.source is not None
+    assert slot.runs == [{"banks": 2}]
+    assert report.preparation is not None, report.stopped

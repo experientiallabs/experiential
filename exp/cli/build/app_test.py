@@ -882,6 +882,46 @@ def test_noninteractive_build_yes_confirms_an_in_budget_estimate(
     assert ProjectStore(root, "support").load_project().build is not None
 
 
+def test_skip_learning_selects_the_build_without_a_learning_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The front door's build confirms its estimate but never starts the unpriced learning pass.
+
+    Args:
+        tmp_path: Temporary trace, catalog, and settings root.
+        monkeypatch: Estimate replacement and a learning pass that must not run.
+    """
+    source = _otlp_export(tmp_path)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    set_maximum_command_cost_usd(1.0, root)
+    monkeypatch.setattr(build_command, "_embedding_cost_ceiling", lambda *_args: 0.75)
+
+    def no_learning(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("--skip-learning must not start the learning pass")
+
+    monkeypatch.setattr("exp.cli.build.learning.learn_with_report", no_learning)
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(source),
+            "--root",
+            str(root),
+            "--no-interactive",
+            "--yes",
+            "--skip-learning",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ProjectStore(root, "support").load_project().build is not None
+
+
 def test_unpriced_embedder_reports_an_undefined_cost_and_requires_manual_override(
     tmp_path: Path,
 ) -> None:

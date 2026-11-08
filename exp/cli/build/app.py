@@ -190,6 +190,12 @@ def build(
         max=1000,
         help="Consolidate cited memory every N traces and at completion; policy stays pinned.",
     ),
+    skip_learning: bool = typer.Option(
+        False,
+        "--skip-learning",
+        help="Stop after the indexes and the grounded world model: no learning pass and no "
+        "learning consent. The decision-variance front door builds this way.",
+    ),
     retry_incomplete: bool = typer.Option(
         False,
         "--retry-incomplete",
@@ -223,6 +229,7 @@ def build(
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
+        skip_learning: Select the completed build without the default learning pass.
         retry_incomplete: Resume an interrupted learning trace in place.
         evidence_reading: Optional investigation readers; omitted follows a saved learning plan.
         dream_every: Optional consolidation interval; omitted follows the saved learning plan.
@@ -399,7 +406,7 @@ def build(
         if dry_run:
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
-        if not (yes or reused) and (no_interactive or not can_prompt(_console)):
+        if not (yes or reused or skip_learning) and (no_interactive or not can_prompt(_console)):
             require_learning_consent(_console, catalog, root=root, command=rerun)
         remaining_estimate = 0.0 if reused else estimate
         if not require_spend_consent(
@@ -449,6 +456,19 @@ def build(
     # dispatch: `exp --help` stays free of optimization machinery (startup-isolation gate).
     from exp.cli.build.learning import learn_with_report
 
+    if skip_learning:
+        from exp.cli.evaluation.learning_summary import LearningSummary
+
+        pipeline.stop()
+        render_completed_build(
+            _console,
+            completed,
+            project=project,
+            learning=LearningSummary(),
+            report=None,
+            duration_seconds=time.monotonic() - started,
+        )
+        return
     try:
         with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
             learning, report_path = learn_with_report(

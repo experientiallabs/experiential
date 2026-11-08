@@ -173,6 +173,13 @@ def plan_front_door(
     stages = [built]
     if any(SLOT_POSITIONS[name] == "after-families" for name in configured_slots(spec)):
         stages.append(_review_stage(project, spec, code_revision, built.status))
+    if project.load_project().build is None:
+        # Every later stage reads the build's traces, tasks or embeddings: name them as
+        # waiting instead of asking their owners to plan over a build that does not exist.
+        stages.extend(_pending_build_stages(spec, dependencies))
+        return FrontDoorPlan(
+            spec_sha256=sha256_json(spec), code_revision=code_revision, stages=tuple(stages)
+        )
     saved = _saved_family_slots(project, spec, code_revision)
     stages.extend(
         _slot_stages(project, spec, "after-families", code_revision, dependencies, dict(saved))
@@ -551,9 +558,16 @@ class _Runner:
                 continue
             executor = slot_executor(name, self.dependencies.slots)
             stage = f"slot {name}"
+            bound = costs.get(stage, ())
+            if self.tracker.stages.get(stage) == StageState.BLOCKED:
+                # Consented while the build was pending: price it now that its inputs exist.
+                saved, bound, _ = executor.plan(
+                    self.context(report.model_copy(update={"slots": results})), settings
+                )
+                self.tracker.stage(stage, "replayed" if saved else "priced")
             result, reason = self.phase(
                 stage,
-                costs.get(stage, ()),
+                bound,
                 lambda executor=executor, settings=settings: executor.run(
                     self.context(report.model_copy(update={"slots": results})), settings
                 ),
@@ -647,9 +661,58 @@ def _build_stage(project: ProjectStore, spec: FrontDoorSpec) -> FrontDoorStage:
             "indexes and the grounded world model.",
         ),
         notes=(
-            "Embeddings are priced by exp build's own preflight; it runs non-interactively only "
-            "when that estimate fits the configured build budget, otherwise it stops and asks.",
+            "Embeddings are priced by exp build's own preflight; consent to this plan is its "
+            "confirmation (--yes), including an estimate above the build budget or an "
+            "undefined one from an unpriced embedder.",
         ),
+    )
+
+
+def _pending_build_stages(
+    spec: FrontDoorSpec, dependencies: FrontDoorDependencies
+) -> tuple[FrontDoorStage, ...]:
+    """Name every stage after a pending project build as blocked, in run order, with no plan."""
+    waiting = "Priced once the project build exists."
+    slots = configured_slots(spec)
+
+    def blocked(position: SlotPosition) -> list[FrontDoorStage]:
+        rows = []
+        for name in slots:
+            if SLOT_POSITIONS[name] == position:
+                slot_executor(name, dependencies.slots)  # still refuse a slot without executor
+                rows.append(
+                    FrontDoorStage(
+                        stage=f"slot {name}",
+                        status=StageState.BLOCKED,
+                        lines=(SLOT_STAGES[name],),
+                        notes=(waiting,),
+                    )
+                )
+        return rows
+
+    limits = spec.preparation.limits
+    return (
+        *blocked("after-families"),
+        FrontDoorStage(
+            stage="bootstrap-preparation",
+            status=StageState.BLOCKED,
+            lines=_PREPARATION_LINES,
+            notes=(
+                f"{waiting} Tagging, compatibility review, family rules and at most "
+                f"{limits.maximum_tasks} starts.",
+            ),
+        ),
+        *blocked("after-preparation"),
+        FrontDoorStage(
+            stage="pipelines",
+            status=StageState.BLOCKED,
+            lines=("One six-stage decision-variance run per registered start.",),
+            notes=(
+                f"{waiting} At most {limits.maximum_tasks} starts, "
+                f"{len(spec.pipeline.mining.actors)} actor tiers each.",
+            ),
+        ),
+        *blocked("after-pipeline"),
     )
 
 

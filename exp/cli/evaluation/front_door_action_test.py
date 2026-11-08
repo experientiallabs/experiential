@@ -65,7 +65,8 @@ def test_the_action_takes_exactly_one_spec() -> None:
 def test_a_pending_build_runs_exp_build_non_interactively(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The builder never answers a cost question itself and reports a stopped build."""
+    """The consented plan is the build's confirmation, so it never stops to ask; a failed
+    build is still reported."""
     commands: list[list[str]] = []
 
     def record(command: list[str], *, check: bool) -> subprocess.CompletedProcess[bytes]:
@@ -82,5 +83,6 @@ def test_a_pending_build_runs_exp_build_non_interactively(
         builder(run.project, source)
     (command,) = commands
     assert command[1:4] == ["-m", "exp", "build"]
-    assert "--non-interactive" in command and "--yes" not in command
+    assert "--non-interactive" in command and "--yes" in command
+    assert "--skip-learning" in command  # the plan never priced exp build's learning pass
     assert command[command.index("--traces") + 1] == str(source.path)
