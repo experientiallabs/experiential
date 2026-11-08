@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from collections.abc import Sequence
 from pathlib import Path
@@ -29,11 +30,13 @@ from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.executable.task import MiningProvenance
-from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
+from exp.optimize.evaluation.rules.agent_loop import run_bounded
+from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, admitted_concurrency
 from exp.optimize.evaluation.variance.behavior_adversarial import hack_signature
 from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.blast_radius import (
     BlastRadius,
+    SeverityJudgment,
     blast_radius,
     judge_severity,
     order_by_blast,
@@ -58,6 +61,8 @@ from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.questions import resolve_question_bank
 from exp.simulation.mining.tagging import TraceTagger, TraceTaggingError
 from exp.simulation.mining.traceml import TraceTrajectory, step_units
+
+logger = logging.getLogger(__name__)
 
 QUESTIONS_PER_CALL = 32
 """Questions the decision model answers per step in one call."""
@@ -242,18 +247,32 @@ def mine_blast_radius(
     review = settings.blast
     if review is None:
         return None
-    rows: list[BlastRadius] = []
-    for key, point in sorted(points.items()):
+
+    def severity_of(key: str) -> SeverityJudgment:
+        """Review one point's severity; a review that cannot be prepared leaves it unscored."""
         source = judged.get(key)
-        severity = judge_severity(
-            project,
-            review,
-            key,
-            _failures(project, source),
-            sources=() if source is None else (source,),
-            code_revision=code_revision,
-        )
-        rows.append(blast_radius(point, severity, review))
+        try:
+            return judge_severity(
+                project,
+                review,
+                key,
+                _failures(project, source),
+                sources=() if source is None else (source,),
+                code_revision=code_revision,
+            )
+        except ValueError as error:
+            logger.warning("blast radius: point %s left unscored: %s", key, str(error)[:500])
+            return SeverityJudgment(point_id=key, severity=None, votes={})
+
+    ordered = sorted(points.items())
+    severities = run_bounded(
+        [lambda key=key: severity_of(key) for key, _ in ordered],
+        admitted_concurrency(project, review.reviewer.model_alias),
+    )
+    rows = [
+        blast_radius(point, severity, review)
+        for (_, point), severity in zip(ordered, severities, strict=True)
+    ]
     ranked = rank_blast(rows)
     saved = save_blast_radius(project.artifacts, ranked, code_revision=code_revision, inputs=inputs)
     return saved, ranked
