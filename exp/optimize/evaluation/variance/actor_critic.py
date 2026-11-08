@@ -62,12 +62,12 @@ from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
-from exp.optimize.evaluation.rules.agent_loop import run_bounded
 from exp.optimize.evaluation.variance.actor_critic_audit import (
     audit_flags,
     ineligible_reasons,
     rank_points,
 )
+from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.contracts import CriticAssessment, JudgeSelection
 from exp.optimize.evaluation.variance.evidence import (
     EvidencePacket,
@@ -568,7 +568,7 @@ def run_actor_critic(
         )
         gate = spec.gate
         record = None if gate is None else load_point_bar(store, gate.records)[packet.pool.branch]
-        judges = run_bounded(
+        judges = run_at_once(
             [
                 lambda j=j: _judge(
                     project, spec, packet, j, identity, sources, code_revision, search, record
@@ -585,7 +585,7 @@ def run_actor_critic(
         schedule = None
         if gate is not None and record is not None:
             chosen, schedule, record = schedule_chosen(gate, record, chosen)
-        critic_answers = run_bounded(
+        critic_answers = run_at_once(
             [
                 lambda c=c: _critic(
                     project, spec, packet, chosen, c, identity, sources, code_revision, search
@@ -595,7 +595,7 @@ def run_actor_critic(
             admitted_concurrency(project, *(row.model_alias for row in spec.critics)),
         )
         catalog = load_model_catalog(project.model_catalog_path)
-        points = run_bounded(
+        points = run_at_once(
             [
                 lambda point=point: _continue(
                     project, spec, packet, point, loader, catalog, code_revision

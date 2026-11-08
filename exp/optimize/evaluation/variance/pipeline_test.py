@@ -1464,6 +1464,9 @@ def reviewed(run: Run, dispositions: tuple[AuditDisposition, ...]) -> PipelineRe
 def pipeline(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Run, PipelineReport]]:
     """Run the whole pipeline once over a fresh two-tier grounded project."""
     with pytest.MonkeyPatch.context() as monkeypatch:
+        # Module scope outlives the per-test XDG isolation: keep the host's admission limits
+        # (and their concurrency) out of the scripted, order-sensitive run.
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path_factory.mktemp("pipeline-xdg")))
         run = wired(tmp_path_factory.mktemp("pipeline"), monkeypatch)
         spec = make_spec(run.fixture, run.rubric, run.bank)
         yield run, run.run(spec)

@@ -30,7 +30,6 @@ from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.executable.task import MiningProvenance
-from exp.optimize.evaluation.rules.agent_loop import run_bounded
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, admitted_concurrency
 from exp.optimize.evaluation.variance.behavior_adversarial import hack_signature
 from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
@@ -44,6 +43,7 @@ from exp.optimize.evaluation.variance.blast_radius import (
     save_blast_radius,
     tier_outcomes,
 )
+from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence, episode_reward
 from exp.optimize.evaluation.variance.family_stages import slot_evidence
 from exp.optimize.evaluation.variance.judge import load_assessment
@@ -265,7 +265,7 @@ def mine_blast_radius(
             return SeverityJudgment(point_id=key, severity=None, votes={})
 
     ordered = sorted(points.items())
-    severities = run_bounded(
+    severities = run_at_once(
         [lambda key=key: severity_of(key) for key, _ in ordered],
         admitted_concurrency(project, review.reviewer.model_alias),
     )

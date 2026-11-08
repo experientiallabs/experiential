@@ -54,7 +54,7 @@ from exp.optimize.evaluation.continuations.intervention import ActionInterventio
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
-from exp.optimize.evaluation.rules.agent_loop import run_bounded
+from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.episode_evidence import (
     evidence_from_branch,
     evidence_from_contrast_cell,
@@ -417,7 +417,7 @@ def judge_study(
                 return JudgedSlot(position=branch.index, gap=_reason(error))
             return _judge(project, judge, evidence, branch.index, code_revision)
 
-        slots = run_bounded(
+        slots = run_at_once(
             [lambda branch=branch: slot(branch) for branch in study.branches], concurrency
         )
         judged = JudgedStudy(study=reference, judge=judge.identity, branches=tuple(slots))

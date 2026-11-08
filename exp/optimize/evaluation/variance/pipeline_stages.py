@@ -34,7 +34,6 @@ from exp.optimize.evaluation.executable.grounded import (
 )
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.factory.authoring import author_response
-from exp.optimize.evaluation.rules.agent_loop import run_bounded
 from exp.optimize.evaluation.rules.challenges import RuntimeChallenges
 from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
@@ -49,6 +48,7 @@ from exp.optimize.evaluation.variance.actor_critic_costs import (
 )
 from exp.optimize.evaluation.variance.actor_critic_phases import carry_deferred
 from exp.optimize.evaluation.variance.bootstrap_stage import PLAN_LINE, run_bootstrapped_rules
+from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
@@ -229,7 +229,7 @@ def run_groups(
     attempts overlap instead of running five groups back to back.
     """
     aliases = spec.mining.actors
-    results = run_bounded(
+    results = run_at_once(
         [
             lambda alias=alias: run_group(
                 project, group_job(project, spec, job, alias), code_revision

@@ -998,6 +998,9 @@ def build(root: Path, monkeypatch: pytest.MonkeyPatch) -> Proof:
 def proof(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Proof]:
     """Build the offline path once; every proof below adds its own stages to the same project."""
     with pytest.MonkeyPatch.context() as monkeypatch:
+        # Module scope outlives the per-test XDG isolation: keep the host's admission limits
+        # (and their concurrency) out of the scripted, order-sensitive run.
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path_factory.mktemp("proof-xdg")))
         yield build(tmp_path_factory.mktemp("proof"), monkeypatch)
 
 
