@@ -52,7 +52,9 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
 from exp.optimize.evaluation.continuations.intervention import ActionIntervention
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import ContinuationBranch
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.agent_loop import run_bounded
 from exp.optimize.evaluation.variance.episode_evidence import (
     evidence_from_branch,
     evidence_from_contrast_cell,
@@ -360,6 +362,7 @@ def judge_study(
     *,
     configuration: JsonObject,
     code_revision: str,
+    concurrency: int = 1,
 ) -> tuple[ArtifactInput, JudgedStudy]:
     """Judge every branch of one saved continuation study once, or replay the saved judging.
 
@@ -369,6 +372,7 @@ def judge_study(
         judge: The frozen judge and its admitted settings.
         configuration: The runtime configuration the study ran under (its job's).
         code_revision: Producing source identity.
+        concurrency: Branches judged at once; each judgment holds one request in flight.
 
     Returns:
         The saved ``judged-continuation-study`` reference and its record.
@@ -396,8 +400,9 @@ def judge_study(
                 raise ValueError(f"saved judged study {identity} judges something else")
             return artifact_input(store.read(identity).manifest), saved
         prefix = reference.artifact_id.removesuffix("-result")
-        slots: list[JudgedSlot] = []
-        for branch in study.branches:
+
+        def slot(branch: ContinuationBranch) -> JudgedSlot:
+            """Judge one branch, or record why its evidence cannot be judged."""
             source = f"{prefix}-branch-{branch.index}"
             try:
                 evidence = evidence_from_branch(
@@ -409,9 +414,12 @@ def judge_study(
                     branch_source=source,
                 )
             except ValueError as error:
-                slots.append(JudgedSlot(position=branch.index, gap=_reason(error)))
-                continue
-            slots.append(_judge(project, judge, evidence, branch.index, code_revision))
+                return JudgedSlot(position=branch.index, gap=_reason(error))
+            return _judge(project, judge, evidence, branch.index, code_revision)
+
+        slots = run_bounded(
+            [lambda branch=branch: slot(branch) for branch in study.branches], concurrency
+        )
         judged = JudgedStudy(study=reference, judge=judge.identity, branches=tuple(slots))
         return _save(project, identity, judged, (reference,), code_revision), judged
 

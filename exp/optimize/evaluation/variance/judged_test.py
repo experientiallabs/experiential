@@ -8,6 +8,8 @@ and author scripts keep their order while the judge's verdicts depend only on th
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -321,3 +323,37 @@ def test_a_run_in_another_task_or_world_is_refused_before_any_judge_call(
     assert judged.branches and all(slot.episode for slot in judged.branches)
     with pytest.raises(ValueError, match="not the judge's frozen world"):
         judge_study(project, reference, judge, configuration=other_world, code_revision="test")
+
+
+def test_a_study_judged_concurrently_keeps_branch_order_and_overlaps_its_judgments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With concurrency the branches' judgments overlap, and each slot keeps its branch."""
+    project, judge, reference = _study(tmp_path, monkeypatch)
+    lock, state = threading.Lock(), {"now": 0, "peak": 0}
+
+    def verdict(evidence: JsonObject) -> str:
+        """Pass every branch while recording overlap."""
+        with lock:
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+        time.sleep(0.2)
+        with lock:
+            state["now"] -= 1
+        del evidence
+        return "pass"
+
+    route_judge(monkeypatch, verdict=verdict)
+
+    _, judged = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="test", concurrency=4
+    )
+
+    planned = len(judged.branches)
+    assert planned >= 2 and state["peak"] == planned
+    assert [slot.position for slot in judged.branches] == list(range(planned))
+    assert all(
+        slot.episode is not None and slot.episode.episode_id.endswith(f"-branch-{slot.position}")
+        for slot in judged.branches
+    )
+    assert slot_rewards(project, judged.branches, judge.identity) == (1.0,) * planned
