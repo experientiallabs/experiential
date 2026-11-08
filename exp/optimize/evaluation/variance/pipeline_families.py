@@ -439,6 +439,13 @@ class _Point:
                 MiningOutputs.model_validate(context.upstream["error-mining"].outputs).tiers,
             ),
         )
+        episodes = observed_episodes(
+            project,
+            build,
+            exposure,
+            tuple(tool.name for tool in checkpoint.task.tools),
+            context.spec.authoring.maximum_episodes,
+        )
         return build_authoring_packet(
             family_id=local_id(f"{self.tier.tier}-{self.point}"),
             task=checkpoint.task,
@@ -446,19 +453,16 @@ class _Point:
             before_state=dict(saved.before),
             public_history=saved.prefix,
             remaining_calls=remaining,
-            sources=world_sources(build),
+            sources=world_sources(
+                build,
+                (*checkpoint.task.source_trace_ids, *(row.episode_id for row in episodes)),
+            ),
             exposure=exposure,
             rule_book=rules.rulebook,
             book=load_rulebook(project, rules.rulebook),
             decision=state,
             scenarios=scenarios,
-            observed_episodes=observed_episodes(
-                project,
-                build,
-                exposure,
-                tuple(tool.name for tool in checkpoint.task.tools),
-                context.spec.authoring.maximum_episodes,
-            ),
+            observed_episodes=episodes,
             coalition=coalition,
         )
 

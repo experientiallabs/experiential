@@ -14,6 +14,7 @@ and the retrieval index is refused unless it is fit-only and scoped to world lea
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput, sha256_json, stable_id
@@ -91,8 +92,32 @@ def local_id(value: str) -> str:
     return (cleaned if cleaned[:1].isalnum() else "x" + cleaned)[:128]
 
 
-def world_sources(build: BuildOutputs) -> tuple[SourceRef, ...]:
-    """Name every world-learning trace as an authoring source."""
+WORLD_SOURCE_LIMIT = 32
+"""Most world-learning traces one authoring packet names as sources.
+
+A family scope can hold a thousand world-learning traces; naming every one in the packet (and
+again in its citable locators) outgrows an author's input limit, so a big family would refuse
+its mining rubric. The rule book already condenses the whole family.
+"""
+
+
+def world_sources(
+    build: BuildOutputs, first: Sequence[str] = (), limit: int = WORLD_SOURCE_LIMIT
+) -> tuple[SourceRef, ...]:
+    """Name at most ``limit`` world-learning traces as authoring sources.
+
+    Args:
+        build: The variance build naming the world-learning traces.
+        first: Trace ids to name before the rest when they are world-learning traces, such
+            as the start's own source traces and the observed replay episodes.
+        limit: Most sources named.
+
+    Returns:
+        The sources: ``first`` (in order, deduplicated) then the build's order, capped.
+    """
+    learning = set(build.rules_traces)
+    chosen = list(dict.fromkeys(trace for trace in first if trace in learning))
+    chosen += [trace for trace in build.rules_traces if trace not in set(chosen)]
     return tuple(
         SourceRef(
             source_id=local_id(f"trace-{trace_id}"),
@@ -100,7 +125,7 @@ def world_sources(build: BuildOutputs) -> tuple[SourceRef, ...]:
             trace_id=trace_id,
             summary="World-learning trajectory the rule book was learned from.",
         )
-        for trace_id in build.rules_traces
+        for trace_id in chosen[:limit]
     )
 
 
@@ -246,6 +271,7 @@ def mining_rubric(
         )
     exposure = load_exposure_plan(project, build.exposure)
     tools = tuple(tool.name for tool in start.task.tools)
+    episodes = observed_episodes(project, build, exposure, tools, spec.authoring.maximum_episodes)
     packet = build_authoring_packet(
         family_id=local_id(f"mining-{start.task.task_id}"),
         task=start.task,
@@ -255,15 +281,15 @@ def mining_rubric(
         ),
         public_history=start.actor.messages,
         remaining_calls=actor.remaining_calls(start.actor),
-        sources=world_sources(build),
+        sources=world_sources(
+            build, (*start.task.source_trace_ids, *(row.episode_id for row in episodes))
+        ),
         exposure=exposure,
         rule_book=rules.rulebook,
         book=load_rulebook(project, rules.rulebook),
         decision=None,
         scenarios=(),
-        observed_episodes=observed_episodes(
-            project, build, exposure, tools, spec.authoring.maximum_episodes
-        ),
+        observed_episodes=episodes,
     )
     packet_ref = save_packet(project, packet, code_revision=revision)
     identity = stable_id(
