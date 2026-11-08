@@ -80,12 +80,19 @@ from exp.simulation.mining.environment_families import (
     load_environment_families,
 )
 from exp.simulation.mining.questions import resolve_question_bank
-from exp.simulation.mining.tag_authoring import TagAuthor, TagAuthoringSpec
-from exp.simulation.mining.tag_bank_selection import AuthoredBank, BankSelectionSpec
+from exp.simulation.mining.scrub import scrub_units
+from exp.simulation.mining.tag_authoring import (
+    TagAuthor,
+    TagAuthoringSpec,
+)
+from exp.simulation.mining.tag_bank_selection import (
+    AuthoredBank,
+    BankSelectionSpec,
+)
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
 from exp.simulation.mining.tagging import DecisionCache, TagMatrix, TraceTagger
 from exp.simulation.mining.task_types import TaskTypeSpec, task_types
-from exp.simulation.mining.views import build_units
+from exp.simulation.mining.views import TraceViewName, Unit, build_units
 from exp.simulation.retrieval.contracts import RAGLineageBinding
 from exp.simulation.retrieval.state_rag import (
     StateRetrievalPolicy,
@@ -146,6 +153,12 @@ class Corpus:
 
 _CORPORA: dict[str, Corpus] = {}
 """Saved corpora already read in this process, by build plan identity and project root."""
+
+
+def _views(corpus: Corpus, trace_id: str, views: tuple[TraceViewName, ...]) -> dict[str, Unit]:
+    """Render a corpus trace's views, scrubbed exactly as its build scrubbed them."""
+    rendered: dict[str, Unit] = dict(build_units(corpus.traces[trace_id], views))
+    return scrub_units(rendered) if corpus.report.spec.credential_scrub else rendered
 
 
 def saved_corpus(context: SlotContext) -> Corpus | None:
@@ -483,7 +496,7 @@ class TagBankExecutor:
         task_view = next(row for row in corpus.report.tagging if row.plan.view == "task")
         shared = (load_tag_matrix(project, task_view.matrix),)
         for family in corpus.families:
-            rendered = [build_units(corpus.traces[t], AUTHORED_VIEWS) for t in family.members]
+            rendered = [_views(corpus, t, AUTHORED_VIEWS) for t in family.members]
             if len(rendered) < MIN_AUTHORED_MEMBERS:
                 # A question must hold in some members and fail in others, so a family this
                 # small cannot be authored; it keeps its fixed-bank tags and gets one task type.
@@ -607,8 +620,8 @@ class TaskTypeExecutor:
             )
             namer = ClusterNamer(client=resolved.client, model=resolved.snapshot)
         exemplars = {
-            trace_id: build_units(trace, ("task",))["task"].text
-            for trace_id, trace in corpus.traces.items()
+            trace_id: _views(corpus, trace_id, ("task",))["task"].text
+            for trace_id in corpus.traces
             if any(trace_id in row.members for row in corpus.families)
         }
         scoping = corpus.report.environment_families

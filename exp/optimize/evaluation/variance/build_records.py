@@ -152,6 +152,11 @@ class VarianceBuildSpec(ContractModel):
             of every identity.
         tagging_deadline_hours: Wall-clock allowance of the admitted decision transport; left
             out of every identity.
+        credential_scrub: Replace credential-shaped spans of every rendered view with typed
+            placeholders before the credential boundary, so such a trace is tagged instead of
+            refused (see :mod:`exp.simulation.mining.scrub`). On by default. False reproduces
+            the earlier behavior, refusing such traces, and the identity of a spec saved before
+            this flag existed: the flag enters the identity only when on.
     """
 
     decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
@@ -182,6 +187,7 @@ class VarianceBuildSpec(ContractModel):
     tag_families: tuple[str, ...] = ()
     concurrency: int = Field(default=DEFAULT_TAGGING_CONCURRENCY, ge=1, le=64)
     tagging_deadline_hours: float = Field(default=12.0, gt=0.0)
+    credential_scrub: bool = True
 
     def identity(self, code_revision: str) -> str:
         """Bind the registration and the producing code.
@@ -196,7 +202,11 @@ class VarianceBuildSpec(ContractModel):
             "variance-build-spec",
             {
                 "spec": sha256_json(
-                    self.model_dump(mode="json", exclude={"concurrency", "tagging_deadline_hours"})
+                    self.model_dump(
+                        mode="json",
+                        exclude={"concurrency", "tagging_deadline_hours"}
+                        | (set() if self.credential_scrub else {"credential_scrub"}),
+                    )
                 ),
                 "code": code_revision,
             },
@@ -321,6 +331,21 @@ class TagFailure(ContractModel):
     role: Role
     view: TagView
     error: str
+
+
+class CredentialScrub(ContractModel):
+    """How many credential-shaped spans the scrub replaced before the credential boundary.
+
+    Counts only: no matched value, prefix or position is ever recorded.
+
+    Attributes:
+        traces: Rendered views with at least one redaction, by view (``errors`` for the error
+            bank's observations views).
+        redactions: Spans replaced, by view and then by placeholder kind.
+    """
+
+    traces: dict[str, int]
+    redactions: dict[str, dict[str, int]]
 
 
 class ViewTagging(ContractModel):
@@ -502,6 +527,7 @@ class VarianceBuildReport(ContractModel):
         probe_ranking: Every mining-probe task ranked by its source traces' error tags.
         selected_probes: Probe tasks selected for error mining, most error-laden first.
         environment_families: Per-family scopes, when environment families were requested.
+        credential_scrub: Redaction counts, when the spec scrubs credentials.
     """
 
     spec: VarianceBuildSpec
@@ -533,6 +559,9 @@ class VarianceBuildReport(ContractModel):
     probe_ranking: tuple[TaskErrorRank, ...] = ()
     selected_probes: tuple[str, ...] = ()
     environment_families: FamilyScoping | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    credential_scrub: CredentialScrub | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 

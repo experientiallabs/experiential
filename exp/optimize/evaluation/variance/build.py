@@ -75,6 +75,7 @@ from exp.optimize.evaluation.variance.build_records import (
     MATRIX_TYPE,
     REPORT_TYPE,
     ConstructionSettings,
+    CredentialScrub,
     ProbeBinding,
     ScopeRule,
     TagFailure,
@@ -110,6 +111,7 @@ from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.environment_review import CompatibilityReviewer
 from exp.simulation.mining.questions import QuestionBank, resolve_question_bank
+from exp.simulation.mining.scrub import scrub_unit
 from exp.simulation.mining.tag_cluster_names import ClusterNamer, named_clusters
 from exp.simulation.mining.tag_clusters import (
     ClusterAdmission,
@@ -168,6 +170,7 @@ class _Prepared:
         units: Rendered units per tagged view, in trace order.
         summary: The credential-free summary.
         errors: Error bank and its observations units, when error tags are requested.
+        scrub: Redaction counts, when the spec scrubs credentials.
     """
 
     build: ProjectBuildArtifacts
@@ -178,6 +181,44 @@ class _Prepared:
     units: Mapping[TagView, tuple[Unit, ...]]
     summary: VarianceBuildPlan
     errors: tuple[QuestionBank, tuple[Unit, ...]] | None
+    scrub: CredentialScrub | None
+
+
+_ScrubTally = dict[str, tuple[int, dict[str, int]]]
+"""Scrubbed views and redactions by kind, per view label."""
+
+
+def _scrubbed(units: tuple[Unit, ...], label: str, counts: _ScrubTally | None) -> tuple[Unit, ...]:
+    """Scrub one view's units in place of the rendered ones, tallying counts only.
+
+    Args:
+        units: Rendered units of one view.
+        label: View name the counts are recorded under.
+        counts: Per-view tally (traces, redactions by kind) to extend, or None when the spec
+            does not scrub.
+
+    Returns:
+        The scrubbed units, or the rendered ones unchanged when the spec does not scrub.
+    """
+    if counts is None:
+        return units
+    scrubbed: list[Unit] = []
+    traces = 0
+    kinds: dict[str, int] = {}
+    for unit in units:
+        clean, found = scrub_unit(unit)
+        scrubbed.append(clean)
+        traces += bool(found)
+        for kind, count in found.items():
+            kinds[kind] = kinds.get(kind, 0) + count
+    counts[label] = (traces, dict(sorted(kinds.items())))
+    return tuple(scrubbed)
+
+
+def _exemplar_text(trace: Trace, spec: VarianceBuildSpec) -> str:
+    """Render one naming exemplar's observations view, scrubbed when the spec scrubs."""
+    unit = observations_view(trace)
+    return scrub_unit(unit)[0].text if spec.credential_scrub else unit.text
 
 
 def plan_variance_build(
@@ -334,6 +375,7 @@ def run_variance_build(
                 "admission": None if clusters is None else clusters[2],
                 "probe_ranking": ranking,
                 "selected_probes": selected,
+                "credential_scrub": prepared.scrub,
             }
         )
         report = scope_families(
@@ -430,22 +472,32 @@ def _prepare(
     tasks = load_task_set(store, build.task_set.artifact_id).tasks
     ordered = sorted(trace for trace in traces if trace in plan.traces)
     units_of = {trace for trace in ordered if plan.role_of(trace) in _TASK_ROLES}
+    tally: _ScrubTally | None = {} if spec.credential_scrub else None
     units: dict[TagView, tuple[Unit, ...]] = {
-        "task": tuple(
-            task_view(traces[trace]) for trace in ordered if plan.role_of(trace) in _TASK_ROLES
+        "task": _scrubbed(
+            tuple(
+                task_view(traces[trace]) for trace in ordered if plan.role_of(trace) in _TASK_ROLES
+            ),
+            "task",
+            tally,
         )
     }
     if "observations" in banks:
-        units["observations"] = tuple(
-            observations_view(traces[trace])
-            for trace in ordered
-            if plan.role_of(trace) == "world_learning"
+        units["observations"] = _scrubbed(
+            tuple(
+                observations_view(traces[trace])
+                for trace in ordered
+                if plan.role_of(trace) == "world_learning"
+            ),
+            "observations",
+            tally,
         )
     views = tuple(view_plan(view, banks[view], units[view], plan) for view in sorted(banks))
     errors = None
     asked = asked_error_bank(spec)
     if asked is not None:
-        errors = (asked, tuple(observations_view(traces[t]) for t in ordered if t in units_of))
+        rendered = tuple(observations_view(traces[t]) for t in ordered if t in units_of)
+        errors = (asked, _scrubbed(rendered, "errors", tally))
     error_plan = None if errors is None else view_plan("observations", *errors, plan)
     calls = sum(
         view.decision_calls for view in (*views, *(() if error_plan is None else (error_plan,)))
@@ -491,7 +543,15 @@ def _prepare(
         if spec.environment_families is None
         else spec.environment_families.calls(summary_roles["world_learning"].traces),
     )
-    return _Prepared(build, plan, traces, tasks, banks, units, summary, errors)
+    scrub = (
+        None
+        if tally is None
+        else CredentialScrub(
+            traces={view: row[0] for view, row in tally.items()},
+            redactions={view: row[1] for view, row in tally.items()},
+        )
+    )
+    return _Prepared(build, plan, traces, tasks, banks, units, summary, errors, scrub)
 
 
 def _embedding_reuse(
@@ -802,7 +862,7 @@ def _cluster(
     names = reference = None
     if spec.cluster_naming is not None and namer is not None:
         exemplars = {
-            trace: observations_view(prepared.traces[trace]).text
+            trace: _exemplar_text(prepared.traces[trace], spec)
             for cluster in clustering.clusters
             for trace in cluster.exemplars
         }
