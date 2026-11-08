@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections.abc import Callable, Mapping
 from copy import copy, deepcopy
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOC
 from exp.runtime.models.providers.backpressure import (
     AdmissionSlot,
     HostProviderAdmission,
+    ProviderAdmissionRefused,
     ProviderRoute,
 )
 from exp.runtime.models.providers.transport import (
@@ -54,6 +56,19 @@ wire), and ``vertex`` mints its OAuth bearer token over Google's own HTTP client
 is admitted the same way, with the local Codex CLI as the inner transport
 (:meth:`AdmittedJsonTransport.over`).
 """
+
+CAPACITY_WAIT_ROUNDS = 8
+"""Extra admission rounds after a ``capacity_wait`` refusal before it reaches the caller.
+
+A capacity refusal happens before any ledger claim, spend reservation or network I/O, so a new
+round is always safe: it only means more concurrent work than the host's in-flight limit was
+queued for one provider or alias. Each round waits up to the attempt's own timeout again after
+a short growing pause, all inside the transport deadline. A ``circuit_open`` refusal is real
+overload evidence and is never retried here.
+"""
+
+CAPACITY_WAIT_PAUSE_SECONDS = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 30.0, 30.0)
+"""Pause before each extra capacity round; the last value repeats."""
 
 _EMBEDDED_TEXT_KEYS = frozenset({"input", "text"})
 """Embedding request fields that carry text: OpenAI-wire ``input`` and Gemini part ``text``."""
@@ -138,6 +153,8 @@ class AdmittedJsonTransport(JsonHttpTransport):
         admission: HostProviderAdmission | None = None,
         route: ProviderRoute | None = None,
         spend_ceiling: OperationSpendCeiling | None = None,
+        capacity_rounds: int = CAPACITY_WAIT_ROUNDS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """Bind physical capacity, immutable receipts and an aware global deadline.
 
@@ -147,7 +164,12 @@ class AdmittedJsonTransport(JsonHttpTransport):
         the provider and alias scopes; the registry binds it per client with :meth:`for_route`,
         and an unbound transport is scoped by its endpoint host. ``spend_ceiling`` defaults to
         the ceiling installed in the current operation scope when the transport is built.
+        ``capacity_rounds`` bounds the extra admission rounds after a not-dispatched
+        ``capacity_wait`` refusal (see :data:`CAPACITY_WAIT_ROUNDS`); ``sleep`` paces them.
         """
+        if capacity_rounds < 0:
+            raise ValueError("capacity_rounds must be zero or more")
+        self._capacity_rounds, self._sleep = capacity_rounds, sleep
         if deadline.tzinfo is None:
             raise ValueError("transport deadline must be timezone-aware")
         self._inner, self._ledger, self._deadline = inner, ledger, deadline
@@ -237,13 +259,35 @@ class AdmittedJsonTransport(JsonHttpTransport):
         remaining = (self._deadline - now).total_seconds()
         if remaining <= 0:
             raise TimeoutError("transport deadline reached before physical dispatch")
-        if self._before_claim is not None:
-            self._before_claim()
         route = self._route_for(url)
-        with self._admission.admit(route, wait_seconds=min(remaining, timeout_seconds)) as slot:
-            return self._dispatch(
-                method, url, payload, retained, timeout_seconds, send, slot, idempotency_key
-            )
+        for round_index in range(self._capacity_rounds + 1):
+            if self._before_claim is not None:
+                self._before_claim()
+            admitted = False
+            try:
+                with self._admission.admit(
+                    route, wait_seconds=min(remaining, timeout_seconds)
+                ) as slot:
+                    admitted = True
+                    return self._dispatch(
+                        method, url, payload, retained, timeout_seconds, send, slot, idempotency_key
+                    )
+            except ProviderAdmissionRefused as refused:
+                if admitted:
+                    raise
+                # Raised by ``admit`` before any slot was held: no claim, reservation or I/O.
+                pause = CAPACITY_WAIT_PAUSE_SECONDS[
+                    min(round_index, len(CAPACITY_WAIT_PAUSE_SECONDS) - 1)
+                ]
+                remaining = (self._deadline - self._clock()).total_seconds() - pause
+                if (
+                    refused.reason != "capacity_wait"
+                    or round_index >= self._capacity_rounds
+                    or remaining <= 0
+                ):
+                    raise
+                self._sleep(pause)
+        raise AssertionError("unreachable: the last admission round returns or raises")
 
     def _dispatch(
         self,

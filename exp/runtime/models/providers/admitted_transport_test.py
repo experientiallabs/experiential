@@ -524,3 +524,59 @@ def test_registry_scopes_each_client_by_provider_and_alias(tmp_path: Path) -> No
     with pytest.raises(ProviderAdmissionRefused):
         client.complete(_request())
     assert len(inner.requests) == 2 and ledger.used() == 2
+
+
+def test_a_request_queued_past_the_host_limit_waits_and_dispatches_instead_of_aborting(
+    tmp_path: Path,
+) -> None:
+    """Intent: more concurrent work than the host limit queues; a capacity refusal resumes.
+
+    A capacity refusal is raised before any claim or I/O, so another admission round is safe;
+    the request dispatches once the other holder frees its slot, and a refusal that outlives
+    every round still reaches the caller with nothing dispatched.
+    """
+    admission = HostProviderAdmission(
+        tmp_path / "admission.sqlite", AdmissionLimits(provider_max_in_flight=1)
+    )
+    route = ProviderRoute(provider="openai-compatible", alias="clef")
+    holder = admission.admit(route, wait_seconds=1)
+    holder.__enter__()
+    pauses: list[float] = []
+
+    def release(seconds: float) -> None:
+        """The other in-flight request finishes during the first pause."""
+        pauses.append(seconds)
+        if len(pauses) == 1:
+            holder.__exit__(None, None, None)
+
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})])
+    transport, ledger, _ = _admitted(tmp_path, inner, admission)
+    queued = AdmittedJsonTransport(
+        inner,
+        ledger=ledger,
+        artifacts=transport._artifacts,
+        code_revision="fixture",
+        deadline=datetime.now(UTC) + timedelta(minutes=10),
+        admission=admission,
+        route=route,
+        sleep=release,
+    )
+    queued.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=0.1)
+    assert len(pauses) == 1 and len(inner.requests) == 1 and ledger.used() == 1
+
+    with admission.admit(route, wait_seconds=1):
+        starved = AdmittedJsonTransport(
+            inner,
+            ledger=ledger,
+            artifacts=transport._artifacts,
+            code_revision="fixture",
+            deadline=datetime.now(UTC) + timedelta(minutes=10),
+            admission=admission,
+            route=route,
+            capacity_rounds=2,
+            sleep=lambda _: None,
+        )
+        with pytest.raises(ProviderAdmissionRefused) as refused:
+            starved.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=0.05)
+    assert refused.value.reason == "capacity_wait"
+    assert len(inner.requests) == 1 and ledger.used() == 1
