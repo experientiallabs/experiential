@@ -689,3 +689,21 @@ def test_nullable_judge_schema_crosses_real_admission_and_settles_once(tmp_path:
     assert '["string", "null"]' in json.dumps(inner.requests[0].payload)
     assert ceiling.summary().settled_usd == pytest.approx(7 / 1000000)
     assert ceiling.summary().unknown_usd == 0
+
+
+def test_forty_concurrent_calls_settle_through_one_ledger_without_a_lock_error(
+    tmp_path: Path,
+) -> None:
+    """Tens of in-flight calls of one operation all reserve, dispatch and settle."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ceiling = _ceiling(tmp_path, _worst_case(_payload()) * 400)
+
+    def call(index: int) -> None:
+        reservation = ceiling.reserve(alias="actor", url=URL, payload=_payload())
+        ceiling.mark_dispatched(reservation, f"attempt-{index}")
+        ceiling.settle(reservation, _ok(10, 5))
+
+    with ThreadPoolExecutor(max_workers=40) as pool:
+        list(pool.map(call, range(200)))
+    assert ceiling.summary().roles[0].attempts == 200

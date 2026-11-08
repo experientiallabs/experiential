@@ -24,6 +24,7 @@ import json
 import math
 import os
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -60,6 +61,32 @@ MAXIMUM_UNPRICED_ATTEMPTS: Final = 100_000
 
 LEDGER_BUSY_TIMEOUT_MS: Final = 120_000
 """Lock wait of one ledger transaction; concurrent calls of one operation share the file."""
+
+_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+_PROCESS_LOCKS_GUARD = threading.Lock()
+
+
+def _process_lock(path: Path) -> threading.RLock:
+    """Return this process's lock serializing transactions on one ledger file."""
+    key = str(path.resolve())
+    with _PROCESS_LOCKS_GUARD:
+        return _PROCESS_LOCKS.setdefault(key, threading.RLock())
+
+
+def _begin_immediate(connection: sqlite3.Connection) -> None:
+    """Take the write lock, retrying a busy refusal until the ledger lock wait runs out."""
+    deadline = time.monotonic() + LEDGER_BUSY_TIMEOUT_MS / 1_000
+    delay = 0.05
+    while True:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as error:
+            if error.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
 
 _TOLERANCE_USD: Final = 1e-9
 _MEDIA_PART_TYPES: Final = frozenset(
@@ -349,20 +376,22 @@ class OperationSpendCeiling:
         """Run one ``BEGIN IMMEDIATE`` transaction on a fresh connection, then close it.
 
         Every concurrent call of an operation reserves, dispatches and settles through this one
-        file, so the lock wait is long enough for tens of in-flight calls to queue behind each
-        other instead of failing the whole phase on a short write burst.
+        file. Threads of this process queue on an in-process lock, so tens of in-flight calls
+        never contend for SQLite's write lock among themselves; another process still contends,
+        and a busy ``BEGIN`` (which has written nothing) is retried within the lock wait.
         """
-        connection = connect_database(self._path, busy_timeout_ms=LEDGER_BUSY_TIMEOUT_MS)
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        with _process_lock(self._path):
+            connection = connect_database(self._path, busy_timeout_ms=LEDGER_BUSY_TIMEOUT_MS)
             try:
-                yield connection
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            connection.execute("COMMIT")
-        finally:
-            connection.close()
+                _begin_immediate(connection)
+                try:
+                    yield connection
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+                connection.execute("COMMIT")
+            finally:
+                connection.close()
 
     def authorize(self, stage: str, *, ceiling_usd: float, unpriced_attempts: int = 0) -> None:
         """Append one consented stage; its latest authorization replaces its earlier ones.
