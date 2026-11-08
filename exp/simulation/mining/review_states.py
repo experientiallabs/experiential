@@ -10,8 +10,12 @@ A transport-level failure is never a review verdict. Two small machines say so e
   replayed as failed from its saved rejection, so its group goes on with its other variants.
 - :data:`GROUP_MACHINE`, per reviewed cluster: ``pending`` moves to ``reviewed`` when every draw
   of its review completed (whatever the verdict, a genuine ``uncertain`` included), or to
-  ``transient_failed`` when one of them failed transiently. Only ``reviewed`` groups are saved;
-  a ``transient_failed`` group is ``retried`` back to ``pending`` on the next run.
+  ``transient_failed`` when one of them failed transiently, or to ``unresolved`` when a draw
+  spent the review's attempt allowance (:data:`ALLOWANCE_EXHAUSTED`) or the reviewer failed
+  unrecoverably. Only ``reviewed`` groups are saved; a ``transient_failed`` group is ``retried``
+  back to ``pending`` on the next run and holds the record back (:class:`FamiliesPending`). An
+  ``unresolved`` group is reported with its reason in the record while every other cluster goes
+  on; it is not saved either, so a later review draws it again.
 
 :func:`is_transient` names the transport-level failures: what the shared retry classifier calls
 retryable (transport errors, retryable HTTP statuses such as 409 and 503, timeouts, OS errors),
@@ -51,12 +55,17 @@ DRAW_MACHINE = StateMachine(
 retried on the next run."""
 
 
+ALLOWANCE_EXHAUSTED = "attempt_budget_exhausted"
+"""The :func:`is_transient` reason of a draw that spent its whole attempt allowance."""
+
+
 class GroupState(StrEnum):
     """States of one reviewed cluster."""
 
     PENDING = "pending"
     REVIEWED = "reviewed"
     TRANSIENT_FAILED = "transient_failed"
+    UNRESOLVED = "unresolved"
 
 
 GROUP_MACHINE = StateMachine(
@@ -67,9 +76,11 @@ GROUP_MACHINE = StateMachine(
         (GroupState.PENDING, "reviewed", GroupState.REVIEWED),
         (GroupState.PENDING, "failed_transiently", GroupState.TRANSIENT_FAILED),
         (GroupState.TRANSIENT_FAILED, "retried", GroupState.PENDING),
+        (GroupState.PENDING, "unresolved", GroupState.UNRESOLVED),
     ),
 )
-"""One cluster's review: reviewed with its verdict, or failed transiently and retried."""
+"""One cluster's review: reviewed with its verdict, failed transiently and retried, or left
+unresolved (allowance spent or reviewer failed unrecoverably) while the other clusters go on."""
 
 
 class TransientReviewFailure(RuntimeError):
@@ -118,7 +129,7 @@ def is_transient(error: BaseException) -> str | None:
     current: BaseException | None = error
     while current is not None:
         if isinstance(current, DispatchCapExhaustedError):
-            return "attempt_budget_exhausted"
+            return ALLOWANCE_EXHAUSTED
         if isinstance(current, Exception):
             classification = classify_retry(current)
             if classification.retryable:

@@ -28,6 +28,7 @@ from exp.optimize.evaluation.variance.family_simulators import (
     load_family_simulator,
 )
 from exp.simulation.mining.environment_families import admitted_families, load_environment_families
+from exp.simulation.rules.tool_names import ToolNames
 
 
 class BootstrapLimits(ContractModel):
@@ -137,7 +138,7 @@ def select_bootstrap_families(
         scope = scoping.scope(family_id)
         if (
             len(scope.rules_traces) > limits.maximum_family_traces
-            or len(scope.tools) > limits.maximum_family_tools
+            or ToolNames(scope.tools).distinct() > limits.maximum_family_tools
         ):
             raise ValueError(f"family {family_id} exceeds its registered trace or tool bound")
         simulator = by_id.get(family_id) or family_simulator(

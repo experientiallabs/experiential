@@ -14,6 +14,12 @@ variants and a reconcile:
 - **uncertain**: the group is kept as an :class:`UncertainGroup` with its open questions. It is
   never forced into a family; :func:`admitted_families` admits one only when the caller names it.
 
+A cluster whose review cannot finish because a draw spent its attempt allowance, or because the
+reviewer failed unrecoverably, is **unresolved**: it is listed in the record's ``unresolved`` with
+its reason, never forced into a family or kept as an uncertain group, and every other cluster is
+still reviewed and admitted. A transport failure that should retry still holds the whole record
+back (:class:`~exp.simulation.mining.review_states.FamiliesPending`).
+
 Only declared eligible traces (world learning) are reviewed or rendered. A clustering holding a
 held-out trace is refused, and a held-out task is never attached. The record is saved as a
 content-addressed ``environment-families`` artifact whose identity binds the clustering, the
@@ -46,6 +52,7 @@ from exp.simulation.mining.environment_review import (
     ContractNote,
     GroupReview,
     OpenQuestion,
+    ReviewAbandoned,
     StateDomain,
     group_contracts,
     reconcile,
@@ -53,6 +60,7 @@ from exp.simulation.mining.environment_review import (
     review_variant,
 )
 from exp.simulation.mining.review_states import (
+    ALLOWANCE_EXHAUSTED,
     GROUP_MACHINE,
     FamiliesPending,
     GroupState,
@@ -211,6 +219,8 @@ class EnvironmentFamilies(ContractModel):
         families: Compatible families, in review order.
         uncertain: Uncertain groups, in review order.
         skipped: Clusters with no eligible member, with why.
+        unresolved: Clusters whose review could not finish (attempt allowance spent or the
+            reviewer failed unrecoverably), with why; never families, never admitted.
     """
 
     protocol: str = ENVIRONMENT_REVIEW_PROTOCOL
@@ -221,6 +231,7 @@ class EnvironmentFamilies(ContractModel):
     families: tuple[EnvironmentFamily, ...] = ()
     uncertain: tuple[UncertainGroup, ...] = ()
     skipped: dict[str, str] = Field(default_factory=dict)
+    unresolved: dict[str, str] = Field(default_factory=dict)
 
     def identity(self) -> str:
         """Return the content-addressed identity of this record."""
@@ -310,7 +321,10 @@ def review_environment_families(
     ``reviewed`` and, with a ``store``, saved under ``identity`` and its cluster, so a rerun
     replays it with no call. A cluster with a draw that failed at the transport level is
     ``transient_failed``: nothing of it is kept, every other cluster is still reviewed, and
-    :class:`FamiliesPending` is raised at the end so no families record is written.
+    :class:`FamiliesPending` is raised at the end so no families record is written. A cluster
+    whose draw spent its attempt allowance, or whose reviewer failed unrecoverably
+    (:class:`ReviewAbandoned`), is ``unresolved``: nothing of it is kept or saved, its reason is
+    recorded in ``unresolved``, and the record is still returned with every other cluster.
 
     Args:
         clustering: The clustering whose clusters are reviewed.
@@ -340,6 +354,7 @@ def review_environment_families(
     uncertain: list[UncertainGroup] = []
     skipped: dict[str, str] = {}
     pending: dict[str, str] = {}
+    unresolved: dict[str, str] = {}
     ident = clustering.identity()
     for cluster in clustering.clusters:
         members = tuple(sorted(t for t in cluster.members if t in allowed))
@@ -375,8 +390,18 @@ def review_environment_families(
                 left,
             )
         except TransientReviewFailure as failure:
+            if failure.reason == ALLOWANCE_EXHAUSTED:
+                GROUP_MACHINE.move(subject, state, "unresolved", journal)
+                unresolved[cluster.cluster_id] = (
+                    f"a review draw spent its whole attempt allowance ({failure.reason})"
+                )
+                continue
             GROUP_MACHINE.move(subject, state, "failed_transiently", journal)
             pending[cluster.cluster_id] = failure.reason
+            continue
+        except ReviewAbandoned as error:
+            GROUP_MACHINE.move(subject, state, "unresolved", journal)
+            unresolved[cluster.cluster_id] = str(error)
             continue
         GROUP_MACHINE.move(subject, state, "reviewed", journal)
         outcome = GroupOutcome(
@@ -397,6 +422,7 @@ def review_environment_families(
         families=attached,
         uncertain=tuple(uncertain),
         skipped=skipped,
+        unresolved=unresolved,
     )
 
 
@@ -414,6 +440,9 @@ def environment_families(
     inputs: Sequence[ArtifactInput] = (),
 ) -> tuple[EnvironmentFamilies, ArtifactInput]:
     """Replay the saved families of exactly this clustering, reviewer and evidence, or review.
+
+    A record with unresolved clusters is saved under its content identity only, never under the
+    replay identity, so the next call reviews those clusters again (the reviewed ones replay).
 
     Returns:
         The record and its saved artifact.
@@ -438,6 +467,11 @@ def environment_families(
         journal=TransitionJournal(store.project_directory / "environment-review" / "moves.jsonl"),
         code_revision=code_revision,
     )
+    if record.unresolved:
+        saved = persist_environment_families(
+            store, record, code_revision=code_revision, inputs=inputs
+        )
+        return record, saved
     return record, write_record(
         store, identity, FAMILIES_TYPE, "families.json", record, code_revision, inputs
     )

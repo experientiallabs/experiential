@@ -351,13 +351,14 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.authors:AUTHORS_PROTOCOL",
-        "variance-authors-v7",
+        "variance-authors-v8",
         (
             "exp.optimize.evaluation.variance.authors",
             "exp.optimize.evaluation.variance.contracts",
             "exp.optimize.evaluation.variance.coalition",
+            "exp.simulation.rules.tool_names",
         ),
-        "6910fc1b9046dfea05b195e235fb0ecbe008fce4b69c317d0c13597af6cc3c64",
+        "a985d23d51a987dc308feb8b5965196c39694eaad6c1eb75cfffd815abbbc6ce",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.rollout_ingest:ROLLOUT_INGEST_CONTRACT",

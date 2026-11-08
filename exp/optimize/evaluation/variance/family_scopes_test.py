@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.tasks import TaskCase, load_task_set
+from exp.common.tasks import TaskCase, ToolSchema, load_task_set
+from exp.common.traces import Trace
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
 from exp.optimize.evaluation.variance.build_records import (
     ConstructionSettings,
@@ -32,6 +33,7 @@ from exp.simulation.mining.environment_families import (
     review_environment_families,
 )
 from exp.simulation.mining.environment_families_test import (
+    _trace,
     answer,
     clustering,
     file_trace,
@@ -43,6 +45,7 @@ from exp.simulation.mining.environment_review import CompatibilityReviewer, Comp
 from exp.simulation.mining.tag_clusters import ClusteringSpec
 from exp.simulation.mining.tagging import TagMatrix, TagRow
 from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.rules.contracts_test import call, result
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 CLUSTERING = ClusteringSpec(min_clusters=1, max_clusters=1)
@@ -289,3 +292,69 @@ def test_a_probe_is_never_placed_in_a_family_whose_contracts_lack_its_tools() ->
 
     assert placements[0].family_id is None and not placed
     assert placements[0].cluster_id == "c00" and "covering" in placements[0].reason
+
+
+def test_a_probe_is_placed_across_tool_name_spellings_but_not_for_a_different_tool() -> None:
+    """A probe declaring ``Write``/``Bash`` lands in a family whose contracts name
+    ``write_file``/``bash``; a probe that also declares a tool the family never saw is refused."""
+    traces = {name: _shell_trace(name) for name in ("s1", "s2")}
+    fitted = clustering({"c00": ("s1", "s2")})
+    _, bound = reviewer(lambda members, variant: answer("compatible", members))
+    record = review_environment_families(fitted, bound, traces=traces, eligible=traces, held_out=())
+    assert set(record.families[0].tool_contracts) == {"bash", "write_file"}
+
+    def probe(task_id: str, tools: tuple[str, ...]) -> TaskCase:
+        """A mining probe declaring exactly these tool names over one tagged source trace."""
+        return TaskCase(
+            task_id=task_id,
+            lineage_group_id="probe-lineage",
+            partition="fit",
+            instruction="edit and run",
+            tools=tuple(
+                ToolSchema(name=name, description=name, input_schema={"type": "object"})
+                for name in tools
+            ),
+            source_trace_ids=("probe-src",),
+            workload_weight=1,
+            origin="mined",
+        )
+
+    plan = ExposurePlan(
+        bindings=ref("bindings"),
+        seed=0,
+        probe_fraction=0.2,
+        roles={"probe-lineage": "mining_probes"},
+        traces={"probe-src": "probe-lineage"},
+    )
+    matrix = TagMatrix(
+        view="task",
+        bank_id="fixture",
+        bank_version=1,
+        question_ids=("q0",),
+        rows=(TagRow(trace_id="probe-src", unit_hash="fixture", values=(1.0,)),),
+    )
+    same = probe("task-7baf", ("Write", "Bash"))
+    other = probe("deploys", ("Write", "Deploy"))
+
+    placements, placed = _place(plan, (same, other), fitted, (matrix,), record.families)
+
+    family = record.families[0].family_id
+    assert [row.family_id for row in placements] == [family, None]
+    assert [task.task_id for task in placed[family]] == ["task-7baf"]
+    assert placed[family][0].tools == ("Bash", "Write")  # stored names keep their spelling
+    assert "covering" in placements[1].reason
+
+
+def _shell_trace(trace_id: str) -> Trace:
+    """A coding episode: write a file, then run it."""
+    return _trace(
+        trace_id,
+        "Write and run a script",
+        (
+            call(f"{trace_id}c1", 0, "write_file", {"path": "a.sh", "text": "ls"}, "k1"),
+            result(f"{trace_id}r1", 1, "write_file", {"written": 2}, "k1"),
+            call(f"{trace_id}c2", 2, "bash", {"command": "sh a.sh"}, "k2"),
+            result(f"{trace_id}r2", 3, "bash", "a.sh", "k2"),
+        ),
+        ("write_file", "bash"),
+    )

@@ -433,6 +433,7 @@ class FamilyScoping(ContractModel):
         uncertain: Uncertain groups reported and left out of training.
         admitted_uncertain: Uncertain groups the spec explicitly admitted.
         left_out: Admitted families without a scope, with why.
+        unresolved: Clusters whose review could not finish, with why; left out of training.
         placements: Every mining-probe task's placement.
     """
 
@@ -441,6 +442,7 @@ class FamilyScoping(ContractModel):
     uncertain: tuple[str, ...] = ()
     admitted_uncertain: tuple[str, ...] = ()
     left_out: dict[str, str] = Field(default_factory=dict)
+    unresolved: dict[str, str] = Field(default_factory=dict)
     placements: tuple[ProbePlacement, ...] = ()
 
     def scope(self, family_id: str) -> FamilyScope:
