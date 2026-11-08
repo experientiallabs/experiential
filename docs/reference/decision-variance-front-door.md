@@ -38,9 +38,10 @@ consent once and runs or resumes.
 
 ## Phases
 
-1. `project-build`: `exp build --non-interactive --yes` runs in a subprocess over the trace
-   source. Consent to the plan digest is its confirmation, including an embedding estimate
-   above the build budget or an undefined one. A `front-door-source` record binds the source
+1. `project-build`: `exp build --non-interactive --yes --skip-learning` runs in a subprocess
+   over the trace source. Consent to the plan digest is its confirmation, including an
+   embedding estimate above the build budget or an undefined one; the build's default learning
+   pass, which the plan does not price, is skipped. A `front-door-source` record binds the source
    digest to the build it produced, so a rerun over the same source skips it. On a project with
    no completed build, the plan prices only this phase; every later phase is shown blocked and
    is priced on the way, against the cumulative ceiling, once the build exists.

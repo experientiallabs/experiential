@@ -84,4 +84,5 @@ def test_a_pending_build_runs_exp_build_non_interactively(
     (command,) = commands
     assert command[1:4] == ["-m", "exp", "build"]
     assert "--non-interactive" in command and "--yes" in command
+    assert "--skip-learning" in command  # the plan never priced exp build's learning pass
     assert command[command.index("--traces") + 1] == str(source.path)
