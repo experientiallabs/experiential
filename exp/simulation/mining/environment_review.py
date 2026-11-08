@@ -114,6 +114,15 @@ class ReviewerError(RuntimeError):
     """A review draw could not be bought or replayed."""
 
 
+class ReviewAbandoned(ReviewerError):
+    """The group's review cannot go on: its allowance is spent or the reviewer failed for good.
+
+    Unlike a plain :class:`ReviewerError`, which fails one variant's draw, this stops the whole
+    group; :func:`~exp.simulation.mining.environment_families.review_environment_families` then
+    reports that cluster as unresolved and reviews the others.
+    """
+
+
 class ReviewDraw(Protocol):
     """Buys or replays one review draw, saved under its identity."""
 
@@ -349,7 +358,12 @@ def group_packet(
         bucket_id = f"b{position:0{width}d}"
         buckets[bucket_id] = tuple(trace.trace_id for trace in rows)
         called = sorted(
-            {name for trace in rows for name, row in parse_tool_contracts([trace]).items() if row.calls}
+            {
+                name
+                for trace in rows
+                for name, row in parse_tool_contracts([trace]).items()
+                if row.calls
+            }
         )
         outcomes: dict[str, int] = {}
         for trace in rows:
@@ -486,9 +500,7 @@ def review_variant(
         ModelMessage(role="system", content=system),
         ModelMessage(role="user", content=json.dumps(packet, sort_keys=True)),
     ]
-    return _loop(
-        reviewer, messages, sorted(by_id), shown, by_id, variant, spec, scope, {}, buckets
-    )
+    return _loop(reviewer, messages, sorted(by_id), shown, by_id, variant, spec, scope, {}, buckets)
 
 
 def reconcile(
@@ -582,6 +594,8 @@ def _loop(
         turns += 1
         try:
             response = reviewer.draw(request, identity=identity)
+        except ReviewAbandoned:
+            raise
         except ReviewerError as error:
             failure = _reason(error)
             break
@@ -590,7 +604,9 @@ def _loop(
         except Exception as error:
             transient = is_transient(error)
             if transient is None:
-                raise
+                raise ReviewAbandoned(
+                    f"the reviewer failed unrecoverably: {_reason(error)}"
+                ) from error
             raise TransientReviewFailure(identity, transient) from error
         calls = response.output.tool_calls
         if not calls:

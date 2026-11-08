@@ -25,6 +25,7 @@ from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.traces import Trace
 from exp.common.traces.trace import TraceOutcome, TraceSource
 from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.mining.environment_families import (
     FAMILIES_TYPE,
     GROUP_TYPE,
@@ -478,6 +479,46 @@ def test_a_transient_503_leaves_the_group_pending_and_the_next_run_reviews_it(
 
     _, refusing = reviewer(by_tools, refuse=True)
     assert run(refusing) == (record, reference)
+
+
+def test_one_cluster_spending_its_review_allowance_is_unresolved_and_the_other_is_admitted(
+    tmp_path: Path,
+) -> None:
+    """A two-cluster build where the file cluster's reviewers spend their attempt allowance
+    still admits the order family and reports the file cluster as unresolved with its reason;
+    nothing of the unresolved cluster is saved, so the next run reviews it again."""
+    store = ProjectStore(tmp_path, "case").artifacts
+    fitted = clustering({"c00": ORDERS, "c01": FILES})
+    script, bound = reviewer(by_tools)
+
+    def capped(request: ModelRequest, *, identity: str) -> ModelResponse:
+        """Spend the attempt allowance on every draw about the file cluster."""
+        packet = json.loads(request.messages[1].content or "{}")
+        if {"f1"} & {row["trace_id"] for row in packet["members"]}:
+            raise RuntimeError("draw gave up") from DispatchCapExhaustedError("cap spent")
+        return script(request, identity=identity)
+
+    def run(bound: CompatibilityReviewer) -> tuple[EnvironmentFamilies, ArtifactInput]:
+        """Review, or replay, both clusters."""
+        return environment_families(
+            store,
+            fitted,
+            bound,
+            traces=TRACES,
+            eligible=ORDERS + FILES,
+            held_out=(),
+            code_revision="test",
+        )
+
+    record, reference = run(CompatibilityReviewer(draw=capped, model=SNAPSHOT))
+
+    assert [f.cluster_id for f in admitted_families(record)] == ["c00"] and not record.uncertain
+    assert set(record.unresolved) == {"c01"} and "allowance" in record.unresolved["c01"]
+    assert store.read(reference.artifact_id).manifest.artifact_type == FAMILIES_TYPE
+    first = len(script.requests)
+    again, _ = run(bound)
+    assert {f.cluster_id for f in again.families} == {"c00", "c01"} and not again.unresolved
+    assert all("f1" in (r.messages[1].content or "") for r in script.requests[first:])
 
 
 def test_traces_outside_the_fit_are_placed_by_the_mixture_over_their_answered_columns() -> None:

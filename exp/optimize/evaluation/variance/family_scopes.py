@@ -248,6 +248,7 @@ def scope_families(
         uncertain=tuple(g.group_id for g in record.uncertain if g.group_id not in admitted_ids),
         admitted_uncertain=tuple(sorted(admitted_ids)),
         left_out=left_out,
+        unresolved=dict(record.unresolved),
         placements=placements,
     )
     return report.model_copy(update={"environment_families": scoping})
