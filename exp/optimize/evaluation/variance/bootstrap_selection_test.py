@@ -202,10 +202,10 @@ def test_selected_tasks_preserve_scope_without_initial_job(
         )
 
 
-def test_frozen_family_scope_drift_and_excessive_learning_are_refused(
+def test_frozen_family_scope_drift_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Knowledge from another world or an over-bound family never reaches bootstrap roles."""
+    """Knowledge from another world never reaches bootstrap roles."""
     project, spec, bound = preparation_fixture(tmp_path, monkeypatch)
     report = saved_build(project, spec, bound)
     row = select_bootstrap_families(project, report, spec.bootstrap, spec.limits)[0]
@@ -213,12 +213,35 @@ def test_frozen_family_scope_drift_and_excessive_learning_are_refused(
     ref = save_family_simulator(project.artifacts, wrong, code_revision="test")
     with pytest.raises(ValueError, match="saved scope"):
         select_bootstrap_families(project, report, spec.bootstrap, spec.limits, simulators=(ref,))
-    with pytest.raises(ValueError, match="trace or tool bound"):
+
+
+def test_a_family_over_the_trace_bound_learns_from_a_bounded_subset_instead_of_refusing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Intent: a 1,000-member family still bootstraps; rules learn from at most the bound.
+
+    The family keeps every member for its corpus and world; only rule learning is bounded, by
+    the stratified subset the task types chose or else an evenly spaced one.
+    """
+    project, spec, bound = preparation_fixture(tmp_path, monkeypatch)
+    report = saved_build(project, spec, bound)
+    limits = spec.limits.model_copy(update={"maximum_family_traces": 1})
+    rows = select_bootstrap_families(project, report, spec.bootstrap, limits)
+    assert rows
+    for row in rows:
+        family = row.spec.families[0].family
+        full = report.environment_families.scope(row.scope.family_id).rules_traces
+        assert len(family.learning_traces) == 1 and set(family.learning_traces) <= set(full)
+        assert family.member_traces == row.scope.members
+    target = rows[0].scope.family_id
+    members = report.environment_families.scope(target).rules_traces
+    chosen = select_bootstrap_families(
+        project, report, spec.bootstrap, limits, learning_traces={target: (members[-1],)}
+    )
+    assert chosen[0].spec.families[0].family.learning_traces == (members[-1],)
+    with pytest.raises(ValueError, match="within maximum_family_traces"):
         select_bootstrap_families(
-            project,
-            report,
-            spec.bootstrap,
-            spec.limits.model_copy(update={"maximum_family_traces": 1}),
+            project, report, spec.bootstrap, limits, learning_traces={target: members[:2]}
         )
 
 

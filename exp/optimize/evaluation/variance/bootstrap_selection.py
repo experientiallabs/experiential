@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from pydantic import Field
 
@@ -69,6 +69,7 @@ def select_bootstrap_families(
     *,
     task_ids: Sequence[str] = (),
     simulators: Sequence[ArtifactInput] = (),
+    learning_traces: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[SelectedBootstrap, ...]:
     """Build one exact registration per selected family without authors, captures or fake jobs.
 
@@ -76,6 +77,12 @@ def select_bootstrap_families(
     explicit list, the build's ranked selection is taken in order up to the task bound; unplaced
     probes are omitted. Every runtime uses its own family's world and tag binding. A supplied
     frozen simulator must match that exact saved scope before its learned knowledge is reused.
+
+    ``maximum_family_traces`` bounds how many member traces one family's rules are learned
+    from, since rule-learning calls scale with trajectories. A family with more members keeps
+    every member in its corpus, index and world, but learns from ``learning_traces[family]``
+    (a stratified subset chosen from its task types) or, without one, an evenly spaced subset
+    of exactly that size; it is never refused for size.
 
     Raises:
         ValueError: A requested task is ineligible or unplaced, no tasks are selected, or a
@@ -136,11 +143,13 @@ def select_bootstrap_families(
     rows: list[SelectedBootstrap] = []
     for family_id in family_ids:
         scope = scoping.scope(family_id)
-        if (
-            len(scope.rules_traces) > limits.maximum_family_traces
-            or ToolNames(scope.tools).distinct() > limits.maximum_family_tools
-        ):
-            raise ValueError(f"family {family_id} exceeds its registered trace or tool bound")
+        tools = ToolNames(scope.tools).distinct()
+        if tools > limits.maximum_family_tools:
+            raise ValueError(
+                f"family {family_id} exposes {tools} tools, over maximum_family_tools "
+                f"{limits.maximum_family_tools}"
+            )
+        scope = _learning_scope(scope, (learning_traces or {}).get(family_id), limits)
         simulator = by_id.get(family_id) or family_simulator(
             families[family_id], scope, scoping.families
         )
@@ -167,6 +176,34 @@ def select_bootstrap_families(
         )
         rows.append(SelectedBootstrap(scope=scope, simulator=simulator, spec=spec))
     return tuple(rows)
+
+
+def _learning_scope(
+    scope: FamilyScope, chosen: Sequence[str] | None, limits: BootstrapLimits
+) -> FamilyScope:
+    """Return the scope whose rules learn from at most ``maximum_family_traces`` members.
+
+    Raises:
+        ValueError: An explicit subset repeats, leaves the family's traces or exceeds the bound.
+    """
+    bound, members = limits.maximum_family_traces, scope.rules_traces
+    if chosen is not None:
+        picked = tuple(chosen)
+        if (
+            not picked
+            or len(set(picked)) != len(picked)
+            or set(picked) - set(members)
+            or len(picked) > bound
+        ):
+            raise ValueError(
+                f"learning traces of family {scope.family_id} must be distinct member traces "
+                "within maximum_family_traces"
+            )
+    elif len(members) > bound:
+        picked = tuple(members[(index * len(members)) // bound] for index in range(bound))
+    else:
+        return scope
+    return scope.model_copy(update={"rules_traces": picked})
 
 
 def _require_scope(simulator: FamilySimulator, scope: FamilyScope) -> None:

@@ -90,6 +90,7 @@ from exp.optimize.evaluation.variance.frontdoor_task_types import (
     saved_slot,
     saved_task_types,
     task_type_preparation,
+    task_type_selection,
 )
 from exp.optimize.evaluation.variance.pipeline import (
     StageExecutor,
@@ -185,7 +186,8 @@ def plan_front_door(
         _slot_stages(project, spec, "after-families", code_revision, dependencies, dict(saved))
     )
     report: BootstrapPreparationReport | None = None
-    effective = effective_spec(project, spec, code_revision)
+    bound = _bound_spec(project, spec, code_revision)
+    effective, selection = (None, ()) if bound is None else bound
     if effective is None:
         preparation = FrontDoorStage(
             stage="bootstrap-preparation",
@@ -201,6 +203,8 @@ def plan_front_door(
         preparation, report, prepared = _preparation_stage(project, spec, code_revision)
         if prepared is not None:
             saved["preparation"] = prepared
+        elif selection:
+            preparation = preparation.model_copy(update={"lines": (*preparation.lines, *selection)})
     else:
         preparation = FrontDoorStage(
             stage="bootstrap-preparation",
@@ -331,6 +335,14 @@ def effective_spec(
     is registered per task type. Unchanged without those slots; None until a configured one of
     them is saved, since every start depends on it.
     """
+    bound = _bound_spec(project, spec, code_revision)
+    return None if bound is None else bound[0]
+
+
+def _bound_spec(
+    project: ProjectStore, spec: FrontDoorSpec, code_revision: str
+) -> tuple[FrontDoorSpec, tuple[str, ...]] | None:
+    """Return :func:`effective_spec` and the task-type start selection's plan lines."""
     preparation = spec.preparation
     recall = spec.slots.get("state-rag")
     if recall is not None:
@@ -338,6 +350,7 @@ def effective_spec(
         if bound is None:
             return None
         preparation = bound
+    lines: tuple[str, ...] = ()
     typed = spec.slots.get("task-types")
     if typed is not None:
         context = SlotContext(project, preparation, code_revision)
@@ -348,8 +361,9 @@ def effective_spec(
         types = saved_task_types(context, typed)
         if types is None:
             return None
+        _, _, lines = task_type_selection(context, types)
         preparation = task_type_preparation(context, types)
-    return spec.model_copy(update={"preparation": preparation})
+    return spec.model_copy(update={"preparation": preparation}), lines
 
 
 def run_directory(project: ProjectStore, spec: FrontDoorSpec) -> Path:

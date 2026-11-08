@@ -91,6 +91,9 @@ class BootstrapPreparationSpec(ContractModel):
         limits: Finite family and task bounds enforced before bootstrap calls.
         task_ids: Explicit selected probe IDs, or empty for ranked compatible probes up to the cap.
         simulators: Saved shared simulators whose exact scoped knowledge should be reused.
+        learning_traces: Per family, the member traces its rules are learned from when the
+            family has more members than ``limits.maximum_family_traces``; a larger family
+            without an entry learns from an evenly spaced subset of that size.
     """
 
     build: BuildSettings
@@ -98,6 +101,7 @@ class BootstrapPreparationSpec(ContractModel):
     limits: BootstrapLimits
     task_ids: tuple[str, ...] = ()
     simulators: tuple[ArtifactInput, ...] = ()
+    learning_traces: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _preparable(self) -> Self:
@@ -371,6 +375,7 @@ def plan_bootstrap_preparation(
             spec.limits,
             task_ids=spec.task_ids,
             simulators=spec.simulators,
+            learning_traces=spec.learning_traces,
         )
     )
     complete: list[str] = []
@@ -422,8 +427,9 @@ def plan_bootstrap_preparation(
                 )
                 components.extend(rows)
                 lines.append(
-                    f"Family {row.family.family_id}: {explanation}; "
-                    f"learned once for {len(missing)} pending tasks."
+                    f"Family {row.family.family_id}: {explanation}; learned once from "
+                    f"{len(row.family.learning_traces)} of {len(family.scope.members)} member "
+                    f"traces for {len(missing)} pending tasks."
                 )
             components.extend(_role_costs(project, batch, len(missing)))
             components.extend(_validation_costs(project, batch, len(missing), family))
@@ -582,6 +588,7 @@ def _run(
         spec.limits,
         task_ids=spec.task_ids,
         simulators=spec.simulators,
+        learning_traces=spec.learning_traces,
     )
     exposure = load_exposure_plan(project, report.exposure)
     traces = {
