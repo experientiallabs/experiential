@@ -39,6 +39,7 @@ from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
+from exp.common.auth.paths import provider_data_dir
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
@@ -61,6 +62,7 @@ from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.rules.agent_loop import run_bounded
 from exp.optimize.evaluation.variance.actor_critic_audit import (
     audit_flags,
     ineligible_reasons,
@@ -112,6 +114,10 @@ from exp.optimize.evaluation.variance.rewards import (
 )
 from exp.optimize.evaluation.variance.role_prompts import PromptDistribution, assign_prompts
 from exp.optimize.evaluation.variance.roles import draw_critic, draw_judge, role_protocol_sha256
+from exp.runtime.models.providers.backpressure import (
+    ADMISSION_LIMITS_NAME,
+    load_admission_limits,
+)
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
@@ -562,9 +568,14 @@ def run_actor_critic(
         )
         gate = spec.gate
         record = None if gate is None else load_point_bar(store, gate.records)[packet.pool.branch]
-        judges = tuple(
-            _judge(project, spec, packet, j, identity, sources, code_revision, search, record)
-            for j in range(len(spec.judges))
+        judges = run_bounded(
+            [
+                lambda j=j: _judge(
+                    project, spec, packet, j, identity, sources, code_revision, search, record
+                )
+                for j in range(len(spec.judges))
+            ],
+            admitted_concurrency(project, *(row.model_alias for row in spec.judges)),
         )
         chosen = tuple(
             sorted({p.step for d in judges if d.selection is not None for p in d.selection.points})
@@ -574,14 +585,26 @@ def run_actor_critic(
         schedule = None
         if gate is not None and record is not None:
             chosen, schedule, record = schedule_chosen(gate, record, chosen)
-        critic_answers = tuple(
-            _critic(project, spec, packet, chosen, c, identity, sources, code_revision, search)
-            for c in range(len(spec.critics))
+        critic_answers = run_bounded(
+            [
+                lambda c=c: _critic(
+                    project, spec, packet, chosen, c, identity, sources, code_revision, search
+                )
+                for c in range(len(spec.critics))
+            ],
+            admitted_concurrency(project, *(row.model_alias for row in spec.critics)),
         )
         catalog = load_model_catalog(project.model_catalog_path)
-        points = tuple(
-            _continue(project, spec, packet, point, loader, catalog, code_revision)
-            for point in chosen
+        points = run_bounded(
+            [
+                lambda point=point: _continue(
+                    project, spec, packet, point, loader, catalog, code_revision
+                )
+                for point in chosen
+            ],
+            admitted_concurrency(
+                project, spec.initial.actor_alias, spec.episode_judge.settings.model_alias
+            ),
         )
         group_tier = actor_tier(
             spec.actor_tier,
@@ -637,6 +660,44 @@ def run_actor_critic(
             files={"report.json": report},
         )
         return report
+
+
+def admitted_concurrency(project: ProjectStore, *aliases: str) -> int:
+    """Return how many independent calls on ``aliases`` may run at once on this host.
+
+    Every physical request waits for a host-wide admission slot of its alias and of its
+    connection's provider (``provider-admission.toml``, defaults 4 and 8); a wait longer than
+    the request's own timeout refuses it and stops the whole run. Draws, critics and point
+    continuations each hold at most one request in flight, so running no more of them than the
+    smallest limit they share keeps every slot wait short instead of serialising thousands of
+    calls.
+
+    A host that registers no limits file runs them one at a time, as before: concurrency is
+    opted into by registering the limits it must respect.
+
+    Args:
+        project: Project whose catalog names each alias's connection.
+        aliases: The catalog aliases the calls use.
+
+    Returns:
+        At least one.
+    """
+    path = provider_data_dir() / ADMISSION_LIMITS_NAME
+    if not path.exists():
+        return 1
+    limits = load_admission_limits(path)
+    catalog = load_model_catalog(project.model_catalog_path)
+    bounds = [limits.provider_max_in_flight] if not aliases else []
+    for alias in aliases:
+        record = catalog.models.get(alias)
+        connection = None if record is None else catalog.connections.get(record.connection)
+        provider = (
+            limits.provider_max_in_flight
+            if connection is None
+            else limits.provider_limit(connection.provider)
+        )
+        bounds += [limits.alias_limit(alias), provider]
+    return max(1, min(bounds))
 
 
 def export_point_harbor(

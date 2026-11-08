@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from exp.common.auth.paths import provider_data_dir
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
 from exp.common.models import BillingSource, ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
@@ -21,6 +24,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
     ActorTier,
     PointResult,
     _pick,
+    admitted_concurrency,
     policy_groups,
     run_actor_critic,
 )
@@ -43,6 +47,7 @@ from exp.optimize.evaluation.variance.judged_test import (
 from exp.optimize.evaluation.variance.rewards import PointOutcome, group_advantages
 from exp.optimize.evaluation.variance.roles import FORCED_PROFILE
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
+from exp.runtime.models.providers.backpressure import ADMISSION_LIMITS_NAME
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
@@ -640,3 +645,77 @@ def test_unscored_judgments_stay_unknown_in_the_point_denominator(
     assert all(row.group.advantages == (None, None) for row in report.points)
     assert report.counts is not None and report.counts.continuations_unknown == 4
     assert report.critics[0].score is not None and report.critics[0].score.reward is None
+
+
+class _OverlapActor(ScriptedJsonTransport):
+    """Serve the scripted group, then finish every continuation, recording peak overlap."""
+
+    def __init__(self, group: list[JsonHttpResponse]) -> None:
+        super().__init__(group)
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+
+    def _answer(self) -> JsonHttpResponse:
+        with self.lock:
+            reply = self._responses.pop(0) if self._responses else _done()
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        time.sleep(0.2)
+        with self.lock:
+            self.in_flight -= 1
+        assert isinstance(reply, JsonHttpResponse)
+        return reply
+
+
+def test_point_continuations_run_at_once_within_the_registered_host_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chosen points continue concurrently once the host registers admission limits.
+
+    Serial continuation of every point is thousands of actor calls one at a time; the run must
+    overlap them, never more than the host's registered alias and provider limits.
+    """
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    limits = provider_data_dir() / ADMISSION_LIMITS_NAME
+    limits.parent.mkdir(parents=True, exist_ok=True)
+    limits.write_text("alias_max_in_flight = 4\n")
+    assert admitted_concurrency(project, "judge") == 4
+    spec = _spec(project, job)
+    actor = _OverlapActor([reply for row in (2, 3, 4) for reply in (_edit(row), _done())])
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor
+    )
+    roles = [
+        _tool_reply(
+            "choose_points",
+            {"points": [_point(0), _point(1)], "audit": [], "limitations": ["Simulated."]},
+        ),
+        _tool_reply(
+            "estimate_points",
+            {
+                "estimates": [
+                    {
+                        "step": s,
+                        "probability": 0.5,
+                        "rationale": "Base.",
+                        "evidence_refs": ["group"],
+                    }
+                    for s in (0, 1)
+                ],
+                "limitations": ["Simulated."],
+            },
+        ),
+    ]
+    route_judge(monkeypatch, roles, None)
+
+    report = run_actor_critic(
+        project, spec, exposure=_exposure(project, job, "mining_probes"), code_revision="test"
+    )
+
+    assert [row.point for row in report.points] == [0, 1]
+    assert all(row.failure is None for row in report.points)
+    assert actor.peak == 2
+
+    limits.write_text("alias_max_in_flight = 1\n")
+    assert admitted_concurrency(project, "judge") == 1
