@@ -58,6 +58,9 @@ OPERATION_UNPRICED_AUTHORIZATION: Final = "operation-unpriced-allowance"
 MAXIMUM_UNPRICED_ATTEMPTS: Final = 100_000
 """Largest explicit unpriced-attempt ceiling one authorization may grant."""
 
+LEDGER_BUSY_TIMEOUT_MS: Final = 120_000
+"""Lock wait of one ledger transaction; concurrent calls of one operation share the file."""
+
 _TOLERANCE_USD: Final = 1e-9
 _MEDIA_PART_TYPES: Final = frozenset(
     {
@@ -343,8 +346,13 @@ class OperationSpendCeiling:
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
-        """Run one ``BEGIN IMMEDIATE`` transaction on a fresh connection, then close it."""
-        connection = connect_database(self._path)
+        """Run one ``BEGIN IMMEDIATE`` transaction on a fresh connection, then close it.
+
+        Every concurrent call of an operation reserves, dispatches and settles through this one
+        file, so the lock wait is long enough for tens of in-flight calls to queue behind each
+        other instead of failing the whole phase on a short write burst.
+        """
+        connection = connect_database(self._path, busy_timeout_ms=LEDGER_BUSY_TIMEOUT_MS)
         try:
             connection.execute("BEGIN IMMEDIATE")
             try:
