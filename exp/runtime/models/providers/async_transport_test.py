@@ -667,3 +667,61 @@ def test_async_transport_names_connection_failures_without_exposing_secrets(meth
     message = asyncio.run(scenario())
     assert "ConnectError" in message
     assert canary not in message
+
+
+def test_gateway_rate_limits_are_retried_within_the_deadline_without_spending_attempts() -> None:
+    """Under the gateway policy, uncertified 429s retry past a 3-attempt policy, with backoff.
+
+    Under sustained concurrency the Experiential gateway answers 429; a completion that gave up
+    after three quick tries became an outcome-unknown actor branch or an unscored judgment.
+    Retry-After is the floor of each wait; bad hops (503) still spend the policy's attempts.
+    """
+    clock = _RetryClock()
+    answers: list[int | None] = [429, 429, 503, 429, 429, 429, None]
+
+    async def operation(timeout: float) -> str:
+        """Answer from the script; None succeeds."""
+        del timeout
+        status = answers.pop(0)
+        if status is None:
+            return "ok"
+        return_after = 5 if status == 429 and len(answers) == 5 else None
+        raise ProviderTransportError(
+            "gateway busy", status_code=status, retry_after_seconds=return_after
+        )
+
+    result = asyncio.run(
+        run_with_retry_async(
+            operation,
+            policy=RetryPolicy(rate_limited_retries=8),
+            deadline=RequestDeadline.after(300, now_monotonic=clock.now),
+            sleep=clock.sleep,
+            now_monotonic=lambda: clock.now,
+            random_sample=lambda: 0.5,
+        )
+    )
+
+    assert result == "ok" and not answers
+    assert len(clock.sleeps) == 6
+    assert clock.sleeps[1] >= 5  # the server's Retry-After is honoured as a floor
+
+    limited = [429] * 20
+
+    async def always_limited(timeout: float) -> str:
+        """Rate limit forever."""
+        del timeout
+        limited.pop()
+        raise ProviderTransportError("gateway busy", status_code=429)
+
+    with pytest.raises(ProviderTransportError):
+        asyncio.run(
+            run_with_retry_async(
+                always_limited,
+                policy=RetryPolicy(rate_limited_retries=8),
+                deadline=RequestDeadline.after(10_000, now_monotonic=clock.now),
+                sleep=clock.sleep,
+                now_monotonic=lambda: clock.now,
+                random_sample=lambda: 0.5,
+            )
+        )
+    assert 20 - len(limited) == 8 + 3

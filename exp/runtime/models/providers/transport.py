@@ -552,11 +552,17 @@ class RetryPolicy:
             jitter. Ordinary retries wait a full-jitter sample of the window. Async server-directed
             minimum waits may exceed it within the existing absolute request deadline. The
             sync helper has no request deadline, so this remains its total per-retry wait bound.
+        rate_limited_retries: Extra async retries of an uncertified HTTP 429 that do not spend
+            ``maximum_attempts``, paced from one second up to thirty (never before Retry-After)
+            inside the request deadline. Zero by default; set for a gateway whose 429 means
+            the request was rejected unprocessed (the Experiential gateway under load). Each
+            retry is still recorded as a potentially paid physical attempt.
     """
 
     maximum_attempts: int = 3
     initial_delay_seconds: float = 0.25
     maximum_delay_seconds: float = 2.0
+    rate_limited_retries: int = 0
 
     def __post_init__(self) -> None:
         """Reject attempt and delay bounds that cannot describe a finite retry schedule."""
@@ -568,6 +574,8 @@ class RetryPolicy:
             raise ValueError("maximum_delay_seconds must be finite")
         if self.maximum_delay_seconds < self.initial_delay_seconds:
             raise ValueError("maximum_delay_seconds cannot be smaller than initial_delay_seconds")
+        if self.rate_limited_retries < 0:
+            raise ValueError("rate_limited_retries must be nonnegative")
 
 
 def classify_retry(exception: Exception) -> RetryClassification:

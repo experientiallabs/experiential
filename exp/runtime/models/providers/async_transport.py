@@ -9,7 +9,7 @@ import ssl
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -488,6 +488,23 @@ class ScriptedAsyncJsonTransport:
         return answer
 
 
+RATE_LIMITED_INITIAL_DELAY_SECONDS = 1.0
+RATE_LIMITED_MAXIMUM_DELAY_SECONDS = 30.0
+
+
+def is_rate_limited(error: BaseException) -> bool:
+    """Return whether an attempt was rate limited (HTTP 429): rejected, never processed."""
+    return isinstance(error, ProviderTransportError) and error.status_code == 429
+
+
+def _rate_limited_policy(policy: RetryPolicy) -> RetryPolicy:
+    """The policy's backoff window widened for rate limiting, which needs seconds, not 2 s."""
+    return replace(
+        policy,
+        maximum_delay_seconds=max(policy.maximum_delay_seconds, RATE_LIMITED_MAXIMUM_DELAY_SECONDS),
+    )
+
+
 async def run_with_retry_async[ResultT](
     operation: Callable[[float], Awaitable[ResultT]],
     *,
@@ -519,8 +536,10 @@ async def run_with_retry_async[ResultT](
         Exception: The first non-retryable error or last retryable error.
     """
     delay = policy.initial_delay_seconds
+    rejected_delay = max(policy.initial_delay_seconds, RATE_LIMITED_INITIAL_DELAY_SECONDS)
     attempts = 0
     unbilled_attempts = 0
+    rejected_attempts = 0
     try:
         while True:
             timeout_seconds = deadline.attempt_timeout(
@@ -541,20 +560,25 @@ async def run_with_retry_async[ResultT](
                 error = exc
             unbilled = is_unbilled_attempt(error)
             unbilled_attempts += int(unbilled)
+            # Where the policy says a 429 means rejected unprocessed (rate_limited_retries), that
+            # many are retried without spending its attempts, paced, inside the deadline.
+            rejected = not unbilled and is_rate_limited(error)
+            rejected_attempts += int(rejected)
+            free = unbilled_attempts + min(rejected_attempts, policy.rate_limited_retries)
+            paced = rejected and rejected_attempts <= policy.rate_limited_retries
             classification = classify(error)
-            if (
-                not classification.retryable
-                or attempts - unbilled_attempts >= policy.maximum_attempts
-            ):
+            if not classification.retryable or attempts - free >= policy.maximum_attempts:
                 raise error
             remaining = deadline.remaining_seconds(now_monotonic=now_monotonic())
             wait = retry_delay_seconds(
                 error,
-                delay=delay,
-                policy=policy,
+                delay=rejected_delay if paced else delay,
+                policy=_rate_limited_policy(policy) if paced else policy,
                 random_sample=random_sample,
                 server_wait_ceiling_seconds=remaining,
             )
+            if paced:
+                rejected_delay = min(rejected_delay * 2, RATE_LIMITED_MAXIMUM_DELAY_SECONDS)
             # Admission retries require positive pacing even when the caller selects immediate
             # ordinary retries. A zero-delay policy cannot create a deadline-long busy loop.
             if wait is None or (unbilled and wait <= 0):

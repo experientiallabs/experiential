@@ -87,7 +87,7 @@ from exp.runtime.models.providers.tinker_sampling import (
     TinkerSamplingClient,
     create_tinker_sampler,
 )
-from exp.runtime.models.providers.transport import JsonHttpTransport
+from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import (
     VertexAnthropicClient,
@@ -101,6 +101,13 @@ ProviderTransport = AsyncJsonHttpTransport | JsonHttpTransport
 
 CatalogRoleName = Literal["world_model", "judge", "candidate"]
 """Completion role whose catalog-configured reasoning effort shapes resolved requests."""
+
+
+EXPERIENTIAL_GATEWAY_HOST = "api.experientiallabs.ai"
+"""Host of the Experiential gateway, whose HTTP 429 rejects a request unprocessed."""
+
+GATEWAY_RETRY_POLICY = RetryPolicy(rate_limited_retries=8)
+"""Completions through the gateway: the default attempts plus eight paced 429 retries."""
 
 
 class ModelConnectionError(ValueError):
@@ -730,6 +737,10 @@ class RuntimeModelCatalog:
             )
         if provider in {"openrouter", "openai-compatible"}:
             http_kwargs["chat_max_tokens_field"] = capabilities.chat_max_tokens_field
+        if provider == "openai-compatible" and endpoint.hostname == EXPERIENTIAL_GATEWAY_HOST:
+            # The gateway answers 429 under sustained concurrency and processes nothing; pace
+            # and retry those inside the request deadline instead of failing the call.
+            http_kwargs["retry_policy"] = GATEWAY_RETRY_POLICY
         if provider == "elevenlabs":
             # Audio only: no sampling or reasoning facts apply, but the
             # configured dispatch timeout does.
