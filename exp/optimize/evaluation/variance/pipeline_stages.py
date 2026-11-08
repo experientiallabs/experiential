@@ -10,11 +10,12 @@ Family authoring and record export live in ``pipeline_families`` and ``pipeline_
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue, sha256_json
 from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelRequest, ModelResponse, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
@@ -24,7 +25,7 @@ from exp.optimize.evaluation.continuations.job import (
     execute_continuation_job,
     saved_continuation_job,
 )
-from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
@@ -33,11 +34,13 @@ from exp.optimize.evaluation.executable.grounded import (
 )
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.factory.authoring import author_response
+from exp.optimize.evaluation.rules.agent_loop import run_bounded
 from exp.optimize.evaluation.rules.challenges import RuntimeChallenges
 from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
     ActorCriticSpec,
+    admitted_concurrency,
     run_actor_critic,
 )
 from exp.optimize.evaluation.variance.actor_critic_costs import (
@@ -141,6 +144,8 @@ from exp.simulation.rules.recall import RecallPolicy
 
 __all__ = ["MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
 
+logger = logging.getLogger(__name__)
+
 
 def tier_job(
     project: ProjectStore, job: ContinuationJob, alias: str, repeats: int | None = None
@@ -213,6 +218,46 @@ def run_group(
     if study is None:
         study = execute_continuation_job(project, job, code_revision=code_revision)
     return continuation_result_reference(project, job, code_revision=code_revision), study
+
+
+def run_groups(
+    project: ProjectStore, spec: DecisionVarianceSpec, job: ContinuationJob, code_revision: str
+) -> dict[str, tuple[ArtifactInput, ContinuationStudy]]:
+    """Run or replay every tier's group at once within host admission, keyed by tier.
+
+    Each tier's group is its own job (its own ledger, runtime and actor alias), so the tiers'
+    attempts overlap instead of running five groups back to back.
+    """
+    aliases = spec.mining.actors
+    results = run_bounded(
+        [
+            lambda alias=alias: run_group(
+                project, group_job(project, spec, job, alias), code_revision
+            )
+            for alias in aliases
+        ],
+        admitted_concurrency(project, *aliases),
+    )
+    return dict(zip(aliases, results, strict=True))
+
+
+def labelled_steps(branch: ContinuationBranch, alias: str, limit: int) -> list[JsonValue]:
+    """Return an attempt's steps to label: at most ``limit``, the bound labelling was priced at.
+
+    An attempt past ``steps_per_call`` steps per actor call is labelled over its first
+    ``limit`` steps instead of refusing the whole stage for every tier.
+    """
+    steps = branch.outcome.get("steps")
+    rows = steps if isinstance(steps, list) else []
+    if len(rows) > limit:
+        logger.warning(
+            "traceml: attempt %s of %s has %s steps; labelling the first %s",
+            branch.index,
+            alias,
+            len(rows),
+            limit,
+        )
+    return rows[:limit]
 
 
 class _RulesStage:
@@ -429,18 +474,13 @@ class _TraceMLStage:
         limit = job.maximum_model_calls * spec.traceml.steps_per_call
         judge_settings = spec.traceml.move_judge
         assert judge_settings is not None
+        groups_run = run_groups(project, spec, job, revision)
         for alias in spec.mining.actors:
-            reference, study = run_group(project, group_job(project, spec, job, alias), revision)
+            reference, study = groups_run[alias]
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
             trajectories = []
             for branch in study.branches:
-                steps = branch.outcome.get("steps")
-                rows = steps if isinstance(steps, list) else []
-                if len(rows) > limit:
-                    raise ValueError(
-                        f"attempt {branch.index} of {alias} has {len(rows)} steps, more than "
-                        f"traceml.steps_per_call allows; raise it"
-                    )
+                rows = labelled_steps(branch, alias, limit)
                 trajectories.append(
                     trajectory_from_workflow_steps(
                         f"{alias}/attempt:{branch.index}",
@@ -800,7 +840,12 @@ class _MiningStage:
             assert schedule is not None
             complete_rollout(project, schedule, saved, code_revision=revision)
         judged, _ = judge_study(
-            project, report.group, judge, configuration=tier.configuration, code_revision=revision
+            project,
+            report.group,
+            judge,
+            configuration=tier.configuration,
+            code_revision=revision,
+            concurrency=admitted_concurrency(project, judge.settings.model_alias),
         )
         return TierMining(
             tier=alias,
