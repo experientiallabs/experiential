@@ -345,12 +345,15 @@ class AuthoredBank(ContractModel):
         selection: The saved ``tag-bank-selection`` record.
         bank: The published bank, as the unchanged tagger resolves it.
         path: The published bank file.
+        rounds: Saved re-authoring rounds whose kept questions joined the bank, in order
+            (:mod:`~exp.simulation.mining.authoring_loop`).
     """
 
     authoring: ArtifactInput
     selection: ArtifactInput
     bank: QuestionBank
     path: str
+    rounds: tuple[ArtifactInput, ...] = ()
 
 
 def corpus_tag_bank(
@@ -482,7 +485,7 @@ def _scores(
     for score in order:
         best: tuple[float, str] | None = None
         for other in kept:
-            value = _correlation(columns[score.question_id], columns[other], spec.min_overlap)
+            value = answer_correlation(columns[score.question_id], columns[other], spec.min_overlap)
             if value is not None and (best is None or value > best[0]):
                 best = (value, other)
         update: JsonObject = {}
@@ -499,7 +502,7 @@ def _scores(
     return tuple(measured[q.question_id] for q in candidate.questions)
 
 
-def _correlation(
+def answer_correlation(
     left: Mapping[str, float], right: Mapping[str, float], minimum: int
 ) -> float | None:
     """Return the absolute Pearson correlation over shared traces, or None when unreadable."""

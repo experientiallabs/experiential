@@ -7,6 +7,9 @@ entry points; every result is a saved record the next phase reads.
   author drafts yes/no questions from a sample of the members' task and observation views and
   the selection keeps the discriminating, answerable, non-redundant ones (``corpus_tag_bank``);
   every member is then tagged with ``authored_bank_for_view`` per view by the decision model.
+  A family with at least ``loop.min_members_to_retry`` members whose tags cluster into a single
+  task type is re-authored with feedback, up to ``loop.max_rounds`` rounds
+  (``author_family_bank``); the plan prices every such round as its worst case.
 - ``task-types`` (:class:`TaskTypeExecutor`): each family is split into named task types over
   its task-view tags plus the authored matrices (``task_types``); ``task_type_family`` narrows a
   family to one type.
@@ -69,6 +72,7 @@ from exp.runtime.models.providers.codex_cli import offline_closed_model
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
+from exp.simulation.mining.authoring_loop import AuthoringLoopSpec, author_family_bank
 from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS, DecisionsTraceTagger
 from exp.simulation.mining.environment_families import (
     EnvironmentFamily,
@@ -76,16 +80,8 @@ from exp.simulation.mining.environment_families import (
     load_environment_families,
 )
 from exp.simulation.mining.questions import resolve_question_bank
-from exp.simulation.mining.tag_authoring import (
-    TagAuthor,
-    TagAuthoringSpec,
-    authored_bank_for_view,
-)
-from exp.simulation.mining.tag_bank_selection import (
-    AuthoredBank,
-    BankSelectionSpec,
-    corpus_tag_bank,
-)
+from exp.simulation.mining.tag_authoring import TagAuthor, TagAuthoringSpec
+from exp.simulation.mining.tag_bank_selection import AuthoredBank, BankSelectionSpec
 from exp.simulation.mining.tag_cluster_names import ClusterNamer
 from exp.simulation.mining.tagging import DecisionCache, TagMatrix, TraceTagger
 from exp.simulation.mining.task_types import TaskTypeSpec, task_types
@@ -388,11 +384,13 @@ class TagBankSlot(ContractModel):
         selection: Discrimination, answerability and redundancy bounds.
         bank_root: Directory the banks are published under; None for the local bank root.
         decision_alias: Native decision alias tagging the selection sample and the members.
+        loop: When a large family that collapses to one task type is re-authored with feedback.
     """
 
     author: AuthorSettings
     authoring: TagAuthoringSpec = TagAuthoringSpec()
     selection: BankSelectionSpec = BankSelectionSpec()
+    loop: AuthoringLoopSpec = AuthoringLoopSpec()
     bank_root: Path | None = None
     decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
 
@@ -425,16 +423,24 @@ class TagBankExecutor:
         author = slot.authoring.calls() * families
         chunks = math.ceil(slot.selection.max_questions / MAX_DECISION_QUESTIONS)
         decisions = len(AUTHORED_VIEWS) * members * chunks * 2
+        looping, loop_author, loop_decisions = loop_worst_case(context, slot, corpus)
         costs: list[CostComponent] = [
-            row.scaled(author) for row in evaluation_costs(context.project, slot.author)
+            row.scaled(author + loop_author)
+            for row in evaluation_costs(context.project, slot.author)
         ]
-        costs.append(decision_cost(context.project, slot.decision_alias, decisions))
-        line = (
+        costs.append(
+            decision_cost(context.project, slot.decision_alias, decisions + loop_decisions)
+        )
+        lines = (
             f"{families} families: up to {author} author calls with "
             f"{slot.author.model_alias}, then at most {decisions} decisions with "
-            f"{slot.decision_alias} (selection sample and every member, per view)."
+            f"{slot.decision_alias} (selection sample and every member, per view).",
+            f"Re-authoring loop: {looping} families of at least "
+            f"{slot.loop.min_members_to_retry} members may collapse to one task type; at worst "
+            f"{slot.loop.max_rounds} rounds each add {loop_author} author calls and "
+            f"{loop_decisions} decisions.",
         )
-        return False, cost_lines(tuple(costs)), (line,)
+        return False, cost_lines(tuple(costs)), lines
 
     def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Run, or replay, every family's bank and member tagging.
@@ -458,7 +464,11 @@ class TagBankExecutor:
         project = context.project
         members_total = sum(len(row.members) for row in corpus.families)
         tagger = self.tagger or decision_tagger(
-            project, slot.decision_alias, "tag-banks", members_total * 64, context.code_revision
+            project,
+            slot.decision_alias,
+            "tag-banks",
+            members_total * 64 * (1 + slot.loop.max_rounds),
+            context.code_revision,
         )
         author = TagAuthor(
             draw=author_draw(project, slot.author, context.code_revision),
@@ -470,36 +480,61 @@ class TagBankExecutor:
         scoping = corpus.report.environment_families
         assert scoping is not None
         inputs: list[ArtifactInput] = [scoping.families]
+        task_view = next(row for row in corpus.report.tagging if row.plan.view == "task")
+        shared = (load_tag_matrix(project, task_view.matrix),)
         for family in corpus.families:
             rendered = [build_units(corpus.traces[t], AUTHORED_VIEWS) for t in family.members]
             if len(rendered) < MIN_AUTHORED_MEMBERS:
                 # A question must hold in some members and fail in others, so a family this
                 # small cannot be authored; it keeps its fixed-bank tags and gets one task type.
                 continue
-            units = [unit for row in rendered for unit in row.values()]
-            authored = corpus_tag_bank(
+            result = author_family_bank(
                 project.artifacts,
                 author,
                 tagger,
                 scope=family.family_id,
                 bank_id=f"authored-{family.family_id[:24]}",
-                units=units,
+                rendered=rendered,
+                views=AUTHORED_VIEWS,
+                shared=shared,
                 tagger_identity=getattr(tagger, "model_identity", {}),
                 authoring=slot.authoring,
                 selection=slot.selection,
+                loop=slot.loop,
                 root=slot.bank_root,
                 code_revision=context.code_revision,
             )
-            banks[family.family_id] = authored
-            inputs.extend((authored.authoring, authored.selection))
-            per_view: dict[str, TagMatrix] = {}
-            for view in AUTHORED_VIEWS:
-                asked = authored_bank_for_view(authored.bank, view)
-                if asked is not None:
-                    per_view[view] = tagger.tag([row[view] for row in rendered], asked)
-            matrices[family.family_id] = per_view
+            banks[family.family_id] = result.bank
+            inputs.extend((result.bank.authoring, result.bank.selection, *result.bank.rounds))
+            matrices[family.family_id] = result.matrices
         record = FamilyBanks(banks=banks, matrices=matrices)
         return save_slot(context, identity, record, tuple(inputs))
+
+
+def loop_worst_case(
+    context: SlotContext, slot: TagBankSlot, corpus: Corpus | None
+) -> tuple[int, int, int]:
+    """Price the re-authoring loop at its worst: every large family runs every round.
+
+    A round asks the author for a full authoring pass and the decision model for every
+    candidate over every member and view, then for the kept ones again over the members.
+
+    Returns:
+        Families that may loop, and the extra author calls and decisions over all rounds.
+    """
+    loop = slot.loop
+    if corpus is None:
+        size = context.preparation.limits.maximum_family_traces
+        sizes = [size] * context.preparation.limits.maximum_families
+    else:
+        sizes = [len(row.members) for row in corpus.families]
+    looping = [size for size in sizes if size >= MIN_AUTHORED_MEMBERS and loop.loops(size)]
+    spec = slot.authoring
+    candidates = len(spec.variants) * spec.rounds * spec.questions_per_draw
+    chunks = math.ceil(candidates / MAX_DECISION_QUESTIONS)
+    author = loop.max_rounds * spec.calls() * len(looping)
+    decisions = loop.max_rounds * len(AUTHORED_VIEWS) * sum(looping) * chunks * 2
+    return len(looping), author, decisions
 
 
 class TaskTypeSlot(ContractModel):

@@ -33,7 +33,7 @@ with no call, and each family's clustering and names are saved as their own arti
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Literal
 
 from pydantic import Field
@@ -268,6 +268,12 @@ def family_clustering_spec(family: EnvironmentFamily, spec: TaskTypeSpec) -> Clu
     return spec.clustering
 
 
+def family_matrices(members: Collection[str], matrices: Sequence[TagMatrix]) -> list[TagMatrix]:
+    """Return the matrices that tag some member: the shared banks and the family's own banks."""
+    wanted = set(members)
+    return [m for m in matrices if any(row.trace_id in wanted for row in m.rows)]
+
+
 def split_family(
     family: EnvironmentFamily,
     matrices: Sequence[TagMatrix],
@@ -295,8 +301,7 @@ def split_family(
         ValueError: No member is tagged in every matrix the family is tagged in.
     """
     spec = spec or TaskTypeSpec()
-    members = set(family.members)
-    own = [m for m in matrices if any(row.trace_id in members for row in m.rows)]
+    own = family_matrices(family.members, matrices)
     clustering = cluster_tags(own, family_clustering_spec(family, spec), trace_ids=family.members)
     names = name_clusters(
         clustering, namer, questions=questions, exemplar_texts=exemplar_texts, spec=spec.naming
