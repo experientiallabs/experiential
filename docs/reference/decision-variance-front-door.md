@@ -22,8 +22,9 @@ exp eval PROJECT --root ROOT --continuations plan.json
 
 The spec has four parts:
 
-- `traces`: the trace file (`path`, `source`, optional gateway `identity`). Omit it to use the
-  project's completed build as it is.
+- `traces`: the trace file or directory (`path`, `source`, optional gateway `identity`); a
+  directory, such as a folder of agent session files, is digested over its sorted relative
+  paths and file bytes. Omit it to use the project's completed build as it is.
 - `preparation`: a `BootstrapPreparationSpec` (variance build with environment families and
   a compatibility reviewer, bootstrap roles, finite limits).
 - `pipeline`: a `PipelineTemplate`, every pipeline setting except the build and the start;
@@ -37,10 +38,12 @@ consent once and runs or resumes.
 
 ## Phases
 
-1. `project-build`: `exp build` runs non-interactively in a subprocess over the trace file. It
-   keeps its own embedding preflight and stops instead of exceeding its configured budget. A
-   `front-door-source` record binds the trace file's digest to the build it produced, so a
-   rerun over the same file skips it.
+1. `project-build`: `exp build --non-interactive --yes` runs in a subprocess over the trace
+   source. Consent to the plan digest is its confirmation, including an embedding estimate
+   above the build budget or an undefined one. A `front-door-source` record binds the source
+   digest to the build it produced, so a rerun over the same source skips it. On a project with
+   no completed build, the plan prices only this phase; every later phase is shown blocked and
+   is priced on the way, against the cumulative ceiling, once the build exists.
 2. `bootstrap-preparation`: `run_bootstrap_preparation` creates the start-bootstrap batch from
    the build: tags, clusters, the family review and per-family scopes with probe routing,
    family rules learned once and frozen into each family runtime, and one authored, reviewed,
