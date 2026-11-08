@@ -18,13 +18,15 @@ from collections.abc import Sequence
 
 from exp.common.tasks.task import TaskCase
 from exp.simulation.rules.model import RuleBook
+from exp.simulation.rules.tool_names import ToolNames
 
 
 def uncovered_tools(book: RuleBook, tasks: Sequence[TaskCase]) -> dict[str, tuple[str, ...]]:
     """Map each task to the declared tools that have no contract in the rule book.
 
-    Only tool names are compared. A task's declared schema is never read into the book, so a
-    declared tool stays uncovered until world learning yields its contract.
+    Only tool names are compared, by canonical key (:class:`ToolNames`), so a declared
+    ``Write`` is covered by a ``write_file`` contract. A task's declared schema is never read
+    into the book, so a declared tool stays uncovered until world learning yields its contract.
 
     Args:
         book: Rule book learned from world-learning evidence.
@@ -38,14 +40,13 @@ def uncovered_tools(book: RuleBook, tasks: Sequence[TaskCase]) -> dict[str, tupl
         ValueError: Two tasks share an identity.
     """
     seen: set[str] = set()
+    known = ToolNames(book.contracts)
     uncovered: dict[str, tuple[str, ...]] = {}
     for task in tasks:
         if task.task_id in seen:
             raise ValueError(f"task {task.task_id!r} appears more than once")
         seen.add(task.task_id)
-        names = tuple(
-            dict.fromkeys(tool.name for tool in task.tools if tool.name not in book.contracts)
-        )
+        names = known.uncovered(tool.name for tool in task.tools)
         if names:
             uncovered[task.task_id] = names
     return uncovered

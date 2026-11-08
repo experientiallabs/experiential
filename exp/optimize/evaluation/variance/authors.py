@@ -73,8 +73,9 @@ from exp.optimize.evaluation.variance.roles import AUDIT_CHECKLIST
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.rules.model import ResearchQuestion, Rule, RuleBook
+from exp.simulation.rules.tool_names import ToolNames
 
-AUTHORS_PROTOCOL = "variance-authors-v7"
+AUTHORS_PROTOCOL = "variance-authors-v8"
 """Version of the author prompts and answer schemas; change it whenever either changes."""
 
 DECISION_STATE_TOOL = "author_decision_state"
@@ -338,9 +339,11 @@ def relevant_rules(book: RuleBook, tools: frozenset[str]) -> tuple[Rule, ...]:
         tools: Tools the actor may call.
 
     Returns:
-        Matching rules in book order, contradicted and unknown ones included.
+        Matching rules in book order, contradicted and unknown ones included; a rule's tool
+        matches by canonical key (:class:`ToolNames`), so ``write_file`` rules reach ``Write``.
     """
-    return tuple(rule for rule in book.rules if rule.tool is None or rule.tool in tools)
+    known = ToolNames(tools)
+    return tuple(rule for rule in book.rules if rule.tool is None or known.match(rule.tool))
 
 
 def relevant_questions(book: RuleBook, tools: frozenset[str]) -> tuple[ResearchQuestion, ...]:
@@ -351,9 +354,10 @@ def relevant_questions(book: RuleBook, tools: frozenset[str]) -> tuple[ResearchQ
         tools: Tools the actor may call.
 
     Returns:
-        Matching questions in book order.
+        Matching questions in book order, matched by canonical tool key.
     """
-    return tuple(item for item in book.questions if item.tool is None or item.tool in tools)
+    known = ToolNames(tools)
+    return tuple(item for item in book.questions if item.tool is None or known.match(item.tool))
 
 
 def decision_state_request(context: DecisionContext, *, output_tokens: int) -> ModelRequest:

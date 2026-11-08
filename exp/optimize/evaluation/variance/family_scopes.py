@@ -15,7 +15,9 @@ identity:
   family over exactly these);
 - its tasks: world-learning tasks whose source traces are members, and mining-probe tasks placed
   by the fitted mixture's posterior over their source trace's tags, into the one admitted family
-  of that cluster whose reconciled contracts cover the task's tools (otherwise unplaced). Placed
+  of that cluster whose reconciled contracts cover the task's tools (otherwise unplaced); tool
+  names are compared by canonical key (:mod:`exp.simulation.rules.tool_names`), so ``Write``
+  is covered by a ``write_file`` contract. Placed
   tasks are saved into the scoping's ``environment-families`` record, so a family loaded from
   it lists exactly its scope's tasks;
 - a tag retrieval binding over its placed probe tasks, under the build's treatment policy.
@@ -68,6 +70,7 @@ from exp.simulation.retrieval.embedding import RAGEmbeddingCache
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.store import load_rag_index
 from exp.simulation.retrieval.tags import TagRetrievalBinding, TaskQueryTags
+from exp.simulation.rules.tool_names import ToolNames
 from exp.simulation.world_model.construction import construct_world_model
 from exp.simulation.world_model.runtime import (
     load_grounded_world_model_artifact,
@@ -274,9 +277,11 @@ def _place(
             rows.append(ProbePlacement(task_id=task.task_id, reason="no tagged source trace"))
             continue
         cluster, posterior = where[trace]
-        tools = {tool.name for tool in task.tools}
+        tools = sorted({tool.name for tool in task.tools})
         candidates = [
-            f for f in families if f.cluster_id == cluster and tools <= set(f.tool_contracts)
+            f
+            for f in families
+            if f.cluster_id == cluster and ToolNames(f.tool_contracts).covers(tools)
         ]
         found = ProbePlacement(
             task_id=task.task_id, trace_id=trace, cluster_id=cluster, posterior=posterior, reason=""
@@ -286,7 +291,7 @@ def _place(
                 f"cluster {cluster} has no admitted family"
                 if not any(f.cluster_id == cluster for f in families)
                 else f"{len(candidates)} admitted families of cluster {cluster} have contracts "
-                f"covering the task's tools {sorted(tools)}"
+                f"covering the task's tools {tools}"
             )
             rows.append(found.model_copy(update={"reason": why}))
             continue
