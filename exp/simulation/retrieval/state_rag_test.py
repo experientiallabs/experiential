@@ -313,3 +313,20 @@ def test_call_plan_prices_authoring_corpus_and_live_steps() -> None:
     plan = plan_state_rag_calls(authoring_calls=5, questions=40, corpus_steps=9, live_steps=16)
     assert (plan.authoring_completions, plan.corpus_decisions, plan.live_decisions) == (5, 18, 32)
     assert plan.decisions == 50
+
+
+def test_tagging_steps_concurrently_saves_the_same_index_as_one_at_a_time() -> None:
+    """Concurrency only speeds tagging up: the saved index is identical."""
+    traces = corpus()
+
+    def build(concurrency: int):  # noqa: ANN202
+        return build_state_tag_index(
+            bank(),
+            steps(traces),
+            fit(*traces),
+            decide=ScriptedDecisions(),
+            decision_model={"model": "clef"},
+            concurrency=concurrency,
+        )
+
+    assert build(8).identity == build(1).identity

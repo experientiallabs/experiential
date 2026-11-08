@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -145,6 +146,7 @@ def build_state_tag_index(
     decision_model: JsonObject,
     scope: CorpusScope | None = None,
     embedder: StateEmbedder | None = None,
+    concurrency: int = 1,
 ) -> StateTagIndex:
     """Tag the pre-turn state of every fit step through the decision model.
 
@@ -156,6 +158,7 @@ def build_state_tag_index(
         decision_model: Identity of the decision model.
         scope: Optional scope; steps outside it are left out.
         embedder: Optional tie-break embedder of rendered states.
+        concurrency: Steps tagged at once; the index is the same for every value.
 
     Returns:
         The tagged index.
@@ -189,20 +192,22 @@ def build_state_tag_index(
     vectors: tuple[tuple[float, ...], ...] | None = None
     if embedder is not None:
         vectors = embedder.embed([state.text() for _, state in kept])
-    rows = []
-    for index, (transition, state) in enumerate(kept):
-        probabilities, _, _ = tag_state(bank, state, decide)
-        rows.append(
-            StateTagRow(
-                transition_id=transition.transition_id,
-                trace_id=transition.trace_id,
-                lineage_id=transition.lineage_id,
-                step_index=state.step_index,
-                state_sha256=state.identity,
-                probabilities=probabilities,
-                vector=None if vectors is None else tuple(vectors[index]),
-            )
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        answers = list(pool.map(lambda pair: tag_state(bank, pair[1], decide)[0], kept))
+    rows = [
+        StateTagRow(
+            transition_id=transition.transition_id,
+            trace_id=transition.trace_id,
+            lineage_id=transition.lineage_id,
+            step_index=state.step_index,
+            state_sha256=state.identity,
+            probabilities=probabilities,
+            vector=None if vectors is None else tuple(vectors[index]),
         )
+        for index, ((transition, state), probabilities) in enumerate(
+            zip(kept, answers, strict=True)
+        )
+    ]
     return StateTagIndex(
         bank=bank,
         decision_model=decision_model,

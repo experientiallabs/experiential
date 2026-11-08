@@ -627,6 +627,7 @@ class StateRagSlot(ContractModel):
         samples: Pre-turn states the author samples per family.
         live_steps: Live steps a served family runtime may tag, for pricing.
         memory: Per-task state description policy bound into every start's simulator.
+        concurrency: Fit steps tagged at once; the saved index does not depend on it.
     """
 
     author_alias: str = Field(min_length=1)
@@ -636,6 +637,7 @@ class StateRagSlot(ContractModel):
     samples: int = Field(default=24, ge=2, le=512)
     live_steps: int = Field(default=0, ge=0)
     memory: StateMemoryPolicy | None = None
+    concurrency: int = Field(default=1, ge=1, le=64)
 
 
 def state_rag_preparation(
@@ -770,6 +772,7 @@ class StateRagExecutor:
                 ],
                 decide=decide,
                 decision_model=model,
+                concurrency=slot.concurrency,
             )
             saved = save_state_tag_index(
                 project.artifacts,
