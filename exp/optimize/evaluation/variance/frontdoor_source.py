@@ -6,6 +6,7 @@ from it, so a rerun over the same file skips the project build.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,8 +48,28 @@ class TraceSource(ContractModel):
     identity: str | None = Field(default=None, min_length=1)
 
     def sha256(self) -> Sha256:
-        """Return the digest of the trace file's exact bytes."""
-        return sha256_bytes(self.path.read_bytes())
+        """Return the digest of the trace file's exact bytes, or of a directory's files.
+
+        A directory (such as a folder of agent session files) hashes every regular file under
+        it, in sorted relative-path order, framing each path and its bytes, so a rename, an
+        added or removed file, or any changed byte changes the digest.
+        """
+        if not self.path.is_dir():
+            return sha256_bytes(self.path.read_bytes())
+        digest = hashlib.sha256(b"front-door-trace-directory-v1\0")
+        files = sorted(
+            (item.relative_to(self.path).as_posix(), item)
+            for item in self.path.rglob("*")
+            if item.is_file()
+        )
+        for relative, item in files:
+            name = relative.encode("utf-8")
+            digest.update(len(name).to_bytes(8, "big") + name)
+            digest.update(item.stat().st_size.to_bytes(8, "big"))
+            with item.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
 
 
 class ProjectBuilder(Protocol):
