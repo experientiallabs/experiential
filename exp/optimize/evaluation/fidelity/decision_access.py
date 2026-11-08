@@ -1,5 +1,7 @@
 """Shared admitted native-decision access for evaluation orchestration."""
 
+import random
+import time
 from collections.abc import Callable
 from datetime import datetime
 
@@ -9,6 +11,18 @@ from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.registry import ResolvedModel
+
+RETRIED_STATUS_CODES = frozenset({429, 502, 503, 504})
+"""Gateway statuses a decision retries: rate limited (never processed) or a bad hop."""
+
+MAXIMUM_DECISION_RETRIES = 8
+"""Most retries of one decision after its first attempt, all inside its deadline."""
+
+INITIAL_BACKOFF_SECONDS = 1.0
+MAXIMUM_BACKOFF_SECONDS = 30.0
+
+_sleep: Callable[[float], None] = time.sleep
+_sample: Callable[[], float] = random.random
 
 
 def decision_caller(
@@ -27,20 +41,42 @@ def decision_caller(
     transport = transport.priced_as(resolved.alias)
 
     def decide(request: DecisionRequest) -> JsonObject:
-        """Dispatch one decision; physical attempts share the run's ledger and deadline."""
-        remaining = (deadline - clock()).total_seconds()
-        response = transport.post(
-            profile.decisions_url,
-            headers=profile.headers,
-            payload=request.provider_body(profile.model_id),
-            timeout_seconds=max(min(remaining, 120.0), 0.001),
-        )
-        if response.status_code != 200 or not isinstance(response.body, dict):
-            raise ProviderTransportError(
+        """Dispatch one decision; physical attempts share the run's ledger and deadline.
+
+        A rate-limited (429) or bad-hop (502, 503, 504) answer is retried with full-jitter
+        exponential backoff, never sooner than the server's Retry-After, while the wait fits
+        the deadline; a 429 was rejected before any processing, so its retry is safe. Under
+        sustained gateway concurrency one 429 must not abort a phase of thousands of calls.
+        """
+        payload = request.provider_body(profile.model_id)
+        backoff = INITIAL_BACKOFF_SECONDS
+        retries = 0
+        while True:
+            remaining = (deadline - clock()).total_seconds()
+            response = transport.post(
+                profile.decisions_url,
+                headers=profile.headers,
+                payload=payload,
+                timeout_seconds=max(min(remaining, 120.0), 0.001),
+            )
+            if response.status_code == 200 and isinstance(response.body, dict):
+                return response.body
+            failure = ProviderTransportError(
                 f"memory-recall decision returned HTTP {response.status_code}",
                 status_code=response.status_code,
+                retry_after_seconds=response.retry_after_seconds,
             )
-        return response.body
+            if response.status_code not in RETRIED_STATUS_CODES or (
+                retries >= MAXIMUM_DECISION_RETRIES
+            ):
+                raise failure
+            floor = response.retry_after_seconds or 0.0
+            wait = max(floor, backoff * _sample())
+            if wait >= (deadline - clock()).total_seconds():
+                raise failure
+            _sleep(wait)
+            retries += 1
+            backoff = min(backoff * 2, MAXIMUM_BACKOFF_SECONDS)
 
     return decide
 
