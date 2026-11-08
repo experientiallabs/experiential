@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -269,6 +269,47 @@ def test_a_phase_priced_on_the_way_stops_beyond_the_consented_ceiling_and_resume
     refused = [row for row in journal if row["event"] == "refused"]
     assert refused and all(row["to"] == "stopped_at_cap" for row in refused)
     assert not any(row["refused"] for row in journal)
+
+
+@dataclass
+class FirstStartFails(ScriptedStage):
+    """Error mining that raises for the first start it sees, as a crashed stage would."""
+
+    failed: list[str] = field(default_factory=list)
+
+    def run(self, context: StageContext) -> StageRun:
+        """Raise once, for the first start; run the rest."""
+        binding = context.spec.mining.bootstrap
+        assert binding is not None
+        if not self.failed or self.failed == [binding.task_id]:
+            self.failed[:] = [binding.task_id]
+            raise ValueError("no judge produced a usable selection; inspect the saved draws")
+        return super().run(context)
+
+
+def test_one_start_whose_pipeline_raises_does_not_cost_the_other_starts_their_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A start's pipeline that raises is recorded as stopped and the next start still runs."""
+    run = front_door(tmp_path, monkeypatch)
+    failing = FirstStartFails("error-mining")
+    run.stages["error-mining"] = failing
+    deps = replace(run.dependencies, executors=run.stages)
+    project, spec = run.project, run.spec
+    plan = plan_front_door(project, spec, code_revision="test", dependencies=deps)
+    approval = FrontDoorApproval(plan_sha256=plan.digest, ceiling_usd=10.0, unpriced_attempts=1_000)
+
+    report = run_front_door(
+        project, spec, code_revision="test", approval=approval, dependencies=deps
+    )
+
+    assert len(report.bindings) == 2 and len(report.pipelines) == 2
+    bad, good = report.pipelines
+    assert failing.failed == [bad.task_id]
+    assert bad.stopped is not None and "ValueError" in bad.stopped
+    assert good.stopped is None and good.complete
+    assert [row.mining.bootstrap for row in failing.runs] == [good.binding]
+    assert report.stopped is not None and bad.task_id in report.stopped
 
 
 @dataclass

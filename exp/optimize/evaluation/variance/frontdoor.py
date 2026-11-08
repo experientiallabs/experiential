@@ -476,14 +476,29 @@ class _Runner:
             return report
         if self.tracker.stages.get("pipelines") == StageState.BLOCKED:
             self.tracker.stage("pipelines", "replayed")
+        # Each start's pipeline is independent: one that stops or raises is recorded and the
+        # next start still runs, so one bad start never costs the others their phase. The run
+        # stops before the after-pipeline slots when any start stopped; a rerun replays the
+        # finished starts and resumes the stopped one.
         outcomes: list[PipelineOutcome] = []
         for binding in prepared.bindings:
-            outcome = self.pipeline(prepared, binding)
-            outcomes.append(outcome)
-            if outcome.stopped is not None:
-                return report.model_copy(
-                    update={"pipelines": tuple(outcomes), "stopped": outcome.stopped}
+            try:
+                outcome = self.pipeline(prepared, binding)
+            except Exception as error:  # noqa: BLE001 - recorded per start; the others still run
+                logger.exception(
+                    "pipeline %s raised; continuing with the next start", binding.task_id
                 )
+                outcome = PipelineOutcome(
+                    task_id=binding.task_id,
+                    binding=binding,
+                    stopped=f"raised {type(error).__name__}: {str(error)[:1000]}",
+                )
+            outcomes.append(outcome)
+        stops = [f"{row.task_id}: {row.stopped}" for row in outcomes if row.stopped is not None]
+        if stops:
+            return report.model_copy(
+                update={"pipelines": tuple(outcomes), "stopped": "; ".join(stops)}
+            )
         report = report.model_copy(update={"pipelines": tuple(outcomes)})
         return self.slots("after-pipeline", report)
 
