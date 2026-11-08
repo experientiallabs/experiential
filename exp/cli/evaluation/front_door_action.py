@@ -6,8 +6,8 @@ plan: every stage with its status, then the completed work, the remaining priced
 unpriced components (including phases that are priced only once an earlier phase exists). With
 ``execute`` it asks spend consent once and runs or resumes
 :func:`~exp.optimize.evaluation.variance.frontdoor.run_front_door`. A pending project build runs
-``exp build`` non-interactively in a subprocess, so the build keeps its own preflight and stops
-rather than overspending its configured budget.
+``exp build --non-interactive --yes`` in a subprocess: the consent to the plan digest, which
+names the pending build, is the build's confirmation of its own embedding estimate.
 """
 
 from __future__ import annotations
@@ -76,6 +76,9 @@ class ExpBuild:
             "--root",
             str(self.root),
             "--non-interactive",
+            # The front door runs its builder only after consent to the exact plan digest,
+            # which names this build; that consent is exp build's confirmation.
+            "--yes",
         ]
         if source.identity is not None:
             command.extend(["--identity", source.identity])
