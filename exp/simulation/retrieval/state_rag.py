@@ -27,6 +27,7 @@ probabilities, what was selected and the tie-break similarities used, and the re
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -38,6 +39,7 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.project.errors import ArtifactStoreError
 from exp.common.state_machine import MachineRun, StateMachine, TransitionRecord
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS, DecisionRequest
 from exp.simulation.mining.tag_clusters import read_record, write_record
@@ -56,6 +58,8 @@ STATE_INDEX_TYPE = "state-tag-index"
 
 Embed = Callable[[Sequence[str]], tuple[tuple[float, ...], ...]]
 """Embed texts into unit vectors, in input order."""
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -192,8 +196,31 @@ def build_state_tag_index(
     vectors: tuple[tuple[float, ...], ...] | None = None
     if embedder is not None:
         vectors = embedder.embed([state.text() for _, state in kept])
+
+    def answer(pair: tuple[RAGTransition, PreTurnState]) -> tuple[float, ...] | None:
+        """Tag one step, or None when its state cannot cross the credential boundary."""
+        try:
+            return tag_state(bank, pair[1], decide)[0]
+        except ArtifactStoreError as error:
+            if not _at_credential_boundary(error):
+                raise
+            return None
+
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        answers = list(pool.map(lambda pair: tag_state(bank, pair[1], decide)[0], kept))
+        answered = list(pool.map(answer, kept))
+    refused = sum(1 for row in answered if row is None)
+    if refused:
+        logger.warning(
+            "%d of %d fit steps were left out of the state-tag index: their state or its answer "
+            "carries credential-like content the credential boundary refuses",
+            refused,
+            len(kept),
+        )
+    pairs = [(pair, row) for pair, row in zip(kept, answered, strict=True) if row is not None]
+    if vectors is not None:
+        vectors = tuple(v for v, row in zip(vectors, answered, strict=True) if row is not None)
+    kept = [pair for pair, _ in pairs]
+    answers = [row for _, row in pairs]
     rows = [
         StateTagRow(
             transition_id=transition.transition_id,
@@ -647,3 +674,9 @@ def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
     dot = sum(a * b for a, b in zip(left, right, strict=True))
     norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
     return dot / norm if norm else 0.0
+
+
+def _at_credential_boundary(error: ArtifactStoreError) -> bool:
+    """Return whether a store error is the credential boundary refusing one request or answer."""
+    text = str(error)
+    return "credential boundary" in text or "secret boundary" in text

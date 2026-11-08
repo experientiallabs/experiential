@@ -330,3 +330,36 @@ def test_tagging_steps_concurrently_saves_the_same_index_as_one_at_a_time() -> N
         )
 
     assert build(8).identity == build(1).identity
+
+
+def test_a_step_refused_at_the_credential_boundary_is_left_out_not_fatal() -> None:
+    """One credential-bearing state drops out of the index; any other failure still stops it."""
+    from exp.common.project.errors import ArtifactStoreError
+
+    traces = corpus()
+    all_steps = steps(traces)
+    scripted = ScriptedDecisions()
+    calls = [0]
+
+    def guarded(request: DecisionRequest) -> JsonObject:
+        calls[0] += 1
+        if calls[0] == 1:  # steps are tagged in order one at a time: this is the first step
+            raise ArtifactStoreError(
+                "provider request cannot be retained at the credential boundary; "
+                "remove credential-bearing content before dispatch"
+            )
+        return scripted(request)
+
+    index = build_state_tag_index(
+        bank(), all_steps, fit(*traces), decide=guarded, decision_model={"model": "clef"}
+    )
+    assert all_steps[0][0].transition_id not in {row.transition_id for row in index.rows}
+    assert len(index.rows) == len(all_steps) - 1
+
+    def broken(request: DecisionRequest) -> JsonObject:
+        raise ArtifactStoreError("disk full")
+
+    with pytest.raises(ArtifactStoreError, match="disk full"):
+        build_state_tag_index(
+            bank(), all_steps, fit(*traces), decide=broken, decision_model={"model": "clef"}
+        )
