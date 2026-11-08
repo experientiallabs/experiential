@@ -121,6 +121,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     TraceMLSettings,
     VariantQualification,
 )
+from exp.optimize.evaluation.variance.pipeline_stages import group_job
 from exp.optimize.evaluation.variance.point_options import OPTIONS_TOOL
 from exp.optimize.evaluation.variance.records import AuditDisposition
 from exp.optimize.evaluation.variance.role_prompts import (
@@ -1547,6 +1548,29 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
             assert binding.judge.definition.profile == mining.profile
     usage = [row.usage.physical_attempts for row in report.stages]
     assert usage[0] == 0 and all(count > 0 for count in usage[2:5])
+
+
+def test_an_unset_group_ceiling_leaves_room_for_every_attempt_to_reach_the_horizon(
+    pipeline: tuple[Run, PipelineReport],
+) -> None:
+    """Without group_physical_attempts a group of G attempts gets G x maximum_model_calls.
+
+    The registered start's own ceiling (64 in the live spec) was sized for its capture; a group
+    of 16 attempts at a 20-call horizon kept under it would exhaust the ledger after a few
+    attempts and leave the rest outcome-unknown.
+    """
+    run, _ = pipeline
+    spec = make_spec(run.fixture, run.rubric, run.bank)
+    unset = spec.model_copy(
+        update={"mining": spec.mining.model_copy(update={"group_physical_attempts": None})}
+    )
+    job = run.fixture.job.model_copy(update={"maximum_physical_attempts": 1})
+    group = group_job(run.project, unset, job, "actor")
+    assert group.study.repeats == unset.mining.attempts
+    assert group.maximum_physical_attempts == unset.mining.attempts * job.maximum_model_calls
+    roomy = job.model_copy(update={"maximum_physical_attempts": 10_000})
+    assert group_job(run.project, unset, roomy, "actor").maximum_physical_attempts == 10_000
+    assert group_job(run.project, spec, job, "actor").maximum_physical_attempts == 40
 
 
 def test_dispositions_rekey_only_families_and_records_with_no_new_call(

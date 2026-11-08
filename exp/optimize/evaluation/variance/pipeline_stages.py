@@ -191,12 +191,18 @@ def judge_costs(
 def group_job(
     project: ProjectStore, spec: DecisionVarianceSpec, job: ContinuationJob, alias: str
 ) -> ContinuationJob:
-    """Return a tier's group job of ``G`` attempts under the group attempt ceiling."""
+    """Return a tier's group job of ``G`` attempts under the group attempt ceiling.
+
+    Without a registered ``group_physical_attempts`` the ceiling is room for every attempt to
+    reach the call horizon (``G`` times ``maximum_model_calls``), never less than the job's own.
+    The registered start's ceiling was sized for its capture, not for a group: keeping it would
+    exhaust the ledger after a few attempts and leave the rest as outcome-unknown branches.
+    """
     group = tier_job(project, job, alias, spec.mining.attempts)
     ceiling = spec.mining.group_physical_attempts
-    return group if ceiling is None else group.model_copy(
-        update={"maximum_physical_attempts": ceiling}
-    )  # fmt: skip
+    if ceiling is None:
+        ceiling = max(job.maximum_physical_attempts, spec.mining.attempts * job.maximum_model_calls)
+    return group.model_copy(update={"maximum_physical_attempts": ceiling})
 
 
 def run_group(

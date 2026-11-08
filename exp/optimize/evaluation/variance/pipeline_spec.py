@@ -299,7 +299,8 @@ class MiningSettings(ContractModel):
         points: Most points per selector ``K``; with ``qualification`` the bar decides instead.
         continuations: Suffixes per distinct point ``M``.
         seed: Trajectory pick seed.
-        group_physical_attempts: Transport ceiling of each group, or None to keep the job's.
+        group_physical_attempts: Transport ceiling of each group, or None for room for every
+            attempt to reach the call horizon (never less than the job's own ceiling).
         continuation_physical_attempts: Transport ceiling of each point's continuations.
         selector_profile: Selector evidence-tool profile; agentic by default.
         critic_profile: Critic evidence-tool profile; agentic by default.
