@@ -32,6 +32,7 @@ from exp.common.project import (
     artifact_input,
 )
 from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.variance.build_source import build_source_identity
 from exp.optimize.evaluation.variance.exposure import ExposurePlan, Role, world_learning_scope
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS
@@ -190,14 +191,19 @@ class VarianceBuildSpec(ContractModel):
     credential_scrub: bool = True
 
     def identity(self, code_revision: str) -> str:
-        """Bind the registration and the producing code.
+        """Bind the registration and the build's semantic code, not the repository revision.
+
+        The code is :func:`build_source_identity` (the build protocol and its own semantic
+        sources), so an unrelated commit replays a saved build; ``code_revision`` is still
+        recorded on every artifact the build writes.
 
         Args:
-            code_revision: Producing source identity.
+            code_revision: Producing source identity; recorded, not part of the identity.
 
         Returns:
             Stable identity of the registration.
         """
+        del code_revision
         return stable_id(
             "variance-build-spec",
             {
@@ -208,7 +214,7 @@ class VarianceBuildSpec(ContractModel):
                         | (set() if self.credential_scrub else {"credential_scrub"}),
                     )
                 ),
-                "code": code_revision,
+                "code": build_source_identity(),
             },
         )
 
