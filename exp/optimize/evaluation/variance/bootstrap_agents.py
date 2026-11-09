@@ -74,7 +74,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     instruction,
 )
 from exp.simulation.reconstruction.models import resolve
-from exp.simulation.rules.contracts import trajectory_view
+from exp.simulation.rules.contracts import trace_locator, trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
 
 RECORDED_STATE_REF = "recorded-state"
@@ -294,7 +294,14 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     Raises:
         ValueError: Any structural check fails.
     """
-    draft = StartDraft.model_validate(canonical_pointers(answer))
+    answer = canonical_pointers(answer)
+    replay = answer.get("replay_trace")
+    if isinstance(replay, str) and replay not in material.sources:
+        # The inventory names a whole trace by its locator; replay_trace takes the bare identity.
+        bare = next((t for t in material.sources if trace_locator(t) == replay), None)
+        if bare is not None:
+            answer = {**answer, "replay_trace": bare}
+    draft = StartDraft.model_validate(answer)
     names = [tool.name for tool in draft.tools]
     declared = {tool.name: tool for tool in draft.manifest.tools}
     if len(set(names)) != len(names):
@@ -338,7 +345,13 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
         raise ValueError("an observed start holds the recorded state unchanged")
     if draft.provenance == "reconstructed":
         if draft.replay_trace not in material.sources:
-            raise ValueError("a reconstructed start names one of the task's source traces")
+            choices = {
+                trace_id: len(material.recorded_prefix(trace_id)) for trace_id in material.sources
+            }
+            raise ValueError(
+                f"a reconstructed start names one of the task's source traces as replay_trace, "
+                f"got {draft.replay_trace!r}; recorded prefix steps by source trace: {choices}"
+            )
         recorded = len(material.recorded_prefix(draft.replay_trace))
         if not 1 <= draft.prefix_steps <= recorded:
             raise ValueError(
@@ -946,7 +959,8 @@ def _check_facts(draft: StartDraft, inventory: frozenset[str]) -> None:
     for fact in draft.facts:
         if outside := sorted(set(fact.references) - inventory):
             raise ValueError(
-                f"fact {fact.fact_id} cites references outside the inventory: {outside}"
+                f"fact {fact.fact_id} cites references outside the inventory: {outside}; a trace "
+                "span is citable only as a step's locator or observation_locator in its trace view"
             )
         recorded = [
             ref for ref in fact.references if ref.startswith("trace:") or ref == RECORDED_STATE_REF

@@ -170,7 +170,8 @@ def _draft(task_id: str, opening: JsonObject) -> JsonObject:
         facts = [_fact("tier", "observed", ["recorded-state"])]
     elif task_id == "recon":
         provenance = "reconstructed"
-        extra = {"replay_trace": "src-recon", "prefix_steps": 2}
+        # The locator form of the trace, as the inventory names it, means the same trace.
+        extra = {"replay_trace": "trace:src-recon", "prefix_steps": 2}
         facts = [_fact("tier", "observed", ["trace:src-recon:span:r2"])]
     elif task_id == "gap" and not findings:
         facts = [_fact("tier", "unknown", [])]
