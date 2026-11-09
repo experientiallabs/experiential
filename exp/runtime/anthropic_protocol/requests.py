@@ -387,7 +387,12 @@ def decode_messages(
             The HTTP layer renders it in the Anthropic error envelope.
     """
     try:
-        return _decode(payload, _MessagesRequest, anthropic_beta=anthropic_beta)
+        return _decode(
+            payload,
+            _MessagesRequest,
+            anthropic_beta=anthropic_beta,
+            streams=payload.get("stream") is True,
+        )
     except ProviderParameterError as error:
         raise invalid_field("messages.content.cache_control", str(error)) from error
 
@@ -417,7 +422,7 @@ def decode_messages_count_tokens(
     if "gateway" in payload:
         raise unsupported_field("gateway")
     try:
-        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta)
+        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta, streams=False)
     except ProviderParameterError as error:
         raise invalid_field("messages.content.cache_control", str(error)) from error
 
@@ -427,8 +432,13 @@ def _decode(
     wire: type[_MessagesRequest],
     *,
     anthropic_beta: str | None,
+    streams: bool,
 ) -> DecodedGatewayRequest:
-    """Validate ``payload`` against ``wire`` and build the canonical request."""
+    """Validate ``payload`` against ``wire`` and build the canonical request.
+
+    ``streams`` says whether the call answers with a stream; ``count_tokens``
+    never does, whatever its ``stream`` field says.
+    """
     # Clients stamp their own bookkeeping on the turns they replay; a key no
     # turn defines is removed with disclosure rather than failing the whole
     # conversation. Content blocks and top-level fields stay strict.
@@ -438,7 +448,7 @@ def _decode(
     payload, media_disclosures = degrade_history_media(payload)
     # Clients with OpenAI-style extra body fields attach Chat's stream_options;
     # usage always streams on this surface.
-    payload, stream_disclosures = accept_messages_stream_options(payload)
+    payload, stream_disclosures = accept_messages_stream_options(payload, streams=streams)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)

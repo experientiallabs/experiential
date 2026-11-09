@@ -146,7 +146,7 @@ def test_messages_stream_options_are_consumed(
     payload: JsonObject, disclosures: tuple[str, ...]
 ) -> None:
     """Usage always streams on Messages: only a request it cannot honor is disclosed."""
-    repaired, named = accept_messages_stream_options(payload)
+    repaired, named = accept_messages_stream_options(payload, streams=payload.get("stream") is True)
     assert "stream_options" not in repaired
     assert repaired.get("stream") == payload.get("stream")
     assert named == disclosures
@@ -155,7 +155,7 @@ def test_messages_stream_options_are_consumed(
 def test_messages_without_stream_options_are_returned_unchanged() -> None:
     """A body with no stream_options is the same object, nothing disclosed."""
     payload: JsonObject = {"stream": True, "model": "m"}
-    repaired, named = accept_messages_stream_options(payload)
+    repaired, named = accept_messages_stream_options(payload, streams=True)
     assert repaired is payload
     assert named == ()
 
@@ -176,7 +176,7 @@ def test_malformed_messages_stream_options_keep_a_named_rejection(
 ) -> None:
     """Anything but an object of optional boolean include_usage/include_obfuscation is a 400."""
     with pytest.raises(OpenAIProtocolError) as error:
-        accept_messages_stream_options({"stream": True, "stream_options": options})
+        accept_messages_stream_options({"stream": True, "stream_options": options}, streams=True)
     assert error.value.status_code == 400
     assert error.value.detail.param == param
 

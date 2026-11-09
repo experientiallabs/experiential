@@ -401,6 +401,13 @@ def test_messages_stream_options_disclose_what_cannot_be_honored() -> None:
     del count_payload["max_tokens"]
     counted = decode_messages_count_tokens(count_payload)
     assert counted.request.ignored_parameters == ("stream_options->ignored(stream_false)",)
+    # count_tokens answers one JSON object even when the body says stream.
+    for options in ({"include_usage": True}, {"include_usage": False}):
+        streamed_count = _body(stream=True, stream_options=options)
+        del streamed_count["max_tokens"]
+        assert decode_messages_count_tokens(streamed_count).request.ignored_parameters == (
+            "stream_options->ignored(stream_false)",
+        )
 
 
 @pytest.mark.parametrize(

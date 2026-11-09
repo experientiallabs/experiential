@@ -26,7 +26,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import httpx
 import pytest
@@ -1644,12 +1644,13 @@ def test_openai_stream_options_serve_on_a_messages_stream(engine: _ServingEngine
 
     Clients with a configured OpenAI-style body overlay (opencode, for
     example) send ``{"include_usage": true}`` on Messages streams. The
-    Anthropic stream always carries usage, so the request is already satisfied and nothing is
-    disclosed; ``include_usage: false`` serves with the field disclosed on
+    Anthropic stream always carries usage, so the request is already
+    satisfied and nothing is disclosed; ``include_usage: false`` serves with the field disclosed on
     the message object, and an unknown key inside the object stays a 400.
     """
 
-    def stream(options: JsonValue) -> list[dict[str, Any]]:
+    def stream(options: JsonValue) -> list[JsonObject]:
+        """Send one Messages stream carrying ``options`` and decode its SSE payloads."""
         with httpx.stream(
             "POST",
             f"{engine.base}/v1/messages",
@@ -1659,21 +1660,24 @@ def test_openai_stream_options_serve_on_a_messages_stream(engine: _ServingEngine
         ) as response:
             assert response.status_code == 200
             raw = b"".join(response.iter_bytes()).decode()
-        return [
-            json.loads(line.removeprefix("data: "))
-            for line in raw.splitlines()
-            if line.startswith("data: ")
-        ]
+        payloads: list[JsonObject] = []
+        for line in raw.splitlines():
+            if line.startswith("data: "):
+                payload = json.loads(line.removeprefix("data: "))
+                assert isinstance(payload, dict)
+                payloads.append(payload)
+        return payloads
 
     honored = stream({"include_usage": True})
     message_delta = next(payload for payload in honored if payload["type"] == "message_delta")
-    assert message_delta["usage"]["output_tokens"] == 4
+    assert cast("JsonObject", message_delta["usage"])["output_tokens"] == 4
     honored_start = next(payload for payload in honored if payload["type"] == "message_start")
-    assert "x-experiential-ignored-parameters" not in honored_start["message"]
+    assert "x-experiential-ignored-parameters" not in cast("JsonObject", honored_start["message"])
 
     opted_out = stream({"include_usage": False})
     opted_out_start = next(payload for payload in opted_out if payload["type"] == "message_start")
-    assert opted_out_start["message"]["x-experiential-ignored-parameters"] == [
+    opted_out_message = cast("JsonObject", opted_out_start["message"])
+    assert opted_out_message["x-experiential-ignored-parameters"] == [
         "stream_options.include_usage->ignored(always_included)"
     ]
     assert any(payload["type"] == "message_delta" for payload in opted_out)

@@ -126,9 +126,9 @@ the order the model produced.
   as `stream_options.include_obfuscation->ignored(not_emitted)`, and the object on
   a non-streaming call as `stream_options->ignored(stream_false)`.
 - Messages accepts Chat's `stream_options` (`{"include_usage": true}`, which clients
-  configured with OpenAI-style extra body fields send on `/v1/messages`). The Anthropic stream always
-  carries usage, so `include_usage: true` or an empty object is satisfied and removed
-  without disclosure; `false` is disclosed as
+  configured with OpenAI-style extra body fields send on `/v1/messages`). The Anthropic
+  stream always carries usage, so `include_usage: true` or an empty object is satisfied
+  and removed without disclosure; `false` is disclosed as
   `stream_options.include_usage->ignored(always_included)`, and the object on a
   non-streaming call as `stream_options->ignored(stream_false)`. Chat's
   `include_obfuscation: true` is disclosed as
