@@ -184,6 +184,13 @@ def test_malformed_payloads_and_bad_base64_are_client_errors() -> None:
     assert parsed["status"] == 400
     status, body = _call(plane, "file_create", purpose="batch", content_b64="@@@")
     assert status == 400 and "base64" in body["error"]["message"]
+    status, body = _call(
+        plane,
+        "file_create",
+        purpose="batch",
+        content_b64=base64.b64encode(b"\x80\x81\x82").decode("ascii"),
+    )
+    assert status == 400 and "UTF-8" in body["error"]["message"]
 
 
 def test_unknown_ids_map_to_404() -> None:

@@ -64,6 +64,12 @@ def test_parse_input_jsonl_rejects_empty_payload() -> None:
         parse_input_jsonl(b"\n\n")
 
 
+def test_parse_input_jsonl_rejects_non_utf8_payload() -> None:
+    """A payload containing non-UTF-8 bytes is refused with a clear error."""
+    with pytest.raises(BatchSubmitError, match="not valid UTF-8"):
+        parse_input_jsonl(b"\x80\x81\x82")
+
+
 def test_parse_input_jsonl_enforces_the_line_budget() -> None:
     """One line above the product cap refuses the whole payload."""
     payload = b"\n".join(b'{"custom_id": "x"}' for _ in range(MAXIMUM_BATCH_LINES + 1))
