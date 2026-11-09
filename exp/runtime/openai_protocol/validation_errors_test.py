@@ -152,3 +152,14 @@ def test_a_key_a_sibling_branch_accepts_is_never_called_unknown() -> None:
     param, message = _rendered(_Action, {"action": {"query": "q", "limit": 3}})
     assert param == "action.limit"
     assert not message.startswith("Unknown parameter")
+
+
+@pytest.mark.parametrize("key", ["A" * 513, "x" * 3_000])
+def test_an_over_long_undefined_key_still_renders_a_bounded_refusal(key: str) -> None:
+    """A caller key longer than the error model allows is abbreviated, never a build failure."""
+    param, message = _rendered(_Tools, {"tools": [{"function": {"name": "f", key: 1}}]})
+    assert param is not None
+    assert len(param) == 256
+    assert param.startswith("tools.0.function.")
+    assert param.endswith("...")
+    assert message == unknown_parameter_message(param)

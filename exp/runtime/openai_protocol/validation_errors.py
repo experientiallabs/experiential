@@ -275,6 +275,30 @@ def _names_unknown_field(
     return True
 
 
+_MAXIMUM_ECHOED_PARAM_CHARACTERS = 256
+"""Longest field path echoed back in an error's ``param`` and message.
+
+An undefined key is the caller's own text and may be arbitrarily long; the
+error model caps ``param`` at 512 characters and the message at 2,048, so an
+unbounded echo would fail to build the 400 it describes.
+"""
+
+
+def _bounded_param(param: str) -> str:
+    """Abbreviate an over-long field path so the refusal can always be built.
+
+    Args:
+        param: Dotted field path, possibly ending in a caller-chosen key.
+
+    Returns:
+        The path unchanged when short enough, else its leading characters
+        followed by ``...``.
+    """
+    if len(param) <= _MAXIMUM_ECHOED_PARAM_CHARACTERS:
+        return param
+    return param[: _MAXIMUM_ECHOED_PARAM_CHARACTERS - 3] + "..."
+
+
 def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
 
@@ -307,7 +331,7 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     ]
     best = min(candidates, key=len)
     location = max((cleaned for cleaned, _ in best), key=len, default=())
-    param = ".".join(location) or "body"
+    param = _bounded_param(".".join(location) or "body")
     details = [detail for cleaned, detail in best if cleaned == location]
     if _names_unknown_field(groups, location, details):
         return invalid_field(param, unknown_parameter_message(param))
