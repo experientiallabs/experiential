@@ -70,6 +70,13 @@ from exp.simulation.world_model.grounded_session import (
 from exp.simulation.world_model.state_memory import StateMemory
 
 
+class InvalidPredictionError(ValueError):
+    """The simulator's reply broke its output contract after every allowed re-ask.
+
+    A known invalid reply, unlike a lost response: a caller may retry the action or refuse.
+    """
+
+
 class PredictorEvent(ContractModel):
     """Private provider evidence; a proposal is never presented as a committed world transition.
 
@@ -448,7 +455,7 @@ class _GroundedWorldBackend:
                     )
                 )
                 if attempt == self.factory.maximum_reasks:
-                    raise
+                    raise InvalidPredictionError(reason) from error
                 body = reask_proposal(body, raw, reason)
                 continue
             if verdict is not None:

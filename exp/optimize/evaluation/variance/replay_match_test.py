@@ -96,6 +96,22 @@ def test_an_empty_simulator_reply_is_retried_once_then_raised() -> None:
     assert twice.calls == 2
 
 
+def test_a_contract_breaking_simulator_reply_is_retried_like_an_empty_one() -> None:
+    """A reply refused after its re-asks is a known invalid reply: retried once, then raised."""
+    from exp.simulation.world_model.executable import InvalidPredictionError
+
+    calls: list[int] = []
+
+    class Session:
+        def execute(self, action: object) -> str:
+            calls.append(1)
+            if len(calls) == 1:
+                raise InvalidPredictionError("prediction edits exceed the writable paths")
+            return "ok"
+
+    assert _execute_retrying(Session(), object()) == "ok" and len(calls) == 2  # type: ignore[arg-type]
+
+
 def _row(locator: str, match: object) -> ReplayStep:
     """A replayed step carrying a match, as ``replay_prefix`` builds it."""
     from exp.optimize.evaluation.variance.bootstrap_capture import UNDECIDED

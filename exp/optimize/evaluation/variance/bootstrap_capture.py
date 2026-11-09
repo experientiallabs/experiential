@@ -81,6 +81,7 @@ from exp.runtime.environments.worlds import ExecutableWorld, ExecutableWorldRunt
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.world_model.executable import InvalidPredictionError
 
 
 def start_definition(
@@ -542,7 +543,7 @@ def _probe_observations(
             for index, action in enumerate(actions):
                 try:
                     observation = _execute_retrying(session, action)
-                except ProviderRetryableResponseError as error:
+                except SIMULATOR_FAILURES as error:
                     failure = (
                         f"the tool simulator gave no usable reply to step {index} "
                         f"({action.name}) twice: {type(error).__name__}: {error}"
@@ -572,17 +573,21 @@ def _probe_observations(
 SIMULATOR_RETRIES = 1
 """Same-request retries of an empty or invalid tool-simulator reply before refusing."""
 
+SIMULATOR_FAILURES = (ProviderRetryableResponseError, InvalidPredictionError)
+"""An empty reply, or one that broke the simulator's output contract after its re-asks."""
+
 
 def _execute_retrying(session: ExecutableWorld, action: ToolCall) -> Observation:
     """Execute one action, retrying an empty or invalid simulator reply once.
 
     Raises:
-        ProviderRetryableResponseError: The retry's reply is still unusable.
+        ProviderRetryableResponseError: The retry's reply is still empty.
+        InvalidPredictionError: The retry's reply still breaks the output contract.
     """
     for attempt in range(SIMULATOR_RETRIES + 1):
         try:
             return session.execute(action)
-        except ProviderRetryableResponseError:
+        except SIMULATOR_FAILURES:
             if attempt == SIMULATOR_RETRIES:
                 raise
     raise AssertionError("unreachable")
