@@ -598,6 +598,11 @@ def _task_call(
                     code_revision,
                 )  # fmt: skip
             except Exception as error:  # noqa: BLE001 - one failing task never blocks the others
+                if _at_credential_boundary(error):
+                    # Content the credential boundary refuses is refused on every attempt: final.
+                    entry = _failed(family, identity, task, previous, error, "credential_boundary")
+                    record(entry.model_copy(update={"status": "refused"}))
+                    return
                 record(_failed(family, identity, task, previous, error, "task"))
                 return
         record(_entry(project, family, identity, saved, attempts))
@@ -906,3 +911,9 @@ def _write_manifest(project: ProjectStore, manifest: BatchManifest) -> None:
     except BaseException:
         Path(staging).unlink(missing_ok=True)
         raise
+
+
+def _at_credential_boundary(error: Exception) -> bool:
+    """Return whether a task failed because the credential boundary refused its content."""
+    text = str(error)
+    return "credential boundary" in text or "secret boundary" in text

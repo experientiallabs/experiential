@@ -76,16 +76,16 @@ def test_envelope_requires_timezone_and_sorted_unique_inputs() -> None:
             code_revision="e7aad17",
         )
 
-    with pytest.raises(ValidationError, match="sorted"):
-        ArtifactEnvelope(
-            schema_version=1,
-            created_at=datetime(2026, 8, 11, tzinfo=UTC),
-            code_revision="e7aad17",
-            inputs=(
-                ArtifactInput(artifact_id="trace-b", sha256=_DIGEST_B),
-                ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_A),
-            ),
-        )
+    unordered = ArtifactEnvelope(
+        schema_version=1,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="e7aad17",
+        inputs=(
+            ArtifactInput(artifact_id="trace-b", sha256=_DIGEST_B),
+            ArtifactInput(artifact_id="trace-a", sha256=_DIGEST_A),
+        ),
+    )
+    assert [item.artifact_id for item in unordered.inputs] == ["trace-a", "trace-b"]
 
     with pytest.raises(ValidationError, match="repeat"):
         ArtifactEnvelope(

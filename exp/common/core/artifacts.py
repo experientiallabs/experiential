@@ -169,9 +169,8 @@ class ArtifactEnvelope(ContractModel):
         input_ids = tuple(item.artifact_id for item in value)
         if len(set(input_ids)) != len(input_ids):
             raise ValueError("artifact inputs must not repeat an artifact_id")
-        if input_ids != tuple(sorted(input_ids)):
-            raise ValueError("artifact inputs must be sorted by artifact_id")
-        return value
+        # Order carries no meaning: store inputs sorted by artifact_id, whatever the caller built.
+        return tuple(sorted(value, key=lambda item: item.artifact_id))
 
 
 def envelope_matches_manifest(envelope: ArtifactEnvelope, manifest: ArtifactEnvelope) -> bool:
