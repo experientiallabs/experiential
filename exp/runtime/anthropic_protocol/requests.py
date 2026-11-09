@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
@@ -363,6 +363,22 @@ class _CountTokensRequest(_MessagesRequest):
     max_tokens: int | None = Field(default=None, gt=0)
 
 
+_STREAM_FLAG = TypeAdapter(bool)
+"""Validator for the ``stream`` flag, coercing exactly as ``_MessagesRequest`` does."""
+
+
+def _asks_for_stream(payload: JsonObject) -> bool:
+    """Whether the body asks for a stream, read the way the wire model reads ``stream``.
+
+    A value the wire model would refuse counts as not streaming here; the wire
+    validation that follows refuses it by name.
+    """
+    try:
+        return _STREAM_FLAG.validate_python(payload.get("stream", False))
+    except ValidationError:
+        return False
+
+
 def decode_messages(
     payload: JsonObject,
     *,
@@ -391,7 +407,7 @@ def decode_messages(
             payload,
             _MessagesRequest,
             anthropic_beta=anthropic_beta,
-            streams=payload.get("stream") is True,
+            streams=_asks_for_stream(payload),
         )
     except ProviderParameterError as error:
         raise invalid_field("messages.content.cache_control", str(error)) from error

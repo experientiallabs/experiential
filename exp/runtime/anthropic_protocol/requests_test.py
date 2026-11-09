@@ -401,6 +401,12 @@ def test_messages_stream_options_disclose_what_cannot_be_honored() -> None:
     del count_payload["max_tokens"]
     counted = decode_messages_count_tokens(count_payload)
     assert counted.request.ignored_parameters == ("stream_options->ignored(stream_false)",)
+    # A coercible stream flag streams, so its options are judged as streaming.
+    coerced = decode_messages(_body(stream="true", stream_options={"include_usage": False}))
+    assert coerced.request.stream is True
+    assert coerced.request.ignored_parameters == (
+        "stream_options.include_usage->ignored(always_included)",
+    )
     # count_tokens answers one JSON object even when the body says stream.
     for options in ({"include_usage": True}, {"include_usage": False}):
         streamed_count = _body(stream=True, stream_options=options)
