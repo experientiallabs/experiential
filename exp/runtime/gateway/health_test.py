@@ -287,6 +287,61 @@ def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
     assert registry.throttled_remaining_seconds((first, second)) is None
 
 
+def test_circuit_failure_names_the_account_failure_holding_the_circuit_open() -> None:
+    """An account-opened circuit reports its sanitized failure while it refuses a claim.
+
+    Reported inside the cooldown and while the half-open probe is in flight,
+    reduced to class, message and ownership (no other request's provider
+    detail), and gone once a claim would succeed or the rung succeeds.
+    """
+    now = [100.0]
+    registry = DeploymentHealthRegistry(open_seconds=30.0, clock=lambda: now[0])
+    quota = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_QUOTA,
+        safe_message="provider account quota or billing is exhausted",
+        provider_detail="Insufficient balance for request abc",
+        failover_eligible=True,
+    )
+    assert registry.circuit_failure((_KEY,), (0,)) is None
+
+    registry.failed(_KEY, quota)
+    assert registry.circuit_failure((_KEY,), (0,)) == GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_QUOTA,
+        safe_message="provider account quota or billing is exhausted",
+    )
+    assert registry.circuit_failure((_KEY,), ()) is None
+
+    now[0] += 31.0
+    assert registry.claim(_KEY)  # The half-open probe.
+    assert registry.circuit_failure((_KEY,), (0,)) is not None
+    registry.release_probe(_KEY)
+    assert registry.circuit_failure((_KEY,), (0,)) is None
+
+    registry.failed(_KEY, quota)
+    registry.succeeded(_KEY)
+    assert registry.circuit_failure((_KEY,), (0,)) is None
+
+
+def test_circuit_failure_requires_every_depth_held_open_by_an_account_failure() -> None:
+    """A claimable depth, or one held open by operational failures, reports nothing."""
+    registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
+    first: DeploymentHealthKey = ("catalog", "deployment-one", "connection")
+    second: DeploymentHealthKey = ("catalog", "deployment-two", "connection")
+    registry.failed(first, _failure(GatewayFailureClass.PROVIDER_AUTHENTICATION))
+
+    assert registry.circuit_failure((first, second), (0, 1)) is None
+    assert registry.circuit_failure((first, second), (0,)) is not None
+
+    registry.failed(second, _failure(GatewayFailureClass.TRANSPORT))
+    registry.failed(second, _failure(GatewayFailureClass.TRANSPORT))
+    assert not registry.claim(second)
+    assert registry.circuit_failure((first, second), (0, 1)) is None
+
+    # Operational failures that reopen an account-opened circuit replace its cause.
+    registry.failed(first, _failure(GatewayFailureClass.TRANSPORT))
+    assert registry.circuit_failure((first, second), (0,)) is None
+
+
 def test_throttle_redial_claim_passes_the_window_but_not_an_open_circuit() -> None:
     """A post-backoff redial re-enters the throttled rung; a dead rung still refuses it."""
     now = [100.0]

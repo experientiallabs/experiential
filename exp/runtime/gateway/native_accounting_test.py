@@ -2477,12 +2477,91 @@ def test_selected_first_route_does_not_force_an_open_health_circuit(
     assert refused["exhausted"] is True
     failure = refused["failure"]
     assert isinstance(failure, dict)
-    assert failure["failure_class"] == "provider_internal"
+    # The refusal names the account failure that opened the circuit.
+    assert failure["failure_class"] == "provider_authentication"
+    assert failure["safe_message"] == "provider rejected its credential"
     assert not ledger.started
     assert registry.entry(selected.authorization.request_id) is None
     ordinary = _admit(registry, selected.route.deployments, request_id="ordinary")
     assert _start(registry, ordinal=0, request_id="ordinary")["route_depth"] == 1
     assert ordinary.total_attempts == 1
+
+
+_QUOTA_MESSAGE = (
+    "provider account quota or billing is exhausted; ask the gateway operator "
+    "to fund or enable the provider account"
+)
+
+
+def _selected_single_rung(registry: NativeAttemptAccounting, request_id: str) -> InflightRequest:
+    """Admit one request whose caller pinned the only rung (``route_id``, no fallbacks)."""
+    entry = _admit(
+        registry, (_deployment("deployment-a", connection_sha256="b" * 64),), request_id=request_id
+    )
+    entry.route = entry.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    return entry
+
+
+def test_selected_route_on_a_quota_exhausted_account_answers_the_quota_failure() -> None:
+    """A pinned no-fallback rung whose account ran dry is refused as provider_quota, not an outage.
+
+    The production shape: a caller pinned one house lane by ``route_id`` with
+    ``allow_fallbacks: false``. The lane's account went quota-exhausted, so its
+    dispatched attempts answered ``provider_quota`` and opened the worker's
+    circuit. Every selected request inside that cooldown was refused before
+    dispatch, and was answered ``provider_internal`` "all exact-model
+    deployments are unavailable": a platform outage that never happened.
+    """
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    _selected_single_rung(registry, "dispatched")
+    attempt = _start(registry, ordinal=0, request_id="dispatched")
+    assert attempt["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(attempt["attempt_id"]),
+        outcome="failed",
+        finalize=True,
+        request_id="dispatched",
+        failure={
+            "failure_class": "provider_quota",
+            "safe_message": _QUOTA_MESSAGE,
+            "failover_eligible": True,
+            "provider_detail": "Insufficient balance for request abc",
+        },
+    )
+
+    _selected_single_rung(registry, "refused")
+    refused = _start(registry, ordinal=0, request_id="refused")
+
+    assert refused["exhausted"] is True
+    assert refused["failure"] == {"failure_class": "provider_quota", "safe_message": _QUOTA_MESSAGE}
+    assert len(ledger.started) == 1
+    assert ledger.finished_requests[-1].failure_class is GatewayFailureClass.PROVIDER_QUOTA
+    # Another request's provider detail never rides along on this refusal.
+    assert ledger.finished_requests[-1].provider_detail is None
+    assert registry.entry("refused") is None
+
+
+def test_selected_route_held_open_by_transport_failures_stays_unavailable() -> None:
+    """Only an account failure is named: an operational circuit keeps the generic answer."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    for _ in range(2):
+        registry.health.failed(
+            key,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.TRANSPORT,
+                safe_message="provider transport failed; retry the request",
+            ),
+        )
+    refused = _start(registry, ordinal=0)
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "provider_internal"
+    assert failure["safe_message"] == "all exact-model deployments are unavailable"
+    assert not ledger.started
 
 
 class TestRungDispatchPolicy:

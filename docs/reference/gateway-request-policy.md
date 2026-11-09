@@ -94,6 +94,13 @@ An unavailable, foreign, conditional-fallback-only, or incompatible selected rou
 is refused, never silently replaced during admission. Reasoning-pinned
 continuations cannot be redirected to an incompatible route.
 
+A selected route's first dial never forces an open health circuit. When that
+circuit was opened by the route's provider account (a rejected credential, a
+missing deployment, or exhausted quota or billing), the refusal carries that
+account failure's class and message, the same answer a dispatched attempt on the
+route receives, instead of a generic outage. Allow fallbacks or select another
+route to keep serving while the account is unavailable.
+
 The host carries the requested handle in
 `AuthorizationSnapshot.requested_route_id` and attests its resolution with
 `GatewayRoute.resolved_route_id`. The engine checks both. The standalone catalog

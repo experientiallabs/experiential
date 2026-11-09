@@ -723,13 +723,13 @@ class NativeAttemptAccounting:
             )
         exhaustion = last_failure
         if exhaustion is None:
-            # An empty forced claim means every deployment is provider-throttled.
-            # Otherwise report unavailable without a free-capacity certificate.
+            # Throttled, else the account failure holding every claimable circuit open (a
+            # selected dial never forces one), else unavailable; no free-capacity certificate.
             throttled_remaining = self._health.throttled_remaining_seconds(keys)
             exhaustion = (
                 all_routes_throttled_failure(throttled_remaining)
                 if throttled_remaining is not None
-                else all_routes_unavailable_failure()
+                else self._health.circuit_failure(keys, ladder) or all_routes_unavailable_failure()
             )
         certified = active and self.finish_request_quietly(
             entry.authorization,
