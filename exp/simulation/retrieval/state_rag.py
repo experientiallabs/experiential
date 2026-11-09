@@ -107,6 +107,9 @@ class StateTagIndex(ContractModel):
         corpus_scope: The scope the steps were restricted to, when one was given.
         embedder: Identity of the tie-break embedder, when vectors are stored.
         rows: Tagged steps sorted by transition.
+        skipped_steps: Fit steps left out because their state or answer could not cross the
+            credential boundary, so a replay knows the index is partial. Omitted (and the
+            identity unchanged) when no step was skipped.
     """
 
     protocol: str = STATE_TAG_PROTOCOL
@@ -115,6 +118,7 @@ class StateTagIndex(ContractModel):
     corpus_scope: CorpusScope | None = Field(default=None, exclude_if=lambda value: value is None)
     embedder: JsonObject | None = Field(default=None, exclude_if=lambda value: value is None)
     rows: tuple[StateTagRow, ...] = Field(min_length=1)
+    skipped_steps: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
 
     @model_validator(mode="after")
     def _consistent(self) -> StateTagIndex:
@@ -241,6 +245,7 @@ def build_state_tag_index(
         corpus_scope=scope,
         embedder=None if embedder is None else embedder.model,
         rows=tuple(sorted(rows, key=lambda row: row.transition_id)),
+        skipped_steps=refused,
     )
 
 

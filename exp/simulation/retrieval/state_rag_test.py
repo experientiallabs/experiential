@@ -23,6 +23,7 @@ from exp.simulation.retrieval.state_rag import (
     StateRAG,
     StateRecallReceipt,
     StateRetrievalPolicy,
+    StateTagIndex,
     build_state_tag_index,
     load_state_tag_index,
     plan_state_rag_calls,
@@ -363,3 +364,41 @@ def test_a_step_refused_at_the_credential_boundary_is_left_out_not_fatal() -> No
         build_state_tag_index(
             bank(), all_steps, fit(*traces), decide=broken, decision_model={"model": "clef"}
         )
+
+
+def test_a_partial_index_records_its_skipped_steps_and_a_complete_one_keeps_its_identity() -> None:
+    """F13: a replay can tell a credential-skipped index is partial; complete ones are unchanged.
+
+    The count is a metadata field omitted when zero, so indexes saved before it (none skipped)
+    keep their content identity.
+    """
+    from exp.common.project.errors import ArtifactStoreError
+
+    traces = corpus()
+    all_steps = steps(traces)
+    complete = build_state_tag_index(
+        bank(), all_steps, fit(*traces), decide=ScriptedDecisions(), decision_model={"model": "c"}
+    )
+    assert complete.skipped_steps == 0
+    assert "skipped_steps" not in complete.model_dump(mode="json")
+    assert (
+        complete.identity == StateTagIndex.model_validate(complete.model_dump(mode="json")).identity
+    )
+
+    scripted, calls = ScriptedDecisions(), [0]
+
+    def guarded(request: DecisionRequest) -> JsonObject:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ArtifactStoreError(
+                "provider request cannot be retained at the credential boundary; "
+                "remove credential-bearing content before dispatch"
+            )
+        return scripted(request)
+
+    partial = build_state_tag_index(
+        bank(), all_steps, fit(*traces), decide=guarded, decision_model={"model": "c"}
+    )
+    assert partial.skipped_steps == 1
+    replayed = StateTagIndex.model_validate_json(partial.model_dump_json())
+    assert replayed.skipped_steps == 1 and replayed.identity == partial.identity
