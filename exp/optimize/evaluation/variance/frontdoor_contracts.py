@@ -75,6 +75,9 @@ class FrontDoorSpec(ContractModel):
         astra_alias: The one approved closed alias, for the build-time tag roles only (the
             tag-bank and state-tag authors and the tag-monitor reviewer at checkpoints 1 to 5);
             refused in every other role (:mod:`~.astra_role`). None keeps every role open-weight.
+        save_partial: When some tasks failed but at least one start registered, save the
+            partial preparation and run the registered starts' pipelines; the failed tasks
+            retry on the next run. False stops before any pipeline instead.
         protocol: Front-door protocol.
     """
 
@@ -85,6 +88,7 @@ class FrontDoorSpec(ContractModel):
     astra_alias: str | None = Field(
         default=None, min_length=1, exclude_if=lambda value: value is None
     )
+    save_partial: bool = Field(default=True, exclude_if=lambda value: value)
     protocol: Literal["decision-variance-front-door-v1"] = FRONT_DOOR_PROTOCOL
 
     @model_validator(mode="after")

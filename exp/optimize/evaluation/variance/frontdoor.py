@@ -39,9 +39,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.models.client import RequestAdmissionRefused
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
@@ -461,7 +462,8 @@ class _Runner:
         )
         if prepared is None:
             return report.model_copy(update={"stopped": reason})
-        if not project.artifacts.exists(result_id):
+        partial = not project.artifacts.exists(result_id)
+        if partial and not (spec.save_partial and prepared.bindings):
             failed = ", ".join(f"{t}" for t in (*prepared.failed_tasks, *prepared.refused_tasks))
             return report.model_copy(
                 update={
@@ -470,7 +472,15 @@ class _Runner:
                     "refused_tasks": prepared.refused_tasks,
                 }
             )
-        saved = artifact_input(project.artifacts.read(result_id).manifest)
+        if partial:
+            # Registered starts need not wait for a failed task: save this run's partial
+            # report under its own content identity and run their pipelines. No "-result" is
+            # written, so the next run replays every saved outcome and retries the failed.
+            saved = save_partial_preparation(
+                project, preparation.identity, prepared, self.code_revision
+            )
+        else:
+            saved = artifact_input(project.artifacts.read(result_id).manifest)
         report = report.model_copy(
             update={
                 "preparation": saved,
@@ -509,6 +519,13 @@ class _Runner:
                 update={"pipelines": tuple(outcomes), "stopped": "; ".join(stops)}
             )
         report = report.model_copy(update={"pipelines": tuple(outcomes)})
+        if partial:
+            return report.model_copy(
+                update={
+                    "stopped": "registered starts ran; failed tasks retry on the next run: "
+                    + ", ".join(prepared.failed_tasks)
+                }
+            )
         return self.slots("after-pipeline", report)
 
     def context(self, report: FrontDoorReport) -> SlotContext:
@@ -886,3 +903,33 @@ def _slot_stages(
             )
         )
     return tuple(rows)
+
+
+PARTIAL_TYPE = "bootstrap-preparation-partial"
+"""Artifact type of a preparation saved while some of its tasks still fail."""
+
+
+def save_partial_preparation(
+    project: ProjectStore, identity: str, prepared: BootstrapPreparationReport, revision: str
+) -> ArtifactInput:
+    """Save, or find, a partial preparation report under its content identity.
+
+    Returns:
+        The saved partial report.
+    """
+    artifact_id = f"{identity}-partial-{sha256_json(prepared)[:20]}"
+    store = project.artifacts
+    if not store.exists(artifact_id):
+        refs = (prepared.build_report, *prepared.batches, *prepared.simulators)
+        store.write_json(
+            artifact_id=artifact_id,
+            artifact_type=PARTIAL_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=revision,
+                inputs=tuple(sorted(set(refs), key=lambda ref: ref.artifact_id)),
+            ),
+            files={"report.json": prepared},
+        )
+    return artifact_input(store.read(artifact_id).manifest)
