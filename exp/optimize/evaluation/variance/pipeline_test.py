@@ -1576,6 +1576,24 @@ def test_an_unset_group_ceiling_leaves_room_for_every_attempt_to_reach_the_horiz
     assert group_job(run.project, spec, job, "actor").maximum_physical_attempts == 40
 
 
+def test_a_continuation_ceiling_below_the_horizon_is_raised_to_room_for_every_continuation(
+    pipeline: tuple[Run, PipelineReport],
+) -> None:
+    """continuation_physical_attempts is a floor: M continuations at the horizon always fit.
+
+    The live spec's 64 against 8 continuations at a 20-call horizon (160) would exhaust each
+    point's ledger and leave its last continuations outcome-unknown.
+    """
+    run, _ = pipeline
+    mining = make_spec(run.fixture, run.rubric, run.bank).mining
+    horizon = mining.registered.maximum_model_calls
+    low = mining.model_copy(update={"continuation_physical_attempts": 1})
+    assert low.continuation_ceiling() == mining.continuations * horizon
+    assert low.continuation_ceiling(8) == 8 * horizon
+    high = mining.model_copy(update={"continuation_physical_attempts": 10_000})
+    assert high.continuation_ceiling() == 10_000
+
+
 def test_dispositions_rekey_only_families_and_records_with_no_new_call(
     pipeline: tuple[Run, PipelineReport],
 ) -> None:

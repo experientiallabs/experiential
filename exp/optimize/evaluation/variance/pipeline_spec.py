@@ -301,7 +301,9 @@ class MiningSettings(ContractModel):
         seed: Trajectory pick seed.
         group_physical_attempts: Transport ceiling of each group, or None for room for every
             attempt to reach the call horizon (never less than the job's own ceiling).
-        continuation_physical_attempts: Transport ceiling of each point's continuations.
+        continuation_physical_attempts: Floor of each point's continuation attempt ceiling,
+            raised to room for every continuation at the call horizon
+            (:meth:`continuation_ceiling`).
         selector_profile: Selector evidence-tool profile; agentic by default.
         critic_profile: Critic evidence-tool profile; agentic by default.
         schedule: Training schedule whose next selector-critic rollout replaces the run of the
@@ -348,6 +350,19 @@ class MiningSettings(ContractModel):
         if self.job is None:
             raise ValueError("the bootstrap binding is unresolved; run through the pipeline entry")
         return self.job
+
+    def continuation_ceiling(self, repeats: int | None = None) -> int:
+        """Return one point's continuation attempt ceiling: room for every continuation.
+
+        ``continuation_physical_attempts`` is kept as a floor: a ceiling below ``repeats``
+        continuations at the call horizon (8 x 20 = 160 against the default 64) would exhaust
+        the ledger and leave the last continuations outcome-unknown.
+
+        Args:
+            repeats: Continuations per point; the mining count by default.
+        """
+        count = self.continuations if repeats is None else repeats
+        return max(self.continuation_physical_attempts, count * self.registered.maximum_model_calls)
 
     @model_validator(mode="after")
     def _tiers(self) -> Self:
@@ -813,6 +828,8 @@ class MiningOutputs(ContractModel):
         rubric_packet: The whole-task packet the rubric was authored from, when it was authored.
         tiers: One entry per actor tier, in spec order.
         blast: Saved blast-radius ranking of every continued point, under qualification.
+        cross_tier: Saved ``cross-tier-blast`` record: each tier's top points continued by
+            every other tier, with per-tier shares and recoveries.
     """
 
     profile: JudgeProfile
@@ -820,6 +837,7 @@ class MiningOutputs(ContractModel):
     rubric_packet: ArtifactInput | None = None
     tiers: tuple[TierMining, ...]
     blast: ArtifactInput | None = None
+    cross_tier: ArtifactInput | None = None
 
 
 class FamilyOutcome(ContractModel):
