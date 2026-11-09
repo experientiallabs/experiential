@@ -57,7 +57,7 @@ class AuthorSettings(ContractModel):
     model_alias: str = Field(min_length=1)
     model: ModelSnapshot
     catalog_sha256: Sha256
-    output_tokens: int = Field(default=4096, ge=1, le=8192)
+    output_tokens: int = Field(default=4096, ge=1, le=65_536)
     reasoning_effort: ReasoningEffort | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
