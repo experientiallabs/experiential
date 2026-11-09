@@ -705,23 +705,40 @@ def blast_reference(artifact: ArtifactInput) -> ReferenceSource:
 
 
 def order_by_blast(
-    ranking: Sequence[int], ranked: Sequence[BlastRadius], *, attempt: int | None = None
+    ranking: Sequence[int],
+    ranked: Sequence[BlastRadius],
+    *,
+    attempt: int | None = None,
+    checkpoints: Mapping[int, str] | None = None,
+    scored_only: bool = False,
 ) -> tuple[int, ...]:
     """Reorder an actor-critic point ranking by blast radius for family selection.
 
     Points with a scored blast radius come first in blast order; every other point keeps its
-    original relative order after them. No point is added or dropped.
+    original relative order after them, or is dropped under ``scored_only``.
 
     Args:
         ranking: Point steps in the actor-critic order.
-        ranked: The blast-radius ranking.
+        ranked: The blast-radius ranking (every tier's points).
         attempt: Only blast rows of this attempt apply, when given.
+        checkpoints: This tier's step -> checkpoint id. Rows are then matched by checkpoint,
+            so another tier's point at the same step and attempt never reorders this tier.
+        scored_only: Keep only points with a scored blast radius: an unscored point (its
+            severity unreviewable or split) never becomes a family, Harbor export or rung.
     """
-    position: Mapping[int, int] = {
-        row.point: row.rank
-        for row in ranked
-        if row.score is not None and (attempt is None or row.attempt == attempt)
-    }
+    if checkpoints is not None:
+        by_id = {row.point_id: row for row in ranked if row.score is not None}
+        position = {
+            step: by_id[checkpoints[step]].rank
+            for step in ranking
+            if step in checkpoints and checkpoints[step] in by_id
+        }
+    else:
+        position = {
+            row.point: row.rank
+            for row in ranked
+            if row.score is not None and (attempt is None or row.attempt == attempt)
+        }
     first = sorted((step for step in ranking if step in position), key=lambda s: position[s])
-    rest = [step for step in ranking if step not in position]
+    rest = [] if scored_only else [step for step in ranking if step not in position]
     return (*first, *rest)

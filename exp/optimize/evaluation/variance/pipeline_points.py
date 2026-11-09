@@ -497,10 +497,21 @@ def load_blast_ranking(store: ArtifactStore, reference: ArtifactInput) -> tuple[
 def family_order(
     store: ArtifactStore, blast: ArtifactInput | None, report: ActorCriticReport
 ) -> tuple[int, ...]:
-    """Return a tier's points in blast-radius order for family selection, or its own ranking."""
+    """Return a tier's scored points in blast-radius order for family selection.
+
+    Under a blast ranking only this tier's own checkpoints with a scored blast radius are
+    returned (F12), so an unscored point never becomes a family, Harbor export or curriculum
+    rung; without one the tier's own ranking is kept.
+    """
     if blast is None:
         return report.ranking
-    return order_by_blast(report.ranking, load_blast_ranking(store, blast), attempt=report.picked)
+    return order_by_blast(
+        report.ranking,
+        load_blast_ranking(store, blast),
+        attempt=report.picked,
+        checkpoints={row.point: row.checkpoint.artifact_id for row in report.points},
+        scored_only=True,
+    )
 
 
 def mining_provenance(

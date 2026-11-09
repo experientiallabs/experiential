@@ -261,3 +261,43 @@ def test_tier_outcomes_combine_tiers_by_shared_checkpoint() -> None:
         ("kimi", 6, 2),
     ]
     assert shared.attempt == 2 and shared.point == 3
+
+
+def test_family_order_keeps_only_this_tiers_scored_checkpoints() -> None:
+    """F12 and tier mixing: unscored points are dropped, and rows match by checkpoint.
+
+    Another tier's point at the same step and attempt (scored first) must not reorder this
+    tier, and an unscored point of this tier must never become a family or Harbor export.
+    """
+    spec = spec_for()
+    ranked = rank_blast(
+        [
+            blast_radius(  # another tier: step 6, attempt 0, ranked first
+                BlastPoint(point_id="other-6", point=6, attempt=0, tiers=tiers((0, 8), (0, 8))),
+                severity("other-6", "critical"),
+                spec,
+            ),
+            blast_radius(
+                BlastPoint(point_id="mine-2", point=2, attempt=0, tiers=tiers((0, 8), (8, 0))),
+                severity("mine-2", "moderate"),
+                spec,
+            ),
+            blast_radius(
+                BlastPoint(point_id="mine-6", point=6, attempt=0, tiers=tiers((0, 8), (8, 0))),
+                severity("mine-6", None),
+                spec,
+            ),
+            blast_radius(  # unscored: its stances did not agree
+                BlastPoint(point_id="mine-9", point=9, attempt=0, tiers=tiers((0, 8))),
+                severity("mine-9", None),
+                spec,
+            ),
+        ]
+    )
+    mine = {2: "mine-2", 6: "mine-6", 9: "mine-9"}
+
+    # Keyed by step, the other tier's critical step 6 promoted this tier's unscored step 6.
+    assert order_by_blast((9, 6, 2), ranked, attempt=0) == (6, 2, 9)
+
+    assert order_by_blast((9, 6, 2), ranked, checkpoints=mine, scored_only=True) == (2,)
+    assert order_by_blast((9, 6, 2), ranked, checkpoints=mine) == (2, 9, 6)
