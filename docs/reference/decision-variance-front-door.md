@@ -106,6 +106,7 @@ stateDiagram-v2
     planned --> replaying: replay
     consented --> running: started
     replaying --> finished: finished
+    replaying --> stopped: stopped
     replaying --> failed: raised
     running --> finished: finished
     running --> stopped: stopped

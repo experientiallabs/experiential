@@ -48,6 +48,18 @@ def test_a_run_consents_before_it_starts_and_ends_once() -> None:
     with pytest.raises(IllegalTransition):
         RUN_MACHINE.target(RunState.PLANNED, "started")
     with pytest.raises(IllegalTransition):
-        RUN_MACHINE.target(RunState.REPLAYING, "stopped")
+        RUN_MACHINE.target(RunState.REPLAYING, "started")
     assert RunState.FINISHED in RUN_MACHINE.final
     assert "planned --> consented: consented" in statecharts()
+
+
+def test_a_replayed_run_that_stops_records_the_stop_instead_of_raising(tmp_path: Path) -> None:
+    """F6: a replay whose saved work stops (a halted slot, a stopped start) ends stopped.
+
+    Without the row the replay raised IllegalTransition after all its work was done.
+    """
+    assert RUN_MACHINE.target(RunState.REPLAYING, "stopped") == RunState.STOPPED
+    tracker = Tracker(TransitionJournal(tmp_path / "t.jsonl"), "run")
+    tracker.run_event("replay")
+    tracker.run_event("stopped")
+    assert not any(row["refused"] for row in tracker.journal.rows())

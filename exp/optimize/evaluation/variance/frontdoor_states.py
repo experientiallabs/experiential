@@ -113,6 +113,7 @@ RUN_MACHINE = StateMachine(
         (RunState.PLANNED, "replay", RunState.REPLAYING),
         (RunState.CONSENTED, "started", RunState.RUNNING),
         (RunState.REPLAYING, "finished", RunState.FINISHED),
+        (RunState.REPLAYING, "stopped", RunState.STOPPED),
         (RunState.REPLAYING, "raised", RunState.FAILED),
         (RunState.RUNNING, "finished", RunState.FINISHED),
         (RunState.RUNNING, "stopped", RunState.STOPPED),
