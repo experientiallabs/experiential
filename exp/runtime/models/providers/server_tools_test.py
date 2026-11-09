@@ -9,6 +9,7 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tool_names,
     anthropic_server_tools_message,
     anthropic_server_tools_present,
+    strip_anthropic_server_tools,
 )
 
 
@@ -52,6 +53,31 @@ def test_a_result_block_alone_still_names_its_tool() -> None:
         ),
     )
     assert anthropic_server_tool_names(request) == ("web_search",)
+
+
+def test_echoed_advisor_history_names_the_advisor_and_strips_on_a_foreign_wire() -> None:
+    """Advisor history is a server-tool carrier like web search.
+
+    A route with no Anthropic rung drops the advisor call and its result the
+    same way it drops an echoed search, and the label names the advisor.
+    """
+    request = _messages_request(
+        echoed_blocks=(
+            {"type": "server_tool_use", "id": "srvtoolu_a", "name": "advisor", "input": {}},
+            {
+                "type": "advisor_tool_result",
+                "tool_use_id": "srvtoolu_a",
+                "content": {"type": "advisor_redacted_result", "encrypted_content": "EqQB"},
+            },
+        ),
+    )
+    assert anthropic_server_tool_names(request) == ("advisor",)
+    assert anthropic_server_tools_present(request) is True
+    assert "'advisor' (Anthropic advisor)" in anthropic_server_tools_message(("advisor",))
+    stripped = strip_anthropic_server_tools(request.messages)
+    assert [message.role for message in stripped.messages] == ["user"]
+    assert stripped.dropped_blocks is True
+    assert stripped.dropped_citations is False
 
 
 def test_no_server_tools_means_no_names() -> None:

@@ -283,7 +283,9 @@ unenumerated behavior surface).
 """
 
 
-MESSAGES_BETA_TOKENS_FIELD_BOUND = frozenset({"dangerous-tool-use-2026-09-03"})
+MESSAGES_BETA_TOKENS_FIELD_BOUND = frozenset(
+    {"advisor-tool-2026-03-01", "dangerous-tool-use-2026-09-03"}
+)
 """Caller ``anthropic-beta`` tokens accepted silently and never relayed as sent.
 
 Each token here only gates one request field, and the gateway injects it
@@ -294,5 +296,9 @@ the caller copy is neither forwarded (a bare token without its field, or on
 a non-Anthropic rung, would change nothing a caller can observe) nor
 disclosed as dropped, so a route that cannot run the server-side review
 answers exactly as if the caller had never asked, and the caller falls back
-to reviewing tool calls itself.
+to reviewing tool calls itself. ``advisor-tool-2026-03-01`` is bound to
+echoed advisor history (``advisor_tool_result`` blocks and the advisor's
+``server_tool_use``), which Anthropic accepts only under that token even after
+the tool leaves ``tools``; the ``advisor_20260301`` tool itself stays rejected
+in :data:`MESSAGES_SERVER_TOOL_TYPES_REJECTED`.
 """

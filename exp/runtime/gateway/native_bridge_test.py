@@ -8269,6 +8269,96 @@ def test_claude_code_tool_changes_serve_on_an_anthropic_messages_rung(tmp_path: 
     assert "tool_addition" not in json.dumps(upstream)
 
 
+def _advisor_history_body() -> str:
+    """A Claude Code turn whose history carries an earlier advisor consult."""
+    return json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "build a worker pool"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_a",
+                            "name": "advisor",
+                            "input": {},
+                        },
+                        {
+                            "type": "advisor_tool_result",
+                            "tool_use_id": "srvtoolu_a",
+                            "content": {
+                                "type": "advisor_redacted_result",
+                                "encrypted_content": "EqQBCkYIBRgC",
+                            },
+                        },
+                        {"type": "text", "text": "Here is the pool."},
+                    ],
+                },
+                {"role": "user", "content": "now add tests"},
+            ],
+        }
+    )
+
+
+def test_echoed_advisor_history_serves_verbatim_on_an_anthropic_messages_rung(
+    tmp_path: Path,
+) -> None:
+    """Advisor history admits and replays byte-for-byte behind its beta token.
+
+    A Claude Code session that consulted the advisor resends both blocks on
+    every later turn. On a native Anthropic rung both
+    blocks dispatch verbatim and the dispatch carries
+    ``advisor-tool-2026-03-01``, without which Anthropic refuses the history.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(
+        root,
+        provider="anthropic",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}),
+        request_timeout_seconds=120.0,
+    )
+
+    admission = _flatten_started(
+        control, _admit(control, raw_key, _advisor_history_body(), surface="messages")
+    )
+
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    sent = json.loads(_advisor_history_body())["messages"][1]["content"]
+    assert cast("list[JsonObject]", messages[1]["content"]) == sent
+    headers = cast("JsonObject", admission["headers"])
+    assert "advisor-tool-2026-03-01" in str(headers["anthropic-beta"]).split(",")
+
+
+def test_echoed_advisor_history_is_dropped_on_a_chat_wire_rung(tmp_path: Path) -> None:
+    """A route with no Anthropic rung drops the advisor blocks, disclosed, like web search."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+
+    admission = _admit(control, raw_key, _advisor_history_body(), surface="messages")
+
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert "messages.server_tool_blocks->dropped(unsupported_by_provider)" in ignored
+    wire_text = json.dumps(_payload_messages(admission))
+    assert "advisor_tool_result" not in wire_text
+    assert "EqQBCkYIBRgC" not in wire_text
+    assert "Here is the pool." in wire_text
+
+
 def test_claude_code_tool_changes_serve_on_a_chat_wire_rung(tmp_path: Path) -> None:
     """A Chat-wire rung receives every tool loaded and the changes as instruction text."""
     _manager, raw_key = _configured_gateway(
