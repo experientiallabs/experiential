@@ -73,6 +73,13 @@ def _create_database(path: Path) -> None:
 PROJECT_BUSY_TIMEOUT_S = 5.0
 """Registered SQLite lock wait of one project transaction admission attempt."""
 
+LOCAL_WRITER_QUEUE_S = 300.0
+"""How long one writer may queue behind this process's other writers before SQLite's own lock.
+
+Tens of concurrent workers (rule memory reads, decisions) share one project database; queuing
+behind them is safe, so only the cross-process SQLite wait keeps the short per-attempt bound.
+"""
+
 PROJECT_LOCK_ATTEMPTS = 4
 """Admission attempts before a project transaction reports the database as busy."""
 
@@ -297,8 +304,13 @@ def project_connection(
         return
     timeout_s = max(0.0, timeout_s)
     deadline = time.monotonic() + timeout_s
-    admission = writer_turn(path, timeout_s=timeout_s) if write else nullcontext(timeout_s)
+    admission = (
+        writer_turn(path, timeout_s=max(timeout_s, LOCAL_WRITER_QUEUE_S))
+        if write
+        else nullcontext(timeout_s)
+    )
     with admission:
+        deadline = time.monotonic() + timeout_s  # queuing behind local writers keeps SQLite's wait
         if write:
             _create_database(path)
         elif path.is_symlink():

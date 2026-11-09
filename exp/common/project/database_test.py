@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -82,6 +83,7 @@ def test_separate_processes_serialize_read_modify_write(tmp_path: Path) -> None:
     """Independent writers cannot lose committed increments on one project record."""
     script = """
 import sys
+import time
 from pathlib import Path
 from exp.common.project.records import ProjectRecords
 state = ProjectRecords(Path(sys.argv[1]), "project-a", "project")
@@ -424,3 +426,24 @@ for index in range(25):
     expected = {f"{worker}-{index}".encode() for worker in range(8) for index in range(25)}
     assert len(events) == len(expected) and set(events) == expected
     assert ProjectRecords(tmp_path, "project-a", "state").read("counter") == b"200"
+
+
+
+def test_many_concurrent_writers_queue_instead_of_failing(tmp_path: Path) -> None:
+    """Forty threads writing project records at once all commit; none hits the local deadline."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from exp.common.project import ProjectConfig, ProjectStore
+    from exp.common.project.records import ProjectRecords
+
+    project = ProjectStore(tmp_path, "writers")
+    project.initialize(ProjectConfig(project_id="writers"))
+    records = ProjectRecords(project.paths.root, project.paths.project_id, "probe")
+
+    def write(n: int) -> None:
+        records.write(f"k{n}", b"x" * 2048)
+        time.sleep(0.02)
+
+    with ThreadPoolExecutor(max_workers=40) as pool:
+        list(pool.map(write, range(400)))
+    assert len([i for i in records.list_ids() if i.startswith("k")]) == 400
