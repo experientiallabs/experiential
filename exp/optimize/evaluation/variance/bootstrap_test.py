@@ -129,6 +129,21 @@ def _ticket_trace(trace_id: str, severity: str = "high") -> Trace:
             result("r2", 3, "check_sla", {"severity": severity, "lock": "none"}, "k2"),
             call("c3", 4, "escalate", {}, "k3"),
             result("r3", 5, "escalate", {"status": "escalated"}, "k3"),
+            # A reconstructed start leaves at least the last 3 steps for the agent.
+            *(
+                row
+                for index in range(4, 7 if trace_id == "src-recon" else 4)
+                for row in (
+                    call(f"c{index}", 2 * index - 2, "read_ticket", {}, f"k{index}"),
+                    result(
+                        f"r{index}",
+                        2 * index - 1,
+                        "read_ticket",
+                        {"ticket": "T-1", "status": "escalated"},
+                        f"k{index}",
+                    ),
+                )
+            ),
         ),
         declare=False,
     )

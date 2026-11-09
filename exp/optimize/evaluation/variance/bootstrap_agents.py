@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache, cached_property
@@ -79,11 +80,19 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
-from exp.runtime.models.providers.errors import ProviderRetryableResponseError
+from exp.runtime.models.providers.errors import (
+    ProviderResponseError,
+    ProviderRetryableResponseError,
+)
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.rules.contracts import trace_locator, trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
+
+LEFT_FRACTION = 0.25
+LEFT_STEPS = 3
+"""A reconstructed start leaves at least this share, and this many, of a trace's steps."""
 
 RECORDED_STATE_REF = "recorded-state"
 """Inventory reference of the recorded environment state snapshot."""
@@ -159,9 +168,26 @@ class StartMaterial:
         rows: list[Provenance] = []
         if self.recorded_state is not None:
             rows.append("observed")
-        if any(self.recorded_prefix(trace_id) for trace_id in self.sources):
+        if any(self.maximum_prefix(trace_id) for trace_id in self.sources):
             rows.append("reconstructed")
         return (*rows, "authored")
+
+    def trace_steps(self, trace_id: str) -> int:
+        """Return how many tool steps a trace recorded."""
+        steps = self.views[trace_id][0]["steps"]
+        assert isinstance(steps, list)
+        return len(steps)
+
+    def maximum_prefix(self, trace_id: str) -> int:
+        """Most steps a reconstructed start may replay from a source trace.
+
+        A prefix replaying the whole trace, or its decisive end, leaves the agent nothing to
+        decide; at least the last :data:`LEFT_FRACTION` of the steps, and at least
+        :data:`LEFT_STEPS`, stay unreplayed. Zero when the trace is too short to reconstruct.
+        """
+        total = self.trace_steps(trace_id)
+        left = max(LEFT_STEPS, math.ceil(total * LEFT_FRACTION))
+        return max(0, min(len(self.recorded_prefix(trace_id)), total - left))
 
     def recorded_prefix(self, trace_id: str) -> tuple[JsonObject, ...]:
         """Return a source trace's leading steps that recorded an observation or a failure."""
@@ -260,14 +286,16 @@ class StartMaterial:
                 rows[provenance] = "initial_state is the recorded state, unchanged"
             elif provenance == "reconstructed":
                 prefixes = {
-                    trace_id: len(self.recorded_prefix(trace_id))
+                    trace_id: self.maximum_prefix(trace_id)
                     for trace_id in sorted(self.sources)
-                    if self.recorded_prefix(trace_id)
+                    if self.maximum_prefix(trace_id)
                 }
                 rows[provenance] = (
                     "replay_trace is one of these source trace identities (bare, no 'trace:') "
-                    "and prefix_steps is 1 to its recorded prefix length, so the start replays "
-                    f"those steps: {json.dumps(prefixes)}"
+                    "and prefix_steps is 1 to the most steps given here. The prefix must end "
+                    "before the trace's decisive work: it sets the scene, and the remaining "
+                    "steps (at least the last quarter, and at least 3) are left for the agent "
+                    f"to decide. Most prefix steps by trace: {json.dumps(prefixes)}"
                 )
             else:
                 rows[provenance] = (
@@ -540,11 +568,14 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
                 f"a reconstructed start names one of the task's source traces as replay_trace, "
                 f"got {draft.replay_trace!r}; recorded prefix steps by source trace: {choices}"
             )
-        recorded = len(material.recorded_prefix(draft.replay_trace))
-        if not 1 <= draft.prefix_steps <= recorded:
+        most = material.maximum_prefix(draft.replay_trace)
+        if not 1 <= draft.prefix_steps <= most:
+            total = material.trace_steps(draft.replay_trace)
             raise ValueError(
-                f"a reconstructed start replays 1 to {recorded} recorded steps of "
-                f"{draft.replay_trace}"
+                f"prefix_steps {draft.prefix_steps} is outside 1 to {most} for "
+                f"{draft.replay_trace}, which recorded {total} steps: the prefix must end before "
+                f"the decisive work and leave at least the last {total - most} steps for the "
+                "agent; shorten the prefix, or choose provenance authored"
             )
     if draft.provenance == "authored" and not draft.reveal_probes:
         raise ValueError("an authored start names reveal probes for its first-reveal check")
@@ -1234,7 +1265,7 @@ def _repaired[Answer: ContractModel](
                     body, key), system=prompt, opening=body, answer=answer, validate=validate,
                     sources=sources, code_revision=code_revision,
                 )  # fmt: skip
-            except (ProviderTransportError, ProviderRetryableResponseError) as error:
+            except (ProviderTransportError, ProviderResponseError) as error:
                 cause = redraw_cause(error)
                 if cause is None or len(causes) == REDRAWS:
                     raise
@@ -1303,10 +1334,16 @@ def redraw_cause(error: Exception) -> str | None:
     """Why a lost draw may be redrawn, or None when it may not.
 
     A transport failure with no status, a 429 or a 5xx (520 included) is transient; an
-    exhausted output allowance is a size failure. Any other provider error is not redrawn.
+    exhausted output allowance is a size failure; a reply outside the typed contract (duplicate
+    JSON keys, unparsable tool arguments) is a lost draw. Any other provider error is not
+    redrawn.
     """
     if isinstance(error, ProviderRetryableResponseError):
         return "output_allowance" if error.hit_length_limit else "unusable_response"
+    if isinstance(error, OpenAICompatibleResponseError):
+        return "malformed_response"
+    if not isinstance(error, ProviderTransportError):
+        return None
     status = error.status_code if isinstance(error, ProviderTransportError) else None
     if status is None or status == 429 or status >= 500:
         return f"transport_{status or 'unknown'}"

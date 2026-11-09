@@ -151,3 +151,30 @@ def test_transient_and_size_failures_are_redrawn_and_others_are_not() -> None:
     assert redraw_cause(ProviderTransportError("x", status_code=400)) is None
     allowance = ProviderRetryableResponseError("x", hit_length_limit=True)
     assert redraw_cause(allowance) == "output_allowance"
+
+
+def test_a_reconstructed_prefix_leaves_the_decisive_steps_to_the_agent() -> None:
+    """Replaying all 8 or 50 recorded steps is refused: a quarter, and at least 3, stay."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import StartMaterial
+
+    def material(total: int) -> StartMaterial:
+        row = object.__new__(StartMaterial)
+        steps = [{"observation_locator": f"s{i}"} for i in range(total)]
+        row.__dict__["views"] = {"t": ({"steps": steps}, frozenset())}
+        return row
+
+    assert material(8).maximum_prefix("t") == 5
+    assert material(50).maximum_prefix("t") == 37
+    assert material(3).maximum_prefix("t") == 0
+
+
+def test_a_malformed_tool_call_reply_is_a_lost_draw() -> None:
+    """Duplicate JSON keys or unparsable arguments redraw like a transient failure."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import redraw_cause
+    from exp.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
+
+    error = OpenAICompatibleResponseError(
+        "tool_calls[0].function.arguments contains duplicate JSON keys"
+    )
+    assert redraw_cause(error) == "malformed_response"
+    assert redraw_cause(ValueError("not a provider error")) is None
