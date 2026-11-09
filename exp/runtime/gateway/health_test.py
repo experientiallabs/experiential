@@ -367,8 +367,14 @@ def test_a_newer_throttle_window_outranks_the_account_failure_only_while_it_runs
 
     registry.exhausted(_KEY, 120.0)
     assert registry.circuit_failure((_KEY,), (0,)) is None
-    # An account failure observed after the window is newer again.
+    # An account failure observed after the window is newer again, and a short
+    # throttle after it outranks it only for its own window, not the older one.
     registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_AUTHENTICATION))
+    assert registry.circuit_failure((_KEY,), (0,)) is not None
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.circuit_failure((_KEY,), (0,)) is None
+    now[0] += 31.0  # The short window ends inside the older 120 s plan window.
+    assert registry.throttled_remaining_seconds((_KEY,), (0,)) is not None
     assert registry.circuit_failure((_KEY,), (0,)) is not None
 
 

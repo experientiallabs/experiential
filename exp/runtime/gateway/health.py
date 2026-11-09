@@ -93,8 +93,9 @@ class _DeploymentHealth:
             it. ``None`` while the circuit is closed or held open by
             operational failures, and never recorded for a tenant origin, whose
             failures stay opaque to callers.
-        circuit_failure_order: Registry observation order of ``circuit_failure``.
-        throttle_order: Registry observation order of the latest throttle window.
+        newer_throttle_until: Monotonic end of the throttle windows observed after
+            ``circuit_failure`` was recorded (zero when none); only these, never an
+            older window, outrank the recorded account failure.
     """
 
     consecutive_failures: int = 0
@@ -104,8 +105,7 @@ class _DeploymentHealth:
     last_resort_probe: bool = False
     refusal_count: int = 0
     circuit_failure: GatewayFailure | None = None
-    circuit_failure_order: int = 0
-    throttle_order: int = 0
+    newer_throttle_until: float = 0.0
 
 
 class DeploymentHealthRegistry:
@@ -144,7 +144,6 @@ class DeploymentHealthRegistry:
         self._states: dict[DeploymentHealthKey, _DeploymentHealth] = {}
         self._lanes = LaneEjections(lane_ejection or LaneEjectionPolicy.from_environ())
         self._lock = threading.Lock()
-        self._observations = 0  # Orders throttle and account observations, under the lock.
 
     def order(self, keys: tuple[DeploymentHealthKey, ...], candidates: Sequence[int]) -> list[int]:
         """Return ``candidates`` with every ejected lane moved last, order otherwise kept.
@@ -317,11 +316,9 @@ class DeploymentHealthRegistry:
             state.last_resort_probe = False
             self._lanes.failed(_lane(key), failure, now)
             if cause == "throttle":
-                state.throttle_until = max(
-                    state.throttle_until,
-                    now + self._throttle_window_seconds(failure),
-                )
-                state.throttle_order = self._observe()
+                window_end = now + self._throttle_window_seconds(failure)
+                state.throttle_until = max(state.throttle_until, window_end)
+                state.newer_throttle_until = max(state.newer_throttle_until, window_end)
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
@@ -338,7 +335,7 @@ class DeploymentHealthRegistry:
                         customer_owned=failure.customer_owned,
                     )
                 )
-                state.circuit_failure_order = self._observe()
+                state.newer_throttle_until = 0.0
                 return
             if cause == "transport":
                 state.consecutive_failures += 1
@@ -367,12 +364,7 @@ class DeploymentHealthRegistry:
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.throttle_until = max(state.throttle_until, now + window)
-            state.throttle_order = self._observe()
-
-    def _observe(self) -> int:
-        """Return the next observation order; the caller holds the registry lock."""
-        self._observations += 1
-        return self._observations
+            state.newer_throttle_until = max(state.newer_throttle_until, now + window)
 
     def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
         """Size one throttle window from the provider's own stated wait.
@@ -482,10 +474,7 @@ class DeploymentHealthRegistry:
                     state is None
                     or state.circuit_failure is None
                     or (state.open_until <= now and not state.half_open_probe)
-                    or (
-                        state.throttle_until > now
-                        and state.throttle_order > state.circuit_failure_order
-                    )
+                    or state.newer_throttle_until > now
                 ):
                     return None
                 first = first or state.circuit_failure
