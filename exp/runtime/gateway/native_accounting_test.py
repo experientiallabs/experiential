@@ -2505,12 +2505,10 @@ def _selected_single_rung(registry: NativeAttemptAccounting, request_id: str) ->
 def test_selected_route_on_a_quota_exhausted_account_answers_the_quota_failure() -> None:
     """A pinned no-fallback rung whose account ran dry is refused as provider_quota, not an outage.
 
-    The production shape: a caller pinned one house lane by ``route_id`` with
-    ``allow_fallbacks: false``. The lane's account went quota-exhausted, so its
-    dispatched attempts answered ``provider_quota`` and opened the worker's
-    circuit. Every selected request inside that cooldown was refused before
-    dispatch, and was answered ``provider_internal`` "all exact-model
-    deployments are unavailable": a platform outage that never happened.
+    A dispatched attempt on the selected rung answers ``provider_quota`` and
+    opens its circuit. A later selected request inside the cooldown is refused
+    before dispatch with that same class and message, never the generic
+    ``provider_internal`` "all exact-model deployments are unavailable".
     """
     ledger = _RecordingLedger()
     registry = NativeAttemptAccounting(ledger)
@@ -2561,6 +2559,53 @@ def test_selected_route_held_open_by_transport_failures_stays_unavailable() -> N
     assert isinstance(failure, dict)
     assert failure["failure_class"] == "provider_internal"
     assert failure["safe_message"] == "all exact-model deployments are unavailable"
+    assert not ledger.started
+
+
+def test_selected_route_on_a_throttled_lead_answers_throttled_despite_a_free_fallback() -> None:
+    """A selected first dial may claim only its own rung, so only that rung's window decides."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            retry_after_seconds=30,
+        ),
+    )
+    refused = _start(registry, ordinal=0)
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "throttled"
+    assert not ledger.started
+
+
+def test_selected_route_names_an_account_failure_newer_than_its_throttle_window() -> None:
+    """An account failure recorded inside a throttle window wins over the older throttle."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            retry_after_seconds=600,
+        ),
+    )
+    # A post-backoff redial passes the window and the account then refuses it.
+    assert registry.health.claim_throttle_redial(key)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_QUOTA,
+            safe_message=_QUOTA_MESSAGE,
+        ),
+    )
+    refused = _start(registry, ordinal=0)
+    assert refused["failure"] == {"failure_class": "provider_quota", "safe_message": _QUOTA_MESSAGE}
     assert not ledger.started
 
 

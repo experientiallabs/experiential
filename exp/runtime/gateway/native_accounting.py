@@ -721,15 +721,15 @@ class NativeAttemptAccounting:
             return started_attempt_payload(
                 attempt_id, candidate, attempt_output_pace(entry, deployment, self._loads)
             )
-        exhaustion = last_failure
+        # The account failure holding every claimable circuit open (newer than any throttle
+        # window on it), else throttled, else unavailable; no free-capacity certificate.
+        exhaustion = last_failure or self._health.circuit_failure(keys, ladder)
         if exhaustion is None:
-            # Throttled, else the account failure holding every claimable circuit open (a
-            # selected dial never forces one), else unavailable; no free-capacity certificate.
-            throttled_remaining = self._health.throttled_remaining_seconds(keys)
+            throttled_remaining = self._health.throttled_remaining_seconds(keys, ladder)
             exhaustion = (
                 all_routes_throttled_failure(throttled_remaining)
                 if throttled_remaining is not None
-                else self._health.circuit_failure(keys, ladder) or all_routes_unavailable_failure()
+                else all_routes_unavailable_failure()
             )
         certified = active and self.finish_request_quietly(
             entry.authorization,

@@ -98,8 +98,10 @@ A selected route's first dial never forces an open health circuit. When that
 circuit was opened by the route's provider account (a rejected credential, a
 missing deployment, or exhausted quota or billing), the refusal carries that
 account failure's class and message, the same answer a dispatched attempt on the
-route receives, instead of a generic outage. Allow fallbacks or select another
-route to keep serving while the account is unavailable.
+route receives, instead of a generic outage. That account failure takes
+precedence over an older throttle window on the same rung. Allowing fallbacks
+does not change a selected first dial; select another route to keep serving
+while the account is unavailable.
 
 The host carries the requested handle in
 `AuthorizationSnapshot.requested_route_id` and attests its resolution with

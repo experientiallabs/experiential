@@ -285,6 +285,10 @@ def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
     # One key outside its window makes the route dispatchable again.
     now[0] += 21.0
     assert registry.throttled_remaining_seconds((first, second)) is None
+    # Judged over the depths a reservation could claim: a selected first dial
+    # (depth 0 only) on a throttled rung is throttled whatever its fallbacks are.
+    assert registry.throttled_remaining_seconds((second, first), (0,)) == 9.0
+    assert registry.throttled_remaining_seconds((first, second), ()) is None
 
 
 def test_circuit_failure_names_the_account_failure_holding_the_circuit_open() -> None:

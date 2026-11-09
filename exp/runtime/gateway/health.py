@@ -398,8 +398,10 @@ class DeploymentHealthRegistry:
                 return False
             return state.throttle_until > now or state.open_until > now
 
-    def throttled_remaining_seconds(self, keys: tuple[DeploymentHealthKey, ...]) -> float | None:
-        """Return the longest remaining throttle window when EVERY key is inside one.
+    def throttled_remaining_seconds(
+        self, keys: tuple[DeploymentHealthKey, ...], depths: Sequence[int] | None = None
+    ) -> float | None:
+        """Return the longest remaining throttle window when EVERY claimable key is inside one.
 
         A route with no claimable deployment and no classified failure of its
         own can only be throttle-suppressed (forced claims admit any
@@ -409,18 +411,22 @@ class DeploymentHealthRegistry:
 
         Args:
             keys: One health key per ordered route deployment.
+            depths: The route indexes this reservation could claim; ``None``
+                judges every deployment. A depth the reservation may not dial
+                says nothing about why it was refused.
 
         Returns:
-            The longest remaining window in seconds, or ``None`` when the
-            route is empty or any deployment is outside a throttle window.
+            The longest remaining window in seconds, or ``None`` when no
+            depth is judged or any judged deployment is outside a throttle window.
         """
-        if not keys:
+        judged = range(len(keys)) if depths is None else depths
+        if not judged:
             return None
         now = self._clock()
         remaining = 0.0
         with self._lock:
-            for key in keys:
-                state = self._states.get(key)
+            for depth in judged:
+                state = self._states.get(keys[depth])
                 if state is None or state.throttle_until <= now:
                     return None
                 remaining = max(remaining, state.throttle_until - now)
@@ -446,7 +452,9 @@ class DeploymentHealthRegistry:
             a circuit an account failure opened that refuses a claim right now
             (inside its cooldown, or its half-open probe in flight), else ``None``.
         """
-        failures: list[GatewayFailure] = []
+        # ``circuit_failure`` is set only with the circuit at its threshold and
+        # cleared whenever the count resets, so it alone marks an account-opened circuit.
+        first: GatewayFailure | None = None
         now = self._clock()
         with self._lock:
             for depth in depths:
@@ -454,12 +462,11 @@ class DeploymentHealthRegistry:
                 if (
                     state is None
                     or state.circuit_failure is None
-                    or state.consecutive_failures < self._failure_threshold
                     or (state.open_until <= now and not state.half_open_probe)
                 ):
                     return None
-                failures.append(state.circuit_failure)
-        return failures[0] if failures else None
+                first = first or state.circuit_failure
+        return first
 
     def release_probe(self, key: DeploymentHealthKey) -> None:
         """Release a claimed half-open probe that never reached provider dispatch.
