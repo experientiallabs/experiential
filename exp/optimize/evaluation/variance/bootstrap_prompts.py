@@ -24,13 +24,15 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v1"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v2"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
 trace:<trace_id>:span:<span_id> for recorded evidence, rule:<rule_id> for the family's learned
 rules, contract:<tool> for parsed tool contracts, finding:<finding_id> for research findings and
-recorded-state for a recorded environment snapshot. Cite only references in the inventory."""
+recorded-state for a recorded environment snapshot. Cite only references in the inventory.
+The opening context counts them by kind; read_trace, read_rules and your findings return the
+exact references, and every one they return is valid."""
 
 AUTHOR_INSTRUCTION = (
     """You author the starting state of one executable task from recorded agent traces.

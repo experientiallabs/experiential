@@ -182,11 +182,13 @@ class StartMaterial:
                     row.model_dump(mode="json") for row in self.knowledge.book.questions
                 ],
             },
-            "source_traces": [self.views[trace_id][0] for trace_id in sorted(self.sources)],
+            "source_traces": [
+                _opening_view(self.views[trace_id][0]) for trace_id in sorted(self.sources)
+            ],
             "recorded_state_available": self.recorded_state is not None,
             "allowed_provenance": list(self.allowed()),
             "findings": [_finding_view(row) for row in self.findings],
-            "inventory": sorted(self.inventory),
+            "inventory": _inventory_summary(self.inventory),
         }
 
     def run(
@@ -740,3 +742,53 @@ def _draw_id(
             "prompts": bootstrap_prompts_sha256(),
         },
     )
+
+
+OPENING_STEPS_HEAD = 40
+OPENING_STEPS_TAIL = 20
+OPENING_TEXT_CHARACTERS = 1_500
+"""Bounds of the opening context; the full trace stays readable through ``read_trace``."""
+
+
+def _clip(value: JsonValue) -> JsonValue:
+    """Clip long strings anywhere in a JSON value, keeping head and tail."""
+    if isinstance(value, str) and len(value) > OPENING_TEXT_CHARACTERS:
+        half = OPENING_TEXT_CHARACTERS // 2
+        return f"{value[:half]}…[{len(value) - OPENING_TEXT_CHARACTERS} characters]…{value[-half:]}"
+    if isinstance(value, dict):
+        return {key: _clip(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clip(item) for item in value]
+    return value
+
+
+def _opening_view(view: JsonObject) -> JsonValue:
+    """A source trace for the opening context: first and last steps, long texts clipped.
+
+    Long agent sessions run to hundreds of steps with large tool output, which overflowed the
+    author's input allowance; every step stays citable and readable in full via ``read_trace``.
+    """
+    steps = view.get("steps")
+    if isinstance(steps, list) and len(steps) > OPENING_STEPS_HEAD + OPENING_STEPS_TAIL:
+        omitted = len(steps) - OPENING_STEPS_HEAD - OPENING_STEPS_TAIL
+        view = {
+            **view,
+            "steps": [
+                *steps[:OPENING_STEPS_HEAD],
+                {"omitted_steps": omitted, "read_with": "read_trace"},
+                *steps[-OPENING_STEPS_TAIL:],
+            ],
+        }
+    return _clip(view)
+
+
+def _inventory_summary(inventory: frozenset[str] | set[str]) -> JsonObject:
+    """Count the citable references by kind instead of listing every step locator."""
+    kinds: dict[str, int] = {}
+    for reference in inventory:
+        kind = reference.split(":", 1)[0]
+        kinds[kind] = kinds.get(kind, 0) + 1
+    return {
+        "counts": dict(sorted(kinds.items())),
+        "note": "cite references returned by read_trace and read_rules; every one is valid",
+    }
