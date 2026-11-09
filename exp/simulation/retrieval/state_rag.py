@@ -43,6 +43,7 @@ from exp.common.project.errors import ArtifactStoreError
 from exp.common.state_machine import MachineRun, StateMachine, TransitionRecord
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS, DecisionRequest
 from exp.simulation.mining.tag_clusters import read_record, write_record
+from exp.simulation.mining.tagging import TraceTaggingError
 from exp.simulation.retrieval.contracts import RAGLineageBinding, RAGTransition
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.retrieval.state_tags import (
@@ -209,6 +210,10 @@ def build_state_tag_index(
             if not _at_credential_boundary(error):
                 raise
             return None
+        except TraceTaggingError as error:
+            if "outcome is unknown" not in str(error):
+                raise
+            return None  # an earlier run's refused or interrupted decision: never re-bought here
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         answered = list(pool.map(answer, kept))

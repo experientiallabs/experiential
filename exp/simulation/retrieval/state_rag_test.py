@@ -402,3 +402,25 @@ def test_a_partial_index_records_its_skipped_steps_and_a_complete_one_keeps_its_
     assert partial.skipped_steps == 1
     replayed = StateTagIndex.model_validate_json(partial.model_dump_json())
     assert replayed.skipped_steps == 1 and replayed.identity == partial.identity
+
+
+def test_a_step_whose_earlier_decision_has_an_unknown_outcome_is_left_out_not_re_bought() -> None:
+    """A step an earlier run left with an unknown outcome is skipped; the run carries on."""
+    from exp.simulation.mining.intents import abandoned_claim_refusal
+    from exp.simulation.mining.tagging import TraceTaggingError
+
+    traces = corpus()
+    all_steps = steps(traces)
+    scripted = ScriptedDecisions()
+    calls = [0]
+
+    def guarded(request: DecisionRequest) -> JsonObject:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise TraceTaggingError(abandoned_claim_refusal("a" * 64))
+        return scripted(request)
+
+    index = build_state_tag_index(
+        bank(), all_steps, fit(*traces), decide=guarded, decision_model={"model": "clef"}
+    )
+    assert len(index.rows) == len(all_steps) - 1

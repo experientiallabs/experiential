@@ -461,9 +461,16 @@ class _Runner:
         )
         if prepared is None:
             return report.model_copy(update={"stopped": reason})
-        saved = None
-        if project.artifacts.exists(result_id):
-            saved = artifact_input(project.artifacts.read(result_id).manifest)
+        if not project.artifacts.exists(result_id):
+            failed = ", ".join(f"{t}" for t in (*prepared.failed_tasks, *prepared.refused_tasks))
+            return report.model_copy(
+                update={
+                    "stopped": f"bootstrap preparation saved no result; failed: {failed}",
+                    "failed_tasks": prepared.failed_tasks,
+                    "refused_tasks": prepared.refused_tasks,
+                }
+            )
+        saved = artifact_input(project.artifacts.read(result_id).manifest)
         report = report.model_copy(
             update={
                 "preparation": saved,

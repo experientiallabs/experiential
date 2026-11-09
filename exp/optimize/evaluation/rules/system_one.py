@@ -105,9 +105,27 @@ class Region(ContractModel):
             locator=self.locator,
             trace_id=self.trace_id,
             step=self.step,
-            quote=self.text,
+            quote=clip_quote(self.text),
             source_sha256=self.sha256,
         )
+
+
+QUOTE_LIMIT = 16_000
+"""Longest quote a passage carries; ``Passage.quote`` refuses anything longer."""
+
+
+def clip_quote(text: str, limit: int = QUOTE_LIMIT) -> str:
+    """Return the text, or its head and tail around a marker when it exceeds the passage limit.
+
+    A step's recorded output can run far past what a rule's evidence needs; the passage keeps the
+    original text's digest, so the clip is visible and the source stays identifiable.
+    """
+    if len(text) <= limit:
+        return text
+    marker = f"\n…[{len(text) - limit + 64} characters clipped from the middle]…\n"
+    keep = limit - len(marker)
+    head = keep * 2 // 3
+    return text[:head] + marker + text[len(text) - (keep - head) :]
 
 
 class RegionCorpus:

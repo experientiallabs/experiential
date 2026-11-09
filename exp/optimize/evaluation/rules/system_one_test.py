@@ -240,3 +240,22 @@ def test_malformed_answers_fail_visibly(tmp_path: Path, monkeypatch: pytest.Monk
     jev = ScriptedJev({}, default={**QUIET, "reading": "maybe"})
     with pytest.raises(ValueError, match="declared option"):
         system_one(project, jev).answer(REFUND)
+
+
+def test_an_over_long_step_becomes_a_clipped_passage_with_the_original_digest() -> None:
+    """A step longer than a passage allows keeps its head, tail and source digest."""
+    from exp.common.core.artifacts import sha256_json as sha256_text
+    from exp.optimize.evaluation.rules.system_one import QUOTE_LIMIT, Region
+
+    text = "HEAD " + "x" * 40_000 + " TAIL"
+    region = Region(
+        locator="trace:t:span:s", trace_id="t", step=3, text=text, sha256=sha256_text(text)
+    )
+    passage = region.passage()
+    assert len(passage.quote) <= QUOTE_LIMIT
+    assert passage.quote.startswith("HEAD ") and passage.quote.endswith(" TAIL")
+    assert "clipped" in passage.quote and passage.source_sha256 == sha256_text(text)
+    short = Region(
+        locator="trace:t:span:u", trace_id="t", step=1, text="ok", sha256=sha256_text("ok")
+    )
+    assert short.passage().quote == "ok"
