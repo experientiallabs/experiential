@@ -56,7 +56,7 @@ OPERATION_DOLLAR_AUTHORIZATION: Final = "operation-explicit-spend"
 OPERATION_UNPRICED_AUTHORIZATION: Final = "operation-unpriced-allowance"
 """Reserved authorization identity whose unpriced allowance overrides every stage grant."""
 
-MAXIMUM_UNPRICED_ATTEMPTS: Final = 100_000
+MAXIMUM_UNPRICED_ATTEMPTS: Final = 1_000_000
 """Largest explicit unpriced-attempt ceiling one authorization may grant."""
 
 LEDGER_BUSY_TIMEOUT_MS: Final = 120_000
