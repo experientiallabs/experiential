@@ -59,7 +59,7 @@ from exp.optimize.evaluation.variance.rewards import (
     explained_variance,
 )
 
-BLAST_RADIUS_PROTOCOL = "blast-radius-v1"
+BLAST_RADIUS_PROTOCOL = "blast-radius-v2"
 """Version of the blast-radius formula, severity reconciliation and saved record."""
 
 SEVERITY_TOOL = "judge_failure_severity"
@@ -185,6 +185,149 @@ class SeverityJudgment(ContractModel):
     reviews: tuple[SeverityReview, ...] = ()
 
 
+CROSS_TIER_PROTOCOL = "cross-tier-blast-v1"
+"""Version of cross-tier continuation, its per-tier shares and recoveries; bump on change."""
+
+CROSS_TIER_TYPE = "cross-tier-blast"
+"""Artifact type of a saved :class:`CrossTierBlast` (``cross_tier.json``)."""
+
+
+class CrossTierSpec(ContractModel):
+    """Which top error positions every other tier continues from.
+
+    Attributes:
+        top_points: Highest-ranked points of each tier the other tiers continue from.
+        continuations: Continuations per point per other tier; None reuses the mining count.
+    """
+
+    top_points: int = Field(default=4, ge=0, le=64, strict=True)
+    continuations: int | None = Field(default=None, ge=1, le=64)
+
+
+class CrossTierPoint(ContractModel):
+    """One point measured by every tier.
+
+    Attributes:
+        point_id: The checkpoint the tiers continued from.
+        origin: The tier whose attempt holds the point.
+        pass_rates: Each graded tier's judged pass rate, ladder order (weakest first).
+        failing_tiers: Graded tiers below the failing rate.
+        failing_share: ``failing / graded``, or None without a graded tier.
+        recoveries: ``(weaker, stronger)`` tier pairs where the weaker failed and the stronger
+            passed from the same state.
+        teaching: Recovered pairs over pairs with a failing weaker tier; 0 without one. A point
+            weak tiers fail and strong tiers recover scores highest.
+        studies: The judged cross-tier continuation studies, by tier.
+        failures: Continuations that could not run or be judged, by tier.
+    """
+
+    point_id: str
+    origin: str
+    pass_rates: dict[str, float] = Field(default_factory=dict)
+    failing_tiers: tuple[str, ...] = ()
+    failing_share: float | None = None
+    recoveries: tuple[tuple[str, str], ...] = ()
+    teaching: float = 0.0
+    studies: dict[str, ArtifactInput] = Field(default_factory=dict)
+    failures: dict[str, str] = Field(default_factory=dict)
+
+
+class CrossTierBlast(ContractModel):
+    """The ``cross-tier-blast`` record: top error positions measured by every tier."""
+
+    protocol: str = CROSS_TIER_PROTOCOL
+    ladder: tuple[str, ...]
+    points: tuple[CrossTierPoint, ...]
+
+    def identity(self) -> str:
+        """Content-addressed identity: protocol and record, never the code revision."""
+        return stable_id(CROSS_TIER_TYPE, {"protocol": self.protocol, "record": sha256_json(self)})
+
+    def teaching(self) -> dict[str, float]:
+        """Each point's teaching score, by point."""
+        return {row.point_id: row.teaching for row in self.points}
+
+
+def cross_tier_point(
+    point: BlastPoint,
+    origin: str,
+    ladder: Sequence[str],
+    spec: BlastSpec,
+    *,
+    studies: Mapping[str, ArtifactInput] | None = None,
+    failures: Mapping[str, str] | None = None,
+) -> CrossTierPoint:
+    """Read one point's per-tier shares and recoveries from its combined tier outcomes.
+
+    Args:
+        point: The point with an outcome per tier (its origin's and the cross-tier ones).
+        origin: The tier whose attempt holds the point.
+        ladder: Every tier, weakest first.
+        spec: Frozen blast settings (failing rate, fewest graded continuations).
+        studies: The judged cross-tier studies, by tier.
+        failures: Continuations that could not run, by tier.
+    """
+    rates: dict[str, float] = {}
+    for outcome in point.tiers:
+        graded = outcome.successes + outcome.failures
+        if graded >= spec.minimum_graded:
+            rates[outcome.tier] = outcome.successes / graded
+    order = [tier for tier in ladder if tier in rates]
+    failing = tuple(tier for tier in order if rates[tier] < spec.failing_rate)
+    recoveries: list[tuple[str, str]] = []
+    pairs = 0
+    for index, weak in enumerate(order):
+        if weak not in failing:
+            continue
+        for strong in order[index + 1 :]:
+            pairs += 1
+            if strong not in failing:
+                recoveries.append((weak, strong))
+    return CrossTierPoint(
+        point_id=point.point_id,
+        origin=origin,
+        pass_rates={tier: rates[tier] for tier in order},
+        failing_tiers=failing,
+        failing_share=None if not order else len(failing) / len(order),
+        recoveries=tuple(recoveries),
+        teaching=0.0 if pairs == 0 else len(recoveries) / pairs,
+        studies=dict(studies or {}),
+        failures=dict(failures or {}),
+    )
+
+
+def save_cross_tier(
+    store: ArtifactStore,
+    record: CrossTierBlast,
+    *,
+    code_revision: str,
+    inputs: tuple[ArtifactInput, ...] = (),
+) -> ArtifactInput:
+    """Save a cross-tier record under its content identity, adopting an identical one."""
+    identity = record.identity()
+    if not store.exists(identity):
+        store.write_json(
+            artifact_id=identity,
+            artifact_type=CROSS_TIER_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=code_revision,
+                inputs=tuple(sorted(set(inputs), key=lambda ref: ref.artifact_id)),
+            ),
+            files={"cross_tier.json": record},
+        )
+    return artifact_input(store.read(identity).manifest)
+
+
+def load_cross_tier(store: ArtifactStore, reference: ArtifactInput) -> CrossTierBlast:
+    """Read a saved cross-tier record, refusing a changed one."""
+    stored = store.read(reference.artifact_id)
+    if artifact_input(stored.manifest) != reference:
+        raise ValueError(f"cross-tier record {reference.artifact_id} changed")
+    return CrossTierBlast.model_validate_json(stored.payloads["cross_tier.json"])
+
+
 class BlastSpec(ContractModel):
     """Frozen blast-radius settings.
 
@@ -196,6 +339,8 @@ class BlastSpec(ContractModel):
         minimum_graded: Fewest graded continuations a tier needs to count.
         maximum_failures: Most failing episodes shown to the reviewer per point.
         objective: Selector objective for the explained-variance fallback.
+        cross_tier: Which top points every other tier continues from, so a point's failing
+            share is read across all tiers; None keeps each tier to its own checkpoints.
     """
 
     reviewer: AuthorSettings
@@ -205,6 +350,7 @@ class BlastSpec(ContractModel):
     minimum_graded: int = Field(default=1, ge=1, le=1000, strict=True)
     maximum_failures: int = Field(default=4, ge=1, le=32, strict=True)
     objective: SelectorObjectiveV2 = DEFAULT_SELECTOR_OBJECTIVE
+    cross_tier: CrossTierSpec | None = Field(default_factory=CrossTierSpec)
 
 
 class BlastRadius(ContractModel):

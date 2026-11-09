@@ -22,11 +22,17 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
+from exp.optimize.evaluation.continuations.job import (
+    ContinuationJob,
+    continuation_result_reference,
+    execute_continuation_job,
+    saved_continuation_job,
+)
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.executable.task import MiningProvenance
@@ -35,23 +41,30 @@ from exp.optimize.evaluation.variance.behavior_adversarial import hack_signature
 from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.blast_radius import (
     BlastRadius,
+    CrossTierBlast,
+    CrossTierPoint,
     SeverityJudgment,
+    TierOutcome,
     blast_radius,
+    cross_tier_point,
     judge_severity,
     order_by_blast,
     rank_blast,
     save_blast_radius,
+    save_cross_tier,
     tier_outcomes,
 )
 from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence, episode_reward
 from exp.optimize.evaluation.variance.family_stages import slot_evidence
 from exp.optimize.evaluation.variance.judge import load_assessment
+from exp.optimize.evaluation.variance.judged import judge_study, slot_rewards
 from exp.optimize.evaluation.variance.pipeline_spec import (
     DecisionVarianceSpec,
     MiningOutputs,
     PointQualification,
     StageContext,
+    TierMining,
 )
 from exp.optimize.evaluation.variance.point_bar import BarRecord, QualificationBar, qualify_points
 from exp.optimize.evaluation.variance.point_selection import PointGate, save_point_bar
@@ -224,19 +237,28 @@ def _failures(project: ProjectStore, judged: ArtifactInput | None) -> list[Episo
 def mine_blast_radius(
     project: ProjectStore,
     spec: DecisionVarianceSpec,
-    reports: Sequence[ActorCriticReport],
+    tiers: Sequence[TierMining],
     *,
     code_revision: str,
     inputs: tuple[ArtifactInput, ...],
-) -> tuple[ArtifactInput, tuple[BlastRadius, ...]] | None:
+) -> tuple[ArtifactInput, tuple[BlastRadius, ...], ArtifactInput | None] | None:
     """Measure, judge, score and rank every continued point across tiers, then save it.
 
+    Each tier first continues only its own points. Under ``blast.cross_tier`` the highest
+    ranked points of every tier are then continued by each of the other tiers from the very
+    same checkpoint (:func:`cross_tier_studies`), so a point's failing share, ``ever_passed``
+    and score are read across every tier, and the per-tier shares and recoveries are saved as
+    a ``cross-tier-blast`` record. Severity is judged once per point, from its origin's
+    failing episodes, and reused.
+
     Returns:
-        The saved ranking and the ranked rows, or None when no severity reviewers are
-        registered (a point without a judged severity is never scored).
+        The saved ranking, the ranked rows and the cross-tier record (None when off), or None
+        when no severity reviewers are registered (a point without a judged severity is never
+        scored).
     """
     settings = spec.mining.qualification
     assert settings is not None
+    reports = [load_report(project, tier.report) for tier in tiers]
     points = tier_outcomes(reports)
     judged = {
         result.checkpoint.artifact_id: result.judged
@@ -265,17 +287,180 @@ def mine_blast_radius(
             return SeverityJudgment(point_id=key, severity=None, votes={})
 
     ordered = sorted(points.items())
-    severities = run_at_once(
-        [lambda key=key: severity_of(key) for key, _ in ordered],
-        admitted_concurrency(project, review.reviewer.model_alias),
+    severities = dict(
+        zip(
+            (key for key, _ in ordered),
+            run_at_once(
+                [lambda key=key: severity_of(key) for key, _ in ordered],
+                admitted_concurrency(project, review.reviewer.model_alias),
+            ),
+            strict=True,
+        )
     )
-    rows = [
-        blast_radius(point, severity, review)
-        for (_, point), severity in zip(ordered, severities, strict=True)
+    ranked = rank_blast([blast_radius(point, severities[key], review) for key, point in ordered])
+    cross_ref = None
+    if review.cross_tier is not None and review.cross_tier.top_points > 0 and len(tiers) > 1:
+        origins = {
+            result.checkpoint.artifact_id: (tier, result.checkpoint)
+            for tier, report in zip(tiers, reports, strict=True)
+            for result in report.points
+        }
+        chosen = top_points_by_tier(ranked, origins, review.cross_tier.top_points)
+        measured = cross_tier_studies(project, spec, tiers, chosen, code_revision=code_revision)
+        ladder = tuple(spec.mining.actors)
+        cross_rows: list[CrossTierPoint] = []
+        for key, (origin, _) in chosen.items():
+            extra = measured.get(key, {})
+            point = points[key]
+            added = tuple(
+                TierOutcome(tier=tier, successes=s, failures=f, unknown=u)
+                for tier, (s, f, u, _, _) in sorted(extra.items())
+                if tier not in {row.tier for row in point.tiers}
+            )
+            point = point.model_copy(update={"tiers": (*point.tiers, *added)})
+            points[key] = point
+            cross_rows.append(
+                cross_tier_point(
+                    point,
+                    origin.tier,
+                    ladder,
+                    review,
+                    studies={t: row[3] for t, row in extra.items() if row[3] is not None},
+                    failures={t: row[4] for t, row in extra.items() if row[4] is not None},
+                )
+            )
+        record = CrossTierBlast(ladder=ladder, points=tuple(cross_rows))
+        cross_ref = save_cross_tier(
+            project.artifacts,
+            record,
+            code_revision=code_revision,
+            inputs=tuple(study for row in cross_rows for study in row.studies.values()),
+        )
+        ranked = rank_blast(
+            [blast_radius(points[key], severities[key], review) for key, _ in ordered]
+        )
+    saved = save_blast_radius(
+        project.artifacts,
+        ranked,
+        code_revision=code_revision,
+        inputs=(*inputs, *(() if cross_ref is None else (cross_ref,))),
+    )
+    return saved, ranked, cross_ref
+
+
+def top_points_by_tier(
+    ranked: Sequence[BlastRadius],
+    origins: Mapping[str, tuple[TierMining, ArtifactInput]],
+    limit: int,
+) -> dict[str, tuple[TierMining, ArtifactInput]]:
+    """Return each tier's ``limit`` highest-ranked points (blast order), keyed by checkpoint."""
+    taken: dict[str, int] = {}
+    chosen: dict[str, tuple[TierMining, ArtifactInput]] = {}
+    for row in ranked:
+        origin = origins.get(row.point_id)
+        if origin is None or taken.get(origin[0].tier, 0) >= limit:
+            continue
+        taken[origin[0].tier] = taken.get(origin[0].tier, 0) + 1
+        chosen[row.point_id] = origin
+    return chosen
+
+
+def cross_tier_job(
+    spec: DecisionVarianceSpec, tier: TierMining, checkpoint: ArtifactInput
+) -> ContinuationJob:
+    """Return the continuations one tier runs from another tier's checkpoint."""
+    review = spec.mining.qualification.blast if spec.mining.qualification else None
+    cross = None if review is None else review.cross_tier
+    repeats = (
+        spec.mining.continuations
+        if cross is None or cross.continuations is None
+        else (cross.continuations)
+    )
+    return tier.job.model_copy(
+        update={
+            "maximum_physical_attempts": spec.mining.continuation_ceiling(repeats),
+            "study": tier.job.study.model_copy(
+                update={
+                    "checkpoint": checkpoint,
+                    "repeats": repeats,
+                    "critic_prediction": None,
+                    "predicted_success": None,
+                    "selection_plan": None,
+                }
+            ),
+        }
+    )
+
+
+CrossCounts = tuple[int, int, int, ArtifactInput | None, str | None]
+"""One tier at one point: successes, failures, unknown, judged study, failure."""
+
+
+def cross_tier_studies(
+    project: ProjectStore,
+    spec: DecisionVarianceSpec,
+    tiers: Sequence[TierMining],
+    chosen: Mapping[str, tuple[TierMining, ArtifactInput]],
+    *,
+    code_revision: str,
+) -> dict[str, dict[str, CrossCounts]]:
+    """Continue every chosen point with every other tier and judge it, concurrently.
+
+    Each (point, tier) is its own continuation job, so it is content-addressed by its exact
+    registration and replays with no call. A job that cannot run or be judged is recorded
+    against that tier and skipped, never aborting the stage. At most the host admission bound
+    of the actors and the judge run at once, each holding one request in flight.
+
+    Returns:
+        Per point, per other tier, its judged counts.
+    """
+    work = [
+        (key, tier, checkpoint)
+        for key, (origin, checkpoint) in chosen.items()
+        for tier in tiers
+        if tier.tier != origin.tier
     ]
-    ranked = rank_blast(rows)
-    saved = save_blast_radius(project.artifacts, ranked, code_revision=code_revision, inputs=inputs)
-    return saved, ranked
+
+    def run(tier: TierMining, checkpoint: ArtifactInput) -> CrossCounts:
+        """Continue and judge one point with one tier."""
+        job = cross_tier_job(spec, tier, checkpoint)
+        try:
+            study = saved_continuation_job(project, job, code_revision=code_revision)
+            if study is None:
+                study = execute_continuation_job(project, job, code_revision=code_revision)
+            reference = continuation_result_reference(project, job, code_revision=code_revision)
+            judged_ref, judged = judge_study(
+                project,
+                reference,
+                tier.judge,
+                configuration=job.configuration,
+                code_revision=code_revision,
+            )
+        except (ValueError, RuntimeError, OSError) as error:
+            logger.warning(
+                "cross-tier: %s from %s failed: %s",
+                tier.tier,
+                checkpoint.artifact_id,
+                str(error)[:500],
+            )
+            return 0, 0, 0, None, (type(error).__name__ + ": " + str(error))[:2000]
+        rewards = slot_rewards(project, judged.branches, judged.judge)
+        labels = [int(reward) for reward in rewards if reward is not None]
+        unknown = len(study.branches) - len(labels)
+        return sum(labels), len(labels) - sum(labels), unknown, judged_ref, None
+
+    aliases = {tier.tier for tier in tiers} | {tier.judge.settings.model_alias for tier in tiers}
+    results = run_at_once(
+        [
+            lambda tier=tier, checkpoint=checkpoint: run(tier, checkpoint)
+            for _, tier, checkpoint in work
+        ],
+        admitted_concurrency(project, *sorted(aliases)),
+    )
+    measured: dict[str, dict[str, CrossCounts]] = {}
+    for (key, tier, _), counts in zip(work, results, strict=True):
+        measured.setdefault(key, {})[tier.tier] = counts
+    return measured
 
 
 def blast_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[CostComponent, ...]:

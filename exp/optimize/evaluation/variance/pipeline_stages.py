@@ -220,6 +220,34 @@ def run_group(
     return continuation_result_reference(project, job, code_revision=code_revision), study
 
 
+def cross_tier_costs(
+    project: ProjectStore, spec: DecisionVarianceSpec
+) -> tuple[CostComponent, ...]:
+    """Price cross-tier continuations: each tier's top points continued by every other tier.
+
+    Every tier's ``top_points`` points are continued by each of the other ``T - 1`` tiers at
+    the continuation ceiling, and every continuation is judged at the profile's most draws.
+    """
+    settings = spec.mining.qualification
+    review = None if settings is None else settings.blast
+    cross = None if review is None else review.cross_tier
+    actors = spec.mining.actors
+    if cross is None or cross.top_points == 0 or len(actors) < 2:
+        return ()
+    repeats = spec.mining.continuations if cross.continuations is None else cross.continuations
+    points = cross.top_points * len(actors)
+    costs: list[CostComponent] = []
+    for alias in actors:
+        job = tier_job(project, spec.mining.registered, alias, repeats).model_copy(
+            update={"maximum_physical_attempts": spec.mining.continuation_ceiling(repeats)}
+        )
+        # This tier continues every other tier's top points.
+        others = points - cross.top_points
+        costs.extend(row.scaled(others) for row in job_costs(project, job))
+        costs.extend(judge_costs(project, spec, others * repeats))
+    return tuple(costs)
+
+
 def run_groups(
     project: ProjectStore, spec: DecisionVarianceSpec, job: ContinuationJob, code_revision: str
 ) -> dict[str, tuple[ArtifactInput, ContinuationStudy]]:
@@ -611,7 +639,7 @@ class _MiningStage:
             if not spec.traceml.enabled:
                 costs.extend(job_costs(project, group_job(project, spec, mining.registered, alias)))
             suffix = tier_job(project, mining.registered, alias, mining.continuations).model_copy(
-                update={"maximum_physical_attempts": mining.continuation_physical_attempts}
+                update={"maximum_physical_attempts": mining.continuation_ceiling()}
             )
             for settings, draws, profile in (
                 (mining.selector, mining.selector_draws, mining.selector_profile),
@@ -624,6 +652,7 @@ class _MiningStage:
         costs.extend(retrieval_costs(project, spec))
         costs.extend(behavior_costs(project, spec))
         costs.extend(blast_costs(project, spec))
+        costs.extend(cross_tier_costs(project, spec))
         profile = mining_profile(spec)
         rubric = (
             f"saved rubric {mining.rubric.artifact_id}"
@@ -697,21 +726,28 @@ class _MiningStage:
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))
             if tier.behavior_differences is not None:
                 references.append(tier.behavior_differences)
-        blast = None
+        blast = cross_tier = None
         if spec.mining.qualification is not None:
             write_deferred(project, spec, [load_report(project, tier.report) for tier in tiers])
             mined = mine_blast_radius(
                 project,
                 spec,
-                [load_report(project, tier.report) for tier in tiers],
+                tiers,
                 code_revision=context.code_revision,
                 inputs=tuple(tier.report for tier in tiers),
             )
             if mined is not None:
-                blast = mined[0]
+                blast, _, cross_tier = mined
                 references.append(blast)
+                if cross_tier is not None:
+                    references.append(cross_tier)
         outputs = MiningOutputs(
-            profile=profile, rubric=rubric, rubric_packet=packet, tiers=tuple(tiers), blast=blast
+            profile=profile,
+            rubric=rubric,
+            rubric_packet=packet,
+            tiers=tuple(tiers),
+            blast=blast,
+            cross_tier=cross_tier,
         )
         summary: JsonObject = {
             "judge_profile": profile.prompt_version,
@@ -805,7 +841,7 @@ class _MiningStage:
             points=mining.points,
             continuations=mining.continuations,
             seed=mining.seed,
-            continuation_physical_attempts=mining.continuation_physical_attempts,
+            continuation_physical_attempts=mining.continuation_ceiling(),
             selector_profile=mining.selector_profile,
             critic_profile=mining.critic_profile,
             references=references,

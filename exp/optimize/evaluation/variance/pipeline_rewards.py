@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
@@ -172,16 +172,17 @@ def difficulty_plan(
     difficulty: Sequence[TaskDifficultyRecord],
     *,
     inputs: tuple[ArtifactInput, ...],
+    teaching: Mapping[str, float] | None = None,
 ) -> tuple[CurriculumPlan | None, ArtifactInput, JsonObject]:
     """Merge the task's difficulty with its bound rungs into the tier's curriculum plan.
 
     Returns:
         The schedule's curriculum plan (None without bound rungs), the saved curriculum and
-        its summary.
+        its summary. ``teaching`` orders ladders inside a strength by cross-tier teaching value.
     """
     task_id = difficulty[0].task_id if difficulty else None
     by_task = {} if task_id is None else {task_id: tuple(stages)}
-    curriculum = merge_curriculum(difficulty, by_task, ladder=ladder)
+    curriculum = merge_curriculum(difficulty, by_task, ladder=ladder, teaching=teaching)
     saved = persist_difficulty_curriculum(
         context.project.artifacts, curriculum, code_revision=context.code_revision, inputs=inputs
     )

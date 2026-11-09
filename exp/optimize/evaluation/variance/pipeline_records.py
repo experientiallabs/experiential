@@ -69,6 +69,7 @@ from exp.optimize.evaluation.executable.task import (
     persist_executable_task,
 )
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_start
+from exp.optimize.evaluation.variance.blast_radius import load_cross_tier
 from exp.optimize.evaluation.variance.crosstalk import (
     CrosstalkProbeSpec,
     ProbeTarget,
@@ -505,6 +506,33 @@ def _package_rung(
     )
 
 
+def ladder_teaching(
+    context: StageContext, tier: TierMining, admitted: list[FamilyOutcome]
+) -> dict[str, float]:
+    """Return each of the tier's ladders' cross-tier teaching score, by ladder identity.
+
+    A family's ladder teaches what its decision point teaches: the share of weaker-fails,
+    stronger-recovers tier pairs the cross-tier blast radius measured at that checkpoint.
+    Without a cross-tier record every ladder scores 0 and the curriculum keeps its order.
+    """
+    project = context.project
+    mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
+    if mining.cross_tier is None:
+        return {}
+    scores = load_cross_tier(project.artifacts, mining.cross_tier).teaching()
+    checkpoints = {
+        row.point: row.checkpoint.artifact_id for row in load_report(project, tier.report).points
+    }
+    teaching: dict[str, float] = {}
+    for row in admitted:
+        if row.tier != tier.tier or row.ladder is None:
+            continue
+        score = scores.get(checkpoints.get(row.point, ""), 0.0)
+        for stage in nudge_curriculum([load_ladder(project, row.ladder)]):
+            teaching[stage.ladder] = max(teaching.get(stage.ladder, 0.0), score)
+    return teaching
+
+
 def _schedule(
     context: StageContext,
     tier: TierMining,
@@ -556,7 +584,12 @@ def _schedule(
             )
     ladder, tiers = difficulty
     plan, curriculum, _ = difficulty_plan(
-        context, stages, ladder, tiers, inputs=(tier.judged_group, *ladders)
+        context,
+        stages,
+        ladder,
+        tiers,
+        inputs=(tier.judged_group, *ladders),
+        teaching=ladder_teaching(context, tier, admitted),
     )
     scored: JsonObject = {
         "curriculum": None if plan is None else plan.model_dump(mode="json"),

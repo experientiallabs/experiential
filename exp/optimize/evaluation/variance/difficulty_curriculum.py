@@ -50,7 +50,7 @@ from exp.optimize.evaluation.variance.records import load_judged_study
 from exp.simulation.mining.tag_clusters import read_record, write_record
 from exp.simulation.mining.task_types import TaskDifficulty, TaskTypes, with_difficulty
 
-DIFFICULTY_CURRICULUM_PROTOCOL = "difficulty-curriculum-v1"
+DIFFICULTY_CURRICULUM_PROTOCOL = "difficulty-curriculum-v2"
 """Version of the pass-rate intervals, tier rules and curriculum merge; bump when any changes."""
 
 DIFFICULTY_TYPE = "difficulty-curriculum"
@@ -339,8 +339,13 @@ def merge_curriculum(
     *,
     ladder: ActorLadder,
     spec: DifficultySpec | None = None,
+    teaching: Mapping[str, float] | None = None,
 ) -> DifficultyCurriculum:
     """Merge difficulty tiers with nudge-ladder rungs into one ordered curriculum.
+
+    Inside one task and nudge strength, ladders whose decision point teaches more come first:
+    ``teaching`` (from the cross-tier blast radius) scores a point that weaker tiers fail and
+    stronger tiers recover from the same state highest.
 
     Args:
         tasks: Every task's difficulty.
@@ -349,6 +354,7 @@ def merge_curriculum(
             task's ladders, bound or not); a task it omits enters as its base task.
         ladder: The actor ladder the tiers were read on.
         spec: The tier registration the tiers were read under.
+        teaching: Each ladder's teaching score, by ladder identity; absent ladders score 0.
 
     Raises:
         ValueError: A stage is given for a task with no difficulty, or a task repeats.
@@ -366,7 +372,12 @@ def merge_curriculum(
         level, label = row.difficulty.level, row.difficulty.label
         stages = sorted(
             stages_by_task.get(row.task_id, ()),
-            key=lambda stage: (STRENGTH_RANK[stage.strength], stage.ladder, stage.position),
+            key=lambda stage: (
+                STRENGTH_RANK[stage.strength],
+                -(teaching or {}).get(stage.ladder, 0.0),
+                stage.ladder,
+                stage.position,
+            ),
         )
         if not stages:
             entries.append(
