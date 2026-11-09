@@ -79,6 +79,8 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
+from exp.runtime.models.providers.errors import ProviderRetryableResponseError
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.rules.contracts import trace_locator, trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
@@ -215,8 +217,10 @@ class StartMaterial:
                 if domains
                 else "an object keyed by exactly the manifest's domain names"
             ),
-            "tools": f"one schema for each of exactly these tools, no others: {tools}",
-            "manifest.tools": f"a contract for each of exactly these tools, no others: {tools}",
+            "tools": "filled by the host from the task's own tool definitions; do not write it",
+            "manifest.tools": (
+                f"one effect policy (reads, writes) for each of exactly these tools: {tools}"
+            ),
             "probe_paths": (
                 "an object mapping a probe name to a JSON pointer into initial_state; every "
                 "probe_paths and facts[].state_paths pointer must resolve in initial_state"
@@ -321,6 +325,146 @@ class StartMaterial:
         return status, result, served if status == "ok" else ()
 
 
+JSON_TYPES = frozenset({"object", "array", "string", "number", "integer", "boolean", "null"})
+"""JSON Schema type names a bare string in a schema position is read as."""
+
+SCHEMA_KEYWORDS = frozenset(
+    {
+        "type", "properties", "items", "required", "enum", "const", "description", "title",
+        "additionalProperties", "minItems", "maxItems", "minLength", "maxLength", "minimum",
+        "maximum", "exclusiveMinimum", "exclusiveMaximum", "default", "examples", "anyOf",
+        "oneOf", "allOf", "not", "prefixItems", "contains", "uniqueItems", "minProperties",
+        "maxProperties", "format", "multipleOf",
+    }
+)  # fmt: skip
+"""Keywords that mark a ``properties`` map as a schema written one level too deep."""
+
+_SCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_SCHEMA_CHILDREN = (
+    "items", "additionalProperties", "additionalItems", "contains", "not", "if", "then", "else",
+    "propertyNames", "unevaluatedItems", "unevaluatedProperties",
+)  # fmt: skip
+_SCHEMA_LISTS = ("allOf", "anyOf", "oneOf", "prefixItems")
+
+
+def normalise_schema(node: JsonValue, path: str, notes: list[str]) -> JsonValue:
+    """Repair the two shapes drafts keep writing in a JSON Schema, recording each repair.
+
+    A bare type name where a schema belongs (``{"properties": {"name": "string"}}``) becomes
+    ``{"type": "string"}``. A ``properties`` map that is plainly a schema itself (its ``type`` is
+    a type name and every key is a schema keyword the parent lacks) is lifted into its parent.
+    Anything else is left for the verifier's schema check to judge.
+    """
+    if isinstance(node, str) and node in JSON_TYPES:
+        notes.append(f"{path or '/'}: wrapped the bare type {node!r} as a schema")
+        return {"type": node}
+    if not isinstance(node, dict):
+        return node
+    node = dict(node)
+    nested = node.get("properties")
+    if (
+        isinstance(nested, dict)
+        and nested.get("type") in JSON_TYPES
+        and set(nested) <= SCHEMA_KEYWORDS
+        and not set(nested) & (set(node) - {"properties"})
+    ):
+        notes.append(f"{path}/properties: lifted a schema written as a properties map")
+        node.pop("properties")
+        node.update(nested)
+    for key in _SCHEMA_MAPS:
+        children = node.get(key)
+        if isinstance(children, dict):
+            node[key] = {
+                name: normalise_schema(child, f"{path}/{key}/{name}", notes)
+                for name, child in children.items()
+            }
+    for key in _SCHEMA_CHILDREN:
+        child = node.get(key)
+        if isinstance(child, list) and key == "items":
+            node[key] = [
+                normalise_schema(row, f"{path}/{key}/{i}", notes) for i, row in enumerate(child)
+            ]
+        elif isinstance(child, (dict, str)):
+            node[key] = normalise_schema(child, f"{path}/{key}", notes)
+    for key in _SCHEMA_LISTS:
+        children = node.get(key)
+        if isinstance(children, list):
+            node[key] = [
+                normalise_schema(row, f"{path}/{key}/{i}", notes) for i, row in enumerate(children)
+            ]
+    return node
+
+
+def normalise_draft(
+    answer: JsonObject, material: StartMaterial
+) -> tuple[JsonObject, tuple[str, ...]]:
+    """Fill what the task fixes and repair known shapes, recording every change.
+
+    The tool schemas are the task's own definitions and the manifest's tool policies are one per
+    task tool, so the author's versions never decide either: ``tools`` is filled from the task,
+    ``manifest.tools`` keeps the author's first policy for each task tool, drops repeats and
+    extras, and declares a missing tool as reading and writing every domain (an effect the
+    family's contracts do not settle is not assumed absent). Verifier and argument schemas get
+    :func:`normalise_schema`; slash-split pointers and a replay trace named by its locator are
+    canonicalised. The checks still run on the result.
+    """
+    notes: list[str] = []
+    answer = dict(answer)
+    task_tools = [tool.model_dump(mode="json") for tool in material.task.task.tools]
+    if answer.get("tools") != task_tools:
+        if "tools" in answer:
+            notes.append("tools: replaced by the task's own tool definitions")
+        answer["tools"] = task_tools
+    manifest = answer.get("manifest")
+    if isinstance(manifest, dict) and isinstance(manifest.get("tools"), list):
+        names = [tool["name"] for tool in task_tools]
+        written: dict[str, JsonValue] = {}
+        for row in manifest["tools"]:
+            name = row.get("name") if isinstance(row, dict) else None
+            if name in names and name not in written:
+                written[name] = row
+            else:
+                notes.append(f"manifest.tools: dropped a repeated or unknown policy for {name!r}")
+        domains = [
+            row["name"]
+            for row in manifest.get("domains", [])
+            if isinstance(row, dict) and isinstance(row.get("name"), str)
+        ]
+        for name in names:
+            if name not in written:
+                notes.append(
+                    f"manifest.tools: {name!r} had no policy; it reads and writes every domain"
+                )
+                written[name] = {"name": name, "reads": domains, "writes": domains}
+        answer["manifest"] = {**manifest, "tools": [written[name] for name in names]}
+    verifier = answer.get("verifier")
+    if isinstance(verifier, dict):
+        verifier = dict(verifier)
+        if "outcome_schema" in verifier:
+            verifier["outcome_schema"] = normalise_schema(
+                verifier["outcome_schema"], "verifier.outcome_schema", notes
+            )
+        policies = verifier.get("argument_schemas")
+        if isinstance(policies, dict):
+            verifier["argument_schemas"] = {
+                name: normalise_schema(schema, f"verifier.argument_schemas.{name}", notes)
+                for name, schema in policies.items()
+            }
+        answer["verifier"] = verifier
+    canonical = canonical_pointers(answer)
+    if canonical != answer:
+        notes.append("pointers: rewrote slash-split pointers to their escaped form")
+    answer = canonical
+    replay = answer.get("replay_trace")
+    if isinstance(replay, str) and replay not in material.sources:
+        # The inventory names a whole trace by its locator; replay_trace takes the bare identity.
+        bare = next((t for t in material.sources if trace_locator(t) == replay), None)
+        if bare is not None:
+            answer = {**answer, "replay_trace": bare}
+            notes.append("replay_trace: named by its bare trace identity")
+    return answer, tuple(notes)
+
+
 def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     """Check a draft's structure, citations and claimed provenance.
 
@@ -334,13 +478,7 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     Raises:
         ValueError: Any structural check fails.
     """
-    answer = canonical_pointers(answer)
-    replay = answer.get("replay_trace")
-    if isinstance(replay, str) and replay not in material.sources:
-        # The inventory names a whole trace by its locator; replay_trace takes the bare identity.
-        bare = next((t for t in material.sources if trace_locator(t) == replay), None)
-        if bare is not None:
-            answer = {**answer, "replay_trace": bare}
+    answer, _ = normalise_draft(answer, material)
     draft = StartDraft.model_validate(answer)
     names = [tool.name for tool in draft.tools]
     declared = {tool.name: tool for tool in draft.manifest.tools}
@@ -662,6 +800,7 @@ def author_start(
         opening={**material.context(), "round": round_, "feedback": feedback},
         answer=task_answer_schema(material),
         validate=lambda answer, read: validate_draft(answer, material),
+        notes=lambda answer: normalise_draft(answer, material)[1],
         sources=sources,
         code_revision=code_revision,
     )
@@ -1065,12 +1204,17 @@ def _repaired[Answer: ContractModel](
     validate: Callable[[JsonObject, frozenset[str]], Answer],
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
+    notes: Callable[[JsonObject], tuple[str, ...]] | None = None,
 ) -> tuple[RoleDraw, Answer | None]:
     """Run, or replay, one role draw and up to ``repairs`` validation-repair draws.
 
     Every role answers through a typed submit tool, yet a draw can still fail its checks. A
     failed answer gets repair draws, each shown the previous answer and its validation errors;
-    the first that validates is the draw's answer. Provider errors propagate.
+    the first that validates is the draw's answer. A draw lost to a transient provider failure
+    or an exhausted output allowance is redrawn up to :data:`REDRAWS` times under a new
+    content-addressed identity (the cause joins it; an allowance redraw is also asked to be
+    concise); only then does the provider error propagate. ``notes`` names the deterministic
+    normalisations applied to the final answer, recorded on the draw.
 
     Returns:
         The draw, carrying its repairs, and its validated answer or None.
@@ -1079,16 +1223,38 @@ def _repaired[Answer: ContractModel](
     def one(
         body: JsonObject, prompt: str, repair: JsonObject | None
     ) -> tuple[RoleDraw, Answer | None, tuple[JsonObject, tuple[str, ...]] | None]:
-        return _draw_full(
-            project, settings, profile, material, role=role, variant=variant, round_=round_,
-            identity=_draw_id(identity, role, variant, round_, index, body, repair),
-            system=prompt, opening=body, answer=answer, validate=validate, sources=sources,
-            code_revision=code_revision,
-        )  # fmt: skip
+        causes: list[str] = []
+        while True:
+            key = repair if not causes else {**(repair or {}), "redraws": list(causes)}
+            try:
+                row, parsed, invalid = _draw_full(
+                    project, settings, profile, material, role=role, variant=variant,
+                    round_=round_, identity=_draw_id(identity, role, variant, round_, index,
+                    body, key), system=prompt, opening=body, answer=answer, validate=validate,
+                    sources=sources, code_revision=code_revision,
+                )  # fmt: skip
+            except (ProviderTransportError, ProviderRetryableResponseError) as error:
+                cause = redraw_cause(error)
+                if cause is None or len(causes) == REDRAWS:
+                    raise
+                causes.append(cause)
+                if cause == "output_allowance":
+                    body = {**body, "conciseness": CONCISE}
+                continue
+            return (
+                (row.model_copy(update={"redraws": tuple(causes)}) if causes else row),
+                (parsed),
+                invalid,
+            )
+
+    def noted(row: RoleDraw, final: JsonObject | None) -> RoleDraw:
+        if notes is None or final is None:
+            return row
+        return row.model_copy(update={"normalisations": notes(final)})
 
     draw, parsed, invalid = one(opening, system, None)
     if invalid is None or repairs == 0:
-        return draw, parsed
+        return noted(draw, draw.answer if invalid is None else invalid[0]), parsed
     rows: list[RoleDraw] = []
     prompt = system + "\n\n" + repair_prompt.replace("{answer}", answer.name)
     for attempt in range(1, repairs + 1):
@@ -1098,13 +1264,16 @@ def _repaired[Answer: ContractModel](
         fixed, parsed, again = one(body, prompt, repair)
         rows.append(fixed)
         if parsed is not None:
-            return draw.model_copy(
-                update={
-                    "answer": fixed.answer,
-                    "failure": None,
-                    "invalid": draw.failure,
-                    "repairs": tuple(rows),
-                }
+            return noted(
+                draw.model_copy(
+                    update={
+                        "answer": fixed.answer,
+                        "failure": None,
+                        "invalid": draw.failure,
+                        "repairs": tuple(rows),
+                    }
+                ),
+                fixed.answer,
             ), parsed
         if again is None:
             break
@@ -1117,6 +1286,30 @@ def _repaired[Answer: ContractModel](
             "repairs": tuple(rows),
         }
     ), None
+
+
+REDRAWS = 2
+"""Fresh redraws of a role draw lost to a transient provider failure or exhausted allowance."""
+
+CONCISE = (
+    "Your previous draw ran out of output tokens before it submitted. Be concise: short "
+    "descriptions, only the facts the task depends on, no repeated content, and submit early."
+)
+"""Added to a redraw's opening after an exhausted output allowance."""
+
+
+def redraw_cause(error: Exception) -> str | None:
+    """Why a lost draw may be redrawn, or None when it may not.
+
+    A transport failure with no status, a 429 or a 5xx (520 included) is transient; an
+    exhausted output allowance is a size failure. Any other provider error is not redrawn.
+    """
+    if isinstance(error, ProviderRetryableResponseError):
+        return "output_allowance" if error.hit_length_limit else "unusable_response"
+    status = error.status_code if isinstance(error, ProviderTransportError) else None
+    if status is None or status == 429 or status >= 500:
+        return f"transport_{status or 'unknown'}"
+    return None
 
 
 def _check_facts(draft: StartDraft, inventory: frozenset[str]) -> None:
@@ -1134,7 +1327,11 @@ def _check_facts(draft: StartDraft, inventory: frozenset[str]) -> None:
             ref for ref in fact.references if ref.startswith("trace:") or ref == RECORDED_STATE_REF
         ]
         if fact.status == "observed" and not recorded:
-            raise ValueError(f"observed fact {fact.fact_id} cites no recorded evidence")
+            raise ValueError(
+                f"observed fact {fact.fact_id} cites no recorded evidence; cite the trace step or "
+                "recorded state that shows it, or mark it inferred and cite the rule, contract or "
+                "finding it follows from"
+            )
         if fact.status == "inferred" and not fact.references:
             raise ValueError(f"inferred fact {fact.fact_id} cites nothing it is inferred from")
 
@@ -1314,7 +1511,9 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
         if isinstance(item, dict) and isinstance(item.get("properties"), dict):
             item["properties"]["name"] = {"enum": names, "type": "string"}
 
-    exact(properties["tools"], tools)
+    # The host fills the tool schemas from the task; the author never writes them.
+    properties.pop("tools", None)
+    body["required"] = [name for name in body.get("required", []) if name != "tools"]
     manifest = properties["manifest"]["properties"]
     exact(manifest["tools"], tools)
     exact(manifest["domains"], domains)

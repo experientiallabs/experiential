@@ -105,3 +105,47 @@ def test_every_role_submits_through_its_typed_contract() -> None:
     assert research["status"]["enum"] == ["resolved", "unresolved"]
     conflict = reveal_answer_schema().input_schema["properties"]["conflicts"]["items"]
     assert set(conflict["required"]) == {"probe", "explanation"}
+
+
+def test_bare_types_are_wrapped_and_a_schema_written_as_properties_is_lifted() -> None:
+    """The two live verifier-schema mistakes are repaired deterministically and recorded."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import normalise_schema
+    from exp.simulation.reconstruction.models import check_schema
+
+    notes: list[str] = []
+    schema = {
+        "type": "object",
+        "properties": {
+            "files": {
+                "type": "object",
+                "properties": {"test_myre.py": {"properties": {"type": "object"}}},
+            },
+            "lines": {"type": "array", "items": {"items": {"properties": {"type": "string"}}}},
+            "name": "string",
+        },
+    }
+    fixed = normalise_schema(schema, "verifier.outcome_schema", notes)
+    check_schema(fixed)
+    files = fixed["properties"]["files"]["properties"]["test_myre.py"]
+    assert files == {"type": "object"}
+    assert fixed["properties"]["lines"]["items"]["items"] == {"type": "string"}
+    assert fixed["properties"]["name"] == {"type": "string"}
+    assert len(notes) == 3
+    kept = {"type": "object", "properties": {"type": "string", "path": "string"}}
+    assert normalise_schema(kept, "", [])["properties"] == {
+        "type": {"type": "string"},
+        "path": {"type": "string"},
+    }
+
+
+def test_transient_and_size_failures_are_redrawn_and_others_are_not() -> None:
+    """5xx, 520, unknown-status and allowance failures redraw; a 400 propagates."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import redraw_cause
+    from exp.runtime.models.providers.errors import ProviderRetryableResponseError
+    from exp.runtime.models.providers.transport import ProviderTransportError
+
+    assert redraw_cause(ProviderTransportError("x", status_code=520)) == "transport_520"
+    assert redraw_cause(ProviderTransportError("x")) == "transport_unknown"
+    assert redraw_cause(ProviderTransportError("x", status_code=400)) is None
+    allowance = ProviderRetryableResponseError("x", hit_length_limit=True)
+    assert redraw_cause(allowance) == "output_allowance"

@@ -440,7 +440,7 @@ class BootstrapSettings(ContractModel):
     reveal_variants: tuple[str, ...] = Field(default=tuple(REVEAL_VARIANTS), min_length=1)
     research_rounds: int = Field(default=2, ge=0, le=4, strict=True)
     research_items: int = Field(default=4, ge=1, le=16, strict=True)
-    author_repairs: int = Field(default=2, ge=0, le=4, strict=True)
+    author_repairs: int = Field(default=4, ge=0, le=4, strict=True)
     replay_judge: AuthorSettings | None = None
     runtime: RuntimeTemplate
     job: JobTemplate
@@ -659,6 +659,9 @@ class RoleDraw(ContractModel):
         invalid: Why this draw's own answer failed its checks, when repair draws followed.
         repairs: The validation-repair draws that followed, in order; the first one carrying an
             answer supplied the draw's answer.
+        redraws: Why earlier attempts at this draw were lost and redrawn (a transient provider
+            failure or an exhausted output allowance), in order.
+        normalisations: Deterministic repairs the host applied to the final answer.
     """
 
     role: str
@@ -669,6 +672,8 @@ class RoleDraw(ContractModel):
     failure: str | None = None
     invalid: str | None = None
     repairs: tuple[RoleDraw, ...] = ()
+    redraws: tuple[str, ...] = ()
+    normalisations: tuple[str, ...] = ()
 
     def transcripts(self) -> tuple[ArtifactInput, ...]:
         """Return this draw's saved transcript and every repair draw's, in order."""

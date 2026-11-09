@@ -614,9 +614,9 @@ def test_unrepairable_drafts_refuse_after_the_bounded_repairs(
     refusal = load_outcome(setup.project, _row(manifest, "auth").identity)
     assert isinstance(refusal, BootstrapRefusal) and refusal.kind == "author_unusable"
     author = refusal.rounds[0].author
-    assert len(author.repairs) == setup.spec.author_repairs == 2
-    assert "2 repair draw(s) failed" in (author.failure or "")
-    assert script.tasks("start_author") == ["auth"] * 3
+    assert len(author.repairs) == setup.spec.author_repairs == 4
+    assert "4 repair draw(s) failed" in (author.failure or "")
+    assert script.tasks("start_author") == ["auth"] * 5
 
 
 @pytest.mark.parametrize("trace_id", ["src-recon", "w1"])
