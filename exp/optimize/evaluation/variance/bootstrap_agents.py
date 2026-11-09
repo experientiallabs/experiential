@@ -18,6 +18,7 @@ replays without a call.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -224,6 +225,7 @@ class StartMaterial:
                     else "A domain named a/b is rooted at /a~1b"
                 )
             ),
+            "provenance": self._provenance_requirements(),
             "verifier.argument_schemas": (
                 f"optional; maps a tool name from {tools} to a JSON Schema object over that "
                 'tool\'s arguments, e.g. {"type": "object", "properties": {"command": '
@@ -231,6 +233,30 @@ class StartMaterial:
                 "(description, outcome_schema) beside it, never inside it"
             ),
         }
+
+    def _provenance_requirements(self) -> JsonObject:
+        """What each provenance the evidence allows obliges the draft to name."""
+        rows: JsonObject = {}
+        for provenance in self.allowed():
+            if provenance == "observed":
+                rows[provenance] = "initial_state is the recorded state, unchanged"
+            elif provenance == "reconstructed":
+                prefixes = {
+                    trace_id: len(self.recorded_prefix(trace_id))
+                    for trace_id in sorted(self.sources)
+                    if self.recorded_prefix(trace_id)
+                }
+                rows[provenance] = (
+                    "replay_trace is one of these source trace identities (bare, no 'trace:') "
+                    "and prefix_steps is 1 to its recorded prefix length, so the start replays "
+                    f"those steps: {json.dumps(prefixes)}"
+                )
+            else:
+                rows[provenance] = (
+                    "reveal_probes names at least one call of a tool whose manifest contract "
+                    "writes nothing"
+                )
+        return rows
 
     def run(
         self, call: ToolCall, maximum_bytes: int
@@ -582,7 +608,7 @@ def author_start(
             identity=_draw_id(identity, "start_author", variant, round_, index, body, repair),
             system=prompt,
             opening=body,
-            answer=author_answer_schema(),
+            answer=task_answer_schema(material),
             validate=lambda answer, read: validate_draft(answer, material),
             sources=sources,
             code_revision=code_revision,
@@ -1094,3 +1120,40 @@ def author_answer_schema() -> ToolSchema:
         body.get("properties", {}),
         tuple(body.get("required", ())),
     )
+
+
+def task_answer_schema(material: StartMaterial) -> ToolSchema:
+    """The submit tool narrowed to this task's fixed shape: its tools, domains and policies.
+
+    The generic contract leaves tool and domain names free and ``verifier.argument_schemas`` an
+    open map, so drafts repeated or swapped tool names and kept writing verifier fields
+    (``description``, ``outcome_schema``) inside the argument-policy map. The requirements were
+    already exact; the schema now says the same: names come from the task's tools and the
+    family's domains, each listed once, and argument policies are keyed only by tool name.
+    """
+    base = author_answer_schema()
+    body = copy.deepcopy(base.input_schema)
+    tools = sorted({tool.name for tool in material.task.task.tools})
+    domains = sorted(material.knowledge.state_domains)
+    properties = body["properties"]
+
+    def exact(array: JsonValue, names: list[str]) -> None:
+        if not isinstance(array, dict) or not names:
+            return
+        array["minItems"] = array["maxItems"] = len(names)
+        item = array.get("items")
+        if isinstance(item, dict) and isinstance(item.get("properties"), dict):
+            item["properties"]["name"] = {"enum": names, "type": "string"}
+
+    exact(properties["tools"], tools)
+    manifest = properties["manifest"]["properties"]
+    exact(manifest["tools"], tools)
+    exact(manifest["domains"], domains)
+    verifier = properties["verifier"]["properties"]
+    verifier["argument_schemas"] = {
+        "type": "object",
+        "description": "Optional JSON Schema over each named tool's call arguments.",
+        "properties": {name: {"type": "object"} for name in tools},
+        "additionalProperties": False,
+    }
+    return base.model_copy(update={"input_schema": body})
