@@ -1863,10 +1863,8 @@ _ADVISOR_RESULT_VARIANTS: tuple[JsonObject, ...] = (
 def test_echoed_advisor_turn_rides_the_verbatim_block_carrier(result_content: JsonObject) -> None:
     """Advisor history decodes like any echoed server-tool turn, every result variant.
 
-    Production 2026-11-09: Claude Code sessions that had consulted the advisor
-    resent its ``advisor_tool_result`` on every later turn and each
-    ``/v1/messages`` call was a 400 "unsupported content block type
-    'advisor_tool_result'". Anthropic keeps the block valid after the tool
+    A client that consulted the advisor resends its ``advisor_tool_result``
+    on every later turn. Anthropic keeps the block valid after the tool
     leaves ``tools`` (the case here: the ``advisor_20260301`` tool itself is
     not served) and tells callers to round-trip it verbatim, encrypted
     variant included.

@@ -63,8 +63,7 @@ production turns on 2026-09-11). Echoed advisor history (the advisor's `server_t
 its `advisor_tool_result`, any result variant, encrypted `advisor_redacted_result` included) is
 carried the same way even though the `advisor_20260301` tool itself stays rejected: Anthropic
 keeps that history valid after the tool leaves `tools`, and on an Anthropic rung the dispatch adds
-the `advisor-tool-2026-03-01` token the history requires (production 2026-11-09: every turn of a
-Claude Code session that had consulted the advisor was a 400). The terminal `message_delta` usage
+the `advisor-tool-2026-03-01` token the history requires. The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
 

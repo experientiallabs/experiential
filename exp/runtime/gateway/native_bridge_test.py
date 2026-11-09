@@ -8308,9 +8308,8 @@ def test_echoed_advisor_history_serves_verbatim_on_an_anthropic_messages_rung(
 ) -> None:
     """Advisor history admits and replays byte-for-byte behind its beta token.
 
-    Production 2026-11-09: every ``/v1/messages`` call of a Claude Code
-    session that had consulted the advisor was a 400 ``unsupported content
-    block type 'advisor_tool_result'``. On a native Anthropic rung both
+    A Claude Code session that consulted the advisor resends both blocks on
+    every later turn. On a native Anthropic rung both
     blocks dispatch verbatim and the dispatch carries
     ``advisor-tool-2026-03-01``, without which Anthropic refuses the history.
     """

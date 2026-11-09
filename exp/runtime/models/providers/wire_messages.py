@@ -33,6 +33,7 @@ from exp.runtime.models.providers.images import (
     responses_image_part,
 )
 from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
+from exp.runtime.models.providers.server_tools import anthropic_server_tool_names
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
 
 TOOL_RESULT_IMAGE_FOLD_HEADER = (
@@ -647,17 +648,13 @@ ANTHROPIC_ADVISOR_TOOL_BETA = "advisor-tool-2026-03-01"
 
 
 def _carries_advisor_history(request: GatewayRequest) -> bool:
-    """Whether the history echoes an advisor call or its result block."""
-    for message in request.messages:
-        block = message.provider_anthropic_block
-        if block is None:
-            continue
-        block_type = block.get("type")
-        if block_type == "advisor_tool_result" or (
-            block_type == "server_tool_use" and block.get("name") == "advisor"
-        ):
-            return True
-    return False
+    """Whether the history echoes an advisor call or its result block.
+
+    The shared server-tool namer reads ``server_tool_use`` names and
+    ``<tool>_tool_result`` types; the ``advisor_20260301`` declaration itself
+    is refused at decode, so a named advisor here is always echoed history.
+    """
+    return "advisor" in anthropic_server_tool_names(request)
 
 
 def anthropic_request_headers(

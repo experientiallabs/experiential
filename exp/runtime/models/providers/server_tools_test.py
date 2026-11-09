@@ -56,7 +56,7 @@ def test_a_result_block_alone_still_names_its_tool() -> None:
 
 
 def test_echoed_advisor_history_names_the_advisor_and_strips_on_a_foreign_wire() -> None:
-    """Advisor history (production 2026-11-09) is a server-tool carrier like web search.
+    """Advisor history is a server-tool carrier like web search.
 
     A route with no Anthropic rung drops the advisor call and its result the
     same way it drops an echoed search, and the label names the advisor.

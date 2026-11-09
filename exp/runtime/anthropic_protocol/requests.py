@@ -187,8 +187,8 @@ class _WebSearchToolResultBlock(BaseModel):
     ``advisor-tool-2026-03-01``): Anthropic tells callers to round-trip it
     verbatim, its ``content`` possibly an encrypted ``advisor_redacted_result``
     the provider decrypts on the next turn, and it stays valid in history after
-    the tool leaves ``tools``. Claude Code resends it on every later turn, so
-    refusing it wedged the whole session (production 2026-11-09).
+    the tool leaves ``tools``. Claude Code resends it on every later turn of a
+    session that consulted the advisor.
     """
 
     model_config = ConfigDict(extra="allow")
