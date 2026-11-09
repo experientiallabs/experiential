@@ -13,15 +13,21 @@ import asyncio
 import base64
 import json
 import logging
+from pathlib import Path
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import BatchSubmitError
 from exp.runtime.gateway.batch.engine import BatchEngine
-from exp.runtime.gateway.boundary import boundary_protocol_error
 from exp.runtime.gateway.interfaces import GatewayControlStore
 from exp.runtime.gateway.sqlite.store import InvalidVirtualKeyError
 
 _LOGGER = logging.getLogger(__name__)
+
+# The text the gateway boundary answers an unclassified failure with.
+_INTERNAL_MESSAGE = (
+    "The gateway request failed. Retry the request; if this persists, "
+    "ask the gateway operator to inspect the server logs."
+)
 
 _ERROR_STATUS: dict[str, int] = {
     "invalid_request_error": 400,
@@ -115,33 +121,29 @@ class BatchControlPlane:
             }
         )
 
-    @staticmethod
-    def _unclassified(operation: str, exc: Exception) -> str:
-        """Map one fault outside the batch contract through the gateway boundary.
+    @classmethod
+    def _unclassified(cls, operation: str, exc: BaseException) -> str:
+        """Log one fault the batch contract cannot classify and answer the lane's 500.
 
-        Every bridge call answers an envelope, so a fault the batch contract
-        does not type goes through the one exception-to-public-error authority
-        rather than escaping as an unlogged bare 500: a dropped database
-        connection or a store refusal keeps its retryable 503, and only a
-        truly unclassified fault is a 500 (the boundary logs its type and
-        raising frame, never the message). The operation and the answered
-        status are logged here so the line names the batch route.
+        Every bridge call answers an envelope, so a fault outside the batch
+        contract is logged here rather than escaping as an unlogged bare 500.
+        Only the type and the raising frame are logged: the message and
+        traceback may quote caller content.
         """
-        mapped = boundary_protocol_error(exc)
+        raised_at = _raising_frame(exc)
         _LOGGER.error(
-            "batch %s answered a %s as %d %s",
+            "batch %s answered an unclassified %s raised at %s as a 500 internal_error",
             operation,
             type(exc).__name__,
-            mapped.status_code,
-            mapped.detail.code,
+            raised_at,
             extra={
                 "operation": "batch_plane",
                 "batch_operation": operation,
                 "exception_type": type(exc).__name__,
-                "status_code": mapped.status_code,
+                "raised_at": raised_at,
             },
         )
-        return json.dumps({"status": mapped.status_code, "body": mapped.json_body()})
+        return cls._error(BatchSubmitError(_INTERNAL_MESSAGE, code="internal_error"))
 
     def file_create(self, argument: str) -> str:
         """Store one uploaded batch input file: {bearer_key, filename, purpose, content_b64}."""
@@ -281,3 +283,19 @@ class BatchControlPlane:
             return self._error(error)
         except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
             return self._unclassified("batch_cancel", exc)
+        except asyncio.CancelledError as exc:
+            # A provider cancel that cancels its own task ends asyncio.run with
+            # CancelledError; this synchronous bridge call has no outer task to
+            # cancel, so it is a fault like any other.
+            return self._unclassified("batch_cancel", exc)
+
+
+def _raising_frame(exception: BaseException) -> str:
+    """Where an exception was raised, as ``module.py:line in function``; never its message."""
+    trace = exception.__traceback__
+    if trace is None:
+        return "unknown"
+    while trace.tb_next is not None:
+        trace = trace.tb_next
+    code = trace.tb_frame.f_code
+    return f"{Path(code.co_filename).name}:{trace.tb_lineno} in {code.co_name}"
