@@ -131,11 +131,13 @@ def match_step(
     if known == 2 and codes["recorded_exit"] != codes["replayed_exit"]:
         return StepMatch(decision="fail", similarity=score, reason="the exit codes differ", **codes)
     if recorded_error != replayed_error:
-        if known == 1:
+        if known == 1 or (known == 2 and score >= JUDGE_SIMILARITY):
+            # The error flags disagree, but an exit code is stated on one side only, or both
+            # sides state the same code: the outputs themselves leave the outcome open.
             return StepMatch(
                 decision="undecided",
                 similarity=score,
-                reason="the error outcomes differ and only one side states an exit code",
+                reason="the error flags differ but the stated exit codes do not settle it",
                 **codes,
             )
         return StepMatch(

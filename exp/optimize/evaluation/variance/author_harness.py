@@ -72,7 +72,11 @@ from exp.optimize.evaluation.variance.build_records import (
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.runtime.models.registry import RuntimeModelCatalog
-from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
+from exp.runtime.models.spend_ceiling import (
+    UnpricedDispatchRefused,
+    install_spend_ceiling,
+    operation_spend_scope,
+)
 from exp.simulation.rules.recall import RecallPolicy
 
 
@@ -303,7 +307,7 @@ def run_full(project: ProjectStore, scratch: ProjectStore, prepared: Prepared, r
             prepared.traces,
             revision,
         )
-    except Exception as error:  # noqa: BLE001 - a stopped flow is a reported outcome
+    except (Exception, UnpricedDispatchRefused) as error:  # noqa: BLE001 - a reported outcome
         stages = [
             frame.name
             for frame in traceback.extract_tb(error.__traceback__)

@@ -131,3 +131,10 @@ def _row(locator: str, match: object) -> ReplayStep:
         replayed_exit=match.replayed_exit,  # type: ignore[attr-defined]
         reason=(UNDECIDED if decision == "undecided" else "") + match.reason,  # type: ignore[attr-defined]
     )
+
+
+def test_equal_exit_codes_with_disagreeing_error_flags_go_to_the_judge() -> None:
+    """Both sides say exit 127; the simulator's own error flag alone does not fail the step."""
+    match = match_step(LISTING.format(code=127), True, LISTING.format(code=127) + " ", False)
+    assert match.decision == "undecided"
+    assert (match.recorded_exit, match.replayed_exit) == (127, 127)
