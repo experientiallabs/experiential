@@ -396,6 +396,14 @@ def decode_chat(
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=thinking.reasoning_effort,
+            reasoning_effort_parameter=(
+                "reasoning.effort"
+                if request.reasoning_effort is None
+                and request.reasoning is not None
+                and request.reasoning.effort is not None
+                and thinking.reasoning_effort is not None
+                else None
+            ),
             thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(

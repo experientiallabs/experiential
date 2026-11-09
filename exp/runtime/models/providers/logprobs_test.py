@@ -259,8 +259,102 @@ def test_an_unqualified_effort_names_the_efforts_that_serve_probabilities() -> N
     assert caught.value.param == "reasoning_effort"
     assert "'medium'" in str(caught.value)
     assert "low, high, max" in str(caught.value)
-    # No qualified effort at all keeps the route refusal on the probability field.
+    assert "remove logprobs and top_logprobs" in str(caught.value)
+    # No qualified effort at all keeps the route refusal on the probability field,
+    # whether or not the caller sent an effort: changing it cannot admit the request.
+    unqualified = replace(profile, logprobs_reasoning_efforts=())
+    for effort in (None, "medium"):
+        with pytest.raises(ProviderParameterError) as caught:
+            require_chat_logprobs(
+                (unqualified,), request.model_copy(update={"reasoning_effort": effort})
+            )
+        assert caught.value.param == "top_logprobs"
+        assert "cannot preserve" in str(caught.value)
+
+
+def test_a_nested_chat_effort_is_refused_under_its_own_spelling() -> None:
+    """A Chat caller who sent ``reasoning.effort`` is pointed at that field, not the flat one."""
+    profile = replace(
+        _profile(),
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="max",
+        supported_reasoning_efforts=("low", "medium", "max"),
+        logprobs_reasoning_efforts=("low", "max"),
+    )
+    base = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "logprobs": True,
+    }
+    nested = decode_chat({**base, "reasoning": {"effort": "medium"}}).request
+    assert nested.reasoning_effort == "medium"
     with pytest.raises(ProviderParameterError) as caught:
-        require_chat_logprobs((replace(profile, logprobs_reasoning_efforts=()),), request)
-    assert caught.value.param == "top_logprobs"
+        require_chat_logprobs((profile,), nested)
+    assert caught.value.param == "reasoning.effort"
+    flat = decode_chat({**base, "reasoning_effort": "medium"}).request
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((profile,), flat)
+    assert caught.value.param == "reasoning_effort"
+
+
+def _reasoning_profile(efforts: tuple[str, ...], default: str = "max") -> GatewayWireProfile:
+    return replace(
+        _profile(),
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort=default,
+        supported_reasoning_efforts=("low", "medium", "high", "max"),
+        logprobs_reasoning_efforts=efforts,
+    )
+
+
+def test_the_suggested_efforts_are_the_ones_every_rung_qualifies() -> None:
+    """A waterfall never suggests an effort a later rung refuses, which would loop the caller."""
+    request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    route = (_reasoning_profile(("low", "high", "max")), _reasoning_profile(("high", "max")))
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs(route, request)
+    assert "one of: high, max," in str(caught.value)
+    assert "or remove logprobs." in str(caught.value)
+    # Disjoint rungs leave no effort that fixes the route: the probability field is named.
+    disjoint = (_reasoning_profile(("low",)), _reasoning_profile(("max",)))
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs(disjoint, request)
+    assert caught.value.param == "logprobs"
     assert "cannot preserve" in str(caught.value)
+
+
+def test_an_incapable_later_rung_refuses_before_any_effort_advice() -> None:
+    """Changing effort cannot admit a route whose later rung returns no probabilities."""
+    request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    route = (_reasoning_profile(("low", "max")), replace(_profile(), supports_logprobs=False))
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs(route, request)
+    assert caught.value.param == "logprobs"
+    assert "cannot preserve" in str(caught.value)
+
+
+def test_an_omitted_effort_is_named_as_the_model_default() -> None:
+    """A caller who sent no effort is not told it sent the default."""
+    request = _chat_request().model_copy(update={"logprobs": True})
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((_reasoning_profile(("low",), default="max"),), request)
+    assert caught.value.param == "logprobs"
+    assert "the model's default reasoning effort 'max'" in str(caught.value)
+
+
+def test_the_nested_effort_refusal_message_names_the_nested_field() -> None:
+    """The message tells a ``reasoning.effort`` caller to change that field."""
+    request = decode_chat(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "reasoning": {"effort": "medium"},
+        }
+    ).request
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((_reasoning_profile(("low", "max")),), request)
+    assert "reasoning.effort 'medium'" in str(caught.value)
+    assert "Use reasoning.effort one of: low, max" in str(caught.value)
