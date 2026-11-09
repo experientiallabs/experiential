@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
+import sys
 from dataclasses import replace
 
 import pytest
@@ -582,3 +584,23 @@ def test_carrier_domains_isolate_fireworks_and_hunyuan() -> None:
             tool_calls=_tool_calls("call-one"),
             scheme=FIREWORKS_SCHEME,
         )
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "exp.runtime.gateway.reasoning_carrier",
+        "exp.runtime.anthropic_protocol",
+        "exp.runtime.openai_protocol",
+        "exp.runtime.gateway.ingest.conversion",
+    ],
+)
+def test_module_imports_first_in_a_fresh_interpreter(module: str) -> None:
+    """Each protocol entry point imports cleanly when it is the first module loaded.
+
+    The carrier, the Anthropic and OpenAI request decoders and the provider registry
+    reach each other; importing the registry at runtime from the carrier would close
+    that loop, so a fresh process that imports one of these first would fail with a
+    circular ImportError. A fresh interpreter keeps other tests' imports out of it.
+    """
+    subprocess.run([sys.executable, "-c", f"import {module}"], check=True, timeout=120)
