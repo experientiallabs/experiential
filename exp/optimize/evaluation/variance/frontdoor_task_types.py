@@ -34,6 +34,7 @@ from exp.optimize.evaluation.variance.frontdoor_executors import (
     PipelineSlotExecutor,
     SlotContext,
     SlotReference,
+    pipeline_tasks,
     read_slot,
     saved_corpus,
     slot_identity,
@@ -251,8 +252,7 @@ class CurriculumSlotExecutor(PipelineSlotExecutor):
     def collect(self, context: SlotContext) -> tuple[str, ContractModel, tuple[ArtifactInput, ...]]:
         """Return every start's curricula grouped by task type, with type difficulty filled."""
         starts: dict[str, tuple[ArtifactInput, ...]] = {}
-        keys = [key for key in context.results if key.startswith("pipeline:")]
-        for task in sorted({key.split(":")[1] for key in keys}):
+        for task in pipeline_tasks(context.results):
             records = stage_outputs(context, task, "records") or {}
             schedules = records.get("schedules")
             rows = schedules.values() if isinstance(schedules, dict) else ()
@@ -276,7 +276,7 @@ class CurriculumSlotExecutor(PipelineSlotExecutor):
                     types = with_task_type_difficulty(types, curriculum)
                     for family in types.by_family:
                         for task_type in family.task_types:
-                            if task in task_type.tasks:
+                            if task in {row.task_id for row in task_type.tasks}:
                                 by_type.setdefault(task_type.task_type_id, []).append(
                                     curriculum_ref
                                 )

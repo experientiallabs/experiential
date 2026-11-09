@@ -940,6 +940,17 @@ class PipelineCollection(ContractModel):
     starts: dict[str, tuple[ArtifactInput, ...]]
 
 
+def pipeline_tasks(results: Mapping[str, object]) -> list[str]:
+    """Return the start tasks of ``pipeline:<task>:<stage>`` keys, sorted.
+
+    A task id may itself hold a colon (``arvo:3938``), so the stage is split off the right.
+    """
+    prefix = "pipeline:"
+    return sorted(
+        {key[len(prefix) :].rsplit(":", 1)[0] for key in results if key.startswith(prefix)}
+    )
+
+
 def stage_outputs(context: SlotContext, task_id: str, stage: str) -> JsonObject | None:
     """Return one start's saved stage outputs, or None when that stage is not saved."""
     reference = context.results.get(f"pipeline:{task_id}:{stage}")
@@ -995,9 +1006,7 @@ class PipelineSlotExecutor:
     def collect(self, context: SlotContext) -> tuple[str, ContractModel, tuple[ArtifactInput, ...]]:
         """Return the record of every start's results and the identity it is saved under."""
         starts: dict[str, tuple[ArtifactInput, ...]] = {}
-        tasks = sorted(
-            {key.split(":")[1] for key in context.results if key.startswith("pipeline:")}
-        )
+        tasks = pipeline_tasks(context.results)
         for task in tasks:
             found: list[ArtifactInput] = []
             if self.slot == "blast-radius":

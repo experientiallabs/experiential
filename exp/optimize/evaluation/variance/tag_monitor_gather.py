@@ -30,6 +30,7 @@ from exp.optimize.evaluation.variance.frontdoor_executors import (
     FamilyStateIndexes,
     SlotContext,
     SlotReference,
+    pipeline_tasks,
     read_slot,
     saved_corpus,
     stage_outputs,
@@ -218,7 +219,7 @@ def gather_rules(context: SlotContext) -> Gathered | None:
 
 def _pipeline_tasks(context: SlotContext) -> list[str]:
     """Every start whose pipeline stages are in the context."""
-    return sorted({key.split(":")[1] for key in context.results if key.startswith("pipeline:")})
+    return pipeline_tasks(context.results)
 
 
 def gather_mining(context: SlotContext) -> Gathered | None:
