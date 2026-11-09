@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cache, cached_property
 
 from pydantic import JsonValue
 
@@ -37,6 +37,7 @@ from exp.optimize.evaluation.rules.agent_loop import (
     reason,
     run_agent,
     run_bounded,
+    tool_schema,
 )
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapSpec,
@@ -428,7 +429,7 @@ def author_start(
         identity=_draw_id(identity, "start_author", variant, round_, 0, opening),
         system=instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant),
         opening=opening,
-        answer=AUTHOR_ANSWER,
+        answer=author_answer_schema(),
         validate=lambda answer, read: validate_draft(answer, material),
         sources=sources,
         code_revision=code_revision,
@@ -792,3 +793,37 @@ def _inventory_summary(inventory: frozenset[str] | set[str]) -> JsonObject:
         "counts": dict(sorted(kinds.items())),
         "note": "cite references returned by read_trace and read_rules; every one is valid",
     }
+
+
+@cache
+def author_answer_schema() -> ToolSchema:
+    """The start author's submit tool, typed by the real ``StartDraft`` contract.
+
+    The hand-written tool only said ``manifest``/``initial_state``/``verifier`` were objects, so
+    every model invented its own shape and drafts failed validation (``owner`` values, tuples given
+    as maps, extra fields). The submit schema is now the contract's own JSON schema, references
+    inlined so any provider can read it.
+    """
+    schema = StartDraft.model_json_schema()
+    definitions = schema.pop("$defs", {})
+
+    def inline(node: JsonValue, depth: int = 0) -> JsonValue:
+        if isinstance(node, dict):
+            reference = node.get("$ref")
+            if isinstance(reference, str) and depth < 12:
+                name = reference.rsplit("/", 1)[-1]
+                rest = {k: v for k, v in node.items() if k != "$ref"}
+                return inline({**definitions.get(name, {}), **rest}, depth + 1)
+            return {k: inline(v, depth) for k, v in node.items() if k != "title"}
+        if isinstance(node, list):
+            return [inline(item, depth) for item in node]
+        return node
+
+    body = inline(schema)
+    assert isinstance(body, dict)
+    return tool_schema(
+        AUTHOR_ANSWER.name,
+        AUTHOR_ANSWER.description,
+        body.get("properties", {}),
+        tuple(body.get("required", ())),
+    )
