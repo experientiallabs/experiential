@@ -193,6 +193,24 @@ class StartMaterial:
             "allowed_provenance": list(self.allowed()),
             "findings": [_finding_view(row) for row in self.findings],
             "inventory": _inventory_summary(self.inventory),
+            "requirements": self.requirements(),
+        }
+
+    def requirements(self) -> JsonObject:
+        """The fixed shape a start must take; the checks enforce exactly these values."""
+        domains = list(self.knowledge.state_domains)
+        tools = [tool.name for tool in self.task.task.tools]
+        return {
+            "manifest.domains": [{"name": name, "owner": "simulated"} for name in domains]
+            or "one or more simulated domains, every owner 'simulated'",
+            "initial_state": (
+                f"an object keyed by exactly these domain names: {domains}"
+                if domains
+                else "an object keyed by exactly the manifest's domain names"
+            ),
+            "tools": f"one schema for each of exactly these tools, no others: {tools}",
+            "manifest.tools": f"a contract for each of exactly these tools, no others: {tools}",
+            "probe_paths": "an object mapping a probe name to a JSON pointer into initial_state",
         }
 
     def run(
