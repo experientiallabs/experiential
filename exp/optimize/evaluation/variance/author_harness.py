@@ -23,17 +23,30 @@ import json
 import secrets
 import sys
 import time
-from collections.abc import Iterator
+import traceback
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.catalog import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.project.artifact_sqlite import StoredArtifact
+from exp.common.project.paths import ProjectPaths
+from exp.common.project.store import ArtifactStore
+from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
 from exp.optimize.evaluation.rules.agent_loop import AgentTranscript
 from exp.optimize.evaluation.rules.stage import REPORT_TYPE, RulesStageReport, load_rulebook
 from exp.optimize.evaluation.spending import operation_spend_ceiling
-from exp.optimize.evaluation.variance.bootstrap import _recorded_state
+from exp.optimize.evaluation.variance.bootstrap import (
+    _bind_evidence,
+    _bootstrap_task,
+    _recorded_state,
+    load_outcome,
+)
 from exp.optimize.evaluation.variance.bootstrap_agents import (
     FamilyKnowledge,
     StartMaterial,
@@ -41,6 +54,7 @@ from exp.optimize.evaluation.variance.bootstrap_agents import (
     validation_errors,
 )
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
+    BootstrapFamily,
     BootstrapRefusal,
     BootstrapSettings,
     BootstrapSpec,
@@ -51,7 +65,12 @@ from exp.optimize.evaluation.variance.bootstrap_selection import (
     select_bootstrap_families,
 )
 from exp.optimize.evaluation.variance.build_records import REPORT_TYPE as BUILD_TYPE
-from exp.optimize.evaluation.variance.build_records import VarianceBuildReport
+from exp.optimize.evaluation.variance.build_records import (
+    VarianceBuildReport,
+    load_exposure_plan,
+)
+from exp.optimize.evaluation.variance.exposure import ExposurePlan
+from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
 from exp.simulation.rules.recall import RecallPolicy
 
@@ -101,9 +120,12 @@ def newest_rules_report(project: ProjectStore, family_id: str) -> str:
 
 
 def build_material(
-    project: ProjectStore, settings: BootstrapSettings, limits: BootstrapLimits, task_id: str,
+    project: ProjectStore,
+    settings: BootstrapSettings,
+    limits: BootstrapLimits,
+    task_id: str,
     rules_report: str | None,
-) -> tuple[BootstrapSpec, StartMaterial]:  # fmt: skip
+) -> Prepared:
     """Freeze the task's material from saved artifacts, mirroring ``family_knowledge``.
 
     The family's rules are the saved rules-stage report's rule book and memory set, bound exactly
@@ -155,7 +177,151 @@ def build_material(
         {trace: traces[trace] for trace in task.source_traces},
         _recorded_state(project, task.recorded_state),
     )
-    return spec, material
+    return Prepared(spec, family, material, load_exposure_plan(project, report.exposure), traces)
+
+
+@dataclass(frozen=True)
+class Prepared:
+    """One task's registration, family, frozen material and the evidence it was read from."""
+
+    spec: BootstrapSpec
+    family: BootstrapFamily
+    material: StartMaterial
+    exposure: ExposurePlan
+    traces: Mapping[str, Trace]
+
+
+class OverlayArtifacts(ArtifactStore):
+    """Writes land in the scratch project; reads fall back to the shared project, unchanged."""
+
+    def __init__(self, paths: ProjectPaths, base: ArtifactStore) -> None:
+        """Bind the scratch paths and the read-only shared store."""
+        super().__init__(paths)
+        self.base = base
+
+    def read(self, artifact_id: str) -> StoredArtifact:
+        """Read the scratch artifact, else the shared one."""
+        return (
+            super().read(artifact_id)
+            if super().exists(artifact_id)
+            else self.base.read(artifact_id)
+        )
+
+    def read_bytes(self, artifact_id: str, relative_path: str) -> bytes:
+        """Read a data file of the scratch artifact, else of the shared one."""
+        if super().exists(artifact_id):
+            return super().read_bytes(artifact_id, relative_path)
+        return self.base.read_bytes(artifact_id, relative_path)
+
+    def exists(self, artifact_id: str) -> bool:
+        """Whether either project holds the artifact."""
+        return super().exists(artifact_id) or self.base.exists(artifact_id)
+
+    def list_ids(self, *, artifact_type: str | None = None) -> tuple[str, ...]:
+        """Every artifact identity of both projects."""
+        own = super().list_ids(artifact_type=artifact_type)
+        return tuple(sorted({*own, *self.base.list_ids(artifact_type=artifact_type)}))
+
+
+ALLOWED_ALIASES = frozenset({"glm", "glm-flash"})
+"""The only catalog aliases a harness run may resolve; every other model is refused."""
+
+
+def local_aliases(project: ProjectStore) -> frozenset[str]:
+    """Catalog aliases whose connection is served on this host's loopback interface."""
+    catalog = load_model_catalog(project.model_catalog_path)
+    return frozenset(
+        alias
+        for alias, record in catalog.models.items()
+        if urlparse(str(catalog.connections[record.connection].base_url or "")).hostname
+        in ("127.0.0.1", "localhost", "::1")
+    )
+
+
+def guard_aliases(allowed: frozenset[str]) -> None:
+    """Refuse, before any dispatch, every model alias outside ``allowed``."""
+    original = RuntimeModelCatalog.resolve
+    if getattr(original, "harness_guard", False):
+        return
+
+    def resolve(self: RuntimeModelCatalog, alias: str, **kwargs: object) -> object:
+        if alias not in allowed:
+            raise PermissionError(f"the harness may call only {sorted(allowed)}, not {alias!r}")
+        return original(self, alias, **kwargs)  # type: ignore[arg-type]
+
+    resolve.harness_guard = True  # type: ignore[attr-defined]
+    RuntimeModelCatalog.resolve = resolve  # type: ignore[method-assign]
+
+
+def run_full(project: ProjectStore, scratch: ProjectStore, prepared: Prepared, run: str) -> int:
+    """Run the whole per-task bootstrap flow in an overlay of the shared project and report it.
+
+    Author, review, research, capture, validation and registration run exactly as the
+    bootstrap runs them; every artifact is written to the scratch project.
+    """
+    # The flow checks the project's frozen build by project identity, so the overlay is a
+    # project of the shared one's name and configuration under the scratch root.
+    root = scratch.paths.root / "full"
+    root.mkdir(exist_ok=True)
+    if not (root / "models.toml").exists():
+        (root / "models.toml").write_bytes(scratch.model_catalog_path.read_bytes())
+    overlay = ProjectStore(root, project.paths.project_id)
+    overlay.artifacts = OverlayArtifacts(overlay.paths, project.artifacts)
+    if not overlay.exists():
+        overlay.initialize(project.load_project())
+    family, task = prepared.family, prepared.material.task
+    revision = "author-harness"
+    outcome = None
+    try:
+        _bind_evidence(overlay, family, task, run, prepared.exposure, prepared.traces, revision)
+        outcome = _bootstrap_task(
+            overlay,
+            prepared.spec,
+            family,
+            task,
+            prepared.material.knowledge,
+            run,
+            prepared.exposure,
+            prepared.traces,
+            revision,
+        )
+    except Exception as error:  # noqa: BLE001 - a stopped flow is a reported outcome
+        _say(f"  RAISED {type(error).__name__}: {str(error)[:600]}")
+        traceback.print_exc()
+    saved = load_outcome(overlay, run)
+    outcome = saved or outcome
+    if outcome is None:
+        _say(f"RESULT {task.task.task_id}: STOPPED")
+        return 1
+    for row in outcome.rounds:
+        steps = (row.author, *row.author.repairs)
+        _say(
+            f"  round {row.round} author: {'PASS' if row.author.failure is None else 'FAIL'} "
+            f"after {len(steps)} draw(s); {(row.author.invalid or row.author.failure or '')[:300]}"
+        )
+        for draw in row.reviews:
+            verdict = None if draw.answer is None else draw.answer.get("verdict")
+            _say(
+                f"  round {row.round} review {draw.variant}: {verdict or 'UNUSABLE'} "
+                f"({1 + len(draw.repairs)} draw(s)) {(draw.failure or draw.invalid or '')[:300]}"
+            )
+        _say(f"  round {row.round} verdict: {row.verdict}; research items {len(row.items)}")
+    for finding in outcome.findings:
+        _say(f"  research {finding.finding_id}: {finding.status} {(finding.failure or '')[:300]}")
+    validation = outcome.validation
+    if validation is not None:
+        _say(
+            f"  validation {validation.method}: {'PASS' if validation.passed else 'FAIL'} "
+            f"{validation.detail[:400]}"
+        )
+        for draw in validation.checks:
+            consistent = None if draw.answer is None else draw.answer.get("consistent")
+            _say(f"  reveal check {draw.variant}: {consistent} {(draw.failure or '')[:300]}")
+    if isinstance(outcome, BootstrapRefusal):
+        _say(f"RESULT {task.task.task_id}: REFUSED {outcome.kind}: {outcome.diagnosis[:500]}")
+        return 1
+    _say(f"RESULT {task.task.task_id}: REGISTERED {outcome.provenance}")
+    return 0
 
 
 def scratch_project(directory: Path, source: ProjectStore) -> ProjectStore:
@@ -206,13 +372,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--variant-round", type=int, default=0, help="round, rotating the stance")
     parser.add_argument("--check", type=Path, nargs="+", help="validate saved answers; no call")
     parser.add_argument("--refusal", help="re-validate a saved refusal's answers; no model call")
+    parser.add_argument("--full", action="store_true", help="run the whole per-task flow")
+    parser.add_argument(
+        "--allow-local",
+        action="store_true",
+        help="also allow aliases served on this host (loopback), such as a local embedder",
+    )
     args = parser.parse_args(argv)
     raw = json.loads(args.spec.read_text())["preparation"]
     settings = BootstrapSettings.model_validate(raw["bootstrap"])
     limits = BootstrapLimits.model_validate(raw["limits"])
     project = ProjectStore(args.root, args.project)
     started = time.monotonic()
-    spec, material = build_material(project, settings, limits, args.task_id, args.rules_report)
+    prepared = build_material(project, settings, limits, args.task_id, args.rules_report)
+    spec, material = prepared.spec, prepared.material
     _say(
         f"material for {args.task_id} in {time.monotonic() - started:.0f}s: "
         f"{len(material.knowledge.traces)} member traces, {len(material.sources)} sources, "
@@ -232,6 +405,16 @@ def main(argv: list[str] | None = None) -> int:
                 report(material, f"round {row.round} draw {index}", answer, failure)
         return 0
     scratch = scratch_project(args.scratch, project)
+    guard_aliases(ALLOWED_ALIASES | (local_aliases(scratch) if args.allow_local else frozenset()))
+    if args.full:
+        run = f"start-bootstrap-harness-{args.task_id}-{secrets.token_hex(4)}"
+        with operation_spend_scope():
+            ceiling = operation_spend_ceiling(scratch, run)
+            ceiling.authorize("author-harness", ceiling_usd=0.0, unpriced_attempts=args.calls)
+            install_spend_ceiling(ceiling)
+            status = run_full(project, scratch, prepared, run)
+            _say(f"{run}: unpriced attempts used {ceiling.summary().unpriced_attempts}")
+        return status
     run = f"author-harness-{args.task_id}-{secrets.token_hex(4)}"
     out = args.scratch / "answers"
     out.mkdir(exist_ok=True)
@@ -241,9 +424,15 @@ def main(argv: list[str] | None = None) -> int:
         install_spend_ceiling(ceiling)
         try:
             draw, draft = author_start(
-                scratch, spec, material, identity=run, round_=args.variant_round, feedback={},
-                sources=(), code_revision="author-harness",
-            )  # fmt: skip
+                scratch,
+                spec,
+                material,
+                identity=run,
+                round_=args.variant_round,
+                feedback={},
+                sources=(),
+                code_revision="author-harness",
+            )
         except Exception as error:  # noqa: BLE001 - a provider refusal is a reported attempt
             _say(f"  RAISED {type(error).__name__}: {str(error)[:400]}")
             draw, draft = None, None
