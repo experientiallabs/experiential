@@ -221,6 +221,8 @@ class StartMaterial:
             "json_pointers": (
                 "RFC 6901: escape '~' as '~0' and '/' inside a key as '~1' at every depth, "
                 "so the key '/opt/venv/bin/python' is the token '~1opt~1venv~1bin~1python'. "
+                "Escaping applies only inside pointers: initial_state keys stay plain text "
+                "('/workspace', never '~1workspace'). "
                 + (
                     "The domain roots are exactly "
                     + json.dumps([pointer_token(name) for name in domains])
