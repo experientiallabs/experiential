@@ -131,6 +131,8 @@ def test_bare_types_are_wrapped_and_a_schema_written_as_properties_is_lifted() -
     assert fixed["properties"]["lines"]["items"]["items"] == {"type": "string"}
     assert fixed["properties"]["name"] == {"type": "string"}
     assert len(notes) == 3
+    named = {"type": "object", "properties": {"type": {"type": "string"}}}
+    assert normalise_schema(named, "", []) == named
     kept = {"type": "object", "properties": {"type": "string", "path": "string"}}
     assert normalise_schema(kept, "", [])["properties"] == {
         "type": {"type": "string"},

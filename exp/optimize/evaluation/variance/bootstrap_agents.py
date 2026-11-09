@@ -364,7 +364,8 @@ def normalise_schema(node: JsonValue, path: str, notes: list[str]) -> JsonValue:
     nested = node.get("properties")
     if (
         isinstance(nested, dict)
-        and nested.get("type") in JSON_TYPES
+        and isinstance(nested.get("type"), str)
+        and nested["type"] in JSON_TYPES
         and set(nested) <= SCHEMA_KEYWORDS
         and not set(nested) & (set(node) - {"properties"})
     ):
