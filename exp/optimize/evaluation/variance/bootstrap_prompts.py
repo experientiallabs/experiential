@@ -24,7 +24,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v6"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v7"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
@@ -98,6 +98,20 @@ The host captured the start and executed each reveal probe once, each from a fre
 start. Compare what each probe revealed with the start's fact ledger and public instruction.
 Answer consistent only when no reveal contradicts a fact or the instruction; otherwise list each
 conflict with the probe index and the facts it contradicts."""
+
+REPLAY_JUDGE_INSTRUCTION = """You judge one replayed step of a reconstructed executable start.
+
+The host replayed a recorded tool call in the simulated world. The opening holds the call, the
+recorded observation and whether it failed, the replayed observation and whether it failed, and
+the normalised similarity and exit codes the host found. Simulated output never matches the
+recorded bytes: dates, owners, paths, version detail and wording differ. Decide one question:
+does the replayed observation convey the same outcome as the recorded one? Same outcome means
+the same success or failure, the same failure cause, and the same facts an agent would act on
+next. Answer same_outcome true or false with a one-sentence reason."""
+
+REPLAY_JUDGE_VARIANTS: dict[str, str] = {
+    "same_outcome": "Stance: compare what an agent would conclude and do next from each output.",
+}
 
 AUTHOR_VARIANTS: dict[str, str] = {
     "evidence_first": """Stance: start from the recorded evidence. Settle each state field from
@@ -231,6 +245,14 @@ RESEARCH_ANSWER = tool_schema(
 )
 """The researcher's answer tool."""
 
+REPLAY_JUDGE_ANSWER = tool_schema(
+    "submit_replay_judgement",
+    "Submit whether the replayed observation conveys the recorded outcome.",
+    {"same_outcome": {"type": "boolean"}, "reason": {"type": "string"}},
+    ("same_outcome", "reason"),
+)
+"""The replay judge's answer tool."""
+
 REVEAL_ANSWER = tool_schema(
     "submit_reveal_check",
     "Submit whether the first reveals agree with the start.",
@@ -275,8 +297,15 @@ def bootstrap_prompts_sha256() -> str:
                 REVIEW_INSTRUCTION,
                 RESEARCH_INSTRUCTION,
                 REVEAL_INSTRUCTION,
+                REPLAY_JUDGE_INSTRUCTION,
             ],
-            "variants": [AUTHOR_VARIANTS, REVIEW_VARIANTS, RESEARCH_VARIANTS, REVEAL_VARIANTS],
+            "variants": [
+                AUTHOR_VARIANTS,
+                REVIEW_VARIANTS,
+                RESEARCH_VARIANTS,
+                REVEAL_VARIANTS,
+                REPLAY_JUDGE_VARIANTS,
+            ],
             "tools": [
                 tool.model_dump(mode="json")
                 for tool in (
@@ -285,6 +314,7 @@ def bootstrap_prompts_sha256() -> str:
                     REVIEW_ANSWER,
                     RESEARCH_ANSWER,
                     REVEAL_ANSWER,
+                    REPLAY_JUDGE_ANSWER,
                 )
             ],
         }

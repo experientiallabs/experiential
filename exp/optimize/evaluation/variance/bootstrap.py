@@ -149,6 +149,8 @@ def task_identity(
             "review_profile",
             "research_profile",
             "author_variants",
+            "author_repairs",
+            "replay_judge",
             "review_variants",
             "research_variants",
             "reveal_variants",

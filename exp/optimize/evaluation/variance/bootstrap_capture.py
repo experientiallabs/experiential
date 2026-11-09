@@ -27,7 +27,7 @@ Only a completed result replays; an unfinished intent is refused without another
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
@@ -57,8 +57,10 @@ from exp.optimize.evaluation.executable.grounded import (
 from exp.optimize.evaluation.executable.loader import load_runtime_definition
 from exp.optimize.evaluation.variance.bootstrap_agents import (
     FamilyKnowledge,
+    ReplayJudgement,
     StartMaterial,
     check_reveals,
+    judge_replay_step,
 )
 from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapSpec,
@@ -66,14 +68,17 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     FamilyInput,
     ReplayStep,
     Reveal,
+    RoleDraw,
     RuntimeTemplate,
     StartDraft,
     StartValidation,
 )
 from exp.optimize.evaluation.variance.family_simulators import derive_definition
+from exp.optimize.evaluation.variance.replay_match import match_step
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.runtime.environments.worlds import ExecutableWorld, ExecutableWorldRuntime
+from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
 
@@ -228,27 +233,48 @@ def validate_start(
     if draft.provenance == "reconstructed":
         assert draft.replay_trace is not None
         steps = material.recorded_prefix(draft.replay_trace)[: draft.prefix_steps]
-        replay = replay_prefix(
+        replay, failure = replay_prefix(
             project, template, definition, checkpoint, steps,
             identity=identity, code_revision=code_revision,
         )  # fmt: skip
-        disagree = [row.locator for row in replay if not row.agrees]
-        detail = (
-            f"{len(replay)} recorded steps of {draft.replay_trace} replay to their observations"
-            if not disagree
-            else f"replay disagrees with the recorded prefix at {disagree}"
-        )
+        replay = judge_undecided(
+            replay,
+            lambda index, step: judge_replay_step(
+                project, spec, material, step, identity=identity, index=index,
+                sources=sources, code_revision=code_revision,
+            ),
+        )  # fmt: skip
+        disagree = [f"{row.locator} ({row.reason})" for row in replay if not row.agrees]
+        rules = {rule: sum(row.rule == rule for row in replay) for rule in MATCH_RULES}
+        if failure is not None:
+            detail = f"replay stopped: {failure}"
+        elif disagree:
+            detail = f"replay disagrees with the recorded prefix at {disagree}"
+        else:
+            detail = (
+                f"{len(replay)} recorded steps of {draft.replay_trace} replay to the recorded "
+                f"outcomes (exact {rules['exact']}, normalised {rules['normalised']}, "
+                f"judge {rules['judge']})"
+            )
         return StartValidation(
             provenance="reconstructed",
             method="prefix_replay",
-            passed=not disagree,
+            passed=failure is None and not disagree and len(replay) == len(steps),
             detail=detail,
             replay=replay,
         )
-    reveals = first_reveals(
+    reveals, failure = first_reveals(
         project, template, definition, checkpoint, draft,
         identity=identity, code_revision=code_revision,
     )  # fmt: skip
+    if failure is not None:
+        return StartValidation(
+            provenance="authored",
+            method="coherence_and_first_reveal",
+            passed=False,
+            detail=f"first reveals stopped: {failure}",
+            reveals=reveals,
+        )
     checks = check_reveals(
         project,
         spec,
@@ -291,8 +317,12 @@ def replay_prefix(
     *,
     identity: str,
     code_revision: str,
-) -> tuple[ReplayStep, ...]:
+) -> tuple[tuple[ReplayStep, ...], str | None]:
     """Execute recorded steps in order in one fresh restore of the start and compare each.
+
+    Each step is matched on substance (:func:`~exp.optimize.evaluation.variance.replay_match.
+    match_step`): exact first, then exit status, error outcome and normalised output. A step
+    normalisation cannot decide is left for :func:`judge_undecided`.
 
     Args:
         project: Project holding the start.
@@ -304,7 +334,7 @@ def replay_prefix(
         code_revision: Producing source identity.
 
     Returns:
-        One comparison per step.
+        One comparison per replayed step, and why the replay stopped early, if it did.
     """
     actions: list[ToolCall] = []
     for index, step in enumerate(steps):
@@ -318,16 +348,17 @@ def replay_prefix(
                 arguments=arguments if isinstance(arguments, dict) else {},
             )  # fmt: skip
         )
-    observations = _probe_observations(
+    observations, failure = _probe_observations(
         project, template, definition, checkpoint, actions,
         identity=identity, code_revision=code_revision,
     )  # fmt: skip
     rows: list[ReplayStep] = []
-    for step, observation in zip(steps, observations, strict=True):
+    for step, observation in zip(steps, observations, strict=False):
         action = step["action"]
         assert isinstance(action, dict)
         replayed = _decode(observation)
         recorded_error = step.get("failure") is not None
+        match = match_step(step.get("observation"), recorded_error, replayed, observation.is_error)
         rows.append(
             ReplayStep(
                 locator=str(step["locator"]),
@@ -336,11 +367,66 @@ def replay_prefix(
                 recorded_error=recorded_error,
                 replayed=replayed,
                 replayed_error=observation.is_error,
-                agrees=observation.is_error == recorded_error
-                and (recorded_error or replayed == step.get("observation")),
+                agrees=match.decision == "pass",
+                rule=match.rule,
+                similarity=match.similarity,
+                recorded_exit=match.recorded_exit,
+                replayed_exit=match.replayed_exit,
+                reason=match.reason if match.decision != "undecided" else UNDECIDED + match.reason,
             )
         )
-    return tuple(rows)
+    return tuple(rows), failure
+
+
+UNDECIDED = "undecided: "
+"""Reason prefix of a replayed step normalisation left for the judge."""
+
+MATCH_RULES = ("exact", "normalised", "judge")
+
+
+def judge_undecided(
+    rows: Sequence[ReplayStep],
+    judge: Callable[[int, JsonObject], tuple[RoleDraw, ReplayJudgement | None]],
+) -> tuple[ReplayStep, ...]:
+    """Settle each undecided replayed step with one judge draw; decided steps stay as they are.
+
+    A judge without a usable answer leaves the step failed, with the judge's failure.
+    """
+    settled: list[ReplayStep] = []
+    for index, row in enumerate(rows):
+        if not row.reason.startswith(UNDECIDED):
+            settled.append(row)
+            continue
+        draw, verdict = judge(
+            index,
+            {
+                "action": row.action,
+                "recorded": row.recorded,
+                "recorded_error": row.recorded_error,
+                "replayed": row.replayed,
+                "replayed_error": row.replayed_error,
+                "normalised_similarity": row.similarity,
+                "recorded_exit": row.recorded_exit,
+                "replayed_exit": row.replayed_exit,
+                "host_note": row.reason.removeprefix(UNDECIDED),
+            },
+        )
+        if verdict is None:
+            reason = f"the judge gave no usable answer: {draw.failure}"
+        else:
+            reason = f"judge: {verdict.reason}"
+        passed = verdict is not None and verdict.same_outcome
+        settled.append(
+            row.model_copy(
+                update={
+                    "agrees": passed,
+                    "rule": "judge" if passed else None,
+                    "reason": reason[:1000],
+                    "judge": draw,
+                }
+            )
+        )
+    return tuple(settled)
 
 
 def first_reveals(
@@ -352,19 +438,21 @@ def first_reveals(
     *,
     identity: str,
     code_revision: str,
-) -> tuple[Reveal, ...]:
+) -> tuple[tuple[Reveal, ...], str | None]:
     """Execute each reveal probe once, each from its own fresh restore of the start.
 
     Returns:
-        What each probe revealed, in probe order.
+        What each probe revealed, in probe order, and why the reveals stopped, if they did.
     """
     rows: list[Reveal] = []
     for index, probe in enumerate(draft.reveal_probes):
-        observations = _probe_observations(
+        observations, failure = _probe_observations(
             project, template, definition, checkpoint,
             (ToolCall(name=probe.name, call_id=f"reveal-{index}", arguments=probe.arguments),),
             identity=identity, code_revision=code_revision,
         )  # fmt: skip
+        if failure is not None:
+            return tuple(rows), failure
         observation = observations[0]
         rows.append(
             Reveal(
@@ -375,7 +463,7 @@ def first_reveals(
                 is_error=observation.is_error,
             )
         )
-    return tuple(rows)
+    return tuple(rows), None
 
 
 class _ProbeResult(ContractModel):
@@ -383,9 +471,11 @@ class _ProbeResult(ContractModel):
 
     Attributes:
         observations: Known results in the exact registered action order.
+        failure: Why execution stopped before every action had a result, if it did.
     """
 
     observations: tuple[Observation, ...]
+    failure: str | None = None
 
 
 def _probe_observations(
@@ -402,7 +492,13 @@ def _probe_observations(
 
     Each known observation is saved before the next action. An interrupted prefix keeps those
     observations but never restores a new session to repeat or continue its incomplete sample.
-    Exceptions from admission, execution, persistence and cleanup propagate unchanged.
+    A tool-simulator reply that is empty or invalid is retried once with the same action in the
+    same session; a second such reply stops execution and is saved as the result's failure, so
+    the start is refused, not crashed. Other exceptions from admission, execution, persistence
+    and cleanup propagate unchanged.
+
+    Returns:
+        The known observations and why execution stopped early, if it did.
     """
     request: JsonObject = {
         "task": identity,
@@ -418,9 +514,8 @@ def _probe_observations(
     result_id = probe_id + "-result"
     with CoordinationLock(store.project_directory / (probe_id + ".lock"), timeout=0):
         if store.exists(result_id):
-            return _ProbeResult.model_validate_json(
-                store.read_bytes(result_id, "result.json")
-            ).observations
+            saved = _ProbeResult.model_validate_json(store.read_bytes(result_id, "result.json"))
+            return saved.observations, saved.failure
         if store.exists(probe_id):
             raise ValueError(
                 "bootstrap validation has an unfinished probe intent; inspect its saved "
@@ -442,9 +537,17 @@ def _probe_observations(
         )
         rows: list[Observation] = []
         sources = [intent]
+        failure: str | None = None
         with _restored(project, template, definition, checkpoint) as session:
             for index, action in enumerate(actions):
-                observation = session.execute(action)
+                try:
+                    observation = _execute_retrying(session, action)
+                except ProviderRetryableResponseError as error:
+                    failure = (
+                        f"the tool simulator gave no usable reply to step {index} "
+                        f"({action.name}) twice: {type(error).__name__}: {error}"
+                    )[:1000]
+                    break
                 sources.append(
                     artifact_input(
                         store.write_json(
@@ -456,14 +559,33 @@ def _probe_observations(
                     )
                 )
                 rows.append(observation)
-        result = _ProbeResult(observations=tuple(rows))
+        result = _ProbeResult(observations=tuple(rows), failure=failure)
         store.write_json(
             artifact_id=result_id,
             artifact_type="start-bootstrap-probe-result",
             envelope=envelope.model_copy(update={"inputs": tuple(sources)}),
             files={"result.json": result},
         )
-        return result.observations
+        return result.observations, result.failure
+
+
+SIMULATOR_RETRIES = 1
+"""Same-request retries of an empty or invalid tool-simulator reply before refusing."""
+
+
+def _execute_retrying(session: ExecutableWorld, action: ToolCall) -> Observation:
+    """Execute one action, retrying an empty or invalid simulator reply once.
+
+    Raises:
+        ProviderRetryableResponseError: The retry's reply is still unusable.
+    """
+    for attempt in range(SIMULATOR_RETRIES + 1):
+        try:
+            return session.execute(action)
+        except ProviderRetryableResponseError:
+            if attempt == SIMULATOR_RETRIES:
+                raise
+    raise AssertionError("unreachable")
 
 
 def mining_job(

@@ -417,8 +417,10 @@ class BootstrapSettings(ContractModel):
         research_rounds: Most research rounds per task before a still-missing deciding fact
             becomes a diagnostic refusal.
         research_items: Most research items answered per round.
-        author_repairs: Most validation-repair draws after an author draft fails its checks; each
-            sees the failed draft and its validation errors and resubmits the complete start.
+        author_repairs: Most validation-repair draws after any role's answer fails its checks;
+            each sees the failed answer and its validation errors and resubmits it complete.
+        replay_judge: Judge of a replayed step normalisation leaves undecided; None uses
+            ``reviewer``.
         runtime: The trusted runtime file starts are captured in, and the definition fields
             used when a family brings no frozen runtime.
         job: The mining job each registration freezes.
@@ -439,6 +441,7 @@ class BootstrapSettings(ContractModel):
     research_rounds: int = Field(default=2, ge=0, le=4, strict=True)
     research_items: int = Field(default=4, ge=1, le=16, strict=True)
     author_repairs: int = Field(default=2, ge=0, le=4, strict=True)
+    replay_judge: AuthorSettings | None = None
     runtime: RuntimeTemplate
     job: JobTemplate
     concurrency: int = Field(default=1, ge=1, le=32, strict=True)
@@ -702,7 +705,13 @@ class ReplayStep(ContractModel):
         recorded_error: Whether the recorded call failed.
         replayed: The replayed observation, decoded when it is JSON.
         replayed_error: Whether the replayed call failed.
-        agrees: Whether error status and observation are equal.
+        agrees: Whether the replay conveys the recorded outcome.
+        rule: What passed the step: ``exact``, ``normalised`` or ``judge``; None when it failed.
+        similarity: Token-set Jaccard similarity of the normalised salient lines.
+        recorded_exit: Exit code the recorded observation states, if any.
+        replayed_exit: Exit code the replayed observation states, if any.
+        reason: Why the step passed or failed.
+        judge: The judge's draw, when normalisation left the step undecided.
     """
 
     locator: str
@@ -712,6 +721,12 @@ class ReplayStep(ContractModel):
     replayed: JsonValue
     replayed_error: bool
     agrees: bool
+    rule: Literal["exact", "normalised", "judge"] | None = None
+    similarity: float | None = None
+    recorded_exit: int | None = None
+    replayed_exit: int | None = None
+    reason: str = ""
+    judge: RoleDraw | None = None
 
 
 class Reveal(ContractModel):

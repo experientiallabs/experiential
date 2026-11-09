@@ -19,6 +19,7 @@ a saved bootstrap refusal against the current checks. Neither makes a model call
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import secrets
 import sys
@@ -336,6 +337,12 @@ def run_full(project: ProjectStore, scratch: ProjectStore, prepared: Prepared, r
             f"  validation {validation.method}: {'PASS' if validation.passed else 'FAIL'} "
             f"{validation.detail[:400]}"
         )
+        for step in validation.replay:
+            _say(
+                f"    step {step.locator.rsplit(':', 1)[-1]}: {'PASS' if step.agrees else 'FAIL'} "
+                f"rule={step.rule} similarity={step.similarity} exit "
+                f"{step.recorded_exit}->{step.replayed_exit}; {step.reason[:200]}"
+            )
         for draw in validation.checks:
             consistent = None if draw.answer is None else draw.answer.get("consistent")
             _say(f"  reveal check {draw.variant}: {consistent} {(draw.failure or '')[:300]}")
@@ -407,6 +414,10 @@ def main(argv: list[str] | None = None) -> int:
     project = ProjectStore(args.root, args.project)
     started = time.monotonic()
     prepared = build_material(project, settings, limits, args.task_id, args.rules_report)
+    if prepared.spec.replay_judge is None and settings.rules is not None:
+        # The registration names no replay judge; judge with the rules stage's glm-flash.
+        judged = prepared.spec.model_copy(update={"replay_judge": settings.rules.author})
+        prepared = dataclasses.replace(prepared, spec=judged)
     spec, material = prepared.spec, prepared.material
     _say(
         f"material for {args.task_id} in {time.monotonic() - started:.0f}s: "

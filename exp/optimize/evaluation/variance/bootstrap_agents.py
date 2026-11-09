@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from functools import cache, cached_property
 from typing import Literal
 
-from pydantic import JsonValue, ValidationError
+from pydantic import Field, JsonValue, ValidationError
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.core.artifacts import stable_id as _stable_id
@@ -63,6 +63,9 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     AUTHOR_REPAIR,
     AUTHOR_VARIANTS,
     READ_TOOLS,
+    REPLAY_JUDGE_ANSWER,
+    REPLAY_JUDGE_INSTRUCTION,
+    REPLAY_JUDGE_VARIANTS,
     RESEARCH_ANSWER,
     RESEARCH_INSTRUCTION,
     RESEARCH_VARIANTS,
@@ -876,6 +879,66 @@ def research(
     return run_bounded(calls, max(1, len(calls)))
 
 
+class ReplayJudgement(ContractModel):
+    """The replay judge's answer.
+
+    Attributes:
+        same_outcome: Whether the replayed observation conveys the recorded outcome.
+        reason: The judgement in one sentence.
+    """
+
+    same_outcome: bool
+    reason: str = Field(min_length=1)
+
+
+def judge_replay_step(
+    project: ProjectStore,
+    spec: BootstrapSpec,
+    material: StartMaterial,
+    step: JsonObject,
+    *,
+    identity: str,
+    index: int,
+    sources: tuple[ArtifactInput, ...],
+    code_revision: str,
+) -> tuple[RoleDraw, ReplayJudgement | None]:
+    """Run, or replay, the judge of one replayed step normalisation left undecided.
+
+    Args:
+        project: Project holding the draw.
+        spec: The registration; ``replay_judge`` judges, else the reviewer.
+        material: What the start was authored from.
+        step: The call, both observations and error flags, and the host's scores.
+        identity: Task bootstrap identity.
+        index: The step's position in the replayed prefix.
+        sources: Saved artifacts the material came from.
+        code_revision: Producing source identity.
+
+    Returns:
+        The draw and its judgement, or None when the judge gave no usable answer.
+    """
+    variant = next(iter(REPLAY_JUDGE_VARIANTS))
+    return _repaired(
+        project,
+        spec.replay_judge or spec.role("reviewer"),
+        spec.review_profile,
+        material,
+        spec.author_repairs,
+        role="replay_judge",
+        variant=variant,
+        round_=0,
+        identity=identity,
+        index=index,
+        system=instruction(REPLAY_JUDGE_INSTRUCTION, REPLAY_JUDGE_VARIANTS, variant),
+        repair_prompt=ROLE_REPAIR,
+        opening={**step, "question": "Does the replayed observation convey the same outcome?"},
+        answer=replay_judge_answer_schema(),
+        validate=lambda answer, read: ReplayJudgement.model_validate(answer),
+        sources=sources,
+        code_revision=code_revision,
+    )
+
+
 def check_reveals(
     project: ProjectStore,
     spec: BootstrapSpec,
@@ -1213,6 +1276,12 @@ def review_answer_schema() -> ToolSchema:
 def research_answer_schema() -> ToolSchema:
     """The researcher's submit tool, typed by its finding answer."""
     return contract_schema(RESEARCH_ANSWER, FindingAnswer)
+
+
+@cache
+def replay_judge_answer_schema() -> ToolSchema:
+    """The replay judge's submit tool, typed by ``ReplayJudgement``."""
+    return contract_schema(REPLAY_JUDGE_ANSWER, ReplayJudgement)
 
 
 @cache

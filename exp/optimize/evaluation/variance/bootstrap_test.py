@@ -500,6 +500,7 @@ def test_a_family_bootstraps_into_validated_registrations(
         False,
     )
     assert [step.agrees for step in recon.validation.replay] == [True, True]
+    assert [step.rule for step in recon.validation.replay] == ["exact", "exact"]
     assert recon.validation.replay[1].replayed == {"severity": "high", "lock": "none"}
     assert (auth.provenance, auth.validation.method, auth.claims_original) == (
         "authored",
