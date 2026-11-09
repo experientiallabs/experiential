@@ -55,7 +55,9 @@ spelling it used (the provider's own error does the same).
 """
 
 
-def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
+def cleaned_location(
+    location: tuple[str | int, ...], *, keep_last: bool = False
+) -> tuple[str, ...]:
     """Drop pydantic union-branch labels so the path names request fields.
 
     A discriminated-union branch label is never the LAST segment of a location
@@ -67,6 +69,11 @@ def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
     last_index = len(location) - 1
     for index, part in enumerate(location):
         text = str(part)
+        if keep_last and index == last_index:
+            # An ``extra_forbidden`` location ends in the caller's own key,
+            # whatever it spells (``_meta``, ``Foo``, a parent's name).
+            cleaned.append(text)
+            continue
         if text in _LOCATION_NOISE:
             continue
         if (
@@ -222,6 +229,76 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     return f"Invalid value for '{param}': expected {description}."
 
 
+def unknown_parameter_message(param: str) -> str:
+    """State that a field the gateway does not define is unsupported and must go.
+
+    Pydantic reports an undefined key as ``extra_forbidden``, which carries no
+    expected shape; a bare ``Invalid value for '<param>'.`` would read as a
+    value fault when the key itself is the problem (an agent framework's own
+    flag on a function tool, such as Agno's ``requires_confirmation``). The
+    code stays ``invalid_parameter``; only the message names the fix.
+    """
+    return f"Unknown parameter '{param}': this field is not supported. Remove it and resend."
+
+
+def _names_unknown_field(
+    groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]],
+    location: tuple[str, ...],
+    details: list[ErrorDetails],
+) -> bool:
+    """Whether the chosen field is a key no union branch defines.
+
+    Every complaint at the chosen location must be ``extra_forbidden``, and
+    every closed sibling branch (one that reported some other stray key beside
+    it) must have called this key extra too: a closed branch that defines the
+    key reports either a value fault there or nothing there at all, and in
+    both cases the caller may have meant that branch, so "unknown parameter"
+    would misdescribe it.
+    """
+    if not details or any(detail["type"] != "extra_forbidden" for detail in details):
+        return False
+    parent = location[:-1]
+    for members in groups.values():
+        siblings = [
+            (cleaned, detail)
+            for cleaned, detail in members
+            if len(cleaned) == len(location) and cleaned[:-1] == parent
+        ]
+        if not any(detail["type"] == "extra_forbidden" for _, detail in siblings):
+            # A branch that never reports a stray key (an open shape, or one
+            # that failed before its extras were checked) says nothing about
+            # whether it defines this one.
+            continue
+        here = [detail for cleaned, detail in siblings if cleaned == location]
+        if not here or any(detail["type"] != "extra_forbidden" for detail in here):
+            return False
+    return True
+
+
+_MAXIMUM_ECHOED_PARAM_CHARACTERS = 256
+"""Longest field path echoed back in an error's ``param`` and message.
+
+An undefined key is the caller's own text and may be arbitrarily long; the
+error model caps ``param`` at 512 characters and the message at 2,048, so an
+unbounded echo would fail to build the 400 it describes.
+"""
+
+
+def _bounded_param(param: str) -> str:
+    """Abbreviate an over-long field path so the refusal can always be built.
+
+    Args:
+        param: Dotted field path, possibly ending in a caller-chosen key.
+
+    Returns:
+        The path unchanged when short enough, else its leading characters
+        followed by ``...``.
+    """
+    if len(param) <= _MAXIMUM_ECHOED_PARAM_CHARACTERS:
+        return param
+    return param[: _MAXIMUM_ECHOED_PARAM_CHARACTERS - 3] + "..."
+
+
 def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
 
@@ -239,7 +316,10 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
     for detail in error.errors(include_url=False):
         groups.setdefault(tuple(detail["loc"][:-1]), []).append(
-            (cleaned_location(detail["loc"]), detail)
+            (
+                cleaned_location(detail["loc"], keep_last=detail["type"] == "extra_forbidden"),
+                detail,
+            )
         )
     if not groups:
         return invalid_field("body")
@@ -251,12 +331,12 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     ]
     best = min(candidates, key=len)
     location = max((cleaned for cleaned, _ in best), key=len, default=())
-    param = ".".join(location) or "body"
+    param = _bounded_param(".".join(location) or "body")
     details = [detail for cleaned, detail in best if cleaned == location]
+    if _names_unknown_field(groups, location, details):
+        return invalid_field(param, unknown_parameter_message(param))
     if param.startswith("gateway."):
         for detail in details:
-            if detail["type"] == "extra_forbidden":
-                return invalid_field(param, f"Unknown parameter '{param}'. Remove it and resend.")
             if detail["type"] in {
                 "greater_than_equal",
                 "less_than_equal",
