@@ -11,6 +11,7 @@ types, so curriculum and difficulty are read per task type.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from pydantic import Field
@@ -126,6 +127,16 @@ class FamilyFacts:
     learning: tuple[str, ...]
 
 
+logger = logging.getLogger(__name__)
+
+EMPTY_SELECTION_LINE = (
+    "Task types selected NO start: the preparation falls back to the build's ranked mining "
+    "probes (selected_probes), not one start per task type. Register preparation.task_ids or "
+    "fix the types before consenting."
+)
+"""Plan line naming an empty task-type selection, which otherwise falls back silently (F10)."""
+
+
 def type_starts(
     task_types: TaskTypes,
     ranked: tuple[str, ...],
@@ -177,6 +188,8 @@ def type_starts(
         if family_id not in families:
             families.append(family_id)
         lines.append(f"Task type {label} ({len(task_type.members)} members): start {pick.task_id}.")
+    if not chosen:
+        lines.append(EMPTY_SELECTION_LINE)
     learning: dict[str, tuple[str, ...]] = {}
     for family_id in families:
         members = scopes[family_id].learning
@@ -223,6 +236,8 @@ def task_type_preparation(context: SlotContext, task_types: TaskTypes) -> Bootst
     """
     preparation = context.preparation
     chosen, learning, _ = task_type_selection(context, task_types)
+    if not chosen and not preparation.task_ids:
+        logger.warning(EMPTY_SELECTION_LINE)
     update: dict[str, object] = {"learning_traces": learning}
     if chosen and not preparation.task_ids:
         update["task_ids"] = chosen

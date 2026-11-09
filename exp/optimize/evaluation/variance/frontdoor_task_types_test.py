@@ -180,3 +180,31 @@ def test_the_curriculum_slot_places_a_start_in_its_task_type(
 
     assert list(record.starts) == [task]
     assert record.by_type == {"tt": (saved,)}
+
+
+def test_an_empty_task_type_selection_is_named_in_the_plan() -> None:
+    """F10: no type yielding a start must be visible before consent, not a silent fallback."""
+    from exp.optimize.evaluation.variance.frontdoor_task_types import EMPTY_SELECTION_LINE
+
+    types = TaskTypes(
+        families="families",
+        model={},
+        spec=TaskTypeSpec(),
+        evidence_sha256="0" * 64,
+        by_family=(
+            FamilyTaskTypes(
+                family_id="big",
+                clustering="",
+                names="",
+                reason="",
+                task_types=(kind("big", "a", 50, ()),),
+            ),
+        ),
+    )
+    facts = {"big": FamilyFacts(path="c00", tools=3, learning=("t",))}
+    limits = BootstrapLimits(
+        maximum_tasks=4, maximum_families=3, maximum_family_traces=100, maximum_family_tools=15
+    )
+    chosen, _, lines = type_starts(types, ("p",), {}, facts, limits)
+    assert chosen == ()
+    assert lines[-1] == EMPTY_SELECTION_LINE
