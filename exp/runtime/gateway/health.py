@@ -90,8 +90,8 @@ class _DeploymentHealth:
         circuit_failure: The account failure (authentication, not found, quota)
             that holds the circuit open, reduced to its class, canonical message
             and ownership so it carries nothing from the request that observed
-            it. ``None`` while the circuit is closed or held open by
-            operational failures.
+            it. ``None`` while the circuit is closed, held open by
+            operational failures, or after a newer throttle answer.
     """
 
     consecutive_failures: int = 0
@@ -315,6 +315,8 @@ class DeploymentHealthRegistry:
                     state.throttle_until,
                     now + self._throttle_window_seconds(failure),
                 )
+                # A newer throttle answer supersedes the recorded account cause.
+                state.circuit_failure = None
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1

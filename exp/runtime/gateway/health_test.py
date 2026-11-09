@@ -346,6 +346,16 @@ def test_circuit_failure_requires_every_depth_held_open_by_an_account_failure() 
     assert registry.circuit_failure((first, second), (0,)) is None
 
 
+def test_a_newer_throttle_supersedes_the_recorded_account_failure() -> None:
+    """A throttle settled after the account failure is the current cause, so none is named."""
+    registry = DeploymentHealthRegistry(clock=lambda: 100.0)
+    registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_QUOTA))
+    assert registry.circuit_failure((_KEY,), (0,)) is not None
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.circuit_failure((_KEY,), (0,)) is None
+    assert registry.throttled_remaining_seconds((_KEY,), (0,)) is not None
+
+
 def test_throttle_redial_claim_passes_the_window_but_not_an_open_circuit() -> None:
     """A post-backoff redial re-enters the throttled rung; a dead rung still refuses it."""
     now = [100.0]
