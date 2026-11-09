@@ -289,7 +289,13 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     if shared and domains != shared:
         raise ValueError(f"a start declares exactly the family's shared domains {sorted(shared)}")
     for pointer in (*draft.probe_paths.values(), *(p for f in draft.facts for p in f.state_paths)):
-        resolve(draft.initial_state, pointer)
+        try:
+            resolve(draft.initial_state, pointer)
+        except ValueError:
+            raise ValueError(
+                f"pointer {pointer!r} does not resolve in initial_state; its top-level keys are "
+                f"{sorted(draft.initial_state)[:12]}"
+            ) from None
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")

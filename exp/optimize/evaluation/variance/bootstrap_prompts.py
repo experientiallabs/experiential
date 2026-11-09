@@ -24,7 +24,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v5"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v6"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
@@ -56,7 +56,10 @@ calls whose first answers show the facts the task depends on).
 AUTHOR_REPAIR = """Repair: your previous start failed its structural checks. The opening holds
 previous_draft (your submitted start) and validation_errors (each a path and what is wrong). Fix
 every error, keep what was right, and resubmit the corrected complete start with the same submit
-tool; never submit only the changed parts."""
+tool; never submit only the changed parts. You may read material first, but this draw must end with
+exactly one submit_start call carrying the whole start. Every pointer in probe_paths and in a fact's
+state_paths must be a JSON pointer (like /Workspace filesystem/files/main.py) that exists in your
+initial_state; if a value is not in initial_state, add it there or drop the pointer."""
 """Appended to the author's instruction on a validation-repair draw."""
 
 REVIEW_INSTRUCTION = (
