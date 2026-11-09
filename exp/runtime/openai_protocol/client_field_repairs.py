@@ -341,7 +341,7 @@ def _validated_stream_options(
 
     Raises:
         OpenAIProtocolError: The value is not an object, names an unknown key,
-            or carries a non-boolean value for a boolean key.
+            or carries a non-null, non-boolean value for a boolean key.
     """
     if options is None:
         return None
@@ -534,10 +534,11 @@ def accept_messages_stream_options(
     carries usage, so ``include_usage: true`` (or an empty object) is already
     satisfied and is removed silently; ``false`` cannot be honored and is
     disclosed. Chat's other key, ``include_obfuscation``, asks for padding the
-    gateway never emits and is disclosed when true, as on Responses. Any
+    gateway never emits and is disclosed when true, as on Responses. A null
+    value for either key asks for nothing and is accepted. Any
     object on a call that does not stream (a ``count_tokens`` call never
     does, whatever its ``stream`` field says) is disclosed as ignored. Any
-    other key, or a non-boolean value, keeps a named rejection.
+    other key, or a non-null non-boolean value, keeps a named rejection.
 
     Args:
         payload: Parsed Anthropic Messages (or ``count_tokens``) body.
@@ -550,7 +551,7 @@ def accept_messages_stream_options(
     Raises:
         OpenAIProtocolError: The object is malformed, names a key other than
             ``include_usage`` and ``include_obfuscation``, or carries a
-            non-boolean value.
+            non-null value that is not a boolean.
     """
     if "stream_options" not in payload:
         return payload, ()

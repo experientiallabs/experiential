@@ -23,6 +23,7 @@ def test_required_protocol_and_sampling_fields_are_supported() -> None:
     assert decisions["thinking"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert decisions["output_config"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert decisions["top_k"] == CompatibilityDisposition.SUPPORTED
+    assert decisions["stream_options"] == CompatibilityDisposition.SUPPORTED
 
 
 def _decided(new_fields: frozenset[str] | set[str], surface: str) -> str:
