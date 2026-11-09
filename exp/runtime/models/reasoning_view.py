@@ -17,7 +17,8 @@ def reasoning_catalog(
         effort: Explicit override, or None to return the original catalog unchanged.
 
     Returns:
-        A local catalog clone, or the same object for no override or an already-off model.
+        A local catalog clone, or the same object for no override, an already-off model, or
+        the effort the catalog already pins for the alias.
 
     Raises:
         ModelConnectionError: The alias is absent.
@@ -33,6 +34,9 @@ def reasoning_catalog(
         if effort == "none":
             return catalog
         raise ValueError(f"model {alias!r} does not support a reasoning effort override")
+    if effort == capability.reasoning_effort:
+        # The catalog already pins this effort as the model's own profile: nothing changes.
+        return catalog
     supported = record.supported_reasoning_efforts or ()
     if effort not in supported:
         raise ValueError(

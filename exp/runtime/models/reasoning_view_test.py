@@ -118,3 +118,18 @@ def test_reasoning_catalog_refuses_unadvertised_effort(
     with pytest.raises(ValueError, match="reasoning effort 'none' is not supported"):
         reasoning_catalog(catalog, "fixture-model", "none")
     assert catalog.model_dump(mode="json") == original
+
+
+def test_the_effort_the_catalog_already_pins_needs_no_declared_override() -> None:
+    """A deployment declaring no overrides still serves the effort its catalog record pins."""
+    capabilities = _DEFAULT_CAPABILITIES.model_copy(
+        update={"supports_reasoning": True, "reasoning_effort": "low"}
+    )
+    catalog = _catalog(
+        provider="openai-compatible",
+        base_url="https://fixture.invalid/v1",
+        capabilities=capabilities,
+    )
+    assert reasoning_catalog(catalog, "fixture-model", "low") is catalog
+    with pytest.raises(ValueError, match="supported efforts: none declared"):
+        reasoning_catalog(catalog, "fixture-model", "high")
