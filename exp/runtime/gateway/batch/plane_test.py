@@ -19,7 +19,7 @@ from exp.runtime.gateway.batch.engine_test import (
     _chat_line,
 )
 from exp.runtime.gateway.batch.plane import BatchControlPlane
-from exp.runtime.gateway.sqlite.store import InvalidVirtualKeyError
+from exp.runtime.gateway.sqlite.store import GatewayStoreError, InvalidVirtualKeyError
 
 
 class MemoryControl:
@@ -233,8 +233,24 @@ def test_an_unclassified_fault_is_logged_and_answered_as_a_500_envelope(
     assert status == 500
     assert body["error"]["code"] == "internal_error"
     assert body["error"]["type"] == "api_error"
-    [record] = caplog.records
-    assert record.getMessage().startswith(f"batch {method} answered an unclassified RuntimeError")
-    assert "in fault" in record.getMessage()
+    messages = [record.getMessage() for record in caplog.records]
+    assert f"batch {method} answered a RuntimeError as 500 internal_error" in messages
+    assert any("unclassified RuntimeError" in m and "in fault" in m for m in messages)
     assert secret not in caplog.text
     assert secret not in json.dumps(body)
+
+
+def test_a_typed_gateway_fault_keeps_its_boundary_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fault the gateway boundary classifies is answered with its status, not a 500.
+
+    A store refusal is the retryable 503 every other gateway surface answers.
+    """
+    plane = _plane()
+
+    def refuse(*_: object, **__: object) -> NoReturn:
+        raise GatewayStoreError("authority crossing")
+
+    monkeypatch.setattr(plane._engine, "list_jobs", refuse)  # noqa: SLF001
+    status, body = _call(plane, "batch_list")
+    assert status == 503
+    assert body["error"]["code"] == "gateway_authority_unavailable"
