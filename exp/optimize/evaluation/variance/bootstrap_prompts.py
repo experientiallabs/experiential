@@ -24,7 +24,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v3"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v4"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
@@ -52,6 +52,12 @@ calls whose first answers show the facts the task depends on).
 """
     + _REFERENCES
 )
+
+AUTHOR_REPAIR = """Repair: your previous start failed its structural checks. The opening holds
+previous_draft (your submitted start) and validation_errors (each a path and what is wrong). Fix
+every error, keep what was right, and resubmit the corrected complete start with the same submit
+tool; never submit only the changed parts."""
+"""Appended to the author's instruction on a validation-repair draw."""
 
 REVIEW_INSTRUCTION = (
     """You review the starting state of one executable task before it is captured.
@@ -254,6 +260,7 @@ def bootstrap_prompts_sha256() -> str:
             "protocol": BOOTSTRAP_PROTOCOL,
             "instructions": [
                 AUTHOR_INSTRUCTION,
+                AUTHOR_REPAIR,
                 REVIEW_INSTRUCTION,
                 RESEARCH_INSTRUCTION,
                 REVEAL_INSTRUCTION,

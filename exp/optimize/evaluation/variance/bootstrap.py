@@ -708,7 +708,12 @@ def _bootstrap_task(
         definition = start_definition(template, family.family, knowledge, task, draft)
         evidence = {
             *sources,
-            *(draw.transcript for row in rounds for draw in (row.author, *row.reviews)),
+            *(
+                ref
+                for row in rounds
+                for draw in (row.author, *row.reviews)
+                for ref in draw.transcripts()
+            ),
             *(row.transcript for row in findings),
         }
         checkpoint = capture_start(
@@ -791,7 +796,9 @@ def _inputs(
 ) -> tuple[ArtifactInput, ...]:
     """Every saved artifact an outcome rests on."""
     refs = {*sources, *(row.transcript for row in findings)}
-    refs |= {draw.transcript for row in rounds for draw in (row.author, *row.reviews)}
+    refs |= {
+        ref for row in rounds for draw in (row.author, *row.reviews) for ref in draw.transcripts()
+    }
     if validation is not None:
         refs |= {draw.transcript for draw in validation.checks}
     if checkpoint is not None:

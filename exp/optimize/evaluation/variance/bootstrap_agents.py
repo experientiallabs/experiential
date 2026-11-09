@@ -11,7 +11,9 @@ cited reference is in the material inventory; an observed fact cites recorded ev
 inferred fact cites support; the claimed provenance is one the evidence allows. Whether a start is
 coherent, sufficiently specified and supports its task, what a missing fact is, and whether a
 reveal contradicts a fact are the roles' judgments. A draw whose answer fails its checks is kept
-with its failure and never redrawn; a saved draw replays without a call.
+with its failure and never redrawn, except that a failed author draft gets up to
+``author_repairs`` validation-repair draws, each shown the draft and its errors; a saved draw
+replays without a call.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache, cached_property
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.core.artifacts import stable_id as _stable_id
@@ -55,6 +57,7 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
 from exp.optimize.evaluation.variance.bootstrap_prompts import (
     AUTHOR_ANSWER,
     AUTHOR_INSTRUCTION,
+    AUTHOR_REPAIR,
     AUTHOR_VARIANTS,
     READ_TOOLS,
     RESEARCH_ANSWER,
@@ -418,21 +421,98 @@ def author_start(
     task_index = sum(ord(ch) for ch in material.task.task.task_id)
     variant = spec.author_variants[(task_index + round_) % len(spec.author_variants)]
     opening = {**material.context(), "round": round_, "feedback": feedback}
-    return _draw(
-        project,
-        spec.author,
-        spec.author_profile,
-        material,
-        role="start_author",
-        variant=variant,
-        round_=round_,
-        identity=_draw_id(identity, "start_author", variant, round_, 0, opening),
-        system=instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant),
-        opening=opening,
-        answer=author_answer_schema(),
-        validate=lambda answer, read: validate_draft(answer, material),
-        sources=sources,
-        code_revision=code_revision,
+    system = instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant)
+
+    def one(
+        index: int, body: JsonObject, prompt: str, repair: JsonObject | None
+    ) -> tuple[RoleDraw, StartDraft | None, JsonObject | None]:
+        return _draw_full(
+            project,
+            spec.author,
+            spec.author_profile,
+            material,
+            role="start_author",
+            variant=variant,
+            round_=round_,
+            identity=_draw_id(identity, "start_author", variant, round_, index, body, repair),
+            system=prompt,
+            opening=body,
+            answer=author_answer_schema(),
+            validate=lambda answer, read: validate_draft(answer, material),
+            sources=sources,
+            code_revision=code_revision,
+        )
+
+    draw, draft, invalid = one(0, opening, system, None)
+    if invalid is None or spec.author_repairs == 0:
+        return draw, draft
+    repairs: list[RoleDraw] = []
+    answer = invalid
+    for index in range(1, spec.author_repairs + 1):
+        errors = validation_errors(answer, material)
+        body = {**opening, "previous_draft": answer, "validation_errors": list(errors)}
+        repair: JsonObject = {"repair": index, "errors": sha256_json(list(errors))}
+        fixed, draft, again = one(index, body, system + "\n\n" + AUTHOR_REPAIR, repair)
+        repairs.append(fixed)
+        if draft is not None:
+            return draw.model_copy(
+                update={
+                    "answer": fixed.answer,
+                    "failure": None,
+                    "invalid": draw.failure,
+                    "repairs": tuple(repairs),
+                }
+            ), draft
+        if again is None:
+            break
+        answer = again
+    last = repairs[-1].failure
+    return draw.model_copy(
+        update={
+            "failure": f"{draw.failure}; {len(repairs)} repair draw(s) failed, last: {last}"[:2000],
+            "invalid": draw.failure,
+            "repairs": tuple(repairs),
+        }
+    ), None
+
+
+VALIDATION_ERRORS = 40
+VALIDATION_ERROR_CHARACTERS = 299
+"""Bounds of the validation errors a repair draw is shown."""
+
+
+def validation_errors(answer: JsonObject, material: StartMaterial) -> tuple[str, ...]:
+    """Return a failed draft's validation errors as ``path: message`` lines, bounded.
+
+    Args:
+        answer: The author's answer arguments.
+        material: What the author could cite.
+
+    Returns:
+        At most :data:`VALIDATION_ERRORS` lines, each under 300 characters; empty when the draft
+        validates.
+    """
+    try:
+        validate_draft(answer, material)
+    except ValidationError as error:
+        rows = [
+            f"{'.'.join(str(part) for part in row['loc']) or '(draft)'}: {row['msg']}"
+            for row in error.errors(include_url=False)
+        ]
+    except ValueError as error:
+        rows = [f"(draft): {reason(error)}"]
+    else:
+        return ()
+    if len(rows) > VALIDATION_ERRORS:
+        rows = [
+            *rows[: VALIDATION_ERRORS - 1],
+            f"(draft): {len(rows) - VALIDATION_ERRORS + 1} more",
+        ]
+    return tuple(
+        row
+        if len(row) <= VALIDATION_ERROR_CHARACTERS
+        else row[: VALIDATION_ERROR_CHARACTERS - 1] + "…"
+        for row in rows
     )
 
 
@@ -643,7 +723,7 @@ def check_reveals(
     return run_bounded([one(variant) for variant in variants], len(variants))
 
 
-def _draw[Answer: ContractModel](
+def _draw_full[Answer: ContractModel](
     project: ProjectStore,
     settings: AuthorSettings,
     profile: AgentProfile,
@@ -659,8 +739,12 @@ def _draw[Answer: ContractModel](
     validate: Callable[[JsonObject, frozenset[str]], Answer],
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
-) -> tuple[RoleDraw, Answer | None]:
-    """Run, or replay, one draw and validate its answer; provider errors propagate."""
+) -> tuple[RoleDraw, Answer | None, JsonObject | None]:
+    """Run, or replay, one draw and validate its answer; provider errors propagate.
+
+    Returns:
+        The draw, its validated answer or None, and the answer when it failed validation.
+    """
 
     def check(draft: JsonObject, read: frozenset[str]) -> str | None:
         try:
@@ -687,12 +771,39 @@ def _draw[Answer: ContractModel](
     )
     draw = RoleDraw(role=role, variant=variant, round=round_, transcript=reference)
     if transcript.answer is None or transcript.stop != "answered":
-        return draw.model_copy(update={"failure": transcript.failure or transcript.stop}), None
+        failure = transcript.failure or transcript.stop
+        return draw.model_copy(update={"failure": failure}), None, None
     try:
         parsed = validate(transcript.answer, transcript.served())
     except ValueError as error:
-        return draw.model_copy(update={"failure": reason(error)}), None
-    return draw.model_copy(update={"answer": transcript.answer}), parsed
+        return draw.model_copy(update={"failure": reason(error)}), None, transcript.answer
+    return draw.model_copy(update={"answer": transcript.answer}), parsed, None
+
+
+def _draw[Answer: ContractModel](
+    project: ProjectStore,
+    settings: AuthorSettings,
+    profile: AgentProfile,
+    material: StartMaterial,
+    *,
+    role: str,
+    variant: str,
+    round_: int,
+    identity: str,
+    system: str,
+    opening: JsonObject,
+    answer: ToolSchema,
+    validate: Callable[[JsonObject, frozenset[str]], Answer],
+    sources: tuple[ArtifactInput, ...],
+    code_revision: str,
+) -> tuple[RoleDraw, Answer | None]:
+    """Run, or replay, one draw and validate its answer; provider errors propagate."""
+    draw, parsed, _ = _draw_full(
+        project, settings, profile, material, role=role, variant=variant, round_=round_,
+        identity=identity, system=system, opening=opening, answer=answer, validate=validate,
+        sources=sources, code_revision=code_revision,
+    )  # fmt: skip
+    return draw, parsed
 
 
 def _check_facts(draft: StartDraft, inventory: frozenset[str]) -> None:
@@ -728,12 +839,22 @@ def _finding_view(row: Finding) -> JsonObject:
 
 
 def _draw_id(
-    identity: str, role: str, variant: str, round_: int, index: int, opening: JsonObject
+    identity: str,
+    role: str,
+    variant: str,
+    round_: int,
+    index: int,
+    opening: JsonObject,
+    repair: JsonObject | None = None,
 ) -> str:
-    """Return a draw identity bound to the task, role, stance, round, opening and prompts."""
+    """Return a draw identity bound to the task, role, stance, round, opening and prompts.
+
+    A validation-repair draw adds its repair index and the digest of the errors it repairs.
+    """
     return _stable_id(
         "start-bootstrap-draw",
         {
+            **({} if repair is None else {"repair": repair}),
             "task": identity,
             "role": role,
             "variant": variant,

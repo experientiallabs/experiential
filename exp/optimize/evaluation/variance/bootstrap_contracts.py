@@ -417,6 +417,8 @@ class BootstrapSettings(ContractModel):
         research_rounds: Most research rounds per task before a still-missing deciding fact
             becomes a diagnostic refusal.
         research_items: Most research items answered per round.
+        author_repairs: Most validation-repair draws after an author draft fails its checks; each
+            sees the failed draft and its validation errors and resubmits the complete start.
         runtime: The trusted runtime file starts are captured in, and the definition fields
             used when a family brings no frozen runtime.
         job: The mining job each registration freezes.
@@ -436,6 +438,7 @@ class BootstrapSettings(ContractModel):
     reveal_variants: tuple[str, ...] = Field(default=tuple(REVEAL_VARIANTS), min_length=1)
     research_rounds: int = Field(default=2, ge=0, le=4, strict=True)
     research_items: int = Field(default=4, ge=1, le=16, strict=True)
+    author_repairs: int = Field(default=2, ge=0, le=4, strict=True)
     runtime: RuntimeTemplate
     job: JobTemplate
     concurrency: int = Field(default=1, ge=1, le=32, strict=True)
@@ -648,8 +651,11 @@ class RoleDraw(ContractModel):
         variant: Stance.
         round: Bootstrap round.
         transcript: Saved draw.
-        answer: Its validated answer, or None.
-        failure: Why there is no usable answer.
+        answer: Its validated answer, or None; after a successful repair, the repaired answer.
+        failure: Why there is no usable answer, after any repairs.
+        invalid: Why this draw's own answer failed its checks, when repair draws followed.
+        repairs: The validation-repair draws that followed, in order; the first one carrying an
+            answer supplied the draw's answer.
     """
 
     role: str
@@ -658,6 +664,13 @@ class RoleDraw(ContractModel):
     transcript: ArtifactInput | None = None
     answer: JsonObject | None = None
     failure: str | None = None
+    invalid: str | None = None
+    repairs: tuple[RoleDraw, ...] = ()
+
+    def transcripts(self) -> tuple[ArtifactInput, ...]:
+        """Return this draw's saved transcript and every repair draw's, in order."""
+        own = () if self.transcript is None else (self.transcript,)
+        return (*own, *(ref for row in self.repairs for ref in row.transcripts()))
 
 
 class ReviewRound(ContractModel):

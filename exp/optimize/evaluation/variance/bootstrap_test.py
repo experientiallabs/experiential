@@ -297,10 +297,15 @@ class BootScript(ScriptedJsonTransport):
         draws: ``(role, task)`` of every draw's first request, in order.
     """
 
-    def __init__(self, fail: Callable[[str, JsonObject], bool] | None = None) -> None:
-        """Bind the failure rule."""
+    def __init__(
+        self,
+        fail: Callable[[str, JsonObject], bool] | None = None,
+        answer: Callable[[str, JsonObject], JsonObject] | None = None,
+    ) -> None:
+        """Bind the failure rule and the answer rule (default :func:`answers`)."""
         super().__init__()
         self.fail = fail or (lambda role, opening: False)
+        self.answer = answer or answers
         self.lock = threading.Lock()
         self.seen: list[tuple[str, str | None]] = []
         self.draws: list[tuple[str, str | None]] = []
@@ -335,9 +340,9 @@ class BootScript(ScriptedJsonTransport):
         script: list[tuple[str, JsonObject]] = [
             ("record_plan", plan),
             _reads(role, opening),
-            ("submit_draft", answers(role, opening)),
+            ("submit_draft", self.answer(role, opening)),
             ("record_self_check", {"issues": [], "revise": False}),
-            (FINALS[role], answers(role, opening)),
+            (FINALS[role], self.answer(role, opening)),
         ]
         return _reply([script[min(turns, len(script) - 1)]])
 
@@ -531,6 +536,85 @@ def test_a_missing_deciding_fact_becomes_research_and_resolves(
     assert gap.draft.facts[0].references == ("finding:r0-0",)
     assert script.tasks("start_researcher") == ["gap"]
     assert script.tasks("start_author") == ["gap", "gap"]
+
+
+def _broken_author(role: str, opening: JsonObject) -> JsonObject:
+    """The live failure shape: domains as a map and no tool policies, repaired once shown."""
+    answer = answers(role, opening)
+    if role != "start_author" or "validation_errors" in opening:
+        return answer
+    return {**answer, "manifest": {"domains": {"tickets": "simulated"}}}
+
+
+def test_a_draft_failing_validation_is_repaired_and_the_task_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema-broken draft gets a repair draw shown its errors; the repaired start is captured."""
+    setup = _setup(tmp_path, monkeypatch)
+    script = BootScript(answer=_broken_author)
+    auth = _registration(setup, setup.run(script, monkeypatch, tasks={"auth"}), "auth")
+
+    author = auth.rounds[0].author
+    assert author.failure is None and author.invalid is not None
+    assert "manifest.domains" in author.invalid and "manifest.tools" in author.invalid
+    assert [(row.round, row.failure) for row in author.repairs] == [(0, None)]
+    assert author.answer == author.repairs[0].answer
+    assert auth.draft.manifest.domains[0].name == "tickets"
+    assert auth.provenance == "authored"
+    assert script.tasks("start_author") == ["auth", "auth"]
+    repair = next(
+        json.loads(str(request.payload["messages"][1]["content"]))  # type: ignore[index]
+        for request in script.requests
+        if "validation_errors" in str(request.payload["messages"][1]["content"])  # type: ignore[index]
+    )
+    errors = repair["validation_errors"]
+    assert repair["previous_draft"]["manifest"] == {"domains": {"tickets": "simulated"}}
+    assert any(row.startswith("manifest.domains") for row in errors)
+    assert any(row.startswith("manifest.tools") for row in errors)
+    assert len(errors) <= 40 and all(len(row) < 300 for row in errors)
+    inputs = bootstrap_module._inputs(auth.rounds, (), None, None, ())
+    assert {author.transcript, author.repairs[0].transcript} <= set(inputs)
+
+    replayed = BootScript(answer=_broken_author)
+    setup.run(replayed, monkeypatch, tasks={"auth"})
+    assert replayed.requests == []
+
+
+def test_a_draft_valid_first_time_triggers_no_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid first draft is the draft; no repair draw is bought."""
+    setup = _setup(tmp_path, monkeypatch)
+    script = BootScript()
+    auth = _registration(setup, setup.run(script, monkeypatch, tasks={"auth"}), "auth")
+
+    author = auth.rounds[0].author
+    assert (author.failure, author.invalid, author.repairs) == (None, None, ())
+    assert script.tasks("start_author") == ["auth"]
+    assert not any(
+        "validation_errors" in str(request.payload["messages"][1]["content"])  # type: ignore[index]
+        for request in script.requests
+    )
+
+
+def test_unrepairable_drafts_refuse_after_the_bounded_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A draft still broken after every repair is refused as author_unusable, repairs recorded."""
+    setup = _setup(tmp_path, monkeypatch)
+
+    def always_broken(role: str, opening: JsonObject) -> JsonObject:
+        answer = answers(role, opening)
+        return {**answer, "manifest": {"domains": {}}} if role == "start_author" else answer
+
+    script = BootScript(answer=always_broken)
+    manifest = setup.run(script, monkeypatch, tasks={"auth"})
+    refusal = load_outcome(setup.project, _row(manifest, "auth").identity)
+    assert isinstance(refusal, BootstrapRefusal) and refusal.kind == "author_unusable"
+    author = refusal.rounds[0].author
+    assert len(author.repairs) == setup.spec.author_repairs == 2
+    assert "2 repair draw(s) failed" in (author.failure or "")
+    assert script.tasks("start_author") == ["auth"] * 3
 
 
 @pytest.mark.parametrize("trace_id", ["src-recon", "w1"])
