@@ -23,6 +23,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache, cached_property
+from typing import Literal
 
 from pydantic import JsonValue, ValidationError
 
@@ -71,6 +72,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     REVIEW_ANSWER,
     REVIEW_INSTRUCTION,
     REVIEW_VARIANTS,
+    ROLE_REPAIR,
     bootstrap_prompts_sha256,
     instruction,
 )
@@ -217,7 +219,8 @@ class StartMaterial:
                 "probe_paths and facts[].state_paths pointer must resolve in initial_state"
             ),
             "json_pointers": (
-                "RFC 6901: escape '~' as '~0' and '/' inside a key as '~1'. "
+                "RFC 6901: escape '~' as '~0' and '/' inside a key as '~1' at every depth, "
+                "so the key '/opt/venv/bin/python' is the token '~1opt~1venv~1bin~1python'. "
                 + (
                     "The domain roots are exactly "
                     + json.dumps([pointer_token(name) for name in domains])
@@ -231,6 +234,12 @@ class StartMaterial:
                 'tool\'s arguments, e.g. {"type": "object", "properties": {"command": '
                 '{"type": "string"}}}; no \'pattern\'. Put the verifier\'s own fields '
                 "(description, outcome_schema) beside it, never inside it"
+            ),
+            "verifier JSON Schemas": (
+                "outcome_schema and every argument schema are JSON Schema objects: each value "
+                'under \'properties\' is itself a schema object such as {"type": "string"}, '
+                'never a bare type string; write "type": "object" beside \'properties\', never '
+                "inside it"
             ),
         }
 
@@ -364,8 +373,8 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             resolve(draft.initial_state, pointer)
         except ValueError:
             raise ValueError(
-                f"pointer {pointer!r} does not resolve in initial_state; its domain roots are "
-                f"{[pointer_token(key) for key in sorted(draft.initial_state)[:12]]}"
+                f"pointer {pointer!r} does not resolve in initial_state; "
+                f"{pointer_hint(draft.initial_state, pointer)}"
             ) from None
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
@@ -410,14 +419,14 @@ def pointer_token(key: str) -> str:
 def canonical_pointer(state: JsonValue, pointer: str) -> str:
     """Return the escaped pointer a slash-split pointer unambiguously means, or it unchanged.
 
-    State keys may hold ``/`` (a domain named ``Python/Node runtime environment``, a file key
-    ``/opt/venv/bin/python``), which RFC 6901 escapes as ``~1``. A pointer that leaves such a slash
-    unescaped does not resolve; when exactly one way of rejoining its tokens into existing keys
-    resolves, that is the location meant, so the pointer is rewritten to it. A pointer that
-    resolves as written, resolves no way, or resolves more than one way is returned unchanged
-    and judged by the resolution check.
+    State keys may hold ``/`` at any depth (a domain named ``Python/Node runtime environment``, a
+    file key ``/opt/venv/bin/python``), which RFC 6901 escapes as ``~1``. A pointer that leaves
+    such a slash unescaped, in full or in part, does not resolve; when exactly one way of
+    rejoining its tokens into existing keys resolves, that is the location meant, so the pointer
+    is rewritten to it with every key escaped. A pointer that resolves as written, resolves no
+    way, or resolves more than one way is returned unchanged and judged by the resolution check.
     """
-    if not pointer.startswith("/") or "~" in pointer:
+    if not pointer.startswith("/"):
         return pointer
     try:
         resolve(state, pointer)
@@ -425,7 +434,10 @@ def canonical_pointer(state: JsonValue, pointer: str) -> str:
         pass
     else:
         return pointer
-    tokens = pointer[1:].split("/")
+    raw = pointer[1:].split("/")
+    if any("~" in token.replace("~0", "").replace("~1", "") for token in raw):
+        return pointer
+    tokens = [token.replace("~1", "/").replace("~0", "~") for token in raw]
     found: list[tuple[str, ...]] = []
 
     def walk(value: JsonValue, index: int, keys: tuple[str, ...]) -> None:
@@ -449,6 +461,28 @@ def canonical_pointer(state: JsonValue, pointer: str) -> str:
     if len(found) != 1:
         return pointer
     return "".join(pointer_token(key) for key in found[0])
+
+
+def pointer_hint(state: JsonValue, pointer: str) -> str:
+    """Say how far a pointer resolves and the escaped tokens available there."""
+    raw = pointer[1:].split("/") if pointer.startswith("/") else []
+    prefix, value = "", state
+    for count in range(len(raw), 0, -1):
+        candidate = "/" + "/".join(raw[:count])
+        try:
+            value = resolve(state, candidate)
+        except ValueError:
+            continue
+        prefix = candidate
+        break
+    where = prefix or "(root)"
+    if isinstance(value, dict):
+        keys = [pointer_token(key)[1:] for key in sorted(value)[:12]]
+        more = "" if len(value) <= 12 else f" and {len(value) - 12} more"
+        return f"{where} resolves; its keys as pointer tokens are {keys}{more}"
+    if isinstance(value, list):
+        return f"{where} resolves to a list of {len(value)} items"
+    return f"{where} resolves to a {type(value).__name__}, which has no children"
 
 
 def canonical_pointers(answer: JsonObject) -> JsonObject:
@@ -501,24 +535,31 @@ def validate_review(
     return review
 
 
-class _FindingAnswer(ContractModel):
-    """A researcher's answer."""
+class FindingAnswer(ContractModel):
+    """A researcher's answer.
 
-    status: str
+    Attributes:
+        status: ``resolved`` only with evidence read; otherwise ``unresolved``.
+        answer: The answer, or what is missing.
+        fact_status: Whether the answer is observed, inferred or still unknown.
+        evidence: Inventory references the answer rests on.
+    """
+
+    status: Literal["resolved", "unresolved"]
     answer: str
-    fact_status: str
+    fact_status: Literal["observed", "inferred", "unknown"]
     evidence: tuple[str, ...] = ()
 
 
 def validate_finding(
     answer: JsonObject, inventory: frozenset[str], read: frozenset[str]
-) -> _FindingAnswer:
+) -> FindingAnswer:
     """Check that a resolved finding cites evidence the researcher read.
 
     Raises:
         ValueError: A resolved finding cites nothing, or cites what was not read.
     """
-    finding = _FindingAnswer.model_validate(answer)
+    finding = FindingAnswer.model_validate(answer)
     if finding.status not in ("resolved", "unresolved"):
         raise ValueError("a finding is resolved or unresolved")
     if finding.fact_status not in ("observed", "inferred", "unknown"):
@@ -583,7 +624,7 @@ def author_start(
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
 ) -> tuple[RoleDraw, StartDraft | None]:
-    """Run, or replay, one author draw for a round.
+    """Run, or replay, one author draw for a round, with its validation repairs.
 
     Args:
         project: Project holding the draw.
@@ -600,60 +641,25 @@ def author_start(
     """
     task_index = sum(ord(ch) for ch in material.task.task.task_id)
     variant = spec.author_variants[(task_index + round_) % len(spec.author_variants)]
-    opening = {**material.context(), "round": round_, "feedback": feedback}
-    system = instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant)
-
-    def one(
-        index: int, body: JsonObject, prompt: str, repair: JsonObject | None
-    ) -> tuple[RoleDraw, StartDraft | None, JsonObject | None]:
-        return _draw_full(
-            project,
-            spec.author,
-            spec.author_profile,
-            material,
-            role="start_author",
-            variant=variant,
-            round_=round_,
-            identity=_draw_id(identity, "start_author", variant, round_, index, body, repair),
-            system=prompt,
-            opening=body,
-            answer=task_answer_schema(material),
-            validate=lambda answer, read: validate_draft(answer, material),
-            sources=sources,
-            code_revision=code_revision,
-        )
-
-    draw, draft, invalid = one(0, opening, system, None)
-    if invalid is None or spec.author_repairs == 0:
-        return draw, draft
-    repairs: list[RoleDraw] = []
-    answer = invalid
-    for index in range(1, spec.author_repairs + 1):
-        errors = validation_errors(answer, material)
-        body = {**opening, "previous_draft": answer, "validation_errors": list(errors)}
-        repair: JsonObject = {"repair": index, "errors": sha256_json(list(errors))}
-        fixed, draft, again = one(index, body, system + "\n\n" + AUTHOR_REPAIR, repair)
-        repairs.append(fixed)
-        if draft is not None:
-            return draw.model_copy(
-                update={
-                    "answer": fixed.answer,
-                    "failure": None,
-                    "invalid": draw.failure,
-                    "repairs": tuple(repairs),
-                }
-            ), draft
-        if again is None:
-            break
-        answer = again
-    last = repairs[-1].failure
-    return draw.model_copy(
-        update={
-            "failure": f"{draw.failure}; {len(repairs)} repair draw(s) failed, last: {last}"[:2000],
-            "invalid": draw.failure,
-            "repairs": tuple(repairs),
-        }
-    ), None
+    return _repaired(
+        project,
+        spec.author,
+        spec.author_profile,
+        material,
+        spec.author_repairs,
+        role="start_author",
+        variant=variant,
+        round_=round_,
+        identity=identity,
+        index=0,
+        system=instruction(AUTHOR_INSTRUCTION, AUTHOR_VARIANTS, variant),
+        repair_prompt=AUTHOR_REPAIR,
+        opening={**material.context(), "round": round_, "feedback": feedback},
+        answer=task_answer_schema(material),
+        validate=lambda answer, read: validate_draft(answer, material),
+        sources=sources,
+        code_revision=code_revision,
+    )
 
 
 VALIDATION_ERRORS = 40
@@ -672,21 +678,26 @@ def validation_errors(answer: JsonObject, material: StartMaterial) -> tuple[str,
         At most :data:`VALIDATION_ERRORS` lines, each under 300 characters; empty when the draft
         validates.
     """
+    return answer_errors(lambda: validate_draft(answer, material))
+
+
+def answer_errors(check: Callable[[], object]) -> tuple[str, ...]:
+    """Run one answer check and return its errors as bounded ``path: message`` lines."""
     try:
-        validate_draft(answer, material)
+        check()
     except ValidationError as error:
         rows = [
-            f"{'.'.join(str(part) for part in row['loc']) or '(draft)'}: {row['msg']}"
+            f"{'.'.join(str(part) for part in row['loc']) or '(answer)'}: {row['msg']}"
             for row in error.errors(include_url=False)
         ]
     except ValueError as error:
-        rows = [f"(draft): {reason(error)}"]
+        rows = [f"(answer): {reason(error)}"]
     else:
         return ()
     if len(rows) > VALIDATION_ERRORS:
         rows = [
             *rows[: VALIDATION_ERRORS - 1],
-            f"(draft): {len(rows) - VALIDATION_ERRORS + 1} more",
+            f"(answer): {len(rows) - VALIDATION_ERRORS + 1} more",
         ]
     return tuple(
         row
@@ -715,18 +726,21 @@ def review_start(
     opening = {**material.context(), "round": round_, "draft": draft.model_dump(mode="json")}
 
     def one(variant: str) -> Callable[[], tuple[RoleDraw, ReviewAnswer | None]]:
-        return lambda: _draw(
+        return lambda: _repaired(
             project,
             spec.role("reviewer"),
             spec.review_profile,
             material,
+            spec.author_repairs,
             role="start_reviewer",
             variant=variant,
             round_=round_,
-            identity=_draw_id(identity, "start_reviewer", variant, round_, 0, opening),
+            identity=identity,
+            index=0,
             system=instruction(REVIEW_INSTRUCTION, REVIEW_VARIANTS, variant),
+            repair_prompt=ROLE_REPAIR,
             opening=opening,
-            answer=REVIEW_ANSWER,
+            answer=review_answer_schema(),
             validate=lambda answer, read: validate_review(answer, draft, material.inventory),
             sources=sources,
             code_revision=code_revision,
@@ -817,20 +831,21 @@ def research(
         opening = {**context, "research_item": item.model_dump(mode="json")}
 
         def run() -> Finding:
-            draw, answer = _draw(
+            draw, answer = _repaired(
                 project,
                 spec.role("researcher"),
                 spec.research_profile,
                 material,
+                spec.author_repairs,
                 role="start_researcher",
                 variant=variant,
                 round_=item.round,
-                identity=_draw_id(
-                    identity, "start_researcher", variant, item.round, index, opening
-                ),
+                identity=identity,
+                index=index,
                 system=instruction(RESEARCH_INSTRUCTION, RESEARCH_VARIANTS, variant),
+                repair_prompt=ROLE_REPAIR,
                 opening=opening,
-                answer=RESEARCH_ANSWER,
+                answer=research_answer_schema(),
                 validate=lambda raw, read: validate_finding(raw, material.inventory, read),
                 sources=sources,
                 code_revision=code_revision,
@@ -882,18 +897,21 @@ def check_reveals(
     }
 
     def one(variant: str) -> Callable[[], tuple[RoleDraw, RevealAnswer | None]]:
-        return lambda: _draw(
+        return lambda: _repaired(
             project,
             spec.role("researcher"),
             spec.research_profile,
             material,
+            spec.author_repairs,
             role="reveal_checker",
             variant=variant,
             round_=0,
-            identity=_draw_id(identity, "reveal_checker", variant, 0, 0, opening),
+            identity=identity,
+            index=0,
             system=instruction(REVEAL_INSTRUCTION, REVEAL_VARIANTS, variant),
+            repair_prompt=ROLE_REPAIR,
             opening=opening,
-            answer=REVEAL_ANSWER,
+            answer=reveal_answer_schema(),
             validate=lambda answer, read: validate_reveal(answer, draft, len(reveals)),
             sources=sources,
             code_revision=code_revision,
@@ -919,11 +937,12 @@ def _draw_full[Answer: ContractModel](
     validate: Callable[[JsonObject, frozenset[str]], Answer],
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
-) -> tuple[RoleDraw, Answer | None, JsonObject | None]:
+) -> tuple[RoleDraw, Answer | None, tuple[JsonObject, tuple[str, ...]] | None]:
     """Run, or replay, one draw and validate its answer; provider errors propagate.
 
     Returns:
-        The draw, its validated answer or None, and the answer when it failed validation.
+        The draw, its validated answer or None, and the answer with its validation errors when
+        it failed validation.
     """
 
     def check(draft: JsonObject, read: frozenset[str]) -> str | None:
@@ -953,37 +972,86 @@ def _draw_full[Answer: ContractModel](
     if transcript.answer is None or transcript.stop != "answered":
         failure = transcript.failure or transcript.stop
         return draw.model_copy(update={"failure": failure}), None, None
+    submitted, served = transcript.answer, transcript.served()
     try:
-        parsed = validate(transcript.answer, transcript.served())
+        parsed = validate(submitted, served)
     except ValueError as error:
-        return draw.model_copy(update={"failure": reason(error)}), None, transcript.answer
-    return draw.model_copy(update={"answer": transcript.answer}), parsed, None
+        errors = answer_errors(lambda: validate(submitted, served))
+        return draw.model_copy(update={"failure": reason(error)}), None, (submitted, errors)
+    return draw.model_copy(update={"answer": submitted}), parsed, None
 
 
-def _draw[Answer: ContractModel](
+def _repaired[Answer: ContractModel](
     project: ProjectStore,
     settings: AuthorSettings,
     profile: AgentProfile,
     material: StartMaterial,
+    repairs: int,
     *,
     role: str,
     variant: str,
     round_: int,
     identity: str,
+    index: int,
     system: str,
+    repair_prompt: str,
     opening: JsonObject,
     answer: ToolSchema,
     validate: Callable[[JsonObject, frozenset[str]], Answer],
     sources: tuple[ArtifactInput, ...],
     code_revision: str,
 ) -> tuple[RoleDraw, Answer | None]:
-    """Run, or replay, one draw and validate its answer; provider errors propagate."""
-    draw, parsed, _ = _draw_full(
-        project, settings, profile, material, role=role, variant=variant, round_=round_,
-        identity=identity, system=system, opening=opening, answer=answer, validate=validate,
-        sources=sources, code_revision=code_revision,
-    )  # fmt: skip
-    return draw, parsed
+    """Run, or replay, one role draw and up to ``repairs`` validation-repair draws.
+
+    Every role answers through a typed submit tool, yet a draw can still fail its checks. A
+    failed answer gets repair draws, each shown the previous answer and its validation errors;
+    the first that validates is the draw's answer. Provider errors propagate.
+
+    Returns:
+        The draw, carrying its repairs, and its validated answer or None.
+    """
+
+    def one(
+        body: JsonObject, prompt: str, repair: JsonObject | None
+    ) -> tuple[RoleDraw, Answer | None, tuple[JsonObject, tuple[str, ...]] | None]:
+        return _draw_full(
+            project, settings, profile, material, role=role, variant=variant, round_=round_,
+            identity=_draw_id(identity, role, variant, round_, index, body, repair),
+            system=prompt, opening=body, answer=answer, validate=validate, sources=sources,
+            code_revision=code_revision,
+        )  # fmt: skip
+
+    draw, parsed, invalid = one(opening, system, None)
+    if invalid is None or repairs == 0:
+        return draw, parsed
+    rows: list[RoleDraw] = []
+    prompt = system + "\n\n" + repair_prompt.replace("{answer}", answer.name)
+    for attempt in range(1, repairs + 1):
+        previous, errors = invalid
+        body = {**opening, "previous_answer": previous, "validation_errors": list(errors)}
+        repair: JsonObject = {"repair": attempt, "errors": sha256_json(list(errors))}
+        fixed, parsed, again = one(body, prompt, repair)
+        rows.append(fixed)
+        if parsed is not None:
+            return draw.model_copy(
+                update={
+                    "answer": fixed.answer,
+                    "failure": None,
+                    "invalid": draw.failure,
+                    "repairs": tuple(rows),
+                }
+            ), parsed
+        if again is None:
+            break
+        invalid = again
+    last = rows[-1].failure
+    return draw.model_copy(
+        update={
+            "failure": f"{draw.failure}; {len(rows)} repair draw(s) failed, last: {last}"[:2000],
+            "invalid": draw.failure,
+            "repairs": tuple(rows),
+        }
+    ), None
 
 
 def _check_facts(draft: StartDraft, inventory: frozenset[str]) -> None:
@@ -1097,16 +1165,15 @@ def _inventory_summary(inventory: frozenset[str] | set[str]) -> JsonObject:
     }
 
 
-@cache
-def author_answer_schema() -> ToolSchema:
-    """The start author's submit tool, typed by the real ``StartDraft`` contract.
+def contract_schema(tool: ToolSchema, contract: type[ContractModel]) -> ToolSchema:
+    """A role's submit tool typed by its real answer contract, references inlined.
 
-    The hand-written tool only said ``manifest``/``initial_state``/``verifier`` were objects, so
-    every model invented its own shape and drafts failed validation (``owner`` values, tuples given
-    as maps, extra fields). The submit schema is now the contract's own JSON schema, references
+    Hand-written submit tools only said fields were objects, so every model invented its own
+    shape and answers failed validation (``owner`` values, tuples given as maps, an author's fact
+    fields in a review finding). The submit schema is the contract's own JSON schema, references
     inlined so any provider can read it.
     """
-    schema = StartDraft.model_json_schema()
+    schema = contract.model_json_schema()
     definitions = schema.pop("$defs", {})
 
     def inline(node: JsonValue, depth: int = 0) -> JsonValue:
@@ -1124,11 +1191,32 @@ def author_answer_schema() -> ToolSchema:
     body = inline(schema)
     assert isinstance(body, dict)
     return tool_schema(
-        AUTHOR_ANSWER.name,
-        AUTHOR_ANSWER.description,
-        body.get("properties", {}),
-        tuple(body.get("required", ())),
+        tool.name, tool.description, body.get("properties", {}), tuple(body.get("required", ()))
     )
+
+
+@cache
+def author_answer_schema() -> ToolSchema:
+    """The start author's submit tool, typed by ``StartDraft``."""
+    return contract_schema(AUTHOR_ANSWER, StartDraft)
+
+
+@cache
+def review_answer_schema() -> ToolSchema:
+    """The start reviewer's submit tool, typed by ``ReviewAnswer``."""
+    return contract_schema(REVIEW_ANSWER, ReviewAnswer)
+
+
+@cache
+def research_answer_schema() -> ToolSchema:
+    """The researcher's submit tool, typed by its finding answer."""
+    return contract_schema(RESEARCH_ANSWER, FindingAnswer)
+
+
+@cache
+def reveal_answer_schema() -> ToolSchema:
+    """The first-reveal checker's submit tool, typed by ``RevealAnswer``."""
+    return contract_schema(REVEAL_ANSWER, RevealAnswer)
 
 
 def task_answer_schema(material: StartMaterial) -> ToolSchema:
@@ -1168,10 +1256,36 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
             "additionalProperties": False,
         }
     verifier = properties["verifier"]["properties"]
+    verifier["outcome_schema"] = _schema_object(SCHEMA_DEPTH)
     verifier["argument_schemas"] = {
         "type": "object",
         "description": "Optional JSON Schema over each named tool's call arguments.",
-        "properties": {name: {"type": "object"} for name in tools},
+        "properties": {name: _schema_object(SCHEMA_DEPTH) for name in tools},
         "additionalProperties": False,
     }
     return base.model_copy(update={"input_schema": body})
+
+
+SCHEMA_DEPTH = 4
+"""Nesting depth to which the submit tool spells out a JSON Schema's own shape."""
+
+
+def _schema_object(depth: int) -> JsonObject:
+    """The shape of a JSON Schema object: every ``properties`` value is itself a schema object.
+
+    Drafts wrote ``{"properties": {"type": "object"}}``, a type string where a property schema
+    belongs, which the verifier rightly refuses. Spelling the shape out to a bounded depth lets
+    the submit tool say so where the value is written.
+    """
+    node: JsonObject = {"type": "object", "description": "A JSON Schema object."}
+    if depth:
+        child = _schema_object(depth - 1)
+        node["properties"] = {
+            "properties": {
+                "type": "object",
+                "description": "Each property's own JSON Schema object, never a type string.",
+                "additionalProperties": child,
+            },
+            "items": child,
+        }
+    return node

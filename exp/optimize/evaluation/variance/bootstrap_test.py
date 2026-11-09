@@ -569,7 +569,7 @@ def test_a_draft_failing_validation_is_repaired_and_the_task_proceeds(
         if "validation_errors" in str(request.payload["messages"][1]["content"])  # type: ignore[index]
     )
     errors = repair["validation_errors"]
-    assert repair["previous_draft"]["manifest"] == {"domains": {"tickets": "simulated"}}
+    assert repair["previous_answer"]["manifest"] == {"domains": {"tickets": "simulated"}}
     assert any(row.startswith("manifest.domains") for row in errors)
     assert any(row.startswith("manifest.tools") for row in errors)
     assert len(errors) <= 40 and all(len(row) < 300 for row in errors)

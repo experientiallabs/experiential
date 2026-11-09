@@ -53,13 +53,20 @@ calls whose first answers show the facts the task depends on).
     + _REFERENCES
 )
 
-AUTHOR_REPAIR = """Repair: your previous start failed its structural checks. The opening holds
-previous_draft (your submitted start) and validation_errors (each a path and what is wrong). Fix
-every error, keep what was right, and resubmit the corrected complete start with the same submit
-tool; never submit only the changed parts. You may read material first, but this draw must end with
-exactly one submit_start call carrying the whole start. Every pointer in probe_paths and in a fact's
-state_paths must be a JSON pointer (like /Workspace filesystem/files/main.py) that exists in your
-initial_state; if a value is not in initial_state, add it there or drop the pointer."""
+ROLE_REPAIR = """Repair: your previous answer failed its checks. The opening holds previous_answer
+(your submitted answer) and validation_errors (each a path and what is wrong). Fix every error,
+keep what was right, and resubmit the corrected complete answer with the same submit tool; never
+submit only the changed parts. You may read material first, but this draw must end with exactly
+one {answer} call carrying the whole answer."""
+"""Appended to any role's instruction on a validation-repair draw; ``{answer}`` names its tool."""
+
+AUTHOR_REPAIR = (
+    ROLE_REPAIR
+    + """ Every pointer in probe_paths and in a fact's state_paths must be a JSON
+pointer (like /Workspace filesystem/files/main.py) that exists in your initial_state, with '/'
+inside a key written '~1' (the key /opt/venv/bin/python is the token ~1opt~1venv~1bin~1python); if
+a value is not in initial_state, add it there or drop the pointer."""
+)
 """Appended to the author's instruction on a validation-repair draw."""
 
 REVIEW_INSTRUCTION = (
@@ -264,6 +271,7 @@ def bootstrap_prompts_sha256() -> str:
             "instructions": [
                 AUTHOR_INSTRUCTION,
                 AUTHOR_REPAIR,
+                ROLE_REPAIR,
                 REVIEW_INSTRUCTION,
                 RESEARCH_INSTRUCTION,
                 REVEAL_INSTRUCTION,

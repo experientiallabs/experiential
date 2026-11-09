@@ -76,3 +76,32 @@ def test_an_invalid_argument_policy_names_its_tool_and_the_schema_error() -> Non
                 "argument_schemas": {"bash": {"properties": {"type": "object"}}},
             }
         )
+
+
+def test_a_partly_escaped_pointer_resolves_a_slashed_key_at_any_depth() -> None:
+    """``/a~1b/interpreters//opt/venv/bin/python/packages/0`` finds the nested slashed key."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import canonical_pointer, pointer_hint
+
+    state = {"a/b": {"interpreters": {"/opt/venv/bin/python": {"packages": ["pytest"]}}}}
+    pointer = "/a~1b/interpreters//opt/venv/bin/python/packages/0"
+    assert canonical_pointer(state, pointer) == (
+        "/a~1b/interpreters/~1opt~1venv~1bin~1python/packages/0"
+    )
+    assert "'~1opt~1venv~1bin~1python'" in pointer_hint(state, "/a~1b/interpreters/python")
+
+
+def test_every_role_submits_through_its_typed_contract() -> None:
+    """Review findings take ``issue``, never an author's fact fields; schemas are objects."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import (
+        research_answer_schema,
+        reveal_answer_schema,
+        review_answer_schema,
+    )
+
+    finding = review_answer_schema().input_schema["properties"]["findings"]["items"]
+    assert "issue" in finding["required"] and finding["additionalProperties"] is False
+    assert "deciding" not in finding["properties"]
+    research = research_answer_schema().input_schema["properties"]
+    assert research["status"]["enum"] == ["resolved", "unresolved"]
+    conflict = reveal_answer_schema().input_schema["properties"]["conflicts"]["items"]
+    assert set(conflict["required"]) == {"probe", "explanation"}
