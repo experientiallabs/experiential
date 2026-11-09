@@ -49,6 +49,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     TraceMLSettings,
 )
 from exp.optimize.evaluation.variance.pipeline_test import write_bank
+from exp.runtime.models.providers.backpressure import ProviderAdmissionRefused
 
 
 class Seen(ContractModel):
@@ -310,6 +311,50 @@ def test_one_start_whose_pipeline_raises_does_not_cost_the_other_starts_their_ph
     assert good.stopped is None and good.complete
     assert [row.mining.bootstrap for row in failing.runs] == [good.binding]
     assert report.stopped is not None and bad.task_id in report.stopped
+
+
+@dataclass
+class FirstStartRefused(ScriptedStage):
+    """Error mining whose first start is refused admission by the host, nothing dispatched."""
+
+    refused: list[str] = field(default_factory=list)
+
+    def run(self, context: StageContext) -> StageRun:
+        """Refuse once, for the first start; run the rest."""
+        binding = context.spec.mining.bootstrap
+        assert binding is not None
+        if not self.refused or self.refused == [binding.task_id]:
+            self.refused[:] = [binding.task_id]
+            raise ProviderAdmissionRefused(
+                "openai-compatible circuit breaker is open",
+                provider="openai-compatible",
+                reason="circuit_open",
+            )
+        return super().run(context)
+
+
+def test_an_admission_refusal_stops_only_its_start_and_its_phase_is_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F11: a BaseException refusal is recorded for its start; the next start still runs."""
+    run = front_door(tmp_path, monkeypatch)
+    refusing = FirstStartRefused("error-mining")
+    run.stages["error-mining"] = refusing
+    deps = replace(run.dependencies, executors=run.stages)
+    project, spec = run.project, run.spec
+    plan = plan_front_door(project, spec, code_revision="test", dependencies=deps)
+    approval = FrontDoorApproval(plan_sha256=plan.digest, ceiling_usd=10.0, unpriced_attempts=1_000)
+
+    report = run_front_door(
+        project, spec, code_revision="test", approval=approval, dependencies=deps
+    )
+
+    bad, good = report.pipelines
+    assert bad.stopped is not None and "ProviderAdmissionRefused" in bad.stopped
+    assert good.stopped is None and good.complete
+    ledger = PhaseLedger(run_directory(project, spec) / "ledger.json")
+    phase = next(row for row in ledger.state.phases if row.phase == f"pipeline {bad.task_id}")
+    assert phase.measured_attempts is not None  # settled, not left reserved
 
 
 @dataclass

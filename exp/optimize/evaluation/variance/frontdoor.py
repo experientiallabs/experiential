@@ -42,6 +42,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
@@ -476,15 +477,16 @@ class _Runner:
             return report
         if self.tracker.stages.get("pipelines") == StageState.BLOCKED:
             self.tracker.stage("pipelines", "replayed")
-        # Each start's pipeline is independent: one that stops or raises is recorded and the
-        # next start still runs, so one bad start never costs the others their phase. The run
-        # stops before the after-pipeline slots when any start stopped; a rerun replays the
-        # finished starts and resumes the stopped one.
+        # Each start's pipeline is independent: one that stops, raises or is refused admission
+        # (a provider or budget refusal, nothing dispatched) is recorded and the next start
+        # runs, so one bad start never costs the others their phase. The run stops before the
+        # after-pipeline slots when any start stopped; a rerun replays the finished starts and
+        # resumes the stopped one.
         outcomes: list[PipelineOutcome] = []
         for binding in prepared.bindings:
             try:
                 outcome = self.pipeline(prepared, binding)
-            except Exception as error:  # noqa: BLE001 - recorded per start; the others still run
+            except (Exception, RequestAdmissionRefused) as error:  # noqa: BLE001 - per start
                 logger.exception(
                     "pipeline %s raised; continuing with the next start", binding.task_id
                 )
@@ -549,7 +551,8 @@ class _Runner:
         before = measure(self.project)
         try:
             result = work()
-        except Exception:
+        except BaseException:
+            # A budget or admission stop is a BaseException; the phase is settled either way.
             self.ledger.settle(name, before, measure(self.project))
             self.tracker.stage(name, "raised")
             raise
