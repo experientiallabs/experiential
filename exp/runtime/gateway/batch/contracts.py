@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, NoReturn
 
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
@@ -342,6 +342,11 @@ class BatchSubmitError(Exception):
         self.message = message
 
 
+def _reject_non_finite_json(value: str) -> NoReturn:
+    """Reject one JavaScript numeric constant outside strict JSON."""
+    raise ValueError(f"non-finite number {value!r} is not valid JSON")
+
+
 def parse_input_jsonl(payload: bytes) -> list[tuple[int, JsonObject]]:
     """Parse batch input JSONL into numbered raw line objects.
 
@@ -362,9 +367,11 @@ def parse_input_jsonl(payload: bytes) -> list[tuple[int, JsonObject]]:
         if not text:
             continue
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(text, parse_constant=_reject_non_finite_json)
         except json.JSONDecodeError as exc:
             raise BatchSubmitError(f"line {line_number} is not valid JSON: {exc.msg}") from exc
+        except ValueError as exc:
+            raise BatchSubmitError(f"line {line_number} is not valid JSON: {exc}") from exc
         if not isinstance(parsed, dict):
             raise BatchSubmitError(f"line {line_number} must be a JSON object")
         lines.append((line_number, parsed))

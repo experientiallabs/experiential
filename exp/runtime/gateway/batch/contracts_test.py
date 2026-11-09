@@ -58,6 +58,14 @@ def test_parse_input_jsonl_rejects_invalid_json() -> None:
         parse_input_jsonl(b"{nope}\n")
 
 
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_parse_input_jsonl_rejects_non_finite_numbers(constant: str) -> None:
+    """JavaScript numeric constants outside strict JSON are refused by line number."""
+    payload = f'{{"custom_id": "a", "body": {{"top_p": {constant}}}}}'.encode()
+    with pytest.raises(BatchSubmitError, match="line 1.*non-finite number"):
+        parse_input_jsonl(payload)
+
+
 def test_parse_input_jsonl_rejects_empty_payload() -> None:
     """A payload without any request line is refused."""
     with pytest.raises(BatchSubmitError, match="no request lines"):
