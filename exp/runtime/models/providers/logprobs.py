@@ -22,7 +22,8 @@ def _effort_refusal(
     The gateway never changes effort to admit probabilities, so without this a
     caller sending e.g. ``medium`` (which a plain request would coerce) sees only
     a generic route refusal and cannot tell what to change. ``qualified`` is the
-    route-wide set, so every suggested effort is one the whole route accepts.
+    refusing rung's own set: route narrowing checks each rung alone, so an
+    effort that rung qualifies admits the request on it.
     """
     field = request.caller_effort_parameter
     if request.reasoning_effort is not None:
@@ -75,20 +76,16 @@ def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: Gatew
             raise ProviderParameterError(
                 message=_ROUTE_REFUSAL, param=parameter, code="unsupported_parameter"
             )
-    reasoning = [profile for profile in profiles if profile.supports_reasoning]
-    # Only an effort every reasoning rung qualifies can admit the request.
-    qualified = tuple(
-        effort
-        for effort in (reasoning[0].logprobs_reasoning_efforts if reasoning else ())
-        if all(effort in profile.logprobs_reasoning_efforts for profile in reasoning)
-    )
-    for profile in reasoning:
+    for profile in profiles:
+        if not profile.supports_reasoning:
+            continue
         effort = (
             request.reasoning_effort
             if request.reasoning_effort is not None
             else profile.reasoning_effort
         )
-        if effort not in profile.logprobs_reasoning_efforts:
+        qualified = profile.logprobs_reasoning_efforts
+        if effort not in qualified:
             # The caller's effort field is named only when a qualified effort exists.
             if not qualified:
                 raise ProviderParameterError(

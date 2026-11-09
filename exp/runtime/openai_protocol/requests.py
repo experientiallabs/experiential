@@ -35,6 +35,7 @@ from exp.runtime.openai_protocol.cache_control import (
     restore_chat_cache_control,
 )
 from exp.runtime.openai_protocol.client_field_repairs import (
+    OUTPUT_CONFIG_EFFORT_TRANSLATED,
     chat_output_cap,
     repair_chat,
     repair_responses,
@@ -260,6 +261,31 @@ def _without_chat_message_extensions(payload: JsonObject) -> JsonObject:
     return {**payload, "messages": messages} if changed else payload
 
 
+def _chat_effort_parameter(
+    request: _ChatRequest, repairs: tuple[str, ...]
+) -> Literal["reasoning.effort", "output_config.effort"] | None:
+    """Name the Chat field the caller's effort came from, when it is not the flat one.
+
+    Args:
+        request: The validated Chat body after client field repairs.
+        repairs: Disclosures from those repairs; a translated
+            ``output_config.effort`` arrives here as ``reasoning_effort``.
+
+    Returns:
+        ``output_config.effort`` or ``reasoning.effort`` for a translated or
+        nested effort, otherwise ``None`` (the flat field, or no effort).
+    """
+    if OUTPUT_CONFIG_EFFORT_TRANSLATED in repairs:
+        return "output_config.effort"
+    if (
+        request.reasoning_effort is None
+        and request.reasoning is not None
+        and request.reasoning.effort is not None
+    ):
+        return "reasoning.effort"
+    return None
+
+
 def decode_chat(
     payload: JsonObject,
     *,
@@ -396,14 +422,7 @@ def decode_chat(
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=thinking.reasoning_effort,
-            reasoning_effort_parameter=(
-                "reasoning.effort"
-                if request.reasoning_effort is None
-                and request.reasoning is not None
-                and request.reasoning.effort is not None
-                and thinking.reasoning_effort is not None
-                else None
-            ),
+            reasoning_effort_parameter=_chat_effort_parameter(request, alias_disclosures),
             thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(

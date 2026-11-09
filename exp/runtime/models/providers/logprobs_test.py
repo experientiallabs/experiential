@@ -296,9 +296,14 @@ def test_a_nested_chat_effort_is_refused_under_its_own_spelling() -> None:
     with pytest.raises(ProviderParameterError) as caught:
         require_chat_logprobs((profile,), flat)
     assert caught.value.param == "reasoning_effort"
+    translated = decode_chat({**base, "output_config": {"effort": "medium"}}).request
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((profile,), translated)
+    assert caught.value.param == "output_config.effort"
 
 
 def _reasoning_profile(efforts: tuple[str, ...], default: str = "max") -> GatewayWireProfile:
+    """Build a probability-capable reasoning rung qualifying ``efforts``."""
     return replace(
         _profile(),
         supports_reasoning=True,
@@ -309,20 +314,16 @@ def _reasoning_profile(efforts: tuple[str, ...], default: str = "max") -> Gatewa
     )
 
 
-def test_the_suggested_efforts_are_the_ones_every_rung_qualifies() -> None:
-    """A waterfall never suggests an effort a later rung refuses, which would loop the caller."""
+def test_a_suggested_effort_admits_the_request_on_the_refusing_rung() -> None:
+    """Narrowing reports the first rung's efforts, and sending one keeps that rung."""
     request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
-    route = (_reasoning_profile(("low", "high", "max")), _reasoning_profile(("high", "max")))
+    route = (_reasoning_profile(("low", "max")), _reasoning_profile(("high",)))
     with pytest.raises(ProviderParameterError) as caught:
-        require_chat_logprobs(route, request)
-    assert "one of: high, max," in str(caught.value)
-    assert "or remove logprobs." in str(caught.value)
-    # Disjoint rungs leave no effort that fixes the route: the probability field is named.
-    disjoint = (_reasoning_profile(("low",)), _reasoning_profile(("max",)))
-    with pytest.raises(ProviderParameterError) as caught:
-        require_chat_logprobs(disjoint, request)
-    assert caught.value.param == "logprobs"
-    assert "cannot preserve" in str(caught.value)
+        compatible_generation_parameter_profile_indexes(route, request)
+    assert caught.value.param == "reasoning_effort"
+    assert "one of: low, max," in str(caught.value)
+    retried = request.model_copy(update={"reasoning_effort": "low"})
+    assert compatible_generation_parameter_profile_indexes(route, retried) == (0,)
 
 
 def test_an_incapable_later_rung_refuses_before_any_effort_advice() -> None:
