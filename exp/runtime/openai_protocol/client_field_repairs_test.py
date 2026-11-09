@@ -11,6 +11,7 @@ from pydantic import JsonValue
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.client_field_repairs import (
     INCLUDE_REASONING_TRANSLATED,
+    MESSAGES_STREAM_USAGE_ALWAYS_INCLUDED,
     OUTPUT_CONFIG_DROPPED,
     OUTPUT_CONFIG_EFFORT_IGNORED,
     OUTPUT_CONFIG_EFFORT_TRANSLATED,
@@ -23,6 +24,7 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     STREAM_OBFUSCATION_IGNORED,
     STREAM_OPTIONS_NOT_STREAMING,
     THINKING_DISPLAY_DROPPED,
+    accept_messages_stream_options,
     accept_responses_stream_options,
     drop_unanchored_output_markers,
     drop_unforwarded_hints,
@@ -103,6 +105,79 @@ def test_malformed_stream_options_keep_a_named_rejection(options: JsonValue, par
     """A malformed object or unknown key is the caller's named 400."""
     with pytest.raises(OpenAIProtocolError) as error:
         accept_responses_stream_options({"stream": True, "stream_options": options})
+    assert error.value.detail.param == param
+
+
+@pytest.mark.parametrize(
+    ("payload", "disclosures"),
+    (
+        ({"stream": True, "stream_options": {"include_usage": True}}, ()),
+        ({"stream": True, "stream_options": {}}, ()),
+        ({"stream": True, "stream_options": {"include_usage": None}}, ()),
+        ({"stream": True, "stream_options": None}, ()),
+        (
+            {"stream": True, "stream_options": {"include_usage": False}},
+            (MESSAGES_STREAM_USAGE_ALWAYS_INCLUDED,),
+        ),
+        ({"stream_options": {"include_usage": True}}, (STREAM_OPTIONS_NOT_STREAMING,)),
+        (
+            {"stream": False, "stream_options": {"include_usage": False}},
+            (STREAM_OPTIONS_NOT_STREAMING,),
+        ),
+        ({"stream": True}, ()),
+        ({"stream": True, "stream_options": {"include_obfuscation": False}}, ()),
+        (
+            {
+                "stream": True,
+                "stream_options": {"include_usage": True, "include_obfuscation": True},
+            },
+            (STREAM_OBFUSCATION_IGNORED,),
+        ),
+        (
+            {
+                "stream": True,
+                "stream_options": {"include_usage": False, "include_obfuscation": True},
+            },
+            (MESSAGES_STREAM_USAGE_ALWAYS_INCLUDED, STREAM_OBFUSCATION_IGNORED),
+        ),
+    ),
+)
+def test_messages_stream_options_are_consumed(
+    payload: JsonObject, disclosures: tuple[str, ...]
+) -> None:
+    """Usage always streams on Messages: only a request it cannot honor is disclosed."""
+    repaired, named = accept_messages_stream_options(payload, streams=payload.get("stream") is True)
+    assert "stream_options" not in repaired
+    assert repaired.get("stream") == payload.get("stream")
+    assert named == disclosures
+
+
+def test_messages_without_stream_options_are_returned_unchanged() -> None:
+    """A body with no stream_options is the same object, nothing disclosed."""
+    payload: JsonObject = {"stream": True, "model": "m"}
+    repaired, named = accept_messages_stream_options(payload, streams=True)
+    assert repaired is payload
+    assert named == ()
+
+
+@pytest.mark.parametrize(
+    ("options", "param"),
+    (
+        ("yes", "stream_options"),
+        ([{"include_usage": True}], "stream_options"),
+        ({"include_usage": "true"}, "stream_options.include_usage"),
+        ({"include_usage": 1}, "stream_options.include_usage"),
+        ({"include_obfuscation": 1}, "stream_options.include_obfuscation"),
+        ({"include_usage": True, "chunk_size": 4}, "stream_options.chunk_size"),
+    ),
+)
+def test_malformed_messages_stream_options_keep_a_named_rejection(
+    options: JsonValue, param: str
+) -> None:
+    """Anything but an object of optional boolean include_usage/include_obfuscation is a 400."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        accept_messages_stream_options({"stream": True, "stream_options": options}, streams=True)
+    assert error.value.status_code == 400
     assert error.value.detail.param == param
 
 

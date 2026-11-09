@@ -125,6 +125,15 @@ the order the model produced.
   padding, so `include_obfuscation: false` is honored exactly; `true` is disclosed
   as `stream_options.include_obfuscation->ignored(not_emitted)`, and the object on
   a non-streaming call as `stream_options->ignored(stream_false)`.
+- Messages accepts Chat's `stream_options` (`{"include_usage": true}`, which clients
+  configured with OpenAI-style extra body fields send on `/v1/messages`). The Anthropic
+  stream always carries usage, so `include_usage: true` or an empty object is satisfied
+  and removed without disclosure; `false` is disclosed as
+  `stream_options.include_usage->ignored(always_included)`, and the object on a
+  non-streaming call as `stream_options->ignored(stream_false)`. Chat's
+  `include_obfuscation: true` is disclosed as
+  `stream_options.include_obfuscation->ignored(not_emitted)`. A null value asks for nothing.
+  Any other key, or a non-null non-boolean value, is a named 400.
 - Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
   as Chat `response_format: {"type": "json_object"}`.
 - A key the gateway does not define on a conversation object is dropped before dispatch

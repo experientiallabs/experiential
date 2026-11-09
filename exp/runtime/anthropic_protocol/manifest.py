@@ -42,6 +42,11 @@ MESSAGES_MANIFEST = CompatibilityManifest(
         # such field, so SDK callers send it through extra_body.
         _field("provider", CompatibilityDisposition.SUPPORTED),
         _field("gateway", CompatibilityDisposition.SUPPORTED),
+        # Chat's ``stream_options`` sent by clients with OpenAI-style extra body
+        # fields. Not an Anthropic field: usage always streams, so it is
+        # consumed before validation with disclosure for what cannot be honored
+        # (``client_field_repairs.accept_messages_stream_options``).
+        _field("stream_options", CompatibilityDisposition.SUPPORTED),
         _field("tools", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("tool_choice", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "extended_thinking"),
