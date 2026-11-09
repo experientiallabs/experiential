@@ -188,7 +188,7 @@ class TaskVerifier(ContractModel):
         try:
             check_schema(self.outcome_schema)
         except SchemaError as error:
-            raise ValueError("invalid verifier JSON Schema") from error
+            raise ValueError(f"invalid verifier JSON Schema: {_schema_error(error)}") from error
         _bounded_predicate(expand_local_references(self.outcome_schema))
         _check_argument_schemas(self.argument_schemas)
         for pointer in (*self.required_paths, *self.preserved_paths):
@@ -258,8 +258,16 @@ def _check_argument_schemas(schemas: dict[str, JsonObject]) -> None:
         try:
             check_schema(schema)
         except SchemaError as error:
-            raise ValueError("invalid argument policy JSON Schema") from error
+            raise ValueError(
+                f"invalid argument policy JSON Schema for tool {name!r}: {_schema_error(error)}"
+            ) from error
         _bounded_predicate(expand_local_references(schema))
+
+
+def _schema_error(error: SchemaError) -> str:
+    """Say where a schema is invalid and why, so its author can fix it."""
+    where = "/".join(str(part) for part in error.path) or "(root)"
+    return f"at {where}: {error.message}"[:300]
 
 
 def _bounded_predicate(schema: JsonValue) -> None:

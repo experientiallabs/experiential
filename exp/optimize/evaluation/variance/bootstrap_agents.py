@@ -18,6 +18,7 @@ replays without a call.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache, cached_property
@@ -210,7 +211,25 @@ class StartMaterial:
             ),
             "tools": f"one schema for each of exactly these tools, no others: {tools}",
             "manifest.tools": f"a contract for each of exactly these tools, no others: {tools}",
-            "probe_paths": "an object mapping a probe name to a JSON pointer into initial_state",
+            "probe_paths": (
+                "an object mapping a probe name to a JSON pointer into initial_state; every "
+                "probe_paths and facts[].state_paths pointer must resolve in initial_state"
+            ),
+            "json_pointers": (
+                "RFC 6901: escape '~' as '~0' and '/' inside a key as '~1'. "
+                + (
+                    "The domain roots are exactly "
+                    + json.dumps([pointer_token(name) for name in domains])
+                    if domains
+                    else "A domain named a/b is rooted at /a~1b"
+                )
+            ),
+            "verifier.argument_schemas": (
+                f"optional; maps a tool name from {tools} to a JSON Schema object over that "
+                'tool\'s arguments, e.g. {"type": "object", "properties": {"command": '
+                '{"type": "string"}}}; no \'pattern\'. Put the verifier\'s own fields '
+                "(description, outcome_schema) beside it, never inside it"
+            ),
         }
 
     def run(
@@ -275,11 +294,21 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     Raises:
         ValueError: Any structural check fails.
     """
-    draft = StartDraft.model_validate(answer)
+    draft = StartDraft.model_validate(canonical_pointers(answer))
     names = [tool.name for tool in draft.tools]
     declared = {tool.name: tool for tool in draft.manifest.tools}
-    if len(set(names)) != len(names) or set(names) != set(declared):
-        raise ValueError("the tool schemas and the manifest must name exactly the same tools")
+    if len(set(names)) != len(names):
+        raise ValueError(f"the tool schemas repeat a tool: {names}")
+    if set(names) != set(declared):
+        raise ValueError(
+            "the tool schemas and the manifest must name exactly the same tools; only in tools: "
+            f"{sorted(set(names) - set(declared))}; only in manifest.tools: "
+            f"{sorted(set(declared) - set(names))}"
+        )
+    if unknown := sorted(set(draft.verifier.argument_schemas) - set(names)):
+        raise ValueError(
+            f"verifier.argument_schemas keys must be tool names from {sorted(names)}; got {unknown}"
+        )
     domains = {domain.name for domain in draft.manifest.domains}
     if any(domain.owner != "simulated" for domain in draft.manifest.domains):
         raise ValueError("every domain of a bootstrapped start is simulated")
@@ -293,8 +322,8 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             resolve(draft.initial_state, pointer)
         except ValueError:
             raise ValueError(
-                f"pointer {pointer!r} does not resolve in initial_state; its top-level keys are "
-                f"{sorted(draft.initial_state)[:12]}"
+                f"pointer {pointer!r} does not resolve in initial_state; its domain roots are "
+                f"{[pointer_token(key) for key in sorted(draft.initial_state)[:12]]}"
             ) from None
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
@@ -323,6 +352,85 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
         if policy is None or policy.writes:
             raise ValueError(f"reveal probe {probe.name!r} is not a declared read-only tool")
     return draft
+
+
+def pointer_token(key: str) -> str:
+    """Return the RFC 6901 pointer naming one top-level key, such as ``/a~1b`` for ``a/b``."""
+    return "/" + key.replace("~", "~0").replace("/", "~1")
+
+
+def canonical_pointer(state: JsonValue, pointer: str) -> str:
+    """Return the escaped pointer a slash-split pointer unambiguously means, or it unchanged.
+
+    State keys may hold ``/`` (a domain named ``Python/Node runtime environment``, a file key
+    ``/opt/venv/bin/python``), which RFC 6901 escapes as ``~1``. A pointer that leaves such a slash
+    unescaped does not resolve; when exactly one way of rejoining its tokens into existing keys
+    resolves, that is the location meant, so the pointer is rewritten to it. A pointer that
+    resolves as written, resolves no way, or resolves more than one way is returned unchanged
+    and judged by the resolution check.
+    """
+    if not pointer.startswith("/") or "~" in pointer:
+        return pointer
+    try:
+        resolve(state, pointer)
+    except ValueError:
+        pass
+    else:
+        return pointer
+    tokens = pointer[1:].split("/")
+    found: list[tuple[str, ...]] = []
+
+    def walk(value: JsonValue, index: int, keys: tuple[str, ...]) -> None:
+        if len(found) > 1:
+            return
+        if index == len(tokens):
+            found.append(keys)
+            return
+        if isinstance(value, dict):
+            for end in range(index + 1, len(tokens) + 1):
+                key = "/".join(tokens[index:end])
+                if key in value:
+                    walk(value[key], end, (*keys, key))
+        elif isinstance(value, list):
+            token = tokens[index]
+            if token.isascii() and token.isdigit() and str(int(token)) == token:
+                if int(token) < len(value):
+                    walk(value[int(token)], index + 1, (*keys, token))
+
+    walk(state, 0, ())
+    if len(found) != 1:
+        return pointer
+    return "".join(pointer_token(key) for key in found[0])
+
+
+def canonical_pointers(answer: JsonObject) -> JsonObject:
+    """Return the answer with its probe and fact pointers in canonical escaped form."""
+    state = answer.get("initial_state")
+    if not isinstance(state, dict):
+        return answer
+    result = dict(answer)
+    probes = answer.get("probe_paths")
+    if isinstance(probes, dict):
+        result["probe_paths"] = {
+            name: canonical_pointer(state, value) if isinstance(value, str) else value
+            for name, value in probes.items()
+        }
+    facts = answer.get("facts")
+    if isinstance(facts, list):
+        rows: list[JsonValue] = []
+        for fact in facts:
+            paths = fact.get("state_paths") if isinstance(fact, dict) else None
+            if isinstance(fact, dict) and isinstance(paths, list):
+                fact = {
+                    **fact,
+                    "state_paths": [
+                        canonical_pointer(state, row) if isinstance(row, str) else row
+                        for row in paths
+                    ],
+                }
+            rows.append(fact)
+        result["facts"] = rows
+    return result
 
 
 def validate_review(
