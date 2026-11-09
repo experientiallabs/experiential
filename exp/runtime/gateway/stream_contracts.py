@@ -509,7 +509,14 @@ class GatewayHeaderTimeout(StrEnum):
 
 
 class GatewayFailure(ContractModel):
-    """Sanitized failure with retry and failover eligibility already classified."""
+    """Sanitized failure with retry and failover eligibility already classified.
+
+    Attributes:
+        tenant_origin: The failure came from a customer-addressed origin. Its
+            class and message settle as they are; the caller-facing answer
+            collapses to the data plane's opaque custom-endpoint error, so the
+            gateway never replays it as a specific provider failure.
+    """
 
     failure_class: GatewayFailureClass
     safe_message: str = Field(min_length=1, max_length=2_048)
@@ -541,6 +548,7 @@ class GatewayFailure(ContractModel):
     header_timeout: GatewayHeaderTimeout | None = None
     """Set only on a header-phase timeout: which bound expired (lane ejection
     counts only ``allowance``)."""
+    tenant_origin: bool = False
 
 
 def _validate_responses_probability_records(

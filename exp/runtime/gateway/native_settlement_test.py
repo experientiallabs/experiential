@@ -229,9 +229,11 @@ def test_exhausted_attempt_payload_preserves_exact_optional_boundary_fields(full
                 "provider_detail": "provider rejected tools",
                 "refusal_reason": "cyber_policy",
                 "retry_after_seconds": 5,
+                "tenant_origin": True,
             }
         )
     failure = GatewayFailure.model_validate(fields)
+    assert failure_from_boundary_payload(fields) == failure
     assert exhausted_attempt_payload(failure) == json.dumps(
         {"exhausted": True, "failure": fields}, separators=(",", ":")
     )

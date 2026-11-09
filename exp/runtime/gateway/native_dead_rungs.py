@@ -87,7 +87,7 @@ def admission_dead_failure(exc: Exception) -> GatewayFailure:
                 failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
                 safe_message=(
                     "the resolved deployment had no usable credential at admission; "
-                    "failing over to the next deployment"
+                    "ask the gateway operator to configure its credential"
                 ),
             )
         case _:

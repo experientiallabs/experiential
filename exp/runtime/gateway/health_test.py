@@ -346,14 +346,45 @@ def test_circuit_failure_requires_every_depth_held_open_by_an_account_failure() 
     assert registry.circuit_failure((first, second), (0,)) is None
 
 
-def test_a_newer_throttle_supersedes_the_recorded_account_failure() -> None:
-    """A throttle settled after the account failure is the current cause, so none is named."""
-    registry = DeploymentHealthRegistry(clock=lambda: 100.0)
+def test_a_newer_throttle_window_outranks_the_account_failure_only_while_it_runs() -> None:
+    """The newest observation names the refusal; an expired throttle hands it back.
+
+    A throttle (a 429 or a plan window at 100 percent) settled after the
+    account failure is the current cause while its window runs. Once it ends
+    with the account-opened circuit still refusing claims, the account failure
+    is the cause again.
+    """
+    now = [100.0]
+    registry = DeploymentHealthRegistry(open_seconds=60.0, clock=lambda: now[0])
     registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_QUOTA))
     assert registry.circuit_failure((_KEY,), (0,)) is not None
     registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
     assert registry.circuit_failure((_KEY,), (0,)) is None
     assert registry.throttled_remaining_seconds((_KEY,), (0,)) is not None
+    now[0] += 31.0  # The default 30 s throttle window ends; the 60 s circuit does not.
+    assert registry.throttled_remaining_seconds((_KEY,), (0,)) is None
+    assert registry.circuit_failure((_KEY,), (0,)) is not None
+
+    registry.exhausted(_KEY, 120.0)
+    assert registry.circuit_failure((_KEY,), (0,)) is None
+    # An account failure observed after the window is newer again.
+    registry.failed(_KEY, _failure(GatewayFailureClass.PROVIDER_AUTHENTICATION))
+    assert registry.circuit_failure((_KEY,), (0,)) is not None
+
+
+def test_a_tenant_origin_account_failure_is_never_named() -> None:
+    """A customer-addressed origin's failure stays opaque: the circuit opens, no cause is kept."""
+    registry = DeploymentHealthRegistry(clock=lambda: 100.0)
+    registry.failed(
+        _KEY,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+            safe_message="provider rejected its credential",
+            tenant_origin=True,
+        ),
+    )
+    assert not registry.claim(_KEY)
+    assert registry.circuit_failure((_KEY,), (0,)) is None
 
 
 def test_throttle_redial_claim_passes_the_window_but_not_an_open_circuit() -> None:
