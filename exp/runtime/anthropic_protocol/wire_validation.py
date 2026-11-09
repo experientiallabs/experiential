@@ -37,6 +37,7 @@ _MESSAGE_BLOCK_TYPES = frozenset(
         "server_tool_use",
         "web_search_tool_result",
         "tool_search_tool_result",
+        "advisor_tool_result",
         "tool_reference",
         "tool_addition",
         "tool_removal",

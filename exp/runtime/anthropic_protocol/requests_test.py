@@ -1842,6 +1842,118 @@ def test_echoed_server_tool_turn_rides_the_verbatim_block_carrier() -> None:
     assert messages[-1].content == "thanks, just the version"
 
 
+def _echoed_advisor_turn(result_content: JsonObject) -> list[JsonObject]:
+    """The assistant blocks an advisor consult echoes back (documented shape)."""
+    return [
+        {"type": "text", "text": "Let me consult the advisor on this."},
+        {"type": "server_tool_use", "id": "srvtoolu_adv", "name": "advisor", "input": {}},
+        {"type": "advisor_tool_result", "tool_use_id": "srvtoolu_adv", "content": result_content},
+        {"type": "text", "text": "Here is the implementation."},
+    ]
+
+
+_ADVISOR_RESULT_VARIANTS: tuple[JsonObject, ...] = (
+    {"type": "advisor_result", "text": "Close the input channel first.", "stop_reason": "end_turn"},
+    {"type": "advisor_redacted_result", "encrypted_content": "EqQBCkYIBRgCIiQ5ZjE0"},
+    {"type": "advisor_tool_result_error", "error_code": "overloaded"},
+)
+
+
+@pytest.mark.parametrize("result_content", _ADVISOR_RESULT_VARIANTS)
+def test_echoed_advisor_turn_rides_the_verbatim_block_carrier(result_content: JsonObject) -> None:
+    """Advisor history decodes like any echoed server-tool turn, every result variant.
+
+    Production 2026-11-09: Claude Code sessions that had consulted the advisor
+    resent its ``advisor_tool_result`` on every later turn and each
+    ``/v1/messages`` call was a 400 "unsupported content block type
+    'advisor_tool_result'". Anthropic keeps the block valid after the tool
+    leaves ``tools`` (the case here: the ``advisor_20260301`` tool itself is
+    not served) and tells callers to round-trip it verbatim, encrypted
+    variant included.
+    """
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_ADVISOR_TOOL_BETA,
+        anthropic_request_headers,
+    )
+
+    blocks = _echoed_advisor_turn(result_content)
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "build a worker pool"},
+                {"role": "assistant", "content": blocks},
+                {"role": "user", "content": "now add tests"},
+            ]
+        ),
+        anthropic_beta=f"claude-code-20250219,{ANTHROPIC_ADVISOR_TOOL_BETA}",
+    ).request
+    messages = decoded.messages
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "assistant",
+        "assistant",
+        "user",
+    ]
+    assert messages[1].content == "Let me consult the advisor on this."
+    assert [message.provider_anthropic_block for message in messages[2:4]] == blocks[1:3]
+    assert messages[4].content == "Here is the implementation."
+    # The caller's token is field-bound: neither relayed as sent nor disclosed
+    # as dropped, and the dispatch adds it beside the history that needs it.
+    assert ANTHROPIC_ADVISOR_TOOL_BETA not in decoded.provider_beta_tokens
+    assert f"anthropic-beta.{ANTHROPIC_ADVISOR_TOOL_BETA}" not in decoded.ignored_parameters
+    headers = anthropic_request_headers({"x-api-key": "k"}, decoded)
+    assert headers["anthropic-beta"] == ANTHROPIC_ADVISOR_TOOL_BETA
+
+    # A caller that omits the token still gets it on the dispatch.
+    bare = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": blocks[1:3]},
+                {"role": "user", "content": "next"},
+            ]
+        )
+    ).request
+    assert anthropic_request_headers({"x-api-key": "k"}, bare)["anthropic-beta"] == (
+        ANTHROPIC_ADVISOR_TOOL_BETA
+    )
+
+
+def test_advisor_token_without_advisor_history_is_a_no_op() -> None:
+    """Echoed web search alone, or the bare token, never adds the advisor beta."""
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_ADVISOR_TOOL_BETA,
+        anthropic_request_headers,
+    )
+
+    bare = decode_messages(_body(), anthropic_beta=ANTHROPIC_ADVISOR_TOOL_BETA).request
+    assert bare.provider_beta_tokens == ()
+    assert bare.ignored_parameters == ()
+    assert "anthropic-beta" not in anthropic_request_headers({"x-api-key": "k"}, bare)
+    search = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "search please"},
+                {"role": "assistant", "content": _echoed_web_search_turn()},
+                {"role": "user", "content": "thanks"},
+            ],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        )
+    ).request
+    assert "anthropic-beta" not in anthropic_request_headers({"x-api-key": "k"}, search)
+
+
+def test_the_advisor_tool_itself_stays_unserved() -> None:
+    """Accepting advisor HISTORY does not accept declaring the advisor tool."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_messages(
+            _body(tools=[{"type": "advisor_20260301", "name": "advisor", "model": "claude-x"}])
+        )
+    assert error.value.detail.param == "tools.0.type"
+
+
 def test_cited_text_splits_around_plain_assistant_text_in_order() -> None:
     """Plain text merges as content while cited text carries verbatim."""
     decoded = decode_messages(
@@ -1899,6 +2011,7 @@ def test_server_tool_blocks_and_citations_are_assistant_only() -> None:
     for content in (
         [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}],
         [{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []}],
+        [{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_1", "content": {}}],
         [{"type": "text", "text": "hi", "citations": [{"type": "char_location"}]}],
     ):
         with pytest.raises(OpenAIProtocolError) as error:

@@ -4,7 +4,8 @@ The decoder is strict and lossless for supported content: text, ``tool_use``,
 ``tool_result``, ``thinking``, and ``redacted_thinking`` blocks translate
 faithfully (thinking history rides the opaque provider-reasoning carrier with
 byte-exact signatures); echoed server-tool output (``server_tool_use``,
-``web_search_tool_result``, and citation-bearing ``text`` blocks) rides the
+``web_search_tool_result``, ``advisor_tool_result``, and citation-bearing
+``text`` blocks) rides the
 verbatim per-block carrier so it round-trips byte-for-byte to native
 Anthropic rungs; ``cache_control`` annotations are validated
 everywhere and carried on the surfaces the Anthropic wire caches natively
@@ -180,11 +181,24 @@ class ServerToolUseBlock(BaseModel):
 
 
 class _WebSearchToolResultBlock(BaseModel):
-    """One server-tool result echoed in history, carried shallowly."""
+    """One server-tool result echoed in history, carried shallowly.
+
+    ``advisor_tool_result`` is the advisor server tool's result (beta
+    ``advisor-tool-2026-03-01``): Anthropic tells callers to round-trip it
+    verbatim, its ``content`` possibly an encrypted ``advisor_redacted_result``
+    the provider decrypts on the next turn, and it stays valid in history after
+    the tool leaves ``tools``. Claude Code resends it on every later turn, so
+    refusing it wedged the whole session (production 2026-11-09).
+    """
 
     model_config = ConfigDict(extra="allow")
 
-    type: Literal["web_search_tool_result", "tool_search_tool_result", "tool_reference"]
+    type: Literal[
+        "web_search_tool_result",
+        "tool_search_tool_result",
+        "advisor_tool_result",
+        "tool_reference",
+    ]
 
 
 _ContentBlock = (

@@ -640,6 +640,26 @@ ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA = "thinking-display-updates-2026-08-18"
 'summarized', 'omitted'")."""
 
 
+ANTHROPIC_ADVISOR_TOOL_BETA = "advisor-tool-2026-03-01"
+"""Beta token Anthropic requires before it accepts echoed advisor history
+(``advisor_tool_result`` blocks), even when the advisor tool is no longer in
+``tools``."""
+
+
+def _carries_advisor_history(request: GatewayRequest) -> bool:
+    """Whether the history echoes an advisor call or its result block."""
+    for message in request.messages:
+        block = message.provider_anthropic_block
+        if block is None:
+            continue
+        block_type = block.get("type")
+        if block_type == "advisor_tool_result" or (
+            block_type == "server_tool_use" and block.get("name") == "advisor"
+        ):
+            return True
+    return False
+
+
 def anthropic_request_headers(
     profile_headers: dict[str, str],
     request: GatewayRequest,
@@ -651,7 +671,9 @@ def anthropic_request_headers(
     ``anthropic-beta`` token (each verified live: the bare field
     is "Extra inputs are not permitted"), so their tokens join the
     connection's static headers exactly when the request carries the field.
-    An Anthropic Files handle likewise needs the Files API token.
+    An Anthropic Files handle likewise needs the Files API token, and echoed
+    advisor history (an ``advisor_tool_result`` block or the advisor's
+    ``server_tool_use``) needs the advisor tool token.
     Allowlisted caller-forwarded tokens (``request.provider_beta_tokens``,
     e.g. the 1M context window) merge the same way. The merged list keeps
     operator tokens first, then caller tokens, then field-required tokens,
@@ -679,6 +701,8 @@ def anthropic_request_headers(
         required.append(ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA)
     if any(handle.provider == "anthropic" for handle in request.media_handles):
         required.append(ANTHROPIC_FILES_API_BETA)
+    if _carries_advisor_history(request):
+        required.append(ANTHROPIC_ADVISOR_TOOL_BETA)
     if not required:
         return headers
     existing = headers.get("anthropic-beta")

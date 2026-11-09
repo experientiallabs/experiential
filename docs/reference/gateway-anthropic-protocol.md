@@ -59,7 +59,12 @@ dropping the declared tool (`tools.web_search->dropped(unsupported_by_provider)`
 answer whose text stays (`messages.content.citations->dropped(unsupported_by_provider)`), and a
 selector that named the tool (`tool_choice->dropped(unsupported_by_provider)`), because Claude
 Code recovers on its own once WebSearch is simply absent while a 400 kills the turn (two
-production turns on 2026-09-11). The terminal `message_delta` usage
+production turns on 2026-09-11). Echoed advisor history (the advisor's `server_tool_use` and
+its `advisor_tool_result`, any result variant, encrypted `advisor_redacted_result` included) is
+carried the same way even though the `advisor_20260301` tool itself stays rejected: Anthropic
+keeps that history valid after the tool leaves `tools`, and on an Anthropic rung the dispatch adds
+the `advisor-tool-2026-03-01` token the history requires (production 2026-11-09: every turn of a
+Claude Code session that had consulted the advisor was a 400). The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
 
@@ -110,4 +115,7 @@ bill the provider's report.
 Other rungs define no equivalent and omit it. The caller's `anthropic-beta` header is forwarded
 through an exact allowlist (`MESSAGES_BETA_TOKENS_FORWARDED`); `extended-cache-ttl-2025-04-11`
 is on it, so a `cache_control: {"type": "ephemeral", "ttl": "1h"}` marker keeps the token that
-admits it. Every other token is dropped with an `anthropic-beta.<token>` disclosure.
+admits it. Field-bound tokens (`MESSAGES_BETA_TOKENS_FIELD_BOUND`: `dangerous-tool-use-2026-09-03`,
+`advisor-tool-2026-03-01`) are accepted silently and added by the dispatch itself exactly when the
+field or history they gate is present. Every other token is dropped with an
+`anthropic-beta.<token>` disclosure.

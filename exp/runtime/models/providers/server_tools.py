@@ -25,6 +25,7 @@ ANTHROPIC_SERVER_TOOL_LABELS: Mapping[str, str] = {
     "web_search": "Claude Code's WebSearch",
     "web_fetch": "Claude Code's WebFetch",
     "code_execution": "Anthropic code execution",
+    "advisor": "Anthropic advisor",
 }
 
 
