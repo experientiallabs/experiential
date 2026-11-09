@@ -2876,6 +2876,111 @@ def test_a_malformed_function_tool_declaration_still_fails_closed() -> None:
     assert "tools" in (rejection.value.detail.param or "")
 
 
+_AGNO_TOOL_KEYS: tuple[JsonObject, ...] = (
+    {"requires_confirmation": True},
+    {"external_execution": True},
+    {"approval_type": "required"},
+)
+"""Agno's client-side approval keys, serialized into each function by ``Function.to_dict``.
+
+None is in OpenAI's function tool schema on Chat or Responses (openai-python
+3.37.0 ``FunctionDefinition`` / ``FunctionToolParam``), so each stays refused,
+but by name, as an unknown field to remove (2026-10-25: 213 refusals in 35
+minutes read the bare "Invalid value for 'tools.0.function.requires_confirmation'.").
+"""
+
+
+@pytest.mark.parametrize("extra", _AGNO_TOOL_KEYS)
+def test_an_undefined_chat_function_key_is_refused_as_unknown_by_name(extra: JsonObject) -> None:
+    """The Chat refusal names the stray key and the fix, never a value fault."""
+    (key,) = extra
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_chat(
+            {
+                "model": "glm-5.3-uncensored:free",
+                "messages": [{"role": "user", "content": "Remove notes.txt."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "delete_file",
+                            "description": "Delete one file.",
+                            "parameters": {"type": "object", "properties": {}},
+                            "strict": True,
+                            **extra,
+                        },
+                    }
+                ],
+            }
+        )
+    param = f"tools.0.function.{key}"
+    assert rejection.value.status_code == 400
+    assert rejection.value.detail.code == "invalid_parameter"
+    assert rejection.value.detail.param == param
+    assert rejection.value.detail.message == (
+        f"Unknown parameter '{param}': this field is not supported. Remove it and resend."
+    )
+
+
+@pytest.mark.parametrize("extra", _AGNO_TOOL_KEYS)
+def test_an_undefined_responses_function_key_is_refused_as_unknown_by_name(
+    extra: JsonObject,
+) -> None:
+    """The Responses tool is flat, so the stray key sits directly on ``tools.N``."""
+    (key,) = extra
+    with pytest.raises(OpenAIProtocolError) as rejection:
+        decode_responses(
+            {
+                "model": "coding",
+                "input": "Remove notes.txt.",
+                "tools": [
+                    {"type": "function", "name": "keep", "parameters": {}},
+                    {
+                        "type": "function",
+                        "name": "delete_file",
+                        "parameters": {"type": "object", "properties": {}},
+                        "strict": True,
+                        "defer_loading": False,
+                        **extra,
+                    },
+                ],
+            }
+        )
+    param = f"tools.1.{key}"
+    assert rejection.value.detail.code == "invalid_parameter"
+    assert rejection.value.detail.param == param
+    assert rejection.value.detail.message == (
+        f"Unknown parameter '{param}': this field is not supported. Remove it and resend."
+    )
+
+
+def test_the_defined_function_tool_keys_still_decode_on_both_surfaces() -> None:
+    """``strict`` and ``defer_loading``, the defined optional keys, are unaffected."""
+    chat = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "defer_loading": True,
+                    "function": {"name": "f", "parameters": {}, "strict": True},
+                },
+                {"type": "openrouter:tool_search"},
+            ],
+        }
+    )
+    responses = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "f", "parameters": {}, "strict": True}],
+        }
+    )
+    assert chat.request.tools[0].strict is True
+    assert responses.request.tools[0].strict is True
+
+
 def test_embeddings_decoder_preserves_supported_fields() -> None:
     """Embeddings conversion keeps the alias, inputs, dimensions, encoding, and attribution."""
     decoded = decode_embeddings(
