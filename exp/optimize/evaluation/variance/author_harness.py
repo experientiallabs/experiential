@@ -253,6 +253,23 @@ def guard_aliases(allowed: frozenset[str]) -> None:
     RuntimeModelCatalog.resolve = resolve  # type: ignore[method-assign]
 
 
+STAGES = frozenset(
+    {
+        "author_start",
+        "review_start",
+        "research",
+        "capture_start",
+        "validate_start",
+        "replay_prefix",
+        "first_reveals",
+        "check_reveals",
+        "restores_exactly",
+        "mining_job",
+    }
+)
+"""Bootstrap steps a stopped flow is reported at."""
+
+
 def run_full(project: ProjectStore, scratch: ProjectStore, prepared: Prepared, run: str) -> int:
     """Run the whole per-task bootstrap flow in an overlay of the shared project and report it.
 
@@ -286,7 +303,12 @@ def run_full(project: ProjectStore, scratch: ProjectStore, prepared: Prepared, r
             revision,
         )
     except Exception as error:  # noqa: BLE001 - a stopped flow is a reported outcome
-        _say(f"  RAISED {type(error).__name__}: {str(error)[:600]}")
+        stages = [
+            frame.name
+            for frame in traceback.extract_tb(error.__traceback__)
+            if frame.name in STAGES
+        ]
+        _say(f"  RAISED in {' > '.join(stages)}: {type(error).__name__}: {str(error)[:600]}")
         traceback.print_exc()
     saved = load_outcome(overlay, run)
     outcome = saved or outcome

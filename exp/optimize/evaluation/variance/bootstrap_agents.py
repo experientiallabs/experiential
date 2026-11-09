@@ -1266,8 +1266,12 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
     return base.model_copy(update={"input_schema": body})
 
 
-SCHEMA_DEPTH = 4
-"""Nesting depth to which the submit tool spells out a JSON Schema's own shape."""
+SCHEMA_DEPTH = 2
+"""Nesting depth to which the submit tool spells out a JSON Schema's own shape.
+
+The provider decodes under a grammar compiled from the submit schema; at depth 4 over seven
+tools that grammar failed verification mid-generation (HTTP 400) on every draw of one task.
+Two levels cover a schema's top-level properties and their children."""
 
 
 def _schema_object(depth: int) -> JsonObject:
