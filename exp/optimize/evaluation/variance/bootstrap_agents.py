@@ -346,7 +346,11 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     if any(domain.owner != "simulated" for domain in draft.manifest.domains):
         raise ValueError("every domain of a bootstrapped start is simulated")
     if set(draft.initial_state) != domains:
-        raise ValueError("the initial state must name exactly the manifest's domains")
+        raise ValueError(
+            "the initial state must name exactly the manifest's domains; only in initial_state: "
+            f"{sorted(set(draft.initial_state) - domains)}; only in manifest.domains: "
+            f"{sorted(domains - set(draft.initial_state))}"
+        )
     shared = set(material.knowledge.state_domains)
     if shared and domains != shared:
         raise ValueError(f"a start declares exactly the family's shared domains {sorted(shared)}")
@@ -1129,7 +1133,8 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
     open map, so drafts repeated or swapped tool names and kept writing verifier fields
     (``description``, ``outcome_schema``) inside the argument-policy map. The requirements were
     already exact; the schema now says the same: names come from the task's tools and the
-    family's domains, each listed once, and argument policies are keyed only by tool name.
+    family's domains, each listed once, initial_state is keyed by exactly those domains, and
+    argument policies are keyed only by tool name.
     """
     base = author_answer_schema()
     body = copy.deepcopy(base.input_schema)
@@ -1149,6 +1154,14 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
     manifest = properties["manifest"]["properties"]
     exact(manifest["tools"], tools)
     exact(manifest["domains"], domains)
+    if domains:
+        properties["initial_state"] = {
+            "type": "object",
+            "description": "Each domain's initial state, keyed by exactly the family's domains.",
+            "properties": {name: {} for name in domains},
+            "required": domains,
+            "additionalProperties": False,
+        }
     verifier = properties["verifier"]["properties"]
     verifier["argument_schemas"] = {
         "type": "object",

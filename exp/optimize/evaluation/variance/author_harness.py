@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import secrets
-import shutil
 import sys
 import time
 from collections.abc import Iterator
@@ -162,7 +161,13 @@ def build_material(
 def scratch_project(directory: Path, source: ProjectStore) -> ProjectStore:
     """A private project beside a copy of the shared root's model catalog."""
     directory.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source.model_catalog_path, directory / "models.toml")
+    target = directory / "models.toml"
+    body = source.model_catalog_path.read_bytes()
+    if not target.exists() or target.read_bytes() != body:
+        # Concurrent harness runs share the scratch root: replace atomically, never truncate.
+        staging = directory / f".models-{secrets.token_hex(4)}.toml"
+        staging.write_bytes(body)
+        staging.replace(target)
     return ProjectStore(directory, "author-harness")
 
 
