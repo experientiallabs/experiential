@@ -331,7 +331,12 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     names = [tool.name for tool in draft.tools]
     declared = {tool.name: tool for tool in draft.manifest.tools}
     if len(set(names)) != len(names):
-        raise ValueError(f"the tool schemas repeat a tool: {names}")
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        expected = {tool.name for tool in material.task.task.tools}
+        raise ValueError(
+            f"the tool schemas repeat {repeated} and lack {sorted(expected - set(names))}; give "
+            f"exactly one schema per tool of {sorted(expected)}"
+        )
     if set(names) != set(declared):
         raise ValueError(
             "the tool schemas and the manifest must name exactly the same tools; only in tools: "
