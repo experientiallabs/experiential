@@ -55,7 +55,9 @@ spelling it used (the provider's own error does the same).
 """
 
 
-def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
+def cleaned_location(
+    location: tuple[str | int, ...], *, keep_last: bool = False
+) -> tuple[str, ...]:
     """Drop pydantic union-branch labels so the path names request fields.
 
     A discriminated-union branch label is never the LAST segment of a location
@@ -67,6 +69,11 @@ def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
     last_index = len(location) - 1
     for index, part in enumerate(location):
         text = str(part)
+        if keep_last and index == last_index:
+            # An ``extra_forbidden`` location ends in the caller's own key,
+            # whatever it spells (``_meta``, ``Foo``, a parent's name).
+            cleaned.append(text)
+            continue
         if text in _LOCATION_NOISE:
             continue
         if (
@@ -241,19 +248,31 @@ def _names_unknown_field(
 ) -> bool:
     """Whether the chosen field is a key no union branch defines.
 
-    Every complaint at the chosen location must be ``extra_forbidden``, across
-    every branch that reported it: when some sibling branch defines the key and
-    objected to its VALUE instead, the caller may have meant that branch, and
-    "unknown parameter" would misdescribe a value fault as a stray key.
+    Every complaint at the chosen location must be ``extra_forbidden``, and
+    every closed sibling branch (one that reported some other stray key beside
+    it) must have called this key extra too: a closed branch that defines the
+    key reports either a value fault there or nothing there at all, and in
+    both cases the caller may have meant that branch, so "unknown parameter"
+    would misdescribe it.
     """
     if not details or any(detail["type"] != "extra_forbidden" for detail in details):
         return False
-    return all(
-        detail["type"] == "extra_forbidden"
-        for members in groups.values()
-        for cleaned, detail in members
-        if cleaned == location
-    )
+    parent = location[:-1]
+    for members in groups.values():
+        siblings = [
+            (cleaned, detail)
+            for cleaned, detail in members
+            if len(cleaned) == len(location) and cleaned[:-1] == parent
+        ]
+        if not any(detail["type"] == "extra_forbidden" for _, detail in siblings):
+            # A branch that never reports a stray key (an open shape, or one
+            # that failed before its extras were checked) says nothing about
+            # whether it defines this one.
+            continue
+        here = [detail for cleaned, detail in siblings if cleaned == location]
+        if not here or any(detail["type"] != "extra_forbidden" for detail in here):
+            return False
+    return True
 
 
 def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
@@ -273,7 +292,10 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
     for detail in error.errors(include_url=False):
         groups.setdefault(tuple(detail["loc"][:-1]), []).append(
-            (cleaned_location(detail["loc"]), detail)
+            (
+                cleaned_location(detail["loc"], keep_last=detail["type"] == "extra_forbidden"),
+                detail,
+            )
         )
     if not groups:
         return invalid_field("body")

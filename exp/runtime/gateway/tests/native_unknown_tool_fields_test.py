@@ -3,10 +3,9 @@
 
 Agno serializes its client-side approval flag ``requires_confirmation`` into
 each function definition it sends (``Function.to_dict``); the field is not in
-OpenAI's function tool schema on Chat or Responses. The gateway answered
-``Invalid value for 'tools.0.function.requires_confirmation'.``, which reads as
-a value fault (213 refusals in 35 minutes, 2026-10-25). The refusal now says
-the field is unknown and to remove it, before any rung is dialled.
+OpenAI's function tool schema on Chat or Responses. The refusal names the field
+as unknown and says to remove it, before any rung is dialled, rather than
+reporting ``Invalid value for '<param>'.``, which would read as a value fault.
 """
 
 from __future__ import annotations

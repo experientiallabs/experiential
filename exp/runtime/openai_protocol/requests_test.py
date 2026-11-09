@@ -2885,8 +2885,7 @@ _AGNO_TOOL_KEYS: tuple[JsonObject, ...] = (
 
 None is in OpenAI's function tool schema on Chat or Responses (openai-python
 3.37.0 ``FunctionDefinition`` / ``FunctionToolParam``), so each stays refused,
-but by name, as an unknown field to remove (2026-10-25: 213 refusals in 35
-minutes read the bare "Invalid value for 'tools.0.function.requires_confirmation'.").
+but by name, as an unknown field to remove rather than as a value fault.
 """
 
 
@@ -2897,7 +2896,7 @@ def test_an_undefined_chat_function_key_is_refused_as_unknown_by_name(extra: Jso
     with pytest.raises(OpenAIProtocolError) as rejection:
         decode_chat(
             {
-                "model": "glm-5.3-uncensored:free",
+                "model": "coding",
                 "messages": [{"role": "user", "content": "Remove notes.txt."}],
                 "tools": [
                     {

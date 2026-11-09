@@ -20,36 +20,52 @@ class _Closed(BaseModel):
 
 
 class _Function(_Closed):
+    """A function declaration with one optional defined key."""
+
     name: str
     strict: bool = False
 
 
 class _Tool(_Closed):
+    """A tool wrapping one function declaration."""
+
     function: _Function
 
 
 class _Tools(_Closed):
+    """A body carrying a list of tools."""
+
     tools: list[_Tool]
 
 
 class _Search(_Closed):
+    """A search action branch."""
+
     query: str
 
 
 class _Fetch(_Closed):
+    """A fetch action branch that defines ``limit``."""
+
     url: str
     limit: int
 
 
 class _Action(_Closed):
+    """A body whose ``action`` is an undiscriminated union."""
+
     action: _Search | _Fetch
 
 
 class _Gateway(_Closed):
+    """A gateway extension object with one defined key."""
+
     retry: bool = False
 
 
 class _Body(_Closed):
+    """A body carrying the gateway extension object."""
+
     gateway: _Gateway
 
 
@@ -81,7 +97,7 @@ def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field
 
 
 def test_an_undefined_key_is_named_unknown_and_unsupported_not_an_invalid_value() -> None:
-    """Agno's ``requires_confirmation`` on a function tool read "Invalid value" (2026-10-25)."""
+    """Agno's ``requires_confirmation`` on a function tool is named unknown, not a bad value."""
     param, message = _rendered(
         _Tools, {"tools": [{"function": {"name": "f", "requires_confirmation": True}}]}
     )
@@ -117,7 +133,22 @@ def test_a_key_some_union_branch_defines_is_never_called_unknown() -> None:
 
 
 def test_an_undefined_gateway_key_keeps_the_unknown_parameter_wording() -> None:
-    """The gateway extension object was the one place already naming stray keys."""
+    """A stray key on the gateway extension object uses the same unknown-parameter wording."""
     param, message = _rendered(_Body, {"gateway": {"retries": 3}})
     assert param == "gateway.retries"
     assert message == unknown_parameter_message("gateway.retries")
+
+
+@pytest.mark.parametrize("key", ["_meta", "Requires", "function", "str"])
+def test_an_undefined_key_is_named_even_when_it_spells_like_a_branch_label(key: str) -> None:
+    """The caller's own key is named, never its parent object (which is defined)."""
+    param, message = _rendered(_Tools, {"tools": [{"function": {"name": "f", key: 1}}]})
+    assert param == f"tools.0.function.{key}"
+    assert message == unknown_parameter_message(f"tools.0.function.{key}")
+
+
+def test_a_key_a_sibling_branch_accepts_is_never_called_unknown() -> None:
+    """``limit`` is valid on the fetch branch, which failed only on its other fields."""
+    param, message = _rendered(_Action, {"action": {"query": "q", "limit": 3}})
+    assert param == "action.limit"
+    assert not message.startswith("Unknown parameter")
