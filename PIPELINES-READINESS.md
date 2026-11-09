@@ -42,3 +42,5 @@ Plus per-alias `max_in_flight` of 6 for the actors, `deepseek-judge` and `glm-fl
 3. Wall clock: branches, families and mining tiers are still serial.
 4. `continuation_physical_attempts` is 64, but 8 continuations can need 160.
 5. live_next4's `RefuseRun` must allow the blast-radius and curriculum slots.
+
+**Update (cross-tier).** `blast.cross_tier.top_points` (default 4): every tier's top-ranked points are continued by the other 4 tiers (8 each). The `cross-tier-blast` record (`error-mining.outputs.cross_tier`) holds per-tier pass rates, recoveries and a teaching score; the blast ranking is recomputed across all tiers, and curriculum ladders are ordered by teaching inside a strength. Added worst case per start: ~12.8k actor + ~7.7k judge calls, plus ~9.6k actor from raising the continuation ceiling to M×H=160. live_next4 must allow the `blast-radius` and `curriculum` slots.
