@@ -762,6 +762,26 @@ def test_mixed_route_narrows_thinking_off_to_rungs_that_honor_it(verbatim_model:
     assert error.value.param == "thinking.type"
 
 
+@pytest.mark.parametrize("verbatim_model", ("claude-haiku-4-5", "claude-opus-4-8"))
+def test_a_kept_substituting_rung_never_shares_a_route_with_a_verbatim_one(
+    verbatim_model: str,
+) -> None:
+    """A kept always-reasoning rung (a live reasoning pin's issuer) serves thinking-off
+    with its substitute alone: the verbatim rung would refuse the one shaped request."""
+    always = _anthropic_profile("claude-opus-5-5")
+    verbatim = replace(_anthropic_profile(verbatim_model), reasoning_effort=None)
+    request = _thinking_off_request()
+    profiles = (always, verbatim)
+    kept = compatible_generation_parameter_profile_indexes(profiles, request, keep=0)
+    assert kept == (0,)
+    public, provider = route_generation_parameter_requests(
+        tuple(profiles[index] for index in kept), request
+    )
+    assert provider.provider_thinking_config == {"type": "adaptive", "display": "omitted"}
+    assert "thinking.type->adaptive" in public.ignored_parameters
+    assert compatible_generation_parameter_profile_indexes(profiles, request, keep=1) == (1,)
+
+
 def test_all_always_thinking_route_keeps_every_rung_for_thinking_off() -> None:
     """A route of always-reasoning rungs serves the substitute on each of them."""
     profiles = (_anthropic_profile("claude-opus-5-5"), _anthropic_profile("claude-fable-5-1"))

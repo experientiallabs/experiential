@@ -9,8 +9,10 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.models.model import ModelCapabilities
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capability_rungs import (
     PROMPT_CACHE_TTL_RUNG_DISCLOSURE,
+    generation_parameter_indexes,
     narrow_to_capable_rungs,
 )
 from exp.runtime.gateway.contracts import (
@@ -22,13 +24,19 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-from exp.runtime.gateway.native_admission import admitted_route_requests
+from exp.runtime.gateway.native_admission import _candidate_serves, admitted_route_requests
 from exp.runtime.gateway.native_bridge_errors import public_capability_error
-from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.native_fallback_rules import eligible_ladder
+from exp.runtime.gateway.routing import (
+    REASONING_CONTINUATION_FAILOVER_ROUTE_REASON,
+    GatewayRoute,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.capability_policy import STRICT_TOOLS_DISCLOSURE
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.protocol import NativeWireClient
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
 _SCHEMA: JsonObject = {
@@ -223,13 +231,26 @@ def test_no_rung_with_structured_output_still_fails_closed() -> None:
         _admit(route, ((wire, client), (wire, client)), _structured_chat())
 
 
-def test_a_live_reasoning_pin_never_moves() -> None:
-    """A continuation pinned to its issuing rung keeps it first; a stale pin does not."""
+def test_a_live_reasoning_pin_holds_while_its_issuer_carries_the_feature() -> None:
+    """A continuation whose issuing rung carries the schema keeps it first, unmoved;
+    one whose issuer cannot carry it narrows past it, and so does a stale pin."""
     route, wires = _qwen_route()
-    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "novita"})
-    kept, _wires, disclosures = narrow_to_capable_rungs(pinned, wires, _structured_chat())
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "cerebras"})
+    pinned = pinned.model_copy(
+        update={
+            "snapshot": pinned.snapshot.model_copy(update={"deployment_ids": ("cerebras",)}),
+            "deployment": route.deployments[1],
+            "fallback_deployments": (),
+        }
+    )
+    kept, _wires, disclosures = narrow_to_capable_rungs(pinned, wires[1:], _structured_chat())
     assert kept is pinned
     assert disclosures == ()
+    issuer_lacks = route.model_copy(update={"reasoning_pinned_deployment_id": "novita"})
+    moved, _wires, disclosures = narrow_to_capable_rungs(issuer_lacks, wires, _structured_chat())
+    assert tuple(item.deployment_id for item in moved.deployments) == ("cerebras",)
+    assert moved.requires_reasoning_strip(moved.deployments[0])
+    assert disclosures == ("response_format->routed(structured_output_rung)",)
     stale = route.model_copy(update={"reasoning_pinned_deployment_id": "issuer"})
     moved, _wires, disclosures = narrow_to_capable_rungs(stale, wires, _structured_chat())
     assert tuple(item.deployment_id for item in moved.deployments) == ("cerebras",)
@@ -800,3 +821,369 @@ def test_a_twelve_hour_request_rides_only_a_wire_that_carries_it(
     with pytest.raises(ProviderCapabilityError) as caught:
         dialect_stream_payload(profile, _twelve_hour_responses())
     assert caught.value.capability == "prompt_cache_ttl_12h"
+
+
+def _claude_code_messages(**extra: object) -> GatewayRequest:
+    """Decode a Claude Code Messages turn: system, one tool, streaming."""
+    body: JsonObject = {
+        "model": "public-model",
+        "max_tokens": 32_000,
+        "stream": True,
+        "system": [{"type": "text", "text": "You are a coding agent."}],
+        "messages": [{"role": "user", "content": "read it"}],
+        "tools": [
+            {
+                "name": "Read",
+                "description": "Read a file.",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }
+        ],
+    }
+    body.update(cast(JsonObject, extra))
+    if body["tools"] == []:
+        del body["tools"]
+    return decode_messages(body).request
+
+
+def _responses_tools() -> GatewayRequest:
+    """Decode one Responses tool turn with sampling only the novita rung takes."""
+    return decode_responses(
+        {
+            "model": "public-model",
+            "input": "read it",
+            "stream": True,
+            "temperature": 0.1,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+    ).request
+
+
+_TOOL_REQUESTS = {
+    "chat": _copilot_chat,
+    "responses": _responses_tools,
+    "messages": _claude_code_messages,
+    "messages_thinking": lambda: _claude_code_messages(thinking={"type": "adaptive"}),
+}
+
+
+@pytest.mark.parametrize("surface", sorted(_TOOL_REQUESTS))
+def test_a_tool_less_lead_never_refuses_tools_another_rung_serves(surface: str) -> None:
+    """gpt-6-astra with its tool-less Novita rung leading: every surface admits a tool
+    turn on the openai rung, keeps the remaining order, and discloses the move."""
+    route, wires = _astra_route(("novita", "openai", "azure_openai"))
+    narrowed, public, provider, _recorded = _admit(route, wires, _TOOL_REQUESTS[surface]())
+    assert _ids(narrowed) == ("openai",)
+    assert provider.tools
+    assert "tools->routed(tools_rung)" in public.ignored_parameters
+
+
+@pytest.mark.parametrize("surface", sorted(_TOOL_REQUESTS))
+def test_a_route_with_no_tool_rung_still_refuses_on_tools(surface: str) -> None:
+    """Only tool-less rungs: the typed refusal is unchanged on every surface."""
+    route, wires = _astra_route(("novita", "azure_openai"))
+    with pytest.raises(ProviderCapabilityError) as caught:
+        _admit(route, wires, _TOOL_REQUESTS[surface]())
+    assert caught.value.capability == "function_tools"
+
+
+@pytest.mark.parametrize("surface", sorted(_TOOL_REQUESTS))
+def test_a_reasoning_pin_on_a_tool_less_issuer_serves_tools_without_its_reasoning(
+    surface: str,
+) -> None:
+    """A continuation pinned to the tool-less Novita rung still goes through the tools
+    narrowing, so the turn is never refused on ``tools`` while openai serves them.
+    The route narrows past the issuer: its sealed reasoning is stripped exactly as
+    on a failover past it, and the ledger records the continuation failover."""
+    route, wires = _astra_route(("novita", "openai", "azure_openai"))
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "novita"})
+    narrowed, public, provider, _recorded = _admit(pinned, wires, _TOOL_REQUESTS[surface]())
+    assert _ids(narrowed) == ("openai",)
+    assert provider.tools
+    assert "tools->routed(tools_rung)" in public.ignored_parameters
+    assert narrowed.requires_reasoning_strip(narrowed.deployments[0])
+    assert narrowed.attempt_route_reason(narrowed.deployments[0]) == (
+        REASONING_CONTINUATION_FAILOVER_ROUTE_REASON
+    )
+
+
+def test_a_reasoning_pin_on_a_tool_issuer_stays_first() -> None:
+    """The issuer serves tools, so the pin holds and leads the route."""
+    route, wires = _astra_route(("openai", "novita", "azure_openai"))
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "openai"})
+    narrowed, public, _provider, _recorded = _admit(pinned, wires, _copilot_chat())
+    assert _ids(narrowed) == ("openai",)
+    assert not narrowed.requires_reasoning_strip(narrowed.deployments[0])
+    assert not any(item.startswith("tools->") for item in public.ignored_parameters)
+
+
+def _failover_only(deployment: ExactModelDeployment) -> ExactModelDeployment:
+    """The same rung reserved for a refusal failover (``failover_only_on``)."""
+    capabilities = deployment.gateway.capabilities.model_copy(
+        update={"failover_only_on": ("refusal",)}
+    )
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"capabilities": capabilities})}
+    )
+
+
+def test_a_failover_only_tool_rung_never_takes_the_first_dial() -> None:
+    """The only tool rung is failover-only: the request is refused on ``tools`` with the
+    typed 400, never handed to the failover rung nor failed as an internal error."""
+    route, wires = _astra_route(("novita", "openai"))
+    route = _route((route.deployments[0], _failover_only(route.deployments[1])))
+    with pytest.raises(ProviderCapabilityError) as caught:
+        _admit(route, wires, _copilot_chat())
+    assert caught.value.capability == "function_tools"
+
+
+def test_an_unrestricted_tool_rung_dials_first_ahead_of_a_failover_only_one() -> None:
+    """Narrowing keeps the failover-only tool rung as a successor, but the first dial
+    goes to the unrestricted tool rung behind it."""
+    base, _wires = _astra_route(("novita", "openai"))
+    second = base.deployments[1].model_copy(update={"deployment_id": "openai-two"})
+    route = _route((base.deployments[0], _failover_only(base.deployments[1]), second))
+    wires = (
+        _astra_profile("https://novita.test", sampling=True),
+        _astra_profile("https://openai.test", sampling=False),
+        _astra_profile("https://openai-two.test", sampling=False),
+    )
+    narrowed, _public, _provider, _recorded = _admit(route, wires, _copilot_chat())
+    assert _ids(narrowed) == ("openai", "openai-two")
+    assert eligible_ladder(narrowed, None) == (1,)
+
+
+def _sampling_only_requests() -> dict[str, GatewayRequest]:
+    """One tool-free turn per surface carrying a ``temperature`` only Novita takes."""
+    return {
+        "chat": _copilot_chat(tools=False),
+        "responses": decode_responses(
+            {"model": "public-model", "input": "go on", "stream": True, "temperature": 0.1}
+        ).request,
+        "messages": _claude_code_messages(temperature=0.1, tools=[]),
+    }
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+def test_a_reasoning_pin_keeps_its_issuer_over_a_sampling_exact_rung(surface: str) -> None:
+    """A continuation pinned to the openai rung that sealed its reasoning sent a
+    ``temperature`` only the Novita rung takes. The sampling ranking never keeps
+    Novita alone at the cost of the issuer and the conversation's reasoning: the
+    issuer leads, and the temperature it cannot take is dropped, disclosed, as on
+    any rung that cannot honor it."""
+    route, wires = _astra_route(("openai", "novita", "azure_openai"))
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "openai"})
+    narrowed, public, provider, _recorded = _admit(
+        pinned, wires, _sampling_only_requests()[surface]
+    )
+    assert _ids(narrowed)[0] == "openai"
+    assert not narrowed.requires_reasoning_strip(narrowed.deployments[0])
+    assert provider.temperature is None
+    assert "temperature->dropped(unsupported_by_provider)" in public.ignored_parameters
+
+
+def test_without_a_pin_the_sampling_exact_rung_still_wins() -> None:
+    """Unpinned, the same turn keeps the rung that honors the temperature exactly."""
+    route, wires = _astra_route(("openai", "novita", "azure_openai"))
+    narrowed, _public, provider, _recorded = _admit(route, wires, _sampling_only_requests()["chat"])
+    assert _ids(narrowed) == ("novita",)
+    assert provider.temperature == 0.1
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+def test_a_failover_only_sampling_rung_never_takes_the_first_dial(surface: str) -> None:
+    """Only a failover-only rung honors the caller's ``temperature``: the ranking keeps
+    the unrestricted rung that must take the first dial, which drops the temperature,
+    disclosed, and the sampling-exact rung stays behind it as a failover successor."""
+    base, _wires = _astra_route(("openai", "novita"))
+    route = _route((base.deployments[0], _failover_only(base.deployments[1])))
+    wires = (
+        _astra_profile("https://openai.test", sampling=False),
+        _astra_profile("https://novita.test", sampling=True),
+    )
+    narrowed, public, provider, _recorded = _admit(route, wires, _sampling_only_requests()[surface])
+    assert _ids(narrowed) == ("openai", "novita")
+    assert eligible_ladder(narrowed, None) == (0,)
+    assert provider.temperature is None
+    assert "temperature->dropped(unsupported_by_provider)" in public.ignored_parameters
+
+
+def test_no_dialable_rung_for_the_generation_parameters_raises_its_own_rejection() -> None:
+    """Only a failover-only rung serves the caller's ``reasoning_effort``: the ranking
+    raises the unrestricted rung's own rejection (so admission tries the disclosed
+    coercion or names the field) instead of a failover-only route nothing may dial."""
+    base, _wires = _astra_route(("openai", "novita"))
+    route = _route((base.deployments[0], _failover_only(base.deployments[1])))
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://p.test"), _CLIENT),
+        _astra_profile("https://novita.test", sampling=True),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }
+    ).request
+    with pytest.raises(ProviderParameterError):
+        generation_parameter_indexes(route, wires, request)
+
+
+def test_a_failover_only_rung_never_vetoes_the_effort_snap_the_first_dial_needs() -> None:
+    """Only the failover-only rung offers ``xhigh``: the disclosed effort snap is searched
+    over the rungs that may take the first dial, so the unrestricted rung serves at its
+    nearest effort instead of the request being refused."""
+    base, _wires = _astra_route(("openai", "novita"))
+    route = _route((base.deployments[0], _failover_only(base.deployments[1])))
+    lead, _client = _astra_profile("https://openai.test", sampling=False)
+    failover, _client = _astra_profile("https://novita.test", sampling=False)
+    wires = (
+        (replace(lead, supported_reasoning_efforts=("low", "medium", "high")), _CLIENT),
+        (failover, _CLIENT),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "go on"}],
+            "stream": True,
+            "reasoning_effort": "xhigh",
+        }
+    ).request
+    narrowed, public, provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed)[0] == "openai"
+    assert eligible_ladder(narrowed, None)[0] == 0
+    assert provider.reasoning_effort == "high"
+    assert any(item.startswith("reasoning_effort->") for item in public.ignored_parameters)
+
+
+def test_the_coercion_probe_counts_the_parallel_tool_calls_last_resort() -> None:
+    """Only a failover-only rung honors ``parallel_tool_calls`` natively; admission then
+    emulates the control on the unrestricted rung, and the coercion probe agrees that the
+    candidate serves instead of skipping it for a weaker repair."""
+    lead = _astra_rung("openai", tools=True)
+    capabilities = lead.gateway.capabilities.model_copy(
+        update={"supports_parallel_tool_calls": False}
+    )
+    lead = lead.model_copy(
+        update={"gateway": lead.gateway.model_copy(update={"capabilities": capabilities})}
+    )
+    second = _failover_only(_astra_rung("openai", tools=True)).model_copy(
+        update={"deployment_id": "openai-two"}
+    )
+    route = _route((lead, second))
+    wires = (
+        _astra_profile("https://openai.test", sampling=True),
+        _astra_profile("https://openai-two.test", sampling=True),
+    )
+    request = _copilot_chat().model_copy(update={"parallel_tool_calls": False})
+    assert _candidate_serves(route, wires, request)
+    narrowed, _public, _provider, _recorded = _admit(route, wires, request)
+    assert eligible_ladder(narrowed, None)[0] == 0
+    assert _ids(narrowed)[0] == "openai"
+
+
+def _with_gateway_capabilities(
+    deployment: ExactModelDeployment, **updates: bool
+) -> ExactModelDeployment:
+    """The same rung with some gateway capability flags replaced."""
+    capabilities = deployment.gateway.capabilities.model_copy(update=updates)
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"capabilities": capabilities})}
+    )
+
+
+def test_a_failover_only_strict_tool_rung_never_blocks_the_strict_tools_coercion() -> None:
+    """Only a failover-only rung takes strict tools: the unrestricted rung still serves
+    after the permitted ``tools.strict->false`` disclosure instead of a refusal."""
+    lead = _with_gateway_capabilities(
+        _astra_rung("openai", tools=True), supports_strict_tools=False
+    )
+    second = _failover_only(
+        _with_gateway_capabilities(_astra_rung("openai", tools=True), supports_strict_tools=True)
+    ).model_copy(update={"deployment_id": "openai-two"})
+    route = _route((lead, second))
+    wires = (
+        _astra_profile("https://openai.test", sampling=True),
+        _astra_profile("https://openai-two.test", sampling=True),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "read it"}],
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "strict": True,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+        }
+    ).request
+    assert _candidate_serves(route, wires, request)
+    narrowed, public, provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed)[0] == "openai"
+    assert eligible_ladder(narrowed, None)[0] == 0
+    assert not any(tool.strict for tool in provider.tools)
+    assert STRICT_TOOLS_DISCLOSURE in public.ignored_parameters
+
+
+def test_the_first_dial_is_the_best_ranked_unrestricted_rung() -> None:
+    """A failover-only Responses rung wins the custom-grammar preference; among the
+    unrestricted rungs the one that keeps ``temperature`` takes the first dial and leads
+    the shared request's shaping, so the temperature is kept, not dropped for the first
+    serviceable rung or shaped for a rung that never dials first."""
+    plain, _client = _astra_profile("https://plain.test", sampling=False)
+    faithful, _client = _astra_profile("https://faithful.test", sampling=True)
+    responses = GatewayWireProfile(
+        dialect="openai_responses", url="https://responses.test/v1", model_id="gpt-6-astra"
+    )
+    base, _wires = _astra_route(("openai", "novita", "azure_openai"))
+    route = _route(
+        (
+            base.deployments[0],
+            _failover_only(base.deployments[1]),
+            base.deployments[2],
+        )
+    )
+    wires = ((plain, _CLIENT), (responses, _CLIENT), (faithful, _CLIENT))
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "run it"}],
+            "temperature": 0.2,
+            "tools": [
+                {
+                    "type": "custom",
+                    "custom": {
+                        "name": "code_exec",
+                        "format": {
+                            "type": "grammar",
+                            "grammar": {"syntax": "lark", "definition": "start: x"},
+                        },
+                    },
+                }
+            ],
+        }
+    ).request
+    indexes = generation_parameter_indexes(route, wires, request)
+    # The failover-only Responses rung ranked ahead of the first dial is left
+    # out, so the selected unrestricted rung also leads route-wide shaping.
+    assert indexes == (2,)
+    _public, provider = route_generation_parameter_requests(
+        tuple(wires[index][0] for index in indexes), request
+    )
+    assert provider.temperature == 0.2

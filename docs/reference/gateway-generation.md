@@ -39,8 +39,10 @@ Otherwise a lead rung that keeps the caller's `temperature` exactly but cannot e
 would win the ranking and be refused, although a later rung serves the schema (qwen3.8-27b,
 2026-10-17). When the lead is passed over the move is disclosed as
 `response_format->routed(structured_output_rung)` (`text.format->...` on Responses). A route
-with no structured-output rung keeps failing closed on the field. A continuation pinned to the
-rung that sealed its reasoning, and a caller-pinned `gateway.routing.route_id`, never move.
+with no structured-output rung keeps failing closed on the field. A caller-pinned
+`gateway.routing.route_id` never moves. A continuation pinned to the rung that sealed its
+reasoning keeps that rung first while it carries the feature; see the pinned-continuation note
+below for when it cannot.
 
 ## Tool and media routing
 
@@ -57,6 +59,29 @@ disclosed. A passed-over lead is disclosed as `tools->routed(tools_rung)`, or
 output narrows among the rungs tools kept, a request no rung can serve whole is refused on the
 feature the tool rungs lack (`response_format`), not on `tools`. A route with no rung for the
 feature keeps failing closed on it.
+
+The narrowing is the same on Chat Completions, Responses and Messages, streaming or not.
+Two edges are decided explicitly:
+
+- A continuation pinned to the rung that sealed its reasoning keeps that rung first through every
+  preference (sampling, thinking), but not past a content feature the issuer cannot carry
+  (tools, media, structured output, the 12-hour cache lifetime). Refusing would fail a turn
+  another rung serves, so the route narrows past the issuer: every surviving rung dispatches
+  without the issuer's sealed reasoning, exactly as on a failover past it, and the ledger records
+  the attempt's route reason as `reasoning_continuation_failover`. Such a stale pin is ordered
+  like an unpinned route, so a plaintext-reasoning carrier still leads the survivors. Without a
+  content feature the issuer is never dropped for a softer preference:
+  when another rung keeps the caller's `temperature` or `top_p` exactly and the issuer cannot,
+  the issuer still leads and the sampling adapts or drops on it, disclosed
+  (`temperature->dropped(unsupported_by_provider)`), because reasoning continuity outranks
+  sampling exactness.
+- A rung authored `failover_only_on` never takes a first dial. When the only rungs that carry the
+  feature are failover-only, the request is refused on the feature with the typed 400 (what the
+  dialable rungs lack), never sent to the failover rung and never failed as an internal error.
+  When an unrestricted rung carries it too, the failover-only rung stays on the route as a
+  successor behind the unrestricted first dial. The sampling ranking follows the same rule:
+  when only a failover-only rung keeps the caller's `temperature` or `top_p` exactly, the
+  unrestricted rung still takes the first dial and the sampling adapts or drops on it, disclosed.
 
 ## Output limits and context windows
 

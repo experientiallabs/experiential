@@ -172,3 +172,50 @@ def test_effort_request_keeps_a_reasoning_bedrock_claude_rung() -> None:
     ).request
     profiles = (relay, _bedrock_claude(reasoning=False), _bedrock_claude(reasoning=True))
     assert compatible_generation_parameter_profile_indexes(profiles, request) == (2,)
+
+
+def test_a_kept_rung_holds_the_most_exact_tier_that_contains_it() -> None:
+    """``keep`` (a live reasoning pin's issuer) is never ranked out for sampling."""
+    sampling = GatewayWireProfile(dialect="openai_compatible", url="https://n.test")
+    no_sampling = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://o.test",
+        supports_temperature=False,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "medium", "high"),
+        reasoning_effort="medium",
+    )
+    request = decode_chat(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "temperature": 0.2}
+    ).request
+    profiles = (no_sampling, sampling)
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+    assert compatible_generation_parameter_profile_indexes(profiles, request, keep=0) == (0, 1)
+    # A kept rung that is already in the exact tier changes nothing.
+    assert compatible_generation_parameter_profile_indexes(profiles, request, keep=1) == (1,)
+
+
+def test_a_kept_rung_that_cannot_serve_leaves_the_preferences_in_force() -> None:
+    """A ``keep`` rung that rejects the request outright ranks exactly as unkept: the
+    grammar-enforcing rung still outranks translation instead of sharing a route with it."""
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://p.test", model_id="m")
+    azure = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://azure.test/openai/v1",
+        model_id="gpt-5-nano",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "medium", "high"),
+    )
+    request = decode_chat(
+        {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_CUSTOM_TOOL],
+            "reasoning_effort": "high",
+        }
+    ).request
+    profiles = (plain, azure, _OPENAI_RESPONSES)
+    unkept = compatible_generation_parameter_profile_indexes(profiles, request)
+    assert compatible_generation_parameter_profile_indexes(profiles, request, keep=0) == unkept

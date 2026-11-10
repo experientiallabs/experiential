@@ -45,8 +45,20 @@ The hard features handled here are all decided by the decoded request alone:
   pre-GPT-5.6 model) is never asked. With no such rung the request is refused.
 
 When no rung carries a feature the route is left whole and the existing
-checks and disclosed coercions decide. A reasoning-pinned continuation whose
-issuing rung is still on the route, and a caller-pinned route, never move.
+checks and disclosed coercions decide. A narrowing that would keep only
+``failover_only_on`` rungs counts as no rung carrying the feature: such a rung
+never takes a first dial, so the route stays whole and the request is refused
+on the feature, never handed to a rung reserved for failover.
+
+A caller-pinned route (``gateway.routing.route_id``) never moves: the caller
+named the rung. A reasoning-pinned continuation keeps its issuing rung first
+through every preference here, but not past a content feature the issuing rung
+cannot carry (tools, media, structured output, the 12-hour cache lifetime):
+refusing would fail a request another rung serves, so the route narrows past
+the issuer, the pin goes stale and every surviving rung dispatches without the
+issuer's sealed reasoning, exactly as on a failover past it (the ledger records
+``reasoning_continuation_failover``). Thinking preferences never move a live
+pin: the issuer already reasoned.
 """
 
 from __future__ import annotations
@@ -56,12 +68,16 @@ from collections.abc import Callable
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_execution import select_route_deployments
+from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.generation_parameter_validation import (
     profile_reasoning_efforts,
     resolve_level_less_enable,
+)
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.protocol import NativeWireClient
 
@@ -207,6 +223,97 @@ def _reasoning_indexes(
     return reasoning
 
 
+def live_issuer_index(route: GatewayRoute) -> int | None:
+    """The route position of a live reasoning pin's issuing rung, else ``None``.
+
+    Live means the issuing rung is still on the route and the caller did not
+    pin a route of their own. Admission keeps that rung through every soft
+    preference (sampling exactness), so reasoning continuity wins and the
+    caller's sampling adapts or drops on it, disclosed, as on any rung that
+    cannot honor it.
+    """
+    if route.resolved_route_id is not None:
+        return None
+    pinned = route.reasoning_pinned_deployment_id
+    ids = [deployment.deployment_id for deployment in route.deployments]
+    return ids.index(pinned) if pinned in ids else None
+
+
+def first_dial_profiles(
+    route: GatewayRoute, resolved_wires: _ResolvedWires
+) -> tuple[GatewayWireProfile, ...]:
+    """Return the wire profiles of the rungs that may take the first dial.
+
+    A disclosed generation coercion is searched over these alone: a
+    ``failover_only_on`` rung that would accept the caller's value verbatim
+    never vetoes the repair an unrestricted rung needs. A route with no
+    unrestricted rung returns every profile (``require_unrestricted_rung``
+    names that case).
+    """
+    profiles = tuple(profile for profile, _client in resolved_wires)
+    dialable = tuple(
+        profile
+        for profile, deployment in zip(profiles, route.deployments, strict=True)
+        if rung_rules(deployment) is None
+    )
+    return dialable or profiles
+
+
+def generation_parameter_indexes(
+    route: GatewayRoute, resolved_wires: _ResolvedWires, request: GatewayRequest
+) -> tuple[int, ...]:
+    """Rank the route's rungs by generation-parameter exactness, keeping a first dial.
+
+    The ranking keeps a live reasoning pin's issuing rung in the most exact
+    tier that holds it (``live_issuer_index``). When the most exact tier would
+    keep only ``failover_only_on`` rungs, none of which may take the first
+    dial, the result is instead the most exact tier that holds the
+    unrestricted rung the normal ranking prefers among the unrestricted rungs:
+    what it cannot honor adapts or drops, disclosed, rather than the request
+    failing on a route that serves it. A failover-only rung ranked ahead of
+    that rung is left out, so the first dial also leads route-wide shaping.
+
+    Args:
+        route: The route ``resolved_wires`` is aligned with.
+        resolved_wires: Ordered wire profiles and clients per deployment.
+        request: The decoded request the ranking judges.
+
+    Returns:
+        Ordered route positions of the selected rungs.
+
+    Raises:
+        ProviderParameterError: No rung that may take the first dial can serve
+            the request's generation parameters (the first such rung's own
+            rejection, see ``compatible_generation_parameter_profile_indexes``).
+    """
+    profiles = tuple(profile for profile, _client in resolved_wires)
+    indexes = compatible_generation_parameter_profile_indexes(
+        profiles, request, keep=live_issuer_index(route)
+    )
+    dialable = [
+        index
+        for index, deployment in enumerate(route.deployments)
+        if rung_rules(deployment) is None
+    ]
+    if not dialable or any(index in dialable for index in indexes):
+        return indexes
+    # The first dial is the dialable rungs' own ranking leader, the one that
+    # best preserves the request. When none serves verbatim this raises its
+    # rejection, so admission tries the disclosed coercion (and otherwise names
+    # the field), never a route of failover-only rungs that fails internally.
+    ranked = compatible_generation_parameter_profile_indexes(
+        tuple(profiles[index] for index in dialable), request
+    )
+    lead = dialable[ranked[0]]
+    kept = compatible_generation_parameter_profile_indexes(profiles, request, keep=lead)
+    # Route-wide shaping reads the first kept rung as the lead (level-less
+    # reasoning defaults, lead-scoped disclosures), so a failover-only rung
+    # ranked ahead of the first dial is left out rather than shaping for it.
+    return tuple(
+        index for index in kept if index >= lead or rung_rules(route.deployments[index]) is None
+    )
+
+
 def narrow_to_capable_rungs(
     route: GatewayRoute, resolved_wires: _ResolvedWires, request: GatewayRequest
 ) -> tuple[GatewayRoute, _ResolvedWires, tuple[str, ...]]:
@@ -221,12 +328,11 @@ def narrow_to_capable_rungs(
         The narrowed route and wires plus the reorder disclosures, each
         recorded only when its feature passed over the lead rung. The inputs
         come back unchanged when the request asks for no hard feature, every
-        rung or no rung carries it, or the route is pinned to a live rung.
+        rung or no rung that may take a first dial carries it, or the caller
+        pinned the route. A live reasoning pin is kept unless its issuing rung
+        cannot carry a content feature the caller sent.
     """
-    pinned = route.reasoning_pinned_deployment_id
-    if route.resolved_route_id is not None or any(
-        deployment.deployment_id == pinned for deployment in route.deployments
-    ):
+    if route.resolved_route_id is not None:
         return route, resolved_wires, ()
     disclosures: list[str] = []
     if request.prompt_cache_ttl == "12h":
@@ -278,6 +384,9 @@ def narrow_to_capable_rungs(
             + STRUCTURED_OUTPUT_RUNG_SUFFIX,
             disclosures,
         )
+    if live_issuer_index(route) is not None:
+        # The issuing rung carries every content feature above; it leads.
+        return route, resolved_wires, tuple(disclosures)
     if requests_thinking(request):
         route, resolved_wires = _narrow(
             route,
@@ -306,8 +415,16 @@ def _narrow(
     disclosure: str,
     disclosures: list[str],
 ) -> tuple[GatewayRoute, _ResolvedWires]:
-    """Select ``indexes`` unless they keep every rung or none, disclosing a moved lead."""
-    if not indexes or len(indexes) == len(route.deployments):
+    """Select ``indexes`` unless they keep every rung or none, disclosing a moved lead.
+
+    A selection of ``failover_only_on`` rungs alone keeps none: no rung of it
+    may take the first dial.
+    """
+    if (
+        not indexes
+        or len(indexes) == len(route.deployments)
+        or all(rung_rules(route.deployments[index]) is not None for index in indexes)
+    ):
         return route, resolved_wires
     if indexes[0] != 0:
         disclosures.append(disclosure)
