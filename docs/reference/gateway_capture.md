@@ -89,11 +89,35 @@ probabilities too. Retention is bounded at 4 MiB per attempt, by the collector's
 response and pending budgets, and by the destination's record ceiling after the
 request and the largest admissible response; an overflow sets `truncated` and
 keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
-`nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
-channel, or a frame whose answer text (not typed thinking or reference parts)
-its records do not reproduce exactly (by their bytes, else their token text),
-is never a
-failure: it ends retention before that frame and marks the prefix `truncated`.
+`nul_replaced` (the token's `bytes` keep it exactly). Alignment is judged on the
+whole sequence: the records (by their bytes, else their token text) must spell
+the emitted reasoning text (`reasoning_content` / `reasoning` and typed thinking
+parts, when the provider prices reasoning tokens at all) followed by the answer
+text (not reference parts). Whether reasoning is priced is decided by the first
+reasoning frame (its own records, or records queued ahead of its text); records
+beside reasoning text after that verdict was no are a hole. Records may run
+ahead of the text by at most 1 KiB, because
+an OpenAI-compatible server detokenizes incrementally and can emit a token's text
+a frame late. Tokens that emit no text are kept at exactly two places: once
+before the first answer text (a template's end-of-thinking delimiter such as
+`</think>`), and on the frame that finishes (stop or end-of-turn tokens); a
+record from an earlier frame still unmatched at the finish, a token only partly
+emitted, a record with empty bytes anywhere else, or priced reasoning after the
+answer started is a hole. A first reasoning frame with records (its own, or queued ahead
+of it) keeps two readings, priced (the records spell the reasoning) and
+answer-only (the records must spell the answer), and an answer that opens with
+a strict prefix of the front token keeps both the delimiter and the partial
+token reading; each pair lasts until later text rules a reading out, and a
+frame is a hole only when no reading survives it. Any record, text, tool call or image after
+the finishing frame is a hole. So a
+self-hosted reasoning model (vLLM with a reasoning parser, speculative decoding
+included) retains its full token sequence, reasoning first. A malformed
+probability channel, text the records never spelled, a silent token anywhere
+else, or records on (or still waiting for text before) a tool-call or image frame is
+never a failure: it ends retention before that frame and marks the prefix `truncated`.
+A truncated prefix's last records (within the 1 KiB lead) may not have been
+confirmed by text yet. A stream that ends (`[DONE]`) with records still waiting
+for text, and no finishing frame to place them, is marked `truncated` too.
 Refusal text is not rendered on every surface, so a refusal frame ends
 retention the same way. The record's
 sidecar is reserved when injection is decided, so a dial is injected only when

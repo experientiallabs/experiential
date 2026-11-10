@@ -120,6 +120,7 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
         &FrameOutput {
             content: "a".into(),
             refusal: String::new(),
+            ..Default::default()
         },
     );
     probabilities.retain(
@@ -128,6 +129,7 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
         &FrameOutput {
             content: "a".into(),
             refusal: String::new(),
+            ..Default::default()
         },
     );
     let (taken, truncated) = probabilities.take().unwrap();
@@ -159,6 +161,7 @@ fn an_output_frame_without_probabilities_marks_the_sequence_incomplete() {
             &FrameOutput {
                 content: "a".into(),
                 refusal: String::new(),
+                ..Default::default()
             },
         );
         assert!(probabilities.take().unwrap().1);
@@ -213,6 +216,7 @@ fn records_on_the_wrong_channel_mark_the_sequence_incomplete() {
         &FrameOutput {
             content: "a".into(),
             refusal: String::new(),
+            ..Default::default()
         },
     );
     // The misaligned frame is never retained; retention ends before it.
@@ -244,6 +248,7 @@ fn records_must_reproduce_the_emitted_text_exactly() {
             &FrameOutput {
                 content: text.into(),
                 refusal: String::new(),
+                ..Default::default()
             },
         );
         probabilities.take().unwrap().1
@@ -275,16 +280,19 @@ fn misaligned_and_refusal_frames_end_retention_without_entering_it() {
     let output = |content: &str, refusal: &str| FrameOutput {
         content: content.into(),
         refusal: refusal.into(),
+        ..Default::default()
     };
     probabilities.retain(Some(&json!({"content":[one("a")]})), 0, &output("a", ""));
-    // Records spelling more than the frame emitted are not retained.
+    // Records may run ahead of the text (a held-back token), but text that
+    // then disagrees with them is a hole and is not retained.
     probabilities.retain(
         Some(&json!({"content":[one("b"), one("c")]})),
         0,
         &output("b", ""),
     );
+    probabilities.retain(Some(&json!({"content":[one("d")]})), 0, &output("xd", ""));
     let (taken, truncated) = probabilities.take().unwrap();
-    assert_eq!(taken.len(), 1);
+    assert_eq!(taken.len(), 2);
     assert!(truncated);
     let mut probabilities = ChatProbabilities::Capture(Buffer::default());
     probabilities.retain(Some(&json!({"refusal":[one("no")]})), 0, &output("", "no"));
@@ -316,6 +324,7 @@ fn each_record_is_checked_by_its_own_representation() {
             &FrameOutput {
                 content: text.into(),
                 refusal: String::new(),
+                ..Default::default()
             },
         );
         probabilities.take().unwrap().1
@@ -344,3 +353,8 @@ fn off_and_caller_states_never_capture() {
     assert!(!ChatProbabilities::Caller.captures());
     assert!(ChatProbabilities::Capture(Buffer::default()).captures());
 }
+
+// Whole-sequence alignment tests, kept beside this module so neither file
+// crosses the repository line limit.
+#[path = "logprobs_alignment_test.rs"]
+mod alignment;

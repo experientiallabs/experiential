@@ -183,35 +183,369 @@ pub(crate) fn may_be_refusal(failure: &Failure) -> bool {
             .is_none_or(|param| param == "logprobs" || param == "top_logprobs")
 }
 
-/// The answer text one frame emits on each channel (empty when none).
+/// The text one frame emits on each channel (empty when none), and the frame
+/// facts that decide where tokens which emit no text may sit.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FrameOutput {
     pub content: String,
     pub refusal: String,
+    /// Reasoning text the provider emitted in this frame (`reasoning_content`
+    /// or `reasoning`, then typed thinking parts). A self-hosted reasoning model (vLLM with a reasoning
+    /// parser) reports these tokens' probabilities on the `content` channel,
+    /// before the answer's.
+    pub reasoning: String,
+    /// The frame carries a finish reason: tokens after its text (a stop or
+    /// end-of-turn token the provider does not render) end the sequence.
+    pub finishes: bool,
+    /// The frame emits output this check cannot spell (tool or function call
+    /// arguments): any records on it are a hole, as before.
+    pub opaque: bool,
 }
 
-/// Whether a channel's records reproduce exactly the text it emitted, each
-/// record by its bytes when it carries them and by its token text otherwise.
-fn reproduces(records: Option<&Vec<TokenLogprob>>, text: &str) -> bool {
-    let mut produced = Vec::with_capacity(text.len());
-    for record in records.map_or(&[][..], Vec::as_slice) {
-        match &record.bytes {
-            Some(bytes) => produced.extend_from_slice(bytes),
-            None => produced.extend_from_slice(record.token.as_bytes()),
+fn record_bytes(record: &TokenLogprob) -> &[u8] {
+    record.bytes.as_deref().unwrap_or(record.token.as_bytes())
+}
+
+/// Bytes the records may run ahead of the emitted text. An OpenAI-compatible
+/// server detokenizes incrementally and may hold back a token's text (a quote,
+/// a space, a partial UTF-8 sequence) until the next frame, so alignment is
+/// judged on the whole sequence, not frame by frame; a lead past this bound is
+/// text the gateway never saw, a hole.
+const MAXIMUM_RECORD_LEAD_BYTES: usize = 1024;
+
+/// How one capture-only frame's records relate to the text emitted so far.
+#[derive(Debug, PartialEq, Eq)]
+enum Alignment {
+    /// The sequence still spells the emitted text: keep the frame.
+    Retain,
+    /// No records and no text that needed them.
+    Empty,
+    /// A missing, surplus or wrong-channel record: retention ends.
+    Hole,
+}
+
+/// Every reading of the attempt's sequence still consistent with the emitted
+/// text. Two decisions cannot always be made on the frame that raises them
+/// (whether reasoning is priced, and whether an answer opening with a prefix
+/// of the front token skips it as the delimiter), so each keeps both readings
+/// until later text rules one out. Each decision is taken at most once per
+/// stream, so at most four readings exist; identical readings merge.
+#[derive(Debug)]
+pub(crate) struct Readings(Vec<Position>);
+
+impl Default for Readings {
+    fn default() -> Self {
+        Self(vec![Position::default()])
+    }
+}
+
+impl Readings {
+    /// Align one frame under every reading, keeping those it does not break.
+    /// The frame is a hole only when no reading survives it.
+    fn align(&mut self, delta: &ChoiceLogprobsDelta, output: &FrameOutput) -> Alignment {
+        let mut survivors: Vec<Position> = Vec::new();
+        let mut alignment = Alignment::Hole;
+        for reading in std::mem::take(&mut self.0) {
+            for (candidate, result) in reading.branches(delta, output) {
+                if result != Alignment::Hole && !survivors.contains(&candidate) {
+                    alignment = result;
+                    survivors.push(candidate);
+                }
+            }
+        }
+        self.0 = survivors;
+        alignment
+    }
+
+    /// Whether every surviving reading still holds records no text spelled.
+    fn all_pending(&self) -> bool {
+        self.0.iter().all(|reading| !reading.pending.is_empty())
+    }
+}
+
+/// One reading's alignment state: record bytes not yet matched by emitted
+/// text, token by token, and where in the answer the sequence stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Position {
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// Bytes of the front pending token already matched.
+    offset: usize,
+    pending_bytes: usize,
+    /// Answer (content) text has been emitted.
+    answer_started: bool,
+    /// The one silent delimiter before the answer has been skipped.
+    delimiter_seen: bool,
+    /// Whether this provider prices reasoning tokens (decided by the first
+    /// reasoning frame: its own records, or records queued ahead of its text).
+    reasoning_priced: Option<bool>,
+    /// A finishing frame ended the sequence.
+    finished: bool,
+}
+
+impl Position {
+    /// Drop the front pending token, whole.
+    fn pop_token(&mut self) {
+        if let Some(token) = self.pending.pop_front() {
+            self.pending_bytes -= token.len();
+        }
+        self.offset = 0;
+    }
+
+    /// Skip the front pending token as the one silent delimiter.
+    fn skip_delimiter(&mut self) {
+        self.pop_token();
+        self.delimiter_seen = true;
+    }
+
+    /// Match `text` against the front of the pending record bytes. With
+    /// `delimiter`, one whole token that does not start the text may be
+    /// skipped first (a template's end-of-thinking token, rendered nowhere).
+    /// `span_skip` picks the reading where text that is a strict prefix of
+    /// the front token skips it as that delimiter.
+    fn consume(&mut self, text: &[u8], delimiter: bool, span_skip: bool) -> bool {
+        let mut position = 0;
+        let mut may_skip = delimiter;
+        if may_skip && span_skip && self.offset == 0 && self.delimiter_spans(text) {
+            // The answer opens with a strict prefix of the pending delimiter
+            // (`<` before `</think>`) that the next tokens spell whole: the
+            // front token is the silent delimiter, not a token emitted in part.
+            self.skip_delimiter();
+            may_skip = false;
+        }
+        while position < text.len() {
+            let Some(front) = self.pending.front() else {
+                // Text the records never spelled.
+                return false;
+            };
+            if front.is_empty() {
+                // A token with no bytes inside text: only the delimiter may
+                // be silent, and only where the answer opens.
+                if may_skip && position == 0 {
+                    self.skip_delimiter();
+                    may_skip = false;
+                    continue;
+                }
+                return false;
+            }
+            let rest = &front[self.offset..];
+            let take = rest.len().min(text.len() - position);
+            if rest[..take] != text[position..position + take] {
+                if may_skip && self.offset == 0 && position == 0 {
+                    self.skip_delimiter();
+                    may_skip = false;
+                    continue;
+                }
+                return false;
+            }
+            position += take;
+            self.offset += take;
+            if self.offset == front.len() {
+                self.pop_token();
+            }
+        }
+        true
+    }
+
+    /// Whether `text` is a strict prefix of the front pending token while the
+    /// tokens after it spell `text` whole, so the front token is a silent
+    /// delimiter rather than a token whose text is only partly emitted.
+    fn delimiter_spans(&self, text: &[u8]) -> bool {
+        let Some(front) = self.pending.front() else {
+            return false;
+        };
+        if text.is_empty() || text.len() >= front.len() || !front.starts_with(text) {
+            return false;
+        }
+        let mut position = 0;
+        for token in self.pending.iter().skip(1) {
+            if token.is_empty() {
+                return false;
+            }
+            let take = token.len().min(text.len() - position);
+            if token[..take] != text[position..position + take] {
+                return false;
+            }
+            position += take;
+            if position == text.len() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Align one frame: append its records, then match its reasoning text and
+    /// its answer text, in that order. Tokens that emit no text are accepted at
+    /// two places only: once before the first answer text (the delimiter), and
+    /// on the finishing frame itself (stop or end-of-turn tokens). Returns
+    /// every reading of this position after the frame, with its result.
+    fn branches(
+        mut self,
+        delta: &ChoiceLogprobsDelta,
+        output: &FrameOutput,
+    ) -> Vec<(Self, Alignment)> {
+        let (content, refusal) = delta.logprobs.as_ref().map_or((None, None), |logprobs| {
+            (logprobs.content.as_deref(), logprobs.refusal.as_deref())
+        });
+        let records = content.unwrap_or(&[]);
+        if refusal.is_some_and(|r| !r.is_empty())
+            || (output.opaque && (!records.is_empty() || !self.pending.is_empty()))
+        {
+            // Refusal records beside answer text are on the wrong channel; tool
+            // call arguments and images are output this check cannot spell, so
+            // records on the frame or still waiting for text cannot be placed.
+            return Vec::new();
+        }
+        if self.finished
+            && (output.opaque
+                || !records.is_empty()
+                || !output.content.is_empty()
+                || !output.reasoning.is_empty())
+        {
+            // The sequence ended on its finishing frame; nothing follows it.
+            return Vec::new();
+        }
+        if self.reasoning_priced.is_none()
+            && !output.reasoning.is_empty()
+            && (!records.is_empty() || !self.pending.is_empty())
+        {
+            // The first reasoning frame's records (its own, or queued ahead of
+            // it) may be reasoning tokens, or answer tokens when the provider
+            // does not price reasoning: both readings continue.
+            let mut priced = self.clone();
+            priced.reasoning_priced = Some(true);
+            let mut readings = priced.split_on_delimiter(delta, output, false);
+            // Unpriced: the records lead an answer and must spell it whole
+            // when it arrives, with no silent delimiter among them.
+            self.reasoning_priced = Some(false);
+            self.delimiter_seen = true;
+            if !(output.finishes && output.content.is_empty()) {
+                readings.extend(self.split_on_delimiter(delta, output, true));
+            }
+            return readings;
+        }
+        self.split_on_delimiter(delta, output, false)
+    }
+
+    /// Align the frame, keeping both readings of an answer that opens with a
+    /// strict prefix of the front token: the delimiter skipped, or that token
+    /// emitted in part.
+    fn split_on_delimiter(
+        mut self,
+        delta: &ChoiceLogprobsDelta,
+        output: &FrameOutput,
+        answer_only: bool,
+    ) -> Vec<(Self, Alignment)> {
+        let mut readings = Vec::with_capacity(2);
+        if !self.answer_started && !self.delimiter_seen && !output.content.is_empty() {
+            let mut spanning = self.clone();
+            let alignment = spanning.align_frame(delta, output, answer_only, true);
+            readings.push((spanning, alignment));
+        }
+        let alignment = self.align_frame(delta, output, answer_only, false);
+        readings.push((self, alignment));
+        readings
+    }
+
+    /// Align one frame under the current pricing verdict. `answer_only` marks
+    /// the frame that just decided the reasoning is unpriced: its records lead
+    /// the answer rather than sitting beside unpriced reasoning. `span_skip`
+    /// picks the delimiter reading of an answer opening with a prefix of the
+    /// front token.
+    fn align_frame(
+        &mut self,
+        delta: &ChoiceLogprobsDelta,
+        output: &FrameOutput,
+        answer_only: bool,
+        span_skip: bool,
+    ) -> Alignment {
+        let records = delta
+            .logprobs
+            .as_ref()
+            .and_then(|logprobs| logprobs.content.as_deref())
+            .unwrap_or(&[]);
+        if !output.reasoning.is_empty() && self.reasoning_priced.is_none() {
+            // Records that arrived on earlier text-less frames (a token whose
+            // text the detokenizer held back) price the reasoning too.
+            self.reasoning_priced = Some(!records.is_empty() || !self.pending.is_empty());
+        }
+        if !output.reasoning.is_empty() {
+            match self.reasoning_priced {
+                // Records beside reasoning text, on this frame or queued ahead
+                // of it, once the reasoning was found unpriced: the reasoning
+                // before them was never matched, so the sequence cannot be
+                // shown whole.
+                Some(false)
+                    if !answer_only
+                        && output.content.is_empty()
+                        && (!records.is_empty() || !self.pending.is_empty()) =>
+                {
+                    return Alignment::Hole;
+                }
+                // Priced reasoning after the answer started is out of order.
+                Some(true) if self.answer_started => return Alignment::Hole,
+                _ => {}
+            }
+        }
+        if records.is_empty() && output.content.is_empty() && !output.finishes {
+            // Reasoning text alone is matched only when the provider prices it.
+            if self.reasoning_priced == Some(true) && !output.reasoning.is_empty() {
+                return if self.consume(output.reasoning.as_bytes(), false, false) {
+                    Alignment::Empty
+                } else {
+                    Alignment::Hole
+                };
+            }
+            return Alignment::Empty;
+        }
+        // A token with no bytes stays in the queue as an empty entry, so its
+        // position decides: the delimiter where the answer opens, or a stop
+        // token after the finishing frame's text, else a hole.
+        for record in records {
+            let bytes = record_bytes(record);
+            self.pending_bytes += bytes.len();
+            self.pending.push_back(bytes.to_vec());
+        }
+        let added = records.len();
+        if self.reasoning_priced == Some(true)
+            && !self.consume(output.reasoning.as_bytes(), false, false)
+        {
+            return Alignment::Hole;
+        }
+        if !output.content.is_empty() {
+            // Under an unpriced verdict a frame that still carries reasoning
+            // text cannot spend the delimiter: a token skipped there could be
+            // that reasoning's own.
+            let unpriced_reasoning =
+                self.reasoning_priced == Some(false) && !output.reasoning.is_empty();
+            let delimiter = !self.answer_started && !self.delimiter_seen && !unpriced_reasoning;
+            if !self.consume(output.content.as_bytes(), delimiter, span_skip) {
+                return Alignment::Hole;
+            }
+            self.answer_started = true;
+        }
+        if output.finishes {
+            // Silent stop tokens sit on the finishing frame itself, whole. A
+            // token only partly emitted, or a record from an earlier frame
+            // still unmatched, never spelled its text, unless it is the one
+            // delimiter an answer never followed.
+            let earlier = self.pending.len().saturating_sub(added);
+            let delimiter = usize::from(!self.answer_started && !self.delimiter_seen);
+            if self.offset != 0 || earlier > delimiter {
+                return Alignment::Hole;
+            }
+            self.pending.clear();
+            self.pending_bytes = 0;
+            self.offset = 0;
+            self.finished = true;
+        } else if self.pending_bytes - self.offset > MAXIMUM_RECORD_LEAD_BYTES {
+            return Alignment::Hole;
+        }
+        if records.is_empty() {
+            Alignment::Empty
+        } else {
+            Alignment::Retain
         }
     }
-    produced == text.as_bytes()
-}
-
-/// Whether the frame has any records, and whether they cover every channel's
-/// emitted text exactly (a missing, partial or wrong-channel record does not).
-fn covers(delta: &ChoiceLogprobsDelta, output: &FrameOutput) -> (bool, bool) {
-    let (content, refusal) = delta.logprobs.as_ref().map_or((None, None), |logprobs| {
-        (logprobs.content.as_ref(), logprobs.refusal.as_ref())
-    });
-    let any = content.is_some_and(|r| !r.is_empty()) || refusal.is_some_and(|r| !r.is_empty());
-    let complete = reproduces(content, &output.content) && reproduces(refusal, &output.refusal);
-    (any, complete)
 }
 
 /// How a normalizer treats Chat probabilities on its wire.
@@ -260,16 +594,33 @@ impl ChatProbabilities {
                 // captured answer; otherwise retention ends before it. Refusal
                 // text is not rendered on every surface (Messages drops it), so
                 // a refusal frame always ends retention.
-                Ok(Some(delta)) if output.refusal.is_empty() => match covers(&delta, output) {
-                    (true, true) => buffer.push(delta),
-                    (false, true) => {}
-                    (_, false) => buffer.truncated = true,
-                },
-                Ok(Some(_)) => buffer.truncated = true,
-                Ok(None) => {
-                    buffer.truncated |= !output.content.is_empty() || !output.refusal.is_empty();
+                // Once retention has ended, later frames are not aligned:
+                // nothing they add could enter the record.
+                _ if buffer.truncated => {}
+                Ok(parsed) if output.refusal.is_empty() => {
+                    let delta = parsed.unwrap_or(ChoiceLogprobsDelta {
+                        choice_index,
+                        logprobs: None,
+                    });
+                    match buffer.readings.align(&delta, output) {
+                        Alignment::Retain => buffer.push(delta),
+                        Alignment::Empty => {}
+                        Alignment::Hole => buffer.truncated = true,
+                    }
                 }
+                Ok(_) => buffer.truncated = true,
                 Err(_) => buffer.truncated = true,
+            }
+        }
+    }
+
+    /// The stream ended (`[DONE]`): records still waiting for text never
+    /// spelled any, so a sequence that did not finish on a finishing frame
+    /// is incomplete.
+    pub(crate) fn end_stream(&mut self) {
+        if let Self::Capture(buffer) = self {
+            if buffer.readings.all_pending() {
+                buffer.truncated = true;
             }
         }
     }
@@ -342,6 +693,8 @@ pub(crate) struct Buffer {
     pub deltas: Vec<ChoiceLogprobsDelta>,
     pub bytes: usize,
     pub truncated: bool,
+    /// Alignment readings across the attempt's frames.
+    pub readings: Readings,
 }
 
 impl Buffer {
