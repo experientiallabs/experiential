@@ -7,11 +7,14 @@ injected model client. A saved branch replays without opening an environment or 
 an interrupted branch is retained as outcome-unknown and is never silently rerolled.
 """
 
-from collections.abc import Callable, Iterable
-from contextlib import AbstractContextManager
+import threading
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar, copy_context
 from datetime import UTC, datetime
 from operator import not_
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 from pydantic import Field, model_validator
 
@@ -513,8 +516,8 @@ def run_continuation_study(
             code_revision,
         )
         registration = artifact_input(store.read(identity).manifest)
-        branches = []
-        for index in range(spec.repeats):
+
+        def one(index: int) -> ContinuationBranch:
             branch_id = f"{identity}-branch-{index}"
             if store.exists(branch_id):
                 branch = ContinuationBranch.model_validate_json(
@@ -556,19 +559,20 @@ def run_continuation_study(
                 )
             else:
                 _save(store, branch_id + "-intent", spec, (registration,), code_revision)
-                branch = _run_branch(
-                    index,
-                    checkpoint,
-                    actor,
-                    model,
-                    world,
-                    probe,
-                    spec,
-                    store,
-                    code_revision,
-                    branch_id,
-                    decider,
-                )
+                with _rollout_slot():
+                    branch = _run_branch(
+                        index,
+                        checkpoint,
+                        actor,
+                        model,
+                        world,
+                        probe,
+                        spec,
+                        store,
+                        code_revision,
+                        branch_id,
+                        decider,
+                    )
                 _save(
                     store,
                     branch_id,
@@ -581,7 +585,20 @@ def run_continuation_study(
                     ),
                     code_revision,
                 )
-            branches.append(branch)
+            return branch
+
+        workers = min(_WORKERS.get(), spec.repeats)
+        branches: list[ContinuationBranch]
+        if workers <= 1:
+            branches = [one(index) for index in range(spec.repeats)]
+        else:
+            # Each branch restores its own session from the checkpoint and saves under its
+            # own index, so identities and results do not depend on scheduling order.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(copy_context().run, one, index) for index in range(spec.repeats)
+                ]
+                branches = [cast(ContinuationBranch, future.result()) for future in futures]
         result = ContinuationStudy(spec=spec, branches=tuple(branches))
         inputs = tuple(
             artifact_input(store.read(f"{identity}-branch-{i}").manifest)
@@ -589,6 +606,65 @@ def run_continuation_study(
         )
         _save(store, result_id, result, (registration, *inputs), code_revision)
         return result
+
+
+_WORKERS: ContextVar[int] = ContextVar("continuation_study_workers", default=1)
+"""Branches of one study run at once in this context."""
+
+_GATE_LOCK = threading.Lock()
+_GATE: list[threading.BoundedSemaphore] = []
+"""The installed process-wide bound on running rollouts, outermost first."""
+
+
+@contextmanager
+def study_workers(workers: int) -> Iterator[None]:
+    """Run up to ``workers`` branches of each study at once inside this block.
+
+    Raises:
+        ValueError: The worker count is not positive.
+    """
+    if workers < 1:
+        raise ValueError("study workers must be positive")
+    token = _WORKERS.set(workers)
+    try:
+        yield
+    finally:
+        _WORKERS.reset(token)
+
+
+@contextmanager
+def rollout_gate(limit: int) -> Iterator[None]:
+    """Bound how many rollouts run at once across every study, in every thread.
+
+    One process-wide semaphore, not nested executors: an inner gate inside an installed one
+    keeps the outer bound.
+
+    Raises:
+        ValueError: The limit is not positive.
+    """
+    if limit < 1:
+        raise ValueError("the rollout bound must be positive")
+    with _GATE_LOCK:
+        installed = not _GATE
+        if installed:
+            _GATE.append(threading.BoundedSemaphore(limit))
+    try:
+        yield
+    finally:
+        if installed:
+            with _GATE_LOCK:
+                _GATE.clear()
+
+
+@contextmanager
+def _rollout_slot() -> Iterator[None]:
+    """Hold one slot of the installed rollout gate, if any, while a branch runs."""
+    gate = _GATE[0] if _GATE else None
+    if gate is None:
+        yield
+        return
+    with gate:
+        yield
 
 
 def _run_branch(

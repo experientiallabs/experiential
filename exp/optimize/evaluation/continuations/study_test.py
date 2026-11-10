@@ -895,3 +895,77 @@ def test_actor_budget_exhaustion_is_counted_apart_from_other_unknowns(tmp_path: 
     assert (metrics["planned"], metrics["assessable"], metrics["unassessable"]) == (5, 1, 4)
     assert metrics["actor_budget_exhausted"] == 3
     assert metrics["actor_budget_exhausted_share"] == 0.6
+
+
+class _StatelessModel:
+    """Answers from the request alone: a tool call first, then done; records peak concurrency."""
+
+    def __init__(self, first: ToolCall) -> None:
+        import threading
+
+        self.first, self.active, self.peak = first, 0, 0
+        self.lock = threading.Lock()
+        self.requests: list[ModelRequest] = []
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Hold the call briefly so concurrent branches overlap."""
+        import time
+
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            self.requests.append(request)
+        time.sleep(0.05)
+        with self.lock:
+            self.active -= 1
+        if any(message.role == "tool" for message in request.messages):
+            return _response(AssistantAction(content="done"))
+        return _response(AssistantAction(tool_calls=(self.first,)))
+
+
+def test_parallel_branches_match_sequential_ones_under_the_rollout_bound(tmp_path: Path) -> None:
+    """Three workers under a bound of two: same branches as one worker, never three at once."""
+    from exp.optimize.evaluation.continuations.study import rollout_gate, study_workers
+
+    case = workbook_case()
+    results = []
+    peaks = []
+    for name, workers in (("serial", 1), ("parallel", 3)):
+        store = ArtifactStore(ProjectPaths(tmp_path / name, "case"))
+        checkpoint, actor = capsule(store)
+        ref = persist_continuation_checkpoint(
+            store, checkpoint, created_at=datetime.now(UTC), code_revision="test"
+        )
+        spec = ContinuationStudySpec(
+            checkpoint=ref,
+            actor_model=_response(AssistantAction(content="done")).model,
+            verifier=TaskVerifier(
+                description="Delete one data row.",
+                outcome_schema={},
+                required_paths=("/final_state/rows",),
+                rules=(OutcomeRule(path="/final_state/rows", operator="equals", value=6),),
+            ),
+            probe_sha256=sha256_json({"probe": "xlsx-row-count-v1"}),
+            repeats=4,
+            selector="parallel branches",
+        )
+        model = _StatelessModel(case.first)
+        with study_workers(workers), rollout_gate(2):
+            result = run_continuation_study(
+                store, spec, actor=actor, model=model, world=workbook_runtime(checkpoint.world),
+                probe=probe, probe_sha256=spec.probe_sha256, code_revision="test",
+            )  # fmt: skip
+        results.append(result)
+        peaks.append(model.peak)
+    serial, parallel = results
+    assert [b.index for b in parallel.branches] == [0, 1, 2, 3]
+
+    def grades(study: ContinuationStudy) -> list[tuple[str, str | None]]:
+        return [
+            (b.status, None if b.assessment is None else b.assessment.status)
+            for b in study.branches
+        ]
+
+    assert grades(parallel) == grades(serial)
+    assert parallel.metrics()["successes"] == serial.metrics()["successes"] == 4
+    assert peaks[0] == 1 and peaks[1] == 2

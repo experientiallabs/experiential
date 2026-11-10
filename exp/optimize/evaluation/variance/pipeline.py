@@ -59,6 +59,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.continuations.study import rollout_gate, study_workers
 from exp.optimize.evaluation.variance.bootstrap import resolve_bootstrap
 from exp.optimize.evaluation.variance.pipeline_build import BUILD_STAGE
 from exp.optimize.evaluation.variance.pipeline_families import FAMILIES_STAGE
@@ -214,10 +215,16 @@ def run_decision_variance(
                 )
                 logger.info("decision-variance run stopped: %s", reason)
                 return PipelineReport(run=run, plan=plan, stages=tuple(results), stopped=reason)
-            saved = _execute(
-                project, spec, row, bound[row.stage], records, references, code_revision,
-                dependencies or StageDependencies(),
-            )  # fmt: skip
+            # A study runs up to ``mining.workers`` attempts at once; every rollout of the run
+            # shares one bound of ``mining.active_rollouts``.
+            with (
+                study_workers(spec.mining.workers),
+                rollout_gate(spec.mining.active_rollouts),
+            ):
+                saved = _execute(
+                    project, spec, row, bound[row.stage], records, references, code_revision,
+                    dependencies or StageDependencies(),
+                )  # fmt: skip
             spent += saved.usage.accounted_usd or 0.0
             replayed = False
         else:
