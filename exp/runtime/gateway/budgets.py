@@ -149,12 +149,26 @@ class BudgetReservationRejected(ValueError):
         scope_kind: BudgetScopeKind,
         reason: str,
         binding: BudgetRefusalBinding | None = None,
+        public_message: str | None = None,
     ) -> None:
-        """Create a rejection; only a matching atomic binding permits scoped continuation."""
+        """Create a rejection; only a matching atomic binding permits scoped continuation.
+
+        Args:
+            scope_kind: The scope of the limit that refused.
+            reason: The ledger's own reason; never shown to the caller.
+            binding: The atomic refusal decision, when it permits continuation.
+            public_message: A complete sentence the ledger vouches is safe to
+                show the caller and to record as the request's terminal
+                message: what refused and what to do about it. Without one
+                the gateway answers its own per-scope monthly budget sentence.
+        """
         if binding is not None and binding.scope.kind != scope_kind:
             raise ValueError("budget refusal binding kind differs from its rejection")
+        if public_message is not None and not 1 <= len(public_message) <= 2_048:
+            raise ValueError("budget refusal public message must be 1 to 2048 characters")
         self.scope_kind = scope_kind
         self.binding = binding
+        self.public_message = public_message
         super().__init__(reason)
 
 
