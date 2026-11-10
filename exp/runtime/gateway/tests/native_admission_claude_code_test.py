@@ -5,9 +5,9 @@ Pins the behavior youtop.ai's Claude Code and opencode sessions hit on
 deepseek-v4.1-flash-uncensored, a ``none/low/high/max`` ladder): an effort the
 route cannot carry snaps to the nearest tier, a budget maps onto the ladder,
 and Claude Code history the provider cannot carry is dropped or folded, each
-disclosed through ``x-experiential-ignored-parameters``. Content the model
-would need to see (an image or PDF in a user turn on a text-only lane) still
-refuses by name.
+disclosed through ``x-experiential-ignored-parameters``. A PDF in a user turn
+on a text-only lane still refuses by name; an image beside caller text becomes
+a disclosed notice asking the model to tell the user.
 """
 
 from __future__ import annotations
@@ -28,6 +28,10 @@ from exp.runtime.gateway.native_admission_test import (
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.dialect_dispatch import (
+    IMAGE_INPUT_DEFAULT_NOTICE,
+    IMAGE_INPUT_DROP_DISCLOSURE,
+)
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 
 _PNG = (
@@ -210,16 +214,23 @@ def test_claude_code_history_the_lane_cannot_carry_degrades_disclosed(
     assert disclosure in public.ignored_parameters
 
 
+def test_user_image_a_text_only_lane_cannot_see_becomes_a_disclosed_notice() -> None:
+    """An image beside caller text is never silently dropped: the latest turn's
+    image becomes a notice asking the model to tell the user, disclosed."""
+    block: JsonObject = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": _PNG},
+    }
+    messages = [{"role": "user", "content": [block, {"type": "text", "text": "what is this"}]}]
+    public, provider = _admit(_body(messages=messages))
+    assert IMAGE_INPUT_DROP_DISCLOSURE in public.ignored_parameters
+    assert provider.messages[-1].content == IMAGE_INPUT_DEFAULT_NOTICE + "what is this"
+    assert provider.images == ()
+
+
 @pytest.mark.parametrize(
     ("block", "capability"),
     [
-        (
-            {
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": _PNG},
-            },
-            "image_input",
-        ),
         (
             {
                 "type": "document",
@@ -236,7 +247,7 @@ def test_claude_code_history_the_lane_cannot_carry_degrades_disclosed(
 def test_user_content_a_text_only_lane_cannot_see_still_refuses(
     block: JsonObject, capability: str
 ) -> None:
-    """An image or PDF the caller asks about is never silently dropped."""
+    """A PDF the caller asks about is never silently dropped."""
     messages = [{"role": "user", "content": [block, {"type": "text", "text": "what is this"}]}]
     with pytest.raises(ProviderCapabilityError) as raised:
         _admit(_body(messages=messages))

@@ -950,6 +950,9 @@ class AuthorizationSnapshot(ClientAttribution):
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
         prompt_caching_disabled: The org turned prompt caching off (prompt_caching.py).
         requested_route_id: Optional public selector, excluded from durable serialization.
+        image_input_notice: Host per-model copy the model is asked to tell the user when a
+            latest-turn image degrades on a text-only route; request-time, never a catalog
+            input, and excluded from durable serialization.
     """
 
     request_id: RequestId
@@ -990,3 +993,4 @@ class AuthorizationSnapshot(ClientAttribution):
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
     prompt_caching_disabled: bool = False
+    image_input_notice: str | None = Field(default=None, max_length=1_024, exclude=True)

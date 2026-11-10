@@ -30,7 +30,9 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_request
 from exp.runtime.models.providers.dialect_dispatch import (
+    IMAGE_INPUT_DROP_DISCLOSURE,
     TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    strip_message_images,
     strip_tool_result_documents,
 )
 from exp.runtime.models.providers.errors import (
@@ -734,7 +736,9 @@ def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject 
     return {**context_management, "edits": retained}
 
 
-def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
+def coerce_capability(
+    capability: str, request: GatewayRequest, image_input_notice: str | None = None
+) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
     Four coercions exist, all only here (after every rung declined the
@@ -744,36 +748,44 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
     structural guarantee the same way (the model still sees the tools and the
     prompt, so it usually calls one, but nothing forces it); a named
     rejection instead would fail every forced-choice request against a model
-    the provider serves fine under ``auto``. Dropping ``service_tier``
-    changes pricing and latency
-    semantics, which the caller can act on only when told, so the drop is
-    disclosed rather than silent. Images inside TOOL results degrade to
-    placeholder text on an image-incapable route because the block is baked
-    into the caller's history and a rejection wedges the whole session; a
-    top-level user image keeps the fail-closed contract (the caller can
-    re-send it), so ``image_input`` coerces only when every image in the
-    request lives in a tool message; ``pdf_input`` and ``pdf_url_input``
-    follow the same rule for documents a tool returned (Claude Code's Read on
-    a PDF). Every other capability names a feature with no approximation and
-    stays fail-closed.
+    the provider serves fine under ``auto``. Dropping ``service_tier`` changes
+    pricing and latency semantics, which the caller can act on only when told,
+    so the drop is disclosed rather than silent. Images degrade to placeholder
+    text on an image-incapable route (a screenshot in history wedges every
+    later turn when refused; a tool screenshot always, a caller-turn image only
+    beside caller text somewhere in the request); ``pdf_input`` and
+    ``pdf_url_input`` degrade only documents a tool returned. Every other
+    capability names a feature with no approximation and stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
         request: Decoded request no rung could preserve.
+        image_input_notice: Host per-model copy for the latest-turn image notice.
 
     Returns:
         The disclosed substitution to retry with, or ``None`` when the
         capability cannot be coerced.
     """
     if capability == "image_input":
-        if any(message.role != "tool" and message.images for message in request.messages):
+        pasted = any(message.role != "tool" and message.images for message in request.messages)
+        if pasted and not any(
+            message.role in ("user", "assistant", "tool") and (message.content or "").strip()
+            for message in request.messages
+        ):
             return None
-        stripped = strip_tool_result_images(request.messages)
-        if stripped is None:
+        disclosures: list[str] = []
+        messages = request.messages
+        if (tool_stripped := strip_tool_result_images(messages)) is not None:
+            messages = tool_stripped
+            disclosures.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
+        if (stripped := strip_message_images(messages, image_input_notice)) is not None:
+            messages = stripped
+            disclosures.append(IMAGE_INPUT_DROP_DISCLOSURE)
+        if not disclosures:
             return None
         return RequestCoercion(
-            request=request.model_copy(update={"messages": stripped}),
-            disclosures=(TOOL_RESULT_IMAGE_DROP_DISCLOSURE,),
+            request=request.model_copy(update={"messages": messages}),
+            disclosures=tuple(disclosures),
         )
     if capability in ("pdf_input", "pdf_url_input"):
         if any(message.role != "tool" and message.documents for message in request.messages):
@@ -825,6 +837,7 @@ def coerce_route_rejections(
     errors: Sequence[ProviderParameterError | ProviderCapabilityError],
     deployment_count: int,
     request: GatewayRequest,
+    image_input_notice: str | None = None,
 ) -> RequestCoercion | None:
     """Pick the one disclosed coercion a set of per-rung rejections allows.
 
@@ -841,6 +854,7 @@ def coerce_route_rejections(
         errors: One rejection per declined deployment, in route order.
         deployment_count: Number of deployments the route offered.
         request: Decoded request no rung could preserve.
+        image_input_notice: Host per-model copy for the latest-turn image notice.
 
     Returns:
         The disclosed substitution to retry with, or ``None`` when nothing
@@ -848,7 +862,7 @@ def coerce_route_rejections(
     """
     capability = route_wide_capability(errors, deployment_count)
     if capability is not None:
-        return coerce_capability(capability, request)
+        return coerce_capability(capability, request, image_input_notice)
     if any(
         isinstance(error, ProviderCapabilityError) and error.capability == "service_tier"
         for error in errors
