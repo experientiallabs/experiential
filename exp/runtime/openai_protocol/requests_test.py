@@ -465,6 +465,99 @@ def test_chat_decoder_accepts_a_verbatim_litellm_message_dump() -> None:
     assert empty.request.messages[1].provider_specific_fields is None
 
 
+def test_chat_decoder_drops_populated_litellm_reasoning_carriers_with_disclosure() -> None:
+    """LiteLLM's populated ``thinking_blocks`` / ``reasoning_items`` decode and drop.
+
+    With a reasoning model LiteLLM fills ``thinking_blocks`` (LiteLLM's
+    ``ChatCompletionThinkingBlock`` and ``ChatCompletionRedactedThinkingBlock``)
+    or ``reasoning_items``, and an agent loop echoes the dump on every turn, so
+    a rejection wedges the session. The blocks are never forwarded; the
+    turn's ``reasoning_content`` still replays, and the drop is disclosed.
+    """
+    decoded = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "Reply with a command."},
+                {
+                    "role": "assistant",
+                    "content": '{"command": "ls"}',
+                    "reasoning_content": "The user wants a listing.",
+                    "thinking_blocks": [
+                        {
+                            "type": "thinking",
+                            "thinking": "The user wants a listing.",
+                            "signature": "EqoBCkgIARABGAIiQ...",
+                        },
+                        {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix..."},
+                        # LiteLLM's non-streaming Bedrock Converse path omits ``thinking``.
+                        {"type": "thinking", "signature": "EqoBCkgIARABGAIiQ..."},
+                    ],
+                    "reasoning_items": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "encrypted_content": "gAAAAB...",
+                            "summary": [{"type": "summary_text", "text": "Listing."}],
+                        }
+                    ],
+                    "provider_specific_fields": {},
+                    "images": [],
+                },
+                {"role": "user", "content": "Output: a.txt"},
+            ],
+        }
+    )
+    echoed = decoded.request.messages[1]
+    assert echoed.content == '{"command": "ls"}'
+    assert "thinking_blocks" not in echoed.model_dump(mode="json")
+    assert "messages.thinking_blocks" in decoded.request.ignored_parameters
+    assert "messages.reasoning_items" in decoded.request.ignored_parameters
+
+    # A null or empty carrier discloses nothing.
+    plain = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "x", "thinking_blocks": []},
+                {"role": "user", "content": "next"},
+            ],
+        }
+    )
+    assert "messages.thinking_blocks" not in plain.request.ignored_parameters
+
+
+def test_responses_decoder_drops_populated_litellm_reasoning_carriers_with_disclosure() -> None:
+    """A Responses history message's LiteLLM carriers clear the official probe and drop.
+
+    A Chat-to-Responses bridge built on LiteLLM echoes the same message dump as
+    ``input`` history (string content, and typed ``output_text`` parts on an
+    id-less assistant message). The official-SDK probe copies the raw item, so
+    this pins that it does not refuse the carriers the wire model accepted and
+    that the drop is disclosed under ``input``.
+    """
+    carriers = {
+        "thinking_blocks": [{"type": "thinking", "thinking": "t", "signature": "s"}],
+        "reasoning_items": [
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "a"}]}
+        ],
+    }
+    for content in ("x", [{"type": "output_text", "text": "x"}]):
+        decoded = decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": content, **carriers},
+                    {"role": "user", "content": "next"},
+                ],
+            }
+        )
+        assert "input.thinking_blocks" in decoded.request.ignored_parameters
+        assert "input.reasoning_items" in decoded.request.ignored_parameters
+
+
 def test_chat_decoder_preserves_only_a_gateway_issued_reasoning_carrier() -> None:
     """A Fireworks continuation stays encrypted until authorized admission."""
     deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
@@ -632,13 +725,20 @@ def test_chat_decoder_rejects_unbound_or_malformed_reasoning_content(
 
 
 def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> None:
-    """A populated refusal or LiteLLM carrier in history stays rejected."""
-    for extra in (
-        {"refusal": "no"},
-        {"thinking_blocks": [{"type": "thinking", "thinking": "x", "signature": "y"}]},
-        {"reasoning_items": [{"type": "reasoning"}]},
-        {"images": [{"image_url": {"url": "https://example.test/a.png"}}]},
-        {"provider_specific_fields": "not-an-object"},
+    """A populated refusal or images list, or a malformed LiteLLM carrier, stays rejected."""
+    for extra, field in (
+        ({"refusal": "no"}, "refusal"),
+        ({"thinking_blocks": [{"type": "unknown", "thinking": "x"}]}, "thinking_blocks"),
+        ({"thinking_blocks": [{"type": "redacted_thinking", "thinking": "x"}]}, "thinking_blocks"),
+        ({"thinking_blocks": {"type": "thinking", "thinking": "x"}}, "thinking_blocks"),
+        (
+            {"thinking_blocks": [{"type": "thinking", "thinking": "x", "junk": 1}]},
+            "thinking_blocks",
+        ),
+        ({"reasoning_items": [{"type": "message"}]}, "reasoning_items"),
+        ({"reasoning_items": [{"type": "reasoning", "summary": "x"}]}, "reasoning_items"),
+        ({"images": [{"image_url": {"url": "https://example.test/a.png"}}]}, "images"),
+        ({"provider_specific_fields": "not-an-object"}, "provider_specific_fields"),
     ):
         with pytest.raises(OpenAIProtocolError) as captured:
             decode_chat(
@@ -648,7 +748,23 @@ def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> No
                 }
             )
         param = captured.value.detail.param
-        assert param is not None and param.startswith("messages.0.")
+        assert param is not None and param.startswith(f"messages.0.{field}"), (extra, param)
+    # The carriers are assistant history; a user message cannot carry them.
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "x",
+                        "thinking_blocks": [{"type": "thinking", "thinking": "x"}],
+                    }
+                ],
+            }
+        )
+    assert captured.value.detail.param is not None
+    assert captured.value.detail.param.startswith("messages.0")
 
 
 def test_cut_off_tool_arguments_and_divergent_operation_headers_both_decode() -> None:

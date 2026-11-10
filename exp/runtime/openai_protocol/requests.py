@@ -60,6 +60,7 @@ from exp.runtime.openai_protocol.errors import (
 )
 from exp.runtime.openai_protocol.history_documents import trim_history_documents
 from exp.runtime.openai_protocol.history_media import degrade_chat_media, degrade_responses_media
+from exp.runtime.openai_protocol.litellm_carriers import litellm_carrier_disclosures
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
@@ -233,8 +234,9 @@ _CHAT_MESSAGE_EXTENSION_KEYS = frozenset(
 ``reasoning_content`` is the authenticated Chat extension and ``reasoning`` /
 ``reasoning_details`` are OpenRouter's replayed-reasoning fields (folded by
 ``reasoning_replay``); the other four are LiteLLM's message-dump keys, which
-``_Message`` admits only in their empty (or, for ``provider_specific_fields``,
-dropped-and-disclosed) forms.
+``_Message`` validates and drops (``provider_specific_fields``,
+``thinking_blocks`` and ``reasoning_items``, each disclosed when populated) or
+admits only empty (``images``).
 """
 
 
@@ -372,6 +374,7 @@ def decode_chat(
                     else ()
                 ),
                 *replayed_reasoning_disclosures(request.messages),
+                *litellm_carrier_disclosures(request.messages, "messages"),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),
@@ -543,6 +546,11 @@ def decode_responses(
     if request.instructions is not None:
         messages.insert(0, GatewayMessage(role="developer", content=request.instructions))
     trimmed, document_disclosures = trim_history_documents(tuple(messages))
+    response_messages = (
+        ()
+        if isinstance(request.input, str)
+        else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
+    )
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.RESPONSES,
@@ -561,11 +569,8 @@ def decode_responses(
                 *document_disclosures,
                 *breakpoints.disclosures,
                 *cache_disclosures,
-                *replayed_reasoning_disclosures(
-                    ()
-                    if isinstance(request.input, str)
-                    else tuple(item for item in request.input if isinstance(item, _ResponseMessage))
-                ),
+                *replayed_reasoning_disclosures(response_messages),
+                *litellm_carrier_disclosures(response_messages, "input"),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=_provider_preferences(payload, request.provider),

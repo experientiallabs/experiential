@@ -635,10 +635,10 @@ material separates conversations, unlike the stem key, which every session of on
 and which would pin them all to one server: the caller's `prompt_cache_key` when present,
 otherwise the conversation's opening (every message through the first user turn), namespaced
 the same way. A host that sets `AuthorizationSnapshot.prompt_caching_disabled` (an organization that turned prompt caching off) gets none of this: admission (`exp/runtime/gateway/prompt_caching.py`) derives no key or session id, skips rendezvous and sticky placement so every pool keeps its certified order, binds no Google cache resource, removes every caller `cache_control` marker before payloads are built (each path disclosed with `->not_forwarded(organization_prompt_caching_off)`, the caller's `prompt_cache_key` included), classes the request as a fresh session for lane spill, and discloses `prompt_caching->best_effort(provider_caches_implicitly)` unless every admitted rung is Anthropic's API or Claude on Vertex AI, which cache only at markers. LiteLLM message dumps
-(`provider_specific_fields`, null `thinking_blocks` / `reasoning_items` / `images`) decode when
-echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
-disclosure and the empty forms are accepted like the SDK's own empty keys, while populated
-carriers stay rejected by name.
+(`provider_specific_fields`, `thinking_blocks`, `reasoning_items`, `images`) decode when echoed back on Chat and Responses history:
+`provider_specific_fields` (any object) and populated `thinking_blocks` / `reasoning_items` in LiteLLM's documented shapes (`exp/runtime/openai_protocol/litellm_carriers.py`)
+are validated, never forwarded, and disclosed as dropped (`messages.<field>` / `input.<field>`): the turn already carries its reasoning as `reasoning_content`, and a
+signature or encrypted item is bound to the issuing account. Empty `images` is accepted; any other shape, or a populated carrier on a non-assistant message, is rejected by name.
 Anthropic-signed thinking replays only on the Anthropic wire: a mixed waterfall's Anthropic rung
 re-emits the caller's blocks verbatim, while every foreign wire omits them at encoding and the
 route discloses `messages.thinking->dropped(unsupported_by_provider)` instead of rejecting (the
