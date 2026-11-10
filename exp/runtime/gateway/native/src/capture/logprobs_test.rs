@@ -353,3 +353,8 @@ fn off_and_caller_states_never_capture() {
     assert!(!ChatProbabilities::Caller.captures());
     assert!(ChatProbabilities::Capture(Buffer::default()).captures());
 }
+
+// Whole-sequence alignment tests, kept beside this module so neither file
+// crosses the repository line limit.
+#[path = "logprobs_alignment_test.rs"]
+mod alignment;

@@ -104,8 +104,11 @@ before the first answer text (a template's end-of-thinking delimiter such as
 record from an earlier frame still unmatched at the finish, a token only partly
 emitted, a record with empty bytes anywhere else, or priced reasoning after the
 answer started is a hole. A first reasoning frame with records (its own, or queued ahead
-of it) is read as priced when they spell the reasoning, else as answer-only,
-and the records must then spell the answer. Any record, text, tool call or image after
+of it) keeps two readings, priced (the records spell the reasoning) and
+answer-only (the records must spell the answer), and an answer that opens with
+a strict prefix of the front token keeps both the delimiter and the partial
+token reading; each pair lasts until later text rules a reading out, and a
+frame is a hole only when no reading survives it. Any record, text, tool call or image after
 the finishing frame is a hole. So a
 self-hosted reasoning model (vLLM with a reasoning parser, speculative decoding
 included) retains its full token sequence, reasoning first. A malformed

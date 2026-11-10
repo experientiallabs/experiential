@@ -427,7 +427,11 @@ fn frames_after_a_hole_are_not_aligned() {
         unreachable!()
     };
     assert!(buffer.truncated);
-    assert!(buffer.position.pending_bytes <= MAXIMUM_RECORD_LEAD_BYTES);
+    assert!(buffer
+        .readings
+        .0
+        .iter()
+        .all(|reading| reading.pending_bytes <= MAXIMUM_RECORD_LEAD_BYTES));
 }
 
 #[test]
@@ -740,4 +744,37 @@ fn opaque_output_after_the_finishing_frame_is_a_hole() {
     let (taken, truncated) = probabilities.take().unwrap();
     assert_eq!(taken.len(), 1);
     assert!(truncated);
+}
+
+#[test]
+fn an_answer_record_equal_to_the_reasoning_keeps_both_readings() {
+    // The queued record could be the reasoning token or the answer's leading
+    // one; the answer frame that carries no record decides.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("Hi")]})),
+        0,
+        &frame("", "", false),
+    );
+    probabilities.retain(None, 0, &frame("Hi", "", false));
+    probabilities.retain(None, 0, &frame("", "Hi", true));
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(!truncated);
+}
+
+#[test]
+fn an_answer_token_emitted_across_frames_is_not_taken_for_the_delimiter() {
+    // "Hel" is a prefix of the front token and the next token repeats it: the
+    // front token is the answer's, emitted over two frames.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[record("Hello"), record("Hel")]})),
+        0,
+        &frame("", "Hel", false),
+    );
+    probabilities.retain(None, 0, &frame("", "loHel", true));
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(!truncated);
 }
