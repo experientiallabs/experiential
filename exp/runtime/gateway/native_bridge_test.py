@@ -8619,7 +8619,7 @@ _ADVISOR_DECLARATION: JsonObject = {
 
 
 def _advisor_declared_body() -> str:
-    """A Claude Code turn that declares the advisor tool (claude-cli 2.1.319)."""
+    """Build a Claude Code turn that declares the advisor tool."""
     body = json.loads(_advisor_history_body())
     body["tools"] = [
         {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
@@ -8633,9 +8633,8 @@ def test_declared_advisor_tool_serves_verbatim_on_an_anthropic_messages_rung(
 ) -> None:
     """The advisor declaration dispatches byte-for-byte behind its beta token.
 
-    Production (2026-11-10): Claude Code declares ``advisor_20260301`` on
-    every request once a user enables the advisor, and every such request
-    was refused. On a native Anthropic rung the entry now follows the
+    Claude Code declares ``advisor_20260301`` on every request once a user
+    enables the advisor. On a native Anthropic rung the entry follows the
     converted custom tools verbatim and the dispatch carries
     ``advisor-tool-2026-03-01``.
     """

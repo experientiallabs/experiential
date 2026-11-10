@@ -109,7 +109,7 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_message,
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
-    drop_declared_advisor,
+    drop_anthropic_advisor,
 )
 from exp.runtime.models.providers.thinking_budget import (
     qwen_uses_total_budget_cap,
@@ -758,26 +758,39 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
-    elif any(
-        entry.get("name") == ANTHROPIC_ADVISOR_TOOL_NAME for entry in request.provider_server_tools
-    ) and any(profile.anthropic_vertex_version is not None for profile in profiles):
+    elif ANTHROPIC_ADVISOR_TOOL_NAME in anthropic_server_tool_names(request) and any(
+        profile.anthropic_vertex_version is not None for profile in profiles
+    ):
         # Claude on Vertex AI (Google managed) speaks the Messages wire but does
         # not offer the advisor (Anthropic lists the Claude API, Claude Platform
         # on AWS and Anthropic-managed Google Cloud only). An all-Vertex route
-        # drops the declaration with disclosure; a route mixing Vertex with
-        # Anthropic rungs refuses it by name, as for any mixed server-tool route.
-        if not all(profile.anthropic_vertex_version is not None for profile in profiles):
+        # drops the declaration and its echoed history with disclosure. A route
+        # mixing Vertex with Anthropic rungs refuses a declared advisor by name,
+        # as for any mixed server-tool route; echoed history alone still forwards
+        # there, so the lead Anthropic rung keeps serving the conversation.
+        vertex_only = all(profile.anthropic_vertex_version is not None for profile in profiles)
+        advisor_declared = any(
+            entry.get("name") == ANTHROPIC_ADVISOR_TOOL_NAME
+            for entry in request.provider_server_tools
+        )
+        if not vertex_only and advisor_declared:
             raise ProviderParameterError(
                 message=anthropic_advisor_vertex_message(),
                 param="tools",
                 code="unsupported_parameter",
             )
-        kept_server_tools, clear_tool_choice = drop_declared_advisor(
-            request, request.provider_server_tools, ignored
-        )
-        provider_updates["provider_server_tools"] = kept_server_tools
-        if clear_tool_choice:
-            provider_updates["tool_choice"] = None
+        if vertex_only:
+            current_messages = provider_updates.get("messages", request.messages)
+            kept_server_tools, kept_messages, clear_tool_choice = drop_anthropic_advisor(
+                request,
+                request.provider_server_tools,
+                cast("Sequence[GatewayMessage]", current_messages),
+                ignored,
+            )
+            provider_updates["provider_server_tools"] = kept_server_tools
+            provider_updates["messages"] = kept_messages
+            if clear_tool_choice:
+                provider_updates["tool_choice"] = None
     # Codex native Responses tool declarations/history serve verbatim only on a
     # native Responses rung; a foreign wire gets them translated to function
     # tools (namespaces hoisted, custom tools as one ``input`` function; hosted

@@ -214,7 +214,7 @@ vocabulary the data plane already carries: the advisor's ``server_tool_use``
 block in a single ``content_block_start`` (any result variant, the encrypted
 ``advisor_redacted_result`` included), relayed verbatim by the generic
 ``*_tool_result`` path; Claude Code declares it on every request once a user
-enables the advisor (claude-cli 2.1.319, 2026-11-10).
+enables the advisor.
 """
 
 MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(

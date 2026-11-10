@@ -2004,11 +2004,10 @@ def test_advisor_token_without_advisor_history_is_a_no_op() -> None:
 def test_the_advisor_tool_declaration_decodes_and_forwards_with_its_beta() -> None:
     """Claude Code's advisor declaration decodes, carries verbatim, and gets its token.
 
-    Production (claude-cli 2.1.319, 2026-11-10): Claude Code declares
-    ``advisor_20260301`` on every request once a user enables the advisor,
-    and the decoder answered each with a 400. The entry now rides the
-    verbatim server-tool carrier like web_search, and the dispatch adds
-    ``advisor-tool-2026-03-01`` whether or not the caller sent it.
+    Claude Code declares ``advisor_20260301`` on every request once a user
+    enables the advisor. The entry rides the verbatim server-tool carrier
+    like web_search, and the dispatch adds ``advisor-tool-2026-03-01``
+    whether or not the caller sent it.
     """
     from exp.runtime.models.providers.wire_messages import (
         ANTHROPIC_ADVISOR_TOOL_BETA,

@@ -237,40 +237,63 @@ def anthropic_advisor_vertex_message() -> str:
     )
 
 
-def drop_declared_advisor(
+def _is_advisor_block(block: JsonObject) -> bool:
+    """Whether one echoed history block is the advisor's call or its result."""
+    block_type = block.get("type")
+    return (
+        block_type == "server_tool_use" and block.get("name") == ANTHROPIC_ADVISOR_TOOL_NAME
+    ) or (block_type == f"{ANTHROPIC_ADVISOR_TOOL_NAME}_tool_result")
+
+
+def drop_anthropic_advisor(
     request: GatewayRequest,
     server_tools: Sequence[JsonObject],
+    messages: Sequence[GatewayMessage],
     ignored: list[str],
-) -> tuple[tuple[JsonObject, ...], bool]:
-    """Drop a declared advisor tool, disclosed, for a route served only by Vertex AI.
+) -> tuple[tuple[JsonObject, ...], tuple[GatewayMessage, ...], bool]:
+    """Drop the advisor, disclosed, for a route served only by Vertex AI.
 
     Claude on Vertex AI (Google managed) runs the other Anthropic server tools but
-    not the advisor, so only the advisor entry leaves the dispatched ``tools``;
-    every other server tool stays and forwards verbatim.
+    not the advisor, so only the advisor leaves the dispatched request: its
+    declaration and its echoed history blocks (the advisor's ``server_tool_use``
+    and ``advisor_tool_result``). Every other server tool and history block stays
+    and forwards verbatim, and with no advisor left the dispatch adds no advisor
+    beta token.
 
     Args:
         request: The caller's canonical request.
         server_tools: The dispatched server-tool entries so far.
+        messages: The dispatched history so far.
         ignored: The route's disclosure list, appended in place.
 
     Returns:
-        The remaining server-tool entries and whether ``tool_choice`` must be
-        cleared on the dispatched request (it named the advisor).
+        The remaining server-tool entries, the remaining history, and whether
+        ``tool_choice`` must be cleared on the dispatched request (it named the
+        advisor, or required a tool and none remains).
     """
     from exp.runtime.gateway.contracts import GatewayNamedToolChoice
 
-    kept = tuple(
+    def disclose(path: str) -> None:
+        if path not in ignored:
+            ignored.append(path)
+
+    kept_tools = tuple(
         entry for entry in server_tools if entry.get("name") != ANTHROPIC_ADVISOR_TOOL_NAME
     )
-    if len(kept) == len(server_tools):
-        return kept, False
-    disclosure = f"tools.{ANTHROPIC_ADVISOR_TOOL_NAME}->dropped(unsupported_by_provider)"
-    if disclosure not in ignored:
-        ignored.append(disclosure)
+    kept_messages = tuple(
+        message
+        for message in messages
+        if message.provider_anthropic_block is None
+        or not _is_advisor_block(message.provider_anthropic_block)
+    )
+    if len(kept_tools) != len(server_tools):
+        disclose(f"tools.{ANTHROPIC_ADVISOR_TOOL_NAME}->dropped(unsupported_by_provider)")
+    if len(kept_messages) != len(messages):
+        disclose("messages.server_tool_blocks->dropped(unsupported_by_provider)")
     clear_tool_choice = (
         isinstance(request.tool_choice, GatewayNamedToolChoice)
         and request.tool_choice.name == ANTHROPIC_ADVISOR_TOOL_NAME
-    ) or (request.tool_choice == "required" and not request.tools and not kept)
-    if clear_tool_choice and "tool_choice->dropped(unsupported_by_provider)" not in ignored:
-        ignored.append("tool_choice->dropped(unsupported_by_provider)")
-    return kept, clear_tool_choice
+    ) or (request.tool_choice == "required" and not request.tools and not kept_tools)
+    if clear_tool_choice:
+        disclose("tool_choice->dropped(unsupported_by_provider)")
+    return kept_tools, kept_messages, clear_tool_choice

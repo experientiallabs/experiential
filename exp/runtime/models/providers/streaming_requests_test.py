@@ -6283,6 +6283,48 @@ def test_the_advisor_tool_is_dropped_on_vertex_and_refused_on_a_vertex_mixed_rou
     assert not any("advisor" in path for path in public.ignored_parameters)
 
 
+def test_echoed_advisor_history_is_dropped_on_vertex_and_forwarded_on_a_mixed_route() -> None:
+    """Advisor history leaves an all-Vertex dispatch (no beta); a mixed route forwards it."""
+    call: JsonObject = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "advisor",
+        "input": {},
+    }
+    result: JsonObject = {
+        "type": "advisor_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": {"type": "advisor_result", "text": "Check the edge case."},
+    }
+    base = _web_search_messages_request()
+    request = base.model_copy(
+        update={
+            "messages": (
+                *base.messages,
+                GatewayMessage(role="assistant", provider_anthropic_block=call),
+                GatewayMessage(role="assistant", provider_anthropic_block=result),
+                GatewayMessage(role="user", content="go on"),
+            )
+        }
+    )
+    public, provider = route_generation_parameter_requests((_vertex_anthropic_profile(),), request)
+    assert all(message.provider_anthropic_block is None for message in provider.messages)
+    assert provider.messages[-1].content == "go on"
+    assert "messages.server_tool_blocks->dropped(unsupported_by_provider)" in (
+        public.ignored_parameters
+    )
+    headers = anthropic_request_headers({"x-api-key": "k"}, provider)
+    assert ANTHROPIC_ADVISOR_TOOL_BETA not in headers.get("anthropic-beta", "")
+
+    _, mixed = route_generation_parameter_requests(
+        (_anthropic_web_search_profile(), _vertex_anthropic_profile()), request
+    )
+    assert [m.provider_anthropic_block for m in mixed.messages if m.provider_anthropic_block] == [
+        call,
+        result,
+    ]
+
+
 def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:
     """Claude Code omits budget_tokens; the Anthropic wire requires one, so it is derived.
 
