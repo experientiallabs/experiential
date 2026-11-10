@@ -37,6 +37,7 @@ from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway, _po
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import DispatchableRoute, dispatchable_route_profiles
 from exp.runtime.gateway.native_request_policy import (
+    no_fallback_narrowing,
     require_route_authority,
     restrict_fallbacks,
     unclaimed_route_failure,
@@ -609,3 +610,14 @@ def test_restrict_fallbacks_records_narrowing_only_when_it_drops_a_rung() -> Non
         "gateway.routing.allow_fallbacks: false",
     )
     assert restrict_fallbacks(request, _provider_route("openai")).caller_narrowing == ()
+
+
+def test_a_no_fallback_root_stage_selection_is_recorded_once() -> None:
+    """A staged route's root-stage cut names the control; the later lead pick adds no copy."""
+    route = _provider_route("openai")
+    assert no_fallback_narrowing(route, removed=False).caller_narrowing == ()
+    cut = no_fallback_narrowing(route, removed=True)
+    assert cut.caller_narrowing == ("gateway.routing.allow_fallbacks: false",)
+    assert no_fallback_narrowing(cut, removed=True).caller_narrowing == (
+        "gateway.routing.allow_fallbacks: false",
+    )

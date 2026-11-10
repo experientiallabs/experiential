@@ -210,6 +210,7 @@ def test_unsupported_keys_are_disclosed_and_the_order_survives_rescheduling() ->
         ({"ignore": ["openai"]}, ("provider.ignore",)),
         ({"allow_fallbacks": False}, ("provider.allow_fallbacks: false",)),
         ({"order": ["bedrock"]}, ()),
+        ({"only": ["openai"], "ignore": ["bedrock"]}, ("provider.only", "provider.ignore")),
     ],
 )
 def test_only_controls_that_remove_a_rung_are_recorded_as_narrowing(

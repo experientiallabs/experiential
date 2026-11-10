@@ -16,6 +16,9 @@ from exp.runtime.gateway.native_settlement import (
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.errors import ProviderParameterError
 
+_GATEWAY_NO_FALLBACKS = "gateway.routing.allow_fallbacks: false"
+"""Public spelling of the gateway's own no-fallback control."""
+
 
 def route_policy_error() -> ProviderParameterError:
     """Name an unhandled, unavailable or conflicting public route selector."""
@@ -97,14 +100,29 @@ def restrict_fallbacks(request: GatewayRequest, route: GatewayRoute) -> GatewayR
         if item.gateway.capabilities.failover_only_on is None
     )
     lead = route.deployments[index]
-    narrowing = route.caller_narrowing
-    if len(route.deployments) > 1:
-        narrowing = (*narrowing, "gateway.routing.allow_fallbacks: false")
-    return route.model_copy(
+    restricted = route.model_copy(
         update={
             "snapshot": project_stage_selection(route.snapshot, (index,)),
             "deployment": lead,
             "fallback_deployments": (),
-            "caller_narrowing": narrowing,
         }
+    )
+    return no_fallback_narrowing(restricted, removed=len(route.deployments) > 1)
+
+
+def no_fallback_narrowing(route: GatewayRoute, *, removed: bool) -> GatewayRoute:
+    """Record ``gateway.routing.allow_fallbacks: false`` once when it removed a rung.
+
+    Args:
+        route: The route after the no-fallback selection.
+        removed: Whether that selection dropped at least one deployment (a root-stage
+            selection of a staged route counts, as does keeping only the lead).
+
+    Returns:
+        The route, with the control recorded in ``caller_narrowing`` when it removed one.
+    """
+    if not removed or _GATEWAY_NO_FALLBACKS in route.caller_narrowing:
+        return route
+    return route.model_copy(
+        update={"caller_narrowing": (*route.caller_narrowing, _GATEWAY_NO_FALLBACKS)}
     )

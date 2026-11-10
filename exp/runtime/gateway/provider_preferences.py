@@ -153,21 +153,20 @@ _NO_FALLBACKS = "provider.allow_fallbacks: false"
 """Public spelling of OpenRouter's no-fallback control."""
 
 
-def _narrow(kept: list[int], remaining: list[int], control: str, narrowing: list[str]) -> list[int]:
-    """Return ``remaining``, recording ``control`` when it removed at least one rung.
+def _record(narrowing: list[str], control: str, *, excludes: bool) -> None:
+    """Record ``control`` when, applied alone to the full route, it excludes a rung.
+
+    Each control is judged on its own, not after the others, so two controls
+    that exclude the same rung are both named: removing only one of them would
+    still keep the request off that rung.
 
     Args:
-        kept: The rung indexes before this control.
-        remaining: The rung indexes the control keeps.
+        narrowing: The confining controls so far; appended to in place.
         control: Public spelling of the control.
-        narrowing: The controls that removed a rung so far; appended to in place.
-
-    Returns:
-        ``remaining``.
+        excludes: Whether the control alone excludes at least one rung.
     """
-    if len(remaining) < len(kept):
+    if excludes:
         narrowing.append(control)
-    return remaining
 
 
 def apply_provider_preferences(
@@ -204,17 +203,17 @@ def apply_provider_preferences(
             code="invalid_parameter",
         )
     kept = list(range(len(route.deployments)))
-    narrowing: list[str] = []  # The controls that actually removed a rung.
+    narrowing: list[str] = []  # The controls that each exclude a rung.
     if only is not None:
         allowed = frozenset().union(*(_names(name) for name in only)) if only else frozenset()
-        kept = _narrow(kept, [i for i in kept if labels[i] in allowed], "provider.only", narrowing)
+        _record(narrowing, "provider.only", excludes=any(item not in allowed for item in labels))
+        kept = [i for i in kept if labels[i] in allowed]
         if not kept:
             raise _unsatisfiable("only", only, available)
     if ignore:
         excluded = frozenset().union(*(_names(name) for name in ignore))
-        kept = _narrow(
-            kept, [i for i in kept if labels[i] not in excluded], "provider.ignore", narrowing
-        )
+        _record(narrowing, "provider.ignore", excludes=any(item in excluded for item in labels))
+        kept = [i for i in kept if labels[i] not in excluded]
         if not kept:
             raise _unsatisfiable("ignore", ignore, available)
     if order:
@@ -222,13 +221,15 @@ def apply_provider_preferences(
         if not any(labels[i] in wanted for i in kept):
             raise _unsatisfiable("order", order, available)
         if not allow_fallbacks:
-            kept = _narrow(kept, [i for i in kept if labels[i] in wanted], _NO_FALLBACKS, narrowing)
+            _record(narrowing, _NO_FALLBACKS, excludes=any(item not in wanted for item in labels))
+            kept = [i for i in kept if labels[i] in wanted]
     elif not allow_fallbacks:
         lead = next(
             (i for i in kept if route.deployments[i].gateway.capabilities.failover_only_on is None),
             kept[0],
         )
-        kept = _narrow(kept, [lead], _NO_FALLBACKS, narrowing)
+        _record(narrowing, _NO_FALLBACKS, excludes=len(labels) > 1)
+        kept = [lead]
     narrowed = select_route_deployments(route, tuple(kept))
     if narrowing:
         narrowed = narrowed.model_copy(
