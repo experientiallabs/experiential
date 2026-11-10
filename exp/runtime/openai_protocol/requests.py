@@ -268,14 +268,13 @@ def decode_chat(
 ) -> DecodedGatewayRequest:
     """Decode one Chat Completions body without silently dropping fields.
 
-    OpenCode may attach an Anthropic-style ``cache_control`` annotation on
-    Chat messages and on text content parts. Supported ephemeral forms are
-    validated outside official OpenAI validation and retained on canonical
-    cache carriers for adapters that support them. Unknown keys on messages, their
-    tool calls and content parts are dropped with disclosure
-    (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown
-    nested field stays rejected. The Vercel AI SDK's camelCase ``promptCacheKey`` is
-    folded onto ``prompt_cache_key`` first, so it decodes as the documented wire field.
+    OpenCode may attach an Anthropic-style ``cache_control`` annotation on Chat messages and on
+    text content parts. Supported ephemeral forms are validated outside official OpenAI
+    validation and retained on canonical cache carriers for adapters that support them. Unknown
+    keys on messages, their tool calls and content parts are dropped with disclosure
+    (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown nested
+    field stays rejected. The Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
+    ``prompt_cache_key`` first, so it decodes as the documented wire field.
 
     Args:
         payload: Parsed JSON request body.
@@ -329,7 +328,7 @@ def decode_chat(
         if isinstance(request.stop, str)
         else request.stop
     )
-    thinking = translate_enable_thinking(request)
+    thinking = translate_enable_thinking(request, alias_disclosures)
     raw_chat_tools = payload.get("tools")
     chat_native_tools = tuple(
         GatewayProviderNativeTool(
@@ -396,6 +395,7 @@ def decode_chat(
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=thinking.reasoning_effort,
+            reasoning_effort_parameter=thinking.effort_parameter,
             thinking_default_enable=thinking.thinking_default_enable,
             stream=request.stream,
             include_usage=(

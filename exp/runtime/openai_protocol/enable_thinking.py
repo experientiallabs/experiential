@@ -14,9 +14,14 @@ OpenRouter numeric budgets receive a named compatibility refusal.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort
-from exp.runtime.openai_protocol.client_field_repairs import chat_output_cap
+from exp.runtime.openai_protocol.client_field_repairs import (
+    OUTPUT_CONFIG_EFFORT_TRANSLATED,
+    chat_output_cap,
+)
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.wire_models import _ChatRequest
 
@@ -38,7 +43,13 @@ chat template; it is named rather than refused."""
 class _EnableThinkingResult:
     """The resolved canonical reasoning controls plus caller disclosures."""
 
-    __slots__ = ("reasoning_effort", "thinking_default_enable", "disclosures", "thinking_config")
+    __slots__ = (
+        "reasoning_effort",
+        "thinking_default_enable",
+        "disclosures",
+        "thinking_config",
+        "effort_parameter",
+    )
 
     def __init__(
         self,
@@ -52,6 +63,10 @@ class _EnableThinkingResult:
         self.reasoning_effort = reasoning_effort
         self.thinking_default_enable = thinking_default_enable
         self.disclosures = disclosures
+        # The caller's effort field when it is not the flat one; set by translation.
+        self.effort_parameter: (
+            Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
+        ) = None
 
 
 def _reasoning_object_intent(request: _ChatRequest) -> bool | None:
@@ -82,7 +97,27 @@ def _reasoning_object_intent(request: _ChatRequest) -> bool | None:
     return votes[0] if votes else None
 
 
-def translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
+def translate_enable_thinking(
+    request: _ChatRequest, repairs: tuple[str, ...]
+) -> _EnableThinkingResult:
+    """Resolve the Chat reasoning controls and record the caller's effort field.
+
+    Args:
+        request: The validated Chat body after client field repairs.
+        repairs: Disclosures from those repairs, which reveal a translated
+            ``output_config.effort``.
+
+    Returns:
+        The resolved controls, with ``effort_parameter`` naming the effort
+        field the caller sent (``None`` when the effort, if any, came from an
+        enable or disable control instead).
+    """
+    result = _translate_enable_thinking(request)
+    result.effort_parameter = _chat_effort_parameter(request, repairs)
+    return result
+
+
+def _translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     """Resolve the effective reasoning control from the flat and alternate fields.
 
     The explicit flat ``reasoning_effort`` selects depth when enable controls agree;
@@ -254,3 +289,29 @@ def _budgeted_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     return _EnableThinkingResult(
         None, False, disclosures, {"type": "enabled", "budget_tokens": budget}
     )
+
+
+def _chat_effort_parameter(
+    request: _ChatRequest, repairs: tuple[str, ...]
+) -> Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None:
+    """Name the Chat effort field the caller sent, if any.
+
+    An effort resolved from an enable or disable control (for example
+    ``reasoning.enabled: false`` becoming ``none``) names no field, so a
+    refusal does not tell the caller to change a field it never sent.
+
+    Args:
+        request: The validated Chat body after client field repairs.
+        repairs: Disclosures from those repairs; a translated
+            ``output_config.effort`` arrives here as ``reasoning_effort``.
+
+    Returns:
+        The caller's effort field, or ``None`` when no effort field was sent.
+    """
+    if OUTPUT_CONFIG_EFFORT_TRANSLATED in repairs:
+        return "output_config.effort"
+    if request.reasoning_effort is not None:
+        return "reasoning_effort"
+    if request.reasoning is not None and request.reasoning.effort is not None:
+        return "reasoning.effort"
+    return None

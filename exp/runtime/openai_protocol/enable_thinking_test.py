@@ -265,3 +265,25 @@ def test_explicit_flat_effort_cannot_discard_a_numeric_budget(field: str) -> Non
     assert error.value.detail.param == (
         "thinking.budget_tokens" if field == "thinking" else "reasoning.max_tokens"
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"reasoning_effort": "low"}, "reasoning_effort"),
+        ({"reasoning": {"effort": "low"}}, "reasoning.effort"),
+        ({"output_config": {"effort": "low"}}, "output_config.effort"),
+    ],
+)
+def test_the_caller_effort_field_is_recorded(overrides: JsonObject, expected: str) -> None:
+    """Refusals name the Chat field the effort came from, nested and translated ones too."""
+    request = _decode(**overrides)
+    assert request.reasoning_effort == "low"
+    assert request.caller_effort_parameter == expected
+
+
+def test_a_disable_control_names_no_effort_field() -> None:
+    """An effort translated from an off switch is not attributed to an effort field."""
+    request = _decode(reasoning={"enabled": False})
+    assert request.reasoning_effort == "none"
+    assert request.reasoning_effort_parameter is None

@@ -17,7 +17,13 @@ include the effective effort, including the provider default when the caller
 omits it. An empty declaration means unknown and rejects that reasoning rung.
 Admission preserves route order, rejects when no eligible rung remains, and
 rechecks the final per-rung request before freezing dispatch. It never changes
-reasoning effort to make a probability request fit. A numeric `thinking_budget`
+reasoning effort to make a probability request fit; the refusal names the
+effective effort (or the model default) and lists the efforts the first
+refusing rung qualifies (sending one admits the request on that rung), on the
+caller's own effort field (`reasoning_effort`, `reasoning.effort` or a
+translated `output_config.effort`) when the caller sent one and some effort
+qualifies. An effort that came from an enable or disable control, or that the
+gateway resolved, keeps the refusal on the probability field. A numeric `thinking_budget`
 is not qualified by an effort declaration and cannot be combined with enabled
 probabilities. Remove the budget and select a probability-capable effort, or
 disable probabilities. This does not enable probabilities across provider
