@@ -238,7 +238,7 @@ the order the model produced.
   caller's own content).
   After 64 distinct field paths, further repairs are disclosed by their top-level field, and
   after 128 disclosures (or for a name over 256 characters) as `body`. The same refusal covers an MCP
-  `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
+  `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, an apply-patch `operation.path`, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
   `stop_sequences` controls, and any string inside a web-search `user_location`, a file-search `filters` object, MCP
   `headers` or a `network_policy`'s `domain_secrets`.
   Embeddings, images and audio have no disclosure channel, so a lone surrogate there is the

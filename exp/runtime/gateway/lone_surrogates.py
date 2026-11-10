@@ -735,6 +735,10 @@ def _names_something(member: _Member, *, caller_keyed: bool) -> bool:
         return False
     if member.opaque:
         return True
+    position = member.position
+    if member.key == "path" and position is not None and position.key == "operation":
+        # An apply-patch operation names the file it changes.
+        return True
     if member.named not in IDENTIFIER_FIELDS:
         return False
     if member.depth == 2 and member.top == "messages" and member.key == "name":

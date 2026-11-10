@@ -771,3 +771,15 @@ def test_connector_and_container_handles_are_refused(payload: JsonObject, param:
     with pytest.raises(LoneSurrogateRefusal) as refused:
         _replace(payload)
     assert refused.value.param == param
+
+
+def test_an_apply_patch_path_is_refused() -> None:
+    """A replayed patch operation names its file; that path is never rewritten."""
+    payload: JsonObject = {
+        "input": [
+            {"type": "apply_patch_call", "operation": {"type": "create_file", "path": "a\ud83d"}}
+        ]
+    }
+    with pytest.raises(LoneSurrogateRefusal) as refused:
+        _replace(payload)
+    assert refused.value.param == "input.0.operation.path"
