@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from exp.common.core.artifacts import JsonObject
     from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 
 # Client-facing labels for the server tools Claude Code exposes, keyed by the
@@ -215,3 +216,61 @@ def disclose_dropped_server_tools(
     if clear_tool_choice:
         disclose("tool_choice->dropped(unsupported_by_provider)")
     return stripped.messages, clear_tool_choice
+
+
+ANTHROPIC_ADVISOR_TOOL_NAME = "advisor"
+"""The name Anthropic requires on a declared ``advisor_20260301`` tool."""
+
+
+def anthropic_advisor_vertex_message() -> str:
+    """Explain why a declared advisor cannot run on a route that reaches Vertex AI.
+
+    Returns:
+        A caller-facing sentence naming the advisor and the Vertex limitation.
+    """
+    return (
+        "The request uses the Anthropic server tool 'advisor' (Anthropic advisor). "
+        "Anthropic does not offer the advisor on Claude models served through Google "
+        "Vertex AI, and this model route mixes Vertex with Anthropic rungs. Switch to a "
+        "Claude model alias served by Anthropic for requests that use the advisor, or "
+        "disable the advisor and resend."
+    )
+
+
+def drop_declared_advisor(
+    request: GatewayRequest,
+    server_tools: Sequence[JsonObject],
+    ignored: list[str],
+) -> tuple[tuple[JsonObject, ...], bool]:
+    """Drop a declared advisor tool, disclosed, for a route served only by Vertex AI.
+
+    Claude on Vertex AI (Google managed) runs the other Anthropic server tools but
+    not the advisor, so only the advisor entry leaves the dispatched ``tools``;
+    every other server tool stays and forwards verbatim.
+
+    Args:
+        request: The caller's canonical request.
+        server_tools: The dispatched server-tool entries so far.
+        ignored: The route's disclosure list, appended in place.
+
+    Returns:
+        The remaining server-tool entries and whether ``tool_choice`` must be
+        cleared on the dispatched request (it named the advisor).
+    """
+    from exp.runtime.gateway.contracts import GatewayNamedToolChoice
+
+    kept = tuple(
+        entry for entry in server_tools if entry.get("name") != ANTHROPIC_ADVISOR_TOOL_NAME
+    )
+    if len(kept) == len(server_tools):
+        return kept, False
+    disclosure = f"tools.{ANTHROPIC_ADVISOR_TOOL_NAME}->dropped(unsupported_by_provider)"
+    if disclosure not in ignored:
+        ignored.append(disclosure)
+    clear_tool_choice = (
+        isinstance(request.tool_choice, GatewayNamedToolChoice)
+        and request.tool_choice.name == ANTHROPIC_ADVISOR_TOOL_NAME
+    ) or (request.tool_choice == "required" and not request.tools and not kept)
+    if clear_tool_choice and "tool_choice->dropped(unsupported_by_provider)" not in ignored:
+        ignored.append("tool_choice->dropped(unsupported_by_provider)")
+    return kept, clear_tool_choice

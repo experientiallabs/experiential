@@ -29,6 +29,7 @@ from pydantic import (
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.manifest import MESSAGES_SERVER_TOOL_TYPES_ACCEPTED
+from exp.runtime.anthropic_protocol.media_blocks import CacheControl
 from exp.runtime.gateway.tool_search.contracts import (
     MESSAGES_TOOL_SEARCH_TYPES,
     GatewayToolSearch,
@@ -43,7 +44,12 @@ from exp.runtime.openai_protocol.errors import invalid_field
 
 
 class ServerTool(BaseModel):
-    """One Anthropic server tool, validated shallowly and carried verbatim."""
+    """One Anthropic server tool, validated shallowly and carried verbatim.
+
+    Attributes:
+        type: The provider tool type (``web_search_20250305``-style), never ``custom``.
+        name: The tool name the provider's ``server_tool_use`` blocks carry.
+    """
 
     model_config = ConfigDict(extra="allow")
 
@@ -62,15 +68,6 @@ ADVISOR_TOOL_TYPE = "advisor_20260301"
 """The advisor server tool's type (beta ``advisor-tool-2026-03-01``)."""
 
 
-class AdvisorCaching(BaseModel):
-    """The advisor's own transcript-caching switch: ``{"type": "ephemeral", "ttl": ...}``."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["ephemeral"]
-    ttl: Literal["5m", "1h"] | None = None
-
-
 class AdvisorToolDeclaration(BaseModel):
     """The documented ``advisor_20260301`` declaration (Anthropic advisor tool).
 
@@ -83,6 +80,19 @@ class AdvisorToolDeclaration(BaseModel):
     ``allowed_callers``, ``defer_loading``, ``strict``) are typed too. Fields
     beyond these are kept and forwarded: the provider owns its evolving
     server-tool surface, as for every other accepted server tool.
+
+    Attributes:
+        type: The tool type discriminator, always ``advisor_20260301``.
+        name: The tool name, which Anthropic requires to be ``advisor``.
+        model: The advisor model the executor consults (non-empty).
+        max_uses: Optional cap on advisor calls per turn (at least 1).
+        max_tokens: Optional cap on each advisor call's output (at least 1024).
+        caching: Optional advisor-side prompt caching, the same
+            ``{"type": "ephemeral", "ttl": "5m" | "1h"}`` shape as ``cache_control``.
+        cache_control: Optional caller cache marker on this tool definition.
+        allowed_callers: Optional callers allowed to invoke the tool.
+        defer_loading: Optional deferred loading of the tool definition.
+        strict: Optional strict input validation switch.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -92,8 +102,8 @@ class AdvisorToolDeclaration(BaseModel):
     model: StrictStr = Field(min_length=1, max_length=256)
     max_uses: StrictInt | None = Field(default=None, ge=1)
     max_tokens: StrictInt | None = Field(default=None, ge=1024)
-    caching: AdvisorCaching | None = None
-    cache_control: dict[str, object] | None = None
+    caching: CacheControl | None = None
+    cache_control: CacheControl | None = None
     allowed_callers: list[StrictStr] | None = None
     defer_loading: StrictBool | None = None
     strict: StrictBool | None = None

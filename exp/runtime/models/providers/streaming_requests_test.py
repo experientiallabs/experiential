@@ -6234,6 +6234,55 @@ def test_the_advisor_tool_follows_the_server_tool_policy_off_anthropic() -> None
     assert public.provider_server_tools == (_ADVISOR_TOOL,)
 
 
+def _vertex_anthropic_profile() -> GatewayWireProfile:
+    """Return one Claude-on-Vertex AI (Google managed) Messages wire profile."""
+    return replace(
+        _anthropic_web_search_profile(
+            "https://us-east5-aiplatform.googleapis.com/v1/publishers/anthropic/models/"
+            "claude-haiku-4-5:streamRawPredict"
+        ),
+        anthropic_vertex_version="vertex-2023-10-16",
+    )
+
+
+def test_the_advisor_tool_is_dropped_on_vertex_and_refused_on_a_vertex_mixed_route() -> None:
+    """Vertex AI does not offer the advisor: dropped alone on Vertex, refused when mixed.
+
+    Every other server tool keeps forwarding verbatim on the all-Vertex route,
+    and the advisor's beta token is not added once the declaration is dropped.
+    """
+    web_search: JsonObject = {"type": "web_search_20250305", "name": "web_search"}
+    request = _advisor_messages_request().model_copy(
+        update={
+            "provider_server_tools": (web_search, _ADVISOR_TOOL),
+            "tool_choice": GatewayNamedToolChoice(name="advisor"),
+        }
+    )
+    public, provider = route_generation_parameter_requests((_vertex_anthropic_profile(),), request)
+    assert provider.provider_server_tools == (web_search,)
+    assert provider.tool_choice is None
+    assert "tools.advisor->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert "tool_choice->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert public.provider_server_tools == (web_search, _ADVISOR_TOOL)
+    headers = anthropic_request_headers({"x-api-key": "k"}, provider)
+    assert ANTHROPIC_ADVISOR_TOOL_BETA not in headers.get("anthropic-beta", "")
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (_anthropic_web_search_profile(), _vertex_anthropic_profile()),
+            _advisor_messages_request(),
+        )
+    assert raised.value.param == "tools"
+    assert "Google Vertex AI" in str(raised.value)
+
+    public, provider = route_generation_parameter_requests(
+        (_vertex_anthropic_profile(),),
+        _advisor_messages_request().model_copy(update={"provider_server_tools": (web_search,)}),
+    )
+    assert provider.provider_server_tools == (web_search,)
+    assert not any("advisor" in path for path in public.ignored_parameters)
+
+
 def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:
     """Claude Code omits budget_tokens; the Anthropic wire requires one, so it is derived.
 
