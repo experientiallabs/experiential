@@ -600,6 +600,7 @@ def _refuse_surrogate_identifiers(raw: dict[str, JsonValue]) -> None:
     """Name the identifier field holding a lone surrogate, without echoing it."""
 
     def lone(text: JsonValue | None) -> bool:
+        """Whether ``text`` is a string carrying a lone UTF-16 surrogate."""
         return isinstance(text, str) and has_lone_surrogate(text)
 
     questions = raw.get("questions")

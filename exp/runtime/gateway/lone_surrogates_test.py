@@ -98,6 +98,7 @@ def test_the_gate_matches_both_decoded_and_nested_escapes() -> None:
 
 
 def _payload() -> JsonObject:
+    """Return a minimal Chat body the surrogate tests mutate."""
     return {
         "model": "m",
         "messages": [

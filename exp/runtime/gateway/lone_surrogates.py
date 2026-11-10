@@ -186,6 +186,7 @@ class LoneSurrogateRefusal(ValueError):
     """
 
     def __init__(self, param: str, message: str) -> None:
+        """Record the refused field path and the caller-facing message."""
         super().__init__(message)
         self.param = param
         self.message = message

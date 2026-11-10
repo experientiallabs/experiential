@@ -51,6 +51,7 @@ def _escaped(body: JsonObject, marker: str = "SLICE") -> str:
 
 
 def _last_chat_payload() -> JsonObject:
+    """Return the most recent body the loopback upstream received."""
     with _SseUpstream.payloads_lock:
         return _SseUpstream.payloads[-1]
 
