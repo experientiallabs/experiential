@@ -50,10 +50,15 @@ def test_declared_usage_requires_complete_accounting() -> None:
     assert declared_usage({"promptTokens": 11, "completionTokens": 5}) == VendorTokenUsage(
         input_tokens=11, output_tokens=5
     )
+    assert declared_usage({"input": None, "output": None}) is None
+    assert declared_usage({"input": None, "input_tokens": 11, "output": 5}) == VendorTokenUsage(
+        input_tokens=11, output_tokens=5
+    )
     assert declared_usage({"input_tokens": 11}) is None
     assert declared_usage(None) is None
-    with pytest.raises(VendorTraceFormatError, match="non-negative integer"):
-        declared_usage({"input_tokens": -1, "output_tokens": 5})
+    for invalid_count in (True, 1.5, "11", -1):
+        with pytest.raises(VendorTraceFormatError, match="non-negative integer"):
+            declared_usage({"input_tokens": invalid_count, "output_tokens": 5})
 
 
 def test_declared_model_identity_never_infers_a_provider() -> None:
