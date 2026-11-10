@@ -12,6 +12,11 @@ from pydantic import Field, StrictInt, ValidationError, field_validator, model_v
 
 from exp.common.core.artifacts import ContractModel, JsonValue
 from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.lone_surrogates import (
+    SURROGATE_ESCAPE,
+    has_lone_surrogate,
+    repaired_text,
+)
 
 MAX_DECISION_QUESTIONS = 32
 MAX_DECISION_CRITERIA = 64
@@ -34,6 +39,12 @@ MAX_DECISION_BODY_BYTES = (
 """Raw body ceiling: the text budget, base64 image data, and bounded asset framing."""
 DECISION_FIELDS = frozenset({"model", "state", "questions", "assets"})
 _STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")
+STATE_SURROGATES_REPLACED = "state->replaced(lone_surrogate)"
+"""Disclosure recorded when lone UTF-16 surrogate escapes in ``state`` become U+FFFD."""
+INSTRUCTIONS_SURROGATES_REPLACED = "questions.instructions->replaced(lone_surrogate)"
+"""Disclosure recorded when lone surrogate escapes in question instructions become U+FFFD."""
+CRITERIA_SURROGATES_REPLACED = "questions.criteria->replaced(lone_surrogate)"
+"""Disclosure recorded when lone surrogate escapes in criteria descriptions become U+FFFD."""
 _CHAT_CONTROLS = frozenset(
     {
         "messages",
@@ -402,10 +413,18 @@ class DecisionUsage(ContractModel):
 
 
 class DecodedDecisionRequest(ContractModel):
-    """The public alias separated from the provider-neutral request."""
+    """The public alias separated from the provider-neutral request.
+
+    Attributes:
+        alias: The public model alias the caller named.
+        request: The provider-neutral decision request.
+        ignored_parameters: Disclosed request rewrites, returned in
+            ``x-experiential-ignored-parameters``.
+    """
 
     alias: str = Field(min_length=1, max_length=512)
     request: DecisionRequest
+    ignored_parameters: tuple[str, ...] = ()
 
 
 def decode_decision_request(body: str, byte_length: int | None = None) -> DecodedDecisionRequest:
@@ -444,15 +463,170 @@ def decode_decision_request(body: str, byte_length: int | None = None) -> Decode
         raise DecisionRequestError(
             "body", "decision JSON nesting exceeds the 64-level limit"
         ) from exc
+    ignored_parameters: tuple[str, ...] = ()
+    if isinstance(raw, dict) and SURROGATE_ESCAPE.search(body) is not None:
+        raw, ignored_parameters = _replace_lone_surrogates(raw)
     _native_json(raw)
     if not isinstance(raw, dict):
         raise DecisionRequestError("body", "decision request body must be a JSON object")
     _require_fields(raw)
-    return DecodedDecisionRequest(
-        alias=raw["model"],
-        request=DecisionRequest(
-            state=raw["state"], questions=raw["questions"], assets=raw.get("assets")
-        ),
+    request = DecisionRequest.model_validate(
+        {"state": raw["state"], "questions": raw["questions"], "assets": raw.get("assets")}
+    )
+    return DecodedDecisionRequest.model_validate(
+        {"alias": raw["model"], "request": request, "ignored_parameters": ignored_parameters}
+    )
+
+
+def _replace_lone_surrogates(
+    raw: dict[str, JsonValue],
+) -> tuple[dict[str, JsonValue], tuple[str, ...]]:
+    """Replace lone UTF-16 surrogates in decision content with U+FFFD, disclosed.
+
+    JavaScript's well-formed ``JSON.stringify`` writes a string cut inside a
+    surrogate pair (an emoji sliced by length) as a lone ``\\udXXX`` escape:
+    valid JSON that has no UTF-8 form, so the text cannot reach a provider.
+    Content (state, instructions, criteria descriptions, and the keys inside
+    them) is repaired the way a lenient UTF-8 decoder would. Identifiers the
+    answer is keyed by (the model, question IDs, choice names, asset
+    references) are refused instead: a rewritten key could not match the
+    caller's own.
+
+    Raises:
+        DecisionRequestError: An identifier holds a lone surrogate, or two
+            content keys become equal once repaired.
+    """
+    # The decoded body is owned here, so it is repaired in place: nothing is
+    # copied per question or per entry before the input bounds are checked.
+    disclosed: list[str] = []
+    if "state" in raw:
+        raw["state"], changed = _repaired_content(raw["state"], "state", 1)
+        if changed:
+            disclosed.append(STATE_SURROGATES_REPLACED)
+    questions = raw.get("questions")
+    if isinstance(questions, dict):
+        instructions_changed = criteria_changed = False
+        for question in questions.values():
+            if not isinstance(question, dict):
+                continue
+            if "instructions" in question:
+                question["instructions"], changed = _repaired_content(
+                    question["instructions"], "questions", 3
+                )
+                instructions_changed |= changed
+            criteria = question.get("criteria")
+            # Choice names are answer keys, and noul's true/false are fixed
+            # vocabulary: only their descriptions are content.
+            if isinstance(criteria, dict):
+                for key, item in criteria.items():
+                    repaired, changed = _repaired_content(item, "questions", 4)
+                    if changed:
+                        criteria[key] = repaired
+                        criteria_changed = True
+            elif isinstance(criteria, list):
+                for index, item in enumerate(criteria):
+                    repaired, changed = _repaired_content(item, "questions", 4)
+                    if changed:
+                        criteria[index] = repaired
+                        criteria_changed = True
+        if instructions_changed:
+            disclosed.append(INSTRUCTIONS_SURROGATES_REPLACED)
+        if criteria_changed:
+            disclosed.append(CRITERIA_SURROGATES_REPLACED)
+    _refuse_surrogate_identifiers(raw)
+    assets = raw.get("assets")
+    if (
+        disclosed
+        and isinstance(assets, dict)
+        and any("\N{REPLACEMENT CHARACTER}" in reference for reference in assets)
+    ):
+        # A repair writes U+FFFD into the text, so it could newly reference
+        # this asset and send an image the caller's own text never named.
+        raise DecisionRequestError(
+            "assets",
+            "an asset reference containing U+FFFD cannot be used while lone UTF-16 "
+            "surrogates in the request text are being replaced; resend the text as valid Unicode",
+        )
+    return raw, tuple(disclosed)
+
+
+def _repaired_content(value: JsonValue, param: str, depth: int) -> tuple[JsonValue, bool]:
+    """Return ``value`` with every lone surrogate replaced, and whether any was.
+
+    Past the nesting limit the value is returned untouched for
+    ``_native_json`` to refuse, which also bounds this recursion.
+    """
+    if depth > MAX_DECISION_JSON_DEPTH:
+        return value, False
+    if isinstance(value, str):
+        return repaired_text(value)
+    if isinstance(value, list):
+        # The decoded body is owned here, so a list is repaired in place:
+        # nothing is allocated per entry of a large unchanged array.
+        any_changed = False
+        for index, item in enumerate(value):
+            repaired, changed = _repaired_content(item, param, depth + 1)
+            if changed:
+                value[index] = repaired
+                any_changed = True
+        return value, any_changed
+    if isinstance(value, dict):
+        if not any(has_lone_surrogate(key) for key in value):
+            # Keys stay as they are, so the owned mapping is repaired in place.
+            unchanged = True
+            for key, item in value.items():
+                repaired, changed = _repaired_content(item, param, depth + 1)
+                if changed:
+                    value[key] = repaired
+                    unchanged = False
+            return value, not unchanged
+        result: dict[str, JsonValue] = {}
+        any_changed = False
+        for key, item in value.items():
+            new_key, key_changed = repaired_text(key)
+            if new_key in result:
+                raise DecisionRequestError(
+                    param,
+                    "decision JSON object keys must stay distinct after lone UTF-16 "
+                    "surrogates are replaced with U+FFFD",
+                )
+            result[new_key], item_changed = _repaired_content(item, param, depth + 1)
+            any_changed |= key_changed or item_changed
+        return result, any_changed
+    return value, False
+
+
+def _refuse_surrogate_identifiers(raw: dict[str, JsonValue]) -> None:
+    """Name the identifier field holding a lone surrogate, without echoing it."""
+
+    def lone(text: JsonValue | None) -> bool:
+        """Whether ``text`` is a string carrying a lone UTF-16 surrogate."""
+        return isinstance(text, str) and has_lone_surrogate(text)
+
+    questions = raw.get("questions")
+    assets = raw.get("assets")
+    if lone(raw.get("model")):
+        param = "model"
+    elif isinstance(questions, dict) and any(
+        lone(name)
+        or (
+            isinstance(question, dict)
+            and question.get("type") == "choice"
+            and isinstance(question.get("criteria"), dict)
+            and any(lone(key) for key in question["criteria"])
+        )
+        for name, question in questions.items()
+    ):
+        param = "questions"
+    elif isinstance(assets, dict) and any(lone(reference) for reference in assets):
+        param = "assets"
+    else:
+        return
+    raise DecisionRequestError(
+        param,
+        "model, question IDs, choice category names, and asset references must not contain "
+        "lone UTF-16 surrogates (a \\uD800-\\uDFFF escape without its pair); these keys "
+        "identify answers, so they are not replaced",
     )
 
 

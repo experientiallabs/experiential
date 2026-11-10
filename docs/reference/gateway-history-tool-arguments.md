@@ -19,8 +19,13 @@ before.
 
 ## What the decoder keeps
 
-The caller's text is kept byte-exact. The decoder also derives one object to stand
-in for it:
+The caller's text is kept byte-exact, with one exception: a lone UTF-16 surrogate
+(raw, or a `\uD800`-`\uDFFF` escape without its pair) has no UTF-8 form, so it is
+replaced with U+FFFD before decoding and disclosed as
+`<path>.arguments->replaced(lone_surrogate)`; one in an object key is refused (see
+[gateway-generation.md](gateway-generation.md)). Every other byte is kept, and the
+repaired text is what the rows below call "the caller's text". The decoder also
+derives one object to stand in for it:
 
 | Text | Stand-in object | Treatment |
 |---|---|---|
@@ -37,7 +42,8 @@ Closing a cut-off object adds no content. It keeps every complete member and
 element, and it keeps the characters of an unterminated string value. It drops
 anything the cut may have shortened: a trailing number or literal (`12` may have
 been `123`), a key with no value, a dangling comma, a partial escape, or half of a
-surrogate pair. Text that is not a valid object prefix is wrapped, never repaired.
+surrogate pair. Text that is not a valid object prefix is wrapped, never repaired
+(apart from the lone surrogate replacement above).
 
 On Responses, the existing payload repairs (`input.arguments->serialized(json_object)`
 and `input.arguments->decoded(double_encoded_json)`) run first, as before.
