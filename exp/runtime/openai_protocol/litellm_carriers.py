@@ -46,6 +46,15 @@ class LiteLLMThinkingBlock(_LiteLLMModel):
     "signature": ...}`` with optional ``cache_control`` and ``index``. The same
     turn carries the plaintext as ``reasoning_content``, so the block is
     validated and dropped with disclosure, never forwarded.
+
+    Attributes:
+        type: The discriminator, always ``"thinking"``.
+        thinking: The block's plaintext reasoning, bounded by
+            ``MAXIMUM_REASONING_CARRIER_BYTES``.
+        signature: The issuing provider's signature, bounded like ``thinking``;
+            ``None`` when LiteLLM recorded none.
+        cache_control: LiteLLM's optional cache marker object, never interpreted.
+        index: LiteLLM's optional non-negative block position.
     """
 
     type: Literal["thinking"]
@@ -56,7 +65,15 @@ class LiteLLMThinkingBlock(_LiteLLMModel):
 
 
 class LiteLLMRedactedThinkingBlock(_LiteLLMModel):
-    """LiteLLM's ``ChatCompletionRedactedThinkingBlock``: an opaque ``data`` payload."""
+    """LiteLLM's ``ChatCompletionRedactedThinkingBlock``: an opaque ``data`` payload.
+
+    Attributes:
+        type: The discriminator, always ``"redacted_thinking"``.
+        data: The provider's opaque redacted payload, bounded by
+            ``MAXIMUM_REASONING_CARRIER_BYTES``.
+        cache_control: LiteLLM's optional cache marker object, never interpreted.
+        index: LiteLLM's optional non-negative block position.
+    """
 
     type: Literal["redacted_thinking"]
     data: _BoundedReasoningText
@@ -71,7 +88,12 @@ LiteLLMThinkingBlockItem = Annotated[
 
 
 class LiteLLMReasoningSummaryText(_LiteLLMModel):
-    """LiteLLM's ``ChatCompletionReasoningSummaryTextBlock`` inside a reasoning item."""
+    """LiteLLM's ``ChatCompletionReasoningSummaryTextBlock`` inside a reasoning item.
+
+    Attributes:
+        type: The discriminator, always ``"summary_text"``.
+        text: The summary's display text, bounded by ``MAXIMUM_REASONING_CARRIER_BYTES``.
+    """
 
     type: Literal["summary_text"]
     text: _BoundedReasoningText
@@ -85,6 +107,13 @@ class LiteLLMReasoningItem(_LiteLLMModel):
     summary is display copy, so neither is replayable here (the same rule
     :mod:`exp.runtime.openai_protocol.reasoning_replay` applies to OpenRouter's
     encrypted and summary blocks): validated and dropped with disclosure.
+
+    Attributes:
+        type: The discriminator, always ``"reasoning"``.
+        id: The provider's optional item id, 1 to 256 characters.
+        encrypted_content: The provider-bound encrypted reasoning, bounded by
+            ``MAXIMUM_REASONING_CARRIER_BYTES``; ``None`` when absent.
+        summary: Optional ``summary_text`` parts; ``None`` when absent.
     """
 
     type: Literal["reasoning"]

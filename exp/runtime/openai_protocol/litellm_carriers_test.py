@@ -59,6 +59,7 @@ class _Message:
         thinking_blocks: tuple[LiteLLMThinkingBlockItem, ...] | None = None,
         reasoning_items: tuple[LiteLLMReasoningItem, ...] | None = None,
     ) -> None:
+        """Hold the two optional carriers; ``None`` means the key was absent."""
         self.thinking_blocks = thinking_blocks
         self.reasoning_items = reasoning_items
 

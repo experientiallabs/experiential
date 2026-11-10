@@ -526,6 +526,36 @@ def test_chat_decoder_drops_populated_litellm_reasoning_carriers_with_disclosure
     assert "messages.thinking_blocks" not in plain.request.ignored_parameters
 
 
+def test_responses_decoder_drops_populated_litellm_reasoning_carriers_with_disclosure() -> None:
+    """A Responses history message's LiteLLM carriers clear the official probe and drop.
+
+    A Chat-to-Responses bridge built on LiteLLM echoes the same message dump as
+    ``input`` history (string content, and typed ``output_text`` parts on an
+    id-less assistant message). The official-SDK probe copies the raw item, so
+    this pins that it does not refuse the carriers the wire model accepted and
+    that the drop is disclosed under ``input``.
+    """
+    carriers = {
+        "thinking_blocks": [{"type": "thinking", "thinking": "t", "signature": "s"}],
+        "reasoning_items": [
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "a"}]}
+        ],
+    }
+    for content in ("x", [{"type": "output_text", "text": "x"}]):
+        decoded = decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": content, **carriers},
+                    {"role": "user", "content": "next"},
+                ],
+            }
+        )
+        assert "input.thinking_blocks" in decoded.request.ignored_parameters
+        assert "input.reasoning_items" in decoded.request.ignored_parameters
+
+
 def test_chat_decoder_preserves_only_a_gateway_issued_reasoning_carrier() -> None:
     """A Fireworks continuation stays encrypted until authorized admission."""
     deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
