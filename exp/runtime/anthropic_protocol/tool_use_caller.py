@@ -10,7 +10,7 @@ field-specific 400.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 
 from pydantic import Discriminator, Field, Tag
 
@@ -42,6 +42,12 @@ class _CodeExecutionCaller(AnthropicWireModel):
     tool_id: str = Field(min_length=1, max_length=256)
 
 
+_CODE_EXECUTION_CALLER_TYPES = frozenset(
+    get_args(_CodeExecutionCaller.model_fields["type"].annotation)
+)
+"""The code execution ``type`` tags, read from the arm so a new version is one edit."""
+
+
 def _caller_arm(value: object) -> str | None:
     """Pick the ``caller`` arm by its ``type`` tag.
 
@@ -51,7 +57,7 @@ def _caller_arm(value: object) -> str | None:
     tag = value.get("type") if isinstance(value, dict) else getattr(value, "type", None)
     if tag == "direct":
         return "_DirectCaller"
-    if tag in ("code_execution_20250825", "code_execution_20260120"):
+    if tag in _CODE_EXECUTION_CALLER_TYPES:
         return "_CodeExecutionCaller"
     return None
 

@@ -12,11 +12,11 @@ def text_input_context(request: GatewayRequest) -> str:
 
     Message text, including the canonical folded tool-error prefix, and tool arguments
     are scanned separately by each adapter. Function
-    definitions, examples, call/result identifiers, names and namespaces, schemas, and normalized
-    search declarations are ordinary text too. Opaque provider content, caller objects,
-    attachments, and provider-owned tools or prompt configuration require a separately
-    validated projection. Internal replay IDs, cache hints, and inert telemetry are not
-    prompt content.
+    definitions, examples, call/result identifiers, names and namespaces, the closed Messages
+    ``tool_use`` caller, schemas, and normalized search declarations are ordinary text too.
+    Opaque provider content, Responses caller objects, attachments, and provider-owned tools
+    or prompt configuration require a separately validated projection. Internal replay IDs,
+    cache hints, and inert telemetry are not prompt content.
 
     Returns:
         Canonical text for the supported non-message context, or an empty string.
