@@ -102,11 +102,14 @@ _MEDIA_PART_TYPES = frozenset({"input_image", "input_file", "input_audio", "imag
 
 
 def _without_media(value: JsonValue) -> JsonValue:
-    """Return a verbatim item with every inline media part removed, for text sizing.
+    """Return a verbatim item without inline media or ciphertext, for text sizing.
 
     A verbatim item (an ``agent_message`` image, an Anthropic image block)
     can embed a base64 data URL that tokenizes by its own rules; counting it
-    as UTF-8 text would read a valid image as millions of text tokens.
+    as UTF-8 text would read a valid image as millions of text tokens. An
+    ``encrypted_content`` carrier (compacted history, an encrypted agent
+    message part) is opaque, and its length bounds nothing about the tokens
+    the provider reconstructs, so it is left out too.
 
     Args:
         value: One JSON value from a verbatim provider item.
@@ -115,7 +118,9 @@ def _without_media(value: JsonValue) -> JsonValue:
         The value without media parts; the caller's object is not modified.
     """
     if isinstance(value, dict):
-        return {key: _without_media(child) for key, child in value.items()}
+        return {
+            key: _without_media(child) for key, child in value.items() if key != "encrypted_content"
+        }
     if isinstance(value, list):
         return [
             _without_media(child)

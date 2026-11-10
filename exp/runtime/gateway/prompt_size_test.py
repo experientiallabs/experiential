@@ -346,3 +346,25 @@ def test_capped_rungs_stay_when_no_uncapped_rung_of_their_model_is_left() -> Non
     other_model = _deployment("other", 200_000).model_copy(update={"exact_model_id": "exact-two"})
     mixed = _route(_capped(_deployment("fast", 200_000), 1_000), other_model)
     assert prompt_cap_indexes(mixed, _request(_tokens(2_000))) is None
+
+
+def test_ciphertext_inside_a_verbatim_item_is_not_counted_as_text() -> None:
+    """An opaque ``encrypted_content`` carrier is not a text lower bound."""
+
+    def _request(native: JsonObject) -> GatewayRequest:
+        """Build a Responses request carrying one native item.
+
+        Args:
+            native: The verbatim item.
+
+        Returns:
+            The request.
+        """
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="assistant", provider_native_item=native),),
+        )
+
+    bare: JsonObject = {"type": "context_compaction", "id": "cc_1"}
+    sealed: JsonObject = {**bare, "encrypted_content": "Z" * 1_000_000}
+    assert prompt_text_bytes(_request(sealed)) == prompt_text_bytes(_request(bare))
