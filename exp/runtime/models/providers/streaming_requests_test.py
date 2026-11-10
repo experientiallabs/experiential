@@ -6242,6 +6242,15 @@ def _vertex_anthropic_profile() -> GatewayWireProfile:
             "claude-haiku-4-5:streamRawPredict"
         ),
         anthropic_vertex_version="vertex-2023-10-16",
+        serves_advisor_tool=False,
+    )
+
+
+def _foundry_anthropic_profile() -> GatewayWireProfile:
+    """Return one Claude-on-Azure AI Foundry Messages wire profile (no advisor)."""
+    return replace(
+        _anthropic_web_search_profile("https://acct.services.ai.azure.com/anthropic/v1/messages"),
+        serves_advisor_tool=False,
     )
 
 
@@ -6283,8 +6292,12 @@ def test_the_advisor_tool_is_dropped_on_vertex_and_refused_on_a_vertex_mixed_rou
     assert not any("advisor" in path for path in public.ignored_parameters)
 
 
-def test_echoed_advisor_history_is_dropped_on_vertex_and_forwarded_on_a_mixed_route() -> None:
-    """Advisor history leaves an all-Vertex dispatch (no beta); a mixed route forwards it."""
+def test_echoed_advisor_history_is_dropped_whenever_a_rung_lacks_the_advisor() -> None:
+    """Advisor history leaves the dispatch (no beta) on Vertex and on a mixed route.
+
+    On a mixed route the shared dispatched request would otherwise carry the
+    blocks onto the Vertex rung at failover; an all-Anthropic route keeps them.
+    """
     call: JsonObject = {
         "type": "server_tool_use",
         "id": "srvtoolu_1",
@@ -6319,10 +6332,28 @@ def test_echoed_advisor_history_is_dropped_on_vertex_and_forwarded_on_a_mixed_ro
     _, mixed = route_generation_parameter_requests(
         (_anthropic_web_search_profile(), _vertex_anthropic_profile()), request
     )
-    assert [m.provider_anthropic_block for m in mixed.messages if m.provider_anthropic_block] == [
+    assert all(message.provider_anthropic_block is None for message in mixed.messages)
+
+    _, native = route_generation_parameter_requests((_anthropic_web_search_profile(),), request)
+    assert [m.provider_anthropic_block for m in native.messages if m.provider_anthropic_block] == [
         call,
         result,
     ]
+
+
+def test_the_advisor_tool_is_dropped_on_azure_foundry_and_refused_when_mixed() -> None:
+    """Azure AI Foundry serves the Messages wire without the advisor, like Vertex."""
+    public, provider = route_generation_parameter_requests(
+        (_foundry_anthropic_profile(),), _advisor_messages_request()
+    )
+    assert provider.provider_server_tools == ()
+    assert "tools.advisor->dropped(unsupported_by_provider)" in public.ignored_parameters
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (_anthropic_web_search_profile(), _foundry_anthropic_profile()),
+            _advisor_messages_request(),
+        )
+    assert "Azure AI Foundry" in str(raised.value)
 
 
 def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:

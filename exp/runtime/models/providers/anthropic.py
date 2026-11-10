@@ -247,6 +247,7 @@ class AnthropicClient(ProviderHttpClient):
         reasoning_effort: str | None = None,
         authorization_bearer: bool = False,
         inference_geo: Literal["us"] | None = None,
+        serves_advisor_tool: bool = True,
     ) -> None:
         """Create an Anthropic client with explicit generation capability gates.
 
@@ -255,6 +256,8 @@ class AnthropicClient(ProviderHttpClient):
         Foundry serves the same native Messages API at ``{endpoint}/anthropic/v1``
         but authenticates with a Bearer token, so a Foundry-hosted Claude routes
         through this client with ``authorization_bearer=True``.
+        ``serves_advisor_tool`` is false for an endpoint that serves the Messages
+        wire without Anthropic's advisor tool (Azure AI Foundry).
         """
         super().__init__(
             model=model,
@@ -274,6 +277,7 @@ class AnthropicClient(ProviderHttpClient):
         self._reasoning_effort = reasoning_effort
         self._authorization_bearer = authorization_bearer
         self._inference_geo = inference_geo
+        self._serves_advisor_tool = serves_advisor_tool
 
     def _headers(self) -> dict[str, str]:
         """Build native Anthropic Messages headers with the connection's auth scheme."""
@@ -307,6 +311,7 @@ class AnthropicClient(ProviderHttpClient):
             supports_reasoning=self._supports_reasoning,
             reasoning_wire_format="anthropic_adaptive",
             reasoning_effort=self._reasoning_effort,
+            serves_advisor_tool=self._serves_advisor_tool,
         )
 
     def _completion_path(self) -> str:

@@ -75,11 +75,14 @@ rejection on a mixed route). Echoed advisor history (the advisor's `server_tool_
 `advisor_tool_result`, any result variant, encrypted `advisor_redacted_result` included) is
 carried the same way with or without the declaration: Anthropic keeps that history valid after
 the tool leaves `tools`, and on an Anthropic rung the dispatch adds the `advisor-tool-2026-03-01`
-token the history requires. Claude on Vertex AI (Google managed) speaks the Messages wire but
-Anthropic does not offer the advisor there: a route served only by Vertex drops the declaration
-(`tools.advisor->dropped(unsupported_by_provider)`) and the echoed advisor history
-(`messages.server_tool_blocks->dropped(unsupported_by_provider)`) while every other server tool
-still forwards, and a route mixing Vertex with Anthropic rungs refuses a declared advisor by name.
+token the history requires. Claude on Vertex AI (Google managed) and on Azure AI Foundry speak the Messages wire, but
+Anthropic does not offer the advisor there (the wire profile's `serves_advisor_tool` is false). A
+route with no rung that serves the advisor drops the declaration
+(`tools.advisor->dropped(unsupported_by_provider)`) while every other server tool still forwards;
+a route where only some rungs serve it refuses a declared advisor by name; and whenever any rung
+lacks it, echoed advisor history leaves the dispatched request
+(`messages.server_tool_blocks->dropped(unsupported_by_provider)`) so a failover never carries it
+onto such a rung and no advisor beta reaches it.
 Advisor sub-inference tokens are reported only in Anthropic's
 `usage.iterations[]` (`type: "advisor_message"`), never in the top-level usage the gateway
 settles from, so the gateway's meters and ledger count executor tokens only. The terminal `message_delta` usage

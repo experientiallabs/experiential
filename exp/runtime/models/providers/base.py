@@ -408,6 +408,15 @@ class GatewayWireProfile:
     ``/videos/generations`` on an xAI-origin OpenAI-compatible connection, and
     ``None`` on every other connection, so the video surface excludes the rung."""
 
+    serves_advisor_tool: bool = True
+    """Whether this endpoint offers Anthropic's advisor server tool (``advisor_20260301``).
+
+    Read only on ``anthropic_messages`` rungs. Anthropic offers the advisor on the
+    Claude API, Claude Platform on AWS and Anthropic-managed Google Cloud; Claude
+    on Vertex AI (Google managed) and on Azure AI Foundry speak the same Messages
+    wire without it, so their clients set this false and the route drops or
+    refuses the advisor instead of forwarding it."""
+
     anthropic_vertex_version: str | None = None
     """Set ONLY on an ``anthropic_messages`` rung served through Vertex AI
     (Claude on Vertex). When present, the dispatch body builder drops the
