@@ -151,7 +151,9 @@ fn settle_argument(
             if let Some(phase) = failure.header_timeout {
                 wire["header_timeout"] = json!(phase.as_str());
             }
-            wire
+            // A customer-addressed origin's failure: health keeps no nameable
+            // cause for it, so a later refusal cannot replay it.
+            failure.with_wire_origin(wire)
         }),
         "finalize": finalize,
         "opened": opened,

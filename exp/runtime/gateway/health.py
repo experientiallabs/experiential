@@ -77,7 +77,26 @@ def _lane(key: DeploymentHealthKey) -> LaneKey:
 
 @dataclass
 class _DeploymentHealth:
-    """Mutable content-free health state protected by the registry lock."""
+    """Mutable content-free health state protected by the registry lock.
+
+    Attributes:
+        consecutive_failures: Operational failures since the last success; a
+            credential failure sets it straight to the threshold.
+        open_until: Monotonic instant the open circuit admits a half-open probe.
+        throttle_until: Monotonic instant the provider-requested backoff ends.
+        half_open_probe: Whether the one half-open probe is in flight.
+        last_resort_probe: Whether the one last-resort probe is in flight.
+        refusal_count: Content refusals observed on this deployment.
+        circuit_failure: The account failure (authentication, not found, quota)
+            that holds the circuit open, reduced to its class, canonical message
+            and ownership so it carries nothing from the request that observed
+            it. ``None`` while the circuit is closed or held open by
+            operational failures, and never recorded for a tenant origin, whose
+            failures stay opaque to callers.
+        newer_throttle_until: Monotonic end of the throttle windows observed after
+            ``circuit_failure`` was recorded (zero when none); only these, never an
+            older window, outrank the recorded account failure.
+    """
 
     consecutive_failures: int = 0
     open_until: float = 0.0
@@ -85,6 +104,8 @@ class _DeploymentHealth:
     half_open_probe: bool = False
     last_resort_probe: bool = False
     refusal_count: int = 0
+    circuit_failure: GatewayFailure | None = None
+    newer_throttle_until: float = 0.0
 
 
 class DeploymentHealthRegistry:
@@ -262,6 +283,7 @@ class DeploymentHealthRegistry:
             state.open_until = 0.0
             state.half_open_probe = False
             state.last_resort_probe = False
+            state.circuit_failure = None
             self._lanes.succeeded(_lane(key))
 
     def succeeded(self, key: DeploymentHealthKey) -> None:
@@ -276,6 +298,7 @@ class DeploymentHealthRegistry:
             state.open_until = 0.0
             state.half_open_probe = False
             state.last_resort_probe = False
+            state.circuit_failure = None
             self._lanes.succeeded(_lane(key))
 
     def failed(self, key: DeploymentHealthKey, failure: GatewayFailure) -> None:
@@ -293,10 +316,9 @@ class DeploymentHealthRegistry:
             state.last_resort_probe = False
             self._lanes.failed(_lane(key), failure, now)
             if cause == "throttle":
-                state.throttle_until = max(
-                    state.throttle_until,
-                    now + self._throttle_window_seconds(failure),
-                )
+                window_end = now + self._throttle_window_seconds(failure)
+                state.throttle_until = max(state.throttle_until, window_end)
+                state.newer_throttle_until = max(state.newer_throttle_until, window_end)
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
@@ -304,11 +326,22 @@ class DeploymentHealthRegistry:
             if cause == "credential":
                 state.consecutive_failures = self._failure_threshold
                 state.open_until = now + self._open_seconds
+                state.circuit_failure = (
+                    None
+                    if failure.tenant_origin
+                    else GatewayFailure(
+                        failure_class=failure.failure_class,
+                        safe_message=failure.safe_message,
+                        customer_owned=failure.customer_owned,
+                    )
+                )
+                state.newer_throttle_until = 0.0
                 return
             if cause == "transport":
                 state.consecutive_failures += 1
                 if state.consecutive_failures >= self._failure_threshold:
                     state.open_until = now + self._open_seconds
+                    state.circuit_failure = None
 
     def exhausted(self, key: DeploymentHealthKey, reset_after_seconds: float) -> None:
         """Suppress one deployment until its provider-stated usage window resets.
@@ -331,6 +364,7 @@ class DeploymentHealthRegistry:
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.throttle_until = max(state.throttle_until, now + window)
+            state.newer_throttle_until = max(state.newer_throttle_until, now + window)
 
     def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
         """Size one throttle window from the provider's own stated wait.
@@ -374,8 +408,10 @@ class DeploymentHealthRegistry:
                 return False
             return state.throttle_until > now or state.open_until > now
 
-    def throttled_remaining_seconds(self, keys: tuple[DeploymentHealthKey, ...]) -> float | None:
-        """Return the longest remaining throttle window when EVERY key is inside one.
+    def throttled_remaining_seconds(
+        self, keys: tuple[DeploymentHealthKey, ...], depths: Sequence[int] | None = None
+    ) -> float | None:
+        """Return the longest remaining throttle window when EVERY claimable key is inside one.
 
         A route with no claimable deployment and no classified failure of its
         own can only be throttle-suppressed (forced claims admit any
@@ -385,22 +421,64 @@ class DeploymentHealthRegistry:
 
         Args:
             keys: One health key per ordered route deployment.
+            depths: The route indexes this reservation could claim; ``None``
+                judges every deployment. A depth the reservation may not dial
+                says nothing about why it was refused.
 
         Returns:
-            The longest remaining window in seconds, or ``None`` when the
-            route is empty or any deployment is outside a throttle window.
+            The longest remaining window in seconds, or ``None`` when no
+            depth is judged or any judged deployment is outside a throttle window.
         """
-        if not keys:
+        judged = range(len(keys)) if depths is None else depths
+        if not judged:
             return None
         now = self._clock()
         remaining = 0.0
         with self._lock:
-            for key in keys:
-                state = self._states.get(key)
+            for depth in judged:
+                state = self._states.get(keys[depth])
                 if state is None or state.throttle_until <= now:
                     return None
                 remaining = max(remaining, state.throttle_until - now)
         return remaining
+
+    def circuit_failure(
+        self, keys: tuple[DeploymentHealthKey, ...], depths: Sequence[int]
+    ) -> GatewayFailure | None:
+        """Return the account failure holding EVERY claimable depth's circuit open.
+
+        A dial that may not force an open circuit (a caller-selected route's
+        first dial) ends with no attempt while its rung's provider account is
+        refusing. That answer is the account's own failure, the same class and
+        message a dispatched attempt on the rung gets, rather than a generic
+        outage of every deployment.
+
+        Args:
+            keys: One health key per ordered route deployment.
+            depths: The route indexes this reservation could claim.
+
+        Returns:
+            The first depth's recorded account failure when every depth sits in
+            a circuit an account failure opened that refuses a claim right now
+            (inside its cooldown, or its half-open probe in flight) and no newer
+            throttle window is still running there, else ``None``.
+        """
+        # ``circuit_failure`` is set only with the circuit at its threshold and
+        # cleared whenever the count resets, so it alone marks an account-opened circuit.
+        first: GatewayFailure | None = None
+        now = self._clock()
+        with self._lock:
+            for depth in depths:
+                state = self._states.get(keys[depth])
+                if (
+                    state is None
+                    or state.circuit_failure is None
+                    or (state.open_until <= now and not state.half_open_probe)
+                    or state.newer_throttle_until > now
+                ):
+                    return None
+                first = first or state.circuit_failure
+        return first
 
     def release_probe(self, key: DeploymentHealthKey) -> None:
         """Release a claimed half-open probe that never reached provider dispatch.

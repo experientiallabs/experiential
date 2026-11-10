@@ -271,7 +271,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             // as `tool_search_round`.
             "tool_search_round": search_redial,
             "reasoning_repair": repair_redial,
-            "failure": last_failure.as_ref().map(|failure| json!({
+            "failure": last_failure.as_ref().map(|failure| failure.with_wire_origin(json!({
                 "failure_class": failure.failure_class.as_str(),
                 "safe_message": failure.safe_message,
                 "retryable_same_deployment": failure.retryable_same_deployment,
@@ -291,7 +291,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // throttle ladder advertises it as `Retry-After`.
                 "retry_after_seconds": failure.retry_after_seconds,
                 "header_timeout": failure.header_timeout.map(|phase| phase.as_str()),
-            })),
+            }))),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
             Ok(text) => text,

@@ -68,6 +68,8 @@ def exhausted_attempt_payload(failure: GatewayFailure, *, known_unbilled: bool =
         payload["refusal_reason"] = failure.refusal_reason.value
     if failure.retry_after_seconds is not None:
         payload["retry_after_seconds"] = failure.retry_after_seconds
+    if failure.tenant_origin:
+        payload["tenant_origin"] = True
     result: JsonObject = {"exhausted": True, "failure": payload}
     if known_unbilled and failure.failure_class is GatewayFailureClass.THROTTLED:
         result["known_unbilled"] = True
@@ -165,6 +167,7 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
         ),
         refusal_reason=refusal_reason_from_payload(data.get("refusal_reason")),
         header_timeout=header_timeout_from_payload(data.get("header_timeout")),
+        tenant_origin=data.get("tenant_origin") is True,
     )
 
 
@@ -384,6 +387,7 @@ def terminal_from_settlement(
             # control plane counts refusals by reason without parsing detail.
             refusal_reason=refusal_reason_from_payload(failure_payload.get("refusal_reason")),
             header_timeout=header_timeout_from_payload(failure_payload.get("header_timeout")),
+            tenant_origin=failure_payload.get("tenant_origin") is True,
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED

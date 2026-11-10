@@ -474,6 +474,16 @@ impl Failure {
         self
     }
 
+    /// Carry the tenant-origin marker on a hand-built bridge copy of this
+    /// failure (only when set), so a failure the control plane stores or
+    /// echoes back as the exhausting answer keeps its opaque public form.
+    pub fn with_wire_origin(&self, mut wire: serde_json::Value) -> serde_json::Value {
+        if self.tenant_origin {
+            wire["tenant_origin"] = json!(true);
+        }
+        wire
+    }
+
     /// Whether the caller sees only [`TENANT_ORIGIN_MESSAGE`]: every class an
     /// upstream answer or connection produces. The caller's own classes, the
     /// gateway's, and an empty completion (a delivered turn) keep their shape.
@@ -639,6 +649,23 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wire_copy_carries_the_tenant_origin_only_when_set() {
+        let failure = Failure::new(FailureClass::ProviderAuthentication, "rejected");
+        let wire = json!({"failure_class": "provider_authentication"});
+        assert_eq!(failure.clone().with_wire_origin(wire.clone()), wire);
+        let tenant = failure.with_tenant_origin(true).with_wire_origin(wire);
+        assert_eq!(tenant["tenant_origin"], json!(true));
+        // The echoed copy deserializes back into an opaque failure.
+        let echoed: Failure = serde_json::from_value(json!({
+            "failure_class": "provider_authentication",
+            "safe_message": "rejected",
+            "tenant_origin": true,
+        }))
+        .unwrap();
+        assert_eq!(echoed.public_error().code, "custom_endpoint_failed");
+    }
 
     #[test]
     fn a_tenant_origin_collapses_every_upstream_class_and_keeps_the_rest() {

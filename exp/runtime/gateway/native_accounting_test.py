@@ -2477,12 +2477,191 @@ def test_selected_first_route_does_not_force_an_open_health_circuit(
     assert refused["exhausted"] is True
     failure = refused["failure"]
     assert isinstance(failure, dict)
-    assert failure["failure_class"] == "provider_internal"
+    # The refusal names the account failure that opened the circuit.
+    assert failure["failure_class"] == "provider_authentication"
+    assert failure["safe_message"] == "provider rejected its credential"
     assert not ledger.started
     assert registry.entry(selected.authorization.request_id) is None
     ordinary = _admit(registry, selected.route.deployments, request_id="ordinary")
     assert _start(registry, ordinal=0, request_id="ordinary")["route_depth"] == 1
     assert ordinary.total_attempts == 1
+
+
+_QUOTA_MESSAGE = (
+    "provider account quota or billing is exhausted; ask the gateway operator "
+    "to fund or enable the provider account"
+)
+
+
+def _selected_single_rung(registry: NativeAttemptAccounting, request_id: str) -> InflightRequest:
+    """Admit one request whose caller pinned the only rung (``route_id``, no fallbacks)."""
+    entry = _admit(
+        registry, (_deployment("deployment-a", connection_sha256="b" * 64),), request_id=request_id
+    )
+    entry.route = entry.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    return entry
+
+
+def test_selected_route_on_a_quota_exhausted_account_answers_the_quota_failure() -> None:
+    """A pinned no-fallback rung whose account ran dry is refused as provider_quota, not an outage.
+
+    A dispatched attempt on the selected rung answers ``provider_quota`` and
+    opens its circuit. A later selected request inside the cooldown is refused
+    before dispatch with that same class and message, never the generic
+    ``provider_internal`` "all exact-model deployments are unavailable".
+    """
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    _selected_single_rung(registry, "dispatched")
+    attempt = _start(registry, ordinal=0, request_id="dispatched")
+    assert attempt["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(attempt["attempt_id"]),
+        outcome="failed",
+        finalize=True,
+        request_id="dispatched",
+        failure={
+            "failure_class": "provider_quota",
+            "safe_message": _QUOTA_MESSAGE,
+            "failover_eligible": True,
+            "provider_detail": "Insufficient balance for request abc",
+        },
+    )
+
+    _selected_single_rung(registry, "refused")
+    refused = _start(registry, ordinal=0, request_id="refused")
+
+    assert refused["exhausted"] is True
+    assert refused["failure"] == {"failure_class": "provider_quota", "safe_message": _QUOTA_MESSAGE}
+    assert len(ledger.started) == 1
+    assert ledger.finished_requests[-1].failure_class is GatewayFailureClass.PROVIDER_QUOTA
+    # Another request's provider detail never rides along on this refusal.
+    assert ledger.finished_requests[-1].provider_detail is None
+    assert registry.entry("refused") is None
+
+
+def test_selected_route_held_open_by_transport_failures_stays_unavailable() -> None:
+    """Only an account failure is named: an operational circuit keeps the generic answer."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    for _ in range(2):
+        registry.health.failed(
+            key,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.TRANSPORT,
+                safe_message="provider transport failed; retry the request",
+            ),
+        )
+    refused = _start(registry, ordinal=0)
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "provider_internal"
+    assert failure["safe_message"] == "all exact-model deployments are unavailable"
+    assert not ledger.started
+
+
+def test_selected_route_on_a_throttled_lead_answers_throttled_despite_a_free_fallback() -> None:
+    """A selected first dial may claim only its own rung, so only that rung's window decides."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            retry_after_seconds=30,
+        ),
+    )
+    refused = _start(registry, ordinal=0)
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "throttled"
+    assert not ledger.started
+
+
+def test_selected_route_names_an_account_failure_newer_than_its_throttle_window() -> None:
+    """An account failure recorded inside a throttle window wins over the older throttle."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request",
+            retry_after_seconds=600,
+        ),
+    )
+    # A post-backoff redial passes the window and the account then refuses it.
+    assert registry.health.claim_throttle_redial(key)
+    registry.health.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_QUOTA,
+            safe_message=_QUOTA_MESSAGE,
+        ),
+    )
+    refused = _start(registry, ordinal=0)
+    assert refused["failure"] == {"failure_class": "provider_quota", "safe_message": _QUOTA_MESSAGE}
+    assert not ledger.started
+
+
+def test_a_settled_tenant_origin_account_failure_is_not_replayed_on_a_selected_route() -> None:
+    """A customer-addressed origin's settled failure opens the circuit but is never named."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    attempt = _start(registry, ordinal=0)
+    _settle(
+        registry,
+        attempt_id=str(attempt["attempt_id"]),
+        outcome="failed",
+        finalize=True,
+        failure={
+            "failure_class": "provider_authentication",
+            "safe_message": "provider rejected its credential",
+            "tenant_origin": True,
+        },
+    )
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    assert not registry.health.claim(key)  # The circuit is open, with no nameable cause.
+    _admit(registry, selected.route.deployments, request_id="refused").route = selected.route
+    refused = _start(registry, ordinal=0, request_id="refused")
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "provider_internal"
+    assert len(ledger.started) == 1
+
+
+def test_an_exhausted_tenant_origin_ladder_echoes_the_opaque_marker() -> None:
+    """The data plane's tenant-origin last failure comes back flagged, never as a bare class.
+
+    The data plane renders the echoed exhausting failure, so the marker it sent
+    must survive or the caller would read the specific provider class.
+    """
+    registry, ledger, _ = _registry()
+    tenant_failure: JsonObject = {
+        "failure_class": "provider_authentication",
+        "safe_message": "provider rejected its credential",
+        "failover_eligible": False,
+        "tenant_origin": True,
+    }
+    first = _start(registry, ordinal=0)
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=tenant_failure,
+    )
+    exhausted = _start(registry, ordinal=1, current_depth=0, failure=tenant_failure)
+    assert exhausted["exhausted"] is True
+    failure = exhausted["failure"]
+    assert isinstance(failure, dict)
+    assert failure["tenant_origin"] is True
+    assert len(ledger.started) == 1
 
 
 class TestRungDispatchPolicy:
