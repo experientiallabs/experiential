@@ -879,7 +879,11 @@ class GatewayRequest(ContractModel):
                 or tool.input_examples is not None
                 for tool in self.tools
             )
-            or any(c.provider_anthropic_caller for m in self.messages for c in m.tool_calls)
+            or any(
+                call.provider_anthropic_caller is not None
+                for message in self.messages
+                for call in message.tool_calls
+            )
         ) and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:

@@ -682,10 +682,10 @@ def test_tool_use_caller_is_a_messages_only_carrier_that_joins_replay_identity()
     )
     assert carried.model_dump() == bare.model_dump()
     assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
-    with pytest.raises(ValidationError, match="Anthropic tool carriers are valid only"):
-        GatewayRequest(
-            surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=history({"type": "direct"})
-        )
+    callers: tuple[JsonObject, ...] = ({"type": "direct"}, {})
+    for caller in callers:
+        with pytest.raises(ValidationError, match="Anthropic tool carriers are valid only"):
+            GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=history(caller))
 
 
 def test_server_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> None:
