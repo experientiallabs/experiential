@@ -132,6 +132,10 @@ class GatewayRoute(ContractModel):
             outcome is the ``lane_saturated`` 429, so the retry lands on the warm rung instead
             of a cold one recomputing the whole prefix. Failures on the rung follow the pool's
             failover rules unchanged, and a soft or default bound keeps the historical spill.
+        caller_narrowing: Public spellings of the caller's routing controls that removed at
+            least one rung from this route (``provider.only``, ``provider.ignore``, the two
+            ``allow_fallbacks: false`` forms), default empty. A refusal names only these, so
+            it never advises removing a control that excluded nothing.
     """
 
     snapshot: ExecutionSnapshot
@@ -151,6 +155,7 @@ class GatewayRoute(ContractModel):
     payload is built, and the payload builders still reject a foreign block.
     """
     cache_placed_deployment_id: str | None = None
+    caller_narrowing: tuple[str, ...] = ()
 
     @property
     def deployments(self) -> tuple[ExactModelDeployment, ...]:

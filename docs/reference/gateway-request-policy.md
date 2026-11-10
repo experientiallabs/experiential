@@ -103,6 +103,14 @@ precedence over an older throttle window on the same rung. Allowing fallbacks
 does not change a selected first dial; select another route to keep serving
 while the account is unavailable.
 
+When the one rung a selected first dial may claim, or every rung a no-fallback
+or `provider.only`/`provider.ignore` request kept, is inside a provider throttle
+window, the throttled refusal keeps its class, wait and `Retry-After` but names
+the caller's own controls and the remedy (remove them to let the gateway use the
+model's other routes). Only controls that actually removed a rung are named;
+when nothing the caller sent excluded a rung that could serve, the refusal keeps
+the generic throttled wording.
+
 The host carries the requested handle in
 `AuthorizationSnapshot.requested_route_id` and attests its resolution with
 `GatewayRoute.resolved_route_id`. The engine checks both. The standalone catalog

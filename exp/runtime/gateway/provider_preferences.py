@@ -7,7 +7,8 @@ never by forwarding them to an aggregator upstream:
 
 * ``only``: keep rungs whose provider is listed;
 * ``ignore``: drop rungs whose provider is listed;
-* ``order``: try rungs of the listed providers first, in that order;
+* ``order``: try rungs of the listed providers first, in that order (behind
+  the lead a ``gateway.routing.route_id`` selects, which stays first);
 * ``allow_fallbacks: false``: with ``order``, serve only the listed providers;
   without it, serve only the first eligible rung. A pinned rung that fails is
   the request's error, never a failover.
@@ -132,11 +133,40 @@ def _stage(route: GatewayRoute, index: int) -> int:
 def _order_permutation(
     route: GatewayRoute, order: tuple[str, ...], label: ProviderLabel
 ) -> tuple[int, ...]:
-    """Stable permutation leading with ``order`` within each model stage."""
+    """Stable permutation leading with ``order`` within each model stage.
+
+    A caller-selected route (``gateway.routing.route_id``) keeps its lead first:
+    the selector names the rung that must lead, and ``order`` ranks only the
+    fallbacks behind it.
+    """
     ranks = _order_rank(route, order, label)
+    pinned = route.resolved_route_id is not None
     return tuple(
-        sorted(range(len(route.deployments)), key=lambda i: (_stage(route, i), ranks[i], i))
+        sorted(
+            range(len(route.deployments)),
+            key=lambda i: (pinned and i != 0, _stage(route, i), ranks[i], i),
+        )
     )
+
+
+_NO_FALLBACKS = "provider.allow_fallbacks: false"
+"""Public spelling of OpenRouter's no-fallback control."""
+
+
+def _record(narrowing: list[str], control: str, *, excludes: bool) -> None:
+    """Record ``control`` when, applied alone to the full route, it excludes a rung.
+
+    Each control is judged on its own, not after the others, so two controls
+    that exclude the same rung are both named: removing only one of them would
+    still keep the request off that rung.
+
+    Args:
+        narrowing: The confining controls so far; appended to in place.
+        control: Public spelling of the control.
+        excludes: Whether the control alone excludes at least one rung.
+    """
+    if excludes:
+        narrowing.append(control)
 
 
 def apply_provider_preferences(
@@ -173,13 +203,25 @@ def apply_provider_preferences(
             code="invalid_parameter",
         )
     kept = list(range(len(route.deployments)))
+    narrowing: list[str] = []  # The controls that each exclude a rung.
+    # Every control is judged on rungs a first dial may claim: excluding a
+    # failover-only rung is no remedy for a refused first dial.
+    first_dial = [
+        i
+        for i, deployment in enumerate(route.deployments)
+        if deployment.gateway.capabilities.failover_only_on is None
+    ]
     if only is not None:
         allowed = frozenset().union(*(_names(name) for name in only)) if only else frozenset()
+        excludes = any(labels[i] not in allowed for i in first_dial)
+        _record(narrowing, "provider.only", excludes=excludes)
         kept = [i for i in kept if labels[i] in allowed]
         if not kept:
             raise _unsatisfiable("only", only, available)
     if ignore:
         excluded = frozenset().union(*(_names(name) for name in ignore))
+        excludes = any(labels[i] in excluded for i in first_dial)
+        _record(narrowing, "provider.ignore", excludes=excludes)
         kept = [i for i in kept if labels[i] not in excluded]
         if not kept:
             raise _unsatisfiable("ignore", ignore, available)
@@ -188,14 +230,21 @@ def apply_provider_preferences(
         if not any(labels[i] in wanted for i in kept):
             raise _unsatisfiable("order", order, available)
         if not allow_fallbacks:
+            excludes = any(labels[i] not in wanted for i in first_dial)
+            _record(narrowing, _NO_FALLBACKS, excludes=excludes)
             kept = [i for i in kept if labels[i] in wanted]
     elif not allow_fallbacks:
         lead = next(
             (i for i in kept if route.deployments[i].gateway.capabilities.failover_only_on is None),
             kept[0],
         )
+        _record(narrowing, _NO_FALLBACKS, excludes=len(first_dial) > 1)
         kept = [lead]
     narrowed = select_route_deployments(route, tuple(kept))
+    if narrowing:
+        narrowed = narrowed.model_copy(
+            update={"caller_narrowing": (*narrowed.caller_narrowing, *narrowing)}
+        )
     if not order or len(narrowed.deployments) < 2:
         return narrowed
     return reorder_route_deployments(narrowed, _order_permutation(narrowed, order, name_of))

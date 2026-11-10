@@ -57,6 +57,7 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake, recovery_entry
+from exp.runtime.gateway.native_request_policy import restrict_fallbacks
 from exp.runtime.gateway.native_settlement import (
     failure_from_boundary_payload,
     ledger_failure,
@@ -72,6 +73,7 @@ from exp.runtime.gateway.recovery import (
     SessionRecoveryRegistry,
 )
 from exp.runtime.gateway.recovery_test import Clock, eligible
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy, GatewayRoutingPolicy
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadKey, RungLoadRegistry, RungShed, _RungLoad
@@ -1307,6 +1309,110 @@ def test_a_fully_throttled_route_exhausts_as_throttled_not_provider_internal() -
     assert public.retry_after_seconds == retry_after
     assert [failure.failure_class.value for failure in ledger.finished_requests] == ["throttled"]
     assert registry.entry("request-one") is None
+
+
+_PINNED_ROUTE_ID = "route_" + "d" * 64
+
+
+def _pinned_lead_registry(
+    *, allow_fallbacks: bool
+) -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
+    """A direct-provider lead the caller pins, an OpenRouter rung behind.
+
+    The caller sends ``gateway.routing.route_id`` naming the lead lane; with
+    ``allow_fallbacks: false`` admission keeps that one rung
+    (``restrict_fallbacks``).
+    """
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
+    route = _route(
+        (
+            _deployment("mp-direct-lead", connection_sha256="b" * 64),
+            _deployment("mp-openrouter-sibling", connection_sha256="c" * 64),
+        )
+    ).model_copy(update={"resolved_route_id": _PINNED_ROUTE_ID})
+    request = _request().model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(
+                routing=GatewayRoutingPolicy(
+                    route_id=_PINNED_ROUTE_ID, allow_fallbacks=allow_fallbacks
+                )
+            )
+        }
+    )
+    entry = InflightRequest(
+        authorization=route.snapshot.authorization,
+        route=restrict_fallbacks(request, route),
+        request=request,
+        deadline_monotonic=time.monotonic() + 30,
+    )
+    registry.register(entry)
+    return registry, ledger, entry
+
+
+@pytest.mark.parametrize(
+    ("allow_fallbacks", "selection"),
+    [
+        (False, "gateway.routing.route_id and gateway.routing.allow_fallbacks: false"),
+        (True, "gateway.routing.route_id"),
+    ],
+)
+def test_a_throttled_caller_selected_route_names_the_selection_not_every_deployment(
+    allow_fallbacks: bool, selection: str
+) -> None:
+    """A throttle window on the rung the caller pinned names the pin and its remedy.
+
+    The generic "all exact-model deployments are inside a provider throttle
+    window" wording reads as a gateway fault while the caller's own request
+    excluded the OpenRouter rung. With fallbacks allowed the first dial is
+    still the selected rung, and a healthy sibling it may not take must not
+    turn the refusal into provider_internal.
+    """
+    registry, ledger, entry = _pinned_lead_registry(allow_fallbacks=allow_fallbacks)
+    assert len(entry.route.deployments) == (2 if allow_fallbacks else 1)
+    registry.health.failed(
+        deployment_health_key(entry.authorization, entry.route.deployment),
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request: http 429",
+        ),
+    )
+
+    exhausted = _start(registry, ordinal=0)
+
+    assert exhausted["exhausted"] is True
+    failure_payload = exhausted["failure"]
+    assert isinstance(failure_payload, dict)
+    assert failure_payload["failure_class"] == "throttled"
+    message = str(failure_payload["safe_message"])
+    retry_after = failure_payload["retry_after_seconds"]
+    assert isinstance(retry_after, int)
+    assert THROTTLED_RETRY_AFTER_SECONDS <= retry_after <= 30
+    assert message == (
+        f"the route selected by {selection} is inside a provider throttle window; "
+        f"retry in {retry_after}s, or remove {selection} to let the gateway use this "
+        "model's other routes"
+    )
+    assert "exact-model" not in message
+    assert not ledger.started
+    assert [failure.failure_class.value for failure in ledger.finished_requests] == ["throttled"]
+
+
+def test_an_unpinned_route_fails_over_past_a_throttled_lead() -> None:
+    """Without the caller's pin the same chain serves on OpenRouter inside the lead's window."""
+    registry, ledger, entry = _registry()
+    registry.health.failed(
+        deployment_health_key(entry.authorization, entry.route.deployment),
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request: http 429",
+        ),
+    )
+
+    started = _start(registry, ordinal=0)
+
+    assert started["route_depth"] == 1
+    assert [row["route_depth"] for row in ledger.started] == [1]
 
 
 def test_an_open_circuit_route_still_dispatches_and_never_reports_throttled() -> None:

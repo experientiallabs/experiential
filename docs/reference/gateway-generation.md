@@ -645,7 +645,8 @@ its routing keys against the model's own rungs at admission and never forwards t
 aggregator upstream:
 
 - `only` keeps rungs of the listed providers; `ignore` drops them.
-- `order` tries the listed providers first, in that order; the rest remain fallbacks.
+- `order` tries the listed providers first, in that order; the rest remain fallbacks. A rung
+  selected by `gateway.routing.route_id` stays first, and `order` ranks the fallbacks behind it.
 - `allow_fallbacks: false` with `order` serves only the listed providers; without `order` it
   serves only the first eligible rung. A pinned rung that fails, or is unavailable, is the
   request's error, never a failover.

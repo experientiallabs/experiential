@@ -71,6 +71,7 @@ from exp.runtime.gateway.native_recovery import (
     recovery_failure,
     retain_recovery_observation_time,
 )
+from exp.runtime.gateway.native_request_policy import unclaimed_route_failure
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_rung_policy import (
     bind_sticky_dispatch,
@@ -83,7 +84,6 @@ from exp.runtime.gateway.native_rung_policy import (
 )
 from exp.runtime.gateway.native_service_tiers import admission_kwarg, tier_ceiling
 from exp.runtime.gateway.native_settlement import (
-    all_routes_throttled_failure,
     all_routes_unavailable_failure,
     budget_quota_failure,
     budget_quota_protocol_error,
@@ -721,15 +721,13 @@ class NativeAttemptAccounting:
             return started_attempt_payload(
                 attempt_id, candidate, attempt_output_pace(entry, deployment, self._loads)
             )
-        # The account failure holding every claimable circuit open (newer than any throttle
-        # window on it), else throttled, else unavailable; no free-capacity certificate.
+        # The account failure holding every claimable circuit open (newer than any running
+        # throttle window there), else throttled naming the caller's confining controls,
+        # else unavailable; never a free-capacity certificate.
         exhaustion = last_failure or self._health.circuit_failure(keys, ladder)
         if exhaustion is None:
-            throttled_remaining = self._health.throttled_remaining_seconds(keys, ladder)
-            exhaustion = (
-                all_routes_throttled_failure(throttled_remaining)
-                if throttled_remaining is not None
-                else all_routes_unavailable_failure()
+            exhaustion = unclaimed_route_failure(
+                self._health, keys, ladder, route, first=selected_first, repair=reasoning_repair
             )
         certified = active and self.finish_request_quietly(
             entry.authorization,

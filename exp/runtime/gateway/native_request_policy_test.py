@@ -22,7 +22,13 @@ from exp.common.models.gateway_chains import (
     GatewayModelReferenceRung,
 )
 from exp.runtime.gateway.affinity import affinity_fingerprint
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayRequest,
+)
+from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_admission import resolve_admission_route
@@ -30,8 +36,17 @@ from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway, _pool_control_plane
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_execution import DispatchableRoute, dispatchable_route_profiles
-from exp.runtime.gateway.native_request_policy import require_route_authority
+from exp.runtime.gateway.native_request_policy import (
+    no_fallback_narrowing,
+    require_route_authority,
+    restrict_fallbacks,
+    select_no_fallback_root,
+    unclaimed_route_failure,
+)
 from exp.runtime.gateway.native_responses import ContinuationContext
+from exp.runtime.gateway.provider_preferences_test import _request as _preferences_request
+from exp.runtime.gateway.provider_preferences_test import _route as _provider_route
+from exp.runtime.gateway.request_policy import GatewayRequestPolicy, GatewayRoutingPolicy
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import sticky_first_order
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
@@ -478,3 +493,191 @@ def test_no_fallback_freezes_route_before_effectful_search_growth(
     assert backend.queries == ["hi"]
     with sqlite3.connect(manager.database_path) as connection:
         assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
+
+
+_LEAD: DeploymentHealthKey = ("catalog", "lead", "connection")
+_SIBLING: DeploymentHealthKey = ("catalog", "sibling", "connection")
+_SELECTED_ROUTE_ID = "route_" + "e" * 64
+
+
+def _throttled(health: DeploymentHealthRegistry, *keys: DeploymentHealthKey) -> None:
+    """Put each key inside a provider throttle window."""
+    for key in keys:
+        health.failed(
+            key,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.THROTTLED,
+                safe_message="provider throttled the request",
+                retry_after_seconds=20,
+            ),
+        )
+
+
+def _message(failure: GatewayFailure) -> str:
+    """The safe message of a throttled refusal, asserting its class."""
+    assert failure.failure_class is GatewayFailureClass.THROTTLED
+    return failure.safe_message
+
+
+@pytest.mark.parametrize(
+    ("pinned", "selected_first", "sibling_throttled", "narrowing", "named"),
+    [
+        (False, False, True, (), None),
+        (True, True, False, (), "gateway.routing.route_id"),
+        (True, True, True, (), None),
+        (True, False, True, (), None),
+        (False, False, True, ("provider.only",), "provider.only"),
+        (
+            True,
+            True,
+            True,
+            ("provider.ignore",),
+            "gateway.routing.route_id and provider.ignore",
+        ),
+    ],
+)
+def test_a_throttled_refusal_names_only_controls_that_excluded_a_rung(
+    pinned: bool,
+    selected_first: bool,
+    sibling_throttled: bool,
+    narrowing: tuple[str, ...],
+    named: str | None,
+) -> None:
+    """A selector is named only when it kept the request off a rung that could serve."""
+    route = _provider_route("openai", "bedrock").model_copy(
+        update={
+            "resolved_route_id": _SELECTED_ROUTE_ID if pinned else None,
+            "caller_narrowing": narrowing,
+        }
+    )
+    health = DeploymentHealthRegistry(clock=lambda: 100.0)
+    _throttled(health, _LEAD, *((_SIBLING,) if sibling_throttled else ()))
+    ladder = (0,) if selected_first else (0, 1)
+    failure = unclaimed_route_failure(
+        health, (_LEAD, _SIBLING), ladder, route, first=selected_first
+    )
+    message = _message(failure)
+    if named is None:
+        assert "exact-model deployments" in message
+    else:
+        assert message.startswith(f"the route selected by {named} is inside")
+        assert message.endswith(f"remove {named} to let the gateway use this model's other routes")
+
+
+def test_a_failover_only_sibling_does_not_make_the_selector_a_remedy() -> None:
+    """A sibling no first dial may claim cannot serve once the selector is removed."""
+    route = _provider_route("openai", "bedrock")
+    sibling = route.fallback_deployments[0]
+    conditional = sibling.model_copy(
+        update={
+            "gateway": sibling.gateway.model_copy(
+                update={
+                    "capabilities": sibling.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("provider_internal",)}
+                    )
+                }
+            )
+        }
+    )
+    route = route.model_copy(
+        update={"fallback_deployments": (conditional,), "resolved_route_id": _SELECTED_ROUTE_ID}
+    )
+    health = DeploymentHealthRegistry(clock=lambda: 100.0)
+    _throttled(health, _LEAD)
+    failure = unclaimed_route_failure(health, (_LEAD, _SIBLING), (0,), route, first=True)
+    assert "exact-model deployments" in _message(failure)
+
+
+def test_an_unthrottled_ladder_is_unavailable_not_throttled() -> None:
+    """With a claimable depth outside every throttle window the answer is unavailable."""
+    failure = unclaimed_route_failure(
+        DeploymentHealthRegistry(clock=lambda: 100.0),
+        (_LEAD,),
+        (0,),
+        _provider_route("openai"),
+        first=False,
+    )
+    assert failure.failure_class is GatewayFailureClass.PROVIDER_INTERNAL
+
+
+def test_restrict_fallbacks_records_narrowing_only_when_it_drops_a_rung() -> None:
+    """``gateway.routing.allow_fallbacks: false`` is named only when it removed a fallback."""
+    request = _preferences_request(None).model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
+        }
+    )
+    assert restrict_fallbacks(request, _provider_route("openai", "bedrock")).caller_narrowing == (
+        "gateway.routing.allow_fallbacks: false",
+    )
+    assert restrict_fallbacks(request, _provider_route("openai")).caller_narrowing == ()
+
+
+def test_a_no_fallback_root_stage_selection_is_recorded_once() -> None:
+    """A staged route's root-stage cut names the control; the later lead pick adds no copy."""
+    route = _provider_route("openai")
+    assert no_fallback_narrowing(route, removed=False).caller_narrowing == ()
+    cut = no_fallback_narrowing(route, removed=True)
+    assert cut.caller_narrowing == ("gateway.routing.allow_fallbacks: false",)
+    assert no_fallback_narrowing(cut, removed=True).caller_narrowing == (
+        "gateway.routing.allow_fallbacks: false",
+    )
+
+
+def test_gateway_no_fallback_is_named_beside_a_provider_control_that_already_narrowed() -> None:
+    """A one-rung route a provider control produced still names the gateway control too."""
+    narrowed = _provider_route("openai").model_copy(update={"caller_narrowing": ("provider.only",)})
+    request = _preferences_request(None).model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
+        }
+    )
+    assert restrict_fallbacks(request, narrowed).caller_narrowing == (
+        "provider.only",
+        "gateway.routing.allow_fallbacks: false",
+    )
+    assert no_fallback_narrowing(narrowed, removed=False).caller_narrowing == (
+        "provider.only",
+        "gateway.routing.allow_fallbacks: false",
+    )
+
+
+def test_a_reasoning_repair_redial_keeps_the_generic_throttled_wording() -> None:
+    """A repair redial is confined to its rung by the gateway, so no caller control is named."""
+    route = _provider_route("openai", "bedrock").model_copy(
+        update={"caller_narrowing": ("provider.only",)}
+    )
+    health = DeploymentHealthRegistry(clock=lambda: 100.0)
+    _throttled(health, _LEAD)
+    failure = unclaimed_route_failure(
+        health, (_LEAD, _SIBLING), (0,), route, first=False, repair=True
+    )
+    assert "exact-model deployments" in _message(failure)
+
+
+def test_restrict_fallbacks_ignores_failover_only_siblings() -> None:
+    """Dropping only failover-only rungs does not name the gateway no-fallback control."""
+    route = _provider_route("openai", "bedrock")
+    sibling = route.fallback_deployments[0]
+    conditional = sibling.model_copy(
+        update={
+            "gateway": sibling.gateway.model_copy(
+                update={
+                    "capabilities": sibling.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("provider_internal",)}
+                    )
+                }
+            )
+        }
+    )
+    route = route.model_copy(update={"fallback_deployments": (conditional,)})
+    request = _preferences_request(None).model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
+        }
+    )
+    assert restrict_fallbacks(request, route).caller_narrowing == ()
+    assert select_no_fallback_root(route, (0,)).caller_narrowing == ()
+    assert select_no_fallback_root(_provider_route("openai", "bedrock"), (0,)).caller_narrowing == (
+        "gateway.routing.allow_fallbacks: false",
+    )

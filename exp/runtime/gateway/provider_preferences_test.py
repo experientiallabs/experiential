@@ -199,3 +199,61 @@ def test_unsupported_keys_are_disclosed_and_the_order_survives_rescheduling() ->
     )
     assert _providers(reordered) == ["bedrock", "openai"]
     assert wires == ("w-bedrock", "w-openai")
+
+
+@pytest.mark.parametrize(
+    ("preferences", "narrowing"),
+    [
+        ({"ignore": ["anthropic"]}, ()),
+        ({"only": ["openai", "bedrock"]}, ()),
+        ({"only": ["openai"]}, ("provider.only",)),
+        ({"ignore": ["openai"]}, ("provider.ignore",)),
+        ({"allow_fallbacks": False}, ("provider.allow_fallbacks: false",)),
+        ({"order": ["bedrock"]}, ()),
+        ({"only": ["openai"], "ignore": ["bedrock"]}, ("provider.only", "provider.ignore")),
+    ],
+)
+def test_only_controls_that_remove_a_rung_are_recorded_as_narrowing(
+    preferences: JsonObject, narrowing: tuple[str, ...]
+) -> None:
+    """A control that excluded nothing is never recorded, so a refusal never names it."""
+    route = apply_provider_preferences(_route("openai", "bedrock"), _request(preferences))
+    assert route.caller_narrowing == narrowing
+
+
+def test_order_keeps_a_selected_route_lead_first() -> None:
+    """``provider.order`` ranks only the fallbacks behind a ``route_id`` lead."""
+    route = _route("experiential_cloud", "bedrock", "anthropic").model_copy(
+        update={"resolved_route_id": "route_" + "f" * 64}
+    )
+    ordered = apply_provider_preferences(route, _request({"order": ["anthropic"]}))
+    assert _providers(ordered) == ["experiential_cloud", "anthropic", "bedrock"]
+    assert ordered.resolved_route_id == route.resolved_route_id
+
+
+def test_controls_excluding_only_failover_only_siblings_are_not_recorded() -> None:
+    """Excluding only failover-only rungs is no remedy for a refused first dial."""
+    route = _route("openai", "bedrock")
+    sibling = route.fallback_deployments[0]
+    conditional = sibling.model_copy(
+        update={
+            "gateway": sibling.gateway.model_copy(
+                update={
+                    "capabilities": sibling.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("provider_internal",)}
+                    )
+                }
+            )
+        }
+    )
+    route = route.model_copy(update={"fallback_deployments": (conditional,)})
+    cases: tuple[JsonObject, ...] = (
+        {"allow_fallbacks": False},
+        {"order": ["openai"], "allow_fallbacks": False},
+        {"only": ["openai"]},
+        {"ignore": ["bedrock"]},
+    )
+    for preferences in cases:
+        narrowed = apply_provider_preferences(route, _request(preferences))
+        assert _providers(narrowed) == ["openai"]
+        assert narrowed.caller_narrowing == ()
