@@ -662,6 +662,32 @@ def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
         )
 
 
+def test_tool_use_caller_is_a_messages_only_carrier_that_joins_replay_identity() -> None:
+    """The echoed Anthropic caller is serialization-inert, replay-distinct, Messages-only."""
+    from exp.common.models.model import ToolCall
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    def history(caller: JsonObject | None) -> tuple[GatewayMessage, ...]:
+        """Return one tool round trip whose call carries ``caller``."""
+        call = ToolCall(call_id="toolu_1", name="Bash", provider_anthropic_caller=caller)
+        return (
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(role="assistant", tool_calls=(call,)),
+            GatewayMessage(role="tool", tool_call_id="toolu_1", content="ok"),
+        )
+
+    bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=history(None))
+    carried = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES, messages=history({"type": "direct"})
+    )
+    assert carried.model_dump() == bare.model_dump()
+    assert canonical_request_sha256(carried) != canonical_request_sha256(bare)
+    callers: tuple[JsonObject, ...] = ({"type": "direct"}, {})
+    for caller in callers:
+        with pytest.raises(ValidationError, match="Anthropic tool carriers are valid only"):
+            GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=history(caller))
+
+
 def test_server_tool_carriers_are_scoped_verbatim_and_join_replay_identity() -> None:
     """Server tool entries and echoed blocks are Messages-only whole-message carriers."""
     from exp.runtime.gateway.replay_identity import canonical_request_sha256

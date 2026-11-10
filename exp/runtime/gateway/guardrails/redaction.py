@@ -40,6 +40,7 @@ def restored_provider_authority(
                 or call.provider_status is not None
                 or call.provider_namespace is not None
                 or call.provider_caller is not None
+                or call.provider_anthropic_caller is not None
                 for call in message.tool_calls
             )
         )

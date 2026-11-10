@@ -872,16 +872,19 @@ class GatewayRequest(ContractModel):
         if self.inference_geo is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("inference_geo is valid only for Messages requests")
         if (
-            # defer_loading is also OpenAI's and OpenRouter's marker, so it is
-            # valid on every surface; the other carriers stay Anthropic-only.
+            # defer_loading is shared with OpenAI and OpenRouter; the rest are Anthropic-only.
             any(
                 tool.eager_input_streaming is not None
                 or tool.allowed_callers is not None
                 or tool.input_examples is not None
                 for tool in self.tools
             )
-            and self.surface != GatewayApiSurface.MESSAGES
-        ):
+            or any(
+                call.provider_anthropic_caller is not None
+                for message in self.messages
+                for call in message.tool_calls
+            )
+        ) and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("Anthropic tool carriers are valid only for Messages requests")
         if self.provider_beta_tokens and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_beta_tokens are valid only for Messages requests")

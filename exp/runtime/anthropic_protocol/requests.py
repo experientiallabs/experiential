@@ -80,6 +80,7 @@ from exp.runtime.anthropic_protocol.tool_changes import (
     tool_change_text,
     tools_after_changes,
 )
+from exp.runtime.anthropic_protocol.tool_use_caller import ToolUseCaller
 from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -137,13 +138,21 @@ class _RedactedThinkingBlock(AnthropicWireModel):
 
 
 class _ToolUseBlock(AnthropicWireModel):
-    """One assistant tool invocation retained in request history."""
+    """One assistant tool invocation retained in request history.
+
+    Attributes:
+        caller: Optional programmatic tool-calling attribution. It rides the canonical
+            tool call (``ToolCall.provider_anthropic_caller``) and re-emits verbatim on
+            Anthropic rungs; other wires have no slot for it and drop it with disclosure,
+            since the call itself is unchanged.
+    """
 
     type: Literal["tool_use"]
     id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     input: JsonObject
     cache_control: CacheControl | None = None
+    caller: ToolUseCaller | None = None
 
 
 class _ToolResultBlock(AnthropicWireModel):
@@ -922,6 +931,9 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                         block.cache_control.model_dump(mode="json", exclude_none=True)
                         if block.cache_control is not None
                         else None
+                    ),
+                    provider_anthropic_caller=(
+                        block.caller.model_dump(mode="json") if block.caller is not None else None
                     ),
                 )
             )

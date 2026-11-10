@@ -12,11 +12,11 @@ def text_input_context(request: GatewayRequest) -> str:
 
     Message text, including the canonical folded tool-error prefix, and tool arguments
     are scanned separately by each adapter. Function
-    definitions, examples, call/result identifiers, names and namespaces, schemas, and normalized
-    search declarations are ordinary text too. Opaque provider content, caller objects,
-    attachments, and provider-owned tools or prompt configuration require a separately
-    validated projection. Internal replay IDs, cache hints, and inert telemetry are not
-    prompt content.
+    definitions, examples, call/result identifiers, names and namespaces, the closed Messages
+    ``tool_use`` caller, schemas, and normalized search declarations are ordinary text too.
+    Opaque provider content, Responses caller objects, attachments, and provider-owned tools
+    or prompt configuration require a separately validated projection. Internal replay IDs,
+    cache hints, and inert telemetry are not prompt content.
 
     Returns:
         Canonical text for the supported non-message context, or an empty string.
@@ -65,7 +65,18 @@ def text_input_context(request: GatewayRequest) -> str:
     calls = [call for message in request.messages for call in message.tool_calls]
     if calls:
         context["tool_calls"] = [
-            {"call_id": call.call_id, "name": call.name, "namespace": call.provider_namespace}
+            {
+                "call_id": call.call_id,
+                "name": call.name,
+                "namespace": call.provider_namespace,
+                # The Messages caller is a closed, decoder-validated shape (a
+                # type tag and a call id), so it projects as ordinary text.
+                **(
+                    {"caller": call.provider_anthropic_caller}
+                    if call.provider_anthropic_caller is not None
+                    else {}
+                ),
+            }
             for call in calls
         ]
     results = [

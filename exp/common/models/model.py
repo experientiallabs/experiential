@@ -277,6 +277,14 @@ class ToolCall(ContractModel):
     optimization artifacts. The excluded replay fields preserve the provider's exact arguments,
     item identity, and output position for immediate protocol replay. They remain absent from
     immutable artifacts but join gateway idempotency identity explicitly.
+
+    Attributes:
+        provider_anthropic_caller: Anthropic Messages ``caller`` attribution on a replayed
+            ``tool_use`` block (``{"type": "direct"}`` or a code execution caller with its
+            ``tool_id``), which Messages clients echo in history. Kept apart from
+            ``provider_caller`` because the vocabularies differ: this one re-emits verbatim only
+            on the Anthropic Messages wire and drops with disclosure elsewhere. Excluded from
+            serialization like the other replay fields; joins gateway replay identity explicitly.
     """
 
     call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
@@ -349,6 +357,7 @@ class ToolCall(ContractModel):
     one. Excluded from serialization like the other replay fields, and joins
     gateway replay identity explicitly.
     """
+    provider_anthropic_caller: JsonObject | None = Field(default=None, exclude=True)
     provider_thought_signature: str | None = Field(
         default=None,
         min_length=1,

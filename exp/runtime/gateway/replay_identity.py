@@ -85,6 +85,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
                 and call.provider_status is None
                 and call.provider_namespace is None
                 and call.provider_caller is None
+                and call.provider_anthropic_caller is None
                 and call.provider_thought_signature is None
             ):
                 continue
@@ -103,6 +104,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
                 retained_call["provider_namespace"] = call.provider_namespace
             if call.provider_caller is not None:
                 retained_call["provider_caller"] = call.provider_caller
+            if call.provider_anthropic_caller is not None:
+                retained_call["provider_anthropic_caller"] = call.provider_anthropic_caller
             if call.provider_thought_signature is not None:
                 retained_call["provider_thought_signature"] = call.provider_thought_signature
             retained_calls.append(retained_call)
