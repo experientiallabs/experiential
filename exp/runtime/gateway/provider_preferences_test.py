@@ -231,7 +231,7 @@ def test_order_keeps_a_selected_route_lead_first() -> None:
     assert ordered.resolved_route_id == route.resolved_route_id
 
 
-def test_no_fallback_is_not_recorded_for_failover_only_siblings() -> None:
+def test_controls_excluding_only_failover_only_siblings_are_not_recorded() -> None:
     """Excluding only failover-only rungs is no remedy for a refused first dial."""
     route = _route("openai", "bedrock")
     sibling = route.fallback_deployments[0]
@@ -250,6 +250,8 @@ def test_no_fallback_is_not_recorded_for_failover_only_siblings() -> None:
     cases: tuple[JsonObject, ...] = (
         {"allow_fallbacks": False},
         {"order": ["openai"], "allow_fallbacks": False},
+        {"only": ["openai"]},
+        {"ignore": ["bedrock"]},
     )
     for preferences in cases:
         narrowed = apply_provider_preferences(route, _request(preferences))

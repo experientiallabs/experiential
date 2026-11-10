@@ -40,6 +40,7 @@ from exp.runtime.gateway.native_request_policy import (
     no_fallback_narrowing,
     require_route_authority,
     restrict_fallbacks,
+    select_no_fallback_root,
     unclaimed_route_failure,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext
@@ -676,3 +677,7 @@ def test_restrict_fallbacks_ignores_failover_only_siblings() -> None:
         }
     )
     assert restrict_fallbacks(request, route).caller_narrowing == ()
+    assert select_no_fallback_root(route, (0,)).caller_narrowing == ()
+    assert select_no_fallback_root(_provider_route("openai", "bedrock"), (0,)).caller_narrowing == (
+        "gateway.routing.allow_fallbacks: false",
+    )

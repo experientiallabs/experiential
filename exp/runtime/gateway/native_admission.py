@@ -49,7 +49,7 @@ from exp.runtime.gateway.native_fallback_rules import (
 )
 from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.native_reasoning import rung_provider_request
-from exp.runtime.gateway.native_request_policy import no_fallback_narrowing, restrict_fallbacks
+from exp.runtime.gateway.native_request_policy import restrict_fallbacks, select_no_fallback_root
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_stage_admission import (
     require_native_model_stage_contract,
@@ -215,8 +215,7 @@ def select_single_route_before_search(
         )
         if not root_indexes:
             raise GatewayRoutingError("no-fallback routing requires an eligible root-model route")
-        cut = len(root_indexes) < len(route.deployments)
-        route = no_fallback_narrowing(select_route_deployments(route, root_indexes), removed=cut)
+        route = select_no_fallback_root(route, root_indexes)
         resolved_wires = tuple(resolved_wires[index] for index in root_indexes)
     if route.resolved_route_id is not None:
         return restrict_fallbacks(request, route), resolved_wires[:1], None

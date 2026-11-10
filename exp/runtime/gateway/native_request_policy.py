@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.model_plan import project_stage_selection
+from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder
 from exp.runtime.gateway.native_settlement import (
     all_routes_throttled_failure,
@@ -111,10 +112,43 @@ def restrict_fallbacks(request: GatewayRequest, route: GatewayRoute) -> GatewayR
             "fallback_deployments": (),
         }
     )
-    first_dial = sum(
-        item.gateway.capabilities.failover_only_on is None for item in route.deployments
+    return no_fallback_narrowing(restricted, removed=first_dial_removed(route, (index,)))
+
+
+def select_no_fallback_root(route: GatewayRoute, root_indexes: tuple[int, ...]) -> GatewayRoute:
+    """Keep a staged route's root-model rungs for a no-fallback request.
+
+    Records ``gateway.routing.allow_fallbacks: false`` when the cut drops a
+    descendant rung a first dial may claim.
+
+    Args:
+        route: The staged route.
+        root_indexes: The ordered indexes of its root-model rungs.
+
+    Returns:
+        The root-only route.
+    """
+    selected = select_route_deployments(route, root_indexes)
+    return no_fallback_narrowing(selected, removed=first_dial_removed(route, root_indexes))
+
+
+def first_dial_removed(route: GatewayRoute, kept: Sequence[int]) -> bool:
+    """Whether keeping only ``kept`` drops a rung a first dial may claim.
+
+    A failover-only rung (``failover_only_on``) never takes a first dial, so
+    dropping only such rungs is no remedy for a refused first dial.
+
+    Args:
+        route: The route before the selection.
+        kept: The route indexes the selection keeps.
+
+    Returns:
+        Whether a dropped deployment is first-dial eligible.
+    """
+    return any(
+        index not in kept and item.gateway.capabilities.failover_only_on is None
+        for index, item in enumerate(route.deployments)
     )
-    return no_fallback_narrowing(restricted, removed=first_dial > 1)
 
 
 def no_fallback_narrowing(route: GatewayRoute, *, removed: bool) -> GatewayRoute:

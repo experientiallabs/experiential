@@ -204,7 +204,7 @@ def apply_provider_preferences(
         )
     kept = list(range(len(route.deployments)))
     narrowing: list[str] = []  # The controls that each exclude a rung.
-    # No-fallback controls are judged on rungs a first dial may claim: excluding a
+    # Every control is judged on rungs a first dial may claim: excluding a
     # failover-only rung is no remedy for a refused first dial.
     first_dial = [
         i
@@ -213,13 +213,15 @@ def apply_provider_preferences(
     ]
     if only is not None:
         allowed = frozenset().union(*(_names(name) for name in only)) if only else frozenset()
-        _record(narrowing, "provider.only", excludes=any(item not in allowed for item in labels))
+        excludes = any(labels[i] not in allowed for i in first_dial)
+        _record(narrowing, "provider.only", excludes=excludes)
         kept = [i for i in kept if labels[i] in allowed]
         if not kept:
             raise _unsatisfiable("only", only, available)
     if ignore:
         excluded = frozenset().union(*(_names(name) for name in ignore))
-        _record(narrowing, "provider.ignore", excludes=any(item in excluded for item in labels))
+        excludes = any(labels[i] in excluded for i in first_dial)
+        _record(narrowing, "provider.ignore", excludes=excludes)
         kept = [i for i in kept if labels[i] not in excluded]
         if not kept:
             raise _unsatisfiable("ignore", ignore, available)
