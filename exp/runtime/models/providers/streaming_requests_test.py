@@ -70,8 +70,10 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.models.providers.wire_messages import (
+    ANTHROPIC_ADVISOR_TOOL_BETA,
     TOOL_RESULT_DOCUMENT_FOLD_HEADER,
     TOOL_RESULT_IMAGE_FOLD_HEADER,
+    anthropic_request_headers,
     tool_result_document_marker,
     tool_result_image_marker,
 )
@@ -6179,6 +6181,194 @@ def test_server_tools_drop_with_disclosure_on_an_all_foreign_route() -> None:
     assert "messages.content.citations->dropped(unsupported_by_provider)" in (
         public.ignored_parameters
     )
+
+
+_ADVISOR_TOOL: JsonObject = {
+    "type": "advisor_20260301",
+    "name": "advisor",
+    "model": "claude-opus-5-5",
+    "max_uses": 3,
+}
+
+
+def _advisor_messages_request() -> GatewayRequest:
+    """Build one Messages request declaring Claude Code's advisor server tool."""
+    return _web_search_messages_request().model_copy(
+        update={"provider_server_tools": (_ADVISOR_TOOL,)}
+    )
+
+
+def test_the_advisor_tool_serves_verbatim_with_its_beta_on_an_anthropic_route() -> None:
+    """On an all-Anthropic route the advisor declaration and its token reach the wire."""
+    profiles = (
+        _anthropic_web_search_profile(),
+        _anthropic_web_search_profile("https://anthropic-b.test"),
+    )
+    public, provider = route_generation_parameter_requests(profiles, _advisor_messages_request())
+    assert provider.provider_server_tools == (_ADVISOR_TOOL,)
+    assert not any("advisor" in path for path in public.ignored_parameters)
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", provider, maximum_output_tokens=128_000
+    )
+    assert payload["tools"] == [_ADVISOR_TOOL]
+    headers = anthropic_request_headers({"x-api-key": "k"}, provider)
+    assert headers["anthropic-beta"] == ANTHROPIC_ADVISOR_TOOL_BETA
+
+
+def test_the_advisor_tool_follows_the_server_tool_policy_off_anthropic() -> None:
+    """A mixed route rejects the advisor by name; an all-foreign route drops it, disclosed."""
+    mixed = (
+        _anthropic_web_search_profile(),
+        GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(mixed, _advisor_messages_request())
+    assert raised.value.param == "tools"
+    assert "'advisor' (Anthropic advisor)" in str(raised.value)
+
+    public, provider = route_generation_parameter_requests(
+        _hy4_foreign_route(), _advisor_messages_request()
+    )
+    assert provider.provider_server_tools == ()
+    assert "tools.advisor->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert public.provider_server_tools == (_ADVISOR_TOOL,)
+
+
+def _vertex_anthropic_profile() -> GatewayWireProfile:
+    """Return one Claude-on-Vertex AI (Google managed) Messages wire profile."""
+    return replace(
+        _anthropic_web_search_profile(
+            "https://us-east5-aiplatform.googleapis.com/v1/publishers/anthropic/models/"
+            "claude-haiku-4-5:streamRawPredict"
+        ),
+        anthropic_vertex_version="vertex-2023-10-16",
+        serves_advisor_tool=False,
+    )
+
+
+def _foundry_anthropic_profile() -> GatewayWireProfile:
+    """Return one Claude-on-Azure AI Foundry Messages wire profile (no advisor)."""
+    return replace(
+        _anthropic_web_search_profile("https://acct.services.ai.azure.com/anthropic/v1/messages"),
+        serves_advisor_tool=False,
+    )
+
+
+def test_the_advisor_tool_is_dropped_on_vertex_and_refused_on_a_vertex_mixed_route() -> None:
+    """Vertex AI does not offer the advisor: dropped alone on Vertex, refused when mixed.
+
+    Every other server tool keeps forwarding verbatim on the all-Vertex route,
+    and the advisor's beta token is not added once the declaration is dropped.
+    """
+    web_search: JsonObject = {"type": "web_search_20250305", "name": "web_search"}
+    request = _advisor_messages_request().model_copy(
+        update={
+            "provider_server_tools": (web_search, _ADVISOR_TOOL),
+            "tool_choice": GatewayNamedToolChoice(name="advisor"),
+        }
+    )
+    public, provider = route_generation_parameter_requests((_vertex_anthropic_profile(),), request)
+    assert provider.provider_server_tools == (web_search,)
+    assert provider.tool_choice is None
+    assert "tools.advisor->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert "tool_choice->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert public.provider_server_tools == (web_search, _ADVISOR_TOOL)
+    headers = anthropic_request_headers({"x-api-key": "k"}, provider)
+    assert ANTHROPIC_ADVISOR_TOOL_BETA not in headers.get("anthropic-beta", "")
+
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (_anthropic_web_search_profile(), _vertex_anthropic_profile()),
+            _advisor_messages_request(),
+        )
+    assert raised.value.param == "tools"
+    assert "Google Vertex AI" in str(raised.value)
+
+    public, provider = route_generation_parameter_requests(
+        (_vertex_anthropic_profile(),),
+        _advisor_messages_request().model_copy(update={"provider_server_tools": (web_search,)}),
+    )
+    assert provider.provider_server_tools == (web_search,)
+    assert not any("advisor" in path for path in public.ignored_parameters)
+
+
+def test_echoed_advisor_history_is_dropped_whenever_a_rung_lacks_the_advisor() -> None:
+    """Advisor history leaves the dispatch (no beta) on Vertex and on a mixed route.
+
+    On a mixed route the shared dispatched request would otherwise carry the
+    blocks onto the Vertex rung at failover; an all-Anthropic route keeps them.
+    """
+    call: JsonObject = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_1",
+        "name": "advisor",
+        "input": {},
+    }
+    result: JsonObject = {
+        "type": "advisor_tool_result",
+        "tool_use_id": "srvtoolu_1",
+        "content": {"type": "advisor_result", "text": "Check the edge case."},
+    }
+    base = _web_search_messages_request()
+    request = base.model_copy(
+        update={
+            "messages": (
+                *base.messages,
+                GatewayMessage(role="assistant", provider_anthropic_block=call),
+                GatewayMessage(role="assistant", provider_anthropic_block=result),
+                GatewayMessage(role="user", content="go on"),
+            )
+        }
+    )
+    public, provider = route_generation_parameter_requests((_vertex_anthropic_profile(),), request)
+    assert all(message.provider_anthropic_block is None for message in provider.messages)
+    assert provider.messages[-1].content == "go on"
+    assert "messages.server_tool_blocks->dropped(unsupported_by_provider)" in (
+        public.ignored_parameters
+    )
+    headers = anthropic_request_headers({"x-api-key": "k"}, provider)
+    assert ANTHROPIC_ADVISOR_TOOL_BETA not in headers.get("anthropic-beta", "")
+
+    _, mixed = route_generation_parameter_requests(
+        (_anthropic_web_search_profile(), _vertex_anthropic_profile()), request
+    )
+    assert all(message.provider_anthropic_block is None for message in mixed.messages)
+
+    _, native = route_generation_parameter_requests((_anthropic_web_search_profile(),), request)
+    assert [m.provider_anthropic_block for m in native.messages if m.provider_anthropic_block] == [
+        call,
+        result,
+    ]
+
+
+def test_the_advisor_tool_is_dropped_on_azure_foundry_and_refused_when_mixed() -> None:
+    """Azure AI Foundry serves the Messages wire without the advisor, like Vertex."""
+    public, provider = route_generation_parameter_requests(
+        (_foundry_anthropic_profile(),), _advisor_messages_request()
+    )
+    assert provider.provider_server_tools == ()
+    assert "tools.advisor->dropped(unsupported_by_provider)" in public.ignored_parameters
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(
+            (_anthropic_web_search_profile(), _foundry_anthropic_profile()),
+            _advisor_messages_request(),
+        )
+    assert "Azure AI Foundry" in str(raised.value)
+
+    sole_tool_controls = _advisor_messages_request().model_copy(
+        update={"tool_choice": "auto", "parallel_tool_calls": False}
+    )
+    public, provider = route_generation_parameter_requests(
+        (_foundry_anthropic_profile(),), sole_tool_controls
+    )
+    assert provider.tool_choice is None
+    assert provider.parallel_tool_calls is None
+    assert "tool_choice->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert "parallel_tool_calls->dropped(unsupported_by_provider)" in public.ignored_parameters
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", provider, maximum_output_tokens=128_000
+    )
+    assert "tools" not in payload and "tool_choice" not in payload
 
 
 def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:

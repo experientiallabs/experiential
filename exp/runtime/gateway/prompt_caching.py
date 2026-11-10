@@ -42,6 +42,9 @@ PROMPT_CACHING_BEST_EFFORT = "prompt_caching->best_effort(provider_caches_implic
 """Disclosure for a route where a rung's provider caches prefixes with no request opt-out."""
 
 _MARKER = "cache_control"
+# The advisor server tool (``advisor_20260301``) switches its own prompt caching
+# with ``caching``; no other server tool declares that key.
+_SERVER_TOOL_CACHING = "caching"
 
 
 def with_cache_affinity(
@@ -112,7 +115,7 @@ def without_prompt_caching(
                 for tool in request.tools
             ),
             "provider_server_tools": tuple(
-                _unmarked(tool) for tool in request.provider_server_tools
+                _unmarked_server_tool(tool) for tool in request.provider_server_tools
             ),
             "messages": tuple(_unmarked_message(message) for message in request.messages),
             "ignored_parameters": tuple(
@@ -182,6 +185,8 @@ def _marker_paths(request: GatewayRequest) -> tuple[str, ...]:
         _MARKER in tool for tool in request.provider_server_tools
     ):
         paths.append(f"tools.{_MARKER}")
+    if any(_SERVER_TOOL_CACHING in tool for tool in request.provider_server_tools):
+        paths.append(f"tools.{_SERVER_TOOL_CACHING}")
     if any(call.cache_control is not None for m in request.messages for call in m.tool_calls):
         paths.append(f"messages.tool_calls.{_MARKER}")
     if any(_content_marked(message) for message in request.messages):
@@ -217,6 +222,11 @@ def _part_marker(part: MessageContentPart) -> JsonObject | None:
 def _unmarked(block: JsonObject) -> JsonObject:
     """Return a verbatim provider block without its cache marker."""
     return {key: value for key, value in block.items() if key != _MARKER}
+
+
+def _unmarked_server_tool(tool: JsonObject) -> JsonObject:
+    """Return a verbatim server tool without its cache marker or advisor caching switch."""
+    return {key: value for key, value in tool.items() if key not in (_MARKER, _SERVER_TOOL_CACHING)}
 
 
 def _unmarked_message(message: GatewayMessage) -> GatewayMessage:

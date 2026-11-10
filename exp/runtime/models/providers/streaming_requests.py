@@ -107,6 +107,7 @@ from exp.runtime.models.providers.server_tools import (
     anthropic_server_tools_message,
     anthropic_server_tools_present,
     disclose_dropped_server_tools,
+    shape_anthropic_advisor,
 )
 from exp.runtime.models.providers.thinking_budget import (
     qwen_uses_total_budget_cap,
@@ -755,6 +756,8 @@ def route_generation_parameter_requests(
         provider_updates["provider_server_tools"] = ()
         if clear_tool_choice:
             provider_updates["tool_choice"] = None
+    else:
+        shape_anthropic_advisor(profiles, request, provider_updates, ignored)
     # Codex native Responses tool declarations/history serve verbatim only on a
     # native Responses rung; a foreign wire gets them translated to function
     # tools (namespaces hoisted, custom tools as one ``input`` function; hosted

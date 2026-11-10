@@ -490,6 +490,8 @@ def test_azure_foundry_routes_a_known_anthropic_model_over_the_native_messages_w
     assert profile.url == "https://silen-resource.services.ai.azure.com/anthropic/v1/messages"
     assert profile.headers["Authorization"] == "Bearer foundry-secret"
     assert "x-api-key" not in profile.headers
+    # Foundry serves the Messages wire without Anthropic's advisor tool.
+    assert profile.serves_advisor_tool is False
 
 
 def test_azure_non_anthropic_model_keeps_the_openai_deployments_wire() -> None:

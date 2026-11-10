@@ -193,6 +193,10 @@ MESSAGES_SERVER_TOOL_TYPES_ACCEPTED = frozenset(
         "tool_search_tool_bm25_20251119",
         "tool_search_tool_regex",
         "tool_search_tool_regex_20251119",
+        # Advisor (beta advisor-tool-2026-03-01): forwarded verbatim on an
+        # all-Anthropic route with the beta token the dispatch adds itself;
+        # dropped with disclosure on a route with no Anthropic rung.
+        "advisor_20260301",
     }
 )
 """Anthropic-defined tool types the gateway forwards verbatim.
@@ -204,12 +208,17 @@ same block vocabulary this gateway carries intact: ``server_tool_use``,
 ``web_search_tool_result``, and citation-bearing ``text`` blocks (the newer
 two default to programmatic calling on some models; that 400 is the
 provider's own, named and actionable). Claude Code's WebSearch sends
-``web_search_20250305`` by default.
+``web_search_20250305`` by default. ``advisor_20260301`` streams only
+vocabulary the data plane already carries: the advisor's ``server_tool_use``
+(``name: "advisor"``, empty ``input``) and one whole ``advisor_tool_result``
+block in a single ``content_block_start`` (any result variant, the encrypted
+``advisor_redacted_result`` included), relayed verbatim by the generic
+``*_tool_result`` path; Claude Code declares it on every request once a user
+enables the advisor.
 """
 
 MESSAGES_SERVER_TOOL_TYPES_REJECTED = frozenset(
     {
-        "advisor_20260301",
         "bash_20241022",
         "bash_20250124",
         "browser_toolset_20260801",
@@ -301,9 +310,8 @@ the caller copy is neither forwarded (a bare token without its field, or on
 a non-Anthropic rung, would change nothing a caller can observe) nor
 disclosed as dropped, so a route that cannot run the server-side review
 answers exactly as if the caller had never asked, and the caller falls back
-to reviewing tool calls itself. ``advisor-tool-2026-03-01`` is bound to
-echoed advisor history (``advisor_tool_result`` blocks and the advisor's
-``server_tool_use``), which Anthropic accepts only under that token even after
-the tool leaves ``tools``; the ``advisor_20260301`` tool itself stays rejected
-in :data:`MESSAGES_SERVER_TOOL_TYPES_REJECTED`.
+to reviewing tool calls itself. ``advisor-tool-2026-03-01`` is bound to the
+advisor: a declared ``advisor_20260301`` tool or echoed advisor history
+(``advisor_tool_result`` blocks and the advisor's ``server_tool_use``), which
+Anthropic accepts only under that token even after the tool leaves ``tools``.
 """

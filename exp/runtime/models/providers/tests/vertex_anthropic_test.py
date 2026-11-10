@@ -100,6 +100,8 @@ def test_stream_profile_pins_the_anthropic_sse_route() -> None:
     profile = client.gateway_wire_profile()
 
     assert profile.dialect == "anthropic_messages"
+    # Claude on Vertex AI (Google managed) does not offer the advisor tool.
+    assert profile.serves_advisor_tool is False
     assert profile.url == (
         f"{_BASE_URL}/publishers/anthropic/models/claude-opus-4-5@20250514:streamRawPredict"
     )

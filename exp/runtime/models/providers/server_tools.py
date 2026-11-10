@@ -14,10 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
+    from exp.common.core.artifacts import JsonObject
     from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+    from exp.runtime.models.providers.base import GatewayWireProfile
 
 # Client-facing labels for the server tools Claude Code exposes, keyed by the
 # Anthropic tool name. Unknown names render bare.
@@ -215,3 +217,152 @@ def disclose_dropped_server_tools(
     if clear_tool_choice:
         disclose("tool_choice->dropped(unsupported_by_provider)")
     return stripped.messages, clear_tool_choice
+
+
+ANTHROPIC_ADVISOR_TOOL_NAME = "advisor"
+"""The name Anthropic requires on a declared ``advisor_20260301`` tool."""
+
+
+def anthropic_advisor_unserved_message() -> str:
+    """Explain why a declared advisor cannot run on a route only partly able to serve it.
+
+    Returns:
+        A caller-facing sentence naming the advisor and the hosts that lack it.
+    """
+    return (
+        "The request uses the Anthropic server tool 'advisor' (Anthropic advisor). "
+        "Anthropic does not offer the advisor on Claude models served through Google "
+        "Vertex AI or Azure AI Foundry, and this model route mixes such a host with "
+        "Anthropic rungs. Switch to a Claude model alias served by Anthropic for requests "
+        "that use the advisor, or disable the advisor and resend."
+    )
+
+
+def _is_advisor_block(block: JsonObject) -> bool:
+    """Whether one echoed history block is the advisor's call or its result."""
+    block_type = block.get("type")
+    return (
+        block_type == "server_tool_use" and block.get("name") == ANTHROPIC_ADVISOR_TOOL_NAME
+    ) or (block_type == f"{ANTHROPIC_ADVISOR_TOOL_NAME}_tool_result")
+
+
+def drop_anthropic_advisor(
+    request: GatewayRequest,
+    server_tools: Sequence[JsonObject],
+    messages: Sequence[GatewayMessage],
+    ignored: list[str],
+) -> tuple[tuple[JsonObject, ...], tuple[GatewayMessage, ...], bool]:
+    """Drop the advisor, disclosed, for a route with a rung that does not serve it.
+
+    Claude on Vertex AI (Google managed) and Azure AI Foundry run the other
+    Anthropic server tools but not the advisor, so only the advisor leaves the
+    dispatched request: its
+    declaration and its echoed history blocks (the advisor's ``server_tool_use``
+    and ``advisor_tool_result``). Every other server tool and history block stays
+    and forwards verbatim, and with no advisor left the dispatch adds no advisor
+    beta token.
+
+    Args:
+        request: The caller's canonical request.
+        server_tools: The dispatched server-tool entries so far.
+        messages: The dispatched history so far.
+        ignored: The route's disclosure list, appended in place.
+
+    Returns:
+        The remaining server-tool entries, the remaining history, and whether
+        ``tool_choice`` must be cleared on the dispatched request (it named the
+        advisor, or required a tool and none remains).
+    """
+    from exp.runtime.gateway.contracts import GatewayNamedToolChoice
+
+    def disclose(path: str) -> None:
+        if path not in ignored:
+            ignored.append(path)
+
+    kept_tools = tuple(
+        entry for entry in server_tools if entry.get("name") != ANTHROPIC_ADVISOR_TOOL_NAME
+    )
+    kept_messages = tuple(
+        message
+        for message in messages
+        if message.provider_anthropic_block is None
+        or not _is_advisor_block(message.provider_anthropic_block)
+    )
+    if len(kept_tools) != len(server_tools):
+        disclose(f"tools.{ANTHROPIC_ADVISOR_TOOL_NAME}->dropped(unsupported_by_provider)")
+    if len(kept_messages) != len(messages):
+        disclose("messages.server_tool_blocks->dropped(unsupported_by_provider)")
+    clear_tool_choice = (
+        isinstance(request.tool_choice, GatewayNamedToolChoice)
+        and request.tool_choice.name == ANTHROPIC_ADVISOR_TOOL_NAME
+    ) or (request.tool_choice == "required" and not request.tools and not kept_tools)
+    if clear_tool_choice:
+        disclose("tool_choice->dropped(unsupported_by_provider)")
+    return kept_tools, kept_messages, clear_tool_choice
+
+
+def shape_anthropic_advisor(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    provider_updates: dict[str, object],
+    ignored: list[str],
+) -> None:
+    """Keep the advisor off every rung that does not serve it, for an Anthropic-wire route.
+
+    Claude on Vertex AI (Google managed) and Azure AI Foundry speak the Messages
+    wire without the advisor (Anthropic offers it on the Claude API, Claude
+    Platform on AWS and Anthropic-managed Google Cloud only). A declared advisor
+    is dropped with disclosure when no rung serves it and refused by name when
+    only some do, as for any mixed server-tool route. Echoed advisor history is
+    dropped from the shared dispatched request whenever any rung lacks the
+    advisor, so a failover onto such a rung never carries blocks it refuses;
+    Anthropic keeps a conversation without them valid, so the advisor-capable
+    rungs still serve it. A route whose every rung serves the advisor is untouched.
+
+    Args:
+        profiles: Ordered wire profiles for every deployment in the route.
+        request: The caller's canonical request.
+        provider_updates: The dispatched request's pending updates, edited in place.
+        ignored: The route's disclosure list, appended in place.
+
+    Raises:
+        ProviderParameterError: A declared advisor on a route where only some
+            rungs serve it.
+    """
+    from exp.runtime.models.providers.errors import ProviderParameterError
+
+    if ANTHROPIC_ADVISOR_TOOL_NAME not in anthropic_server_tool_names(request) or all(
+        profile.serves_advisor_tool for profile in profiles
+    ):
+        return
+    advisor_declared = any(
+        entry.get("name") == ANTHROPIC_ADVISOR_TOOL_NAME for entry in request.provider_server_tools
+    )
+    if advisor_declared and any(profile.serves_advisor_tool for profile in profiles):
+        raise ProviderParameterError(
+            message=anthropic_advisor_unserved_message(),
+            param="tools",
+            code="unsupported_parameter",
+        )
+    current_messages = provider_updates.get("messages", request.messages)
+    kept_tools, kept_messages, clear_tool_choice = drop_anthropic_advisor(
+        request,
+        request.provider_server_tools,
+        cast("Sequence[GatewayMessage]", current_messages),
+        ignored,
+    )
+    provider_updates["provider_server_tools"] = kept_tools
+    provider_updates["messages"] = kept_messages
+    if not kept_tools and not request.tools and not request.provider_native_tools:
+        # No tool definition survives: tool-selection controls have no meaning,
+        # and the provider rejects a tool_choice without tools.
+        if request.tool_choice is not None:
+            clear_tool_choice = True
+            if "tool_choice->dropped(unsupported_by_provider)" not in ignored:
+                ignored.append("tool_choice->dropped(unsupported_by_provider)")
+        if request.parallel_tool_calls is not None:
+            provider_updates["parallel_tool_calls"] = None
+            if "parallel_tool_calls->dropped(unsupported_by_provider)" not in ignored:
+                ignored.append("parallel_tool_calls->dropped(unsupported_by_provider)")
+    if clear_tool_choice:
+        provider_updates["tool_choice"] = None

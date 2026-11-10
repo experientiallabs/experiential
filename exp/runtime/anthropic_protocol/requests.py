@@ -70,6 +70,7 @@ from exp.runtime.anthropic_protocol.server_tools import (
     messages_tool_search,
     messages_web_search,
     require_served_server_tool_types,
+    require_valid_advisor_declarations,
 )
 from exp.runtime.anthropic_protocol.tool_changes import (
     CustomTool,
@@ -477,6 +478,7 @@ def _decode(
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
+    require_valid_advisor_declarations(payload, request.tools)
     forwarded_betas, dropped_beta_disclosures = passthrough_fields.beta_tokens(anthropic_beta)
     messages: list[GatewayMessage] = []
     system_text = _system_text(request.system)

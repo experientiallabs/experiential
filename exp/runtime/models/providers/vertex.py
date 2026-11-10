@@ -706,6 +706,7 @@ class VertexAnthropicClient(ProviderHttpClient):
             # budgets, and max_tokens ceilings on Vertex-Anthropic vs direct
             # Anthropic. Batch is out of scope.
             anthropic_vertex_version=VERTEX_ANTHROPIC_VERSION,
+            serves_advisor_tool=False,
         )
 
     def _completion_path(self) -> str:

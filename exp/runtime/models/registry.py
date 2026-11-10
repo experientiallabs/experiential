@@ -557,6 +557,7 @@ class RuntimeModelCatalog:
                     api_key=api_key,
                     base_url=azure_anthropic_base_url(connection.base_url),
                     authorization_bearer=True,
+                    serves_advisor_tool=False,
                     transport=self._transport_factory(),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,

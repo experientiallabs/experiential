@@ -59,6 +59,12 @@ def _marked_request() -> GatewayRequest:
         ),
         provider_server_tools=(
             {"type": "web_search_20250305", "name": "web_search", "cache_control": _EPHEMERAL},
+            {
+                "type": "advisor_20260301",
+                "name": "advisor",
+                "model": "claude-opus-4-1",
+                "caching": _EPHEMERAL,
+            },
         ),
         messages=(
             GatewayMessage(
@@ -112,6 +118,7 @@ def test_caching_off_strips_every_marker_and_discloses_each_path() -> None:
     assert cache_markers(stripped) == ()
     assert stripped.provider_server_tools == (
         {"type": "web_search_20250305", "name": "web_search"},
+        {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-4-1"},
     )
     assert [message.content for message in stripped.messages] == [
         message.content for message in request.messages
@@ -122,6 +129,7 @@ def test_caching_off_strips_every_marker_and_discloses_each_path() -> None:
         for path in (
             "cache_control",
             "tools.cache_control",
+            "tools.caching",
             "messages.tool_calls.cache_control",
             "messages.content.cache_control",
             "prompt_cache_key",
