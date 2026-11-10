@@ -70,8 +70,10 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
 )
 from exp.runtime.models.providers.wire_messages import (
+    ANTHROPIC_ADVISOR_TOOL_BETA,
     TOOL_RESULT_DOCUMENT_FOLD_HEADER,
     TOOL_RESULT_IMAGE_FOLD_HEADER,
+    anthropic_request_headers,
     tool_result_document_marker,
     tool_result_image_marker,
 )
@@ -6179,6 +6181,57 @@ def test_server_tools_drop_with_disclosure_on_an_all_foreign_route() -> None:
     assert "messages.content.citations->dropped(unsupported_by_provider)" in (
         public.ignored_parameters
     )
+
+
+_ADVISOR_TOOL: JsonObject = {
+    "type": "advisor_20260301",
+    "name": "advisor",
+    "model": "claude-opus-5-5",
+    "max_uses": 3,
+}
+
+
+def _advisor_messages_request() -> GatewayRequest:
+    """Build one Messages request declaring Claude Code's advisor server tool."""
+    return _web_search_messages_request().model_copy(
+        update={"provider_server_tools": (_ADVISOR_TOOL,)}
+    )
+
+
+def test_the_advisor_tool_serves_verbatim_with_its_beta_on_an_anthropic_route() -> None:
+    """On an all-Anthropic route the advisor declaration and its token reach the wire."""
+    profiles = (
+        _anthropic_web_search_profile(),
+        _anthropic_web_search_profile("https://anthropic-b.test"),
+    )
+    public, provider = route_generation_parameter_requests(profiles, _advisor_messages_request())
+    assert provider.provider_server_tools == (_ADVISOR_TOOL,)
+    assert not any("advisor" in path for path in public.ignored_parameters)
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", provider, maximum_output_tokens=128_000
+    )
+    assert payload["tools"] == [_ADVISOR_TOOL]
+    headers = anthropic_request_headers({"x-api-key": "k"}, provider)
+    assert headers["anthropic-beta"] == ANTHROPIC_ADVISOR_TOOL_BETA
+
+
+def test_the_advisor_tool_follows_the_server_tool_policy_off_anthropic() -> None:
+    """A mixed route rejects the advisor by name; an all-foreign route drops it, disclosed."""
+    mixed = (
+        _anthropic_web_search_profile(),
+        GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
+    )
+    with pytest.raises(ProviderParameterError) as raised:
+        route_generation_parameter_requests(mixed, _advisor_messages_request())
+    assert raised.value.param == "tools"
+    assert "'advisor' (Anthropic advisor)" in str(raised.value)
+
+    public, provider = route_generation_parameter_requests(
+        _hy4_foreign_route(), _advisor_messages_request()
+    )
+    assert provider.provider_server_tools == ()
+    assert "tools.advisor->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert public.provider_server_tools == (_ADVISOR_TOOL,)
 
 
 def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:

@@ -646,17 +646,17 @@ ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA = "thinking-display-updates-2026-08-18"
 
 
 ANTHROPIC_ADVISOR_TOOL_BETA = "advisor-tool-2026-03-01"
-"""Beta token Anthropic requires before it accepts echoed advisor history
-(``advisor_tool_result`` blocks), even when the advisor tool is no longer in
-``tools``."""
+"""Beta token Anthropic requires for a declared ``advisor_20260301`` tool and
+for echoed advisor history (``advisor_tool_result`` blocks), even when the
+advisor tool is no longer in ``tools``."""
 
 
-def _carries_advisor_history(request: GatewayRequest) -> bool:
-    """Whether the history echoes an advisor call or its result block.
+def _carries_advisor(request: GatewayRequest) -> bool:
+    """Whether the request declares the advisor tool or echoes advisor history.
 
-    The shared server-tool namer reads ``server_tool_use`` names and
-    ``<tool>_tool_result`` types; the ``advisor_20260301`` declaration itself
-    is refused at decode, so a named advisor here is always echoed history.
+    The shared server-tool namer reads declared server tools' ``name``
+    (``advisor_20260301`` must be named ``advisor``), ``server_tool_use``
+    names, and ``<tool>_tool_result`` types, so one check covers both.
     """
     return "advisor" in anthropic_server_tool_names(request)
 
@@ -672,9 +672,10 @@ def anthropic_request_headers(
     ``anthropic-beta`` token (each verified live: the bare field
     is "Extra inputs are not permitted"), so their tokens join the
     connection's static headers exactly when the request carries the field.
-    An Anthropic Files handle likewise needs the Files API token, and echoed
-    advisor history (an ``advisor_tool_result`` block or the advisor's
-    ``server_tool_use``) needs the advisor tool token.
+    An Anthropic Files handle likewise needs the Files API token, and a
+    declared advisor tool or echoed advisor history (an
+    ``advisor_tool_result`` block or the advisor's ``server_tool_use``) needs
+    the advisor tool token.
     Allowlisted caller-forwarded tokens (``request.provider_beta_tokens``,
     e.g. the 1M context window) merge the same way. The merged list keeps
     operator tokens first, then caller tokens, then field-required tokens,
@@ -702,7 +703,7 @@ def anthropic_request_headers(
         required.append(ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA)
     if any(handle.provider == "anthropic" for handle in request.media_handles):
         required.append(ANTHROPIC_FILES_API_BETA)
-    if _carries_advisor_history(request):
+    if _carries_advisor(request):
         required.append(ANTHROPIC_ADVISOR_TOOL_BETA)
     if not required:
         return headers

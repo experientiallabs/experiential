@@ -8610,6 +8610,84 @@ def test_echoed_advisor_history_is_dropped_on_a_chat_wire_rung(tmp_path: Path) -
     assert "Here is the pool." in wire_text
 
 
+_ADVISOR_DECLARATION: JsonObject = {
+    "type": "advisor_20260301",
+    "name": "advisor",
+    "model": "claude-opus-5-5",
+    "caching": {"type": "ephemeral", "ttl": "5m"},
+}
+
+
+def _advisor_declared_body() -> str:
+    """A Claude Code turn that declares the advisor tool (claude-cli 2.1.319)."""
+    body = json.loads(_advisor_history_body())
+    body["tools"] = [
+        {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+        _ADVISOR_DECLARATION,
+    ]
+    return json.dumps(body)
+
+
+def test_declared_advisor_tool_serves_verbatim_on_an_anthropic_messages_rung(
+    tmp_path: Path,
+) -> None:
+    """The advisor declaration dispatches byte-for-byte behind its beta token.
+
+    Production (2026-11-10): Claude Code declares ``advisor_20260301`` on
+    every request once a user enables the advisor, and every such request
+    was refused. On a native Anthropic rung the entry now follows the
+    converted custom tools verbatim and the dispatch carries
+    ``advisor-tool-2026-03-01``.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(
+        root,
+        provider="anthropic",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}),
+        request_timeout_seconds=120.0,
+    )
+
+    admission = _flatten_started(
+        control, _admit(control, raw_key, _advisor_declared_body(), surface="messages")
+    )
+
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    tools = cast("list[JsonObject]", upstream["tools"])
+    assert [tool.get("name") for tool in tools] == ["Bash", "advisor"]
+    assert tools[1] == _ADVISOR_DECLARATION
+    headers = cast("JsonObject", admission["headers"])
+    assert "advisor-tool-2026-03-01" in str(headers["anthropic-beta"]).split(",")
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert not any("advisor" in path for path in ignored)
+
+
+def test_declared_advisor_tool_is_dropped_on_a_chat_wire_rung(tmp_path: Path) -> None:
+    """A route with no Anthropic rung serves the turn without the advisor, disclosed."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+
+    admission = _admit(control, raw_key, _advisor_declared_body(), surface="messages")
+
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert "tools.advisor->dropped(unsupported_by_provider)" in ignored
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    upstream = json.dumps(route[0]["upstream_payload"])
+    assert "advisor_20260301" not in upstream
+    assert "claude-opus-5-5" not in upstream
+    assert "Bash" in upstream
+
+
 def test_claude_code_tool_changes_serve_on_a_chat_wire_rung(tmp_path: Path) -> None:
     """A Chat-wire rung receives every tool loaded and the changes as instruction text."""
     _manager, raw_key = _configured_gateway(

@@ -52,8 +52,15 @@ decided per type by the same manifest: verified `web_search_*` entries forward v
 the converted custom tools, their streamed output (`server_tool_use`, `web_search_tool_result`,
 citation-bearing text blocks, and the `pause_turn` stop reason) reaches the caller intact on
 both response paths, and a next-turn echo of those blocks (each carried verbatim as a
-whole-message block) re-serves byte-for-byte; every other Anthropic-defined tool type is
-rejected by name because the data plane does not yet carry its result blocks. Like the thinking
+whole-message block) re-serves byte-for-byte. The advisor tool (`advisor_20260301`, beta
+`advisor-tool-2026-03-01`, which Claude Code declares on every request once the advisor is
+enabled) is served the same way: the declaration is validated against its documented shape
+(`name: "advisor"`, a required `model`, `max_uses` of at least 1, `max_tokens` of at least 1024,
+`caching` of `{"type": "ephemeral", "ttl": "5m" | "1h"}`; other fields forward untouched), so a
+malformed entry is a named 400 at `tools.<n>.<field>`, then forwards verbatim with the beta token
+the dispatch adds itself, and the advisor's `server_tool_use` and whole `advisor_tool_result`
+block stream back verbatim. Every other Anthropic-defined tool type is rejected by name because
+the data plane does not yet carry its result blocks. Like the thinking
 carriers, server tools replay only on the Anthropic wire. A MIXED route (an Anthropic rung beside
 another) rejects them by name; a route with NO Anthropic rung serves the turn without them,
 dropping the declared tool (`tools.web_search->dropped(unsupported_by_provider)`), its echoed
@@ -62,11 +69,15 @@ dropping the declared tool (`tools.web_search->dropped(unsupported_by_provider)`
 answer whose text stays (`messages.content.citations->dropped(unsupported_by_provider)`), and a
 selector that named the tool (`tool_choice->dropped(unsupported_by_provider)`), because Claude
 Code recovers on its own once WebSearch is simply absent while a 400 kills the turn (two
-production turns on 2026-09-11). Echoed advisor history (the advisor's `server_tool_use` and
-its `advisor_tool_result`, any result variant, encrypted `advisor_redacted_result` included) is
-carried the same way even though the `advisor_20260301` tool itself stays rejected: Anthropic
-keeps that history valid after the tool leaves `tools`, and on an Anthropic rung the dispatch adds
-the `advisor-tool-2026-03-01` token the history requires. The terminal `message_delta` usage
+production turns on 2026-09-11). The declared advisor follows the same route
+policy (`tools.advisor->dropped(unsupported_by_provider)` with no Anthropic rung, a named
+rejection on a mixed route). Echoed advisor history (the advisor's `server_tool_use` and its
+`advisor_tool_result`, any result variant, encrypted `advisor_redacted_result` included) is
+carried the same way with or without the declaration: Anthropic keeps that history valid after
+the tool leaves `tools`, and on an Anthropic rung the dispatch adds the `advisor-tool-2026-03-01`
+token the history requires. Advisor sub-inference tokens are reported only in Anthropic's
+`usage.iterations[]` (`type: "advisor_message"`), never in the top-level usage the gateway
+settles from, so the gateway's meters and ledger count executor tokens only. The terminal `message_delta` usage
 report supersedes the `message_start` input legs when present, because server-tool turns re-read
 fetched results as input and the start-frame count severely undercounts the billed total.
 
@@ -119,5 +130,5 @@ through an exact allowlist (`MESSAGES_BETA_TOKENS_FORWARDED`); `extended-cache-t
 is on it, so a `cache_control: {"type": "ephemeral", "ttl": "1h"}` marker keeps the token that
 admits it. Field-bound tokens (`MESSAGES_BETA_TOKENS_FIELD_BOUND`: `dangerous-tool-use-2026-09-03`,
 `advisor-tool-2026-03-01`) are accepted silently and added by the dispatch itself exactly when the
-field or history they gate is present. Every other token is dropped with an
+field, tool, or history they gate is present. Every other token is dropped with an
 `anthropic-beta.<token>` disclosure.

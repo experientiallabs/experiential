@@ -1923,8 +1923,8 @@ def test_echoed_advisor_turn_rides_the_verbatim_block_carrier(result_content: Js
 
     A client that consulted the advisor resends its ``advisor_tool_result``
     on every later turn. Anthropic keeps the block valid after the tool
-    leaves ``tools`` (the case here: the ``advisor_20260301`` tool itself is
-    not served) and tells callers to round-trip it verbatim, encrypted
+    leaves ``tools`` (the case here: no ``advisor_20260301`` tool is
+    declared) and tells callers to round-trip it verbatim, encrypted
     variant included.
     """
     from exp.runtime.models.providers.wire_messages import (
@@ -2001,13 +2001,101 @@ def test_advisor_token_without_advisor_history_is_a_no_op() -> None:
     assert "anthropic-beta" not in anthropic_request_headers({"x-api-key": "k"}, search)
 
 
-def test_the_advisor_tool_itself_stays_unserved() -> None:
-    """Accepting advisor HISTORY does not accept declaring the advisor tool."""
+def test_the_advisor_tool_declaration_decodes_and_forwards_with_its_beta() -> None:
+    """Claude Code's advisor declaration decodes, carries verbatim, and gets its token.
+
+    Production (claude-cli 2.1.319, 2026-11-10): Claude Code declares
+    ``advisor_20260301`` on every request once a user enables the advisor,
+    and the decoder answered each with a 400. The entry now rides the
+    verbatim server-tool carrier like web_search, and the dispatch adds
+    ``advisor-tool-2026-03-01`` whether or not the caller sent it.
+    """
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_ADVISOR_TOOL_BETA,
+        anthropic_request_headers,
+    )
+
+    advisor: JsonObject = {
+        "type": "advisor_20260301",
+        "name": "advisor",
+        "model": "claude-opus-5-5",
+        "max_uses": 3,
+        "max_tokens": 2048,
+        "caching": {"type": "ephemeral", "ttl": "5m"},
+    }
+    for beta in (ANTHROPIC_ADVISOR_TOOL_BETA, None):
+        decoded = decode_messages(
+            _body(
+                tools=[
+                    {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                    advisor,
+                ]
+            ),
+            anthropic_beta=beta,
+        ).request
+        assert tuple(tool.name for tool in decoded.tools) == ("Bash",)
+        assert decoded.provider_server_tools == (advisor,)
+        assert decoded.ignored_parameters == ()
+        headers = anthropic_request_headers({"x-api-key": "k"}, decoded)
+        assert headers["anthropic-beta"] == ANTHROPIC_ADVISOR_TOOL_BETA
+
+
+def test_a_minimal_advisor_declaration_with_unknown_fields_forwards_verbatim() -> None:
+    """Only ``type``, ``name`` and ``model`` are required; extra provider fields ride along."""
+    advisor: JsonObject = {
+        "type": "advisor_20260301",
+        "name": "advisor",
+        "model": "claude-opus-5-5",
+        "cache_control": {"type": "ephemeral"},
+        "defer_loading": False,
+        "some_future_field": {"x": 1},
+    }
+    decoded = decode_messages(_body(tools=[advisor])).request
+    assert decoded.provider_server_tools == (advisor,)
+
+
+@pytest.mark.parametrize(
+    ("entry", "param"),
+    [
+        ({"type": "advisor_20260301", "name": "advisor"}, "tools.0.model"),
+        ({"type": "advisor_20260301", "name": "advisor", "model": ""}, "tools.0.model"),
+        ({"type": "advisor_20260301", "name": "advisor", "model": 5}, "tools.0.model"),
+        ({"type": "advisor_20260301", "name": "consult", "model": "m"}, "tools.0.name"),
+        (
+            {"type": "advisor_20260301", "name": "advisor", "model": "m", "max_uses": 0},
+            "tools.0.max_uses",
+        ),
+        (
+            {"type": "advisor_20260301", "name": "advisor", "model": "m", "max_uses": "2"},
+            "tools.0.max_uses",
+        ),
+        (
+            {"type": "advisor_20260301", "name": "advisor", "model": "m", "max_tokens": 512},
+            "tools.0.max_tokens",
+        ),
+        (
+            {
+                "type": "advisor_20260301",
+                "name": "advisor",
+                "model": "m",
+                "caching": {"type": "ephemeral", "ttl": "10m"},
+            },
+            "tools.0.caching.ttl",
+        ),
+        (
+            {"type": "advisor_20260301", "name": "advisor", "model": "m", "caching": "on"},
+            "tools.0.caching",
+        ),
+    ],
+)
+def test_a_malformed_advisor_declaration_is_rejected_by_field(
+    entry: JsonObject, param: str
+) -> None:
+    """A malformed advisor entry is a named 400 here, never a provider error."""
     with pytest.raises(OpenAIProtocolError) as error:
-        decode_messages(
-            _body(tools=[{"type": "advisor_20260301", "name": "advisor", "model": "claude-x"}])
-        )
-    assert error.value.detail.param == "tools.0.type"
+        decode_messages(_body(tools=[entry]))
+    assert error.value.status_code == 400
+    assert error.value.detail.param == param
 
 
 def test_cited_text_splits_around_plain_assistant_text_in_order() -> None:

@@ -5,15 +5,27 @@ carry no ``input_schema``; their per-type configuration is an evolving
 provider surface, so only the discriminator pair is validated and the raw
 entry forwards byte-for-byte on native Anthropic rungs. A ``web_search_*``
 entry additionally normalizes into the gateway's own web-search request so a
-route with no Anthropic rung can run the search itself.
+route with no Anthropic rung can run the search itself. The advisor tool
+(``advisor_20260301``) additionally validates against its documented
+declaration (:class:`AdvisorToolDeclaration`) so a malformed entry is a named
+400 here rather than a provider error, then forwards verbatim like the rest.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import cast
+from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    model_validator,
+)
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.manifest import MESSAGES_SERVER_TOOL_TYPES_ACCEPTED
@@ -44,6 +56,78 @@ class ServerTool(BaseModel):
         if self.type == "custom":
             raise ValueError("custom tools must declare an input_schema")
         return self
+
+
+ADVISOR_TOOL_TYPE = "advisor_20260301"
+"""The advisor server tool's type (beta ``advisor-tool-2026-03-01``)."""
+
+
+class AdvisorCaching(BaseModel):
+    """The advisor's own transcript-caching switch: ``{"type": "ephemeral", "ttl": ...}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["ephemeral"]
+    ttl: Literal["5m", "1h"] | None = None
+
+
+class AdvisorToolDeclaration(BaseModel):
+    """The documented ``advisor_20260301`` declaration (Anthropic advisor tool).
+
+    The executor model consults ``model`` mid-generation through a
+    ``server_tool_use`` block named ``advisor``; the result returns as an
+    ``advisor_tool_result`` block. ``max_uses`` caps calls per turn,
+    ``max_tokens`` (at least 1024) caps each call's output, and ``caching``
+    switches advisor-side prompt caching. The generic tool-definition
+    properties Anthropic documents for every tool (``cache_control``,
+    ``allowed_callers``, ``defer_loading``, ``strict``) are typed too. Fields
+    beyond these are kept and forwarded: the provider owns its evolving
+    server-tool surface, as for every other accepted server tool.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["advisor_20260301"]
+    name: Literal["advisor"]
+    model: StrictStr = Field(min_length=1, max_length=256)
+    max_uses: StrictInt | None = Field(default=None, ge=1)
+    max_tokens: StrictInt | None = Field(default=None, ge=1024)
+    caching: AdvisorCaching | None = None
+    cache_control: dict[str, object] | None = None
+    allowed_callers: list[StrictStr] | None = None
+    defer_loading: StrictBool | None = None
+    strict: StrictBool | None = None
+
+
+def require_valid_advisor_declarations(payload: JsonObject, tools: Sequence[object]) -> None:
+    """Validate every declared advisor tool against its documented shape.
+
+    Args:
+        payload: Raw request body (its ``tools`` array carries the verbatim entry).
+        tools: The decoded ``tools`` entries, positionally aligned with the payload.
+
+    Raises:
+        OpenAIProtocolError: An advisor entry is malformed (missing ``model``,
+            a name other than ``advisor``, ``max_tokens`` below 1024, ...).
+    """
+    raw_tools = payload.get("tools")
+    if not isinstance(raw_tools, list):
+        return
+    for tool_index, tool in enumerate(tools):
+        if not isinstance(tool, ServerTool) or tool.type != ADVISOR_TOOL_TYPE:
+            continue
+        try:
+            AdvisorToolDeclaration.model_validate(raw_tools[tool_index])
+        except ValidationError as exc:
+            detail = exc.errors(include_url=False)[0]
+            location = ".".join(str(part) for part in detail["loc"])
+            path = f"tools.{tool_index}.{location}" if location else f"tools.{tool_index}"
+            raise invalid_field(
+                path,
+                f"Invalid value for '{path}': "
+                + str(detail["msg"]).removeprefix("Value error, ")
+                + ".",
+            ) from exc
 
 
 def require_served_server_tool_types(tools: Sequence[object]) -> None:
