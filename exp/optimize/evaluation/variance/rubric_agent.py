@@ -42,6 +42,7 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    JsonValue,
     Sha256,
     sha256_json,
 )
@@ -1046,29 +1047,68 @@ def first_request_bytes(
     return max(sizes)
 
 
+REPLY_CHARACTERS = 2_000
+"""Longest step text (reply or argument) kept whole when a packet must shrink; longer is clipped."""
+
+
+def _clipped(value: JsonValue) -> tuple[JsonValue, int]:
+    """A reply with every long string kept as head and tail, and how many were clipped."""
+    if isinstance(value, str) and len(value) > REPLY_CHARACTERS:
+        half = REPLY_CHARACTERS // 2
+        omitted = len(value) - REPLY_CHARACTERS
+        return f"{value[:half]}\n...[{omitted} characters omitted]...\n{value[-half:]}", 1
+    if isinstance(value, dict):
+        rows = {key: _clipped(item) for key, item in value.items()}
+        return {key: row[0] for key, row in rows.items()}, sum(row[1] for row in rows.values())
+    if isinstance(value, list):
+        rows = [_clipped(item) for item in value]
+        return [row[0] for row in rows], sum(row[1] for row in rows)
+    return value, 0
+
+
 def fitted_packet(
     packet: AuthoringPacket,
     settings: AuthorSettings,
     profile: RubricAuthoringProfile,
     library: LibraryBinding | None = None,
 ) -> AuthoringPacket:
-    """Drop observed episodes, largest first, until the first request fits with headroom.
+    """Shrink a packet until its first request fits with headroom, keeping every episode first.
 
     The first request must fit ``(1 - FIT_HEADROOM)`` of the author's input allowance so the
-    later phases, which add earlier answers, and repair turns still fit. How many episodes were
-    dropped is recorded on the packet. A packet that does not fit even without episodes is
-    returned without them, and the author's own allowance check refuses it.
+    later phases, which add earlier answers, and repair turns still fit. Long step texts (replies
+    and arguments, such as a written file) are clipped to their head and tail first, so every
+    episode keeps its calls, order and errors; only if that is not enough are episodes dropped,
+    largest first. Both counts are recorded on the packet. A packet that does not fit even
+    without episodes is returned without them, and the author's own allowance check refuses it.
 
     Returns:
         The packet the author is shown.
     """
     budget = int(settings.maximum_input_bytes * (1 - FIT_HEADROOM))
-    episodes = list(packet.observed_episodes)
-    fitted = packet
+    if first_request_bytes(packet, settings, profile, library) <= budget:
+        return packet
+    clipped_count = 0
+    episodes = []
+    for episode in packet.observed_episodes:
+        steps = []
+        for step in episode.steps:
+            reply, replied = _clipped(step.reply)
+            arguments, argued = _clipped(step.arguments)
+            clipped_count += replied + argued
+            assert isinstance(arguments, dict)
+            steps.append(step.model_copy(update={"reply": reply, "arguments": arguments}))
+        episodes.append(episode.model_copy(update={"steps": tuple(steps)}))
+    fitted = packet.model_copy(
+        update={
+            "observed_episodes": tuple(episodes),
+            "clipped_replies": packet.clipped_replies + clipped_count,
+        }
+    )
+    base = fitted
     while episodes and first_request_bytes(fitted, settings, profile, library) > budget:
         largest = max(range(len(episodes)), key=lambda i: (len(episodes[i].model_dump_json()), i))
         del episodes[largest]
-        fitted = packet.model_copy(
+        fitted = base.model_copy(
             update={
                 "observed_episodes": tuple(episodes),
                 "omitted_episodes": packet.omitted_episodes

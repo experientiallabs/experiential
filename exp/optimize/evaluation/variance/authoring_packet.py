@@ -280,6 +280,8 @@ class AuthoringPacket(ContractModel):
         observed_episodes: Source-derived replay episodes induced programs are validated on.
         omitted_episodes: Observed episodes left out so the packet fits its author's input
             allowance; zero when every selected episode is shown.
+        clipped_replies: Long episode step texts (replies and arguments) shown as head and tail
+            for the same reason.
         variants: The exact task variants.
         brief: The decision brief, a proposal.
         coalition: Every attempt, tier, pattern, selector, critic and contrast behind the family.
@@ -301,6 +303,7 @@ class AuthoringPacket(ContractModel):
     claims: tuple[PacketClaim, ...] = ()
     observed_episodes: tuple[InductionEpisode, ...] = ()
     omitted_episodes: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
+    clipped_replies: int = Field(default=0, ge=0, exclude_if=lambda value: value == 0)
     variants: tuple[PacketVariant, ...] = Field(min_length=1)
     brief: DecisionBrief
     coalition: CoalitionEvidence = Field(default_factory=CoalitionEvidence)

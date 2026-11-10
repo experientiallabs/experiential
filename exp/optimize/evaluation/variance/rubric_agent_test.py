@@ -368,10 +368,10 @@ def test_a_lost_draw_is_redrawn_and_exhausted_repairs_end_in_the_last_failure() 
     assert failure == "bad" and names == ["e", "e-repair-1", "e-redraw-1", "e-redraw-1-repair-1"]
 
 
-def test_an_oversized_packet_drops_its_largest_episodes_until_the_first_request_fits(
+def test_an_oversized_packet_clips_long_texts_then_drops_its_largest_episodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Episodes go largest first, the count is recorded, and the first request fits."""
+    """Long step texts are clipped first; only then do episodes go, largest first; both counted."""
     from exp.optimize.evaluation.variance.rubric_agent import (
         FIT_HEADROOM,
         first_request_bytes,
@@ -382,26 +382,31 @@ def test_an_oversized_packet_drops_its_largest_episodes_until_the_first_request_
     fixture = grounded_fixture(tmp_path, monkeypatch)
     packet, _ = ticket_packet(fixture, coalition=ticket_coalition())
 
-    def episode(name: str, size: int) -> InductionEpisode:
+    def episode(name: str, size: int, steps: int = 1) -> InductionEpisode:
         step = {"tool": "read_ticket", "arguments": {"note": "x" * size}, "reply": {"ok": True}}
-        return InductionEpisode.model_validate({"episode_id": name, "steps": [step]})
+        return InductionEpisode.model_validate({"episode_id": name, "steps": [step] * steps})
 
-    big = packet.model_copy(
+    profile = RubricAuthoringProfile(variants=("requirements-first",))
+    base = first_request_bytes(packet, fixture.settings, profile)
+    settings = fixture.settings.model_copy(
+        update={"maximum_input_bytes": int((base + 30_000) / (1 - FIT_HEADROOM))}
+    )
+    long_texts = packet.model_copy(
+        update={"observed_episodes": (episode("small", 1_000), episode("huge", 60_000))}
+    )
+    clipped = fitted_packet(long_texts, settings, profile)
+    assert [row.episode_id for row in clipped.observed_episodes] == ["small", "huge"]
+    assert clipped.clipped_replies == 1 and clipped.omitted_episodes == 0
+
+    many_steps = packet.model_copy(
         update={
             "observed_episodes": (
-                episode("small", 1_000), episode("huge", 60_000), episode("mid", 40_000),
+                episode("small", 1_000), episode("long", 1_500, 30), episode("mid", 1_500, 12),
             )
         }
     )  # fmt: skip
-    profile = RubricAuthoringProfile(variants=("requirements-first",))
-    settings = fixture.settings.model_copy(
-        update={"maximum_input_bytes": int((first_request_bytes(packet, fixture.settings, profile)
-        + 30_000) / (1 - FIT_HEADROOM))}
-    )  # fmt: skip
-
-    fitted = fitted_packet(big, settings, profile)
-
-    assert [row.episode_id for row in fitted.observed_episodes] == ["small"]
-    assert fitted.omitted_episodes == 2
+    fitted = fitted_packet(many_steps, settings, profile)
+    assert [row.episode_id for row in fitted.observed_episodes] == ["small", "mid"]
+    assert fitted.omitted_episodes == 1
     assert first_request_bytes(fitted, settings, profile) <= settings.maximum_input_bytes * 0.8
     assert fitted_packet(packet, settings, profile) == packet
