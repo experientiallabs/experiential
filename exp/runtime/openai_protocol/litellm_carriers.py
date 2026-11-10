@@ -50,7 +50,8 @@ class LiteLLMThinkingBlock(_LiteLLMModel):
     Attributes:
         type: The discriminator, always ``"thinking"``.
         thinking: The block's plaintext reasoning, bounded by
-            ``MAXIMUM_REASONING_CARRIER_BYTES``.
+            ``MAXIMUM_REASONING_CARRIER_BYTES``; ``None`` when LiteLLM omitted it
+            (its non-streaming Bedrock Converse path builds a signature-only block).
         signature: The issuing provider's signature, bounded like ``thinking``;
             ``None`` when LiteLLM recorded none.
         cache_control: LiteLLM's optional cache marker object, never interpreted.
@@ -58,7 +59,7 @@ class LiteLLMThinkingBlock(_LiteLLMModel):
     """
 
     type: Literal["thinking"]
-    thinking: _BoundedReasoningText
+    thinking: _BoundedReasoningText | None = None
     signature: _BoundedReasoningText | None = None
     cache_control: JsonObject | None = None
     index: int | None = Field(default=None, ge=0)

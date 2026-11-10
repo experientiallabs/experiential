@@ -490,6 +490,8 @@ def test_chat_decoder_drops_populated_litellm_reasoning_carriers_with_disclosure
                             "signature": "EqoBCkgIARABGAIiQ...",
                         },
                         {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix..."},
+                        # LiteLLM's non-streaming Bedrock Converse path omits ``thinking``.
+                        {"type": "thinking", "signature": "EqoBCkgIARABGAIiQ..."},
                     ],
                     "reasoning_items": [
                         {
@@ -726,7 +728,6 @@ def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> No
     """A populated refusal or images list, or a malformed LiteLLM carrier, stays rejected."""
     for extra, field in (
         ({"refusal": "no"}, "refusal"),
-        ({"thinking_blocks": [{"type": "thinking", "signature": "y"}]}, "thinking_blocks"),
         ({"thinking_blocks": [{"type": "unknown", "thinking": "x"}]}, "thinking_blocks"),
         ({"thinking_blocks": [{"type": "redacted_thinking", "thinking": "x"}]}, "thinking_blocks"),
         ({"thinking_blocks": {"type": "thinking", "thinking": "x"}}, "thinking_blocks"),

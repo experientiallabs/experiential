@@ -22,16 +22,18 @@ def test_thinking_blocks_accept_exactly_litellms_documented_shapes() -> None:
         [
             {"type": "thinking", "thinking": "t", "signature": "s", "index": 0},
             {"type": "thinking", "thinking": "t", "signature": None, "cache_control": {}},
+            # LiteLLM's non-streaming Bedrock Converse path omits ``thinking``.
+            {"type": "thinking", "signature": "s"},
             {"type": "redacted_thinking", "data": "d"},
         ]
     )
     assert [type(block) for block in blocks] == [
         LiteLLMThinkingBlock,
         LiteLLMThinkingBlock,
+        LiteLLMThinkingBlock,
         LiteLLMRedactedThinkingBlock,
     ]
     for junk in (
-        [{"type": "thinking"}],
         [{"type": "redacted_thinking", "thinking": "t"}],
         [{"type": "text", "text": "t"}],
         [{"type": "thinking", "thinking": "t", "extra": 1}],
