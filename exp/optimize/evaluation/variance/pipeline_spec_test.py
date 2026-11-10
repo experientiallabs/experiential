@@ -219,3 +219,29 @@ def test_search_ladder_and_point_decisions_are_on_by_default_on_the_authoring_al
     )
     priced = next(row for row in bare.stages if row.stage == "families")
     assert sum(row.attempts for row in families.costs) > sum(row.attempts for row in priced.costs)
+
+
+def test_mining_draws_on_its_own_finite_simulator_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mining job's simulator ceiling is sized from the mining shape or set explicitly;
+    the world's frozen semantics, and so the captured start, are unchanged."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
+
+    run = wired(tmp_path, monkeypatch)
+    mining = make_spec(run.fixture, run.rubric, run.bank).mining
+    job = mining.job
+    assert job is not None and "maximum_physical_attempts" in job.configuration
+    sized = mining.registered.configuration["maximum_physical_attempts"]
+    rollouts = len(mining.actors) * (mining.attempts + mining.points * mining.continuations)
+    reasks = job.configuration.get("maximum_reasks", 0)
+    assert sized == min(100_000, rollouts * (job.maximum_model_calls or 1) * (1 + reasks) * 3)
+    explicit = mining.model_copy(update={"simulator_physical_attempts": 12_345})
+    assert explicit.registered.configuration["maximum_physical_attempts"] == 12_345
+    before = GroundedRuntimeDefinition.model_validate(job.configuration)
+    after = GroundedRuntimeDefinition.model_validate(explicit.registered.configuration)
+    assert before.probe_sha256 == after.probe_sha256
+    assert sha256_json(before.model_dump(mode="json", exclude={"maximum_physical_attempts"})) == (
+        sha256_json(after.model_dump(mode="json", exclude={"maximum_physical_attempts"}))
+    )

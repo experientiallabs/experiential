@@ -270,6 +270,10 @@ class PointQualification(ContractModel):
     defer: bool = True
 
 
+SIMULATOR_ROUTES = 3
+"""Simulator ledger routes one predicted call may spend on: predictor, embedding and recall."""
+
+
 class MiningSettings(ContractModel):
     """The ``error-mining`` stage: one actor-critic run per actor tier.
 
@@ -313,6 +317,12 @@ class MiningSettings(ContractModel):
         retrieval_top_k: Most matches one search returns.
         behaviors: Paired behavioral differences mined before selection, when set.
         qualification: Point qualification bar and deferral queue replacing ``K``, when set.
+        simulator_physical_attempts: The simulator's lifetime call ceiling for every mining
+            rollout of the start (groups, continuations, cross-tier), on a ledger of its own
+            apart from bootstrap validation; None sizes it from the mining shape
+            (:meth:`simulator_ceiling`).
+        workers: Attempts (and continuations) of one study run at once.
+        active_rollouts: Most rollouts running at once across the whole pipeline.
     """
 
     job: ContinuationJob | None = None
@@ -340,16 +350,52 @@ class MiningSettings(ContractModel):
     behaviors: BehaviorDifferenceSpec | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    simulator_physical_attempts: int | None = Field(
+        default=None, ge=1, le=100_000, exclude_if=lambda value: value is None
+    )
+    workers: int = Field(default=3, ge=1, le=32, strict=True)
+    active_rollouts: int = Field(default=12, ge=1, le=128, strict=True)
     qualification: PointQualification | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
     @property
     def registered(self) -> ContinuationJob:
-        """Return the mining job; a bootstrap binding is resolved at the pipeline entry."""
+        """Return the mining job; a bootstrap binding is resolved at the pipeline entry.
+
+        A grounded runtime's simulator ceiling is replaced by :meth:`simulator_ceiling`. The
+        ceiling is not part of the world's frozen semantics, so the captured start restores
+        unchanged, but it is part of the runtime's identity, so mining draws on its own finite
+        ledger instead of the one bootstrap validation already spent from.
+        """
         if self.job is None:
             raise ValueError("the bootstrap binding is unresolved; run through the pipeline entry")
-        return self.job
+        configuration = self.job.configuration
+        if "maximum_physical_attempts" not in configuration:
+            return self.job
+        return self.job.model_copy(
+            update={
+                "configuration": {
+                    **configuration,
+                    "maximum_physical_attempts": self.simulator_ceiling(self.job),
+                }
+            }
+        )
+
+    def simulator_ceiling(self, job: ContinuationJob) -> int:
+        """The mining simulator ceiling: explicit, or room for every planned rollout.
+
+        Every tier runs ``attempts`` group attempts and continues up to ``points`` points with
+        ``continuations`` suffixes each, every rollout reaching the call horizon, each call
+        predicted with its re-asks on every ledger route. Bounded by the runtime's 100,000.
+        """
+        if self.simulator_physical_attempts is not None:
+            return self.simulator_physical_attempts
+        reasks = job.configuration.get("maximum_reasks", 0)
+        retries = 1 + (reasks if isinstance(reasks, int) else 0)
+        rollouts = len(self.actors) * (self.attempts + self.points * self.continuations)
+        calls = job.maximum_model_calls or 1
+        return min(100_000, rollouts * calls * retries * SIMULATOR_ROUTES)
 
     def continuation_ceiling(self, repeats: int | None = None) -> int:
         """Return one point's continuation attempt ceiling: room for every continuation.
