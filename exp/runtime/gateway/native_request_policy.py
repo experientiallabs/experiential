@@ -111,7 +111,10 @@ def restrict_fallbacks(request: GatewayRequest, route: GatewayRoute) -> GatewayR
             "fallback_deployments": (),
         }
     )
-    return no_fallback_narrowing(restricted, removed=len(route.deployments) > 1)
+    first_dial = sum(
+        item.gateway.capabilities.failover_only_on is None for item in route.deployments
+    )
+    return no_fallback_narrowing(restricted, removed=first_dial > 1)
 
 
 def no_fallback_narrowing(route: GatewayRoute, *, removed: bool) -> GatewayRoute:

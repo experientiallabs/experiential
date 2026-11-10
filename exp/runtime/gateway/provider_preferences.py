@@ -204,6 +204,13 @@ def apply_provider_preferences(
         )
     kept = list(range(len(route.deployments)))
     narrowing: list[str] = []  # The controls that each exclude a rung.
+    # No-fallback controls are judged on rungs a first dial may claim: excluding a
+    # failover-only rung is no remedy for a refused first dial.
+    first_dial = [
+        i
+        for i, deployment in enumerate(route.deployments)
+        if deployment.gateway.capabilities.failover_only_on is None
+    ]
     if only is not None:
         allowed = frozenset().union(*(_names(name) for name in only)) if only else frozenset()
         _record(narrowing, "provider.only", excludes=any(item not in allowed for item in labels))
@@ -221,14 +228,15 @@ def apply_provider_preferences(
         if not any(labels[i] in wanted for i in kept):
             raise _unsatisfiable("order", order, available)
         if not allow_fallbacks:
-            _record(narrowing, _NO_FALLBACKS, excludes=any(item not in wanted for item in labels))
+            excludes = any(labels[i] not in wanted for i in first_dial)
+            _record(narrowing, _NO_FALLBACKS, excludes=excludes)
             kept = [i for i in kept if labels[i] in wanted]
     elif not allow_fallbacks:
         lead = next(
             (i for i in kept if route.deployments[i].gateway.capabilities.failover_only_on is None),
             kept[0],
         )
-        _record(narrowing, _NO_FALLBACKS, excludes=len(labels) > 1)
+        _record(narrowing, _NO_FALLBACKS, excludes=len(first_dial) > 1)
         kept = [lead]
     narrowed = select_route_deployments(route, tuple(kept))
     if narrowing:

@@ -229,3 +229,29 @@ def test_order_keeps_a_selected_route_lead_first() -> None:
     ordered = apply_provider_preferences(route, _request({"order": ["anthropic"]}))
     assert _providers(ordered) == ["experiential_cloud", "anthropic", "bedrock"]
     assert ordered.resolved_route_id == route.resolved_route_id
+
+
+def test_no_fallback_is_not_recorded_for_failover_only_siblings() -> None:
+    """Excluding only failover-only rungs is no remedy for a refused first dial."""
+    route = _route("openai", "bedrock")
+    sibling = route.fallback_deployments[0]
+    conditional = sibling.model_copy(
+        update={
+            "gateway": sibling.gateway.model_copy(
+                update={
+                    "capabilities": sibling.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("provider_internal",)}
+                    )
+                }
+            )
+        }
+    )
+    route = route.model_copy(update={"fallback_deployments": (conditional,)})
+    cases: tuple[JsonObject, ...] = (
+        {"allow_fallbacks": False},
+        {"order": ["openai"], "allow_fallbacks": False},
+    )
+    for preferences in cases:
+        narrowed = apply_provider_preferences(route, _request(preferences))
+        assert _providers(narrowed) == ["openai"]
+        assert narrowed.caller_narrowing == ()

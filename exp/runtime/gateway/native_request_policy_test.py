@@ -652,3 +652,27 @@ def test_a_reasoning_repair_redial_keeps_the_generic_throttled_wording() -> None
         health, (_LEAD, _SIBLING), (0,), route, first=False, repair=True
     )
     assert "exact-model deployments" in _message(failure)
+
+
+def test_restrict_fallbacks_ignores_failover_only_siblings() -> None:
+    """Dropping only failover-only rungs does not name the gateway no-fallback control."""
+    route = _provider_route("openai", "bedrock")
+    sibling = route.fallback_deployments[0]
+    conditional = sibling.model_copy(
+        update={
+            "gateway": sibling.gateway.model_copy(
+                update={
+                    "capabilities": sibling.gateway.capabilities.model_copy(
+                        update={"failover_only_on": ("provider_internal",)}
+                    )
+                }
+            )
+        }
+    )
+    route = route.model_copy(update={"fallback_deployments": (conditional,)})
+    request = _preferences_request(None).model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
+        }
+    )
+    assert restrict_fallbacks(request, route).caller_narrowing == ()
