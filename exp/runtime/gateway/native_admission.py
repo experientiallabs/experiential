@@ -26,6 +26,7 @@ from exp.runtime.gateway.affinity import (
     rendezvous_order,
 )
 from exp.runtime.gateway.capability_rungs import (
+    first_dial_profiles,
     generation_parameter_indexes,
     live_issuer_index,
     narrow_to_capable_rungs,
@@ -324,7 +325,7 @@ def prepare_route_requests(
         # minimal disclosed coercion when semantics allow, otherwise
         # keep the named rejection.
         coercion = coerce_generation_parameters(
-            tuple(profile for profile, _client in resolved_wires),
+            first_dial_profiles(route, resolved_wires),
             admitted_request,
             admits=candidate_serves,
         )
@@ -341,7 +342,7 @@ def prepare_route_requests(
             # refuses it name the caller's remedy. Nothing is recorded for a
             # request that never serves.
             coercion = coerce_generation_parameters(
-                tuple(profile for profile, _client in resolved_wires),
+                first_dial_profiles(route, resolved_wires),
                 admitted_request,
             )
         if coercion is None:
@@ -679,44 +680,40 @@ def _candidate_serves(
         candidate_indexes = generation_parameter_indexes(route, resolved_wires, candidate)
         candidate_route = select_route_deployments(route, candidate_indexes)
         candidate_wires = tuple(resolved_wires[index] for index in candidate_indexes)
-        candidate_public, candidate_provider = route_generation_parameter_requests(
-            tuple(profile for profile, _client in candidate_wires),
-            candidate,
-        )
+        profiles = tuple(profile for profile, _client in candidate_wires)
+        candidate_public, provider = route_generation_parameter_requests(profiles, candidate)
     except (ProviderParameterError, ProviderCapabilityError):
         return False
-    candidate_provider = candidate_provider.model_copy(
-        update={"stream": True, "include_usage": True}
+    stream = candidate_public.stream
+    provider = provider.model_copy(update={"stream": True, "include_usage": True})
+    indexes, errors = protocol_compatible_indexes(
+        candidate_route, candidate_wires, provider, public_stream=stream
     )
+    if not indexes:
+        coercion = coerce_route_rejections(errors, len(candidate_route.deployments), candidate)
+        if coercion is not None:
+            try:
+                _public, provider = route_generation_parameter_requests(profiles, coercion.request)
+            except (ProviderParameterError, ProviderCapabilityError):
+                return False
+            provider = provider.model_copy(update={"stream": True, "include_usage": True})
+            indexes, errors = protocol_compatible_indexes(
+                candidate_route, candidate_wires, provider, public_stream=stream
+            )
+    # Admission refuses a request only failover-only rungs serve, after its
+    # parallel_tool_calls last resort.
+    if indexes and not dialable_rejections(candidate_route, indexes, errors):
+        return True
+    if provider.parallel_tool_calls is None:
+        return False
     indexes, errors = protocol_compatible_indexes(
         candidate_route,
         candidate_wires,
-        candidate_provider,
-        public_stream=candidate_public.stream,
+        provider,
+        public_stream=stream,
+        emulate_parallel_tool_calls=True,
     )
-    if indexes:
-        # Admission refuses a request only failover-only rungs serve.
-        return not dialable_rejections(candidate_route, indexes, errors)
-    capability_coercion = coerce_route_rejections(
-        errors, len(candidate_route.deployments), candidate
-    )
-    if capability_coercion is None:
-        return False
-    try:
-        _coerced_public, coerced_provider = route_generation_parameter_requests(
-            tuple(profile for profile, _client in candidate_wires),
-            capability_coercion.request,
-        )
-    except (ProviderParameterError, ProviderCapabilityError):
-        return False
-    coerced_provider = coerced_provider.model_copy(update={"stream": True, "include_usage": True})
-    coerced_indexes, _coerced_errors = protocol_compatible_indexes(
-        candidate_route,
-        candidate_wires,
-        coerced_provider,
-        public_stream=candidate_public.stream,
-    )
-    return bool(coerced_indexes)
+    return bool(indexes) and not dialable_rejections(candidate_route, indexes, errors)
 
 
 def protocol_compatible_indexes(

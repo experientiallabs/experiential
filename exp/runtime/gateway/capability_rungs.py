@@ -239,6 +239,26 @@ def live_issuer_index(route: GatewayRoute) -> int | None:
     return ids.index(pinned) if pinned in ids else None
 
 
+def first_dial_profiles(
+    route: GatewayRoute, resolved_wires: _ResolvedWires
+) -> tuple[GatewayWireProfile, ...]:
+    """Return the wire profiles of the rungs that may take the first dial.
+
+    A disclosed generation coercion is searched over these alone: a
+    ``failover_only_on`` rung that would accept the caller's value verbatim
+    never vetoes the repair an unrestricted rung needs. A route with no
+    unrestricted rung returns every profile (``require_unrestricted_rung``
+    names that case).
+    """
+    profiles = tuple(profile for profile, _client in resolved_wires)
+    dialable = tuple(
+        profile
+        for profile, deployment in zip(profiles, route.deployments, strict=True)
+        if rung_rules(deployment) is None
+    )
+    return dialable or profiles
+
+
 def generation_parameter_indexes(
     route: GatewayRoute, resolved_wires: _ResolvedWires, request: GatewayRequest
 ) -> tuple[int, ...]:

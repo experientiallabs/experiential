@@ -24,7 +24,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-from exp.runtime.gateway.native_admission import admitted_route_requests
+from exp.runtime.gateway.native_admission import _candidate_serves, admitted_route_requests
 from exp.runtime.gateway.native_bridge_errors import public_capability_error
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder
 from exp.runtime.gateway.routing import (
@@ -1030,3 +1030,56 @@ def test_no_dialable_rung_for_the_generation_parameters_raises_its_own_rejection
     ).request
     with pytest.raises(ProviderParameterError):
         generation_parameter_indexes(route, wires, request)
+
+
+def test_a_failover_only_rung_never_vetoes_the_effort_snap_the_first_dial_needs() -> None:
+    """Only the failover-only rung offers ``xhigh``: the disclosed effort snap is searched
+    over the rungs that may take the first dial, so the unrestricted rung serves at its
+    nearest effort instead of the request being refused."""
+    base, _wires = _astra_route(("openai", "novita"))
+    route = _route((base.deployments[0], _failover_only(base.deployments[1])))
+    lead, _client = _astra_profile("https://openai.test", sampling=False)
+    failover, _client = _astra_profile("https://novita.test", sampling=False)
+    wires = (
+        (replace(lead, supported_reasoning_efforts=("low", "medium", "high")), _CLIENT),
+        (failover, _CLIENT),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "go on"}],
+            "stream": True,
+            "reasoning_effort": "xhigh",
+        }
+    ).request
+    narrowed, public, provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed)[0] == "openai"
+    assert eligible_ladder(narrowed, None)[0] == 0
+    assert provider.reasoning_effort == "high"
+    assert any(item.startswith("reasoning_effort->") for item in public.ignored_parameters)
+
+
+def test_the_coercion_probe_counts_the_parallel_tool_calls_last_resort() -> None:
+    """Only a failover-only rung honors ``parallel_tool_calls`` natively; admission then
+    emulates the control on the unrestricted rung, and the coercion probe agrees that the
+    candidate serves instead of skipping it for a weaker repair."""
+    lead = _astra_rung("openai", tools=True)
+    capabilities = lead.gateway.capabilities.model_copy(
+        update={"supports_parallel_tool_calls": False}
+    )
+    lead = lead.model_copy(
+        update={"gateway": lead.gateway.model_copy(update={"capabilities": capabilities})}
+    )
+    second = _failover_only(_astra_rung("openai", tools=True)).model_copy(
+        update={"deployment_id": "openai-two"}
+    )
+    route = _route((lead, second))
+    wires = (
+        _astra_profile("https://openai.test", sampling=True),
+        _astra_profile("https://openai-two.test", sampling=True),
+    )
+    request = _copilot_chat().model_copy(update={"parallel_tool_calls": False})
+    assert _candidate_serves(route, wires, request)
+    narrowed, _public, _provider, _recorded = _admit(route, wires, request)
+    assert eligible_ladder(narrowed, None)[0] == 0
+    assert _ids(narrowed)[0] == "openai"
