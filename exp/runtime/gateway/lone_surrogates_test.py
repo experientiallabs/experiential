@@ -783,3 +783,40 @@ def test_an_apply_patch_path_is_refused() -> None:
     with pytest.raises(LoneSurrogateRefusal) as refused:
         _replace(payload)
     assert refused.value.param == "input.0.operation.path"
+
+
+@pytest.mark.parametrize(
+    ("item", "param"),
+    [
+        (
+            {"type": "local_shell_call", "action": {"working_directory": "/w\ud83d"}},
+            "input.0.action.working_directory",
+        ),
+        ({"type": "image_generation_call", "result": "aGk\ud83d"}, "input.0.result"),
+        ({"type": "agent_message", "author": "a\ud83d"}, "input.0.author"),
+        ({"type": "agent_message", "recipient": "r\ud83d"}, "input.0.recipient"),
+        ({"type": "agent_message", "agent": {"agent_name": "n\ud83d"}}, "input.0.agent.agent_name"),
+    ],
+)
+def test_replayed_item_paths_payloads_and_agents_are_refused(item: JsonObject, param: str) -> None:
+    """Shell directories, image results and agent identities in replayed items stay verbatim."""
+    with pytest.raises(LoneSurrogateRefusal) as refused:
+        _replace({"input": [item]})
+    assert refused.value.param == param
+
+
+def test_shell_output_json_is_repaired_at_the_inner_layer() -> None:
+    """A local shell output is JSON text: its lone escape is repaired, its keys judged."""
+    output = '{"stdout": "x\\ud83d", "code": 0}'
+    payload: JsonObject = {"input": [{"type": "local_shell_call_output", "output": output}]}
+    assert _replace(payload) == ("input.output->replaced(lone_surrogate)",)
+    repaired = cast(list[JsonObject], payload["input"])[0]["output"]
+    assert repaired == output.replace("\\ud83d", "\\ufffd")
+    with pytest.raises(LoneSurrogateRefusal):
+        _replace({"input": [{"type": "local_shell_call_output", "output": '{"k\\ud83d": 1}'}]})
+
+
+def test_an_output_field_elsewhere_is_plain_content() -> None:
+    """Only a local shell output is JSON text; other outputs keep literal escape text."""
+    payload: JsonObject = {"input": [{"type": "function_call_output", "output": "\\ud83d"}]}
+    assert _replace(payload) == ()

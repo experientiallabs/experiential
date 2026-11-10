@@ -233,12 +233,15 @@ the order the model produced.
   `context_management`, `diagnostics`, `safeguards`, `output_config`, `citations`) or the
   top-level `provider` routing preferences, and opaque provider tokens (`signature`,
   `thought_signature`, `encrypted_content`, `data`), as is an object key holding one
-  (including a key inside tool-call `arguments` the decoder reads as an object, also when the
+  (including a key inside tool-call `arguments`, or a local shell call output's JSON `output`,
+  the decoder reads as an object, also when the
   arguments are double-encoded or cut off mid-object; arguments sent as an object are the
   caller's own content).
   After 64 distinct field paths, further repairs are disclosed by their top-level field, and
   after 128 disclosures (or for a name over 256 characters) as `body`. The same refusal covers an MCP
-  `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, an apply-patch `operation.path`, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
+  `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, an apply-patch `operation.path`, a local shell
+  `working_directory`, an image generation `result`, an agent message's `author`, `recipient`
+  and `agent_name`, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
   `stop_sequences` controls, and any string inside a web-search `user_location`, a file-search `filters` object, MCP
   `headers` or a `network_policy`'s `domain_secrets`.
   Embeddings, images and audio have no disclosure channel, so a lone surrogate there is the

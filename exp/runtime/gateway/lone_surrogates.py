@@ -67,6 +67,8 @@ IDENTIFIER_FIELDS = frozenset(
         "file_ids",
         "tunnel_id",
         "connector_id",
+        "working_directory",
+        "agent_name",
         "container",
         "fingerprint",
         "authorization",
@@ -129,6 +131,18 @@ MAX_ARGUMENTS_CHARS = 4_000_000
 
 NESTED_JSON_FIELDS = frozenset({"arguments"})
 """String fields whose value is itself JSON text the decoders parse again."""
+
+ITEM_JSON_FIELDS = frozenset({("local_shell_call_output", "output")})
+"""(item type, field) pairs whose string is JSON text, repaired like ``arguments``."""
+
+ITEM_IDENTIFIER_FIELDS = frozenset(
+    {
+        ("image_generation_call", "result"),
+        ("agent_message", "author"),
+        ("agent_message", "recipient"),
+    }
+)
+"""(item type, field) pairs that name something or carry an opaque payload in that item."""
 
 OPEN_OBJECT_FIELDS = frozenset(
     {
@@ -297,7 +311,7 @@ def replace_lone_surrogates(
         if not isinstance(member.value, str):
             continue
         lone = has_lone_surrogate(member.value)
-        argument_text = member.key in NESTED_JSON_FIELDS
+        argument_text = member.key in NESTED_JSON_FIELDS or member.item_field in ITEM_JSON_FIELDS
         escaped_text = argument_text and may_hold_lone_surrogate(member.value)
         if not lone and not escaped_text:
             continue
@@ -426,6 +440,14 @@ class _Member:
         if isinstance(self.key, str):
             return self.key
         return "" if self.position is None else self.position.named
+
+    @property
+    def item_field(self) -> tuple[str, str] | None:
+        """``(type, key)`` when the member sits directly in an object with a string ``type``."""
+        if not isinstance(self.container, dict) or not isinstance(self.key, str):
+            return None
+        kind = self.container.get("type")
+        return (kind, self.key) if isinstance(kind, str) else None
 
     @property
     def depth(self) -> int:
@@ -738,6 +760,8 @@ def _names_something(member: _Member, *, caller_keyed: bool) -> bool:
     position = member.position
     if member.key == "path" and position is not None and position.key == "operation":
         # An apply-patch operation names the file it changes.
+        return True
+    if member.item_field in ITEM_IDENTIFIER_FIELDS:
         return True
     if member.named not in IDENTIFIER_FIELDS:
         return False
