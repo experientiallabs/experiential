@@ -588,6 +588,8 @@ def _grade_goal(verifier: TaskVerifier, value: JsonObject) -> Assessment:
         try:
             resolve(value, pointer)
         except ValueError:
+            if pointer in verifier.required_paths and _observed_absence(value, pointer):
+                return Assessment(status="fail", reason=f"required state absent at {pointer}")
             return Assessment(status="unassessable", reason=f"missing observation {pointer}")
     schema = expand_local_references(verifier.outcome_schema)
     error = next(_StrictTypes(schema).iter_errors(value), None)
@@ -667,6 +669,13 @@ def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) 
             if value.get("initial_state") is None:
                 raise ValueError("missing initial state")
         except ValueError:
+            if _absent_from_observed(value.get("initial_state"), pointer):
+                # Nothing was there to protect: preserving it means it stays absent.
+                for state in states:
+                    if isinstance(state, dict) and _resolves(state, pointer):
+                        violations.append(f"protected state created: {pointer}")
+                        break
+                continue
             missing.append(f"initial state comparison unavailable: {pointer}")
             continue
         for state in states:
@@ -927,3 +936,44 @@ def load_evaluation_task(store: ArtifactStore, reference: ArtifactInput) -> Eval
     if task.parent is not None:
         _protect_parent(load_evaluation_task(store, task.parent), task)
     return task
+
+
+def _resolves(value: JsonValue, pointer: str) -> bool:
+    """Whether a pointer names a value."""
+    try:
+        resolve(value, pointer)
+    except ValueError:
+        return False
+    return True
+
+
+def _absent_from_observed(state: JsonValue, pointer: str) -> bool:
+    """Whether an observed state shows the pointer's value absent rather than unobserved.
+
+    The state is an observed projection keyed by probe; a pointer whose probe key the state
+    holds but whose rest names nothing there is an observed absence. A pointer under a probe
+    the projection does not hold, or into an unobserved state, stays unobserved.
+    """
+    if not isinstance(state, dict) or not pointer.startswith("/"):
+        return False
+    probe = pointer[1:].split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+    if probe in state:
+        return not _resolves(state, pointer)
+    return False
+
+
+def _observed_absence(value: JsonObject, pointer: str) -> bool:
+    """Whether a missing ``/final_state`` pointer is an observed absence in a complete workflow.
+
+    The final state was observed and its probe existed at the start, so the value's absence is
+    what the workflow left, a known goal failure, not a missing observation.
+    """
+    prefix = "/final_state/"
+    if not pointer.startswith(prefix) or not isinstance(value.get("final_state"), dict):
+        return False
+    rest = "/" + pointer[len(prefix) :]
+    probe = rest[1:].split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+    initial, final = value.get("initial_state"), value.get("final_state")
+    if not isinstance(initial, dict) or not isinstance(final, dict) or probe not in initial:
+        return False
+    return probe not in final or _absent_from_observed(final, rest)

@@ -80,6 +80,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
+from exp.optimize.evaluation.variance.verifier_paths import project_verifier, unplaced
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
     ProviderRetryableResponseError,
@@ -269,6 +270,13 @@ class StartMaterial:
                 'tool\'s arguments, e.g. {"type": "object", "properties": {"command": '
                 '{"type": "string"}}}; no \'pattern\'. Put the verifier\'s own fields '
                 "(description, outcome_schema) beside it, never inside it"
+            ),
+            "verifier coordinates": (
+                "the verifier is graded over the evaluator projection: /initial_state and "
+                "/final_state hold each probe_paths value keyed by its probe name, so required and "
+                "rule paths are /final_state/<probe>/... and preserved paths are /<probe>/...; add "
+                "a probe for every part of the state the verifier reads, for example the files map "
+                "to see a file the agent creates"
             ),
             "verifier JSON Schemas": (
                 "outcome_schema and every argument schema are JSON Schema objects: each value "
@@ -484,6 +492,16 @@ def normalise_draft(
     if canonical != answer:
         notes.append("pointers: rewrote slash-split pointers to their escaped form")
     answer = canonical
+    state, probes = answer.get("initial_state"), answer.get("probe_paths")
+    verifier = answer.get("verifier")
+    if isinstance(verifier, dict) and isinstance(probes, dict) and isinstance(state, dict):
+        authored = set(probes)
+        probes = {str(name): str(pointer) for name, pointer in probes.items()}
+        verifier, moved = project_verifier(verifier, state, probes, add=True)
+        added = sorted(set(probes) - authored)
+        notes.extend(moved)
+        notes.extend(f"probe_paths: added {name!r} for the verifier" for name in added)
+        answer = {**answer, "verifier": verifier, "probe_paths": probes}
     replay = answer.get("replay_trace")
     if isinstance(replay, str) and replay not in material.sources:
         # The inventory names a whole trace by its locator; replay_trace takes the bare identity.
@@ -548,6 +566,13 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
                 f"pointer {pointer!r} does not resolve in initial_state; "
                 f"{pointer_hint(draft.initial_state, pointer)}"
             ) from None
+    if outside := unplaced(draft.verifier.model_dump(mode="json"), draft.probe_paths):
+        raise ValueError(
+            f"verifier pointers {outside[:6]} name nothing the grade observes: the verifier is "
+            "graded over the probe projection, so write /final_state/<probe>/... (required and "
+            f"rule paths) or /<probe>/... (preserved paths) with a probe of "
+            f"{sorted(draft.probe_paths)}"
+        )
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")
@@ -1540,6 +1565,7 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
     tools = sorted({tool.name for tool in material.task.task.tools})
     domains = sorted(material.knowledge.state_domains)
     properties = body["properties"]
+    assert isinstance(properties, dict)
 
     def exact(array: JsonValue, names: list[str]) -> None:
         if not isinstance(array, dict) or not names:
@@ -1551,7 +1577,10 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
 
     # The host fills the tool schemas from the task; the author never writes them.
     properties.pop("tools", None)
-    body["required"] = [name for name in body.get("required", []) if name != "tools"]
+    required = body.get("required", [])
+    body["required"] = (
+        [name for name in required if name != "tools"] if isinstance(required, list) else []
+    )
     manifest = properties["manifest"]["properties"]
     exact(manifest["tools"], tools)
     exact(manifest["domains"], domains)

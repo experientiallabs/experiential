@@ -883,3 +883,31 @@ def test_argument_schema_draft_compiles_and_legacy_serialization_stays_identical
     compiled = draft.compile()
     assert compiled.argument_schemas == draft.argument_schemas
     assert TaskVerifier.model_validate_json(compiled.model_dump_json()) == compiled
+
+
+def test_an_observed_absence_is_known_and_an_unprotected_path_must_stay_absent() -> None:
+    """A required probe gone from the observed final state fails; a preserved path that did
+    not exist is kept by staying absent, so its creation is a violation, not an unknown."""
+    from exp.simulation.evaluation.tasks import TaskVerifier, grade
+
+    outcome: JsonObject = {
+        "initial_state": {"file": "x"},
+        "final_state": {},
+        "final_answer": "done",
+        "steps": [{"status": "valid", "action": {"name": "bash"}, "after": {}}],
+        "stop_reason": "completed",
+    }
+    verifier = TaskVerifier.model_validate(
+        {"description": "d", "outcome_schema": {}, "required_paths": ["/final_state/file"]}
+    )
+    assert grade(verifier, outcome).goal.status == "fail"
+    unknown = TaskVerifier.model_validate(
+        {"description": "d", "outcome_schema": {}, "required_paths": ["/final_state/other"]}
+    )
+    assert grade(unknown, outcome).goal.status == "unassessable"
+    created: JsonObject = {**outcome, "final_state": {"file": "x", "new": 1}}
+    created["steps"] = [{"status": "valid", "action": {"name": "bash"}, "after": {"file": "x"}}]
+    kept = TaskVerifier.model_validate(
+        {"description": "d", "outcome_schema": {}, "preserved_paths": ["/file/missing"]}
+    )
+    assert grade(kept, created).policy.status == "pass"
