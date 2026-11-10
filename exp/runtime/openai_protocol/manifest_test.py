@@ -76,7 +76,8 @@ def test_manifests_classify_explicit_exclusions() -> None:
         assert chat[spelling] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["service_tier"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["service_tier"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert responses["background"] == CompatibilityDisposition.UNSUPPORTED
+    # Accepted only at false (n8n sends it on every call); true is refused by name.
+    assert responses["background"] == CompatibilityDisposition.SUPPORTED
     assert responses["conversation"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["include"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["store"] == CompatibilityDisposition.SUPPORTED

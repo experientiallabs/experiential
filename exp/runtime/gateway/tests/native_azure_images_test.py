@@ -50,7 +50,7 @@ pytest.importorskip("exp_gateway_native")
 _PIXEL = base64.b64encode(b"\x89PNG\r\n\x1a\nazure-pixels").decode()
 _MAI_RATE = 40_000_000  # ~$0.04 per MAI-Image-2.6 image.
 _FLUX_RATE = 30_000_000
-_ALIASES = ["azure-gpt-image", "coding", "flux2", "mai", "mai-uncarded"]
+_ALIASES = ["azure-gpt-image", "azure-renamed-image", "coding", "flux2", "mai", "mai-uncarded"]
 
 
 class _AzureUpstream(BaseHTTPRequestHandler):
@@ -164,6 +164,17 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         manager,
         alias="azure-gpt-image",
         provider_model="gpt-image-deploy",
+        exact_model_id="gpt-image-1.5",
+        prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=5_000_000,
+            output_nano_usd_per_million_tokens=40_000_000,
+        ),
+    )
+    _add_alias(
+        root,
+        manager,
+        alias="azure-renamed-image",
+        provider_model="prod-images",
         exact_model_id="gpt-image-1.5",
         prices=GatewayTokenPrices(
             input_nano_usd_per_million_tokens=5_000_000,
@@ -365,4 +376,30 @@ def test_a_usage_free_wire_without_a_per_image_card_is_refused(engine: _ServingE
     response = _post(engine, {"model": "mai-uncarded", "prompt": "a red fox"})
     assert response.status_code == 400, response.text
     assert "per-image price" in response.json()["error"]["message"]
+    assert _upstream_count() == before
+
+
+def test_a_gpt_image_deployment_under_any_name_never_receives_response_format(
+    engine: _ServingEngine,
+) -> None:
+    """The lane's exact model id, not the free deployment name, marks a GPT image model."""
+    response = _post(
+        engine,
+        {"model": "azure-renamed-image", "prompt": "a red fox", "response_format": "b64_json"},
+    )
+    assert response.status_code == 200, response.text
+    _path, _headers, payload = _last_upstream()
+    assert payload == {"model": "prod-images", "prompt": "a red fox", "n": 1}
+
+
+def test_a_url_request_to_a_renamed_gpt_image_deployment_is_refused_before_dispatch(
+    engine: _ServingEngine,
+) -> None:
+    """No rung of the alias can answer ``url``: a named 400 and no upstream call."""
+    before = _upstream_count()
+    response = _post(
+        engine, {"model": "azure-renamed-image", "prompt": "a red fox", "response_format": "url"}
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["param"] == "response_format"
     assert _upstream_count() == before

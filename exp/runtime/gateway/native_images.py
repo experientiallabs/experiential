@@ -35,6 +35,7 @@ from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.catalog_prices import BilledUnitKind, GatewayTokenPrices
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -87,7 +88,10 @@ from exp.runtime.models.providers.bedrock_stability import (
     stability_body,
     stability_model,
 )
-from exp.runtime.models.providers.openai_compatible import openai_images_request
+from exp.runtime.models.providers.openai_compatible import (
+    openai_images_request,
+    returns_base64_images_only,
+)
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.xai import is_xai_images_url
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -154,6 +158,20 @@ def unpriced_variant_error(variant: str) -> OpenAIProtocolError:
     )
 
 
+def base64_only_error(alias: str) -> OpenAIProtocolError:
+    """Build the public 400 for a ``url`` request no rung of the alias can answer."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_value",
+        message=(
+            f"The model {alias!r} returns base64 images only, so response_format 'url' "
+            "is not supported. Remove response_format (or send 'b64_json') and read each "
+            "image from data[].b64_json."
+        ),
+        param="response_format",
+    )
+
+
 def unsupported_request_error(param: str, message: str) -> OpenAIProtocolError:
     """Build the public 400 for a request no image rung can serve faithfully."""
     return OpenAIProtocolError(
@@ -173,6 +191,15 @@ def unbillable_wire_error() -> OpenAIProtocolError:
         ),
         param="model",
     )
+
+
+def _azure_model_id(deployment: ExactModelDeployment) -> str | None:
+    """The catalog model id that classifies an Azure image rung, else None.
+
+    Only Azure serves under a freely chosen deployment name; every other
+    provider's wire id is the model id itself.
+    """
+    return deployment.exact_model_id if deployment.provider == "azure" else None
 
 
 def _azure_usage_free_wire(exact_model_id: str, deployment: str) -> bool:
@@ -214,12 +241,16 @@ class _RungWire:
     stability: bool
 
 
-def _rung_wire(profile: GatewayWireProfile, request: ImagesRequest) -> _RungWire:
+def _rung_wire(
+    profile: GatewayWireProfile, request: ImagesRequest, exact_model_id: str | None
+) -> _RungWire:
     """Build one rung's provider body for the request.
 
     Args:
         profile: The rung's resolved wire profile (``images_url`` present).
         request: The canonical image request.
+        exact_model_id: On Azure, the lane's catalog model id (the deployment
+            name in ``profile.model_id`` need not spell the model); otherwise None.
 
     Returns:
         The rung's body and wire shape.
@@ -236,7 +267,10 @@ def _rung_wire(profile: GatewayWireProfile, request: ImagesRequest) -> _RungWire
         images_url = profile.images_url or ""
         return _RungWire(
             payload=openai_images_request(
-                profile.model_id, request, inline_images=is_xai_images_url(images_url)
+                profile.model_id,
+                request,
+                inline_images=is_xai_images_url(images_url),
+                exact_model_id=exact_model_id,
             ),
             stability=False,
         )
@@ -420,6 +454,7 @@ def _admit_accepted(
     serving: list[int] = []
     rung_wires: dict[int, tuple[GatewayWireProfile, NativeWireClient | None, _RungWire]] = {}
     unpriced = False
+    base64_only = False
     unbillable = False
     unsupported: AzureImagesUnsupportedError | None = None
     refused: StabilityParameterError | None = None
@@ -431,8 +466,18 @@ def _admit_accepted(
         supports = None if capabilities is None else capabilities.supports_image_generation
         if not _images_rung(profile.images_url, supports):
             continue
+        if (
+            request.edit is None
+            and request.response_format == "url"
+            and returns_base64_images_only(profile.model_id, _azure_model_id(deployment))
+        ):
+            # A GPT image model answers base64 only and the gateway hosts no
+            # images to link to, so the rung cannot honor ``url`` (fail-closed).
+            # An edit is left to ``_rung_wire``: no OpenAI-wire rung edits.
+            base64_only = True
+            continue
         try:
-            wire = _rung_wire(profile, request)
+            wire = _rung_wire(profile, request, _azure_model_id(deployment))
         except StabilityParameterError as exc:
             # The first refusal names the parameter if no other rung serves.
             refused = refused or exc
@@ -470,6 +515,8 @@ def _admit_accepted(
         rung_wires[index] = (profile, client, wire)
     if not serving:
         _finish_unsupported(plane, authorization)
+        if base64_only:
+            raise NativeBridgeError(base64_only_error(authorization.alias))
         if unsupported is not None:
             raise NativeBridgeError(
                 unsupported_request_error(unsupported.param, unsupported.message)

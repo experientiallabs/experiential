@@ -134,6 +134,10 @@ the order the model produced.
   `include_obfuscation: true` is disclosed as
   `stream_options.include_obfuscation->ignored(not_emitted)`. A null value asks for nothing.
   Any other key, or a non-null non-boolean value, is a named 400.
+- Responses `background: false` (or `null`) is accepted and removed without
+  disclosure: every response is already served in the foreground, and n8n's OpenAI
+  node sends `background: false` on every call. `background: true` (a stored,
+  pollable background job) is refused with `unsupported_parameter` on `background`.
 - Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
   as Chat `response_format: {"type": "json_object"}`.
 - A key the gateway does not define on a conversation object is dropped before dispatch
