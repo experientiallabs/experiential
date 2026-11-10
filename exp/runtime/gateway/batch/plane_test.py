@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 from typing import NoReturn
+
+import pytest
 
 from exp.runtime.gateway.batch.engine import BatchEngine
 from exp.runtime.gateway.batch.engine_test import (
@@ -192,3 +196,67 @@ def test_unknown_ids_map_to_404() -> None:
     for method, key in (("batch_retrieve", "batch_id"), ("file_retrieve", "file_id")):
         status, body = _call(plane, method, **{key: "missing"})
         assert status == 404 and body["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    ("method", "engine_call"),
+    [
+        ("file_create", "upload_file"),
+        ("file_retrieve", "file_metadata"),
+        ("file_content", "file_content"),
+        ("batch_create", "submit"),
+        ("batch_retrieve", "retrieve"),
+        ("batch_list", "list_jobs"),
+        ("batch_cancel", "cancel"),
+    ],
+)
+def test_an_unclassified_fault_is_logged_and_answered_as_a_500_envelope(
+    method: str,
+    engine_call: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-BatchSubmitError is one error line plus the 500 envelope, never a raise.
+
+    The line names the type and raising frame, never the message.
+    """
+    plane = _plane()
+    secret = "caller-content-canary"
+
+    def fault(*_: object, **__: object) -> NoReturn:
+        """Stand in for an engine call that fails outside the batch contract."""
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(plane._engine, engine_call, fault)  # noqa: SLF001
+    payload = {"purpose": "batch", "content_b64": base64.b64encode(b"{}").decode()}
+    with caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.batch.plane"):
+        status, body = _call(plane, method, **payload)
+    assert status == 500
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["type"] == "api_error"
+    [record] = caplog.records
+    assert record.getMessage().startswith(f"batch {method} answered an unclassified RuntimeError")
+    assert "in fault" in record.getMessage()
+    assert secret not in caplog.text
+    assert secret not in json.dumps(body)
+
+
+def test_a_cancelled_provider_cancel_is_answered_as_a_500_envelope(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A provider cancel ending in CancelledError answers the envelope instead of escaping."""
+    plane = _plane()
+
+    async def cancelled(*_: object, **__: object) -> NoReturn:
+        """Stand in for a provider cancel that ends in cancellation."""
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(plane._engine, "cancel", cancelled)  # noqa: SLF001
+    with caplog.at_level(logging.ERROR, logger="exp.runtime.gateway.batch.plane"):
+        status, body = _call(plane, "batch_cancel", batch_id="batch_1")
+    assert status == 500
+    assert body["error"]["code"] == "internal_error"
+    [record] = caplog.records
+    assert record.getMessage().startswith(
+        "batch batch_cancel answered an unclassified CancelledError"
+    )

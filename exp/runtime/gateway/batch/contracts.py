@@ -356,8 +356,16 @@ def parse_input_jsonl(payload: bytes) -> list[tuple[int, JsonObject]]:
         raise BatchSubmitError(
             f"batch input exceeds {MAXIMUM_INPUT_FILE_BYTES} bytes; split the job"
         )
+    try:
+        # Split in the same expression so the whole decoded string is released
+        # before parsing; only the line strings stay referenced.
+        raw_lines = payload.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise BatchSubmitError(
+            f"batch input is not valid UTF-8 (byte {exc.start}); JSONL must be UTF-8 encoded"
+        ) from exc
     lines: list[tuple[int, JsonObject]] = []
-    for line_number, raw in enumerate(payload.decode("utf-8", errors="strict").splitlines(), 1):
+    for line_number, raw in enumerate(raw_lines, 1):
         text = raw.strip()
         if not text:
             continue
@@ -365,6 +373,17 @@ def parse_input_jsonl(payload: bytes) -> list[tuple[int, JsonObject]]:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
             raise BatchSubmitError(f"line {line_number} is not valid JSON: {exc.msg}") from exc
+        except ValueError as exc:
+            # The decoder refuses an integer literal over the interpreter's
+            # conversion limit (4,300 digits) with a plain ValueError.
+            raise BatchSubmitError(
+                f"line {line_number} carries a JSON number too long to parse; "
+                "send long numbers as strings"
+            ) from exc
+        except RecursionError as exc:
+            raise BatchSubmitError(
+                f"line {line_number} is nested too deeply to parse; flatten the request body"
+            ) from exc
         if not isinstance(parsed, dict):
             raise BatchSubmitError(f"line {line_number} must be a JSON object")
         lines.append((line_number, parsed))

@@ -58,6 +58,20 @@ def test_parse_input_jsonl_rejects_invalid_json() -> None:
         parse_input_jsonl(b"{nope}\n")
 
 
+def test_parse_input_jsonl_refuses_undecodable_input_as_a_submit_error() -> None:
+    """Non-UTF-8 bytes, an over-long integer, and deep nesting are caller 400s.
+
+    Each is reported as a ``BatchSubmitError`` naming the line, so the plane
+    answers the caller's fault rather than an internal error.
+    """
+    with pytest.raises(BatchSubmitError, match="not valid UTF-8"):
+        parse_input_jsonl(b"\xff\xfe{}")
+    with pytest.raises(BatchSubmitError, match="line 2 carries a JSON number too long"):
+        parse_input_jsonl(b'{"a": 1}\n{"n": ' + b"1" * 5_000 + b"}\n")
+    with pytest.raises(BatchSubmitError, match="line 1 is nested too deeply"):
+        parse_input_jsonl(b"[" * 200_000)
+
+
 def test_parse_input_jsonl_rejects_empty_payload() -> None:
     """A payload without any request line is refused."""
     with pytest.raises(BatchSubmitError, match="no request lines"):

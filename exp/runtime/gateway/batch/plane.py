@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import logging
+from pathlib import Path
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.batch.contracts import BatchSubmitError
@@ -21,6 +22,12 @@ from exp.runtime.gateway.interfaces import GatewayControlStore
 from exp.runtime.gateway.sqlite.store import InvalidVirtualKeyError
 
 _LOGGER = logging.getLogger(__name__)
+
+# The text the gateway boundary answers an unclassified failure with.
+_INTERNAL_MESSAGE = (
+    "The gateway request failed. Retry the request; if this persists, "
+    "ask the gateway operator to inspect the server logs."
+)
 
 _ERROR_STATUS: dict[str, int] = {
     "invalid_request_error": 400,
@@ -114,6 +121,30 @@ class BatchControlPlane:
             }
         )
 
+    @classmethod
+    def _unclassified(cls, operation: str, exc: BaseException) -> str:
+        """Log one fault the batch contract cannot classify and answer the lane's 500.
+
+        Every bridge call answers an envelope, so a fault outside the batch
+        contract is logged here rather than escaping as an unlogged bare 500.
+        Only the type and the raising frame are logged: the message and
+        traceback may quote caller content.
+        """
+        raised_at = _raising_frame(exc)
+        _LOGGER.error(
+            "batch %s answered an unclassified %s raised at %s as a 500 internal_error",
+            operation,
+            type(exc).__name__,
+            raised_at,
+            extra={
+                "operation": "batch_plane",
+                "batch_operation": operation,
+                "exception_type": type(exc).__name__,
+                "raised_at": raised_at,
+            },
+        )
+        return cls._error(BatchSubmitError(_INTERNAL_MESSAGE, code="internal_error"))
+
     def file_create(self, argument: str) -> str:
         """Store one uploaded batch input file: {bearer_key, filename, purpose, content_b64}."""
         try:
@@ -135,6 +166,8 @@ class BatchControlPlane:
             return self._envelope(record.public_object())
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("file_create", exc)
 
     def file_retrieve(self, argument: str) -> str:
         """Return one owned file's metadata object: {bearer_key, file_id}."""
@@ -149,6 +182,8 @@ class BatchControlPlane:
             return self._envelope(record.public_object())
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("file_retrieve", exc)
 
     def file_content(self, argument: str) -> str:
         """Return one owned file's content as base64: {bearer_key, file_id}."""
@@ -163,6 +198,8 @@ class BatchControlPlane:
             return self._envelope({"content_b64": base64.b64encode(content).decode("ascii")})
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("file_content", exc)
 
     def batch_create(self, argument: str) -> str:
         """Submit one batch: {bearer_key, input_file_id, endpoint, metadata?}."""
@@ -184,6 +221,8 @@ class BatchControlPlane:
             return self._envelope(job.public_object())
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("batch_create", exc)
 
     def batch_retrieve(self, argument: str) -> str:
         """Return one owned batch object: {bearer_key, batch_id}."""
@@ -198,6 +237,8 @@ class BatchControlPlane:
             return self._envelope(job.public_object())
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("batch_retrieve", exc)
 
     def batch_list(self, argument: str) -> str:
         """Return the caller's batches page: {bearer_key, limit?, after?}."""
@@ -223,6 +264,8 @@ class BatchControlPlane:
             )
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("batch_list", exc)
 
     def batch_cancel(self, argument: str) -> str:
         """Request cancellation of one owned batch: {bearer_key, batch_id}."""
@@ -238,3 +281,21 @@ class BatchControlPlane:
             return self._envelope(job.public_object())
         except BatchSubmitError as error:
             return self._error(error)
+        except Exception as exc:  # noqa: BLE001 - every bridge call answers an envelope
+            return self._unclassified("batch_cancel", exc)
+        except asyncio.CancelledError as exc:
+            # A provider cancel that cancels its own task ends asyncio.run with
+            # CancelledError; this synchronous bridge call has no outer task to
+            # cancel, so it is a fault like any other.
+            return self._unclassified("batch_cancel", exc)
+
+
+def _raising_frame(exception: BaseException) -> str:
+    """Where an exception was raised, as ``module.py:line in function``; never its message."""
+    trace = exception.__traceback__
+    if trace is None:
+        return "unknown"
+    while trace.tb_next is not None:
+        trace = trace.tb_next
+    code = trace.tb_frame.f_code
+    return f"{Path(code.co_filename).name}:{trace.tb_lineno} in {code.co_name}"
