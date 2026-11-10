@@ -417,6 +417,9 @@ def test_an_omitted_effort_is_named_as_the_model_default() -> None:
         require_chat_logprobs((_reasoning_profile(("low",), default="max"),), request)
     assert caught.value.param == "logprobs"
     assert "the model's default reasoning effort 'max'" in str(caught.value)
+    # A level-less on switch (enable_thinking=true) leaves no caller effort;
+    # the advice must not let a kept switch contradict the suggested effort.
+    assert "(with any thinking on/off control set to agree)" in str(caught.value)
 
 
 def test_the_nested_effort_refusal_message_names_the_nested_field() -> None:

@@ -59,7 +59,8 @@ def _effort_refusal(
     )
     return (
         f"Token probabilities are not available with {requested} on this model. "
-        f"Use {field} one of: {choices}, or remove {remove}."
+        f"Use {field} one of: {choices} (with any thinking on/off control set to agree), "
+        f"or remove {remove}."
     )
 
 
