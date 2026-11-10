@@ -167,14 +167,14 @@ async fn run_ladder(
             "raw_key": raw_key,
             "attempt_ordinal": total_attempts,
             "current_depth": current_depth,
-            "failure": last_failure.as_ref().map(|failure| json!({
+            "failure": last_failure.as_ref().map(|failure| failure.with_wire_origin(json!({
                 "failure_class": failure.failure_class.as_str(),
                 "safe_message": failure.safe_message,
                 "retryable_same_deployment": failure.retryable_same_deployment,
                 "failover_eligible": failure.failover_eligible,
                 "rejected_parameter": failure.rejected_parameter,
                 "provider_detail": failure.provider_detail,
-            })),
+            }))),
         }));
         let started_text = match state.bridge.call("start_attempt", argument).await {
             Ok(text) => text,

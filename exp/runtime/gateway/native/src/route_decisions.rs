@@ -266,7 +266,7 @@ async fn run_ladder(
             "raw_key": raw_key,
             "attempt_ordinal": total_attempts,
             "current_depth": current_depth,
-            "failure": last_failure.as_ref().map(|failure| json!({
+            "failure": last_failure.as_ref().map(|failure| failure.with_wire_origin(json!({
                 "failure_class": failure.failure_class.as_str(),
                 "safe_message": failure.safe_message,
                 "retryable_same_deployment": failure.retryable_same_deployment,
@@ -275,7 +275,7 @@ async fn run_ladder(
                 "provider_detail": failure.provider_detail,
                 "customer_owned": failure.customer_owned,
                 "retry_after_seconds": failure.retry_after_seconds,
-            })),
+            }))),
         }));
         let started_text = match state.bridge.call("start_attempt", argument).await {
             Ok(text) => text,

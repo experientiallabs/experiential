@@ -2609,6 +2609,35 @@ def test_selected_route_names_an_account_failure_newer_than_its_throttle_window(
     assert not ledger.started
 
 
+def test_an_exhausted_tenant_origin_ladder_echoes_the_opaque_marker() -> None:
+    """The data plane's tenant-origin last failure comes back flagged, never as a bare class.
+
+    The data plane renders the echoed exhausting failure, so the marker it sent
+    must survive or the caller would read the specific provider class.
+    """
+    registry, ledger, _ = _registry()
+    tenant_failure: JsonObject = {
+        "failure_class": "provider_authentication",
+        "safe_message": "provider rejected its credential",
+        "failover_eligible": False,
+        "tenant_origin": True,
+    }
+    first = _start(registry, ordinal=0)
+    _settle(
+        registry,
+        attempt_id=str(first["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=tenant_failure,
+    )
+    exhausted = _start(registry, ordinal=1, current_depth=0, failure=tenant_failure)
+    assert exhausted["exhausted"] is True
+    failure = exhausted["failure"]
+    assert isinstance(failure, dict)
+    assert failure["tenant_origin"] is True
+    assert len(ledger.started) == 1
+
+
 class TestRungDispatchPolicy:
     """Bounded-queue spill, fair-share sheds, overflow, and their disclosures."""
 
