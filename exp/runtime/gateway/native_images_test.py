@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 from pathlib import Path
@@ -172,3 +173,77 @@ def test_admit_attributes_the_calling_app(tmp_path: Path) -> None:
     with sqlite3.connect(ledger.database_path) as connection:
         rows = connection.execute("select client_app, user_agent from gateway_requests").fetchall()
     assert rows == [("claude_code", "claude-cli/2.1.278 (external, cli)")]
+
+
+def test_admit_drops_b64_json_for_a_gpt_image_model(tmp_path: Path) -> None:
+    """``chatgpt-image-latest`` answers base64 and refuses ``response_format``."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_image_generation=True),
+        provider_model="chatgpt-image-latest",
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        {"model": "coding", "prompt": "a cat", "response_format": "b64_json"},
+    )
+    route = admission["route"]
+    assert isinstance(route, list) and len(route) == 1
+    assert route[0]["upstream_payload"] == {
+        "model": "chatgpt-image-latest",
+        "prompt": "a cat",
+        "n": 1,
+    }
+
+
+def test_admit_refuses_url_on_a_gpt_image_model_naming_the_field(tmp_path: Path) -> None:
+    """No rung can answer ``url``: a typed 400 on ``response_format``, accounted, no dispatch."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_image_generation=True),
+        provider_model="gpt-image-1",
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, {"model": "coding", "prompt": "a cat", "response_format": "url"})
+    error = _public_error(raised.value)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_value"
+    assert error["param"] == "response_format"
+    assert "base64 images only" in str(error["message"])
+    assert json.loads(control.usage_json("{}"))["totals"]["requests"] == 1
+
+
+def test_a_url_edit_on_a_gpt_image_model_is_refused_as_not_an_edit_model(
+    tmp_path: Path,
+) -> None:
+    """An edit's ``url`` is not the fault: no OpenAI-wire rung edits images at all."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_image_generation=True),
+        provider_model="gpt-image-1",
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+        )
+    )
+    upload = {
+        "fields": {"model": "coding", "prompt": "a cat", "response_format": "url"},
+        "files": {"image": base64.b64encode(b"not-a-real-png").decode("ascii")},
+    }
+    with pytest.raises(NativeBridgeError) as raised:
+        control.admit_image_edits(json.dumps({"raw_key": raw_key, "upload": upload}))
+    error = _public_error(raised.value)
+    assert error["status_code"] == 400
+    assert error["param"] == "model"
+    assert "does not edit images" in str(error["message"])

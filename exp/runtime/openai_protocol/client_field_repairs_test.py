@@ -24,6 +24,7 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     STREAM_OBFUSCATION_IGNORED,
     STREAM_OPTIONS_NOT_STREAMING,
     THINKING_DISPLAY_DROPPED,
+    accept_foreground_responses,
     accept_messages_stream_options,
     accept_responses_stream_options,
     drop_unanchored_output_markers,
@@ -179,6 +180,51 @@ def test_malformed_messages_stream_options_keep_a_named_rejection(
         accept_messages_stream_options({"stream": True, "stream_options": options}, streams=True)
     assert error.value.status_code == 400
     assert error.value.detail.param == param
+
+
+def test_n8n_default_responses_body_decodes_with_background_false() -> None:
+    """n8n's OpenAI node sends ``background: false`` on every Responses call.
+
+    The body below is the node's default ``createRequest`` shape (n8n-io/n8n
+    ``nodes/vendors/OpenAi/v2/actions/text/helpers/responses.ts``); its
+    undefined options are absent from the JSON.
+    """
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": "hello"}],
+            "parallel_tool_calls": True,
+            "store": True,
+            "background": False,
+        }
+    )
+    assert decoded.alias == "gpt-5.4"
+    assert decoded.request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("value", (False, None))
+def test_foreground_background_is_consumed_silently(value: JsonValue) -> None:
+    """``false`` (or ``null``) is already satisfied, so it is removed undisclosed."""
+    repaired = accept_foreground_responses({"model": "m", "input": "hi", "background": value})
+    assert repaired == {"model": "m", "input": "hi"}
+
+
+def test_background_true_keeps_the_exact_parameter_refusal() -> None:
+    """A stored, pollable background job is not served; the refusal names the field."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses({"model": "m", "input": "hi", "background": True})
+    assert error.value.detail.code == "unsupported_parameter"
+    assert error.value.detail.param == "background"
+    assert "only at false" in error.value.detail.message
+
+
+@pytest.mark.parametrize("value", ("false", 0, {}))
+def test_non_boolean_background_is_an_invalid_value(value: JsonValue) -> None:
+    """A non-boolean is never read as false."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses({"model": "m", "input": "hi", "background": value})
+    assert error.value.detail.code == "invalid_parameter"
+    assert error.value.detail.param == "background"
 
 
 _CHAT_BASE: JsonObject = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}

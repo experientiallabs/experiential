@@ -46,6 +46,7 @@ from exp.runtime.models.providers.openai_compatible import (
     openai_embedding_response_raw,
     openai_images_request,
     parse_openai_wire_tool_call,
+    returns_base64_images_only,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
@@ -1236,3 +1237,64 @@ def test_other_rungs_forward_the_callers_response_format() -> None:
     asked = ImagesRequest(prompt="a cat", response_format="url")
     assert openai_images_request("dall-e-3", asked)["response_format"] == "url"
     assert "response_format" not in openai_images_request("dall-e-3", ImagesRequest(prompt="a"))
+
+
+@pytest.mark.parametrize("asked", [None, "b64_json"])
+@pytest.mark.parametrize("inline", [False, True])
+def test_gpt_image_models_never_receive_response_format(
+    asked: Literal["b64_json"] | None, inline: bool
+) -> None:
+    """GPT image models refuse the field (400 ``Unknown parameter``) and answer base64 anyway."""
+    request = ImagesRequest(prompt="a cat", response_format=asked)
+    body = openai_images_request("chatgpt-image-latest", request, inline_images=inline)
+    assert body == {"model": "chatgpt-image-latest", "prompt": "a cat", "n": 1}
+
+
+def test_gpt_image_models_cannot_be_asked_for_url() -> None:
+    """Admission excludes the rung first; the builder never silently swaps the format."""
+    with pytest.raises(ValueError, match="base64 images only"):
+        openai_images_request("gpt-image-1", ImagesRequest(prompt="a", response_format="url"))
+
+
+@pytest.mark.parametrize(
+    ("model_id", "base64_only"),
+    (
+        ("gpt-image-1", True),
+        ("gpt-image-1-mini", True),
+        ("gpt-image-1.5", True),
+        ("gpt-image-2-2026-04-21", True),
+        ("chatgpt-image-latest", True),
+        ("openai/GPT-Image-1", True),
+        ("dall-e-3", False),
+        ("dall-e-2", False),
+        ("grok-imagine-image", False),
+    ),
+)
+def test_returns_base64_images_only_names_the_gpt_image_family(
+    model_id: str, base64_only: bool
+) -> None:
+    """Only the GPT image family; dall-e keeps ``url`` and ``b64_json``."""
+    assert returns_base64_images_only(model_id) is base64_only
+
+
+def test_an_azure_deployment_name_is_classified_by_its_exact_model_id() -> None:
+    """A freely named Azure deployment of a GPT image model is still base64-only."""
+    assert returns_base64_images_only("prod-images", "gpt-image-1.5") is True
+    assert returns_base64_images_only("prod-images", "dall-e-3") is False
+    body = openai_images_request(
+        "prod-images",
+        ImagesRequest(prompt="a cat", response_format="b64_json"),
+        exact_model_id="gpt-image-1.5",
+    )
+    assert body == {"model": "prod-images", "prompt": "a cat", "n": 1}
+
+
+def test_an_azure_catalog_model_id_alone_decides() -> None:
+    """On Azure the catalog model id decides; the free deployment name never does."""
+    assert returns_base64_images_only("gpt-image-production", "dall-e-3") is False
+    assert returns_base64_images_only("dall-e-prod", "gpt-image-1.5") is True
+    assert returns_base64_images_only("gpt-image-prod", "mai-image-2") is False
+    assert returns_base64_images_only("gpt-image-prod", "flux.2-pro") is False
+    assert returns_base64_images_only("gpt-image-prod", "FLUX-1.1-pro") is False
+    assert returns_base64_images_only("gpt-image-1", None) is True
+    assert returns_base64_images_only("dall-e-3", None) is False

@@ -11,8 +11,8 @@ Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
 Chat, agents attach determinism and cache-retention hints (``seed``,
 ``prompt_cache_retention``) no route forwards, clients with OpenAI-style
 extra body fields send Chat's ``stream_options`` on Anthropic Messages calls,
-and image clients send OpenRouter's Chat ``modalities`` of text and image,
-which the route's own
+n8n sends Responses ``background: false``, and image clients send
+OpenRouter's Chat ``modalities`` of text and image, which the route's own
 declared output modalities already decide. OpenRouter's deprecated
 ``include_reasoning`` boolean is rewritten to the ``reasoning.exclude`` it
 aliases. A
@@ -28,7 +28,7 @@ import json
 from typing import Literal
 
 from exp.common.core.artifacts import JsonObject, JsonValue
-from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.legacy_functions import translate_legacy_functions
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
 from exp.runtime.openai_protocol.official_schema import stream_requested
@@ -421,6 +421,42 @@ def accept_responses_stream_options(payload: JsonObject) -> tuple[JsonObject, tu
     return remaining, disclosures
 
 
+def accept_foreground_responses(payload: JsonObject) -> JsonObject:
+    """Consume a Responses ``background`` flag that asks for the foreground.
+
+    n8n's OpenAI node sends ``background: false`` on every Responses call
+    unless its Background Mode option is switched on. Every response this
+    gateway serves already runs in the foreground, so ``false`` (or ``null``)
+    is satisfied exactly and removed without disclosure; ``true`` asks for a
+    stored, pollable background job the gateway does not run and keeps the
+    exact-parameter refusal. Nothing is forwarded to a provider either way.
+
+    Args:
+        payload: Parsed Responses body.
+
+    Returns:
+        The payload without ``background``.
+
+    Raises:
+        OpenAIProtocolError: ``background`` is true or not a boolean.
+    """
+    if "background" not in payload:
+        return payload
+    background = payload["background"]
+    if background is True:
+        raise unsupported_field(
+            "background",
+            message=(
+                "The parameter 'background' is supported only at false: this gateway "
+                "serves every response in the foreground. Remove the field or send "
+                "false and resend the request."
+            ),
+        )
+    if background is not None and background is not False:
+        raise invalid_field("background", "'background' must be a boolean.")
+    return {key: value for key, value in payload.items() if key != "background"}
+
+
 def drop_unforwarded_hints(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Remove the top-level ``seed`` and ``prompt_cache_retention`` hints.
 
@@ -761,12 +797,13 @@ def repair_responses(
     (``responses_probe.drop_gateway_web_search_items``).
 
     Raises:
-        OpenAIProtocolError: ``stream_options`` is malformed.
+        OpenAIProtocolError: ``stream_options`` is malformed, or ``background``
+            is true or not a boolean.
     """
     payload, items = drop_responses_client_items(drop_gateway_web_search_items(payload))
     payload, markers = drop_unanchored_output_markers(payload)
     payload, arguments = normalize_responses_call_arguments(payload)
     payload, unknown = drop_unknown_responses_message_fields(payload)
     payload, hints = drop_unforwarded_hints(payload)
-    payload, stream = accept_responses_stream_options(payload)
+    payload, stream = accept_responses_stream_options(accept_foreground_responses(payload))
     return payload, (*disclosures, *items, *markers, *arguments, *unknown, *hints, *stream)

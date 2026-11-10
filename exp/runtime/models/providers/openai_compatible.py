@@ -227,13 +227,49 @@ def openai_embedding_request(
     return request
 
 
+_BASE64_ONLY_IMAGE_MODEL_PREFIXES = ("gpt-image", "chatgpt-image")
+"""Wire-id prefixes of OpenAI's GPT image models (``gpt-image-1``, ``gpt-image-1.5``,
+``gpt-image-2``, ``chatgpt-image-latest``, ...)."""
+
+
+def returns_base64_images_only(model_id: str, exact_model_id: str | None = None) -> bool:
+    """Whether one served image model always answers base64 and refuses ``response_format``.
+
+    OpenAI's Images API defines ``response_format`` for ``dall-e-2`` and
+    ``dall-e-3`` only: "This parameter isn't supported for the GPT image
+    models, which always return base64-encoded images" (the official
+    ``ImageGenerateParams`` reference), and the provider answers a GPT image
+    model that receives it with ``400 Unknown parameter: 'response_format'``.
+
+    Azure names a deployment freely, so its wire id need not spell the model;
+    an Azure caller passes the lane's catalog model id, which then alone
+    decides. Every other provider's wire id is the model id itself.
+
+    Args:
+        model_id: The served image model id (optionally vendor-prefixed).
+        exact_model_id: On Azure, the lane's catalog model id; otherwise None.
+
+    Returns:
+        True when the deciding id names a GPT image model.
+    """
+    deciding = model_id if exact_model_id is None else exact_model_id
+    return deciding.rsplit("/", 1)[-1].lower().startswith(_BASE64_ONLY_IMAGE_MODEL_PREFIXES)
+
+
 def openai_images_request(
-    model_id: str, request: ImagesRequest, *, inline_images: bool = False
+    model_id: str,
+    request: ImagesRequest,
+    *,
+    inline_images: bool = False,
+    exact_model_id: str | None = None,
 ) -> JsonObject:
     """Convert one canonical image-generation request into the OpenAI wire body.
 
     Every optional control is omitted when absent so the provider default
-    applies; ``user`` is never forwarded (metadata-only in the manifest).
+    applies; ``user`` is never forwarded (metadata-only in the manifest). A
+    GPT image model never receives ``response_format``: ``b64_json`` is what it
+    returns anyway, and admission excludes such a rung from a ``url`` request
+    (:func:`returns_base64_images_only`).
 
     Args:
         model_id: Served image model id.
@@ -242,9 +278,15 @@ def openai_images_request(
             asked, for a provider that keeps hosted images (xAI refuses ``url``
             output for Zero Data Retention teams). The caller then receives
             ``b64_json`` items; the gateway hosts no images to link to.
+        exact_model_id: On Azure, the lane's catalog model id (the served id
+            is a freely chosen deployment name); otherwise None.
 
     Returns:
         The OpenAI-compatible ``/images/generations`` request body.
+
+    Raises:
+        ValueError: A ``url`` request reached a GPT image model, which cannot
+            honor it.
     """
     body: JsonObject = {"model": model_id, "prompt": request.prompt, "n": request.n}
     for field in (
@@ -260,7 +302,11 @@ def openai_images_request(
         value = getattr(request, field)
         if value is not None:
             body[field] = value
-    if inline_images:
+    if returns_base64_images_only(model_id, exact_model_id):
+        if request.response_format == "url":
+            raise ValueError(f"{model_id!r} returns base64 images only and cannot serve 'url'")
+        body.pop("response_format", None)
+    elif inline_images:
         body["response_format"] = "b64_json"
     return body
 

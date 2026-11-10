@@ -40,8 +40,11 @@ An xAI connection is an `openai-compatible` connection on `https://api.x.ai/v1`.
 lanes (xAI answers a 400 the gateway relays otherwise). xAI refuses hosted (`url`) image output
 for Zero Data Retention teams, so every request to xAI's own `/images/generations` asks for
 `response_format: "b64_json"` whatever the caller sent, and the caller receives `b64_json` items
-even when it asked for `url` (the gateway hosts no images to link to). Other providers receive the
-caller's `response_format` unchanged. Per-image billing is the same either way. Published xAI
+even when it asked for `url` (the gateway hosts no images to link to). OpenAI's GPT image models
+(`gpt-image-*`, `chatgpt-image-*`) always answer base64 and refuse `response_format` with a 400, so
+they never receive it: `b64_json` is what they return anyway, and a `url` request excludes their
+rungs, refused with a 400 on `response_format` when no other rung remains. Other providers receive
+the caller's `response_format` unchanged. Per-image billing is the same either way. Published xAI
 prices (2026-10-18): Grok Imagine Image $0.02, Imagine Image Quality $0.05, Imagine Image 2.0
 $0.04 per image.
 

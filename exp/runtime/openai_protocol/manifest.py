@@ -238,10 +238,15 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # dropped on wires that have no such field.
         _field("provider", CompatibilityDisposition.SUPPORTED),
         _field("gateway", CompatibilityDisposition.SUPPORTED),
+        # Accepted only at its no-op default of false
+        # (``client_field_repairs.accept_foreground_responses`` consumes it and
+        # keeps the exact-parameter refusal for true): n8n's OpenAI node sends
+        # background:false on every Responses call, and the gateway serves
+        # every response in the foreground. Never forwarded to a provider.
+        _field("background", CompatibilityDisposition.SUPPORTED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
-                "background",
                 "context_management",
                 "conversation",
                 "moderation",
