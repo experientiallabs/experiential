@@ -56,10 +56,13 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelFinishReason, ModelMessage, ModelRequest, ModelSnapshot
-from exp.common.models.client import ModelClient
+from exp.common.models.client import ModelClient, RequestAdmissionRefused
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.records import ProjectRecordError, ProjectRecords
+from exp.runtime.models.providers.transport import known_unbilled_attempts
 from exp.runtime.models.registry import ResolvedModel
+from exp.runtime.models.structured_completion import CompletionNotDispatched
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.mining.intents import (
     CLAIM_POLL_SECONDS,
     CLAIM_WAIT_SECONDS,
@@ -514,8 +517,11 @@ class DecisionCache:
         assert claim is not None  # _reserve returns an answer to replay or a claim to buy under.
         try:
             response = dispatch()
-        except BaseException:
-            self._abandon(claim)
+        except BaseException as error:
+            if certified_unsent(error):
+                self._release(claim)
+            else:
+                self._abandon(claim)
             raise
         self._commit(key, request, response, claim=claim)
         return response
@@ -606,6 +612,26 @@ class DecisionCache:
             self.records.write(f"decision/{key}", payload)
             if self.records.read(f"intent/{key}") == held:
                 self.records.replace(f"intent/{key}", expected=held, replacement=None)
+
+    def _release(self, claim: DecisionClaim) -> None:
+        """Drop this run's claim on a call certified never sent, so a later run may buy it.
+
+        Only a refusal that proves nothing left (an admission refusal, a completion stopped
+        before dispatch, a spent provider cap, or retry evidence that every attempt was unpaid)
+        comes here; anything else keeps the claim, because its outcome may have been billed.
+        A failure to drop it is logged and leaves the claim to the lease, like ``_abandon``.
+        """
+        held = claim.payload()
+        try:
+            with self._locked():
+                if self.records.read(f"intent/{claim.key}") == held:
+                    self.records.replace(f"intent/{claim.key}", expected=held, replacement=None)
+        except (TraceTaggingError, ProjectRecordError):
+            logger.warning(
+                "the claim on decision %s could not be released after a certified unsent call; "
+                "it stays in flight until its lease runs out",
+                claim.key[:12],
+            )
 
     def _abandon(self, claim: DecisionClaim) -> None:
         """Mark this run's claim as a call that committed no answer.
@@ -955,3 +981,22 @@ def _hashed_probability(unit_hash: str, question: Question) -> float:
         f"{unit_hash}\n{question.question_id}\n{question.text}".encode(), usedforsecurity=False
     ).digest()
     return int.from_bytes(digest[:8], "big") / 2**64
+
+
+def certified_unsent(error: BaseException) -> bool:
+    """Whether a failed decision call is certified never to have reached the provider.
+
+    Args:
+        error: What the dispatch raised.
+
+    Returns:
+        True for a local admission refusal, a completion stopped before dispatch, retry
+        evidence that every started attempt was unpaid, or a spent provider cap raised with no
+        retry evidence (so no earlier attempt of this call was sent).
+    """
+    if isinstance(error, (RequestAdmissionRefused, CompletionNotDispatched)):
+        return True
+    if known_unbilled_attempts(error) > 0:
+        return True
+    evidence = getattr(error, "_exp_request_attempt_evidence", None)
+    return isinstance(error, DispatchCapExhaustedError) and evidence is None

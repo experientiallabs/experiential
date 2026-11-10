@@ -19,6 +19,7 @@ import httpx
 import truststore
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
@@ -673,7 +674,13 @@ def run_with_retry[ResultT](
 
 
 def is_unbilled_attempt(error: BaseException) -> bool:
-    """Recognize only an explicit trusted adapter's pre-dispatch HTTP 429 assertion."""
+    """Recognize a trusted pre-dispatch refusal: an adapter's HTTP 429 assertion or the cap.
+
+    The dispatch ledger refuses a slot before any intent is recorded or byte is sent, so a
+    spent provider cap is as certainly unbilled as an asserted 429.
+    """
+    if isinstance(error, DispatchCapExhaustedError):
+        return True
     return (
         isinstance(error, ProviderTransportError)
         and error.status_code == 429

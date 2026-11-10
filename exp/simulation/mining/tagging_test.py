@@ -809,3 +809,33 @@ def test_discarding_a_claim_that_is_not_there_says_so(tmp_path: Path) -> None:
 
     with pytest.raises(TraceTaggingError, match="has no retained claim"):
         cache.discard_intent("d" * 64)
+
+
+def test_a_call_the_provider_cap_refused_before_sending_can_be_bought_later(
+    tmp_path: Path,
+) -> None:
+    """A spent cap proves nothing was sent, so its claim is released, not left unknown."""
+    from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
+
+    bank = _bank()
+    cache = DecisionCache(ProjectPaths(root=tmp_path, project_id="fixture"))
+    refused = _ScriptedClient([DispatchCapExhaustedError("provider cap spent")])
+    with pytest.raises(DispatchCapExhaustedError):
+        _tagger(refused, cache=cache).tag([_unit()], bank)
+
+    later = _ScriptedClient([_reply(bank, 5)])
+    matrix = _tagger(later, cache=cache).tag([_unit()], bank)
+    assert len(later.requests) == 1
+    assert matrix.rows[0].values == (5 / ANSWER_SCALE,) * 2
+
+
+def test_a_cap_refusal_after_a_sent_attempt_stays_unknown() -> None:
+    """Retry evidence of an earlier sent attempt keeps the conservative reading."""
+    from exp.runtime.models.providers.transport import retain_request_attempt_evidence
+    from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
+    from exp.simulation.mining.tagging import certified_unsent
+
+    error = DispatchCapExhaustedError("provider cap spent")
+    assert certified_unsent(error)
+    retain_request_attempt_evidence(error, attempts=2, unbilled_attempts=1)
+    assert not certified_unsent(error)
