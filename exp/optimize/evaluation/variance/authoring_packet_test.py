@@ -544,3 +544,25 @@ def test_a_whole_task_packet_has_only_its_baseline_and_refuses_scenarios(
     assert packet.variants[0].state == INITIAL and len(packet.observed_episodes) == 1
     with pytest.raises(ValueError, match="cannot carry scenarios"):
         build((tier_scenario("urgent", "high"),))
+
+
+def test_a_response_the_secret_boundary_refuses_is_an_unusable_draw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused, unsaved response is a failure reason, not an exception that stops the rest."""
+    from exp.common.project.errors import ArtifactStoreError
+    from exp.optimize.evaluation.variance import authoring_packet
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise ArtifactStoreError("provider response violates the secret boundary (credential)")
+
+    monkeypatch.setattr(authoring_packet, "author_response", refuse)
+    reason = authoring_packet.buy_author_draw(
+        None,
+        None,
+        None,
+        identity="x",
+        sources=(),
+        code_revision="t",  # type: ignore[arg-type]
+    )
+    assert isinstance(reason, str) and "secret boundary" in reason

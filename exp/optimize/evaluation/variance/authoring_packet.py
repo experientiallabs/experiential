@@ -48,6 +48,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.project.errors import ArtifactStoreError
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
 from exp.optimize.evaluation.variance.coalition import CoalitionEvidence
@@ -745,6 +746,12 @@ def buy_author_draw(
             code_revision=code_revision,
         )
     except (ValueError, ProviderTransportError, DispatchCapExhaustedError, TimeoutError) as error:
+        return bounded_reason(error)
+    except ArtifactStoreError as error:
+        # A response the secret boundary refuses was never saved: the draw has no answer, the
+        # same as any other unusable response, and must not stop the drafts beside it.
+        if "secret boundary" not in str(error):
+            raise
         return bounded_reason(error)
 
 
