@@ -349,6 +349,17 @@ class ToolCall(ContractModel):
     one. Excluded from serialization like the other replay fields, and joins
     gateway replay identity explicitly.
     """
+    provider_anthropic_caller: JsonObject | None = Field(default=None, exclude=True)
+    """Anthropic Messages ``caller`` attribution on a replayed ``tool_use`` block.
+
+    Programmatic tool calling stamps every ``tool_use`` with how it was invoked
+    (``{"type": "direct"}`` or a code execution caller with its ``tool_id``),
+    and Messages clients echo it in history. A separate carrier from
+    :attr:`provider_caller` because the two vocabularies differ: this one
+    re-emits verbatim only on the Anthropic Messages wire and drops with
+    disclosure elsewhere. Excluded from serialization like the other replay
+    fields, and joins gateway replay identity explicitly.
+    """
     provider_thought_signature: str | None = Field(
         default=None,
         min_length=1,

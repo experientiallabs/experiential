@@ -640,6 +640,16 @@ def route_generation_parameter_requests(
                 "tools.input_examples",
                 any(tool.input_examples is not None for tool in request.tools),
             ),
+            # The tool_use-side counterpart of allowed_callers: Messages
+            # clients echo the provider's programmatic-call attribution.
+            (
+                "messages.content.tool_use.caller->dropped(unsupported_by_provider)",
+                any(
+                    call.provider_anthropic_caller is not None
+                    for message in request.messages
+                    for call in message.tool_calls
+                ),
+            ),
         )
         for path, present in tool_annotation_paths:
             if present and path not in ignored:

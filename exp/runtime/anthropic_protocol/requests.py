@@ -28,9 +28,18 @@ the HTTP layer renders them in the Anthropic envelope.
 from __future__ import annotations
 
 import json
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    Tag,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
@@ -136,14 +145,74 @@ class _RedactedThinkingBlock(AnthropicWireModel):
     data: str = ""
 
 
+class _DirectCaller(AnthropicWireModel):
+    """A ``tool_use`` the model invoked directly (traditional tool use)."""
+
+    type: Literal["direct"]
+
+
+class _CodeExecutionCaller(AnthropicWireModel):
+    """A ``tool_use`` invoked programmatically from a code execution run.
+
+    ``tool_id`` is the id of the code execution ``server_tool_use`` block that
+    made the call. Anthropic tags responses ``code_execution_20260120``; the
+    SDK's request params also admit the older ``code_execution_20250825``.
+    """
+
+    type: Literal["code_execution_20250825", "code_execution_20260120"]
+    tool_id: str = Field(min_length=1, max_length=256)
+
+
+def _caller_arm(value: object) -> str | None:
+    """Pick the ``caller`` arm by its ``type`` tag.
+
+    The tags are wire-model class names so the error renderer strips them from
+    the field path, exactly as it strips ordinary union arm labels.
+    """
+    tag = value.get("type") if isinstance(value, dict) else getattr(value, "type", None)
+    if tag == "direct":
+        return "_DirectCaller"
+    if tag in ("code_execution_20250825", "code_execution_20260120"):
+        return "_CodeExecutionCaller"
+    return None
+
+
+ToolUseCaller = Annotated[
+    Annotated[_DirectCaller, Tag("_DirectCaller")]
+    | Annotated[_CodeExecutionCaller, Tag("_CodeExecutionCaller")],
+    Discriminator(
+        _caller_arm,
+        custom_error_type="invalid_caller",
+        custom_error_message=(
+            "caller must be an object whose type is 'direct', "
+            "'code_execution_20250825', or 'code_execution_20260120'"
+        ),
+    ),
+]
+"""Anthropic's ``caller`` attribution on a ``tool_use`` block, validated closed.
+
+Programmatic tool calling (stable, no beta header) stamps every response
+``tool_use`` with how it was invoked, and clients such as Claude Code echo the
+block back in history. The shapes are the official SDK's
+``DirectCallerParam``, ``ServerToolCallerParam``, and
+``ServerToolCaller20260120Param``; anything else stays a field-specific 400.
+"""
+
+
 class _ToolUseBlock(AnthropicWireModel):
-    """One assistant tool invocation retained in request history."""
+    """One assistant tool invocation retained in request history.
+
+    ``caller`` rides the canonical tool call (``ToolCall.provider_anthropic_caller``)
+    and re-emits verbatim on Anthropic rungs; other wires have no slot for it
+    and drop it with disclosure, since the call itself is unchanged.
+    """
 
     type: Literal["tool_use"]
     id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
     input: JsonObject
     cache_control: CacheControl | None = None
+    caller: ToolUseCaller | None = None
 
 
 class _ToolResultBlock(AnthropicWireModel):
@@ -922,6 +991,9 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                         block.cache_control.model_dump(mode="json", exclude_none=True)
                         if block.cache_control is not None
                         else None
+                    ),
+                    provider_anthropic_caller=(
+                        block.caller.model_dump(mode="json") if block.caller is not None else None
                     ),
                 )
             )

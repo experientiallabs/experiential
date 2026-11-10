@@ -597,6 +597,10 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
         # defines tool_use-block prompt caching natively.
         if call.cache_control is not None:
             tool_use["cache_control"] = call.cache_control
+        # Programmatic tool-calling attribution the caller echoed re-emits
+        # verbatim; absent stays absent.
+        if call.provider_anthropic_caller is not None:
+            tool_use["caller"] = call.provider_anthropic_caller
         blocks.append(tool_use)
     if blocks and all(
         block.get("type") == "text" and not str(block.get("text", "")).strip() for block in blocks

@@ -37,8 +37,11 @@ Responses expose observed cache reads and writes; absent write counts remain unk
 The decoder also
 carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted
-bare by the live API, verified 2026-08-30) and `inference_geo` verbatim on Anthropic rungs with
-disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
+bare by the live API, verified 2026-08-30), the programmatic tool-calling `caller` that clients
+echo on history `tool_use` blocks (typed closed: `{"type": "direct"}` or a
+`code_execution_20250825` / `code_execution_20260120` caller with its `tool_id`; dropped elsewhere
+as `messages.content.tool_use.caller->dropped(unsupported_by_provider)`), and `inference_geo`
+verbatim on Anthropic rungs with disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
 decision behind an SDK-surface drift gate in
 `exp/runtime/anthropic_protocol/manifest.py`, and carries user `image` and PDF `document` blocks
 as typed content parts (base64 or URL source, optional `title`, cache marker) that admission

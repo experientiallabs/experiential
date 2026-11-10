@@ -2391,6 +2391,146 @@ def test_decode_names_a_duplicate_tool_use_id_instead_of_crashing() -> None:
     assert rejected.value.detail.param == "messages.1"
 
 
+def _caller_history(caller: JsonValue) -> list[JsonObject]:
+    """Return a Claude Code tool round trip whose echoed tool_use carries ``caller``."""
+    return [
+        {"role": "user", "content": "list files"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Listing."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": {"command": "ls"},
+                    "caller": caller,
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}],
+        },
+    ]
+
+
+_BASH_TOOL: JsonObject = {
+    "name": "Bash",
+    "description": "run",
+    "input_schema": {"type": "object"},
+}
+
+
+@pytest.mark.parametrize(
+    "caller",
+    (
+        {"type": "direct"},
+        {"type": "code_execution_20260120", "tool_id": "srvtoolu_abc"},
+        {"type": "code_execution_20250825", "tool_id": "srvtoolu_abc"},
+    ),
+)
+def test_tool_use_caller_decodes_and_re_emits_verbatim_on_the_anthropic_wire(
+    caller: JsonObject,
+) -> None:
+    """Anthropic's programmatic tool-calling ``caller`` round-trips byte-for-byte.
+
+    Claude Code echoes the attribution the provider stamps on every
+    ``tool_use``; rejecting it as an unknown key failed every follow-up turn of
+    the session (claude-cli 2.1.319 to 2.1.322).
+    """
+    decoded = decode_messages(_body(messages=_caller_history(caller), tools=[_BASH_TOOL]))
+    assistant = decoded.request.messages[1]
+    assert assistant.tool_calls[0].provider_anthropic_caller == caller
+    # The Responses-vocabulary carrier is untouched.
+    assert assistant.tool_calls[0].provider_caller is None
+    role, blocks = anthropic_blocks(assistant)
+    assert role == "assistant"
+    assert blocks[-1] == {
+        "type": "tool_use",
+        "id": "toolu_1",
+        "name": "Bash",
+        "input": {"command": "ls"},
+        "caller": caller,
+    }
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-sonnet-4-6",
+    )
+    public, provider = route_generation_parameter_requests((anthropic,), decoded.request)
+    assert not any("caller" in path for path in public.ignored_parameters)
+    assert provider.messages[1].tool_calls[0].provider_anthropic_caller == caller
+
+
+def test_tool_use_caller_in_ordered_thinking_replay_is_carried_verbatim() -> None:
+    """A signed thinking turn replays its tool_use with the caller intact."""
+    messages = _caller_history({"type": "direct"})
+    assistant_content = cast(list[JsonObject], messages[1]["content"])
+    assistant_content.insert(0, {"type": "thinking", "thinking": "plan", "signature": "sig"})
+    decoded = decode_messages(_body(messages=messages, tools=[_BASH_TOOL]))
+    _role, blocks = anthropic_blocks(decoded.request.messages[1])
+    assert blocks[-1]["caller"] == {"type": "direct"}
+
+
+def test_tool_use_caller_drops_with_disclosure_on_a_chat_route() -> None:
+    """A Chat Completions rung has no slot for ``caller``: the call is kept, the
+    attribution is dropped, and the drop is disclosed."""
+    decoded = decode_messages(
+        _body(
+            messages=_caller_history({"type": "code_execution_20260120", "tool_id": "srvtoolu_x"}),
+            tools=[_BASH_TOOL],
+        )
+    )
+    chat = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.openai.com/v1/chat/completions",
+        model_id="gpt-5.6-sol",
+    )
+    public, _provider = route_generation_parameter_requests((chat,), decoded.request)
+    assert (
+        "messages.content.tool_use.caller->dropped(unsupported_by_provider)"
+        in public.ignored_parameters
+    )
+    wire = openai_chat_message(decoded.request.messages[1])
+    assert "caller" not in json.dumps(wire)
+    assert wire["tool_calls"] == [
+        {
+            "id": "toolu_1",
+            "type": "function",
+            "function": {"name": "Bash", "arguments": '{"command":"ls"}'},
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("caller", "param"),
+    (
+        ({"type": "program"}, "messages.1.content.1.caller"),
+        ({"type": "code_execution_20260120"}, "messages.1.content.1.caller.tool_id"),
+        ({"type": "direct", "tool_id": "x"}, "messages.1.content.1.caller.tool_id"),
+        ("direct", "messages.1.content.1.caller"),
+    ),
+)
+def test_malformed_tool_use_caller_is_still_rejected(caller: JsonValue, param: str) -> None:
+    """``caller`` is typed closed: an unknown type, a missing ``tool_id``, an
+    extra key, or a non-object stays a field-specific 400."""
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_messages(_body(messages=_caller_history(caller), tools=[_BASH_TOOL]))
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param == param
+
+
+def test_caller_is_not_admitted_on_tool_result_blocks() -> None:
+    """Anthropic documents ``caller`` on tool_use only; the decoder stays closed."""
+    messages = _caller_history({"type": "direct"})
+    result = cast(list[JsonObject], messages[2]["content"])[0]
+    result["caller"] = {"type": "direct"}
+    with pytest.raises(OpenAIProtocolError, match="Unknown parameter") as rejected:
+        decode_messages(_body(messages=messages, tools=[_BASH_TOOL]))
+    assert rejected.value.detail.param == "messages.2.content.0.caller"
+
+
 def test_forced_tool_choice_decodes_to_the_canonical_forced_forms() -> None:
     """``any`` and a named ``tool`` reach the canonical forced forms admission
     narrows and coerces on; ``auto`` and ``none`` stay open selectors."""
