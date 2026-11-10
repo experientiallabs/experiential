@@ -353,5 +353,16 @@ def shape_anthropic_advisor(
     )
     provider_updates["provider_server_tools"] = kept_tools
     provider_updates["messages"] = kept_messages
+    if not kept_tools and not request.tools and not request.provider_native_tools:
+        # No tool definition survives: tool-selection controls have no meaning,
+        # and the provider rejects a tool_choice without tools.
+        if request.tool_choice is not None:
+            clear_tool_choice = True
+            if "tool_choice->dropped(unsupported_by_provider)" not in ignored:
+                ignored.append("tool_choice->dropped(unsupported_by_provider)")
+        if request.parallel_tool_calls is not None:
+            provider_updates["parallel_tool_calls"] = None
+            if "parallel_tool_calls->dropped(unsupported_by_provider)" not in ignored:
+                ignored.append("parallel_tool_calls->dropped(unsupported_by_provider)")
     if clear_tool_choice:
         provider_updates["tool_choice"] = None

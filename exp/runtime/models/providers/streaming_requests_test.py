@@ -6355,6 +6355,21 @@ def test_the_advisor_tool_is_dropped_on_azure_foundry_and_refused_when_mixed() -
         )
     assert "Azure AI Foundry" in str(raised.value)
 
+    sole_tool_controls = _advisor_messages_request().model_copy(
+        update={"tool_choice": "auto", "parallel_tool_calls": False}
+    )
+    public, provider = route_generation_parameter_requests(
+        (_foundry_anthropic_profile(),), sole_tool_controls
+    )
+    assert provider.tool_choice is None
+    assert provider.parallel_tool_calls is None
+    assert "tool_choice->dropped(unsupported_by_provider)" in public.ignored_parameters
+    assert "parallel_tool_calls->dropped(unsupported_by_provider)" in public.ignored_parameters
+    payload = anthropic_messages_stream_payload(
+        "claude-haiku-4-5", provider, maximum_output_tokens=128_000
+    )
+    assert "tools" not in payload and "tool_choice" not in payload
+
 
 def test_a_bare_enabled_thinking_config_gets_a_derived_budget_on_an_anthropic_route() -> None:
     """Claude Code omits budget_tokens; the Anthropic wire requires one, so it is derived.
