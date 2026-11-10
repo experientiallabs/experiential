@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -120,6 +121,20 @@ def test_load_otel_genai_file_accepts_otlp_envelope(tmp_path: Path) -> None:
     result = load_otel_genai_file(path)
 
     assert result.traces[0].task == "Ping"
+
+
+def test_load_otel_genai_file_preserves_negative_integer_attribute(tmp_path: Path) -> None:
+    """A native signed integer survives the shared OTLP normalization path."""
+    spans = _spans()
+    attributes = cast(dict[str, object], spans[0]["attributes"])
+    attributes["test.offset"] = -1
+    path = tmp_path / "otel.json"
+    path.write_text(json.dumps(spans), encoding="utf-8")
+
+    result = load_otel_genai_file(path)
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].attributes["test.offset"] == -1
 
 
 def test_load_otel_genai_file_retains_malformed_jsonl_issue(tmp_path: Path) -> None:
