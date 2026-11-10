@@ -524,6 +524,12 @@ A mixed route narrows to its OpenAI Responses rungs instead, like a
 ``compaction_trigger``."""
 
 
+TOOL_RESULT_ATTRIBUTION_DROPPED = (
+    "messages.tool_results.attribution->dropped(unsupported_by_provider)"
+)
+"""The disclosure for tool-result attribution a foreign wire cannot carry."""
+
+
 COMPACTION_TRIGGER_UNSERVABLE = (
     "A 'compaction_trigger' input item asks the provider for an encrypted context "
     "compaction, which only an OpenAI Responses route can produce, and this model "
@@ -541,7 +547,7 @@ turn), so a foreign rung narrows out of a mixed route and a route without an
 OpenAI Responses rung refuses before dispatch."""
 
 
-def _agent_message_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
+def agent_message_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
     """Render one raw ``agent_message`` as the text of a foreign-wire user message.
 
     The heading follows Codex's own rendering of an agent message for a
@@ -577,7 +583,7 @@ def _agent_message_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
     return "\n".join((heading, *texts)), tuple(disclosures)
 
 
-def _unpaired_output_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
+def unpaired_output_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
     """Render one ``function_call_output`` that answers no call as foreign-wire user text.
 
     A named output without a ``call_id`` (Codex 0.162+ delivers thread
@@ -599,10 +605,14 @@ def _unpaired_output_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
     tool = ".".join(part for part in (namespace, name) if part is not None)
     heading = f"Tool {tool} result:" if tool else "Tool result:"
     output = item.get("output")
-    if isinstance(output, str):
-        return f"{heading}\n{output}", ()
-    texts: list[str] = []
     disclosures: list[str] = []
+    if item.get("caller") is not None:
+        # The caller attribution has no carrier in a user turn, like a paired
+        # result's caller on a foreign wire.
+        disclosures.append(TOOL_RESULT_ATTRIBUTION_DROPPED)
+    if isinstance(output, str):
+        return f"{heading}\n{output}", tuple(disclosures)
+    texts: list[str] = []
     for part in output if isinstance(output, list) else ():
         kind = part.get("type") if isinstance(part, dict) else None
         text = part.get("text") if isinstance(part, dict) else None
@@ -631,7 +641,7 @@ def _convert_history_item(
     """
     item_type = item.get("type")
     if item_type == "agent_message":
-        text, dropped = _agent_message_text(item)
+        text, dropped = agent_message_text(item)
         return GatewayMessage(role="user", content=text), dropped
     if item_type == "compaction_trigger":
         raise ProviderParameterError(
@@ -690,7 +700,7 @@ def _convert_history_item(
         call_id = _string(item.get("call_id"))
         output = item.get("output")
         if call_id is None:
-            text, dropped = _unpaired_output_text(item)
+            text, dropped = unpaired_output_text(item)
             return GatewayMessage(role="user", content=text), dropped
         return (
             GatewayMessage(

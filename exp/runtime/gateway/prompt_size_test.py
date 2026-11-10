@@ -7,6 +7,7 @@ import base64
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import ImageContentPart, TextContentPart
 from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -138,6 +139,40 @@ def test_text_bytes_count_every_text_the_model_reads_and_no_media() -> None:
     )
     assert prompt_text_bytes(request) == expected
     assert minimum_prompt_tokens(request) == expected // MAXIMUM_BYTES_PER_TOKEN
+
+
+def test_media_inside_a_verbatim_item_is_not_counted_as_text() -> None:
+    """An agent message's inline image is media; only the item's text is sized."""
+    text_part: JsonObject = {"type": "input_text", "text": "look"}
+    item: JsonObject = {
+        "type": "agent_message",
+        "author": "/root",
+        "recipient": "/w",
+        "content": [text_part],
+    }
+    with_image: JsonObject = {
+        **item,
+        "content": [
+            text_part,
+            {"type": "input_image", "image_url": "data:image/png;base64," + "A" * 400_000},
+        ],
+    }
+
+    def _request(native: JsonObject) -> GatewayRequest:
+        """Build a Responses request carrying one native item.
+
+        Args:
+            native: The verbatim item.
+
+        Returns:
+            The request.
+        """
+        return GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", provider_native_item=native),),
+        )
+
+    assert prompt_text_bytes(_request(with_image)) == prompt_text_bytes(_request(item))
 
 
 def test_raw_tool_arguments_are_counted_verbatim_when_present() -> None:

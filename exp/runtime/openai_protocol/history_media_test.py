@@ -294,7 +294,15 @@ def test_an_unchanged_history_is_returned_without_copies() -> None:
 
 
 @pytest.mark.parametrize(
-    "item_type", ["compaction", "program", "program_output", "tool_search_output"]
+    "item_type",
+    [
+        "compaction",
+        "program",
+        "program_output",
+        "tool_search_output",
+        "context_compaction",
+        "item_reference",
+    ],
 )
 def test_every_provider_authored_item_ends_the_latest_turn(item_type: str) -> None:
     """A hosted output item is the model speaking, so earlier user media is history."""

@@ -8,6 +8,7 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.codex_tools import agent_message_text, unpaired_output_text
 
 MAX_WINDOW_CHARACTERS: Final = 30_000
 """Total kept characters; at six JSON bytes per character this leaves room for questions."""
@@ -126,37 +127,31 @@ def message_text(message: GatewayMessage) -> str:
 
 
 def _native_input_text(message: GatewayMessage) -> str:
-    """Return the plaintext of a verbatim-carried item that is caller input.
+    """Return the text a verbatim-carried item of caller input puts before the model.
 
     A native OpenAI Responses rung receives an ``agent_message`` and a
     ``function_call_output`` that answers no call as input the model reads,
-    so their text parts are classified like any user turn; otherwise a caller
-    could route a prompt past the check by spelling it as one of those items.
-    Opaque parts (images, encrypted content) carry no classifiable text.
+    and a foreign wire renders each as a user turn with a heading built from
+    its author or tool name. The classifier reads that same rendering
+    (``codex_tools.agent_message_text`` and ``unpaired_output_text``), so a
+    caller cannot route a prompt past the check by spelling it as one of these
+    items or by putting it in the metadata the heading shows. Opaque parts
+    (images, encrypted content) carry no classifiable text.
 
     Args:
         message: A user-role message carrying one native Responses item.
 
     Returns:
-        The item's text parts joined by newlines, or an empty string.
+        The item's rendered text, or an empty string for any other item.
     """
     item = message.provider_native_item or {}
     match item.get("type"):
         case "agent_message":
-            parts = item.get("content")
+            return agent_message_text(item)[0]
         case "function_call_output":
-            parts = item.get("output")
-            if isinstance(parts, str):
-                return parts
+            return unpaired_output_text(item)[0]
         case _:
             return ""
-    return "\n".join(
-        part["text"]
-        for part in (parts if isinstance(parts, list) else ())
-        if isinstance(part, dict)
-        and part.get("type") in ("input_text", "output_text", "text")
-        and isinstance(part.get("text"), str)
-    )
 
 
 def _latest_user_index(messages: tuple[GatewayMessage, ...]) -> int | None:

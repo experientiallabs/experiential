@@ -1168,3 +1168,23 @@ def test_a_dropped_trailing_native_item_exposing_assistant_prefill_narrows_the_r
     kept = compatible_generation_parameter_profile_indexes((_ANTHROPIC, _OPENAI_RESPONSES), request)
 
     assert kept == (1,)
+
+
+def test_an_unpaired_output_caller_is_disclosed_as_dropped_on_a_foreign_wire() -> None:
+    """The caller attribution has no carrier in a user turn, so it is named."""
+    request = _codex_items_request(
+        {
+            "type": "function_call_output",
+            "name": "send_message_to_thread",
+            "caller": {"type": "direct"},
+            "output": "done",
+        }
+    )
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert provider.messages[-1].content == "Tool send_message_to_thread result:\ndone"
+    assert (
+        "messages.tool_results.attribution->dropped(unsupported_by_provider)"
+        in public.ignored_parameters
+    )

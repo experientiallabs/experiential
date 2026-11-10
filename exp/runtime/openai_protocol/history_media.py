@@ -333,9 +333,20 @@ def _degrade_parts(
 
 
 _MODEL_ITEM_TYPES: Final = frozenset(
-    {"reasoning", "function_call", "custom_tool_call", *HOSTED_TOOL_ITEM_TYPES_ASSISTANT}
+    {
+        "reasoning",
+        "function_call",
+        "custom_tool_call",
+        "context_compaction",
+        "item_reference",
+        *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
+    }
 )
-"""Responses item types the model authored, beside assistant-role messages."""
+"""Responses item types the provider authored, beside assistant-role messages.
+
+``context_compaction`` and ``item_reference`` are provider-issued history
+(compacted output and a stored output item), so each ends the turn before it
+like any other model item."""
 
 
 def _model_turn(item: JsonObject) -> bool:
