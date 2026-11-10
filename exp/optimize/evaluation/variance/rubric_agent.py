@@ -30,6 +30,7 @@ its variant's prompt texts, and :func:`rubric_agent_protocol_sha256` pins them a
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Literal, Self
@@ -45,7 +46,7 @@ from exp.common.core.artifacts import (
     sha256_json,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.models import ModelRequest
+from exp.common.models import ModelMessage, ModelRequest
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.authoring_packet import (
@@ -78,7 +79,7 @@ from exp.optimize.evaluation.variance.rubric_critic import (
     critic_protocol_sha256,
 )
 
-RUBRIC_AGENT_PROTOCOL = "rubric-agent-v2"
+RUBRIC_AGENT_PROTOCOL = "rubric-agent-v3"
 """Version of the prompt variants, phases, reconciliation and their host checks."""
 
 PLAN_TOOL = "submit_rubric_plan"
@@ -273,6 +274,9 @@ class RubricAuthoringProfile(ContractModel):
         agentic: Plan, draft, self-critique and final draws instead of one direct draw each.
         critic: The LLM design critic reviewing every drafted rubric; None for structural
             host checks only.
+        repairs: Repair draws after a draw's answer fails a contract or host check, each shown
+            the failed answer and the error.
+        redraws: Fresh draws after a draw is lost (no usable response) or its repairs fail.
     """
 
     variants: tuple[PromptVariantId, ...] = Field(
@@ -282,6 +286,8 @@ class RubricAuthoringProfile(ContractModel):
     )
     agentic: bool = True
     critic: DesignCriticProfile | None = None
+    repairs: int = Field(default=2, ge=0, le=4, strict=True)
+    redraws: int = Field(default=1, ge=0, le=2, strict=True)
 
     @model_validator(mode="after")
     def _distinct(self) -> Self:
@@ -290,11 +296,16 @@ class RubricAuthoringProfile(ContractModel):
             raise ValueError("rubric prompt variants must be distinct")
         return self
 
+    def attempts(self) -> int:
+        """Return the most draws one logical draw may take: its redraws times its repairs."""
+        return (1 + self.redraws) * (1 + self.repairs)
+
     def draws(self) -> int:
-        """Return the most draws one agentic authoring makes, critic reviews included."""
-        reviewed = len(self.variants) * (2 if self.agentic else 1) + 1
+        """Return the most draws one agentic authoring makes, repairs, redraws and reviews in."""
+        reviewed = (len(self.variants) * (2 if self.agentic else 1) + 1) * self.attempts()
         critic = 0 if self.critic is None else self.critic.draws() * reviewed
-        return len(self.variants) * (4 if self.agentic else 1) + 1 + critic
+        logical = len(self.variants) * (4 if self.agentic else 1) + 1
+        return logical * self.attempts() + critic
 
 
 class AgenticDraft(ContractModel):
@@ -406,7 +417,7 @@ def phase_request(
     payload["phase"] = phase
     payload["prior"] = prior
     return forced_request(
-        variant_prompt(variant, phase), payload, tool, model.model_json_schema(), output_tokens
+        variant_prompt(variant, phase), payload, tool, answer_schema(model), output_tokens
     )
 
 
@@ -454,6 +465,7 @@ def author_rubric_agentic(
             )  # fmt: skip
         draws = _Draws(project, settings, packet, packet_reference, code_revision)
         draws.library, draws.reviewer = library, reviewer
+        draws.repairs, draws.redraws = profile.repairs, profile.redraws
         members = tuple(
             draws.member(variant, f"{identity}-{variant}", agentic=profile.agentic)
             for variant in profile.variants
@@ -597,6 +609,43 @@ class _Draws:
         self.reference, self.code_revision = reference, code_revision
         self.library: LibraryBinding | None = None
         self.reviewer: DesignReviewer | None = None
+        self.repairs, self.redraws = 0, 0
+
+    def settle[Result](
+        self,
+        request: ModelRequest,
+        name: str,
+        tool: str,
+        judge: Callable[[ArtifactInput, object], tuple[Result, str | None]],
+    ) -> tuple[Result | None, str | None]:
+        """Buy one logical draw with bounded repairs and redraws; return its result and failure.
+
+        ``judge`` turns a saved response's arguments into a result and the contract or host
+        check it failed, if any. A failed answer is repaired: the same request plus a turn
+        holding the answer and its error, up to ``repairs`` times. A lost draw (no usable
+        response) or one whose repairs all fail is redrawn fresh, up to ``redraws`` times. Each
+        draw has its own identity, so a rerun replays exactly.
+
+        Returns:
+            The last judged result (None when no draw was answered) and the last failure, or
+            None when a draw passed its checks.
+        """
+        result: Result | None = None
+        failure: str | None = None
+        for redraw in range(self.redraws + 1):
+            base = name if redraw == 0 else f"{name}-redraw-{redraw}"
+            current = request
+            for repair in range(self.repairs + 1):
+                bought = self.buy(current, base if repair == 0 else f"{base}-repair-{repair}", tool)
+                if isinstance(bought, str):
+                    failure = bought
+                    break
+                response, arguments = bought
+                result, failure = judge(response, arguments)
+                if failure is None:
+                    return result, None
+                current = repair_request(request, arguments, failure)
+        return result, failure
 
     def buy(
         self, request: ModelRequest, identity: str, tool: str
@@ -659,10 +708,17 @@ class _Draws:
                 library=self.library,
             )  # fmt: skip
             tool = {"plan": PLAN_TOOL, "draft": RUBRIC_TOOL, "critique": CRITIQUE_TOOL}[phase]
-            bought = self.buy(request, f"{identity}-{phase}", tool)
-            if isinstance(bought, str):
-                return unavailable(bought)
-            record = self._phase(phase, *bought, prior)
+            record, failure = self.settle(
+                request,
+                f"{identity}-{phase}",
+                tool,
+                lambda response, arguments, phase=phase: self._judged_phase(
+                    phase, response, arguments, prior
+                ),
+            )
+            if record is None:
+                return unavailable(failure or "no draw was answered")
+            self._phase_feed(phase, record, prior)
             phases.append(record)
             blocked = record.answer is not None and record.answer.get("status") == "needs_research"
             if blocked and record.answer is not None and not record.findings:
@@ -694,20 +750,27 @@ class _Draws:
     ) -> AgenticDraft:
         """Buy the deciding draw and check it; the final phase must cover every design check."""
         name = identity if phase == "direct" else f"{identity}-final"
-        bought = self.buy(request, name, RUBRIC_TOOL)
-        if isinstance(bought, str):
-            return unavailable(bought)
-        response, arguments = bought
-        draft = checked_draft(
-            arguments,
-            self.packet,
-            identity=identity,
-            response=response,
-            variants=(variant,),
-            require_coverage=phase == "final",
-            library=self.library,
-            reviewer=self.reviewer,
-        )
+
+        def judge(
+            response: ArtifactInput, arguments: object
+        ) -> tuple[tuple[RubricDraft, object], str | None]:
+            draft = checked_draft(
+                arguments,
+                self.packet,
+                identity=identity,
+                response=response,
+                variants=(variant,),
+                require_coverage=phase == "final",
+                library=self.library,
+                reviewer=self.reviewer,
+            )
+            return (draft, arguments), draft.failure if draft.status == "refused" else None
+
+        settled, failure = self.settle(request, name, RUBRIC_TOOL, judge)
+        if settled is None:
+            return unavailable(failure or "no draw was answered")
+        draft, arguments = settled
+        response = draft.response
         answer = None if draft.status == "refused" else _parsed(arguments)
         phases.append(
             PhaseRecord(
@@ -720,14 +783,14 @@ class _Draws:
         )
         return done(draft)
 
-    def _phase(
+    def _judged_phase(
         self, phase: _Stage, response: ArtifactInput, arguments: object, prior: JsonObject
-    ) -> PhaseRecord:
-        """Validate one non-final phase, record it and feed it to the next phase.
+    ) -> tuple[PhaseRecord, str | None]:
+        """Check one non-final phase's answer; return its record and the failure to repair.
 
-        A refused plan or critique is recorded and the next phase is told why. A draft is kept
-        with every structural problem and design finding the host found, which the critique
-        and final phases must address.
+        A plan or critique that fails its contract, or a plan citing unsupplied locators, is
+        repaired. A draft only has to parse: its structural problems and design findings are
+        kept on the record for the critique and final phases to address.
         """
         try:
             if isinstance(arguments, ValueError):
@@ -740,35 +803,45 @@ class _Draws:
                 invented = self.packet.unsupplied(cited)
                 if invented:
                     raise ValueError(f"plan cites locators that were not supplied: {invented}")
-                prior["plan"] = plan.model_dump(mode="json")
-                return PhaseRecord(phase="plan", response=response, answer=prior["plan"])
+                answer = plan.model_dump(mode="json")
+                return PhaseRecord(phase="plan", response=response, answer=answer), None
             if phase == "critique":
-                critique = RubricCritique.model_validate(arguments)
-                prior["critique"] = critique.model_dump(mode="json")
-                return PhaseRecord(phase="critique", response=response, answer=prior["critique"])
-            answer = RubricAnswer.model_validate(arguments)
+                answer = RubricCritique.model_validate(arguments).model_dump(mode="json")
+                return PhaseRecord(phase="critique", response=response, answer=answer), None
+            parsed = RubricAnswer.model_validate(arguments)
         except ValueError as error:
-            prior[phase] = {"refused": bounded_reason(error)}
-            return PhaseRecord(phase=phase, response=response, failure=bounded_reason(error))
+            failure = bounded_reason(error)
+            return PhaseRecord(phase=phase, response=response, failure=failure), failure
         findings: list[DesignFinding] = []
         try:
-            check_rubric_structure(answer, self.packet, self.library)
+            check_rubric_structure(parsed, self.packet, self.library)
         except ValueError as error:
             findings.append(
                 DesignFinding(check=31, severity="violation", detail=bounded_reason(error))
             )
-        if answer.rubric is not None and self.reviewer is not None:
+        if parsed.rubric is not None and self.reviewer is not None:
             try:
-                findings += self.reviewer(answer.rubric)
+                findings += self.reviewer(parsed.rubric)
             except ValueError as error:
                 findings.append(
                     DesignFinding(check=31, severity="violation", detail=bounded_reason(error))
                 )
-        prior["draft"] = answer.model_dump(mode="json")
-        prior["host_findings"] = [row.model_dump(mode="json") for row in findings]
         return PhaseRecord(
-            phase="draft", response=response, answer=prior["draft"], findings=tuple(findings)
-        )
+            phase="draft",
+            response=response,
+            answer=parsed.model_dump(mode="json"),
+            findings=tuple(findings),
+        ), None
+
+    @staticmethod
+    def _phase_feed(phase: _Stage, record: PhaseRecord, prior: JsonObject) -> None:
+        """Feed a settled phase to the next: its answer, or why it was refused."""
+        if record.answer is None:
+            prior[phase] = {"refused": record.failure}
+            return
+        prior[phase] = record.answer
+        if phase == "draft":
+            prior["host_findings"] = [row.model_dump(mode="json") for row in record.findings]
 
     def reconcile(
         self, identity: str, profile: RubricAuthoringProfile, members: tuple[AgenticDraft, ...]
@@ -825,32 +898,46 @@ class _Draws:
             RECONCILE_PROMPT,
             payload,
             RECONCILE_TOOL,
-            ReconciliationAnswer.model_json_schema(),
+            answer_schema(ReconciliationAnswer),
             self.settings.output_tokens,
         )
-        bought = self.buy(request, f"{identity}-reconcile", RECONCILE_TOOL)
-        if isinstance(bought, str):
+        variants = {m.variant for m in ready}
+
+        def judge(
+            response: ArtifactInput, arguments: object
+        ) -> tuple[tuple[ArtifactInput, ReconciliationAnswer | None], str | None]:
+            try:
+                if isinstance(arguments, ValueError):
+                    raise arguments
+                answer = ReconciliationAnswer.model_validate(arguments)
+                check_rubric_answer(
+                    answer, self.packet, library=self.library, reviewer=self.reviewer
+                )
+                recorded = {row.subject for row in answer.disagreements}
+                silent = sorted({row.subject for row in detected} - recorded)
+                if silent:
+                    raise ValueError(f"reconciliation silently resolved disagreements {silent}")
+                stray = sorted(
+                    {k for row in answer.disagreements for k in row.positions} - variants
+                )
+                if stray:
+                    raise ValueError(f"disagreements name variants that drafted nothing: {stray}")
+            except ValueError as error:
+                return (response, None), bounded_reason(error)
+            return (response, answer), None
+
+        settled, failure = self.settle(request, f"{identity}-reconcile", RECONCILE_TOOL, judge)
+        if settled is None:
             return result(
                 RubricDraft(
-                    identity=identity, packet_sha256=sha, status="unavailable", failure=bought
+                    identity=identity,
+                    packet_sha256=sha,
+                    status="unavailable",
+                    failure=failure or "no draw was answered",
                 )
             )
-        response, arguments = bought
-        try:
-            if isinstance(arguments, ValueError):
-                raise arguments
-            answer = ReconciliationAnswer.model_validate(arguments)
-            check_rubric_answer(answer, self.packet, library=self.library, reviewer=self.reviewer)
-            recorded = {row.subject for row in answer.disagreements}
-            silent = sorted({row.subject for row in detected} - recorded)
-            if silent:
-                raise ValueError(f"reconciliation silently resolved disagreements {silent}")
-            variants = {m.variant for m in ready}
-            stray = sorted({k for row in answer.disagreements for k in row.positions} - variants)
-            if stray:
-                raise ValueError(f"disagreements name variants that drafted nothing: {stray}")
-        except ValueError as error:
-            failure = bounded_reason(error)
+        response, answer = settled
+        if answer is None:
             record = PhaseRecord(phase="final", response=response, failure=failure)
             draft = RubricDraft(
                 identity=identity,
@@ -893,3 +980,38 @@ def _decisions(answer: JsonObject) -> list[JsonObject]:
     """Return the library decisions of a parsed rubric answer."""
     rows = answer.get("library_decisions")
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+REPAIR_NOTE = (
+    "Repair: your previous answer failed a check. previous_answer is what you submitted and "
+    "validation_errors says what is wrong. Fix every error, keep what was right, and submit the "
+    "complete corrected answer with the same tool: a ready answer carries its rubric; cite only "
+    "locators the packet supplied; cover or waive every design check the host found uncovered."
+)
+"""The repair turn appended to a rubric draw whose answer failed a check."""
+
+
+def repair_request(request: ModelRequest, arguments: object, failure: str) -> ModelRequest:
+    """The same request plus one turn holding the failed answer and its error."""
+    previous = None if isinstance(arguments, ValueError) else arguments
+    turn = {"repair": REPAIR_NOTE, "previous_answer": previous, "validation_errors": [failure]}
+    return request.model_copy(
+        update={
+            "messages": (
+                *request.messages,
+                ModelMessage(role="user", content=json.dumps(turn, sort_keys=True, default=str)),
+            )
+        }
+    )
+
+
+def answer_schema(model: type[ContractModel]) -> JsonObject:
+    """A phase's answer schema, saying in place what its model validator requires."""
+    schema = model.model_json_schema()
+    rubric = schema.get("properties", {}).get("rubric")
+    if isinstance(rubric, dict):
+        rubric["description"] = (
+            "Required when status is ready: the complete rubric. Omit only when status is "
+            "needs_research, which then requires research."
+        )
+    return schema

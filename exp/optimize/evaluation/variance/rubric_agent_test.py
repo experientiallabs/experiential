@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.common.models import ModelMessage, ModelRequest
 from exp.optimize.evaluation.variance.authoring_packet_test import (
     ticket_coalition,
     ticket_packet,
@@ -168,7 +169,10 @@ def test_a_final_that_keeps_a_violation_or_an_unwaived_gap_is_refused(
             )
         ),
     )
-    profile = RubricAuthoringProfile(variants=("requirements-first",), critic=CRITIC)
+    # Without repairs the first failed final is refused; repairs are tested on their own.
+    profile = RubricAuthoringProfile(
+        variants=("requirements-first",), critic=CRITIC, repairs=0, redraws=0
+    )
     results = [
         author_rubric_agentic(
             fixture.project,
@@ -222,8 +226,9 @@ def test_reconciliation_records_every_disagreement_and_refuses_a_silent_merge(
         tool_reply(RECONCILE_TOOL, silent),
     )
     profile = RubricAuthoringProfile(
-        variants=("requirements-first", "alternatives-first"), agentic=False
-    )
+        variants=("requirements-first", "alternatives-first"), agentic=False, repairs=0,
+        redraws=0,
+    )  # fmt: skip
 
     merged = author_rubric_agentic(
         fixture.project, fixture.settings, reference, identity="merge", code_revision="t",
@@ -295,4 +300,69 @@ def test_library_decisions_that_differ_between_variants_must_be_reconciled(
     assert result.draft.status == "ready", result.draft.failure
     assert [row.subject for row in result.disagreements] == [subject]
     assert result.draft.rubric is not None and result.draft.rubric.library == library.citation()
-    assert profile.draws() == 3
+    assert profile.draws() == 3 * profile.attempts() == 18
+
+
+def test_a_failed_phase_answer_is_repaired_with_its_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invented plan locator and a ready final without a rubric are each sent back once."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    _, reference = ticket_packet(fixture, coalition=ticket_coalition())
+    invented = json.loads(json.dumps(PLAN).replace('"rule:tickets.tier"', '"rule:invented"'))
+    transport = wire(
+        monkeypatch,
+        tool_reply(PLAN_TOOL, invented),
+        tool_reply(PLAN_TOOL, PLAN),
+        tool_reply(RUBRIC_TOOL, covering_answer(FAST)),
+        tool_reply(CRITIQUE_TOOL, CRITIQUE),
+        tool_reply(RUBRIC_TOOL, {"status": "ready", "limitations": ["none"]}),
+        tool_reply(RUBRIC_TOOL, covering_answer(criterion("fast", role="efficiency_diagnostic"))),
+    )
+    profile = RubricAuthoringProfile(variants=("failure-patterns-first",), repairs=1, redraws=0)
+
+    result = author_rubric_agentic(
+        fixture.project, fixture.settings, reference, identity="repaired", code_revision="t",
+        profile=profile,
+    )  # fmt: skip
+
+    assert result.draft.status == "ready", result.draft.failure
+    assert len(transport.requests) == 6 <= profile.draws()
+    plan_repair, final_repair = transport.requests[1].payload, transport.requests[5].payload
+    for payload, error in ((plan_repair, "not supplied"), (final_repair, "carries its rubric")):
+        assert isinstance(payload, dict)
+        messages = payload["messages"]
+        assert isinstance(messages, list) and len(messages) == 3
+        last = messages[2]
+        assert isinstance(last, dict)
+        turn = json.loads(str(last["content"]))
+        assert error in turn["validation_errors"][0] and turn["previous_answer"] is not None
+
+
+def test_a_lost_draw_is_redrawn_and_exhausted_repairs_end_in_the_last_failure() -> None:
+    """A draw with no usable response is redrawn fresh; repairs stop at their bound."""
+    from exp.optimize.evaluation.variance.rubric_agent import _Draws
+
+    draws = object.__new__(_Draws)
+    draws.repairs, draws.redraws = 1, 1
+    names: list[str] = []
+    replies: list[object] = ["lost: output allowance", ({"ok": True}), ({"ok": False})]
+
+    def buy(request: object, name: str, tool: str) -> object:
+        names.append(name)
+        reply = replies.pop(0)
+        return reply if isinstance(reply, str) else ("response", reply)
+
+    draws.buy = buy  # type: ignore[method-assign]
+    request = ModelRequest(messages=(ModelMessage(role="user", content="{}"),))
+    result, failure = draws.settle(
+        request, "d", "tool", lambda response, args: (args, None if args["ok"] else "bad")
+    )
+    assert (result, failure) == ({"ok": True}, None) and names == ["d", "d-redraw-1"]
+
+    names.clear()
+    replies[:] = [{"ok": False}, {"ok": False}, {"ok": False}, {"ok": False}]
+    result, failure = draws.settle(
+        request, "e", "tool", lambda response, args: (args, None if args["ok"] else "bad")
+    )
+    assert failure == "bad" and names == ["e", "e-repair-1", "e-redraw-1", "e-redraw-1-repair-1"]

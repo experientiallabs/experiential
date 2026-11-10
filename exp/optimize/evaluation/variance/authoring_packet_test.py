@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -557,12 +558,13 @@ def test_a_response_the_secret_boundary_refuses_is_an_unusable_draw(
         raise ArtifactStoreError("provider response violates the secret boundary (credential)")
 
     monkeypatch.setattr(authoring_packet, "author_response", refuse)
+    unused = cast(Any, None)
     reason = authoring_packet.buy_author_draw(
-        None,
-        None,
-        None,
+        unused,
+        unused,
+        unused,
         identity="x",
         sources=(),
-        code_revision="t",  # type: ignore[arg-type]
+        code_revision="t",
     )
     assert isinstance(reason, str) and "secret boundary" in reason
