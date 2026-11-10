@@ -121,6 +121,34 @@ def all_routes_throttled_failure(remaining_seconds: float) -> GatewayFailure:
     )
 
 
+def selected_route_throttled_failure(remaining_seconds: float, selection: str) -> GatewayFailure:
+    """Return the throttle-window failure for a rung the caller confined the request to.
+
+    Same class, wait and ``Retry-After`` as :func:`all_routes_throttled_failure`,
+    but the message names the caller's own control (``selection``, from
+    ``unclaimed_route_failure``) and the remedy, because the gateway had other
+    routes for the model and the request forbade them.
+
+    Args:
+        remaining_seconds: Remaining throttle window of the selected rung.
+        selection: Public spelling of the confining routing controls.
+
+    Returns:
+        Sanitized throttled failure naming the selection and the retry window.
+    """
+    throttled = all_routes_throttled_failure(remaining_seconds)
+    seconds = throttled.retry_after_seconds
+    return throttled.model_copy(
+        update={
+            "safe_message": (
+                f"the route selected by {selection} is inside a provider throttle window; "
+                f"retry in {seconds}s, or remove {selection} to let the gateway use this "
+                "model's other routes"
+            )
+        }
+    )
+
+
 def gateway_updating_failure() -> GatewayFailure:
     """Return the sanitized retryable failure for a transient roll condition.
 

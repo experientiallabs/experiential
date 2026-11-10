@@ -199,3 +199,32 @@ def test_unsupported_keys_are_disclosed_and_the_order_survives_rescheduling() ->
     )
     assert _providers(reordered) == ["bedrock", "openai"]
     assert wires == ("w-bedrock", "w-openai")
+
+
+@pytest.mark.parametrize(
+    ("preferences", "narrowing"),
+    [
+        ({"ignore": ["anthropic"]}, ()),
+        ({"only": ["openai", "bedrock"]}, ()),
+        ({"only": ["openai"]}, ("provider.only",)),
+        ({"ignore": ["openai"]}, ("provider.ignore",)),
+        ({"allow_fallbacks": False}, ("provider.allow_fallbacks: false",)),
+        ({"order": ["bedrock"]}, ()),
+    ],
+)
+def test_only_controls_that_remove_a_rung_are_recorded_as_narrowing(
+    preferences: JsonObject, narrowing: tuple[str, ...]
+) -> None:
+    """A control that excluded nothing is never recorded, so a refusal never names it."""
+    route = apply_provider_preferences(_route("openai", "bedrock"), _request(preferences))
+    assert route.caller_narrowing == narrowing
+
+
+def test_order_keeps_a_selected_route_lead_first() -> None:
+    """``provider.order`` ranks only the fallbacks behind a ``route_id`` lead."""
+    route = _route("experiential_cloud", "bedrock", "anthropic").model_copy(
+        update={"resolved_route_id": "route_" + "f" * 64}
+    )
+    ordered = apply_provider_preferences(route, _request({"order": ["anthropic"]}))
+    assert _providers(ordered) == ["experiential_cloud", "anthropic", "bedrock"]
+    assert ordered.resolved_route_id == route.resolved_route_id

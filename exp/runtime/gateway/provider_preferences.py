@@ -7,7 +7,8 @@ never by forwarding them to an aggregator upstream:
 
 * ``only``: keep rungs whose provider is listed;
 * ``ignore``: drop rungs whose provider is listed;
-* ``order``: try rungs of the listed providers first, in that order;
+* ``order``: try rungs of the listed providers first, in that order (behind
+  the lead a ``gateway.routing.route_id`` selects, which stays first);
 * ``allow_fallbacks: false``: with ``order``, serve only the listed providers;
   without it, serve only the first eligible rung. A pinned rung that fails is
   the request's error, never a failover.
@@ -132,11 +133,41 @@ def _stage(route: GatewayRoute, index: int) -> int:
 def _order_permutation(
     route: GatewayRoute, order: tuple[str, ...], label: ProviderLabel
 ) -> tuple[int, ...]:
-    """Stable permutation leading with ``order`` within each model stage."""
+    """Stable permutation leading with ``order`` within each model stage.
+
+    A caller-selected route (``gateway.routing.route_id``) keeps its lead first:
+    the selector names the rung that must lead, and ``order`` ranks only the
+    fallbacks behind it.
+    """
     ranks = _order_rank(route, order, label)
+    pinned = route.resolved_route_id is not None
     return tuple(
-        sorted(range(len(route.deployments)), key=lambda i: (_stage(route, i), ranks[i], i))
+        sorted(
+            range(len(route.deployments)),
+            key=lambda i: (pinned and i != 0, _stage(route, i), ranks[i], i),
+        )
     )
+
+
+_NO_FALLBACKS = "provider.allow_fallbacks: false"
+"""Public spelling of OpenRouter's no-fallback control."""
+
+
+def _narrow(kept: list[int], remaining: list[int], control: str, narrowing: list[str]) -> list[int]:
+    """Return ``remaining``, recording ``control`` when it removed at least one rung.
+
+    Args:
+        kept: The rung indexes before this control.
+        remaining: The rung indexes the control keeps.
+        control: Public spelling of the control.
+        narrowing: The controls that removed a rung so far; appended to in place.
+
+    Returns:
+        ``remaining``.
+    """
+    if len(remaining) < len(kept):
+        narrowing.append(control)
+    return remaining
 
 
 def apply_provider_preferences(
@@ -173,14 +204,17 @@ def apply_provider_preferences(
             code="invalid_parameter",
         )
     kept = list(range(len(route.deployments)))
+    narrowing: list[str] = []  # The controls that actually removed a rung.
     if only is not None:
         allowed = frozenset().union(*(_names(name) for name in only)) if only else frozenset()
-        kept = [i for i in kept if labels[i] in allowed]
+        kept = _narrow(kept, [i for i in kept if labels[i] in allowed], "provider.only", narrowing)
         if not kept:
             raise _unsatisfiable("only", only, available)
     if ignore:
         excluded = frozenset().union(*(_names(name) for name in ignore))
-        kept = [i for i in kept if labels[i] not in excluded]
+        kept = _narrow(
+            kept, [i for i in kept if labels[i] not in excluded], "provider.ignore", narrowing
+        )
         if not kept:
             raise _unsatisfiable("ignore", ignore, available)
     if order:
@@ -188,14 +222,18 @@ def apply_provider_preferences(
         if not any(labels[i] in wanted for i in kept):
             raise _unsatisfiable("order", order, available)
         if not allow_fallbacks:
-            kept = [i for i in kept if labels[i] in wanted]
+            kept = _narrow(kept, [i for i in kept if labels[i] in wanted], _NO_FALLBACKS, narrowing)
     elif not allow_fallbacks:
         lead = next(
             (i for i in kept if route.deployments[i].gateway.capabilities.failover_only_on is None),
             kept[0],
         )
-        kept = [lead]
+        kept = _narrow(kept, [lead], _NO_FALLBACKS, narrowing)
     narrowed = select_route_deployments(route, tuple(kept))
+    if narrowing:
+        narrowed = narrowed.model_copy(
+            update={"caller_narrowing": (*narrowed.caller_narrowing, *narrowing)}
+        )
     if not order or len(narrowed.deployments) < 2:
         return narrowed
     return reorder_route_deployments(narrowed, _order_permutation(narrowed, order, name_of))
