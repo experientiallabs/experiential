@@ -621,3 +621,21 @@ def test_a_no_fallback_root_stage_selection_is_recorded_once() -> None:
     assert no_fallback_narrowing(cut, removed=True).caller_narrowing == (
         "gateway.routing.allow_fallbacks: false",
     )
+
+
+def test_gateway_no_fallback_is_named_beside_a_provider_control_that_already_narrowed() -> None:
+    """A one-rung route a provider control produced still names the gateway control too."""
+    narrowed = _provider_route("openai").model_copy(update={"caller_narrowing": ("provider.only",)})
+    request = _preferences_request(None).model_copy(
+        update={
+            "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
+        }
+    )
+    assert restrict_fallbacks(request, narrowed).caller_narrowing == (
+        "provider.only",
+        "gateway.routing.allow_fallbacks: false",
+    )
+    assert no_fallback_narrowing(narrowed, removed=False).caller_narrowing == (
+        "provider.only",
+        "gateway.routing.allow_fallbacks: false",
+    )

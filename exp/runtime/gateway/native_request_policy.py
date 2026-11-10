@@ -111,7 +111,12 @@ def restrict_fallbacks(request: GatewayRequest, route: GatewayRoute) -> GatewayR
 
 
 def no_fallback_narrowing(route: GatewayRoute, *, removed: bool) -> GatewayRoute:
-    """Record ``gateway.routing.allow_fallbacks: false`` once when it removed a rung.
+    """Record ``gateway.routing.allow_fallbacks: false`` once when it excludes a rung.
+
+    The control is judged against the route before any caller narrowing, like the
+    provider controls: once a provider control has removed a rung, the authorized
+    route had fallbacks the gateway control alone would also exclude, so removing
+    only the provider control would still leave the request on one rung.
 
     Args:
         route: The route after the no-fallback selection.
@@ -119,9 +124,10 @@ def no_fallback_narrowing(route: GatewayRoute, *, removed: bool) -> GatewayRoute
             selection of a staged route counts, as does keeping only the lead).
 
     Returns:
-        The route, with the control recorded in ``caller_narrowing`` when it removed one.
+        The route, with the control recorded in ``caller_narrowing`` when it excludes one.
     """
-    if not removed or _GATEWAY_NO_FALLBACKS in route.caller_narrowing:
+    excludes = removed or bool(route.caller_narrowing)
+    if not excludes or _GATEWAY_NO_FALLBACKS in route.caller_narrowing:
         return route
     return route.model_copy(
         update={"caller_narrowing": (*route.caller_narrowing, _GATEWAY_NO_FALLBACKS)}
