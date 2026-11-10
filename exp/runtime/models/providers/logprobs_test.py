@@ -326,6 +326,25 @@ def test_a_suggested_effort_admits_the_request_on_the_refusing_rung() -> None:
     assert compatible_generation_parameter_profile_indexes(route, retried) == (0,)
 
 
+def test_suggested_efforts_are_limited_to_the_rungs_effort_ladder() -> None:
+    """A qualified effort the rung cannot carry is never suggested, since the retry would fail."""
+    request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    rung = replace(
+        _reasoning_profile(("low", "ultra"), default="low"),
+        supported_reasoning_efforts=("low", "medium"),
+    )
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((rung,), request)
+    assert "one of: low," in str(caught.value)
+    assert "ultra" not in str(caught.value)
+    # No qualified effort on the ladder: the probability field is named.
+    unreachable = replace(rung, logprobs_reasoning_efforts=("ultra",))
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((unreachable,), request)
+    assert caught.value.param == "logprobs"
+    assert "cannot preserve" in str(caught.value)
+
+
 def test_an_incapable_later_rung_refuses_before_any_effort_advice() -> None:
     """Changing effort cannot admit a route whose later rung returns no probabilities."""
     request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})

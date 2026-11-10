@@ -5,6 +5,9 @@ from collections.abc import Sequence
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.generation_parameter_validation import (
+    profile_reasoning_efforts,
+)
 from exp.runtime.models.providers.protocol import emulated_stop_sequences
 from exp.runtime.models.providers.thinking_budget import (
     thinking_budget_parameter,
@@ -84,9 +87,11 @@ def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: Gatew
             if request.reasoning_effort is not None
             else profile.reasoning_effort
         )
-        qualified = profile.logprobs_reasoning_efforts
-        if effort not in qualified:
-            # The caller's effort field is named only when a qualified effort exists.
+        if effort not in profile.logprobs_reasoning_efforts:
+            # Suggest only qualified efforts the rung can also carry, or the
+            # retry is refused; with none, the caller's effort field is not named.
+            ladder = profile_reasoning_efforts(profile)
+            qualified = [level for level in profile.logprobs_reasoning_efforts if level in ladder]
             if not qualified:
                 raise ProviderParameterError(
                     message=_ROUTE_REFUSAL, param=parameter, code="unsupported_parameter"
