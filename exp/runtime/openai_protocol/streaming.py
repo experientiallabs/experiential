@@ -783,7 +783,9 @@ class ResponsesSseEncoder:
                 if status != "failed"
                 else {
                     "code": "server_error",
-                    "message": failure.safe_message
+                    # The caller wording the HTTP error carries, never the
+                    # durable operator sentence.
+                    "message": public_failure_error(failure).detail.message
                     if failure is not None
                     else "Gateway stream failed.",
                 }

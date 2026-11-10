@@ -117,7 +117,8 @@ async fn a_429_naming_an_exhausted_account_is_provider_quota_and_a_throttle_keep
     );
     assert_eq!(
         throttled.public_error().message,
-        "provider throttled the request; retry after the delay in the Retry-After header"
+        "The model's provider is rate limiting requests right now. Retry after a short delay \
+         (the Retry-After header gives the wait when the response carries one)."
     );
     // No body leaves the throttle with the status-only detail.
     let bare = open_against_body("429 Too Many Requests", "", "m").await;

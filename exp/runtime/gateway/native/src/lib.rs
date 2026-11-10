@@ -11,6 +11,7 @@ mod audio_duration;
 mod audio_elevenlabs;
 mod audio_upload;
 mod bridge;
+mod caller_copy;
 mod capture;
 mod codex_native_inversion;
 mod dialects;

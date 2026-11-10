@@ -22,7 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
     TokenLogprob,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.streaming import (
     ChatSseEncoder,
     ResponsesSseEncoder,
@@ -339,6 +339,36 @@ def test_responses_failure_closes_visible_content_then_emits_one_failed_terminal
     error = cast(JsonObject, response["error"])
     assert error["message"] == "Provider stream failed."
     assert "response.output_item.done" in {payload["type"] for payload in payloads}
+
+
+def test_responses_failed_terminal_carries_the_caller_wording() -> None:
+    """The failed envelope says what the HTTP error says, not the durable sentence."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        stream=True,
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL,
+        safe_message="all exact-model deployments are unavailable",
+    )
+    frames = encode_events(
+        ResponsesSseEncoder(
+            request_id="request-three",
+            model="coding",
+            created_at=123,
+            request=request,
+        ),
+        (GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure),),
+    )
+    terminal = next(
+        payload
+        for payload in (_responses_payload(frame) for frame in frames)
+        if payload["type"] == "response.failed"
+    )
+    error = cast(JsonObject, cast(JsonObject, terminal["response"])["error"])
+    assert error["message"] == public_failure_error(failure).detail.message
+    assert error["message"] != failure.safe_message
 
 
 def test_chat_stream_projects_choice_logprobs_metadata_events() -> None:

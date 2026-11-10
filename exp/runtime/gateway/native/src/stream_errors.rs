@@ -952,7 +952,7 @@ mod tests {
         assert_eq!(public.error_type, "invalid_request_error");
         assert_eq!(
             public.message,
-            "provider refused the request: cybersecurity policy"
+            "The model's provider declined this request (cybersecurity policy). Rephrase the request or choose another model."
         );
         assert_eq!(public.refusal_reason, Some(RefusalReason::CyberPolicy));
         // The public envelope carries the snake_case category and never the
