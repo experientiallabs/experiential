@@ -387,6 +387,7 @@ def terminal_from_settlement(
             # control plane counts refusals by reason without parsing detail.
             refusal_reason=refusal_reason_from_payload(failure_payload.get("refusal_reason")),
             header_timeout=header_timeout_from_payload(failure_payload.get("header_timeout")),
+            tenant_origin=failure_payload.get("tenant_origin") is True,
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED

@@ -2609,6 +2609,32 @@ def test_selected_route_names_an_account_failure_newer_than_its_throttle_window(
     assert not ledger.started
 
 
+def test_a_settled_tenant_origin_account_failure_is_not_replayed_on_a_selected_route() -> None:
+    """A customer-addressed origin's settled failure opens the circuit but is never named."""
+    registry, ledger, selected = _registry()
+    selected.route = selected.route.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
+    attempt = _start(registry, ordinal=0)
+    _settle(
+        registry,
+        attempt_id=str(attempt["attempt_id"]),
+        outcome="failed",
+        finalize=True,
+        failure={
+            "failure_class": "provider_authentication",
+            "safe_message": "provider rejected its credential",
+            "tenant_origin": True,
+        },
+    )
+    key = deployment_health_key(selected.authorization, selected.route.deployment)
+    assert not registry.health.claim(key)  # The circuit is open, with no nameable cause.
+    _admit(registry, selected.route.deployments, request_id="refused").route = selected.route
+    refused = _start(registry, ordinal=0, request_id="refused")
+    failure = refused["failure"]
+    assert isinstance(failure, dict)
+    assert failure["failure_class"] == "provider_internal"
+    assert len(ledger.started) == 1
+
+
 def test_an_exhausted_tenant_origin_ladder_echoes_the_opaque_marker() -> None:
     """The data plane's tenant-origin last failure comes back flagged, never as a bare class.
 
