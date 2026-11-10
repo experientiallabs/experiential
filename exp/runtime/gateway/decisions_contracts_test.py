@@ -15,10 +15,13 @@ from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway import decisions_contracts
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.decisions_contracts import (
+    CRITERIA_SURROGATES_REPLACED,
     DECISION_IMAGE_TOKEN_RESERVATION,
+    INSTRUCTIONS_SURROGATES_REPLACED,
     MAX_DECISION_BODY_BYTES,
     MAX_DECISION_INPUT_BYTES,
     MAX_DECISION_JSON_DEPTH,
+    STATE_SURROGATES_REPLACED,
     ChoiceQuestion,
     DecisionRequest,
     DecisionRequestError,
@@ -207,8 +210,8 @@ def test_out_of_native_range_integers_fail_before_admission(location: str, value
 
 
 @pytest.mark.parametrize("location", ["state", "instructions", "choice", "score"])
-@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan"), "\ud800"])
-def test_nonfinite_and_invalid_unicode_nested_values_fail_cleanly(
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_nonfinite_nested_values_fail_cleanly(
     location: str,
     value: JsonValue,
 ) -> None:
@@ -224,22 +227,140 @@ def test_exponent_overflow_is_rejected_even_when_json_syntax_is_standard() -> No
         decode_decision_request(raw)
 
 
-@pytest.mark.parametrize("location", ["alias", "state_key", "question_id", "choice_name"])
+@pytest.mark.parametrize("location", ["alias", "question_id", "choice_name"])
 def test_lone_surrogates_in_identifiers_are_refused(location: str) -> None:
-    """JSON object keys and aliases must be valid UTF-8 just like their values."""
+    """Identifiers the answer is keyed by are refused, never rewritten to U+FFFD."""
     body = _request_with_nested("valid", "state")
     if location == "alias":
         body["model"] = "\udfff"
-    elif location == "state_key":
-        body["state"] = {"\udfff": "value"}
     elif location == "question_id":
         body["questions"] = {"\udfff": {"type": "noul", "instructions": "Decide"}}
     else:
         body["questions"] = {
             "q": {"type": "choice", "instructions": "Choose", "criteria": {"\udfff": "A", "b": "B"}}
         }
-    with pytest.raises(ValueError, match="UTF-8"):
+    with pytest.raises(DecisionRequestError, match="lone UTF-16 surrogates") as refused:
         decode_decision_request(json.dumps(body))
+    assert refused.value.param == ("model" if location == "alias" else "questions")
+    assert "\udfff" not in refused.value.message
+
+
+def test_a_lone_surrogate_asset_reference_is_refused_on_assets() -> None:
+    """An asset reference names an image, so it is refused rather than rewritten."""
+    body = {**_body(), "assets": {"\ud83d": {"format": "png", "data_base64": "AAAA"}}}
+    with pytest.raises(DecisionRequestError, match="lone UTF-16 surrogates") as refused:
+        decode_decision_request(json.dumps(body))
+    assert refused.value.param == "assets"
+
+
+def test_a_repair_cannot_newly_reference_an_asset() -> None:
+    """A U+FFFD asset reference is refused while text repairs could create a match."""
+    body = {
+        **_body(),
+        "state": "see \ud83d",
+        "assets": {"\ufffd": {"format": "png", "data_base64": "AAAA"}},
+    }
+    with pytest.raises(DecisionRequestError, match="U\\+FFFD") as refused:
+        decode_decision_request(json.dumps(body))
+    assert refused.value.param == "assets"
+
+
+# What Node's well-formed JSON.stringify writes for a string sliced inside an
+# emoji: valid JSON escapes with no UTF-8 form. Python's json.dumps writes the same.
+_LONE_ESCAPES = {
+    "high": ('"cut \\ud83d"', "cut \ufffd"),
+    "low": ('"\\ude00 cut"', "\ufffd cut"),
+    "reversed pair": ('"\\ude00\\ud83d"', "\ufffd\ufffd"),
+    "high before text": ('"\\ud83dx"', "\ufffdx"),
+}
+
+
+def _raw_body(state: str) -> str:
+    """Return a request whose state text is the literal JSON ``state``."""
+    return (
+        '{"model":"jev-latest","state":{"text":' + state + "},"
+        '"questions":{"q":{"type":"noul","instructions":"Decide"}}}'
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(_LONE_ESCAPES))
+def test_lone_surrogate_escapes_in_state_become_replacement_characters(shape: str) -> None:
+    """Each lone surrogate is one U+FFFD, and the rewrite is disclosed."""
+    literal, expected = _LONE_ESCAPES[shape]
+    decoded = decode_decision_request(_raw_body(literal))
+    assert decoded.request.state == {"text": expected}
+    assert decoded.ignored_parameters == (STATE_SURROGATES_REPLACED,)
+    provider = decoded.request.provider_body("jev-1")
+    assert json.dumps(provider, ensure_ascii=False).encode("utf-8")
+
+
+def test_a_paired_escape_and_raw_emoji_are_served_unchanged() -> None:
+    """A complete surrogate pair is one scalar: nothing to replace, nothing disclosed."""
+    for literal in ('"\\ud83d\\ude00"', '"\U0001f600"'):
+        decoded = decode_decision_request(_raw_body(literal))
+        assert decoded.request.state == {"text": "\U0001f600"}
+        assert decoded.ignored_parameters == ()
+
+
+def test_a_body_without_surrogates_is_served_unchanged_and_undisclosed() -> None:
+    """The ordinary request keeps its exact admitted wire and discloses nothing."""
+    decoded = decode_decision_request(json.dumps(_body()))
+    assert decoded.ignored_parameters == ()
+    assert decoded.request.provider_body("type-safe/jev-latest") == _body()
+
+
+@pytest.mark.parametrize("location", ["state", "instructions", "choice", "score"])
+def test_lone_surrogates_in_every_content_position_are_replaced(location: str) -> None:
+    """State, instructions, and criteria descriptions are content and are repaired."""
+    body = _request_with_nested("sliced \ud83d", location)
+    decoded = decode_decision_request(json.dumps(body))
+    expected = _request_with_nested("sliced \ufffd", location)
+    assert decoded.request.provider_body("jev-latest") == expected
+    disclosure = {
+        "state": STATE_SURROGATES_REPLACED,
+        "instructions": INSTRUCTIONS_SURROGATES_REPLACED,
+        "choice": CRITERIA_SURROGATES_REPLACED,
+        "score": CRITERIA_SURROGATES_REPLACED,
+    }[location]
+    assert decoded.ignored_parameters == (disclosure,)
+
+
+def test_noul_outcome_descriptions_and_content_keys_are_replaced() -> None:
+    """Keys inside content are content; noul's true and false stay fixed vocabulary."""
+    body = _body()
+    body["state"] = {"title \udc00": {"inner \ud800": ["\ud800"]}}
+    body["questions"] = {
+        "q": {"type": "noul", "instructions": "Decide", "criteria": {"true": "yes \ud83d"}}
+    }
+    decoded = decode_decision_request(json.dumps(body))
+    assert decoded.request.state == {"title \ufffd": {"inner \ufffd": ["\ufffd"]}}
+    assert decoded.request.provider_body("m")["questions"] == {
+        "q": {"type": "noul", "instructions": "Decide", "criteria": {"true": "yes \ufffd"}}
+    }
+    assert decoded.ignored_parameters == (
+        STATE_SURROGATES_REPLACED,
+        CRITERIA_SURROGATES_REPLACED,
+    )
+
+
+@pytest.mark.parametrize(
+    "state", ['{"a\\ud800": 1, "a\\udc00": 2}', '{"a\\ufffd": 1, "a\\ud800": 2}']
+)
+def test_content_keys_that_collide_once_replaced_are_refused(state: str) -> None:
+    """Replacement never merges two caller keys into one silently."""
+    with pytest.raises(DecisionRequestError, match="distinct") as refused:
+        decode_decision_request(_raw_body(state))
+    assert refused.value.param == "state"
+    assert public_decision_error(refused.value) == ("state", refused.value.message)
+
+
+def test_a_bom_and_a_raw_surrogate_keep_their_existing_refusals() -> None:
+    """Only JSON escapes are repaired; text that never was UTF-8 is still refused."""
+    with pytest.raises(json.JSONDecodeError):
+        decode_decision_request("\ufeff" + json.dumps(_body()))
+    raw = json.dumps(_body(), ensure_ascii=False).replace("Refund", "Refund \ud83d")
+    with pytest.raises(DecisionRequestError, match="valid UTF-8 text"):
+        decode_decision_request(raw)
 
 
 @pytest.mark.parametrize("depth", [MAX_DECISION_JSON_DEPTH + 1, 1500])

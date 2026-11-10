@@ -180,7 +180,9 @@ class NativeDecisionsMixin:
         except Exception as exc:  # noqa: BLE001 - sanitize the authority boundary.
             raise authority_error(exc) from exc
         try:
-            return _admit_accepted(self, authorization, decoded.request, deadline)
+            return _admit_accepted(
+                self, authorization, decoded.request, deadline, decoded.ignored_parameters
+            )
         except NativeBridgeError:
             raise
         except Exception as exc:  # noqa: BLE001 - close every accepted failure.
@@ -199,8 +201,13 @@ def _admit_accepted(
     authorization: AuthorizationSnapshot,
     request: DecisionRequest,
     deadline: float,
+    ignored_parameters: tuple[str, ...] = (),
 ) -> str:
-    """Package only certified, available, explicitly priced decision deployments."""
+    """Package only certified, available, explicitly priced decision deployments.
+
+    ``ignored_parameters`` are the decoder's disclosed rewrites; the native
+    plane returns them on the answer as ``x-experiential-ignored-parameters``.
+    """
     if not isinstance(authorization.target, DirectTarget):
         _finish_unsupported(plane, authorization)
         raise NativeBridgeError(not_a_decision_model_error(authorization.alias))
@@ -310,6 +317,7 @@ def _admit_accepted(
         },
         "maximum_total_attempts": depth,
         "maximum_same_deployment_attempts": 1,
+        "ignored_parameters": list(ignored_parameters),
     }
     serialized = json.dumps(response, separators=(",", ":"))
     plane._accounting.register(  # noqa: SLF001

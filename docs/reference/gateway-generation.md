@@ -212,6 +212,37 @@ the order the model produced.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.
+- A lone UTF-16 surrogate escape (`\ud83d` without its pair, what JavaScript's well-formed
+  `JSON.stringify` writes for a string cut inside an emoji) is valid JSON with no UTF-8 form.
+  On Chat, Responses and Messages (and a Messages count) every such escape in content
+  (message text and parts, tool results, tool-call `arguments`, system prompts and
+  instructions, tool descriptions and schemas, metadata) becomes U+FFFD before any decoder
+  reads the body, disclosed once per field path as `<path>->replaced(lone_surrogate)` with
+  list positions omitted (`messages.content`, `messages.tool_calls.function.arguments`,
+  `system.text`). A path stops at a caller-keyed object (`parameters`, `input_schema`,
+  `schema`, `metadata`, `properties`, a tool call's `input`, a tool's `input_examples`, a message's `provider_specific_fields`), so no
+  caller key is echoed.
+  A field that names something is a 400 `invalid_parameter` naming that field instead:
+  `model`, tool and function `name`s, a call's `namespace`, `id`, `call_id`, `tool_call_id`,
+  `tool_use_id`, `previous_response_id`, `file_id`, `user`, `safety_identifier`,
+  `prompt_cache_key` (and its `promptCacheKey` alias), `server_label`, `tool_name`,
+  `allowed_callers` entries, media `url`/`image_url`/`file_url`, MCP `server_url`, web-search
+  domain filters (`include_domains`, `exclude_domains`, `allowed_domains`, `blocked_domains`),
+  Messages `inference_geo`, `metadata.user_id`, `type`, `role`, any string inside a
+  verbatim provider object (a Responses call's `caller`, `client_metadata`; Messages
+  `context_management`, `diagnostics`, `safeguards`, `output_config`, `citations`) or the
+  top-level `provider` routing preferences, and opaque provider tokens (`signature`,
+  `thought_signature`, `encrypted_content`, `data`), as is an object key holding one
+  (including a key inside tool-call `arguments` the decoder reads as an object, also when the
+  arguments are double-encoded or cut off mid-object; arguments sent as an object are the
+  caller's own content).
+  After 64 distinct field paths, further repairs are disclosed by their top-level field, and
+  after 128 disclosures (or for a name over 256 characters) as `body`. The same refusal covers an MCP
+  `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
+  `stop_sequences` controls, and any string inside a web-search `user_location`, a file-search `filters` object, MCP
+  `headers` or a `network_policy`'s `domain_secrets`.
+  Embeddings, images and audio have no disclosure channel, so a lone surrogate there is the
+  same field-named 400. A body whose bytes are not UTF-8 stays `invalid_json`.
 - A Chat system, developer, user or tool message whose `content` is null or omitted (Go clients
   drop an empty tool result under `omitempty`) is refused with `400 invalid_parameter` naming
   `messages.<n>.content`; an empty string is content and is accepted.

@@ -6,13 +6,20 @@ import json
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
+from exp.runtime.gateway.lone_surrogates import (
+    LoneSurrogateRefusal,
+    may_hold_lone_surrogate,
+    refuse_lone_surrogates,
+    replace_lone_surrogates,
+)
+from exp.runtime.models.providers.json_prefix import incomplete_json_object_prefix
 from exp.runtime.openai_protocol.audio_requests import (
     DecodedSpeechRequest,
     DecodedTranscriptionRequest,
     decode_speech,
     decode_transcription,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
 from exp.runtime.openai_protocol.image_edits_requests import decode_image_edits
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
@@ -66,18 +73,20 @@ def decode_native_body(
         NativeDecodeError: The body is not JSON, not an object, or fails
             shared protocol validation.
     """
-    payload = _load_object_body(body)
+    payload, repairs = _load_repaired_body(body)
     try:
         if surface == "messages":
-            return decode_messages(payload, anthropic_beta=anthropic_beta)
-        decoder = decode_responses if surface == "responses" else decode_chat
-        return decoder(
-            payload,
-            idempotency_key=idempotency_key,
-            client_request_id=client_request_id,
-        )
+            decoded = decode_messages(payload, anthropic_beta=anthropic_beta)
+        else:
+            decoder = decode_responses if surface == "responses" else decode_chat
+            decoded = decoder(
+                payload,
+                idempotency_key=idempotency_key,
+                client_request_id=client_request_id,
+            )
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
+    return _disclosed(decoded, repairs)
 
 
 def decode_native_count_tokens_body(
@@ -101,11 +110,12 @@ def decode_native_count_tokens_body(
         NativeDecodeError: The body is not JSON, not an object, or fails
             shared protocol validation.
     """
-    payload = _load_object_body(body)
+    payload, repairs = _load_repaired_body(body)
     try:
-        return decode_messages_count_tokens(payload, anthropic_beta=anthropic_beta)
+        decoded = decode_messages_count_tokens(payload, anthropic_beta=anthropic_beta)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
+    return _disclosed(decoded, repairs)
 
 
 def decode_native_embeddings_body(body: str) -> DecodedEmbeddingsRequest:
@@ -133,7 +143,58 @@ def decode_native_embeddings_body(body: str) -> DecodedEmbeddingsRequest:
         raise NativeDecodeError(exc) from exc
 
 
+def _load_repaired_body(body: str) -> tuple[JsonObject, tuple[str, ...]]:
+    """Parse a text-generation body, replacing lone surrogates in its content.
+
+    The one place every Chat, Responses, and Messages body (and a Messages
+    count) is repaired, before any decoder reads a string; see
+    :mod:`exp.runtime.gateway.lone_surrogates`.
+
+    Returns:
+        The repaired object and its ``->replaced(lone_surrogate)`` disclosures.
+
+    Raises:
+        NativeDecodeError: The body is not a JSON object, or a name holds a
+            lone surrogate.
+    """
+    payload = _parse_object_body(body)
+    if not may_hold_lone_surrogate(body):
+        return payload, ()
+    try:
+        return payload, replace_lone_surrogates(
+            payload, object_prefix=incomplete_json_object_prefix
+        )
+    except LoneSurrogateRefusal as exc:
+        raise NativeDecodeError(invalid_field(exc.param, exc.message)) from exc
+
+
+def _disclosed(decoded: DecodedGatewayRequest, repairs: tuple[str, ...]) -> DecodedGatewayRequest:
+    """Append the decode-time repairs to the request's disclosed parameters."""
+    if not repairs:
+        return decoded
+    request = decoded.request
+    disclosures = tuple(dict.fromkeys((*request.ignored_parameters, *repairs)))
+    return decoded.model_copy(
+        update={"request": request.model_copy(update={"ignored_parameters": disclosures})}
+    )
+
+
 def _load_object_body(body: str) -> JsonObject:
+    """Parse a body for a surface with no disclosure channel; refuse lone surrogates.
+
+    Embeddings, images, and audio cannot announce a rewrite, so a lone
+    surrogate there is a field-specific 400 rather than a silent U+FFFD.
+    """
+    payload = _parse_object_body(body)
+    if may_hold_lone_surrogate(body):
+        try:
+            refuse_lone_surrogates(payload)
+        except LoneSurrogateRefusal as exc:
+            raise NativeDecodeError(invalid_field(exc.param, exc.message)) from exc
+    return payload
+
+
+def _parse_object_body(body: str) -> JsonObject:
     """Parse one raw request body into a JSON object or raise the public error."""
     try:
         payload = json.loads(body)

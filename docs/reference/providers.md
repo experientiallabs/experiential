@@ -212,6 +212,17 @@ all three question types; replace `systemone` with the decision alias your gatew
 | `choice` | Object mapping 2 through 64 category names to text, object, or array descriptions, or `null` | `type`, `choice`, `confidence`, `probabilities` keyed by the requested names |
 | `score` | Ordered array of 2 through 10 text, object, or array descriptions | `type`, `score`, `confidence`, `legend`, `probabilities` keyed by zero-based index strings |
 
+A lone UTF-16 surrogate escape (`\ud83d` without its pair, which JavaScript's `JSON.stringify`
+writes for a string cut inside an emoji) has no UTF-8 form, so the gateway replaces each one with
+U+FFFD in content (state, instructions, criteria descriptions, and the keys inside them) and
+names the rewrite in the answer's `x-experiential-ignored-parameters` list
+(`state->replaced(lone_surrogate)`, `questions.instructions->replaced(lone_surrogate)`,
+`questions.criteria->replaced(lone_surrogate)`). Identifiers the answer is keyed by (`model`,
+question IDs, choice category names, asset references) are refused instead, and so are two
+content keys that would become equal, and an asset reference containing U+FFFD while a
+repair is made (the repair could otherwise newly reference that asset). A body whose bytes are not UTF-8 is refused as invalid
+JSON.
+
 The response contains `id`, the requested public `model` alias, `answers` under the original
 question IDs, and `usage.input_tokens` / `usage.output_tokens`. These are structured decision
 values, not assistant text. Probabilities and confidence must be finite values from 0 to 1,
