@@ -268,6 +268,7 @@ def test_an_unqualified_effort_names_the_efforts_that_serve_probabilities() -> N
     assert "'medium'" in str(caught.value)
     assert "low, high, max" in str(caught.value)
     assert "remove logprobs and top_logprobs" in str(caught.value)
+    assert "thinking on/off control set to agree" in str(caught.value)
     # No qualified effort at all keeps the route refusal on the probability field,
     # whether or not the caller sent an effort: changing it cannot admit the request.
     unqualified = replace(profile, logprobs_reasoning_efforts=())
@@ -335,7 +336,7 @@ def test_a_suggested_effort_admits_the_request_on_the_refusing_rung() -> None:
     with pytest.raises(ProviderParameterError) as caught:
         compatible_generation_parameter_profile_indexes(route, request)
     assert caught.value.param == "reasoning_effort"
-    assert "one of: low, max," in str(caught.value)
+    assert "one of: low, max (" in str(caught.value)
     retried = request.model_copy(update={"reasoning_effort": "low"})
     assert compatible_generation_parameter_profile_indexes(route, retried) == (0,)
 
@@ -355,7 +356,7 @@ def test_suggested_efforts_are_limited_to_the_rungs_effort_ladder() -> None:
     )
     with pytest.raises(ProviderParameterError) as caught:
         require_chat_logprobs((rung,), request)
-    assert "one of: low," in str(caught.value)
+    assert "one of: low (" in str(caught.value)
     assert "ultra" not in str(caught.value)
     # No qualified effort on the ladder: the probability field is named.
     unreachable = replace(rung, logprobs_reasoning_efforts=("ultra",))

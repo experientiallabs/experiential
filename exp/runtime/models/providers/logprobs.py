@@ -43,7 +43,8 @@ def _effort_refusal(
     if _caller_named_effort(request):
         return (
             f"Token probabilities are not available with {field} {effort!r} on this model. "
-            f"Use {field} one of: {choices}, or remove {remove}."
+            f"Use {field} one of: {choices} (with any thinking on/off control set to agree), "
+            f"or remove {remove}."
         )
     if request.reasoning_effort is not None:
         return (
