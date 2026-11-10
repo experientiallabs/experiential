@@ -36,6 +36,7 @@ from exp.runtime.models.providers.capability_policy import STRICT_TOOLS_DISCLOSU
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.protocol import NativeWireClient
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
 _SCHEMA: JsonObject = {
@@ -1142,8 +1143,9 @@ def test_a_failover_only_strict_tool_rung_never_blocks_the_strict_tools_coercion
 
 def test_the_first_dial_is_the_best_ranked_unrestricted_rung() -> None:
     """A failover-only Responses rung wins the custom-grammar preference; among the
-    unrestricted rungs the one that keeps ``temperature`` takes the first dial, so the
-    shared request keeps it instead of dropping it for the first serviceable rung."""
+    unrestricted rungs the one that keeps ``temperature`` takes the first dial and leads
+    the shared request's shaping, so the temperature is kept, not dropped for the first
+    serviceable rung or shaped for a rung that never dials first."""
     plain, _client = _astra_profile("https://plain.test", sampling=False)
     faithful, _client = _astra_profile("https://faithful.test", sampling=True)
     responses = GatewayWireProfile(
@@ -1178,5 +1180,10 @@ def test_the_first_dial_is_the_best_ranked_unrestricted_rung() -> None:
         }
     ).request
     indexes = generation_parameter_indexes(route, wires, request)
-    assert 2 in indexes
-    assert 0 not in indexes
+    # The failover-only Responses rung ranked ahead of the first dial is left
+    # out, so the selected unrestricted rung also leads route-wide shaping.
+    assert indexes == (2,)
+    _public, provider = route_generation_parameter_requests(
+        tuple(wires[index][0] for index in indexes), request
+    )
+    assert provider.temperature == 0.2

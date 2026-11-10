@@ -270,7 +270,8 @@ def generation_parameter_indexes(
     dial, the result is instead the most exact tier that holds the
     unrestricted rung the normal ranking prefers among the unrestricted rungs:
     what it cannot honor adapts or drops, disclosed, rather than the request
-    failing on a route that serves it.
+    failing on a route that serves it. A failover-only rung ranked ahead of
+    that rung is left out, so the first dial also leads route-wide shaping.
 
     Args:
         route: The route ``resolved_wires`` is aligned with.
@@ -305,7 +306,12 @@ def generation_parameter_indexes(
     )
     lead = dialable[ranked[0]]
     kept = compatible_generation_parameter_profile_indexes(profiles, request, keep=lead)
-    return kept if lead in kept else indexes
+    # Route-wide shaping reads the first kept rung as the lead (level-less
+    # reasoning defaults, lead-scoped disclosures), so a failover-only rung
+    # ranked ahead of the first dial is left out rather than shaping for it.
+    return tuple(
+        index for index in kept if index >= lead or rung_rules(route.deployments[index]) is None
+    )
 
 
 def narrow_to_capable_rungs(
