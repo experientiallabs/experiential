@@ -240,7 +240,7 @@ the order the model produced.
   After 64 distinct field paths, further repairs are disclosed by their top-level field, and
   after 128 disclosures (or for a name over 256 characters) as `body`. The same refusal covers an MCP
   `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, an apply-patch `operation.path`, a local shell
-  `working_directory`, an image generation `result`, an agent message's `author`, `recipient`
+  `working_directory`, a computer action's `keys`, a shell skill's `skill_id`, an image generation `result`, an agent message's `author`, `recipient`
   and `agent_name`, a `configuration_update`'s `reasoning.effort`, the Messages `speed` and
   `thinking.display` selectors, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
   `stop_sequences` controls, and any string inside a web-search `user_location`, a file-search `filters` object, MCP

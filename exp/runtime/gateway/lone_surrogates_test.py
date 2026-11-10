@@ -805,6 +805,10 @@ def test_an_apply_patch_path_is_refused() -> None:
             {"type": "local_shell_call", "action": {"env": {"TOKEN": "t\ud83d"}}},
             "input.0.action.env",
         ),
+        (
+            {"type": "computer_call", "action": {"keys": ["ctrl", "k\ud83d"]}},
+            "input.0.action.keys.1",
+        ),
     ],
 )
 def test_replayed_item_paths_payloads_and_agents_are_refused(item: JsonObject, param: str) -> None:
@@ -843,3 +847,21 @@ def test_messages_pass_through_controls_are_refused(body: JsonObject, param: str
     with pytest.raises(LoneSurrogateRefusal) as refused:
         _replace(body)
     assert refused.value.param == param
+
+
+def test_a_shell_skill_id_is_refused() -> None:
+    """A stored skill reference on a shell tool declaration is a resource selector."""
+    body: JsonObject = {
+        "tools": [{"type": "shell", "environment": {"skills": [{"skill_id": "s\ud83d"}]}}]
+    }
+    with pytest.raises(LoneSurrogateRefusal) as refused:
+        _replace(body)
+    assert refused.value.param == "tools.0.environment.skills.0.skill_id"
+
+
+def test_a_namespace_output_schema_is_caller_keyed_schema_content() -> None:
+    """Keys below ``output_schema`` are the caller's schema: repaired, never refused."""
+    body: JsonObject = {
+        "tools": [{"type": "namespace", "output_schema": {"$defs": {"id": {"title": "x\ud83d"}}}}]
+    }
+    assert _replace(body) == ("tools.output_schema->replaced(lone_surrogate)",)

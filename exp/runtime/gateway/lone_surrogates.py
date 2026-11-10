@@ -71,6 +71,8 @@ IDENTIFIER_FIELDS = frozenset(
         "agent_name",
         "effort",
         "speed",
+        "keys",
+        "skill_id",
         "container",
         "fingerprint",
         "authorization",
@@ -152,6 +154,7 @@ OPEN_OBJECT_FIELDS = frozenset(
     {
         "parameters",
         "input_schema",
+        "output_schema",
         "schema",
         "metadata",
         "properties",
