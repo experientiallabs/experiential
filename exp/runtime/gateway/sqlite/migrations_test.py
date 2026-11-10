@@ -745,6 +745,25 @@ def test_concurrent_initializers_choose_migration_plan_under_exclusive_lock(
         connection.close()
 
 
+def test_locked_database_reports_contention_and_remains_usable(tmp_path: Path) -> None:
+    """A competing writer produces an actionable lock error, never a corruption claim."""
+    path = tmp_path / "gateway.db"
+    initialize_database(path)
+    writer = sqlite3.connect(path, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(
+            GatewaySchemaError, match="locked by another exp process.*retry"
+        ) as caught:
+            initialize_database(path, busy_timeout_ms=50)
+        assert "corrupt" not in str(caught.value).lower()
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+    assert initialize_database(path, busy_timeout_ms=50) is None
+
+
 def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: Path) -> None:
     """Unknown future versions and missing schema objects fail closed."""
     newer = tmp_path / "newer.db"
