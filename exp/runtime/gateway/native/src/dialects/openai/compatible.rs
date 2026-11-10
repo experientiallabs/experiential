@@ -134,6 +134,7 @@ impl Normalizer {
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         if frame.data == "[DONE]" {
+            self.chat_logprobs.end_stream();
             return self.finish_openai_compatible_stream();
         }
         let payload = parse_object(&frame.data)?;
@@ -252,9 +253,43 @@ impl Normalizer {
                     _ => String::new(),
                 }
             };
+            let delta = choice.get("delta");
+            // Exactly the reasoning value the decoder emits: a string only.
+            let mut reasoning = delta
+                .and_then(|delta| {
+                    delta
+                        .get("reasoning_content")
+                        .filter(|value| !value.is_null())
+                        .or_else(|| delta.get("reasoning"))
+                })
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let (thinking, thinking_after_answer) = typed_thinking(delta);
+            reasoning.push_str(&thinking);
+            let present = |key: &str| {
+                delta
+                    .and_then(|delta| delta.get(key))
+                    .is_some_and(|value| match value {
+                        Value::Null => false,
+                        Value::Array(items) => !items.is_empty(),
+                        _ => true,
+                    })
+            };
             let output = crate::capture::logprobs::FrameOutput {
                 content: text("content"),
                 refusal: text("refusal"),
+                reasoning,
+                finishes: choice
+                    .get("finish_reason")
+                    .is_some_and(|reason| reason.is_string()),
+                // Tool calls and images are output the text check cannot
+                // spell; typed thinking after answer text in one frame cannot
+                // be ordered reasoning first.
+                opaque: present("tool_calls")
+                    || present("function_call")
+                    || present("images")
+                    || thinking_after_answer,
             };
             self.chat_logprobs
                 .retain(choice.get("logprobs"), choice_index as u32, &output);
@@ -692,6 +727,42 @@ impl Normalizer {
         }
         self.finish_openai_compatible_stream()
     }
+}
+
+/// Typed thinking text in a `delta.content` parts array, in wire order (the
+/// text the normalizer surfaces as reasoning), and whether a thinking part
+/// follows answer text within the same array. Capture alignment only: a
+/// malformed part contributes nothing here and fails the decoder instead.
+fn typed_thinking(delta: Option<&Value>) -> (String, bool) {
+    let mut thinking = String::new();
+    let mut answer = false;
+    let mut after_answer = false;
+    let Some(Value::Array(parts)) = delta.and_then(|delta| delta.get("content")) else {
+        return (thinking, after_answer);
+    };
+    for part in parts {
+        let before = thinking.len();
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                answer |= part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty());
+            }
+            Some("thinking") => match part.get("thinking") {
+                Some(Value::String(text)) => thinking.push_str(text),
+                Some(Value::Array(inner)) => inner
+                    .iter()
+                    .filter(|fragment| fragment.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|fragment| fragment.get("text").and_then(Value::as_str))
+                    .for_each(|text| thinking.push_str(text)),
+                _ => {}
+            },
+            _ => {}
+        }
+        after_answer |= answer && thinking.len() > before;
+    }
+    (thinking, after_answer)
 }
 
 #[cfg(test)]
