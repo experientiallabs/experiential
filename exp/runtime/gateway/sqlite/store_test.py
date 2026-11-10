@@ -31,6 +31,7 @@ from exp.runtime.gateway.sqlite.alias_activation import (
 from exp.runtime.gateway.sqlite.provider_authority import (
     ProviderAuthorityError,
     ProviderConnectionBinding,
+    provider_connection_revision_id,
 )
 from exp.runtime.gateway.sqlite.store import (
     AliasNotGrantedError,
@@ -1258,6 +1259,96 @@ def test_provider_revisions_are_sqlite_authority_and_alias_bindings_remain_froze
             organization_id="org-one",
             connection_id="primary",
         )
+
+
+def test_disabled_provider_connection_can_be_added_again(tmp_path: Path) -> None:
+    """Adding a removed name reactivates it without colliding with retained history."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    original = ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY")
+    original_revision = provider_connection_revision_id("primary", original)
+    _, first = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=original_revision,
+        config=original,
+    )
+    assert store.disable_provider_connection(organization_id="org-one", connection_id="primary")
+
+    with pytest.raises(ProviderAuthorityError, match="different immutable revision"):
+        store.upsert_provider_connection(
+            organization_id="org-one",
+            connection_id="primary",
+            revision_id="mismatched-revision",
+            config=original,
+        )
+    assert store.provider_connections(organization_id="org-one") == ()
+
+    changed, restored = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=original_revision,
+        config=original,
+    )
+
+    assert changed
+    assert restored == first
+    assert store.provider_connections(organization_id="org-one") == (first,)
+
+    assert store.disable_provider_connection(organization_id="org-one", connection_id="primary")
+    replacement = ConnectionConfig(provider="openai", api_key_env="SECONDARY_OPENAI_KEY")
+    changed, replaced = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=provider_connection_revision_id("primary", replacement),
+        config=replacement,
+    )
+    assert changed
+    assert replaced.revision_number == 2
+
+
+def test_provider_connection_can_return_to_an_older_revision(tmp_path: Path) -> None:
+    """A revision switchback reuses history without corrupting later numbering."""
+    store = SQLiteGatewayStore(tmp_path / "gateway.db")
+    store.create_organization(organization_id="org-one", slug="one", display_name="One")
+    configs = (
+        ConnectionConfig(provider="openai", api_key_env="OPENAI_API_KEY"),
+        ConnectionConfig(provider="openai", api_key_env="SECONDARY_OPENAI_KEY"),
+        ConnectionConfig(provider="openai", api_key_env="THIRD_OPENAI_KEY"),
+    )
+    revisions = tuple(provider_connection_revision_id("primary", config) for config in configs)
+    _, first = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=revisions[0],
+        config=configs[0],
+    )
+    store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=revisions[1],
+        config=configs[1],
+        replace=True,
+    )
+
+    changed, restored = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=revisions[0],
+        config=configs[0],
+        replace=True,
+    )
+    _, third = store.upsert_provider_connection(
+        organization_id="org-one",
+        connection_id="primary",
+        revision_id=revisions[2],
+        config=configs[2],
+        replace=True,
+    )
+
+    assert changed
+    assert restored == first
+    assert third.revision_number == 3
 
 
 def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Path) -> None:
