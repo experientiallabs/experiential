@@ -7,6 +7,11 @@ from dataclasses import replace
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import (
+    DocumentContentPart,
+    ImageContentPart,
+    TextContentPart,
+)
 from exp.common.models.model import ReasoningEffort
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.contracts import (
@@ -24,10 +29,21 @@ from exp.runtime.models.providers.capability_policy import (
     coerce_generation_parameters,
     coerce_structured_text_schema,
 )
-from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
+from exp.runtime.models.providers.dialect_dispatch import (
+    IMAGE_INPUT_DEFAULT_NOTICE,
+    IMAGE_INPUT_DROP_DISCLOSURE,
+    IMAGE_INPUT_PLACEHOLDER,
+    dialect_stream_payload,
+    image_input_notice,
+    latest_turn_user_indexes,
+)
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.reasoning_compat import efforts_by_nearness
-from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
+from exp.runtime.models.providers.streaming_requests import (
+    TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+    TOOL_RESULT_IMAGE_PLACEHOLDER,
+    route_generation_parameter_requests,
+)
 
 
 def _budgeted_haiku_profile() -> GatewayWireProfile:
@@ -863,9 +879,163 @@ def test_tool_result_images_degrade_with_placeholder_on_a_non_vision_route() -> 
     assert coercion.disclosures == (TOOL_RESULT_IMAGE_DROP_DISCLOSURE,)
 
 
-def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
-    """A user image the caller can re-send never degrades silently."""
-    assert coerce_capability("image_input", _tool_image_request(user_image=True)) is None
+def test_user_images_degrade_with_placeholder_beside_tool_images() -> None:
+    """A pasted user image degrades like a tool screenshot instead of refusing.
+
+    Both live in the history an agent resends every turn, so refusing either
+    wedges the thread; each image becomes placeholder text in place and each
+    kind is disclosed.
+    """
+    coercion = coerce_capability("image_input", _tool_image_request(user_image=True))
+    assert coercion is not None
+    user, tool = coercion.request.messages
+    assert user.content_parts == ()
+    # The only user turn is the latest: the model is asked to tell the user.
+    assert user.content == "go" + IMAGE_INPUT_DEFAULT_NOTICE
+    assert tool.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert coercion.request.images == ()
+    assert coercion.disclosures == (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        IMAGE_INPUT_DROP_DISCLOSURE,
+    )
+
+
+def test_user_image_keeps_other_attachments_in_place() -> None:
+    """Only image parts are replaced; a document beside them keeps its slot."""
+    pdf = DocumentContentPart(media_type="application/pdf", data="JVBERi0xLjQK")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="see",
+                content_parts=(
+                    TextContentPart(text="see"),
+                    ImageContentPart(media_type="image/png", data="aGk="),
+                    pdf,
+                ),
+            ),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    (message,) = coercion.request.messages
+    assert message.content_parts == (
+        TextContentPart(text="see"),
+        TextContentPart(text=IMAGE_INPUT_DEFAULT_NOTICE),
+        pdf,
+    )
+    assert message.content == "see" + IMAGE_INPUT_DEFAULT_NOTICE
+
+
+def _user_image(text: str) -> GatewayMessage:
+    """One user message carrying ``text`` and a small PNG."""
+    return GatewayMessage(
+        role="user",
+        content=text,
+        content_parts=(
+            TextContentPart(text=text),
+            ImageContentPart(media_type="image/png", data="aGk="),
+        ),
+    )
+
+
+def test_only_the_latest_user_turn_asks_the_model_to_surface_the_error() -> None:
+    """Show the error, keep the history alive.
+
+    A resent image in an earlier turn becomes a bare marker so the model does
+    not repeat the error every turn; the latest turn's image carries the
+    host's per-model copy when one is authored, else the default notice.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            _user_image("old"),
+            GatewayMessage(role="assistant", content="ok"),
+            _user_image("new"),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    old, _assistant, new = coercion.request.messages
+    assert old.content == "old" + IMAGE_INPUT_PLACEHOLDER
+    assert new.content == "new" + IMAGE_INPUT_DEFAULT_NOTICE
+
+    copy = "We're rejecting images on this model for now."
+    custom = coerce_capability("image_input", request, copy)
+    assert custom is not None
+    assert custom.request.messages[0].content == "old" + IMAGE_INPUT_PLACEHOLDER
+    assert custom.request.messages[2].content == "new" + image_input_notice(copy)
+    assert image_input_notice(copy) == (
+        "[image not processed: this model does not accept image input. "
+        "Tell the user exactly this: We're rejecting images on this model for now.]"
+    )
+    # Blank copy is no copy.
+    assert image_input_notice("  ") == IMAGE_INPUT_DEFAULT_NOTICE
+
+
+def test_every_user_message_since_the_model_spoke_is_the_latest_turn() -> None:
+    """An image, then its question, as two user messages: both are the latest turn.
+
+    Same rule as the decoders' history-media pass (the user messages since the
+    model last spoke), so the image sent just before the question still gets
+    the notice rather than the bare history marker.
+    """
+    messages = (
+        _user_image("old"),
+        GatewayMessage(role="assistant", content="ok"),
+        _user_image("here"),
+        GatewayMessage(role="user", content="what is this?"),
+    )
+    assert latest_turn_user_indexes(messages) == frozenset({2, 3})
+    coercion = coerce_capability(
+        "image_input",
+        GatewayRequest(surface=GatewayApiSurface.CHAT_COMPLETIONS, messages=messages),
+    )
+    assert coercion is not None
+    old, _assistant, here, _question = coercion.request.messages
+    assert old.content == "old" + IMAGE_INPUT_PLACEHOLDER
+    assert here.content == "here" + IMAGE_INPUT_DEFAULT_NOTICE
+
+
+def test_a_tool_screenshot_degrades_even_without_caller_text() -> None:
+    """The caller-text guard covers caller-turn images only.
+
+    A tool screenshot is history the caller cannot edit, so it degrades even
+    when no message carries text beside it.
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content=" "),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="",
+                content_parts=(ImageContentPart(media_type="image/png", data="aGk="),),
+            ),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    assert coercion.request.messages[1].content == TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert coercion.disclosures == (TOOL_RESULT_IMAGE_DROP_DISCLOSURE,)
+
+
+def test_a_request_of_nothing_but_images_keeps_the_refusal() -> None:
+    """With no caller text the placeholder would be all the model sees."""
+    image_only = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are helpful."),
+            GatewayMessage(
+                role="user",
+                content="",
+                content_parts=(ImageContentPart(media_type="image/png", data="aGk="),),
+            ),
+        ),
+    )
+    assert coerce_capability("image_input", image_only) is None
     # And a request with no images at all offers nothing to coerce.
     assert (
         coerce_capability(
@@ -1594,3 +1764,69 @@ def test_an_active_effort_never_snaps_down_to_off() -> None:
     assert coercion is not None
     assert coercion.request.reasoning_effort == "high"
     assert coercion.disclosures == ("reasoning_effort->high(nearest_supported)",)
+
+
+def test_degraded_images_keep_every_cache_marker_on_their_blocks() -> None:
+    """A caller cache boundary on an image or on the text beside it survives the degrade.
+
+    The placeholder inherits the image's marker and the marked text run is
+    rebuilt from the new parts, so an Anthropic-wire rung still re-emits
+    every breakpoint the caller placed.
+    """
+    marker: JsonObject = {"type": "ephemeral"}
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="look",
+                content_parts=(
+                    TextContentPart(text="look", cache_control=marker),
+                    ImageContentPart(media_type="image/png", data="aGk=", cache_control=marker),
+                ),
+                provider_text_blocks=({"type": "text", "text": "look", "cache_control": marker},),
+            ),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    (message,) = coercion.request.messages
+    assert message.content_parts == ()
+    assert message.content == "look" + IMAGE_INPUT_DEFAULT_NOTICE
+    assert message.provider_text_blocks == (
+        {"type": "text", "text": "look", "cache_control": marker},
+        {"type": "text", "text": IMAGE_INPUT_DEFAULT_NOTICE, "cache_control": marker},
+    )
+
+
+def test_a_tool_screenshot_degrades_and_the_pdf_beside_it_keeps_its_place() -> None:
+    """Only the image part of a tool result is replaced; its document stays for a
+    route that carries PDFs, and the placeholder keeps the image's cache marker."""
+    marker: JsonObject = {"type": "ephemeral"}
+    pdf = DocumentContentPart(media_type="application/pdf", data="JVBERi0xLjQK")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(
+            GatewayMessage(role="user", content="go"),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="tool said:",
+                content_parts=(
+                    TextContentPart(text="tool said:"),
+                    ImageContentPart(media_type="image/png", data="aGk=", cache_control=marker),
+                    pdf,
+                ),
+            ),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    _user, tool = coercion.request.messages
+    assert tool.content_parts == (
+        TextContentPart(text="tool said:"),
+        TextContentPart(text=TOOL_RESULT_IMAGE_PLACEHOLDER, cache_control=marker),
+        pdf,
+    )
+    assert tool.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert coercion.disclosures == (TOOL_RESULT_IMAGE_DROP_DISCLOSURE,)

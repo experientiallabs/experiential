@@ -131,7 +131,7 @@ def admitted_route_requests(
     """
     request = fast_request(without_prompt_caching(request, authorization), authorization)
     route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
-        route, resolved_wires, request, authorization.fast
+        route, resolved_wires, request, authorization.fast, authorization.image_input_notice
     )
     require_fast_path(provider_request, authorization)
     if disclosures:
@@ -223,7 +223,7 @@ def select_single_route_before_search(
     preview = strip_search_carriers(preview) if preview.web_search is not None else preview
     preview = plan_tool_search(preview, [profile.dialect for profile, _ in resolved_wires]).request
     route, resolved_wires, _, prepared, _ = prepare_route_requests(
-        route, resolved_wires, preview, authorization.fast
+        route, resolved_wires, preview, authorization.fast, authorization.image_input_notice
     )
     route, resolved_wires = _prefer_cache_capable_rungs(route, resolved_wires, prepared)
     route, resolved_wires, placement = _affinity_ordered_rungs(
@@ -240,6 +240,9 @@ def select_single_route_before_search(
     return restricted, (resolved_wires[index],), placement
 
 
+MAXIMUM_ROUTE_DEGRADES = 4
+"""Route-wide disclosed degrades admission chains before refusing (each clears one rejection)."""
+
 PRIORITY_TIER_UNAVAILABLE_DISCLOSURE = "service_tier->default(priority_unavailable)"
 """Disclosure recorded when no rung offers the priority tier and the request runs at standard."""
 
@@ -249,6 +252,7 @@ def prepare_route_requests(
     resolved_wires: _ResolvedWires,
     request: GatewayRequest,
     fast: bool = False,
+    image_input_notice: str | None = None,
 ) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, tuple[str, ...]]:
     """Pure capability filtering and shaping, with disclosures returned but never recorded.
 
@@ -336,15 +340,12 @@ def prepare_route_requests(
         if coercion is None:
             # No coercion SERVES, but one may still APPLY: the probe refused
             # every candidate because the coerced request dies one layer
-            # later, on a blocker that has nothing to do with the coerced
-            # field. Re-raising the verbatim rejection here would name that
-            # field (an image on a text-only route read as "thinking is not
-            # supported by this model route", because shaping rejects the
-            # foreign-wire thinking config before preflight ever sees the
-            # image; 25 such 400s on 2026-09-11). Carry the unprobed
-            # coercion forward instead and let the stage that actually
-            # refuses it name the caller's remedy. Nothing is recorded for a
-            # request that never serves.
+            # later, on a blocker unrelated to the coerced field. Re-raising
+            # the verbatim rejection would name that field (an image on a
+            # text-only route read as an unsupported thinking config). Carry
+            # the unprobed coercion forward so the stage that actually refuses
+            # names the caller's remedy; nothing is recorded for a request that
+            # never serves.
             coercion = coerce_generation_parameters(
                 first_dial_profiles(route, resolved_wires),
                 admitted_request,
@@ -397,28 +398,28 @@ def prepare_route_requests(
         provider_request,
         public_stream=public_request.stream,
     )
-    if rejections := coercible_rejections(route, protocol_indexes, protocol_errors):
-        # Degrade once with disclosure where the rejection set allows it (no
-        # rung may take the first dial): a unanimous capability rejection
-        # coerces any coercible capability, mixed rejections only the
-        # service-tier hint.
-        coercion = coerce_route_rejections(rejections, len(rejections), admitted_request)
-        if coercion is not None:
-            admitted_request = coercion.request
-            coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
-            public_request, provider_request = route_generation_parameter_requests(
-                tuple(profile for profile, _client in resolved_wires),
-                admitted_request,
-            )
-            provider_request = provider_request.model_copy(
-                update={"stream": True, "include_usage": True}
-            )
-            protocol_indexes, protocol_errors = protocol_compatible_indexes(
-                route,
-                resolved_wires,
-                provider_request,
-                public_stream=public_request.stream,
-            )
+    # Disclosed degrades while no rung may take the first dial: a unanimous rejection
+    # coerces any coercible capability, mixed ones only the service-tier hint, and
+    # clearing one can expose the next (a caller image, then a tool-result PDF).
+    for _degrade in range(MAXIMUM_ROUTE_DEGRADES):
+        if not (rejections := coercible_rejections(route, protocol_indexes, protocol_errors)):
+            break
+        coercion = coerce_route_rejections(
+            rejections, len(rejections), admitted_request, image_input_notice
+        )
+        if coercion is None:
+            break
+        admitted_request = coercion.request
+        coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
+        public_request, provider_request = route_generation_parameter_requests(
+            tuple(profile for profile, _client in resolved_wires), admitted_request
+        )
+        provider_request = provider_request.model_copy(
+            update={"stream": True, "include_usage": True}
+        )
+        protocol_indexes, protocol_errors = protocol_compatible_indexes(
+            route, resolved_wires, provider_request, public_stream=public_request.stream
+        )
     if provider_request.parallel_tool_calls is not None and (
         not protocol_indexes or dialable_rejections(route, protocol_indexes, protocol_errors)
     ):
@@ -666,8 +667,8 @@ def _candidate_serves(
     The policy layer sees only wire profiles, so without this probe a
     candidate could pass generation narrowing yet land on rungs that all fail
     deployment capability preflight, blocking a farther candidate whose rungs
-    serve. The probe mirrors the real pipeline exactly, including the single
-    capability coercion admission may run afterwards: clearing one capability
+    serve. The probe mirrors the real pipeline exactly, including the chained
+    capability coercions admission may run afterwards: clearing one capability
     can merely expose the next, so the coerced candidate must itself pass
     preflight before the snap counts as servable.
 
@@ -692,19 +693,22 @@ def _candidate_serves(
     indexes, errors = protocol_compatible_indexes(
         candidate_route, candidate_wires, provider, public_stream=stream
     )
-    if rejections := coercible_rejections(candidate_route, indexes, errors):
+    for _degrade in range(MAXIMUM_ROUTE_DEGRADES):  # The same chained degrades as admission.
+        if not (rejections := coercible_rejections(candidate_route, indexes, errors)):
+            break
         coercion = coerce_route_rejections(rejections, len(rejections), candidate)
-        if coercion is not None:
-            try:
-                _public, provider = route_generation_parameter_requests(profiles, coercion.request)
-            except (ProviderParameterError, ProviderCapabilityError):
-                return False
-            provider = provider.model_copy(update={"stream": True, "include_usage": True})
-            indexes, errors = protocol_compatible_indexes(
-                candidate_route, candidate_wires, provider, public_stream=stream
-            )
-    # Admission refuses a request only failover-only rungs serve, after its
-    # parallel_tool_calls last resort.
+        if coercion is None:
+            break
+        candidate = coercion.request
+        try:
+            _public, provider = route_generation_parameter_requests(profiles, candidate)
+        except (ProviderParameterError, ProviderCapabilityError):
+            return False
+        provider = provider.model_copy(update={"stream": True, "include_usage": True})
+        indexes, errors = protocol_compatible_indexes(
+            candidate_route, candidate_wires, provider, public_stream=stream
+        )
+    # Admission refuses what only failover-only rungs serve, after its last resort.
     if indexes and not dialable_rejections(candidate_route, indexes, errors):
         return True
     if provider.parallel_tool_calls is None:

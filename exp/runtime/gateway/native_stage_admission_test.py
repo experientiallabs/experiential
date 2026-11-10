@@ -247,7 +247,11 @@ def test_no_fallback_stage_preselection_never_enters_child(
     accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=Host())
 
     def prepare(
-        candidate: GatewayRoute, resolved: tuple, incoming: GatewayRequest, _fast: bool = False
+        candidate: GatewayRoute,
+        resolved: tuple,
+        incoming: GatewayRequest,
+        _fast: bool = False,
+        _image_input_notice: str | None = None,
     ) -> tuple:
         """Observe the stage boundary before capability filtering or effectful search."""
         assert all(item.exact_model_id == snapshot.exact_model_id for item in candidate.deployments)

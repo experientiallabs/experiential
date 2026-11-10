@@ -25,6 +25,7 @@ from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, Gatewa
 from exp.runtime.models.providers.anthropic import safeguards_for_upstream
 from exp.runtime.models.providers.anthropic_tool_compat import anthropic_rejects_forced_tool_choice
 from exp.runtime.models.providers.base import SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS
+from exp.runtime.models.providers.cache_policy import multimodal_text_cache_blocks
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
@@ -196,9 +197,9 @@ it wedges every later turn of a multi-turn session, which is strictly worse
 than a disclosed degrade. Every wire now carries the image itself (natively
 inside the tool result on Anthropic, Responses and Bedrock; folded into a
 following user turn on Chat Completions and Gemini), so the degrade remains
-only for a rung with no image input at all (``capability_policy``). Top-level
-user images keep the fail-closed contract because the caller can re-send those
-differently.
+only for a rung with no image input at all (``capability_policy``). Caller-turn
+images degrade the same way (``IMAGE_INPUT_DROP_DISCLOSURE``) unless the request
+carries no caller text at all.
 """
 
 TOOL_RESULT_IMAGE_PLACEHOLDER = "[image omitted: this model route cannot carry tool-result images]"
@@ -209,6 +210,10 @@ def strip_tool_result_images(
     messages: tuple[GatewayMessage, ...],
 ) -> tuple[GatewayMessage, ...] | None:
     """Replace tool-message image parts with positional placeholder text.
+
+    Every other part (a document beside the screenshot) keeps its place, and a
+    placeholder inherits its image's cache marker; a message left with only
+    text collapses back to plain content.
 
     Args:
         messages: The request's canonical messages.
@@ -224,11 +229,131 @@ def strip_tool_result_images(
         if message.role != "tool" or not message.images:
             out.append(message)
             continue
-        content = "".join(
-            part.text if part.kind == "text" else TOOL_RESULT_IMAGE_PLACEHOLDER
+        parts = tuple(
+            TextContentPart(text=TOOL_RESULT_IMAGE_PLACEHOLDER, cache_control=part.cache_control)
+            if part.kind == "image"
+            else part
             for part in message.content_parts
         )
-        out.append(message.model_copy(update={"content": content, "content_parts": ()}))
+        content = "".join(part.text for part in parts if part.kind == "text")
+        if all(part.kind == "text" for part in parts):
+            parts = ()
+        out.append(message.model_copy(update={"content": content, "content_parts": parts}))
+    return tuple(out)
+
+
+IMAGE_INPUT_DROP_DISCLOSURE = "messages.content.image->placeholder"
+"""Disclosure recorded when caller-turn images degrade to placeholder text.
+
+Coding agents keep a pasted screenshot in the conversation history and resend
+it on every later turn, so refusing a text-only route would wedge the whole
+thread for good. The rule: show the error, keep the history alive. An image in the LATEST user turn
+becomes a notice that asks the model to tell the user; an image in an earlier,
+resent turn becomes a bare marker so the model does not repeat the error every
+turn. A request with no caller text at all keeps the refusal
+(``capability_policy``)."""
+
+IMAGE_INPUT_PLACEHOLDER = "[image not processed]"
+"""Text substituted for each dropped image in an earlier, resent user turn."""
+
+IMAGE_INPUT_NOTICE_PREFIX = "[image not processed: this model does not accept image input. "
+"""Opening of the latest-turn notice; the instruction to the model follows."""
+
+IMAGE_INPUT_DEFAULT_NOTICE = (
+    IMAGE_INPUT_NOTICE_PREFIX + "Tell the user their image could not be processed by this model.]"
+)
+"""Latest-turn notice when the host authored no per-model message."""
+
+
+def image_input_notice(message: str | None) -> str:
+    """Return the latest-turn image notice, quoting a host-authored message.
+
+    Args:
+        message: The host's per-model copy for this alias, or ``None`` for
+            the default instruction.
+
+    Returns:
+        The bracketed notice substituted for each latest-turn image.
+    """
+    if message is None or not message.strip():
+        return IMAGE_INPUT_DEFAULT_NOTICE
+    return IMAGE_INPUT_NOTICE_PREFIX + f"Tell the user exactly this: {message.strip()}]"
+
+
+def latest_turn_user_indexes(messages: tuple[GatewayMessage, ...]) -> frozenset[int]:
+    """Return the indexes of the user messages after the last assistant message.
+
+    The latest turn is everything the caller added since the model last spoke,
+    the same rule the decoders' history-media pass applies to raw wire entries
+    (``openai_protocol.history_media.latest_turn``), so consecutive user
+    messages (an image, then its question) are all the latest turn.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The latest turn's user-message indexes.
+    """
+    last_model = max(
+        (index for index, message in enumerate(messages) if message.role == "assistant"),
+        default=-1,
+    )
+    return frozenset(
+        index
+        for index, message in enumerate(messages)
+        if index > last_model and message.role == "user"
+    )
+
+
+def strip_message_images(
+    messages: tuple[GatewayMessage, ...],
+    notice: str | None = None,
+) -> tuple[GatewayMessage, ...] | None:
+    """Replace non-tool image parts with positional placeholder text.
+
+    Images in the latest turn's user messages (:func:`latest_turn_user_indexes`)
+    become :func:`image_input_notice`; images in every earlier message become
+    :data:`IMAGE_INPUT_PLACEHOLDER`.
+    Every other part keeps its place; a message left with only text collapses
+    back to plain content. A placeholder inherits its image's cache marker and
+    the cache-marked text run is rebuilt from the new parts, so every caller
+    cache boundary survives the degrade; tool messages are left to
+    :func:`strip_tool_result_images`.
+
+    Args:
+        messages: The request's canonical messages.
+        notice: The host's per-model copy for the latest-turn notice, if any.
+
+    Returns:
+        The degraded messages, or ``None`` when no non-tool message carries an
+        image (nothing to strip).
+    """
+    if not any(message.role != "tool" and message.images for message in messages):
+        return None
+    latest = latest_turn_user_indexes(messages)
+    latest_notice = image_input_notice(notice)
+    out: list[GatewayMessage] = []
+    for index, message in enumerate(messages):
+        if message.role == "tool" or not message.images:
+            out.append(message)
+            continue
+        text = latest_notice if index in latest else IMAGE_INPUT_PLACEHOLDER
+        parts = tuple(
+            TextContentPart(text=text, cache_control=part.cache_control)
+            if part.kind == "image"
+            else part
+            for part in message.content_parts
+        )
+        content = "".join(part.text for part in parts if part.kind == "text")
+        # The text run is re-projected so every cache marker keeps its block.
+        marked = multimodal_text_cache_blocks(parts)
+        if all(part.kind == "text" for part in parts):
+            parts = ()
+        out.append(
+            message.model_copy(
+                update={"content": content, "content_parts": parts, "provider_text_blocks": marked}
+            )
+        )
     return tuple(out)
 
 

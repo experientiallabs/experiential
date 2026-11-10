@@ -16,6 +16,7 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.content import (
     AudioContentPart,
+    DocumentContentPart,
     ImageContentPart,
     MediaHandle,
     TextContentPart,
@@ -24,6 +25,7 @@ from exp.common.models.content import (
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.common.models.model import ModelCapabilities, ToolCall
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
@@ -66,10 +68,16 @@ from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.allowed_tools import ALLOWED_TOOLS_DISCLOSURE
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
+from exp.runtime.models.providers.dialect_dispatch import (
+    IMAGE_INPUT_DROP_DISCLOSURE,
+    IMAGE_INPUT_PLACEHOLDER,
+    TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    dialect_stream_payload,
+    image_input_notice,
+)
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
-from exp.runtime.openai_protocol.requests import decode_chat
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
 
 def _deployment(
@@ -954,6 +962,235 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert tool_message.content == TOOL_RESULT_IMAGE_PLACEHOLDER
     assert TOOL_RESULT_IMAGE_DROP_DISCLOSURE in public.ignored_parameters
     assert accounting.recorded == 1
+
+
+def _pasted_screenshot_request(surface: GatewayApiSurface) -> GatewayRequest:
+    """Decode a coding-agent turn whose history carries a pasted user screenshot.
+
+    One body per public surface: the image rides as a Chat ``image_url`` part,
+    a Responses ``input_image`` part, or an Anthropic ``image`` block, in an
+    earlier user turn that the agent resends on every later turn.
+    """
+    data_url = f"data:image/png;base64,{_TOOL_IMAGE_PNG}"
+    match surface:
+        case GatewayApiSurface.CHAT_COMPLETIONS:
+            image: JsonObject = {"type": "image_url", "image_url": {"url": data_url}}
+            text: JsonObject = {"type": "text", "text": "what is wrong here?"}
+            decoded = decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [
+                        {"role": "user", "content": [text, image]},
+                        {"role": "assistant", "content": "I cannot tell yet."},
+                        {"role": "user", "content": "try again"},
+                    ],
+                }
+            )
+        case GatewayApiSurface.RESPONSES:
+            decoded = decode_responses(
+                {
+                    "model": "coding",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "what is wrong here?"},
+                                {"type": "input_image", "image_url": data_url},
+                            ],
+                        },
+                        {"role": "assistant", "content": "I cannot tell yet."},
+                        {"role": "user", "content": "try again"},
+                    ],
+                }
+            )
+        case _:
+            decoded = decode_messages(
+                {
+                    "model": "coding",
+                    "max_tokens": 128,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "what is wrong here?"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _TOOL_IMAGE_PNG,
+                                    },
+                                },
+                            ],
+                        },
+                        {"role": "assistant", "content": "I cannot tell yet."},
+                        {"role": "user", "content": "try again"},
+                    ],
+                }
+            )
+    return decoded.request.model_copy(update={"include_usage": True})
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.MESSAGES,
+    ],
+)
+def test_user_image_degrades_with_disclosure_on_a_text_only_route(
+    surface: GatewayApiSurface,
+) -> None:
+    """A pasted screenshot serves as placeholder text instead of a refusal.
+
+    An agent that once sent an image to a text-only model would otherwise get
+    every later turn refused, because the image stays in the history it
+    resends. The text-only route answers with the image
+    replaced in place and ``ignored_parameters`` naming the drop.
+    """
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("vllm", gateway=text_only),)
+    route = _mixed_route("maximize_availability", deployments, surface)
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://vllm.test"), client),)
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        _pasted_screenshot_request(surface),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    first = provider.messages[0]
+    assert first.content_parts == ()
+    assert first.content == "what is wrong here?" + IMAGE_INPUT_PLACEHOLDER
+    assert provider.images == ()
+    assert IMAGE_INPUT_DROP_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 1
+
+
+def test_a_caller_image_and_a_tool_pdf_degrade_in_one_admission() -> None:
+    """Clearing the image exposes the tool-result PDF; admission degrades that too.
+
+    A text-only route rejects the caller's image first. Once it becomes
+    placeholder text, the route rejects the PDF a tool returned, which has its
+    own disclosed placeholder, so the request serves with both drops named.
+    """
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_streaming_tool_arguments=True
+        )
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("vllm", gateway=text_only),),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://vllm.test"), client),)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="read it",
+                content_parts=(
+                    TextContentPart(text="read it"),
+                    ImageContentPart(media_type="image/png", data=_TOOL_IMAGE_PNG),
+                ),
+            ),
+            GatewayMessage(
+                role="assistant", content="", tool_calls=(ToolCall(call_id="call-1", name="read"),)
+            ),
+            GatewayMessage(
+                role="tool",
+                tool_call_id="call-1",
+                content="file:",
+                content_parts=(
+                    TextContentPart(text="file:"),
+                    DocumentContentPart(media_type="application/pdf", data="JVBERi0xLjQK"),
+                ),
+            ),
+            GatewayMessage(role="user", content="and now?"),
+        ),
+        stream=True,
+    )
+    _narrowed, _wires, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.images == ()
+    assert all(not message.documents for message in provider.messages)
+    assert IMAGE_INPUT_DROP_DISCLOSURE in public.ignored_parameters
+    assert TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE in public.ignored_parameters
+
+
+def test_latest_turn_image_carries_the_hosts_per_model_notice() -> None:
+    """The authorization's per-model copy reaches the latest-turn notice.
+
+    The host looks the copy up per alias at authorize time and freezes it on
+    the snapshot; admission quotes it into the placeholder so the model tells
+    the user, while the thread keeps serving.
+    """
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("vllm", gateway=text_only),),
+        GatewayApiSurface.MESSAGES,
+    )
+    copy = "We're rejecting images on this model for now."
+    authorization = route.snapshot.authorization.model_copy(update={"image_input_notice": copy})
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://vllm.test"), client),)
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _TOOL_IMAGE_PNG,
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    ).request.model_copy(update={"include_usage": True})
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=authorization,
+    )
+
+    assert provider.messages[0].content == "look" + image_input_notice(copy)
+    assert IMAGE_INPUT_DROP_DISCLOSURE in public.ignored_parameters
 
 
 @pytest.mark.parametrize("stream", [True, False])
@@ -2202,7 +2439,9 @@ def test_an_image_refusal_is_never_blamed_on_the_thinking_field() -> None:
     "The parameter 'thinking' is not supported by this model route" for a
     pasted screenshot (25 such 400s on 2026-09-11; removing thinking still
     failed). The rejection the caller sees must be the one the coerced request
-    hits: the image, on ``messages``.
+    hits: the image, on ``messages``. The turn is image-only: an image beside
+    caller text degrades to a placeholder instead, so only a
+    request with nothing but images still reaches the refusal.
     """
     from exp.runtime.anthropic_protocol.requests import decode_messages
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -2240,7 +2479,6 @@ def test_an_image_refusal_is_never_blamed_on_the_thinking_field() -> None:
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/png", "data": _TOOL_IMAGE_PNG},
             },
-            {"type": "text", "text": "What is this?"},
         ],
     }
     for thinking in ({"type": "disabled"}, {"type": "enabled"}, {"type": "adaptive"}):
