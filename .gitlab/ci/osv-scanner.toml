@@ -43,3 +43,13 @@ reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
 id = "GHSA-r4j5-9xpp-3985"
 ignoreUntil = 2026-11-14
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
+
+[[IgnoredVulns]]
+id = "GHSA-cp25-j9x5-p5xm"
+ignoreUntil = 2026-11-23
+reason = "urwid 3.0.5, capture extra only on Python 3.13+, pulled by exp-mitmproxy. The advisory is in urwid's CGI web display (urwid/display/web.py), which nothing here imports or serves. The fix (4.0.7) needs an exp-mitmproxy release allowing urwid 4; then pin it and delete this entry."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+ignoreUntil = 2026-11-23
+reason = "libsqlite3-sys 0.36.0 (rusqlite 0.38 bundled SQLite) in the native local capture store, which opens only its own database under the user's capture directory. The advisory needs an attacker-crafted database plus -wal file pair on the local disk. The fix is rusqlite with libsqlite3-sys 0.39 (SQLite 3.54); bump it in a dedicated native change and delete this entry."
