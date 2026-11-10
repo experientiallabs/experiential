@@ -32,6 +32,7 @@ from exp.runtime.gateway.routing import (
     GatewayRoute,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.capability_policy import STRICT_TOOLS_DISCLOSURE
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.protocol import NativeWireClient
@@ -1083,3 +1084,99 @@ def test_the_coercion_probe_counts_the_parallel_tool_calls_last_resort() -> None
     narrowed, _public, _provider, _recorded = _admit(route, wires, request)
     assert eligible_ladder(narrowed, None)[0] == 0
     assert _ids(narrowed)[0] == "openai"
+
+
+def _with_gateway_capabilities(
+    deployment: ExactModelDeployment, **updates: bool
+) -> ExactModelDeployment:
+    """The same rung with some gateway capability flags replaced."""
+    capabilities = deployment.gateway.capabilities.model_copy(update=updates)
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"capabilities": capabilities})}
+    )
+
+
+def test_a_failover_only_strict_tool_rung_never_blocks_the_strict_tools_coercion() -> None:
+    """Only a failover-only rung takes strict tools: the unrestricted rung still serves
+    after the permitted ``tools.strict->false`` disclosure instead of a refusal."""
+    lead = _with_gateway_capabilities(
+        _astra_rung("openai", tools=True), supports_strict_tools=False
+    )
+    second = _failover_only(
+        _with_gateway_capabilities(_astra_rung("openai", tools=True), supports_strict_tools=True)
+    ).model_copy(update={"deployment_id": "openai-two"})
+    route = _route((lead, second))
+    wires = (
+        _astra_profile("https://openai.test", sampling=True),
+        _astra_profile("https://openai-two.test", sampling=True),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "read it"}],
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "strict": True,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+        }
+    ).request
+    assert _candidate_serves(route, wires, request)
+    narrowed, public, provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed)[0] == "openai"
+    assert eligible_ladder(narrowed, None)[0] == 0
+    assert not any(tool.strict for tool in provider.tools)
+    assert STRICT_TOOLS_DISCLOSURE in public.ignored_parameters
+
+
+def test_the_first_dial_is_the_best_ranked_unrestricted_rung() -> None:
+    """A failover-only Responses rung wins the custom-grammar preference; among the
+    unrestricted rungs the one that keeps ``temperature`` takes the first dial, so the
+    shared request keeps it instead of dropping it for the first serviceable rung."""
+    plain, _client = _astra_profile("https://plain.test", sampling=False)
+    faithful, _client = _astra_profile("https://faithful.test", sampling=True)
+    responses = GatewayWireProfile(
+        dialect="openai_responses", url="https://responses.test/v1", model_id="gpt-6-astra"
+    )
+    base, _wires = _astra_route(("openai", "novita", "azure_openai"))
+    route = _route(
+        (
+            base.deployments[0],
+            _failover_only(base.deployments[1]),
+            base.deployments[2],
+        )
+    )
+    wires = ((plain, _CLIENT), (responses, _CLIENT), (faithful, _CLIENT))
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "run it"}],
+            "temperature": 0.2,
+            "tools": [
+                {
+                    "type": "custom",
+                    "custom": {
+                        "name": "code_exec",
+                        "format": {
+                            "type": "grammar",
+                            "grammar": {"syntax": "lark", "definition": "start: x"},
+                        },
+                    },
+                }
+            ],
+        }
+    ).request
+    indexes = generation_parameter_indexes(route, wires, request)
+    assert 2 in indexes
+    assert 0 not in indexes

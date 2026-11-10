@@ -25,6 +25,7 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_fallback_rules import (
     FALLBACK_REASON_PREFIX,
     FailoverRulesError,
+    coercible_rejections,
     dialable_rejections,
     eligible_depths,
     eligible_ladder,
@@ -252,3 +253,20 @@ def test_untried_depths_include_skipped_earlier_rungs_and_honor_the_rules() -> N
     assert untried_depths(rules, throttled, [0, 1, 0], 1) == (2,)
     # A policy that does not advance the class leaves only matching rule rungs.
     assert untried_depths((None, None), throttled, [0, 1], 1, unrestricted=False) == ()
+
+
+def test_coercible_rejections_are_due_only_without_a_first_dial() -> None:
+    """A coercion judges the unrestricted rungs' rejections when no first dial serves."""
+    route = _route(_deployment("a"), _deployment("byok", ("refusal",)), _deployment("c"))
+    # Only the failover-only rung serves: coerce over what the dialable rungs lack.
+    assert coercible_rejections(route, (1,), ("a-lacks", "c-lacks")) == ("a-lacks", "c-lacks")
+    # An unrestricted rung serves: no coercion is due.
+    assert coercible_rejections(route, (1, 2), ("a-lacks",)) == ()
+    # Nothing serves: the dialable rungs' rejections alone.
+    assert coercible_rejections(route, (), ("a-lacks", "byok-lacks", "c-lacks")) == (
+        "a-lacks",
+        "c-lacks",
+    )
+    # No unrestricted rung at all: every rejection, left to the guard's error.
+    restricted = _route(_deployment("x", ("refusal",)), _deployment("y", ("throttled",)))
+    assert coercible_rejections(restricted, (), ("x-lacks", "y-lacks")) == ("x-lacks", "y-lacks")

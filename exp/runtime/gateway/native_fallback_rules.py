@@ -197,6 +197,29 @@ def dialable_rejections[Rejection](
     )
 
 
+def coercible_rejections[Rejection](
+    route: GatewayRoute, served: Sequence[int], rejections: Sequence[Rejection]
+) -> tuple[Rejection, ...]:
+    """Return the rejections a disclosed capability coercion judges, if one is due.
+
+    A coercion is due when no rung that may take the first dial serves the
+    request: either nothing serves, or only failover-only rungs do. It then
+    judges the unrestricted rungs' rejections alone (a failover-only rung that
+    preserves the field cannot dial it first), or every rejection on a route
+    with no unrestricted rung (``require_unrestricted_rung`` names that case).
+
+    Args:
+        route: The route the per-rung check ran over.
+        served: Route positions that passed it, in route order.
+        rejections: One rejection per position that did not, in route order.
+
+    Returns:
+        The rejections to coerce over, empty when an unrestricted rung serves.
+    """
+    dialable = dialable_rejections(route, served, rejections)
+    return dialable if dialable or served else tuple(rejections)
+
+
 def rule_fallback_reason(
     route: GatewayRoute, candidate: int, current_depth: object, failure: GatewayFailure | None
 ) -> str | None:

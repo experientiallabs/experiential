@@ -42,7 +42,11 @@ from exp.runtime.gateway.native_execution import (
     request_carries_cache_markers,
     select_route_deployments,
 )
-from exp.runtime.gateway.native_fallback_rules import dialable_rejections, require_unrestricted_rung
+from exp.runtime.gateway.native_fallback_rules import (
+    coercible_rejections,
+    dialable_rejections,
+    require_unrestricted_rung,
+)
 from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_request_policy import restrict_fallbacks
@@ -393,13 +397,12 @@ def prepare_route_requests(
         provider_request,
         public_stream=public_request.stream,
     )
-    if not protocol_indexes:
-        # Degrade once with disclosure where the rejection set allows it:
-        # a unanimous capability rejection coerces any coercible capability,
-        # mixed rejections only the service-tier hint.
-        coercion = coerce_route_rejections(
-            protocol_errors, len(route.deployments), admitted_request
-        )
+    if rejections := coercible_rejections(route, protocol_indexes, protocol_errors):
+        # Degrade once with disclosure where the rejection set allows it (no
+        # rung may take the first dial): a unanimous capability rejection
+        # coerces any coercible capability, mixed rejections only the
+        # service-tier hint.
+        coercion = coerce_route_rejections(rejections, len(rejections), admitted_request)
         if coercion is not None:
             admitted_request = coercion.request
             coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
@@ -689,8 +692,8 @@ def _candidate_serves(
     indexes, errors = protocol_compatible_indexes(
         candidate_route, candidate_wires, provider, public_stream=stream
     )
-    if not indexes:
-        coercion = coerce_route_rejections(errors, len(candidate_route.deployments), candidate)
+    if rejections := coercible_rejections(candidate_route, indexes, errors):
+        coercion = coerce_route_rejections(rejections, len(rejections), candidate)
         if coercion is not None:
             try:
                 _public, provider = route_generation_parameter_requests(profiles, coercion.request)

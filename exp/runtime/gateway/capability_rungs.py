@@ -267,9 +267,10 @@ def generation_parameter_indexes(
     The ranking keeps a live reasoning pin's issuing rung in the most exact
     tier that holds it (``live_issuer_index``). When the most exact tier would
     keep only ``failover_only_on`` rungs, none of which may take the first
-    dial, the result is instead the most exact tier that holds the first
-    unrestricted rung able to serve: the caller's sampling adapts or drops on
-    it, disclosed, rather than the request failing on a route that serves it.
+    dial, the result is instead the most exact tier that holds the
+    unrestricted rung the normal ranking prefers among the unrestricted rungs:
+    what it cannot honor adapts or drops, disclosed, rather than the request
+    failing on a route that serves it.
 
     Args:
         route: The route ``resolved_wires`` is aligned with.
@@ -295,17 +296,16 @@ def generation_parameter_indexes(
     ]
     if not dialable or any(index in dialable for index in indexes):
         return indexes
-    for lead in dialable:
-        kept = compatible_generation_parameter_profile_indexes(profiles, request, keep=lead)
-        if lead in kept:
-            return kept
-    # No rung that may take the first dial serves verbatim: raise its own
-    # rejection so admission tries the disclosed coercion (and otherwise names
+    # The first dial is the dialable rungs' own ranking leader, the one that
+    # best preserves the request. When none serves verbatim this raises its
+    # rejection, so admission tries the disclosed coercion (and otherwise names
     # the field), never a route of failover-only rungs that fails internally.
-    compatible_generation_parameter_profile_indexes(
+    ranked = compatible_generation_parameter_profile_indexes(
         tuple(profiles[index] for index in dialable), request
     )
-    return indexes
+    lead = dialable[ranked[0]]
+    kept = compatible_generation_parameter_profile_indexes(profiles, request, keep=lead)
+    return kept if lead in kept else indexes
 
 
 def narrow_to_capable_rungs(
