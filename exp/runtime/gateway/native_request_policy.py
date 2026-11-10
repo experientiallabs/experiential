@@ -50,7 +50,8 @@ def unclaimed_route_failure(
     ladder: Sequence[int],
     route: GatewayRoute,
     *,
-    selected_first: bool,
+    first: bool,
+    repair: bool = False,
 ) -> GatewayFailure:
     """Answer a reservation that found no claimable rung and has no failure of its own.
 
@@ -64,13 +65,16 @@ def unclaimed_route_failure(
     named whenever another control narrowed the route or a sibling an unpinned
     first dial may claim (not failover-only) remains outside a throttle window;
     a later attempt may take every rung, so the selector then excludes nothing.
+    A reasoning-repair redial may claim only the rung it repairs whatever the
+    caller sent, so no control is named for it.
 
     Args:
         health: The worker's deployment health registry.
         keys: One health key per ordered route deployment.
         ladder: The route indexes this reservation could claim.
         route: The admitted route.
-        selected_first: Whether this is a caller-selected route's first dial.
+        first: Whether this is a caller-selected route's first dial.
+        repair: Whether this is a reasoning-repair redial of one rung.
 
     Returns:
         The sanitized throttled or unavailable failure.
@@ -82,9 +86,9 @@ def unclaimed_route_failure(
     # Only a sibling an unpinned first dial may claim makes removing the selector a remedy.
     siblings = [depth for depth in eligible_ladder(route, None) if depth != 0]
     sibling_free = bool(siblings) and health.throttled_remaining_seconds(keys, siblings) is None
-    if selected_first and (controls or sibling_free):
+    if first and (controls or sibling_free):
         controls.insert(0, "gateway.routing.route_id")
-    if not controls:
+    if repair or not controls:
         return all_routes_throttled_failure(remaining)
     return selected_route_throttled_failure(remaining, " and ".join(controls))
 

@@ -553,7 +553,7 @@ def test_a_throttled_refusal_names_only_controls_that_excluded_a_rung(
     _throttled(health, _LEAD, *((_SIBLING,) if sibling_throttled else ()))
     ladder = (0,) if selected_first else (0, 1)
     failure = unclaimed_route_failure(
-        health, (_LEAD, _SIBLING), ladder, route, selected_first=selected_first
+        health, (_LEAD, _SIBLING), ladder, route, first=selected_first
     )
     message = _message(failure)
     if named is None:
@@ -583,7 +583,7 @@ def test_a_failover_only_sibling_does_not_make_the_selector_a_remedy() -> None:
     )
     health = DeploymentHealthRegistry(clock=lambda: 100.0)
     _throttled(health, _LEAD)
-    failure = unclaimed_route_failure(health, (_LEAD, _SIBLING), (0,), route, selected_first=True)
+    failure = unclaimed_route_failure(health, (_LEAD, _SIBLING), (0,), route, first=True)
     assert "exact-model deployments" in _message(failure)
 
 
@@ -594,7 +594,7 @@ def test_an_unthrottled_ladder_is_unavailable_not_throttled() -> None:
         (_LEAD,),
         (0,),
         _provider_route("openai"),
-        selected_first=False,
+        first=False,
     )
     assert failure.failure_class is GatewayFailureClass.PROVIDER_INTERNAL
 
@@ -639,3 +639,16 @@ def test_gateway_no_fallback_is_named_beside_a_provider_control_that_already_nar
         "provider.only",
         "gateway.routing.allow_fallbacks: false",
     )
+
+
+def test_a_reasoning_repair_redial_keeps_the_generic_throttled_wording() -> None:
+    """A repair redial is confined to its rung by the gateway, so no caller control is named."""
+    route = _provider_route("openai", "bedrock").model_copy(
+        update={"caller_narrowing": ("provider.only",)}
+    )
+    health = DeploymentHealthRegistry(clock=lambda: 100.0)
+    _throttled(health, _LEAD)
+    failure = unclaimed_route_failure(
+        health, (_LEAD, _SIBLING), (0,), route, first=False, repair=True
+    )
+    assert "exact-model deployments" in _message(failure)

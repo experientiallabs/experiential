@@ -727,7 +727,7 @@ class NativeAttemptAccounting:
         exhaustion = last_failure or self._health.circuit_failure(keys, ladder)
         if exhaustion is None:
             exhaustion = unclaimed_route_failure(
-                self._health, keys, ladder, route, selected_first=selected_first
+                self._health, keys, ladder, route, first=selected_first, repair=reasoning_repair
             )
         certified = active and self.finish_request_quietly(
             entry.authorization,
