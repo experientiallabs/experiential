@@ -16,10 +16,7 @@ from pydantic import Field, TypeAdapter, ValidationError
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.openai_protocol.manifest import IMAGES_MANIFEST, validate_manifest
-from exp.runtime.openai_protocol.requests import (
-    _validate_official,
-    _validate_wire,
-)
+from exp.runtime.openai_protocol.official_schema import validate_official, validate_wire
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 from exp.runtime.openai_protocol.wire_models import _WireModel
 
@@ -79,8 +76,8 @@ def decode_images(payload: JsonObject) -> DecodedImagesRequest:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     validate_manifest(payload, IMAGES_MANIFEST)
-    _validate_official(_IMAGES_OFFICIAL, payload)
-    request = _validate_wire(_ImagesRequest, payload)
+    validate_official(_IMAGES_OFFICIAL, payload)
+    request = validate_wire(_ImagesRequest, payload)
     try:
         canonical = ImagesRequest(
             prompt=request.prompt,

@@ -193,6 +193,7 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     allowed: list[str] = []
     got: str | None = None
     member_error = False
+    open_string = False
     for detail in details:
         if detail["type"] == "string_too_long":
             # The bound and the arriving LENGTH are both display-safe facts
@@ -207,6 +208,7 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
                     f"{maximum:,} characters, but got {len(value):,}."
                 )
         phrase = _EXPECTED_BY_ERROR_TYPE.get(detail["type"])
+        open_string = open_string or detail["type"] == "string_type"
         if detail["type"] in {"literal_error", "enum"}:
             member_error = True
             context = detail.get("ctx") or {}
@@ -219,6 +221,12 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
         # so it contributes no honest "got" type.
         if detail["type"] != "missing" and "input" in detail:
             got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
+    if open_string:
+        # An open vocabulary (``str | Literal[...]``, the SDK's ``model``)
+        # admits any string, so its member list names no constraint; listing
+        # it would bury "expected a string" behind every known model id.
+        allowed = []
+        member_error = False
     if allowed:
         expected.insert(0, f"one of {_join_quoted(allowed)}")
     if not expected:

@@ -30,7 +30,7 @@ from exp.runtime.openai_protocol.manifest import (
     TRANSCRIPTION_MANIFEST,
     validate_manifest,
 )
-from exp.runtime.openai_protocol.requests import _validate_official, _validate_wire
+from exp.runtime.openai_protocol.official_schema import validate_official, validate_wire
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 from exp.runtime.openai_protocol.wire_models import _WireModel
 
@@ -157,8 +157,8 @@ def decode_speech(payload: JsonObject) -> DecodedSpeechRequest:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     validate_manifest(payload, SPEECH_MANIFEST)
-    _validate_official(_SPEECH_OFFICIAL, payload)
-    request = _validate_wire(_SpeechRequest, payload)
+    validate_official(_SPEECH_OFFICIAL, payload)
+    request = validate_wire(_SpeechRequest, payload)
     try:
         canonical = SpeechRequest(
             input=request.input,
@@ -201,7 +201,7 @@ def decode_transcription(payload: JsonObject) -> DecodedTranscriptionRequest:
         OpenAIProtocolError: The upload is invalid, unknown, or unsupported.
     """
     validate_manifest(payload, TRANSCRIPTION_MANIFEST)
-    request = _validate_wire(_TranscriptionRequest, payload)
+    request = validate_wire(_TranscriptionRequest, payload)
     if request.timestamp_granularities and request.response_format != "verbose_json":
         # The provider rejects timestamps on any other format after the
         # upload; refusing here costs the caller nothing.

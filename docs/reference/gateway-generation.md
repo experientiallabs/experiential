@@ -210,6 +210,14 @@ the order the model produced.
   rung dispatches at the standard tier, disclosed as
   `service_tier->default(priority_unavailable)`. Standard never costs more. `flex`
   asks for a cheaper tier, so it stays a typed refusal on such a route.
+- An explicit JSON `null` on a Chat or Responses top-level field OpenAI documents as
+  nullable (`stream`, `stream_options`, `temperature`, `max_tokens`, `stop`, `metadata`,
+  `seed`, and the rest of the official SDK's `Optional` request fields, pinned in
+  `exp/runtime/openai_protocol/nullable_params.py` and locked to the installed SDK by
+  test) is removed before decoding, so the field takes its default exactly as if
+  omitted, with no disclosure. A null on a field OpenAI refuses as null (`model`,
+  `messages`, `input`, `tools`, `tool_choice`, `response_format`, `text`, `user`) stays
+  a named 400.
 
 ## Reasoning controls
 
