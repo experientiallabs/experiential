@@ -69,6 +69,7 @@ SUPPORTED_TEXT_CONTEXTS = (
     "tool_call_name",
     "tool_call_namespace",
     "tool_call_id",
+    "tool_call_anthropic_caller",
     "tool_result_name",
     "tool_result_namespace",
     "tool_result_id",
@@ -242,6 +243,23 @@ def text_context_request(field: str, text: str) -> GatewayRequest:
                 declared_as="messages_server_tool",
                 tool_type="tool_search_tool_regex",
                 tool_name=text,
+            )
+        case "tool_call_anthropic_caller":
+            data["messages"] = (
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(
+                        ToolCall(
+                            call_id="call-one",
+                            name="lookup",
+                            arguments={},
+                            provider_anthropic_caller={
+                                "type": "code_execution_20260120",
+                                "tool_id": text,
+                            },
+                        ),
+                    ),
+                ),
             )
         case "tool_call_name" | "tool_call_namespace" | "tool_call_id":
             data["messages"] = (

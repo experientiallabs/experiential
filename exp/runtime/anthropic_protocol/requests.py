@@ -140,9 +140,11 @@ class _RedactedThinkingBlock(AnthropicWireModel):
 class _ToolUseBlock(AnthropicWireModel):
     """One assistant tool invocation retained in request history.
 
-    ``caller`` rides the canonical tool call (``ToolCall.provider_anthropic_caller``)
-    and re-emits verbatim on Anthropic rungs; other wires have no slot for it
-    and drop it with disclosure, since the call itself is unchanged.
+    Attributes:
+        caller: Optional programmatic tool-calling attribution. It rides the canonical
+            tool call (``ToolCall.provider_anthropic_caller``) and re-emits verbatim on
+            Anthropic rungs; other wires have no slot for it and drop it with disclosure,
+            since the call itself is unchanged.
     """
 
     type: Literal["tool_use"]

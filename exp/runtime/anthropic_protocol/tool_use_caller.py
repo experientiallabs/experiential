@@ -18,7 +18,11 @@ from exp.runtime.anthropic_protocol.media_blocks import AnthropicWireModel
 
 
 class _DirectCaller(AnthropicWireModel):
-    """A ``tool_use`` the model invoked directly (traditional tool use)."""
+    """A ``tool_use`` the model invoked directly (traditional tool use).
+
+    Attributes:
+        type: Always ``direct``.
+    """
 
     type: Literal["direct"]
 
@@ -26,9 +30,12 @@ class _DirectCaller(AnthropicWireModel):
 class _CodeExecutionCaller(AnthropicWireModel):
     """A ``tool_use`` invoked programmatically from a code execution run.
 
-    ``tool_id`` is the id of the code execution ``server_tool_use`` block that
-    made the call. Anthropic tags responses ``code_execution_20260120``; the
-    SDK's request params also admit the older ``code_execution_20250825``.
+    Attributes:
+        type: The code execution tool version. Anthropic tags responses
+            ``code_execution_20260120``; the SDK's request params also admit the
+            older ``code_execution_20250825``.
+        tool_id: The id of the code execution ``server_tool_use`` block that made
+            the call.
     """
 
     type: Literal["code_execution_20250825", "code_execution_20260120"]

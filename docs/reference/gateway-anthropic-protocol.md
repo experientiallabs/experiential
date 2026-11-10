@@ -41,8 +41,8 @@ bare by the live API, verified 2026-08-30), the programmatic tool-calling `calle
 echo on history `tool_use` blocks (typed closed: `{"type": "direct"}` or a
 `code_execution_20250825` / `code_execution_20260120` caller with its `tool_id`; dropped elsewhere
 as `messages.content.tool_use.caller->dropped(unsupported_by_provider)`), and `inference_geo`
-verbatim on Anthropic rungs with disclosure-drops elsewhere, keeps every official SDK tool and top-level field a recorded
-decision behind an SDK-surface drift gate in
+verbatim on Anthropic rungs with disclosure-drops elsewhere, keeps every official SDK tool and
+top-level field a recorded decision behind an SDK-surface drift gate in
 `exp/runtime/anthropic_protocol/manifest.py`, and carries user `image` and PDF `document` blocks
 as typed content parts (base64 or URL source, optional `title`, cache marker) that admission
 checks against the route's `supports_image_input` / `supports_pdf_input` (and the `_url_input`

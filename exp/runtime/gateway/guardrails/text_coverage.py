@@ -65,7 +65,18 @@ def text_input_context(request: GatewayRequest) -> str:
     calls = [call for message in request.messages for call in message.tool_calls]
     if calls:
         context["tool_calls"] = [
-            {"call_id": call.call_id, "name": call.name, "namespace": call.provider_namespace}
+            {
+                "call_id": call.call_id,
+                "name": call.name,
+                "namespace": call.provider_namespace,
+                # The Messages caller is a closed, decoder-validated shape (a
+                # type tag and a call id), so it projects as ordinary text.
+                **(
+                    {"caller": call.provider_anthropic_caller}
+                    if call.provider_anthropic_caller is not None
+                    else {}
+                ),
+            }
             for call in calls
         ]
     results = [
