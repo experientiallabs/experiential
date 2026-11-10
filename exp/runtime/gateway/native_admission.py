@@ -25,7 +25,11 @@ from exp.runtime.gateway.affinity import (
     house_aggregator_last,
     rendezvous_order,
 )
-from exp.runtime.gateway.capability_rungs import live_issuer_index, narrow_to_capable_rungs
+from exp.runtime.gateway.capability_rungs import (
+    generation_parameter_indexes,
+    live_issuer_index,
+    narrow_to_capable_rungs,
+)
 from exp.runtime.gateway.class_throttles import fast_request, require_fast_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -75,10 +79,7 @@ from exp.runtime.models.providers.errors import (
     ProviderResponseError,
 )
 from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
-from exp.runtime.models.providers.generation_route_compat import (
-    compatible_generation_parameter_profile_indexes,
-    plaintext_reasoning_lead_order,
-)
+from exp.runtime.models.providers.generation_route_compat import plaintext_reasoning_lead_order
 from exp.runtime.models.providers.prompt_cache_options import honors_markers
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
@@ -312,15 +313,12 @@ def prepare_route_requests(
     coercion_disclosures: tuple[str, ...] = admission_disclosures
     full_route = route
     full_wires = resolved_wires
-    issuer = live_issuer_index(route)  # A live reasoning pin's issuer outranks sampling.
 
     def candidate_serves(candidate: GatewayRequest) -> bool:
         return _candidate_serves(full_route, full_wires, candidate)
 
     try:
-        compatible_indexes = compatible_generation_parameter_profile_indexes(
-            tuple(profile for profile, _client in resolved_wires), admitted_request, keep=issuer
-        )
+        compatible_indexes = generation_parameter_indexes(route, resolved_wires, admitted_request)
     except ProviderParameterError:
         # No rung preserves the request verbatim; retry once with the
         # minimal disclosed coercion when semantics allow, otherwise
@@ -348,15 +346,13 @@ def prepare_route_requests(
             )
         if coercion is None:
             raise
-        compatible_indexes = compatible_generation_parameter_profile_indexes(
-            tuple(profile for profile, _client in resolved_wires), coercion.request, keep=issuer
-        )
+        compatible_indexes = generation_parameter_indexes(route, resolved_wires, coercion.request)
         admitted_request = coercion.request
         coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
     route = select_route_deployments(route, compatible_indexes)
     resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
-    if route.resolved_route_id is None and route.reasoning_pinned_deployment_id is None:
-        # Plaintext-reasoning carriers lead; the rungs that drop it stay as fallbacks.
+    if route.resolved_route_id is None and live_issuer_index(route) is None:
+        # Plaintext-reasoning carriers lead (a stale pin included); the rest are fallbacks.
         order = plaintext_reasoning_lead_order(
             tuple(profile for profile, _client in resolved_wires),
             admitted_request,
@@ -419,20 +415,27 @@ def prepare_route_requests(
                 provider_request,
                 public_stream=public_request.stream,
             )
-    if not protocol_indexes and provider_request.parallel_tool_calls is not None:
-        # LAST resort for parallel_tool_calls: no rung honours the control
-        # natively (and no other coercion freed one), so admit the rungs whose
-        # only objection is that control. The data plane then drops `true`
-        # (the provider's default) or serializes `false` per rung, disclosed
-        # (native_bridge's per-rung shaping). A native rung is always
-        # preferred, which is why this pass runs after everything else.
-        protocol_indexes, protocol_errors = protocol_compatible_indexes(
+    if provider_request.parallel_tool_calls is not None and (
+        not protocol_indexes or dialable_rejections(route, protocol_indexes, protocol_errors)
+    ):
+        # LAST resort for parallel_tool_calls: no rung that may take the first
+        # dial honours the control natively (and no other coercion freed one),
+        # so admit the rungs whose only objection is that control. The data
+        # plane then drops `true` (the provider's default) or serializes
+        # `false` per rung, disclosed (native_bridge's per-rung shaping). A
+        # native rung is always preferred, which is why this pass runs after
+        # everything else; a native failover-only rung alone cannot be dialed.
+        emulated_indexes, emulated_errors = protocol_compatible_indexes(
             route,
             resolved_wires,
             provider_request,
             public_stream=public_request.stream,
             emulate_parallel_tool_calls=True,
         )
+        if not protocol_indexes or not dialable_rejections(
+            route, emulated_indexes, emulated_errors
+        ):
+            protocol_indexes, protocol_errors = emulated_indexes, emulated_errors
     if not protocol_indexes:
         if not protocol_errors:
             raise GatewayRoutingError("authorized route has no compatible deployment")
@@ -560,12 +563,7 @@ def _keeps_issuing_rung_first(route: GatewayRoute) -> bool:
     dead the pin is stale: every surviving rung runs without the reasoning,
     so the pool's normal ordering applies to them.
     """
-    if route.resolved_route_id is not None:
-        return True
-    pinned = route.reasoning_pinned_deployment_id
-    return pinned is not None and any(
-        deployment.deployment_id == pinned for deployment in route.deployments
-    )
+    return route.resolved_route_id is not None or live_issuer_index(route) is not None
 
 
 def _affinity_ordered_rungs(
@@ -678,10 +676,7 @@ def _candidate_serves(
         Whether admission would serve the candidate.
     """
     try:
-        candidate_indexes = compatible_generation_parameter_profile_indexes(
-            tuple(profile for profile, _client in resolved_wires),
-            candidate,
-        )
+        candidate_indexes = generation_parameter_indexes(route, resolved_wires, candidate)
         candidate_route = select_route_deployments(route, candidate_indexes)
         candidate_wires = tuple(resolved_wires[index] for index in candidate_indexes)
         candidate_public, candidate_provider = route_generation_parameter_requests(
@@ -700,7 +695,8 @@ def _candidate_serves(
         public_stream=candidate_public.stream,
     )
     if indexes:
-        return True
+        # Admission refuses a request only failover-only rungs serve.
+        return not dialable_rejections(candidate_route, indexes, errors)
     capability_coercion = coerce_route_rejections(
         errors, len(candidate_route.deployments), candidate
     )

@@ -9,8 +9,10 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.models.model import ModelCapabilities
+from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capability_rungs import (
     PROMPT_CACHE_TTL_RUNG_DISCLOSURE,
+    generation_parameter_indexes,
     narrow_to_capable_rungs,
 )
 from exp.runtime.gateway.contracts import (
@@ -31,7 +33,7 @@ from exp.runtime.gateway.routing import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
-from exp.runtime.models.providers.errors import ProviderCapabilityError
+from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
@@ -821,8 +823,6 @@ def test_a_twelve_hour_request_rides_only_a_wire_that_carries_it(
 
 def _claude_code_messages(**extra: object) -> GatewayRequest:
     """Decode a Claude Code Messages turn: system, one tool, streaming."""
-    from exp.runtime.anthropic_protocol.requests import decode_messages
-
     body: JsonObject = {
         "model": "public-model",
         "max_tokens": 32_000,
@@ -894,11 +894,10 @@ def test_a_route_with_no_tool_rung_still_refuses_on_tools(surface: str) -> None:
 def test_a_reasoning_pin_on_a_tool_less_issuer_serves_tools_without_its_reasoning(
     surface: str,
 ) -> None:
-    """A continuation pinned to the tool-less Novita rung used to skip the tools
-    narrowing, so the sampling ranking kept Novita and the turn was refused on
-    ``tools`` while openai serves them. The route now narrows past the issuer: its
-    sealed reasoning is stripped exactly as on a failover past it, and the ledger
-    records the continuation failover."""
+    """A continuation pinned to the tool-less Novita rung still goes through the tools
+    narrowing, so the turn is never refused on ``tools`` while openai serves them.
+    The route narrows past the issuer: its sealed reasoning is stripped exactly as
+    on a failover past it, and the ledger records the continuation failover."""
     route, wires = _astra_route(("novita", "openai", "azure_openai"))
     pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "novita"})
     narrowed, public, provider, _recorded = _admit(pinned, wires, _TOOL_REQUESTS[surface]())
@@ -971,10 +970,10 @@ def _sampling_only_requests() -> dict[str, GatewayRequest]:
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 def test_a_reasoning_pin_keeps_its_issuer_over_a_sampling_exact_rung(surface: str) -> None:
     """A continuation pinned to the openai rung that sealed its reasoning sent a
-    ``temperature`` only the Novita rung takes. The sampling ranking used to keep
-    Novita alone, dropping the issuer and the conversation's reasoning. The issuer
-    now leads: continuity wins, and the temperature it cannot take is dropped,
-    disclosed, as on any rung that cannot honor it."""
+    ``temperature`` only the Novita rung takes. The sampling ranking never keeps
+    Novita alone at the cost of the issuer and the conversation's reasoning: the
+    issuer leads, and the temperature it cannot take is dropped, disclosed, as on
+    any rung that cannot honor it."""
     route, wires = _astra_route(("openai", "novita", "azure_openai"))
     pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "openai"})
     narrowed, public, provider, _recorded = _admit(
@@ -992,3 +991,42 @@ def test_without_a_pin_the_sampling_exact_rung_still_wins() -> None:
     narrowed, _public, provider, _recorded = _admit(route, wires, _sampling_only_requests()["chat"])
     assert _ids(narrowed) == ("novita",)
     assert provider.temperature == 0.1
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+def test_a_failover_only_sampling_rung_never_takes_the_first_dial(surface: str) -> None:
+    """Only a failover-only rung honors the caller's ``temperature``: the ranking keeps
+    the unrestricted rung that must take the first dial, which drops the temperature,
+    disclosed, and the sampling-exact rung stays behind it as a failover successor."""
+    base, _wires = _astra_route(("openai", "novita"))
+    route = _route((base.deployments[0], _failover_only(base.deployments[1])))
+    wires = (
+        _astra_profile("https://openai.test", sampling=False),
+        _astra_profile("https://novita.test", sampling=True),
+    )
+    narrowed, public, provider, _recorded = _admit(route, wires, _sampling_only_requests()[surface])
+    assert _ids(narrowed) == ("openai", "novita")
+    assert eligible_ladder(narrowed, None) == (0,)
+    assert provider.temperature is None
+    assert "temperature->dropped(unsupported_by_provider)" in public.ignored_parameters
+
+
+def test_no_dialable_rung_for_the_generation_parameters_raises_its_own_rejection() -> None:
+    """Only a failover-only rung serves the caller's ``reasoning_effort``: the ranking
+    raises the unrestricted rung's own rejection (so admission tries the disclosed
+    coercion or names the field) instead of a failover-only route nothing may dial."""
+    base, _wires = _astra_route(("openai", "novita"))
+    route = _route((base.deployments[0], _failover_only(base.deployments[1])))
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://p.test"), _CLIENT),
+        _astra_profile("https://novita.test", sampling=True),
+    )
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }
+    ).request
+    with pytest.raises(ProviderParameterError):
+        generation_parameter_indexes(route, wires, request)

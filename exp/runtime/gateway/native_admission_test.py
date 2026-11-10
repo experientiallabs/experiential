@@ -2940,6 +2940,53 @@ def test_plaintext_reasoning_history_leads_on_its_carrier_and_keeps_every_fallba
     assert narrowed.snapshot.deployment_ids == ("plain", "carrier", "later")
 
 
+@pytest.mark.parametrize(
+    ("pin", "expected"),
+    [("plain", ("plain", "carrier", "later")), ("gone", ("carrier", "plain", "later"))],
+)
+def test_plaintext_reasoning_ordering_skips_only_a_live_pin(
+    pin: str, expected: tuple[str, ...]
+) -> None:
+    """A live issuer keeps the lead; a pin whose issuer left the route is stale.
+
+    A stale pin (its issuing rung narrowed out, for example by a content
+    feature it cannot carry) dispatches every survivor without the sealed
+    reasoning, so the plaintext-reasoning carrier leads exactly as on a route
+    with no pin at all.
+    """
+    route = _mixed_route(
+        "maximize_availability",
+        tuple(_deployment(name, gateway=_TOOL_CAPABLE) for name in ("plain", "carrier", "later")),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+    ).model_copy(update={"reasoning_pinned_deployment_id": pin})
+    client = cast(NativeWireClient, object())
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test")
+    carrier = GatewayWireProfile(
+        dialect="openai_compatible", url="https://carrier.test", reasoning_output_exposed=True
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="run ls"),
+            GatewayMessage(
+                role="assistant",
+                content="done",
+                provider_reasoning=(ExposedReasoningContentBlock(content="list the files"),),
+            ),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+    )
+    narrowed, _wires, _public, _provider, _placement = admitted_route_requests(
+        route,
+        ((plain, client), (carrier, client), (plain, client)),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == expected
+
+
 def test_a_prompt_cap_moves_a_long_prompt_to_the_main_lane_but_never_refuses() -> None:
     """Applied after the tier filter: with no uncapped carded rung left, the capped one serves."""
     from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy

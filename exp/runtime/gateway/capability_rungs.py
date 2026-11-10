@@ -76,6 +76,9 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     profile_reasoning_efforts,
     resolve_level_less_enable,
 )
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 STRUCTURED_OUTPUT_RUNG_SUFFIX = "->routed(structured_output_rung)"
@@ -234,6 +237,55 @@ def live_issuer_index(route: GatewayRoute) -> int | None:
     pinned = route.reasoning_pinned_deployment_id
     ids = [deployment.deployment_id for deployment in route.deployments]
     return ids.index(pinned) if pinned in ids else None
+
+
+def generation_parameter_indexes(
+    route: GatewayRoute, resolved_wires: _ResolvedWires, request: GatewayRequest
+) -> tuple[int, ...]:
+    """Rank the route's rungs by generation-parameter exactness, keeping a first dial.
+
+    The ranking keeps a live reasoning pin's issuing rung in the most exact
+    tier that holds it (``live_issuer_index``). When the most exact tier would
+    keep only ``failover_only_on`` rungs, none of which may take the first
+    dial, the result is instead the most exact tier that holds the first
+    unrestricted rung able to serve: the caller's sampling adapts or drops on
+    it, disclosed, rather than the request failing on a route that serves it.
+
+    Args:
+        route: The route ``resolved_wires`` is aligned with.
+        resolved_wires: Ordered wire profiles and clients per deployment.
+        request: The decoded request the ranking judges.
+
+    Returns:
+        Ordered route positions of the selected rungs.
+
+    Raises:
+        ProviderParameterError: No rung that may take the first dial can serve
+            the request's generation parameters (the first such rung's own
+            rejection, see ``compatible_generation_parameter_profile_indexes``).
+    """
+    profiles = tuple(profile for profile, _client in resolved_wires)
+    indexes = compatible_generation_parameter_profile_indexes(
+        profiles, request, keep=live_issuer_index(route)
+    )
+    dialable = [
+        index
+        for index, deployment in enumerate(route.deployments)
+        if rung_rules(deployment) is None
+    ]
+    if not dialable or any(index in dialable for index in indexes):
+        return indexes
+    for lead in dialable:
+        kept = compatible_generation_parameter_profile_indexes(profiles, request, keep=lead)
+        if lead in kept:
+            return kept
+    # No rung that may take the first dial serves verbatim: raise its own
+    # rejection so admission tries the disclosed coercion (and otherwise names
+    # the field), never a route of failover-only rungs that fails internally.
+    compatible_generation_parameter_profile_indexes(
+        tuple(profiles[index] for index in dialable), request
+    )
+    return indexes
 
 
 def narrow_to_capable_rungs(

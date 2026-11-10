@@ -68,10 +68,9 @@ Two edges are decided explicitly:
   (tools, media, structured output, the 12-hour cache lifetime). Refusing would fail a turn
   another rung serves, so the route narrows past the issuer: every surviving rung dispatches
   without the issuer's sealed reasoning, exactly as on a failover past it, and the ledger records
-  the attempt's route reason as `reasoning_continuation_failover`. Before this, a pinned turn
-  skipped the narrowing altogether, so a sampling control only a tool-less rung takes made the
-  ranking pick that rung and the turn was refused on `tools` (a pin on the tool rung itself
-  included). Without a content feature the issuer is never dropped for a softer preference:
+  the attempt's route reason as `reasoning_continuation_failover`. Such a stale pin is ordered
+  like an unpinned route, so a plaintext-reasoning carrier still leads the survivors. Without a
+  content feature the issuer is never dropped for a softer preference:
   when another rung keeps the caller's `temperature` or `top_p` exactly and the issuer cannot,
   the issuer still leads and the sampling adapts or drops on it, disclosed
   (`temperature->dropped(unsupported_by_provider)`), because reasoning continuity outranks
@@ -80,7 +79,9 @@ Two edges are decided explicitly:
   feature are failover-only, the request is refused on the feature with the typed 400 (what the
   dialable rungs lack), never sent to the failover rung and never failed as an internal error.
   When an unrestricted rung carries it too, the failover-only rung stays on the route as a
-  successor behind the unrestricted first dial.
+  successor behind the unrestricted first dial. The sampling ranking follows the same rule:
+  when only a failover-only rung keeps the caller's `temperature` or `top_p` exactly, the
+  unrestricted rung still takes the first dial and the sampling adapts or drops on it, disclosed.
 
 ## Output limits and context windows
 

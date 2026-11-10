@@ -194,3 +194,28 @@ def test_a_kept_rung_holds_the_most_exact_tier_that_contains_it() -> None:
     assert compatible_generation_parameter_profile_indexes(profiles, request, keep=0) == (0, 1)
     # A kept rung that is already in the exact tier changes nothing.
     assert compatible_generation_parameter_profile_indexes(profiles, request, keep=1) == (1,)
+
+
+def test_a_kept_rung_that_cannot_serve_leaves_the_preferences_in_force() -> None:
+    """A ``keep`` rung that rejects the request outright ranks exactly as unkept: the
+    grammar-enforcing rung still outranks translation instead of sharing a route with it."""
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://p.test", model_id="m")
+    azure = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://azure.test/openai/v1",
+        model_id="gpt-5-nano",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "medium", "high"),
+    )
+    request = decode_chat(
+        {
+            "model": "gpt-5-nano",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_CUSTOM_TOOL],
+            "reasoning_effort": "high",
+        }
+    ).request
+    profiles = (plain, azure, _OPENAI_RESPONSES)
+    unkept = compatible_generation_parameter_profile_indexes(profiles, request)
+    assert compatible_generation_parameter_profile_indexes(profiles, request, keep=0) == unkept
