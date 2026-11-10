@@ -364,7 +364,9 @@ async fn status_only_classifications_carry_the_status_as_ledger_detail() {
     assert_eq!(failure.provider_detail.as_deref(), Some("http 503"));
     assert_eq!(
         failure.public_error().message,
-        "provider service failed; retry after a short delay",
+        "The model's provider had a server error and no other provider for this model \
+         could take the request. Retry after a short delay; if it keeps failing, choose \
+         another model.",
         "a server-side class never relays detail to the caller"
     );
     let throttled = open_against_body("429 Too Many Requests", "", "m").await;
@@ -405,7 +407,7 @@ async fn a_refused_connection_names_the_transport_fault_for_the_ledger() {
     );
     assert_eq!(
         failure.public_error().message,
-        "provider transport failed; retry the request"
+        "The gateway could not reach the model's provider. Retry after a short delay; if it keeps failing, choose another model."
     );
 }
 
@@ -464,7 +466,7 @@ async fn a_content_filter_4xx_is_a_refusal_not_a_request_shape_error() {
     assert!(failure.provider_detail.is_some());
     assert_eq!(
         failure.public_error().message,
-        "provider refused the request: content policy"
+        "The model's provider declined this request (content policy). Rephrase the request or choose another model."
     );
 }
 
@@ -533,14 +535,14 @@ async fn an_azure_streamed_content_filter_chunk_under_a_400_is_a_refusal() {
     assert_eq!(public.code, "refusal");
     assert_eq!(
         public.message,
-        "provider refused the request: content policy"
+        "The model's provider declined this request (content policy). Rephrase the request or choose another model."
     );
     let messages = crate::encode_messages::anthropic_error_body(&public);
     assert_eq!(messages["error"]["type"], "invalid_request_error");
     assert_eq!(messages["error"]["refusal_reason"], "content_policy");
     assert_eq!(
         messages["error"]["message"],
-        "provider refused the request: content policy"
+        "The model's provider declined this request (content policy). Rephrase the request or choose another model."
     );
     // A chunk with only an error verdict (no finish yet) is the same refusal;
     // a stream of ordinary chunks stays a request-shape error.
@@ -660,7 +662,7 @@ async fn gemini_relay_refusal_http_403_keeps_the_bounded_public_contract() {
         );
         assert_eq!(
             public.message,
-            "provider refused the request: content policy"
+            "The model's provider declined this request (content policy). Rephrase the request or choose another model."
         );
         assert!(!public
             .json_body()

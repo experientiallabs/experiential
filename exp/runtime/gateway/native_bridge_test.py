@@ -98,6 +98,10 @@ from exp.runtime.models.providers.instruction_turns import (
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.protocol import DEVELOPER_ROLE_REWRITE_DISCLOSURE
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
+from exp.runtime.openai_protocol.caller_copy import (
+    CALLER_COPY_EXAMPLES,
+    CALLER_COPY_PASSTHROUGH,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 from exp.runtime.openai_protocol.state import ProtocolNamespace
@@ -4473,6 +4477,13 @@ def test_rust_failure_taxonomy_matches_public_failure_error() -> None:
         if failure_class != GatewayFailureClass.QUOTA_EXCEEDED:
             assert actual["message"] == expected.detail.message, failure_class
             assert actual["retry_after_seconds"] == expected.retry_after_seconds, failure_class
+    # The caller wording of each durable sentence is the same on both planes.
+    for failure_class, durable in (*CALLER_COPY_EXAMPLES, *CALLER_COPY_PASSTHROUGH):
+        expected = public_failure_error(
+            GatewayFailure(failure_class=failure_class, safe_message=durable)
+        )
+        actual = json.loads(native.failure_public_error_fixture(failure_class.value, durable))
+        assert actual["message"] == expected.detail.message, durable
 
 
 def test_rust_chat_sse_frames_match_python_and_the_committed_golden() -> None:

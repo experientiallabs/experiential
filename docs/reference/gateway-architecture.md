@@ -693,16 +693,16 @@ sentence. The bounded ledger detail exempts the request's own model id from the 
 so a provider sentence naming the model is kept rather than dropped.
 
 **A refusal names its bounded category to the caller.** A `refusal` answer stays a 400 with code
-`refusal` and type `invalid_request_error`, but it now carries a machine-readable `refusal_reason`
-field in the error body (present on every surface that renders the public error: `/v1/chat/completions`,
-`/v1/responses`, and `/v1/messages`, whose Anthropic envelope carries the same field). The category
-is a closed vocabulary derived from the provider's own code and sentence, never its prose:
-`cyber_policy`, `cbrn`, `content_policy`, `recitation`, `data_inspection`, and `unspecified` for a
-refusal the provider filed under no reason. The caller-facing message is the fixed sentence plus the
-category's fixed phrase ("provider refused the request: cybersecurity policy"), while the raw provider
-token keeps riding `provider_detail` into the ledger only. The reason also rides the settlement
-argument next to `provider_detail`, so the control plane counts refusals by reason without parsing the
-free-form detail.
+`refusal` and type `invalid_request_error` and carries a machine-readable `refusal_reason` on every
+surface (`/v1/chat/completions`, `/v1/responses`, and `/v1/messages`). The category is a closed
+vocabulary from the provider's own code and sentence, never its prose: `cyber_policy`, `cbrn`,
+`content_policy`, `recitation`, `data_inspection`, or `unspecified`. The durable `safe_message` is the
+fixed sentence plus the category's phrase ("provider refused the request: cybersecurity policy"); the
+raw provider token rides `provider_detail` and the settlement argument into the ledger only. **Callers
+read caller wording, never the durable sentence:** the public error maps each known `safe_message`
+("provider service failed", "all exact-model deployments are unavailable", the refusal above) to what
+happened and what to do (`caller_copy.rs`, mirrored by `exp.runtime.openai_protocol.caller_copy`);
+status, code, type, `Retry-After` and `refusal_reason` are unchanged, and unlisted sentences pass through.
 
 **Customer-managed credentials fail as the customer's error.** On a BYOK rung, a provider 401/403
 or 402, at stream open or declared mid-stream, is the customer's configuration, not operator

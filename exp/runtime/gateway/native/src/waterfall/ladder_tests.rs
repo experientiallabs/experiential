@@ -864,7 +864,7 @@ fn gemini_relay_refusal_http_and_sse_stop_the_default_ladder_and_settle_once() {
             assert_eq!(error.error_type, "invalid_request_error");
             assert_eq!(
                 error.message,
-                "provider refused the request: content policy"
+                "The model's provider declined this request (content policy). Rephrase the request or choose another model."
             );
             assert_eq!(
                 error.json_body()["error"]["refusal_reason"],

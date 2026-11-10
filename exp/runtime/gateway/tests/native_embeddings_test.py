@@ -410,9 +410,9 @@ def test_provider_client_error_relays_the_parameter_and_detail(engine: _ServingE
 @pytest.mark.parametrize(
     ("selector", "expected_fragment"),
     (
-        ("short-count", "malformed response"),
-        ("unbilled", "malformed response"),
-        ("server-error", "provider service failed"),
+        ("short-count", "incomplete or invalid response"),
+        ("unbilled", "incomplete or invalid response"),
+        ("server-error", "had a server error"),
     ),
 )
 def test_unbillable_or_failing_provider_answers_fail_closed(
