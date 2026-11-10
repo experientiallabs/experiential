@@ -69,6 +69,8 @@ IDENTIFIER_FIELDS = frozenset(
         "connector_id",
         "working_directory",
         "agent_name",
+        "effort",
+        "speed",
         "container",
         "fingerprint",
         "authorization",
@@ -103,8 +105,9 @@ IDENTIFIER_FIELDS = frozenset(
 )
 """Fields that name a model, tool, call, protocol member, caller, cache key, or provider token."""
 
-IDENTIFIER_PATHS = frozenset({("metadata", "user_id")})
-"""Identifiers below a caller-keyed object (the Messages end-user id in ``metadata``)."""
+IDENTIFIER_PATHS = frozenset({("metadata", "user_id"), ("thinking", "display")})
+"""Identifiers one level below a top-level object: the Messages end-user id in
+``metadata`` and the Messages reasoning-display selector in ``thinking``."""
 
 OPAQUE_FIELDS = frozenset(
     {
@@ -119,6 +122,7 @@ OPAQUE_FIELDS = frozenset(
         "filters",
         "headers",
         "domain_secrets",
+        "env",
     }
 )
 """Provider objects that round-trip verbatim; any string below one is an identifier."""

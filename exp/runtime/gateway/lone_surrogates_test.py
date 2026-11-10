@@ -797,6 +797,14 @@ def test_an_apply_patch_path_is_refused() -> None:
         ({"type": "agent_message", "author": "a\ud83d"}, "input.0.author"),
         ({"type": "agent_message", "recipient": "r\ud83d"}, "input.0.recipient"),
         ({"type": "agent_message", "agent": {"agent_name": "n\ud83d"}}, "input.0.agent.agent_name"),
+        (
+            {"type": "configuration_update", "reasoning": {"effort": "hi\ud83d"}},
+            "input.0.reasoning.effort",
+        ),
+        (
+            {"type": "local_shell_call", "action": {"env": {"TOKEN": "t\ud83d"}}},
+            "input.0.action.env",
+        ),
     ],
 )
 def test_replayed_item_paths_payloads_and_agents_are_refused(item: JsonObject, param: str) -> None:
@@ -821,3 +829,17 @@ def test_an_output_field_elsewhere_is_plain_content() -> None:
     """Only a local shell output is JSON text; other outputs keep literal escape text."""
     payload: JsonObject = {"input": [{"type": "function_call_output", "output": "\\ud83d"}]}
     assert _replace(payload) == ()
+
+
+@pytest.mark.parametrize(
+    ("body", "param"),
+    [
+        ({"speed": "fast\ud83d"}, "speed"),
+        ({"thinking": {"type": "enabled", "display": "sum\ud83d"}}, "thinking.display"),
+    ],
+)
+def test_messages_pass_through_controls_are_refused(body: JsonObject, param: str) -> None:
+    """Evolving provider selectors forwarded verbatim are refused, never repaired."""
+    with pytest.raises(LoneSurrogateRefusal) as refused:
+        _replace(body)
+    assert refused.value.param == param

@@ -241,9 +241,10 @@ the order the model produced.
   after 128 disclosures (or for a name over 256 characters) as `body`. The same refusal covers an MCP
   `approval_request_id` and `allowed_tools` entries, a program `fingerprint`, an apply-patch `operation.path`, a local shell
   `working_directory`, an image generation `result`, an agent message's `author`, `recipient`
-  and `agent_name`, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
+  and `agent_name`, a `configuration_update`'s `reasoning.effort`, the Messages `speed` and
+  `thinking.display` selectors, a `container_id`, `vector_store_ids` and `file_ids` entries, an MCP `tunnel_id`, `connector_id` and `authorization`, a code-interpreter `container` id, the `stop` and
   `stop_sequences` controls, and any string inside a web-search `user_location`, a file-search `filters` object, MCP
-  `headers` or a `network_policy`'s `domain_secrets`.
+  `headers`, a `network_policy`'s `domain_secrets` or a local shell `env`.
   Embeddings, images and audio have no disclosure channel, so a lone surrogate there is the
   same field-named 400. A body whose bytes are not UTF-8 stays `invalid_json`.
 - A Chat system, developer, user or tool message whose `content` is null or omitted (Go clients
