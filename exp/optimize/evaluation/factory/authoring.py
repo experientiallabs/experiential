@@ -125,6 +125,11 @@ def _effective_request(spec: AuthorSettings, request: ModelRequest) -> ModelRequ
     return request.model_copy(update={"reasoning_effort": spec.reasoning_effort})
 
 
+def author_request_bytes(spec: AuthorSettings, request: ModelRequest) -> int:
+    """The size the input allowance check measures for this request under these settings."""
+    return len(_effective_request(spec, request).model_dump_json().encode())
+
+
 def _prepare_author(
     project: ProjectStore, spec: AuthorSettings, request: ModelRequest
 ) -> ModelCatalog:

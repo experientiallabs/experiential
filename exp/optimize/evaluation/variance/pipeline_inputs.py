@@ -50,6 +50,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
 from exp.optimize.evaluation.variance.rubric_agent import (
     RubricAuthoringProfile,
     author_rubric_agentic,
+    fitted_packet,
 )
 from exp.optimize.evaluation.variance.rubric_author import save_rubric
 from exp.runtime.agents.chat import ChatAgentRuntime
@@ -291,6 +292,7 @@ def mining_rubric(
         scenarios=(),
         observed_episodes=episodes,
     )
+    packet = fitted_packet(packet, spec.authoring.rubric_author, spec.authoring.rubric_profile)
     packet_ref = save_packet(project, packet, code_revision=revision)
     identity = stable_id(
         "mining-rubric",

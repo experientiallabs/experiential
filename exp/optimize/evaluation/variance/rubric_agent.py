@@ -48,7 +48,7 @@ from exp.common.core.artifacts import (
 from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelMessage, ModelRequest
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_request_bytes
 from exp.optimize.evaluation.variance.authoring_packet import (
     AuthoringPacket,
     bounded_reason,
@@ -1015,3 +1015,65 @@ def answer_schema(model: type[ContractModel]) -> JsonObject:
             "needs_research, which then requires research."
         )
     return schema
+
+
+FIT_HEADROOM = 0.2
+"""Share of the input allowance a packet's first request leaves for later phases and repairs."""
+
+
+def first_request_bytes(
+    packet: AuthoringPacket,
+    settings: AuthorSettings,
+    profile: RubricAuthoringProfile,
+    library: LibraryBinding | None = None,
+) -> int:
+    """The largest first request any variant of the profile sends for this packet, in bytes."""
+    sizes = []
+    for variant in profile.variants:
+        request = (
+            phase_request(
+                packet, variant, "plan", {}, output_tokens=settings.output_tokens, library=library
+            )
+            if profile.agentic
+            else rubric_request(
+                packet,
+                output_tokens=settings.output_tokens,
+                instruction=variant_prompt(variant),
+                library=library,
+            )
+        )
+        sizes.append(author_request_bytes(settings, request))
+    return max(sizes)
+
+
+def fitted_packet(
+    packet: AuthoringPacket,
+    settings: AuthorSettings,
+    profile: RubricAuthoringProfile,
+    library: LibraryBinding | None = None,
+) -> AuthoringPacket:
+    """Drop observed episodes, largest first, until the first request fits with headroom.
+
+    The first request must fit ``(1 - FIT_HEADROOM)`` of the author's input allowance so the
+    later phases, which add earlier answers, and repair turns still fit. How many episodes were
+    dropped is recorded on the packet. A packet that does not fit even without episodes is
+    returned without them, and the author's own allowance check refuses it.
+
+    Returns:
+        The packet the author is shown.
+    """
+    budget = int(settings.maximum_input_bytes * (1 - FIT_HEADROOM))
+    episodes = list(packet.observed_episodes)
+    fitted = packet
+    while episodes and first_request_bytes(fitted, settings, profile, library) > budget:
+        largest = max(range(len(episodes)), key=lambda i: (len(episodes[i].model_dump_json()), i))
+        del episodes[largest]
+        fitted = packet.model_copy(
+            update={
+                "observed_episodes": tuple(episodes),
+                "omitted_episodes": packet.omitted_episodes
+                + len(packet.observed_episodes)
+                - len(episodes),
+            }
+        )
+    return fitted

@@ -366,3 +366,42 @@ def test_a_lost_draw_is_redrawn_and_exhausted_repairs_end_in_the_last_failure() 
         request, "e", "tool", lambda response, args: (args, None if args["ok"] else "bad")
     )
     assert failure == "bad" and names == ["e", "e-repair-1", "e-redraw-1", "e-redraw-1-repair-1"]
+
+
+def test_an_oversized_packet_drops_its_largest_episodes_until_the_first_request_fits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Episodes go largest first, the count is recorded, and the first request fits."""
+    from exp.optimize.evaluation.variance.rubric_agent import (
+        FIT_HEADROOM,
+        first_request_bytes,
+        fitted_packet,
+    )
+    from exp.simulation.induction.contracts import InductionEpisode
+
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    packet, _ = ticket_packet(fixture, coalition=ticket_coalition())
+
+    def episode(name: str, size: int) -> InductionEpisode:
+        step = {"tool": "read_ticket", "arguments": {"note": "x" * size}, "reply": {"ok": True}}
+        return InductionEpisode.model_validate({"episode_id": name, "steps": [step]})
+
+    big = packet.model_copy(
+        update={
+            "observed_episodes": (
+                episode("small", 1_000), episode("huge", 60_000), episode("mid", 40_000),
+            )
+        }
+    )  # fmt: skip
+    profile = RubricAuthoringProfile(variants=("requirements-first",))
+    settings = fixture.settings.model_copy(
+        update={"maximum_input_bytes": int((first_request_bytes(packet, fixture.settings, profile)
+        + 30_000) / (1 - FIT_HEADROOM))}
+    )  # fmt: skip
+
+    fitted = fitted_packet(big, settings, profile)
+
+    assert [row.episode_id for row in fitted.observed_episodes] == ["small"]
+    assert fitted.omitted_episodes == 2
+    assert first_request_bytes(fitted, settings, profile) <= settings.maximum_input_bytes * 0.8
+    assert fitted_packet(packet, settings, profile) == packet
