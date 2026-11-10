@@ -4,7 +4,8 @@ messages are exercised in requests_test.py."""
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel, ConfigDict, ValidationError
+from openai.types.chat.completion_create_params import CompletionCreateParamsNonStreaming
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from exp.runtime.openai_protocol.validation_errors import (
     cleaned_location,
@@ -163,3 +164,15 @@ def test_an_over_long_undefined_key_still_renders_a_bounded_refusal(key: str) ->
     assert param.startswith("tools.0.function.")
     assert param.endswith("...")
     assert message == unknown_parameter_message(param)
+
+
+def test_an_open_string_vocabulary_names_the_string_not_its_members() -> None:
+    """``str | Literal[...]`` (the SDK's ``model``) admits any string: no member list is shown."""
+    adapter = TypeAdapter[object](CompletionCreateParamsNonStreaming)
+    with pytest.raises(ValidationError) as raised:
+        adapter.validate_python({"model": {"value": "coding"}, "messages": []})
+    error = validation_protocol_error(raised.value)
+    assert error.detail.param == "model"
+    assert error.detail.message == (
+        "Invalid value for 'model': expected a string, but got an object instead."
+    )

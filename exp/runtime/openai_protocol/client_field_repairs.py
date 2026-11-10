@@ -31,6 +31,7 @@ from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.openai_protocol.errors import invalid_field
 from exp.runtime.openai_protocol.legacy_functions import translate_legacy_functions
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
+from exp.runtime.openai_protocol.official_schema import stream_requested
 from exp.runtime.openai_protocol.responses_probe import drop_gateway_web_search_items
 from exp.runtime.openai_protocol.unknown_message_fields import (
     drop_unknown_chat_message_fields,
@@ -396,7 +397,7 @@ def accept_responses_stream_options(payload: JsonObject) -> tuple[JsonObject, tu
     if options is None:
         return remaining, ()
     obfuscation = options.get("include_obfuscation")
-    if payload.get("stream") is not True:
+    if not stream_requested(payload):
         return remaining, (STREAM_OPTIONS_NOT_STREAMING,)
     disclosures = (
         *((STREAM_OBFUSCATION_IGNORED,) if obfuscation is True else ()),
@@ -515,7 +516,7 @@ def drop_chat_stream_options_without_stream(
         The payload without ``stream_options`` when ``stream`` is not true,
         plus a disclosure when a non-null object was removed.
     """
-    if "stream_options" not in payload or payload.get("stream") is True:
+    if "stream_options" not in payload or stream_requested(payload):
         return payload, ()
     options = payload["stream_options"]
     remaining = {key: value for key, value in payload.items() if key != "stream_options"}

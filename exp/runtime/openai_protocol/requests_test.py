@@ -45,6 +45,10 @@ from exp.runtime.models.providers.streaming_requests import (
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
+from exp.runtime.openai_protocol.nullable_params import (
+    CHAT_NULLABLE_PARAMS,
+    RESPONSES_NULLABLE_PARAMS,
+)
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
@@ -6127,3 +6131,78 @@ def test_chat_image_url_accepts_original_detail() -> None:
     (image,) = decoded.request.messages[0].content_parts
     assert isinstance(image, ImageContentPart)
     assert image.detail == "original"
+
+
+_CHAT_BODY: JsonObject = {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+_RESPONSES_BODY: JsonObject = {"model": "coding", "input": "hi"}
+
+
+def test_chat_stream_null_decodes_as_non_streaming() -> None:
+    """``"stream": null`` decodes as a non-streaming request, as OpenAI serves it."""
+    decoded = decode_chat({**_CHAT_BODY, "stream": None, "stream_options": None})
+    assert decoded.request.stream is False
+    assert decoded == decode_chat(_CHAT_BODY)
+
+
+@pytest.mark.parametrize("value", [1, 1.0])
+def test_a_numeric_true_stream_streams_with_its_stream_options(value: float) -> None:
+    """``stream: 1`` streams on both surfaces and keeps ``stream_options`` like ``true``."""
+    chat = decode_chat(
+        {**_CHAT_BODY, "stream": value, "stream_options": {"include_usage": True}}
+    ).request
+    assert chat.stream is True
+    assert chat.include_usage is True
+    assert chat.ignored_parameters == ()
+    responses = decode_responses(
+        {**_RESPONSES_BODY, "stream": value, "stream_options": {"include_obfuscation": False}}
+    ).request
+    assert responses.stream is True
+    assert responses.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("field", sorted(CHAT_NULLABLE_PARAMS))
+def test_every_chat_nullable_null_decodes_as_absent(field: str) -> None:
+    """A null on any OpenAI-nullable Chat field is the default, with no disclosure."""
+    assert decode_chat({**_CHAT_BODY, field: None}) == decode_chat(_CHAT_BODY)
+
+
+@pytest.mark.parametrize("field", sorted(RESPONSES_NULLABLE_PARAMS))
+def test_every_responses_nullable_null_decodes_as_absent(field: str) -> None:
+    """A null on any OpenAI-nullable Responses field is the default, with no disclosure."""
+    assert decode_responses({**_RESPONSES_BODY, field: None}) == decode_responses(_RESPONSES_BODY)
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        (_CHAT_BODY, "model"),
+        (_CHAT_BODY, "messages"),
+        (_CHAT_BODY, "tool_choice"),
+        (_CHAT_BODY, "response_format"),
+        (_RESPONSES_BODY, "model"),
+        (_RESPONSES_BODY, "input"),
+        (_RESPONSES_BODY, "tool_choice"),
+    ],
+)
+def test_a_null_openai_refuses_is_still_refused_by_name(body: JsonObject, field: str) -> None:
+    """Fields OpenAI does not let be null keep a 400 that names them, never ``stream``."""
+    decode = decode_chat if "messages" in body else decode_responses
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode({**body, field: None})
+    assert raised.value.status_code == 400
+    assert raised.value.detail.param == field
+
+
+def test_a_non_string_chat_model_is_named_not_reported_as_a_missing_stream() -> None:
+    """A non-string ``model`` is named, never reported as a missing ``stream``.
+
+    A body whose ``model`` is not a string (PowerShell 5.1's ``ConvertTo-Json`` of a
+    ``Get-Content`` string emits an object) fails both official union branches;
+    validating only the branch ``stream`` selects keeps the error on ``model``.
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat({**_CHAT_BODY, "model": {"value": "coding", "PSPath": "C:\\model.txt"}})
+    assert raised.value.detail.param == "model"
+    assert str(raised.value) == (
+        "Invalid value for 'model': expected a string, but got an object instead."
+    )
