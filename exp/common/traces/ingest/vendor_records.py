@@ -90,14 +90,23 @@ def read_vendor_export(
     )
     try:
         document: JsonValue = json.loads(text)
-    except json.JSONDecodeError:
-        payloads, issues = _decode_jsonl(text, vendor=vendor, error_type=error_type)
+    except json.JSONDecodeError as exc:
+        payloads, issues = _decode_jsonl(
+            text,
+            vendor=vendor,
+            error_type=error_type,
+            document_error=exc,
+        )
         return VendorExport(source=source, payloads=payloads, issues=issues)
     return VendorExport(source=source, payloads=(document,), issues=())
 
 
 def _decode_jsonl(
-    text: str, *, vendor: str, error_type: type[ValueError]
+    text: str,
+    *,
+    vendor: str,
+    error_type: type[ValueError],
+    document_error: json.JSONDecodeError,
 ) -> tuple[tuple[JsonValue, ...], tuple[TraceNormalizationIssue, ...]]:
     """Decode JSONL records and retain every malformed line as an explicit exclusion.
 
@@ -105,6 +114,7 @@ def _decode_jsonl(
         text: UTF-8 JSONL source text.
         vendor: Vendor label used in the no-record error message.
         error_type: Error class raised when the source declares no records.
+        document_error: Original whole-document failure retained if no JSONL record decodes.
 
     Returns:
         Decoded records in source order and retained parse exclusions.
@@ -124,8 +134,16 @@ def _decode_jsonl(
             issues.append(
                 TraceNormalizationIssue(f"line-{line_number}", f"invalid JSONL record: {exc.msg}")
             )
-    if not payloads and not issues:
-        raise error_type(f"{vendor} export contains no records")
+    if not payloads:
+        if not issues:
+            raise error_type(f"{vendor} export contains no records")
+        issues = [
+            TraceNormalizationIssue(
+                "document",
+                f"invalid JSON document: {document_error.msg} at "
+                f"line {document_error.lineno} column {document_error.colno}",
+            )
+        ]
     return tuple(payloads), tuple(issues)
 
 
