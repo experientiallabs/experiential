@@ -19,6 +19,7 @@ from exp.runtime.models.providers.allowed_tools import (
     needs_allowed_tools_translation,
     restrict_to_allowed_tools,
 )
+from exp.runtime.models.providers.anthropic_annotations import anthropic_annotation_disclosures
 from exp.runtime.models.providers.codex_tools import (
     convert_native_history,
     translate_native_tools,
@@ -615,45 +616,10 @@ def route_generation_parameter_requests(
         if "messages.provider_specific_fields" not in ignored:
             ignored.append("messages.provider_specific_fields")
 
-    # Anthropic tool annotations (and Responses defer_loading) drop elsewhere with disclosure.
-    if not all(profile.dialect == "anthropic_messages" for profile in profiles):
-        tool_annotation_paths = (
-            (
-                f"tools.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}",
-                any(tool.cache_control is not None for tool in request.tools)
-                and not all(profile.preserves_cache_control for profile in profiles),
-            ),
-            (
-                "tools.eager_input_streaming",
-                any(tool.eager_input_streaming is not None for tool in request.tools),
-            ),
-            (
-                "tools.defer_loading",
-                any(tool.defer_loading is not None for tool in request.tools)
-                and not all(profile.dialect == "openai_responses" for profile in profiles),
-            ),
-            (
-                "tools.allowed_callers",
-                any(tool.allowed_callers is not None for tool in request.tools),
-            ),
-            (
-                "tools.input_examples",
-                any(tool.input_examples is not None for tool in request.tools),
-            ),
-            # The tool_use-side counterpart of allowed_callers: Messages
-            # clients echo the provider's programmatic-call attribution.
-            (
-                "messages.content.tool_use.caller->dropped(unsupported_by_provider)",
-                any(
-                    call.provider_anthropic_caller is not None
-                    for message in request.messages
-                    for call in message.tool_calls
-                ),
-            ),
-        )
-        for path, present in tool_annotation_paths:
-            if present and path not in ignored:
-                ignored.append(path)
+    # Anthropic-native annotations drop elsewhere with disclosure.
+    ignored.extend(
+        d for d in anthropic_annotation_disclosures(profiles, request) if d not in ignored
+    )
 
     # Responses tool-call attribution (the nested-tool `namespace` and the
     # SDK 3.0 programmatic `caller`, on calls and on their results) exists
