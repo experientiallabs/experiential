@@ -64,7 +64,9 @@ class _EnableThinkingResult:
         self.thinking_default_enable = thinking_default_enable
         self.disclosures = disclosures
         # The caller's effort field when it is not the flat one; set by translation.
-        self.effort_parameter: Literal["reasoning.effort", "output_config.effort"] | None = None
+        self.effort_parameter: (
+            Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
+        ) = None
 
 
 def _reasoning_object_intent(request: _ChatRequest) -> bool | None:
@@ -106,8 +108,9 @@ def translate_enable_thinking(
             ``output_config.effort``.
 
     Returns:
-        The resolved controls, with ``effort_parameter`` naming a nested or
-        translated effort field.
+        The resolved controls, with ``effort_parameter`` naming the effort
+        field the caller sent (``None`` when the effort, if any, came from an
+        enable or disable control instead).
     """
     result = _translate_enable_thinking(request)
     result.effort_parameter = _chat_effort_parameter(request, repairs)
@@ -290,8 +293,12 @@ def _budgeted_thinking(request: _ChatRequest) -> _EnableThinkingResult:
 
 def _chat_effort_parameter(
     request: _ChatRequest, repairs: tuple[str, ...]
-) -> Literal["reasoning.effort", "output_config.effort"] | None:
-    """Name the Chat field the caller's effort came from, when it is not the flat one.
+) -> Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None:
+    """Name the Chat effort field the caller sent, if any.
+
+    An effort resolved from an enable or disable control (for example
+    ``reasoning.enabled: false`` becoming ``none``) names no field, so a
+    refusal does not tell the caller to change a field it never sent.
 
     Args:
         request: The validated Chat body after client field repairs.
@@ -299,15 +306,12 @@ def _chat_effort_parameter(
             ``output_config.effort`` arrives here as ``reasoning_effort``.
 
     Returns:
-        ``output_config.effort`` or ``reasoning.effort`` for a translated or
-        nested effort, otherwise ``None`` (the flat field, or no effort).
+        The caller's effort field, or ``None`` when no effort field was sent.
     """
     if OUTPUT_CONFIG_EFFORT_TRANSLATED in repairs:
         return "output_config.effort"
-    if (
-        request.reasoning_effort is None
-        and request.reasoning is not None
-        and request.reasoning.effort is not None
-    ):
+    if request.reasoning_effort is not None:
+        return "reasoning_effort"
+    if request.reasoning is not None and request.reasoning.effort is not None:
         return "reasoning.effort"
     return None

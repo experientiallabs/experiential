@@ -17,6 +17,15 @@ from exp.runtime.models.providers.thinking_budget import (
 _ROUTE_REFUSAL = "This model route cannot preserve the requested token probabilities."
 
 
+def _caller_named_effort(request: GatewayRequest) -> bool:
+    """Whether the effort on the request came from an effort field the caller sent.
+
+    An effort translated from an enable or disable control, or resolved by the
+    gateway for a rung, is not the caller's field to change.
+    """
+    return request.reasoning_effort is not None and request.reasoning_effort_parameter is not None
+
+
 def _effort_refusal(
     effort: str | None, qualified: Sequence[str], request: GatewayRequest, parameter: str
 ) -> str:
@@ -29,16 +38,27 @@ def _effort_refusal(
     effort that rung qualifies admits the request on it.
     """
     field = request.caller_effort_parameter
-    if request.reasoning_effort is not None:
-        requested = f"{field} {effort!r}"
-    elif effort is None:
-        requested = "the model's default reasoning effort"
-    else:
-        requested = f"the model's default reasoning effort {effort!r}"
     remove = "logprobs and top_logprobs" if parameter == "top_logprobs" else "logprobs"
+    choices = ", ".join(qualified)
+    if _caller_named_effort(request):
+        return (
+            f"Token probabilities are not available with {field} {effort!r} on this model. "
+            f"Use {field} one of: {choices}, or remove {remove}."
+        )
+    if request.reasoning_effort is not None:
+        return (
+            f"Token probabilities are not available with the reasoning effort this request "
+            f"resolves to ({effort!r}) on this model. Send {field} one of: {choices} in place "
+            f"of the other thinking controls, or remove {remove}."
+        )
+    requested = (
+        "the model's default reasoning effort"
+        if effort is None
+        else f"the model's default reasoning effort {effort!r}"
+    )
     return (
         f"Token probabilities are not available with {requested} on this model. "
-        f"Use {field} one of: {', '.join(qualified)}, or remove {remove}."
+        f"Use {field} one of: {choices}, or remove {remove}."
     )
 
 
@@ -99,9 +119,7 @@ def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: Gatew
             raise ProviderParameterError(
                 message=_effort_refusal(effort, qualified, request, parameter),
                 param=(
-                    request.caller_effort_parameter
-                    if request.reasoning_effort is not None
-                    else parameter
+                    request.caller_effort_parameter if _caller_named_effort(request) else parameter
                 ),
                 code="unsupported_parameter",
             )

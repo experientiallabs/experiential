@@ -280,3 +280,10 @@ def test_the_caller_effort_field_is_recorded(overrides: JsonObject, expected: st
     request = _decode(**overrides)
     assert request.reasoning_effort == "low"
     assert request.caller_effort_parameter == expected
+
+
+def test_a_disable_control_names_no_effort_field() -> None:
+    """An effort translated from an off switch is not attributed to an effort field."""
+    request = _decode(reasoning={"enabled": False})
+    assert request.reasoning_effort == "none"
+    assert request.reasoning_effort_parameter is None

@@ -255,7 +255,15 @@ def test_an_unqualified_effort_names_the_efforts_that_serve_probabilities() -> N
     )
     require_chat_logprobs((profile,), request)
     with pytest.raises(ProviderParameterError) as caught:
-        require_chat_logprobs((profile,), request.model_copy(update={"reasoning_effort": "medium"}))
+        require_chat_logprobs(
+            (profile,),
+            request.model_copy(
+                update={
+                    "reasoning_effort": "medium",
+                    "reasoning_effort_parameter": "reasoning_effort",
+                }
+            ),
+        )
     assert caught.value.param == "reasoning_effort"
     assert "'medium'" in str(caught.value)
     assert "low, high, max" in str(caught.value)
@@ -316,7 +324,13 @@ def _reasoning_profile(efforts: tuple[str, ...], default: str = "max") -> Gatewa
 
 def test_a_suggested_effort_admits_the_request_on_the_refusing_rung() -> None:
     """Narrowing reports the first rung's efforts, and sending one keeps that rung."""
-    request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    request = _chat_request().model_copy(
+        update={
+            "logprobs": True,
+            "reasoning_effort": "medium",
+            "reasoning_effort_parameter": "reasoning_effort",
+        }
+    )
     route = (_reasoning_profile(("low", "max")), _reasoning_profile(("high",)))
     with pytest.raises(ProviderParameterError) as caught:
         compatible_generation_parameter_profile_indexes(route, request)
@@ -328,7 +342,13 @@ def test_a_suggested_effort_admits_the_request_on_the_refusing_rung() -> None:
 
 def test_suggested_efforts_are_limited_to_the_rungs_effort_ladder() -> None:
     """A qualified effort the rung cannot carry is never suggested, since the retry would fail."""
-    request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    request = _chat_request().model_copy(
+        update={
+            "logprobs": True,
+            "reasoning_effort": "medium",
+            "reasoning_effort_parameter": "reasoning_effort",
+        }
+    )
     rung = replace(
         _reasoning_profile(("low", "ultra"), default="low"),
         supported_reasoning_efforts=("low", "medium"),
@@ -345,9 +365,43 @@ def test_suggested_efforts_are_limited_to_the_rungs_effort_ladder() -> None:
     assert "cannot preserve" in str(caught.value)
 
 
+def test_an_effort_the_caller_did_not_name_keeps_the_probability_field() -> None:
+    """A disable control or a gateway-resolved effort is not reported as a caller field."""
+    profile = replace(
+        _reasoning_profile(("low", "max")),
+        supported_reasoning_efforts=("none", "low", "medium", "max"),
+    )
+    disabled = decode_chat(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "reasoning": {"enabled": False},
+        }
+    ).request
+    assert disabled.reasoning_effort == "none"
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((profile,), disabled)
+    assert caught.value.param == "logprobs"
+    assert "resolves to ('none')" in str(caught.value)
+    assert "in place of the other thinking controls" in str(caught.value)
+    # A rung request whose effort the gateway resolved carries no caller field.
+    shaped = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    with pytest.raises(ProviderParameterError) as caught:
+        require_chat_logprobs((profile,), shaped)
+    assert caught.value.param == "logprobs"
+    assert "reasoning_effort 'medium'" not in str(caught.value)
+
+
 def test_an_incapable_later_rung_refuses_before_any_effort_advice() -> None:
     """Changing effort cannot admit a route whose later rung returns no probabilities."""
-    request = _chat_request().model_copy(update={"logprobs": True, "reasoning_effort": "medium"})
+    request = _chat_request().model_copy(
+        update={
+            "logprobs": True,
+            "reasoning_effort": "medium",
+            "reasoning_effort_parameter": "reasoning_effort",
+        }
+    )
     route = (_reasoning_profile(("low", "max")), replace(_profile(), supports_logprobs=False))
     with pytest.raises(ProviderParameterError) as caught:
         require_chat_logprobs(route, request)
