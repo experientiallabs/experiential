@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema_reshaping,
     anthropic_rejects_assistant_prefill,
@@ -363,7 +363,7 @@ def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
 
 
 def require_assistant_prefill_supported(
-    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+    profiles: Sequence[GatewayWireProfile], messages: Sequence[GatewayMessage]
 ) -> None:
     """Refuse a trailing assistant turn before dispatch on rungs whose model rejects it.
 
@@ -377,13 +377,18 @@ def require_assistant_prefill_supported(
     assistant message prefill" through OpenRouter), and the release matcher
     only ever matches a Claude release id.
 
+    Args:
+        profiles: The route's wire profiles.
+        messages: The history as it will be dispatched, after any foreign-wire
+            conversion (a dropped native item can expose a trailing assistant turn).
+
     Raises:
         ProviderParameterError: The final message is an assistant turn and a
             profile's model refuses prefill.
     """
-    if not request.messages or request.messages[-1].role != "assistant":
+    if not messages or messages[-1].role != "assistant":
         return
-    if request.messages[-1].provider_native_item is not None:
+    if messages[-1].provider_native_item is not None:
         return
     for profile in profiles:
         if not anthropic_rejects_assistant_prefill(profile.model_id):

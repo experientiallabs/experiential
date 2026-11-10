@@ -115,7 +115,7 @@ def message_text(message: GatewayMessage) -> str:
         The message text, or an empty string when it carries none.
     """
     if message.provider_native_item is not None:
-        return ""
+        return _native_input_text(message) if message.role == "user" else ""
     if message.content is not None:
         return message.folded_tool_error_content()
     if message.provider_anthropic_block is not None:
@@ -123,6 +123,40 @@ def message_text(message: GatewayMessage) -> str:
     if message.provider_anthropic_blocks is not None:
         return "".join(_block_text(block) for block in message.provider_anthropic_blocks)
     return ""
+
+
+def _native_input_text(message: GatewayMessage) -> str:
+    """Return the plaintext of a verbatim-carried item that is caller input.
+
+    A native OpenAI Responses rung receives an ``agent_message`` and a
+    ``function_call_output`` that answers no call as input the model reads,
+    so their text parts are classified like any user turn; otherwise a caller
+    could route a prompt past the check by spelling it as one of those items.
+    Opaque parts (images, encrypted content) carry no classifiable text.
+
+    Args:
+        message: A user-role message carrying one native Responses item.
+
+    Returns:
+        The item's text parts joined by newlines, or an empty string.
+    """
+    item = message.provider_native_item or {}
+    match item.get("type"):
+        case "agent_message":
+            parts = item.get("content")
+        case "function_call_output":
+            parts = item.get("output")
+            if isinstance(parts, str):
+                return parts
+        case _:
+            return ""
+    return "\n".join(
+        part["text"]
+        for part in (parts if isinstance(parts, list) else ())
+        if isinstance(part, dict)
+        and part.get("type") in ("input_text", "output_text", "text")
+        and isinstance(part.get("text"), str)
+    )
 
 
 def _latest_user_index(messages: tuple[GatewayMessage, ...]) -> int | None:

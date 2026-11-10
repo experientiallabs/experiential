@@ -550,9 +550,10 @@ class GatewayDeploymentCapabilities(ContractModel):
             mid-turn frames.
         supports_reasoning_effort_update: Whether a ``configuration_update`` input item may
             change reasoning effort mid-conversation without invalidating the cached prompt
-            prefix -- the request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). Off
-            until the decoder recognizes the item (it must not hit the unknown-item reject path)
-            and applies the effort forward.
+            prefix -- the request-level ``reasoning.effort`` stays fixed (GPT-6 Astra). The
+            decoder accepts the item and a native OpenAI Responses rung receives it verbatim for
+            the provider to interpret; this slot stays off until the gateway itself applies the
+            effort forward, and nothing reads it yet.
         time_to_first_byte_base_seconds: Deployment override for the lane's flat
             time-to-first-byte allowance.
 

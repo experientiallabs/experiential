@@ -142,6 +142,41 @@ def test_opaque_items_and_image_only_requests_are_not_refused() -> None:
     assert classification_window(request, ClassificationWindow()) == ""
 
 
+def test_caller_input_carried_as_a_native_item_is_classified() -> None:
+    """An agent message or an unpaired tool output is input the model reads, so
+    its text is the latest user text rather than an opaque item."""
+    agent = _request(
+        GatewayMessage(
+            role="user",
+            provider_native_item={
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {"type": "input_text", "text": "first"},
+                    {"type": "encrypted_content", "encrypted_content": "opaque"},
+                    {"type": "input_text", "text": "second"},
+                ],
+            },
+        ),
+    )
+    unpaired = _request(
+        GatewayMessage(
+            role="user",
+            provider_native_item={
+                "type": "function_call_output",
+                "name": "send_message_to_thread",
+                "output": "delegated task",
+            },
+        ),
+    )
+
+    assert classification_window(agent, ClassificationWindow()) == ("[latest user]\nfirst\nsecond")
+    assert classification_window(unpaired, ClassificationWindow()) == (
+        "[latest user]\ndelegated task"
+    )
+
+
 def test_long_messages_keep_head_and_tail_and_the_system_text_keeps_its_head() -> None:
     """Truncation keeps both ends of user text, where instructions tend to hide."""
     request = _request(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeGuard
 
@@ -14,7 +15,113 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     SealedReasoningContentBlock,
 )
+from exp.runtime.openai_protocol.custom_tool_wire import (
+    CustomToolCallItem,
+    CustomToolCallOutputItem,
+)
 from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.responses_input_items import (
+    AgentMessageItem,
+    CompactionTriggerItem,
+    ConfigurationUpdateItem,
+    ContextCompactionItem,
+    ItemReferenceItem,
+)
+from exp.runtime.openai_protocol.wire_models import (
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
+    _AdditionalToolsItem,
+    _HostedToolItemEcho,
+)
+
+NativeInputRole = Literal["developer", "user", "assistant", "tool"]
+"""The canonical role a verbatim-carried input item holds its place under."""
+
+NATIVE_INPUT_ITEMS = (
+    _AdditionalToolsItem,
+    CustomToolCallItem,
+    CustomToolCallOutputItem,
+    _HostedToolItemEcho,
+    AgentMessageItem,
+    CompactionTriggerItem,
+    ContextCompactionItem,
+    ConfigurationUpdateItem,
+    ItemReferenceItem,
+)
+"""Input item models the decoder carries byte-for-byte as ``ReplayedNativeItem``.
+
+None of them has a canonical message form: a native Responses rung receives
+the raw caller item, and a foreign wire translates or drops it with
+disclosure (``codex_tools.convert_native_history``)."""
+
+
+def native_input_role(
+    item: _AdditionalToolsItem
+    | CustomToolCallItem
+    | CustomToolCallOutputItem
+    | _HostedToolItemEcho
+    | AgentMessageItem
+    | CompactionTriggerItem
+    | ContextCompactionItem
+    | ConfigurationUpdateItem
+    | ItemReferenceItem,
+) -> NativeInputRole:
+    """Return the role one verbatim-carried item holds its place under.
+
+    Provider-authored output (calls, compacted history, stored references)
+    is assistant history; results answering a call are tool history; an
+    agent message and a compaction request are input the model answers, so a
+    foreign wire never reads them as assistant prefill; tool definitions and
+    the positional configuration update are harness instructions.
+
+    Args:
+        item: One validated item of a ``NATIVE_INPUT_ITEMS`` model.
+
+    Returns:
+        The canonical role the carried item holds its place under.
+    """
+    match item:
+        case _HostedToolItemEcho():
+            return "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
+        case CustomToolCallItem() | ContextCompactionItem() | ItemReferenceItem():
+            return "assistant"
+        case CustomToolCallOutputItem():
+            return "tool"
+        case AgentMessageItem() | CompactionTriggerItem():
+            return "user"
+        case _AdditionalToolsItem() | ConfigurationUpdateItem():
+            return "developer"
+
+
+def dropped_native_breakpoints(
+    index: int, raw: JsonObject, marked_items: Sequence[JsonObject]
+) -> tuple[str, ...]:
+    """Name each prompt cache breakpoint a verbatim-carried item cannot keep.
+
+    The breakpoint extraction marks a text part of any item with a ``content``
+    list, but a verbatim item reaches the provider as the caller's stripped
+    bytes, so a breakpoint on an ``agent_message`` part has no carrier and is
+    disclosed as dropped rather than lost silently.
+
+    Args:
+        index: The item's position in ``input``.
+        raw: The item as carried (breakpoints already stripped).
+        marked_items: The marker-carrying input items, or empty when the
+            request has no breakpoint.
+
+    Returns:
+        One disclosure per dropped breakpoint, in part order.
+    """
+    if not marked_items:
+        return ()
+    parts = marked_items[index].get("content")
+    raw_parts = raw.get("content")
+    if not isinstance(parts, list) or not isinstance(raw_parts, list):
+        return ()
+    return tuple(
+        f"input.{index}.content.{part_index}.prompt_cache_breakpoint->dropped(unsupported_item)"
+        for part_index, (part, raw_part) in enumerate(zip(parts, raw_parts, strict=False))
+        if part != raw_part
+    )
 
 
 @dataclass(frozen=True)
@@ -52,11 +159,10 @@ class ReplayedFunctionCall:
 
 @dataclass(frozen=True)
 class ReplayedNativeItem:
-    """One Codex-native input item carried byte-for-byte (tool namespaces,
-    freeform tool calls and their outputs)."""
+    """One input item carried byte-for-byte (see ``NATIVE_INPUT_ITEMS``)."""
 
     index: int
-    role: Literal["developer", "assistant", "tool"]
+    role: NativeInputRole
     item: JsonObject
 
 

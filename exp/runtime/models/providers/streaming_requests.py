@@ -836,15 +836,11 @@ def route_generation_parameter_requests(
         and message.provider_native_item is None
         for message in request.messages
     ):
-        # The Anthropic wire rejects empty text content blocks post-dispatch
-        # ("text content blocks must be non-empty"; 2026-09-05, six orgs on
-        # claude-fable routes) and a user turn whose text is all whitespace
-        # ("text content blocks must contain non-whitespace text"; a user
-        # message must have non-empty content, so unlike an assistant turn
-        # it cannot dispatch as an empty array). Empty blocks inside a richer
-        # turn drop loss-free at conversion, but a user turn with no readable
-        # text has nothing to send and dropping the whole message would
-        # change conversation structure, so it is refused by name pre-dispatch.
+        # The Anthropic wire rejects empty or whitespace-only text blocks after
+        # dispatch, and a user turn, unlike an assistant turn, cannot dispatch
+        # as an empty array. Empty blocks inside a richer turn drop loss-free at
+        # conversion, but dropping a whole user turn would change the
+        # conversation structure, so it is refused by name pre-dispatch.
         raise ProviderParameterError(
             message=(
                 "A user message with empty or whitespace-only content cannot be "
@@ -855,7 +851,10 @@ def route_generation_parameter_requests(
             code="invalid_parameter",
         )
 
-    require_assistant_prefill_supported(profiles, request)
+    require_assistant_prefill_supported(
+        profiles,
+        cast("Sequence[GatewayMessage]", provider_updates.get("messages", request.messages)),
+    )
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
