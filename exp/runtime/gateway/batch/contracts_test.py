@@ -61,9 +61,8 @@ def test_parse_input_jsonl_rejects_invalid_json() -> None:
 def test_parse_input_jsonl_refuses_undecodable_input_as_a_submit_error() -> None:
     """Non-UTF-8 bytes, an over-long integer, and deep nesting are caller 400s.
 
-    Each raised a non-BatchSubmitError (UnicodeDecodeError, the decoder's plain
-    ValueError past 4,300 digits, RecursionError) that escaped the plane and
-    the bridge as a bare 500.
+    Each is reported as a ``BatchSubmitError`` naming the line, so the plane
+    answers the caller's fault rather than an internal error.
     """
     with pytest.raises(BatchSubmitError, match="not valid UTF-8"):
         parse_input_jsonl(b"\xff\xfe{}")

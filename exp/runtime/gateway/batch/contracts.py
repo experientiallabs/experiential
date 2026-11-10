@@ -357,13 +357,15 @@ def parse_input_jsonl(payload: bytes) -> list[tuple[int, JsonObject]]:
             f"batch input exceeds {MAXIMUM_INPUT_FILE_BYTES} bytes; split the job"
         )
     try:
-        decoded = payload.decode("utf-8", errors="strict")
+        # Split in the same expression so the whole decoded string is released
+        # before parsing; only the line strings stay referenced.
+        raw_lines = payload.decode("utf-8", errors="strict").splitlines()
     except UnicodeDecodeError as exc:
         raise BatchSubmitError(
             f"batch input is not valid UTF-8 (byte {exc.start}); JSONL must be UTF-8 encoded"
         ) from exc
     lines: list[tuple[int, JsonObject]] = []
-    for line_number, raw in enumerate(decoded.splitlines(), 1):
+    for line_number, raw in enumerate(raw_lines, 1):
         text = raw.strip()
         if not text:
             continue

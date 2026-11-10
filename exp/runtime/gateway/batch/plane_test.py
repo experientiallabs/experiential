@@ -224,6 +224,7 @@ def test_an_unclassified_fault_is_logged_and_answered_as_a_500_envelope(
     secret = "caller-content-canary"
 
     def fault(*_: object, **__: object) -> NoReturn:
+        """Stand in for an engine call that fails outside the batch contract."""
         raise RuntimeError(secret)
 
     monkeypatch.setattr(plane._engine, engine_call, fault)  # noqa: SLF001
@@ -247,6 +248,7 @@ def test_a_cancelled_provider_cancel_is_answered_as_a_500_envelope(
     plane = _plane()
 
     async def cancelled(*_: object, **__: object) -> NoReturn:
+        """Stand in for a provider cancel that ends in cancellation."""
         raise asyncio.CancelledError
 
     monkeypatch.setattr(plane._engine, "cancel", cancelled)  # noqa: SLF001
