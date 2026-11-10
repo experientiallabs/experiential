@@ -1,5 +1,7 @@
 """Incremental JSON parsing preserves exact record shapes and excludes malformed lines."""
 
+import codecs
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -40,6 +42,30 @@ def test_partial_bad_line_cannot_leak_nodes_into_next_record(tmp_path: Path) -> 
         archive = JsonArchive(path, directory, connection, "chat-json")
         assert [node.value() for node in archive.documents()] == [{"good": 1}, {"good": 2}]
         assert len(archive.issues) == 1 and archive.issues[0].source_record == "line-2"
+
+
+@pytest.mark.parametrize("jsonl", [False, True])
+def test_json_archive_accepts_a_leading_utf8_bom(tmp_path: Path, *, jsonl: bool) -> None:
+    """A Unicode signature is ignored without changing the snapshot identity.
+
+    Args:
+        tmp_path: Temporary directory receiving the archive and source fixture.
+        jsonl: Whether to exercise a multi-record JSONL export.
+    """
+    payloads = [{"id": 1}, {"id": 2}] if jsonl else [{"id": 1}]
+    separator = "\n" if jsonl else ""
+    raw = codecs.BOM_UTF8 + separator.join(json.dumps(payload) for payload in payloads).encode()
+    path = tmp_path / ("input.jsonl" if jsonl else "input.json")
+    path.write_bytes(raw)
+    directory = tmp_path / "scratch"
+    directory.mkdir()
+
+    with sqlite3.connect(directory / "archive.db") as connection:
+        archive = JsonArchive(path, directory, connection, "chat-json")
+
+        assert [node.value() for node in archive.documents()] == payloads
+        assert archive.issues == []
+        assert archive.source.sha256 == hashlib.sha256(raw).hexdigest()
 
 
 def test_utf8_failure_is_not_silently_replaced(tmp_path: Path) -> None:
