@@ -39,3 +39,35 @@ def test_a_verifier_reading_outside_the_workflow_cannot_be_shown_correct() -> No
     broken = {**VERIFIER, "rules": [{"operator": "equals", "path": "/tests/passed", "value": 4}]}
     results = {row.control: row for row in run_controls(broken, STATE, PROBES)}
     assert results["correct"].status == "not_constructible" and not results["correct"].ok
+
+
+def test_a_rule_contradicting_a_preserved_path_leaves_no_passing_state() -> None:
+    """Run 28's 86fd verifier: equals a literal on the probe it also protects; nothing passes."""
+    contradictory = {
+        **VERIFIER,
+        "rules": [{"operator": "equals", "path": "/final_state/test_file", "value": "unchanged"}],
+        "required_paths": ["/final_state/test_file"],
+        "preserved_paths": ["/test_file"],
+    }
+    results = {row.control: row for row in run_controls(contradictory, STATE, PROBES)}
+    assert results["correct"].status == "fail" and "protected state changed" in (
+        results["correct"].reason
+    )
+
+
+def test_a_domain_keeps_its_initial_shape() -> None:
+    """A filesystem domain must stay an object with its files map; values may change."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import shape_schema
+    from exp.runtime.environments.world_responses import validate_state_projection
+
+    schema = shape_schema(STATE["Workspace filesystem"])
+    assert schema == {
+        "type": "object",
+        "required": ["files"],
+        "properties": {"files": {"type": "object"}},
+    }
+    validate_state_projection({"fs": {"files": {"/workspace/new.py": "x"}}}, {"fs": schema})
+    import pytest
+
+    with pytest.raises(ValueError, match="transition refused"):
+        validate_state_projection({"fs": "the whole filesystem as text"}, {"fs": schema})

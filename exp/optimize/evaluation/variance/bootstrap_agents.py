@@ -80,6 +80,7 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
+from exp.optimize.evaluation.variance.grading_controls import run_controls
 from exp.optimize.evaluation.variance.verifier_paths import project_verifier, unplaced
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
@@ -502,6 +503,20 @@ def normalise_draft(
         notes.extend(moved)
         notes.extend(f"probe_paths: added {name!r} for the verifier" for name in added)
         answer = {**answer, "verifier": verifier, "probe_paths": probes}
+    manifest = answer.get("manifest")
+    if isinstance(manifest, dict) and isinstance(state, dict):
+        rows: list[JsonValue] = []
+        for row in manifest.get("domains", []):
+            if (
+                isinstance(row, dict)
+                and row.get("state_schema") is None
+                and isinstance(name := row.get("name"), str)
+                and name in state
+            ):
+                row = {**row, "state_schema": shape_schema(state[name])}
+                notes.append(f"manifest.domains: {name!r} keeps its initial shape on every move")
+            rows.append(row)
+        answer = {**answer, "manifest": {**manifest, "domains": rows}}
     replay = answer.get("replay_trace")
     if isinstance(replay, str) and replay not in material.sources:
         # The inventory names a whole trace by its locator; replay_trace takes the bare identity.
@@ -572,6 +587,26 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             "graded over the probe projection, so write /final_state/<probe>/... (required and "
             f"rule paths) or /<probe>/... (preserved paths) with a probe of "
             f"{sorted(draft.probe_paths)}"
+        )
+    controls = {
+        row.control: row
+        for row in run_controls(
+            draft.verifier.model_dump(mode="json"),
+            draft.initial_state,
+            dict(draft.probe_paths),
+            add=False,
+        )
+    }
+    if not controls["correct"].ok:
+        raise ValueError(
+            "no final state can pass the verifier: a state satisfying every rule and keeping "
+            f"every preserved path grades {controls['correct'].status} "
+            f"({controls['correct'].reason}); make the rules and preserved paths consistent"
+        )
+    if controls["no_op"].status == "pass":
+        raise ValueError(
+            "the verifier passes when the agent does nothing: require the outcome the task asks "
+            "for, not the initial state"
         )
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
@@ -1630,3 +1665,35 @@ def _schema_object(depth: int) -> JsonObject:
             "items": child,
         }
     return node
+
+
+def shape_schema(value: JsonValue) -> JsonObject:
+    """The shape a simulated domain must keep: its type and, for an object, its top-level keys.
+
+    Run 28's simulator replaced a whole filesystem domain with a string on the first write, and
+    every protected file under it read as removed. A domain's declared ``state_schema`` is
+    checked on every transition, so a prediction changing the domain's type or dropping a
+    top-level key is refused (and re-asked) instead of corrupting the world. Values may change;
+    only container and text types are pinned, and keys starting null or numeric stay loose.
+    """
+    if isinstance(value, dict):
+        properties: JsonObject = {}
+        for key, item in value.items():
+            kind = _json_kind(item)
+            properties[key] = {} if kind is None else {"type": kind}
+        return {"type": "object", "required": sorted(value), "properties": properties}
+    kind = _json_kind(value)
+    return {} if kind is None else {"type": kind}
+
+
+def _json_kind(value: JsonValue) -> str | None:
+    """A JSON type to pin, or None for a value whose type may legitimately change."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    return None
