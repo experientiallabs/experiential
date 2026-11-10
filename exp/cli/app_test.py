@@ -26,6 +26,7 @@ def test_root_cli_and_subgroups_are_exact() -> None:
     assert set(root.list_commands(root_context)) == {
         "build",
         "capture",
+        "code",
         "config",
         "eval",
         "login",

@@ -7,7 +7,7 @@ results, and plans do not live here.
 
 | File | Purpose |
 |---|---|
-| `usage.md` | CLI map for build, bounded optimize model, optimize router, run, config, login, and foreground macOS capture. |
+| `usage.md` | CLI map for build, bounded optimize model, optimize router, run, config, login, code, and foreground macOS capture. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
 | `reference/gateway-responses-input-items.md` | Responses input items without a canonical message (agent messages, compaction, configuration updates, item references): validation and per-wire treatment. |

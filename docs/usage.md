@@ -9,6 +9,7 @@ The root surface is deliberately small:
 |---|---|---|
 | `exp` | Open the branded home screen. `Run Gateway` is the first option and runs setup when needed. | Interactive gateway menu, or the default gateway in a non-interactive terminal. |
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud, save the returned organization key, and synchronize account-visible models with the catalog's default-route capabilities and undiscounted prices. Known metadata is reused without capability or price questions. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
+| `exp code [ARGS ...]` | Run exp-code, the open-source coding and cowork agent (Node.js 22.19+), on a running local gateway or the hosted one through `exp login`. Every argument goes to exp-code. | Agent sessions under `~/.exp-code`; changes in the working directory. |
 | `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
 | `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, simulated with the build's learned memory, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
