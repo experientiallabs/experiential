@@ -32,6 +32,9 @@ from exp.runtime.models.providers.codex_tools import (
 )
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol import decode_responses
 from exp.runtime.openai_protocol.model_adapter import model_request
@@ -168,16 +171,19 @@ def test_convert_history_custom_tool_call_roundtrips() -> None:
 
 
 def test_convert_history_additional_tools_dropped() -> None:
+    """The tool-namespace item drops with disclosure; the conversation it sat in remains."""
+    turn = GatewayMessage(role="user", content="go")
     request = _request(
         messages=(
+            turn,
             GatewayMessage(
-                role="assistant",
+                role="developer",
                 provider_native_item={"type": "additional_tools", "tools": []},
             ),
         ),
     )
     messages, disclosures = convert_native_history(request.messages, NativeToolMapping())
-    assert messages == ()
+    assert messages == (turn,)
     assert "input.additional_tools->dropped(declared_inline)" in disclosures
 
 
@@ -914,3 +920,271 @@ def test_custom_only_parallel_false_is_emulated_on_wires_without_the_control() -
 
     assert "parallel_tool_calls->emulated(serialized_by_gateway)" in public.ignored_parameters
     assert provider.serialize_tool_calls is True
+
+
+_AGENT_TASK: JsonObject = {
+    "type": "agent_message",
+    "author": "/root",
+    "recipient": "/root/worker",
+    "content": [
+        {
+            "type": "input_text",
+            "text": "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n"
+            "List the repository's tests.",
+        }
+    ],
+}
+"""A sub-agent's task as Codex 0.162 records it (``InterAgentCommunication``)."""
+
+
+def _codex_items_request(*items: JsonObject) -> GatewayRequest:
+    """Decode one Responses body whose input ends with ``items`` after a user turn."""
+    return decode_responses(
+        {"model": "coding", "input": [{"role": "user", "content": "start"}, *items]}
+    ).request
+
+
+@pytest.mark.parametrize("profile", [_AZURE_CHAT, _ANTHROPIC])
+def test_an_agent_message_becomes_a_user_turn_on_a_foreign_wire(
+    profile: GatewayWireProfile,
+) -> None:
+    """The delivered task keeps its text and Codex's heading as the next user turn.
+
+    Args:
+        profile: A Chat or Messages wire that has no agent-message item.
+    """
+    request = _codex_items_request(_AGENT_TASK)
+
+    public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.messages[-1].role == "user"
+    assert provider.messages[-1].provider_native_item is None
+    assert provider.messages[-1].content == (
+        "Agent message from /root:\nMessage Type: NEW_TASK\nTask name: /root/worker\n"
+        "Sender: /root\nPayload:\nList the repository's tests."
+    )
+    assert not any("agent_message" in entry for entry in public.ignored_parameters)
+
+
+def test_an_encrypted_agent_message_part_drops_with_disclosure_on_a_foreign_wire() -> None:
+    """Only the issuing backend can read ciphertext: the plaintext header stays, the part goes."""
+    request = _codex_items_request(
+        {
+            **_AGENT_TASK,
+            "content": [
+                {"type": "input_text", "text": "Message Type: MESSAGE\nPayload:\n"},
+                {"type": "encrypted_content", "encrypted_content": "gAAAAB-opaque"},
+            ],
+        }
+    )
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert (
+        provider.messages[-1].content
+        == "Agent message from /root:\nMessage Type: MESSAGE\nPayload:\n"
+    )
+    assert (
+        "input.agent_message.content.encrypted_content->dropped(unsupported_by_provider)"
+        in public.ignored_parameters
+    )
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "configuration_update", "reasoning": {"effort": "high"}},
+        {"type": "context_compaction", "id": "cc_1", "encrypted_content": "gAAAAB-opaque"},
+        {"type": "item_reference", "id": "rs_1"},
+    ],
+)
+def test_provider_owned_input_items_drop_with_disclosure_on_a_foreign_wire(
+    item: JsonObject,
+) -> None:
+    """No foreign wire can read these items, so each is removed and named.
+
+    Args:
+        item: One provider-owned input item.
+    """
+    request = _codex_items_request(item, {"role": "user", "content": "continue"})
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert [message.role for message in provider.messages] == ["user", "user"]
+    assert all(message.provider_native_item is None for message in provider.messages)
+    assert f"input.{item['type']}->dropped(unsupported_by_provider)" in public.ignored_parameters
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        _AGENT_TASK,
+        {"type": "compaction_trigger"},
+        {"type": "configuration_update", "reasoning": {"effort": "low"}},
+        {"type": "context_compaction", "encrypted_content": "gAAAAB-opaque"},
+        {"type": "item_reference", "id": "item_from_elsewhere"},
+    ],
+)
+def test_codex_input_items_forward_verbatim_on_a_native_responses_wire(item: JsonObject) -> None:
+    """The OpenAI Responses wire owns each item, so it re-emits byte-for-byte at its position.
+
+    Args:
+        item: One input item the native wire carries verbatim.
+    """
+    request = _codex_items_request(item)
+
+    _public, provider = route_generation_parameter_requests((_OPENAI_RESPONSES,), request)
+    items = dialect_stream_payload(_OPENAI_RESPONSES, provider)["input"]
+
+    assert items == [{"role": "user", "content": "start"}, item]
+
+
+def test_a_compaction_trigger_narrows_out_a_foreign_rung_and_refuses_without_one() -> None:
+    """Only an OpenAI Responses rung can answer with a compaction item.
+
+    A mixed route keeps the OpenAI rung alone; a route with no such rung
+    refuses before dispatch instead of serving a billed ordinary answer the
+    client discards.
+    """
+    request = _codex_items_request({"type": "compaction_trigger"})
+
+    kept = compatible_generation_parameter_profile_indexes(
+        (_AZURE_CHAT, _OPENAI_RESPONSES), request
+    )
+    with pytest.raises(ProviderParameterError) as refused:
+        compatible_generation_parameter_profile_indexes((_AZURE_CHAT, _ANTHROPIC), request)
+
+    assert kept == (1,)
+    assert refused.value.param == "input"
+    assert refused.value.code == "unsupported_parameter"
+    assert "'compaction_trigger'" in str(refused.value)
+    assert "custom model provider" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("output", "expected", "dropped"),
+    [
+        (
+            "<codex_delegation>Review the patch.</codex_delegation>",
+            "Tool codex_app.send_message_to_thread result:\n"
+            "<codex_delegation>Review the patch.</codex_delegation>",
+            (),
+        ),
+        (
+            [
+                {"type": "input_text", "text": "Alice mentioned you."},
+                {"type": "input_image", "image_url": "https://example.com/a.png"},
+            ],
+            "Tool codex_app.send_message_to_thread result:\nAlice mentioned you.",
+            ("input.function_call_output.output.input_image->dropped(unsupported_by_provider)",),
+        ),
+    ],
+)
+def test_an_unpaired_function_output_becomes_a_user_turn_on_a_foreign_wire(
+    output: JsonValue, expected: str, dropped: tuple[str, ...]
+) -> None:
+    """A Chat wire refuses an orphan tool message, so the output becomes the input it is.
+
+    Args:
+        output: The output in string or list form.
+        expected: The rendered user text.
+        dropped: The disclosures for parts with no carrier.
+    """
+    request = _codex_items_request(
+        {
+            "type": "function_call_output",
+            "name": "send_message_to_thread",
+            "namespace": "codex_app",
+            "output": output,
+        }
+    )
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert provider.messages[-1].role == "user"
+    assert provider.messages[-1].tool_call_id is None
+    assert provider.messages[-1].content == expected
+    for disclosure in dropped:
+        assert disclosure in public.ignored_parameters
+
+
+def test_a_history_of_only_provider_owned_items_narrows_out_a_foreign_rung() -> None:
+    """Dropping every turn would dispatch an empty conversation, so a foreign
+    rung is excluded: a mixed route keeps the OpenAI rung alone and a route
+    without one refuses before dispatch."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "instructions": "Be brief.",
+            "input": [{"type": "item_reference", "id": "rs_1"}],
+        }
+    ).request
+
+    kept = compatible_generation_parameter_profile_indexes(
+        (_AZURE_CHAT, _OPENAI_RESPONSES), request
+    )
+    with pytest.raises(ProviderParameterError) as refused:
+        compatible_generation_parameter_profile_indexes((_AZURE_CHAT, _ANTHROPIC), request)
+
+    assert kept == (1,)
+    assert refused.value.param == "input"
+    assert refused.value.code == "unsupported_parameter"
+    assert "provider-owned history" in str(refused.value)
+
+
+def test_a_configuration_only_history_narrows_out_a_foreign_rung() -> None:
+    """A positional configuration update alone leaves a foreign wire nothing to send."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [{"type": "configuration_update", "reasoning": {"effort": "high"}}],
+        }
+    ).request
+
+    kept = compatible_generation_parameter_profile_indexes(
+        (_AZURE_CHAT, _OPENAI_RESPONSES), request
+    )
+    with pytest.raises(ProviderParameterError) as refused:
+        compatible_generation_parameter_profile_indexes((_AZURE_CHAT, _ANTHROPIC), request)
+
+    assert kept == (1,)
+    assert refused.value.param == "input"
+
+
+def test_a_dropped_trailing_native_item_exposing_assistant_prefill_narrows_the_rung() -> None:
+    """Dropping a trailing provider-owned item leaves an assistant turn last, which a
+    prefill-refusing model rejects, so its rung narrows out before dispatch."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": "done"},
+                {"type": "item_reference", "id": "rs_1"},
+            ],
+        }
+    ).request
+
+    kept = compatible_generation_parameter_profile_indexes((_ANTHROPIC, _OPENAI_RESPONSES), request)
+
+    assert kept == (1,)
+
+
+def test_an_unpaired_output_caller_is_disclosed_as_dropped_on_a_foreign_wire() -> None:
+    """The caller attribution has no carrier in a user turn, so it is named."""
+    request = _codex_items_request(
+        {
+            "type": "function_call_output",
+            "name": "send_message_to_thread",
+            "caller": {"type": "direct"},
+            "output": "done",
+        }
+    )
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert provider.messages[-1].content == "Tool send_message_to_thread result:\ndone"
+    assert (
+        "messages.tool_results.attribution->dropped(unsupported_by_provider)"
+        in public.ignored_parameters
+    )

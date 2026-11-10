@@ -41,8 +41,6 @@ from exp.runtime.openai_protocol.client_field_repairs import (
 )
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
-    CustomToolCallItem,
-    CustomToolCallOutputItem,
 )
 from exp.runtime.openai_protocol.custom_tools import (
     chat_custom_call_messages,
@@ -96,12 +94,15 @@ from exp.runtime.openai_protocol.reasoning_replay import (
     replayed_reasoning_disclosures,
 )
 from exp.runtime.openai_protocol.responses_input import (
+    NATIVE_INPUT_ITEMS,
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
     ReplayedInput,
     ReplayedMessage,
     ReplayedNativeItem,
     ReplayedReasoning,
+    dropped_native_breakpoints,
+    native_input_role,
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
@@ -126,13 +127,10 @@ from exp.runtime.openai_protocol.web_search import (
     split_online_suffix,
 )
 from exp.runtime.openai_protocol.wire_models import (
-    HOSTED_TOOL_ITEM_TYPES_TOOL,
-    _AdditionalToolsItem,
     _AssistantToolCall,
     _ChatRequest,
     _ChatTool,
     _FunctionCall,
-    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -835,27 +833,18 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(
-            item,
-            (
-                _AdditionalToolsItem,
-                CustomToolCallItem,
-                CustomToolCallOutputItem,
-                _HostedToolItemEcho,
-            ),
-        ):
+        if isinstance(item, NATIVE_INPUT_ITEMS):
+            if item.type == "compaction_trigger" and index != len(value) - 1:
+                raise invalid_field(
+                    f"input.{index}.type", "A 'compaction_trigger' must be the final input item."
+                )
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _HostedToolItemEcho):
-                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
-            elif isinstance(item, CustomToolCallItem):
-                native_role = "assistant"
-            elif isinstance(item, CustomToolCallOutputItem):
-                native_role = "tool"
-            else:
-                native_role = "developer"
+            cache_disclosures.extend(
+                dropped_native_breakpoints(index, raw_items[index], marked_items)
+            )
             replayed.append(
-                ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
+                ReplayedNativeItem(index=index, role=native_input_role(item), item=raw_items[index])
             )
         elif isinstance(item, _ResponseReasoningItem):
             if item.encrypted_content is None:
@@ -949,6 +938,17 @@ def _response_input_messages(
                     ),
                 )
             )
+        elif item.call_id is None:
+            # A named output that answers no call (SDK 3.37 makes call_id
+            # optional; Codex delivers thread messages and notifications
+            # this way) has no canonical tool message, so it is carried
+            # verbatim like the other provider-owned items.
+            if item.name is None:
+                raise invalid_field(
+                    f"input.{index}.call_id",
+                    "A function_call_output needs a call_id, or a name when it answers no call.",
+                )
+            replayed.append(ReplayedNativeItem(index=index, role="user", item=raw_items[index]))
         else:
             if isinstance(item.output, str):
                 output_text, output_parts = item.output, ()

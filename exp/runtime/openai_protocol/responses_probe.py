@@ -18,6 +18,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.responses_input_items import SDK_UNKNOWN_INPUT_ITEM_TYPES
 from exp.runtime.openai_protocol.wire_models import (
     _ResponseMessage,
     _ResponsesRequest,
@@ -26,6 +27,9 @@ from exp.runtime.openai_protocol.wire_models import (
 
 PROBE_OUTPUT_ITEM_ID = "msg_gateway_probe"
 """Placeholder item id the official probe sees on an id-less assistant message."""
+
+PROBE_UNPAIRED_CALL_ID = "call_gateway_probe"
+"""Placeholder call id the official probe sees on an unpaired function output."""
 
 
 def official_message_content(entry: JsonObject) -> JsonObject:
@@ -139,6 +143,46 @@ _SDK_WEB_SEARCH_ACTIONS = frozenset({"search", "open_page", "find_in_page"})
 """Web search action types the installed SDK's input-item schema enumerates."""
 
 
+_SDK_WEB_SEARCH_STATUSES = frozenset({"in_progress", "searching", "completed", "failed"})
+"""Web search item statuses the installed SDK's input-item schema enumerates."""
+
+
+def official_web_search_item(entry: JsonObject) -> JsonObject:
+    """Shape one replayed ``web_search_call`` the way the installed SDK schema requires.
+
+    Codex serializes every field of its web search item as optional
+    (``ResponseItem::WebSearchCall`` and ``WebSearchAction``, codex-rs
+    ``protocol/src/models.rs``): ``id``, ``status`` and ``action`` are left
+    out when unknown, a ``find_in_page`` action may lack its ``url`` or
+    ``pattern``, and newer action types and statuses (openai-python 3.37 adds
+    ``incomplete``) postdate the installed schema, which requires each of
+    them. The item forwards byte-for-byte to the native Responses rung that
+    authored it, so only the probe copy is completed: placeholders fill what
+    is missing or newer, and every field the caller did send keeps its own
+    shape check.
+
+    Args:
+        entry: One raw ``web_search_call`` input item.
+
+    Returns:
+        The probe copy of the item; the caller's item is never modified.
+    """
+    item = dict(entry)
+    if item.get("id") is None:
+        item["id"] = PROBE_OUTPUT_ITEM_ID
+    status = item.get("status")
+    if status is None or (isinstance(status, str) and status not in _SDK_WEB_SEARCH_STATUSES):
+        item["status"] = "completed"
+    action = item.get("action")
+    if action is None or (
+        isinstance(action, dict) and action.get("type") not in _SDK_WEB_SEARCH_ACTIONS
+    ):
+        item["action"] = {"type": "search", "query": ""}
+    elif isinstance(action, dict) and action.get("type") == "find_in_page":
+        item["action"] = {"url": "", "pattern": "", **action}
+    return item
+
+
 _GATEWAY_WEB_SEARCH_ITEM_ID = re.compile(r"wsgw_[0-9a-f]{32}")
 """The id of a web_search_call item the gateway itself rendered (native
 ``web_search.rs``, ``GATEWAY_WEB_SEARCH_ITEM_PREFIX``)."""
@@ -194,6 +238,13 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
         for index, entry in enumerate(cast("list[JsonValue]", raw)):
+            if isinstance(entry, dict) and entry.get("type") in SDK_UNKNOWN_INPUT_ITEM_TYPES:
+                # The installed SDK does not enumerate these items (see
+                # ``responses_input_items``); the strict wire model owns them.
+                # An SDK-known placeholder keeps the item's position, so a
+                # probe complaint about a later item names its real index.
+                adapted.append({"type": "item_reference", "id": PROBE_OUTPUT_ITEM_ID})
+                continue
             if isinstance(entry, dict):
                 entry = official_message_content(official_image_details(entry, f"input.{index}"))
             if (
@@ -223,6 +274,15 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
                 adapted.append(item)
+            elif (
+                isinstance(entry, dict)
+                and entry.get("type") == "function_call_output"
+                and entry.get("call_id") is None
+            ):
+                # SDK 3.37 makes call_id optional (a named output that answers
+                # no call, which Codex 0.162+ sends); the installed 3.0 schema
+                # still requires it, so the probe sees a placeholder.
+                adapted.append({**entry, "call_id": PROBE_UNPAIRED_CALL_ID})
             elif isinstance(entry, dict) and entry.get("type") == "web_search_call":
                 # A replayed provider-executed web search item forwards
                 # byte-for-byte to the native Responses rung that authored it
@@ -232,11 +292,7 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 # value for 'input.N.action.type'" on 55 requests, Sep 24 -
                 # Oct 6), so the probe sees an SDK-known action in place of an
                 # unknown one and still checks the item's structure.
-                item = dict(entry)
-                action = item.get("action")
-                if isinstance(action, dict) and action.get("type") not in _SDK_WEB_SEARCH_ACTIONS:
-                    item["action"] = {"type": "search", "query": ""}
-                adapted.append(item)
+                adapted.append(official_web_search_item(entry))
             elif isinstance(entry, dict) and entry.get("type") == "reasoning":
                 item = dict(entry)
                 if item.get("id") is None:

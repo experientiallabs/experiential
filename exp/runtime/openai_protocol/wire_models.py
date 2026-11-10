@@ -32,6 +32,7 @@ from exp.runtime.gateway.request_policy import GatewayRequestPolicy
 from exp.runtime.gateway.sampling_extras import SamplingExtraFields
 from exp.runtime.gateway.service_tiers import ServiceTier
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
+from exp.runtime.openai_protocol import responses_input_items as _extra_items
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
 from exp.runtime.openai_protocol.custom_tool_wire import ChatCustomTool, ChatCustomToolCall
 from exp.runtime.openai_protocol.custom_tool_wire import CustomToolCallItem as _CustomToolCall
@@ -721,7 +722,7 @@ class _ResponseFunctionOutput(_WireModel):
 
     Attributes:
         type: Required function-result discriminator.
-        call_id: Required bounded linkage to the corresponding assistant tool call.
+        call_id: Bounded linkage to the assistant call; absent on an unpaired output.
         name: Optional nonempty tool name, at most 256 characters and preserved verbatim.
         namespace: Optional nonempty tool-tree owner, at most 256 characters and retained on replay.
         caller: Optional opaque programmatic-call attribution, preserved verbatim.
@@ -731,7 +732,9 @@ class _ResponseFunctionOutput(_WireModel):
     """
 
     type: Literal["function_call_output"]
-    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
+    call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     name: str | None = Field(default=None, min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None
@@ -935,7 +938,12 @@ _ResponsesOutputItem = Annotated[
     | _AdditionalToolsItem
     | _CustomToolCall
     | _CustomToolCallOutput
-    | _HostedToolItemEcho,
+    | _HostedToolItemEcho
+    | _extra_items.AgentMessageItem
+    | _extra_items.CompactionTriggerItem
+    | _extra_items.ContextCompactionItem
+    | _extra_items.ConfigurationUpdateItem
+    | _extra_items.ItemReferenceItem,
     Field(discriminator="type"),
 ]
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem

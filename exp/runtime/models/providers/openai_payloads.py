@@ -69,7 +69,8 @@ def _without_probability_metadata(item: JsonObject) -> JsonObject:
 def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """Shape one replayed Responses item for the OpenAI wire; ``None`` drops it.
 
-    Two client habits are repaired, everything else re-emits verbatim: an
+    Two client habits are repaired, everything else (an ``item_reference``
+    included, whose id is the reference itself) re-emits verbatim: an
     input MESSAGE or REASONING item loses the output-only ``status`` OpenAI
     rejects on it, and an item carrying a foreign ``id`` loses the id (a
     reasoning item with a foreign id is dropped whole: without its encrypted
@@ -79,6 +80,10 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
     item_type = shaped.get("type")
+    if item_type == "item_reference":
+        # The id IS the reference: the issuing provider judges whether it
+        # resolves (a dangling one is the caller's 400, see ``upstream.rs``).
+        return shaped
     if isinstance(item_id, str) and (
         item_id.startswith(_FOREIGN_ITEM_ID_PREFIX)
         or not openai_issued_item_id(

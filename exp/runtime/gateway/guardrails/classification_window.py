@@ -8,6 +8,7 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.codex_tools import agent_message_text, unpaired_output_text
 
 MAX_WINDOW_CHARACTERS: Final = 30_000
 """Total kept characters; at six JSON bytes per character this leaves room for questions."""
@@ -115,7 +116,7 @@ def message_text(message: GatewayMessage) -> str:
         The message text, or an empty string when it carries none.
     """
     if message.provider_native_item is not None:
-        return ""
+        return _native_input_text(message) if message.role == "user" else ""
     if message.content is not None:
         return message.folded_tool_error_content()
     if message.provider_anthropic_block is not None:
@@ -123,6 +124,34 @@ def message_text(message: GatewayMessage) -> str:
     if message.provider_anthropic_blocks is not None:
         return "".join(_block_text(block) for block in message.provider_anthropic_blocks)
     return ""
+
+
+def _native_input_text(message: GatewayMessage) -> str:
+    """Return the text a verbatim-carried item of caller input puts before the model.
+
+    A native OpenAI Responses rung receives an ``agent_message`` and a
+    ``function_call_output`` that answers no call as input the model reads,
+    and a foreign wire renders each as a user turn with a heading built from
+    its author or tool name. The classifier reads that same rendering
+    (``codex_tools.agent_message_text`` and ``unpaired_output_text``), so a
+    caller cannot route a prompt past the check by spelling it as one of these
+    items or by putting it in the metadata the heading shows. Opaque parts
+    (images, encrypted content) carry no classifiable text.
+
+    Args:
+        message: A user-role message carrying one native Responses item.
+
+    Returns:
+        The item's rendered text, or an empty string for any other item.
+    """
+    item = message.provider_native_item or {}
+    match item.get("type"):
+        case "agent_message":
+            return agent_message_text(item)[0]
+        case "function_call_output":
+            return unpaired_output_text(item)[0]
+        case _:
+            return ""
 
 
 def _latest_user_index(messages: tuple[GatewayMessage, ...]) -> int | None:

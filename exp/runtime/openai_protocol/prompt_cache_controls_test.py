@@ -9,6 +9,8 @@ Chat requests carrying ``prompt_cache_options`` were refused pre-admission.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import JsonValue
 
@@ -235,3 +237,29 @@ def test_invalid_shapes_are_typed_400s(body: JsonObject, param: str) -> None:
     assert captured.value.status_code == 400
     assert captured.value.detail.code == "invalid_parameter"
     assert captured.value.detail.param == param
+
+
+def test_a_breakpoint_on_an_agent_message_part_is_disclosed_as_dropped() -> None:
+    """A verbatim agent message reaches the provider unmarked, so the breakpoint is named."""
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "user", "content": "go"},
+                {
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/worker",
+                    "content": [
+                        {"type": "input_text", "text": "a"},
+                        {"type": "input_text", "text": "b", "prompt_cache_breakpoint": _BREAKPOINT},
+                    ],
+                },
+            ],
+        }
+    ).request
+    assert (
+        "input.1.content.1.prompt_cache_breakpoint->dropped(unsupported_item)"
+        in decoded.ignored_parameters
+    )
+    assert "prompt_cache_breakpoint" not in json.dumps(decoded.messages[-1].provider_native_item)

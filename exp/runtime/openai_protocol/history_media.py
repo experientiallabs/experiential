@@ -333,9 +333,20 @@ def _degrade_parts(
 
 
 _MODEL_ITEM_TYPES: Final = frozenset(
-    {"reasoning", "function_call", "custom_tool_call", *HOSTED_TOOL_ITEM_TYPES_ASSISTANT}
+    {
+        "reasoning",
+        "function_call",
+        "custom_tool_call",
+        "context_compaction",
+        "item_reference",
+        *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
+    }
 )
-"""Responses item types the model authored, beside assistant-role messages."""
+"""Responses item types the provider authored, beside assistant-role messages.
+
+``context_compaction`` and ``item_reference`` are provider-issued history
+(compacted output and a stored output item), so each ends the turn before it
+like any other model item."""
 
 
 def _model_turn(item: JsonObject) -> bool:
@@ -343,8 +354,20 @@ def _model_turn(item: JsonObject) -> bool:
     return item.get("role") == "assistant" or item.get("type") in _MODEL_ITEM_TYPES
 
 
+def _user_input(item: JsonObject) -> bool:
+    """Whether one history entry is caller input: a user message or an unpaired output.
+
+    A ``function_call_output`` without a ``call_id`` answers no call; the
+    decoder carries it as user input (a thread message or notification), so
+    its media is the caller's current input, not historical tool data.
+    """
+    return item.get("role") == "user" or (
+        item.get("type") == "function_call_output" and item.get("call_id") is None
+    )
+
+
 def latest_turn(items: list[JsonValue]) -> frozenset[int]:
-    """Return the indexes of the user entries after the last model-output entry.
+    """Return the indexes of the caller-input entries after the last model-output entry.
 
     Model output is an assistant message, a reasoning or function/custom tool
     call item, or any provider-authored hosted item (compaction and program
@@ -367,7 +390,7 @@ def latest_turn(items: list[JsonValue]) -> frozenset[int]:
     return frozenset(
         index
         for index, item in enumerate(items)
-        if index > last_model and isinstance(item, dict) and item.get("role") == "user"
+        if index > last_model and isinstance(item, dict) and _user_input(item)
     )
 
 
@@ -423,8 +446,9 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
 def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Replace unservable inline media in a Responses input history.
 
-    ``function_call_output`` parts degrade in every position; message items
-    degrade except the latest turn's user messages. The payload is never mutated.
+    ``function_call_output`` parts degrade in every position except an
+    unpaired output in the latest turn; message items degrade except the
+    latest turn's user messages. The payload is never mutated.
 
     Args:
         payload: Parsed Responses body, before strict wire validation.
@@ -449,11 +473,12 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
             continue
         item_object = cast(JsonObject, item)
         if item_object.get("type") == "function_call_output":
+            # Only an unpaired output can be in the latest turn (``_user_input``).
             field, text_type, position, is_latest = (
                 "output",
                 "input_text",
                 "input.function_call_output.output",
-                False,
+                index in latest,
             )
         elif "role" in item_object:
             assistant = item_object.get("role") == "assistant"

@@ -82,6 +82,11 @@ def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field
     """A union-branch label is never the last segment; a caller field may be."""
     assert cleaned_location(("input", 1, "reasoning", "id")) == ("input", "1", "id")
     assert cleaned_location(("messages", 0, "reasoning")) == ("messages", "0", "reasoning")
+    # Only the label right after the item index is a branch: the next segment
+    # is the item's own field, even one that spells like a variant.
+    assert cleaned_location(
+        ("input", 4, "tagged-union[...]", "configuration_update", "reasoning", "effort")
+    ) == ("input", "4", "reasoning", "effort")
     assert cleaned_location(("body", "input", "tuple[...]", 0, "_ResponseMessage", "role")) == (
         "input",
         "0",

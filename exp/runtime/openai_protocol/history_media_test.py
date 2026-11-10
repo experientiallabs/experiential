@@ -294,7 +294,15 @@ def test_an_unchanged_history_is_returned_without_copies() -> None:
 
 
 @pytest.mark.parametrize(
-    "item_type", ["compaction", "program", "program_output", "tool_search_output"]
+    "item_type",
+    [
+        "compaction",
+        "program",
+        "program_output",
+        "tool_search_output",
+        "context_compaction",
+        "item_reference",
+    ],
 )
 def test_every_provider_authored_item_ends_the_latest_turn(item_type: str) -> None:
     """A hosted output item is the model speaking, so earlier user media is history."""
@@ -309,3 +317,38 @@ def test_every_provider_authored_item_ends_the_latest_turn(item_type: str) -> No
     degraded, disclosures = degrade_responses_media(payload)
     assert disclosures == ("input.content.image->placeholder(oversized)",)
     assert degraded is not payload
+
+
+def test_an_unpaired_output_in_the_latest_turn_keeps_its_strict_media() -> None:
+    """An output that answers no call is current caller input, so an oversized
+    image in it is refused like one in the latest user message, never replaced."""
+    payload: JsonObject = {
+        "model": "coding",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {
+                "type": "function_call_output",
+                "name": "send_message_to_thread",
+                "output": [{"type": "input_image", "image_url": _OVERSIZED_URL}],
+            },
+        ],
+    }
+    with pytest.raises(OpenAIProtocolError):
+        degrade_responses_media(payload)
+
+
+def test_a_paired_output_still_degrades_in_the_latest_turn() -> None:
+    """A result answering a call stays historical tool data."""
+    payload: JsonObject = {
+        "model": "coding",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [{"type": "input_image", "image_url": _OVERSIZED_URL}],
+            },
+        ],
+    }
+    _degraded, disclosures = degrade_responses_media(payload)
+    assert disclosures == ("input.function_call_output.output.image->placeholder(oversized)",)

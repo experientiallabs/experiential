@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from exp.common.core.artifacts import JsonValue
 from exp.common.models.content import TextContentPart
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -84,7 +85,8 @@ def prompt_text_bytes(request: GatewayRequest) -> int:
             total += len(arguments.encode("utf-8"))
         for verbatim in (message.provider_native_item, message.provider_anthropic_block):
             if verbatim is not None:
-                total += len(json.dumps(verbatim, separators=(",", ":")).encode("utf-8"))
+                text = json.dumps(_without_media(verbatim), separators=(",", ":"))
+                total += len(text.encode("utf-8"))
     for tool in request.tools:
         total += len(tool.name.encode("utf-8"))
         if tool.description:
@@ -93,6 +95,39 @@ def prompt_text_bytes(request: GatewayRequest) -> int:
     for entry in request.provider_server_tools:
         total += len(json.dumps(entry, separators=(",", ":")).encode("utf-8"))
     return total
+
+
+_MEDIA_PART_TYPES = frozenset({"input_image", "input_file", "input_audio", "image", "document"})
+"""Part types inside a verbatim item that carry media, not text the model reads as text."""
+
+
+def _without_media(value: JsonValue) -> JsonValue:
+    """Return a verbatim item without inline media or ciphertext, for text sizing.
+
+    A verbatim item (an ``agent_message`` image, an Anthropic image block)
+    can embed a base64 data URL that tokenizes by its own rules; counting it
+    as UTF-8 text would read a valid image as millions of text tokens. An
+    ``encrypted_content`` carrier (compacted history, an encrypted agent
+    message part) is opaque, and its length bounds nothing about the tokens
+    the provider reconstructs, so it is left out too.
+
+    Args:
+        value: One JSON value from a verbatim provider item.
+
+    Returns:
+        The value without media parts; the caller's object is not modified.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _without_media(child) for key, child in value.items() if key != "encrypted_content"
+        }
+    if isinstance(value, list):
+        return [
+            _without_media(child)
+            for child in value
+            if not (isinstance(child, dict) and child.get("type") in _MEDIA_PART_TYPES)
+        ]
+    return value
 
 
 def minimum_prompt_tokens(request: GatewayRequest) -> int:
