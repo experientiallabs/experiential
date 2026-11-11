@@ -370,6 +370,9 @@ WORKSPACE_ROOTS = ("/workspace/", "/testbed/", "/app/", "/repo/", "/home/user/",
 _TOKEN_BREAK = re.compile(r"[\s'\"`(),;:<>\[\]{}=|]+")
 """Characters that end a path token in free text."""
 
+_QUOTED = re.compile(r"`([^`\n]+)`|\"([^\"\n]+)\"|'([^'\n]+)'")
+"""A quoted span names an exact file, spaces and punctuation included (``"my file.py"``)."""
+
 
 def workspace_relative(path: str) -> str:
     """A path with its workspace-root prefix removed (``/workspace/a.py`` is ``a.py``)."""
@@ -386,9 +389,14 @@ def path_tokens(text: str) -> set[str]:
     """Every whitespace- or punctuation-delimited token of a text, workspace-relative.
 
     A token is matched whole: ``engine.py`` names ``engine.py`` but not ``test_engine.py``.
-    Trailing sentence punctuation is dropped (``engine.py.`` is ``engine.py``).
+    Trailing sentence punctuation is dropped (``engine.py.`` is ``engine.py``). A quoted span
+    is also kept exactly, so ``"my file.py"`` and ``"engine.py."`` name those files.
     """
     rows = set()
+    for quoted in _QUOTED.finditer(text):
+        name = next(group for group in quoted.groups() if group is not None)
+        if name and name.strip() == name:
+            rows.add(workspace_relative(name))
     for raw in _TOKEN_BREAK.split(text):
         word = raw.rstrip(".!?")
         if word:

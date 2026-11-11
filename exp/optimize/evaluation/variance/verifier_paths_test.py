@@ -152,3 +152,18 @@ def test_pointers_outside_a_files_map_are_not_checked() -> None:
         "preserved_paths": ["/files"],
     }
     assert ungrounded(verifier, TASK_STATE, TASK_PROBES, set()) == []
+
+
+def test_quoted_exact_file_names_stay_whole() -> None:
+    """A quoted name keeps its spaces and punctuation; prose tokens still match whole."""
+    from exp.optimize.evaluation.variance.verifier_paths import path_tokens
+
+    text = (
+        'Create "my file.py", `report,final.py`, \'config:prod.py\' and "engine.py." '
+        "then fix engine.py."
+    )
+    named = path_tokens(text)
+    for name in ("my file.py", "report,final.py", "config:prod.py", "engine.py.", "engine.py"):
+        assert name in named
+    assert "test_engine.py" not in named
+    assert "engine/py" not in named
