@@ -1,5 +1,7 @@
 """Probe-coordinate grading tells known outcomes apart."""
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject
 from exp.optimize.evaluation.variance.grading_controls import EXPECTED, run_controls
 
@@ -195,3 +197,130 @@ def test_a_draft_reading_inside_a_files_map_off_its_key_style_is_refused() -> No
     stand_in = SimpleNamespace(initial_state=state, probe_paths=probes, verifier=verifier)
     with pytest.raises(ValueError, match="files map"):
         _check_verifier_reads(cast("StartDraft", stand_in))
+
+
+@pytest.mark.parametrize(
+    "item_schema",
+    [
+        {"type": "object"},
+        {"type": "object", "required": ["passed"], "properties": {"passed": {"const": True}}},
+        {"type": "string", "enum": ["passed"]},
+        {"$ref": "#/$defs/run"},
+    ],
+)
+def test_a_positive_control_constructs_schema_valid_run_records(item_schema: JsonObject) -> None:
+    """An empty run log can acquire a typed item; padding null must not refuse the task."""
+    verifier: JsonObject = {
+        "description": "A real run is recorded and the suite passes.",
+        "outcome_schema": {
+            "$defs": {
+                "run": {
+                    "type": "object",
+                    "required": ["passed"],
+                    "properties": {"passed": {"const": True}},
+                }
+            },
+            "properties": {
+                "final_state": {
+                    "properties": {
+                        "oracle": {"properties": {"runs": {"type": "array", "items": item_schema}}}
+                    }
+                }
+            },
+        },
+        "required_paths": ["/final_state/oracle"],
+        "rules": [
+            {"operator": "equals", "path": "/final_state/oracle/passed", "value": True},
+            {"operator": "min_items", "path": "/final_state/oracle/runs", "value": 1},
+        ],
+        "preserved_paths": ["/fixed"],
+    }
+    state: JsonObject = {"Oracle": {"passed": False, "runs": []}, "fixed": "preserved"}
+    probes = {"oracle": "/Oracle", "fixed": "/fixed"}
+    controls = run_controls(verifier, state, probes)
+    assert all(row.ok for row in controls), [(r.control, r.status, r.reason) for r in controls]
+
+
+SMOOTHING_STATE: JsonObject = {
+    "Workspace filesystem": {
+        "files": {"smoothing.py": "def smooth(path): ...", "test_smoothing.py": "def test(): ..."}
+    },
+    "Tests": {"last_run": {"passed": False, "collected": 0}},
+}
+SMOOTHING_PROBES = {
+    "smoothing": "/Workspace filesystem/files/smoothing.py",
+    "tests": "/Workspace filesystem/files/test_smoothing.py",
+    "oracle": "/Tests",
+}
+
+
+def test_a_verifier_that_a_placeholder_implementation_passes_fails_its_wrong_content_control() -> (
+    None
+):
+    """Exists and type rules alone accept any stub written to the target file."""
+    exists_only: JsonObject = {
+        "description": "smoothing.py exists and the tests are kept.",
+        "outcome_schema": {},
+        "required_paths": ["/final_state/smoothing", "/final_state/tests"],
+        "rules": [
+            {"operator": "exists", "path": "/final_state/smoothing"},
+            {"operator": "type", "path": "/final_state/smoothing", "value": "string"},
+            {"operator": "exists", "path": "/final_state/tests"},
+        ],
+        "preserved_paths": ["/tests"],
+    }
+    results = {
+        row.control: row for row in run_controls(exists_only, SMOOTHING_STATE, SMOOTHING_PROBES)
+    }
+    assert results["correct"].ok
+    assert results["wrong_content"].status == "pass" and not results["wrong_content"].ok
+
+    behavioral: JsonObject = {
+        **exists_only,
+        "rules": [
+            *exists_only["rules"],  # type: ignore[misc]
+            {"operator": "exists", "path": "/final_state/oracle/last_run"},
+            {"operator": "equals", "path": "/final_state/oracle/last_run/passed", "value": True},
+        ],
+    }
+    results = {
+        row.control: row for row in run_controls(behavioral, SMOOTHING_STATE, SMOOTHING_PROBES)
+    }
+    assert all(row.ok for row in results.values()), results
+    assert "equals rule failed at /final_state/oracle/last_run/passed" in (
+        results["wrong_content"].reason
+    )
+
+
+def test_the_wrong_content_control_never_touches_a_preserved_value() -> None:
+    """A protected test file read by a rule stays as it was, so preservation cannot pass it."""
+    only_preserved: JsonObject = {
+        "description": "The tests are kept.",
+        "outcome_schema": {},
+        "rules": [{"operator": "type", "path": "/final_state/tests", "value": "string"}],
+        "preserved_paths": ["/tests"],
+    }
+    results = {
+        row.control: row for row in run_controls(only_preserved, SMOOTHING_STATE, SMOOTHING_PROBES)
+    }
+    assert results["wrong_content"].status == "not_constructible"
+
+
+def test_an_exists_rule_on_a_null_run_record_leaves_room_for_its_fields() -> None:
+    """A rejected start read exists last_run and last_run/passed while last_run started null; the
+    witness wrote text for the first and then could not hold the second."""
+    verifier: JsonObject = {
+        "description": "The recorded run passes.",
+        "outcome_schema": {},
+        "required_paths": ["/final_state/oracle"],
+        "rules": [
+            {"operator": "exists", "path": "/final_state/oracle/last_run"},
+            {"operator": "equals", "path": "/final_state/oracle/last_run/passed", "value": True},
+            {"operator": "min_items", "path": "/final_state/oracle/runs", "value": 1},
+        ],
+        "preserved_paths": ["/tests"],
+    }
+    state: JsonObject = {"Oracle": {"last_run": None, "runs": []}, "Tests": "def test(): ..."}
+    probes = {"oracle": "/Oracle", "tests": "/Tests"}
+    results = {row.control: row for row in run_controls(verifier, state, probes)}
+    assert all(row.ok for row in results.values()), results

@@ -1,7 +1,9 @@
 """Decision evidence is immutable and idempotent within its run identity."""
 
 import json
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.project import ProjectStore
+from exp.common.project import ArtifactStore, ProjectStore
 from exp.optimize.evaluation.fidelity import decision_access
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
@@ -90,3 +92,41 @@ def test_a_rate_limited_decision_is_retried_after_retry_after_instead_of_abortin
     with pytest.raises(ProviderTransportError, match="HTTP 429"):
         _decide(endless)(request)  # type: ignore[arg-type]
     assert endless.posts == decision_access.MAXIMUM_DECISION_RETRIES + 1
+
+
+def test_parallel_receipt_recorders_publish_one_immutable_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Independent rollouts can publish the same recall receipt without aborting either.
+
+    Both writers miss the existence check; the second write meets the first's immutable artifact
+    and is absorbed as the same content-addressed receipt rather than failing its rollout.
+    """
+    project = ProjectStore(tmp_path, "parallel-receipts")
+    original_exists = project.artifacts.exists
+    rendezvous = threading.Barrier(2)
+
+    def simultaneous_misses(store: ArtifactStore, identity: str) -> bool:
+        """Expose both unsynchronized writers to the same absent receipt."""
+        del store
+        present = original_exists(identity)
+        if not present and identity.startswith("jev-receipt-"):
+            try:
+                rendezvous.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+        return present
+
+    monkeypatch.setattr(ArtifactStore, "exists", simultaneous_misses)
+    recorders = [
+        receipt_recorder(project, "same-run", "test", lambda: datetime.now(UTC)) for _ in range(2)
+    ]
+    receipt: JsonObject = {"id": "source", "response": {"support": False}}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda record: record(receipt), recorders))
+    ids = project.artifacts.list_ids(artifact_type="jev-receipt")
+    assert len(ids) == 1
+    assert json.loads(project.artifacts.read_bytes(ids[0], "receipt.json")) == {
+        "run": "same-run",
+        **receipt,
+    }

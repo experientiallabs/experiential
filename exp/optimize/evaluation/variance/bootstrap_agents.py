@@ -633,6 +633,15 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             "the verifier passes when the agent does nothing: require the outcome the task asks "
             "for, not the initial state"
         )
+    if not controls["wrong_content"].ok:
+        raise ValueError(
+            "the verifier does not tell a solution from a stub: with every value its rules read "
+            "outside preserved_paths kept present but holding placeholder content (placeholder "
+            "text, a flipped boolean, a changed number) it grades "
+            f"{controls['wrong_content'].status} ({controls['wrong_content'].reason}); add a "
+            "rule on the content or behavioral result the task asks for, such as a recorded "
+            "test outcome, not only that a file exists or has a type"
+        )
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")

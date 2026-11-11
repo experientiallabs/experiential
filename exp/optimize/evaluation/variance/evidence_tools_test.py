@@ -585,7 +585,11 @@ def test_request_capped_draw_requires_finite_operation_authorization_before_disp
     with operation_spend_scope():
         if allowance is not None:
             ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={})
-            ceiling.authorize("first", ceiling_usd=1.0, unpriced_attempts=min(allowance, 100_000))
+            ceiling.authorize(
+                "first",
+                ceiling_usd=1.0,
+                unpriced_attempts=min(allowance, MAXIMUM_UNPRICED_ATTEMPTS),
+            )
             if allowance > MAXIMUM_UNPRICED_ATTEMPTS:
                 ceiling.authorize("second", ceiling_usd=1.0, unpriced_attempts=1)
             install_spend_ceiling(ceiling)

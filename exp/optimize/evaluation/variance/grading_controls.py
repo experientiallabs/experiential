@@ -7,8 +7,10 @@ own probe projection and grade each with the real grader:
 * ``correct``: every rule satisfied, protected values kept; expected ``pass``.
 * ``no_op``: the final state is the initial one; expected ``fail`` (a task that passes when the
   agent does nothing does not measure the agent).
-* ``wrong_content``: correct, except each rule-checked value is replaced by a value its rule
-  refuses; expected ``fail``.
+* ``wrong_content``: correct, except every value a rule reads outside the preserved paths stays
+  present with placeholder content of the same type (placeholder text, a flipped boolean, a
+  changed number, placeholder items); expected ``fail``. A verifier that only checks a target
+  exists, has a type or has enough items passes it and does not tell a solution from a stub.
 * ``missing_observation``: the final state was not observed; expected ``unassessable``.
 * ``observed_absence``: a required probe present at the start is absent from the observed final
   state; expected ``fail``, distinct from ``missing_observation``.
@@ -24,6 +26,7 @@ import copy
 from typing import Literal
 
 from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue
+from exp.common.core.json_schema import expand_local_references
 from exp.optimize.evaluation.variance.verifier_paths import keyed_by_paths, project_verifier, split
 from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, grade
 from exp.simulation.reconstruction.models import resolve
@@ -118,7 +121,45 @@ _TYPED: dict[str, JsonValue] = {
 }
 
 
-def _satisfying(rule: OutcomeRule, current: JsonValue) -> JsonValue:
+def _schema_at(schema: JsonObject, pointer: str) -> JsonObject:
+    """Read a field's declared schema from the expanded workflow schema."""
+    node = schema
+    for part in split(pointer):
+        properties = node.get("properties")
+        child = properties.get(part) if isinstance(properties, dict) else None
+        if child is None and part.isdecimal():
+            child = node.get("items")
+        if not isinstance(child, dict):
+            return {}
+        node = child
+    return node
+
+
+def _schema_seed(schema: JsonObject) -> JsonValue:
+    """Construct a simple typed item; the real grader still checks the complete witness."""
+    if "const" in schema:
+        return copy.deepcopy(schema["const"])
+    values = schema.get("enum")
+    if isinstance(values, list) and values:
+        return copy.deepcopy(values[0])
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((value for value in kind if isinstance(value, str)), None)
+    if kind == "object":
+        properties = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return {}
+        result: JsonObject = {}
+        for key in required:
+            if isinstance(key, str):
+                child = properties.get(key)
+                result[key] = _schema_seed(child if isinstance(child, dict) else {})
+        return result
+    return copy.deepcopy(_TYPED.get(kind)) if isinstance(kind, str) else None
+
+
+def _satisfying(rule: OutcomeRule, current: JsonValue, schema: JsonObject) -> JsonValue:
     """A value the rule accepts, keeping the current one when it already does."""
     if rule.operator == "equals":
         return rule.value
@@ -126,28 +167,49 @@ def _satisfying(rule: OutcomeRule, current: JsonValue) -> JsonValue:
         return _TYPED.get(str(rule.value), current)
     if rule.operator == "min_items":
         size = rule.value if isinstance(rule.value, int) else 0
-        return (
-            list(current)[:size] + [None] * max(0, size - len(current))
-            if isinstance(current, list)
-            else [None] * size
-        )
+        values = list(current) if isinstance(current, list) else []
+        item = schema.get("items")
+        seed = _schema_seed(item if isinstance(item, dict) else {})
+        return values + [copy.deepcopy(seed) for _ in range(max(0, size - len(values)))]
     if rule.operator == "max_items":
         limit = rule.value if isinstance(rule.value, int) else 0
         return list(current)[:limit] if isinstance(current, list) else []
     return current if current is not None else "synthesized"
 
 
-def _refused(rule: OutcomeRule) -> tuple[bool, JsonValue]:
-    """A value the rule refuses, and whether one exists (``exists`` refuses only absence)."""
-    if rule.operator == "equals":
-        return True, {"not": rule.value}
-    if rule.operator == "type":
-        return True, None if rule.value != "null" else "not null"
-    if rule.operator == "min_items" and isinstance(rule.value, int) and rule.value > 0:
-        return True, []
-    if rule.operator == "max_items" and isinstance(rule.value, int):
-        return True, [None] * (rule.value + 1)
-    return False, None
+PLACEHOLDER = "placeholder"
+"""Text a wrong-content control writes where the verifier reads a text."""
+
+
+def _placeholder(value: JsonValue) -> JsonValue:
+    """The same value's shape with placeholder content: present, same type, wrong content.
+
+    Text becomes placeholder text, a boolean flips, a number changes, a list keeps its length
+    and an object its keys, each holding placeholders; null stays null.
+    """
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        return PLACEHOLDER if value != PLACEHOLDER else PLACEHOLDER + " text"
+    if isinstance(value, int):
+        return value + 1
+    if isinstance(value, float):
+        return value + 1.0
+    if isinstance(value, list):
+        return [_placeholder(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _placeholder(item) for key, item in value.items()}
+    return value
+
+
+def _protected(pointer: str, preserved: tuple[str, ...]) -> bool:
+    """Whether a ``/final_state`` pointer reads inside, or holds, a preserved path."""
+    keys = split(pointer)[1:]
+    for path in preserved:
+        kept = split(path)
+        if keys[: len(kept)] == kept or kept[: len(keys)] == keys:
+            return True
+    return False
 
 
 def _workflow(initial: JsonObject, final: JsonObject | None, tool: str = "control") -> JsonObject:
@@ -209,15 +271,26 @@ def run_controls(
             )
         )
 
+    schema = expand_local_references(graded.outcome_schema)
     final = copy.deepcopy(initial)
     built = True
+    read = [*graded.required_paths, *(rule.path for rule in graded.rules)]
+
+    def parent(pointer: str) -> bool:
+        """Whether another read lies inside this pointer, so its value must hold children."""
+        keys = split(pointer)
+        return any(
+            len(other) > len(keys) and other[: len(keys)] == keys for other in map(split, read)
+        )
+
     for pointer in graded.required_paths:
         if pointer.startswith("/final_state/"):
             rest = pointer[len("/final_state") :]
             try:
                 resolve(final, rest)
             except ValueError:
-                built &= _set(final, rest, "synthesized")
+                if not parent(pointer):
+                    built &= _set(final, rest, "synthesized")
     for rule in graded.rules:
         if not rule.path.startswith("/final_state/"):
             built = False
@@ -227,7 +300,10 @@ def run_controls(
             current = resolve(final, rest)
         except ValueError:
             current = None
-        built &= _set(final, rest, _satisfying(rule, current))
+        if rule.operator == "exists" and current is None and parent(rule.path):
+            # A deeper read fills this value with an object; text here would leave it nothing.
+            continue
+        built &= _set(final, rest, _satisfying(rule, current, _schema_at(schema, rule.path)))
     record(
         "correct",
         workflow(final) if built else None,
@@ -236,14 +312,23 @@ def run_controls(
     record("no_op", workflow(copy.deepcopy(initial)))
     wrong = copy.deepcopy(final)
     changed = False
+    preserved = () if graded.preserve_state else graded.preserved_paths
     for rule in graded.rules:
-        exists, bad = _refused(rule)
-        if exists and rule.path.startswith("/final_state/"):
-            changed |= _set(wrong, rule.path[len("/final_state") :], bad)
+        if graded.preserve_state or _protected(rule.path, preserved):
+            continue
+        rest = rule.path[len("/final_state") :]
+        try:
+            # From the correct witness, so a parent and its child read agree on one placeholder.
+            current = resolve(final, rest)
+        except ValueError:
+            continue
+        placeholder = _placeholder(current)
+        if placeholder != current:
+            changed |= _set(wrong, rest, placeholder)
     record(
         "wrong_content",
         workflow(wrong) if built and changed else None,
-        "no rule refuses a present value",
+        "no rule reads a value outside the preserved paths that placeholder content can change",
     )
     record(
         "missing_observation",

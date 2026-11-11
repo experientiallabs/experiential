@@ -24,7 +24,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v12"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v15"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
@@ -40,6 +40,27 @@ AUTHOR_INSTRUCTION = (
 Produce the task's public instruction, the tool schemas the actor sees, the world manifest (every
 state domain simulated), the exact initial state, the evaluator projection (probe_paths, JSON
 pointers into the initial state), a verifier over the final state, and a ledger of facts.
+The verifier.outcome_schema field is an ordinary JSON Schema over the complete workflow,
+including final_state. Use {} when no additional shape constraint is needed; keep goal and
+preservation checks in rules, required_paths and preserved_paths. Never emit schema-editor
+metadata such as wrap or itemKeys, or a schema describing the verifier fields themselves.
+Success must measure the requested outcome and admit different valid solutions. For open-ended
+code repair, never require equality to a reference source file, a particular implementation
+fragment or one sequence of repair actions. Exact bytes are appropriate only when the public task
+explicitly requires them. Expose behavioral test results through executable tool effects and
+state, preserve the required test coverage, and accept any implementation meeting that behavior.
+An actor-written claim that tests passed is not evidence that tests executed. A verifier's
+synthetic positive control only proves its predicates can be satisfied, not that they express
+the task correctly. Consider an alternative correct solution and a plausible incorrect one;
+the verifier must distinguish them for the requested behavioral reason.
+The host grades a wrong-content control: every value your rules read outside preserved_paths
+is kept present with placeholder content of the same type (text becomes a placeholder, a
+boolean flips, a number changes, a list keeps its length with placeholder items). The verifier
+must fail it, so rules that only check a file exists, has a type or has enough items are
+refused: at least one rule must read the content or behavioral result the task asks for.
+A files map keyed by paths holds each file under one key, so pkg/mod.py is the pointer token
+pkg~1mod.py under the files map's probe, never nested segments.
+
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
 or rules) or unknown (nothing recorded decides it). Mark a fact deciding when the right course
 of action depends on it. Never present an inferred or unknown fact as observed.
@@ -75,6 +96,22 @@ REVIEW_INSTRUCTION = (
 Decide whether the start is coherent (state, manifest, tools, instruction and verifier agree),
 sufficiently specified (every deciding fact is settled, not unknown or guessed) and supports the
 task (an actor can succeed or fail on its own decisions). Answer accept, research or refuse.
+
+Verify that success measures the task's requested outcome rather than agreement with a reference
+solution. For open-ended code repair, a whole-source equality, a required implementation fragment,
+or a required sequence of repair actions rejects other correct implementations and is not a sound
+success condition. Exact bytes are appropriate only where the public task explicitly requires
+those bytes. A coding task should expose behavioral test results through its executable tools and
+state, preserve the required test coverage, and accept any implementation satisfying that behavior.
+Do not accept self-reported success or actor-written claims as evidence that tests executed.
+
+Independently consider a different valid solution and a plausible invalid one. Explain whether the
+verifier distinguishes them for the right reason. Synthetic grading controls only show that the
+verifier's predicates can be satisfied; they do not show that its predicates express correctness.
+Refuse a draft that only a hidden canonical solution can pass, even when its synthetic positive
+control passes, and a draft that a placeholder implementation passes because its rules only check
+that files exist. Diagnose the defect so the author can repair the verifier and observable state.
+
 Choose research when a deciding fact is missing and the family's evidence could settle it: name
 each missing fact as a research item with the question and why it decides. Choose refuse, with a
 diagnosis, when the start cannot be made sound from the evidence. Cite what supports each finding.
