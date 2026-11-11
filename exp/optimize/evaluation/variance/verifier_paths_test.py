@@ -98,3 +98,57 @@ def test_a_pointer_the_state_cannot_place_in_its_key_style_is_left_for_refusal()
     assert off_style(deep, FILES_STATE, FILES_PROBES) == ["/final_state/oracle/run/rc"]
     shallow: JsonObject = {"rules": [{"operator": "exists", "path": "/final_state/oracle/rc"}]}
     assert off_style(shallow, FILES_STATE, FILES_PROBES) == []
+
+
+TASK_STATE: JsonObject = {
+    "Workspace filesystem": {"files": {"engine.py": "e", "test_engine.py": "t"}},
+    "Tests": {"test_run": {"status": "failed"}},
+}
+TASK_PROBES = {"files": "/Workspace filesystem/files", "tests": "/Tests"}
+
+
+def test_a_garbled_file_key_is_refused_with_the_closest_grounded_names() -> None:
+    """Run 32: engine~1py and test~1engine.py are well formed but name no file of the task."""
+    from exp.optimize.evaluation.variance.verifier_paths import path_tokens, ungrounded
+
+    verifier: JsonObject = {
+        "required_paths": ["/final_state/files/engine~1py", "/final_state/files/engine.py"],
+        "preserved_paths": ["/files/test~1engine.py"],
+    }
+    rows = ungrounded(verifier, TASK_STATE, TASK_PROBES, path_tokens("Fix engine.py."))
+    assert len(rows) == 2
+    assert "'engine/py'" in rows[0] and "'/final_state/files/engine.py'" in rows[0]
+    assert "'test/engine.py'" in rows[1] and "'/files/test_engine.py'" in rows[1]
+
+
+def test_initial_and_task_named_files_are_grounded() -> None:
+    """An initial files-map key, a file the task asks to create and a /workspace/ path pass."""
+    from exp.optimize.evaluation.variance.verifier_paths import path_tokens, ungrounded
+
+    verifier: JsonObject = {
+        "required_paths": ["/final_state/files/test_engine.py", "/final_state/files/cli.py"],
+        "rules": [{"operator": "exists", "path": "/final_state/files/docs~1usage.md"}],
+    }
+    named = path_tokens("Create cli.py, then document it in /workspace/docs/usage.md.")
+    assert ungrounded(verifier, TASK_STATE, TASK_PROBES, named) == []
+    assert ungrounded(verifier, TASK_STATE, TASK_PROBES, path_tokens("Create xcli.py")) != []
+
+
+def test_a_name_inside_a_longer_token_does_not_ground_a_file() -> None:
+    """``engine.py`` in the text grounds engine.py, not a substring like ``gine.py``."""
+    from exp.optimize.evaluation.variance.verifier_paths import path_tokens, ungrounded
+
+    verifier: JsonObject = {"required_paths": ["/final_state/files/gine.py"]}
+    assert ungrounded(verifier, TASK_STATE, TASK_PROBES, path_tokens("edit engine.py")) != []
+
+
+def test_pointers_outside_a_files_map_are_not_checked() -> None:
+    """Named fields, other workflow roots and unplaced pointers are left to other checks."""
+    from exp.optimize.evaluation.variance.verifier_paths import ungrounded
+
+    verifier: JsonObject = {
+        "required_paths": ["/final_state/tests/test_run", "/final_answer", "/final_state/nope/x"],
+        "rules": [{"operator": "equals", "path": "/final_state/tests/test_run/status"}],
+        "preserved_paths": ["/files"],
+    }
+    assert ungrounded(verifier, TASK_STATE, TASK_PROBES, set()) == []

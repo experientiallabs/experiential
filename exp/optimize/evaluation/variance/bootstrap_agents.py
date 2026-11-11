@@ -83,11 +83,15 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
 )
 from exp.optimize.evaluation.variance.grading_controls import projection, run_controls
 from exp.optimize.evaluation.variance.verifier_paths import (
+    file_entry,
     keyed_by_paths,
     off_style,
+    path_tokens,
     project_verifier,
     split,
+    ungrounded,
     unplaced,
+    workspace_relative,
 )
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
@@ -612,7 +616,7 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             f"rule paths) or /<probe>/... (preserved paths) with a probe of "
             f"{sorted(draft.probe_paths)}"
         )
-    _check_verifier_reads(draft)
+    _check_verifier_reads(draft, (material.task.task.instruction,))
     controls = {
         row.control: row
         for row in run_controls(
@@ -1706,7 +1710,7 @@ LONG_EQUALS = 200
 """Longest text an ``equals`` rule may demand; longer means byte-identical file contents."""
 
 
-def _check_verifier_reads(draft: StartDraft) -> None:
+def _check_verifier_reads(draft: StartDraft, texts: Sequence[str] = ()) -> None:
     """Refuse verifier rules that read what no simulated run reliably holds.
 
     A rule demanding a long text equal (a whole file) passes only a byte-identical rewrite. A
@@ -1715,7 +1719,13 @@ def _check_verifier_reads(draft: StartDraft) -> None:
     that shape in initial_state, so the domain's state_schema keeps it. A pointer walking into a
     files map as nested directories names a shape no run holds (run 31: none of 11 such rules
     resolved in any of 13 final states, where each file is one flat key), and is refused when
-    normalisation could not rewrite it to the map's key style.
+    normalisation could not rewrite it to the map's key style. A pointer naming a file neither
+    the initial files map nor the task names (run 32: ``engine~1py`` for ``engine.py``) is
+    refused with the closest grounded names (:func:`grounded_names`).
+
+    Args:
+        draft: The draft.
+        texts: Task text beyond the draft's own instruction (the selected task's instruction).
     """
     if off := off_style(
         draft.verifier.model_dump(mode="json"), draft.initial_state, dict(draft.probe_paths)
@@ -1726,6 +1736,17 @@ def _check_verifier_reads(draft: StartDraft) -> None:
             "paths holds each file under one key, so write the key escaped "
             "(/final_state/<files probe>/pkg~1mod.py for pkg/mod.py), and give an object the "
             "verifier reads inside at least one entry so its key style is known"
+        )
+    if stray := ungrounded(
+        draft.verifier.model_dump(mode="json"),
+        draft.initial_state,
+        dict(draft.probe_paths),
+        grounded_names(draft, texts),
+    ):
+        raise ValueError(
+            f"verifier pointers name files the task never mentions: {stray[:6]}; a file key is "
+            "the exact relative file name as the task or initial_state writes it (only a '/' "
+            "inside it becomes '~1'), never a respelling of it"
         )
     initial = projection(draft.initial_state, dict(draft.probe_paths))
     for rule in draft.verifier.rules:
@@ -1745,6 +1766,38 @@ def _check_verifier_reads(draft: StartDraft) -> None:
                     "full shape in initial_state (every key the verifier reads, null where not "
                     "yet known) so the simulator keeps those keys"
                 )
+
+
+def grounded_names(draft: StartDraft, texts: Sequence[str] = ()) -> set[str]:
+    """Workspace-relative paths the task names: in its text, reveal probes and fact state paths.
+
+    A file the agent must create is grounded by the task naming it (``smoothing.py``); a reveal
+    probe reading ``/workspace/engine.py`` grounds ``engine.py``.
+    """
+    names: set[str] = set()
+    for text in (draft.instruction, *texts):
+        names |= path_tokens(text)
+
+    def argument_text(value: JsonValue) -> None:
+        if isinstance(value, str):
+            names.update(path_tokens(value))
+        elif isinstance(value, dict):
+            for item in value.values():
+                argument_text(item)
+        elif isinstance(value, list):
+            for item in value:
+                argument_text(item)
+
+    for probe in draft.reveal_probes:
+        argument_text(probe.arguments)
+    for fact in draft.facts:
+        for pointer in fact.state_paths:
+            keys = _pointer_keys(pointer)
+            if len(keys) > 1 and keys[0] in draft.initial_state:
+                found = file_entry(draft.initial_state[keys[0]], keys[1:])
+                if found is not None:
+                    names.add(workspace_relative(found[1]))
+    return names
 
 
 def check_qualification_preconditions(verifier: TaskVerifier) -> None:

@@ -94,7 +94,14 @@ def test_verifier_reads_the_simulator_cannot_be_trusted_to_hold_are_refused() ->
         verifier = TaskVerifier.model_validate(
             {"description": "d", "outcome_schema": {}, "rules": rules}
         )
-        stand_in = SimpleNamespace(initial_state=state, probe_paths=probes, verifier=verifier)
+        stand_in = SimpleNamespace(
+            initial_state=state,
+            probe_paths=probes,
+            verifier=verifier,
+            instruction="Make the suite green.",
+            facts=(),
+            reveal_probes=(),
+        )
         return cast("StartDraft", stand_in)
 
     verbatim: JsonObject = {
@@ -197,6 +204,51 @@ def test_a_draft_reading_inside_a_files_map_off_its_key_style_is_refused() -> No
     stand_in = SimpleNamespace(initial_state=state, probe_paths=probes, verifier=verifier)
     with pytest.raises(ValueError, match="files map"):
         _check_verifier_reads(cast("StartDraft", stand_in))
+
+
+def test_a_draft_naming_a_file_the_task_never_mentions_is_refused() -> None:
+    """Run 32's task-307a: engine~1py named no file, so every branch lacked required state.
+
+    Reveal probes (after their /workspace/ root) and the task text ground a file; a key nothing
+    grounds is refused with the closest grounded name.
+    """
+    from types import SimpleNamespace
+    from typing import cast
+
+    import pytest
+
+    from exp.optimize.evaluation.variance.bootstrap_agents import _check_verifier_reads
+    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft
+    from exp.simulation.evaluation.tasks import TaskVerifier
+
+    state: JsonObject = {"fs": {"files": {"engine.py": "e"}}, "Tests": {"status": "red"}}
+    probes = {"files": "/fs/files", "status": "/Tests/status"}
+
+    def draft(paths: list[str], *, reveal: str = "") -> StartDraft:
+        verifier = TaskVerifier.model_validate(
+            {"description": "d", "outcome_schema": {}, "required_paths": paths}
+        )
+        stand_in = SimpleNamespace(
+            initial_state=state,
+            probe_paths=probes,
+            verifier=verifier,
+            instruction="Make the suite green.",
+            reveal_probes=(SimpleNamespace(arguments={"path": reveal}),) if reveal else (),
+            facts=(),
+        )
+        return cast("StartDraft", stand_in)
+
+    with pytest.raises(ValueError, match=r"engine~1py.*'/final_state/files/engine.py'"):
+        _check_verifier_reads(draft(["/final_state/files/engine~1py"]))
+    _check_verifier_reads(draft(["/final_state/files/engine.py", "/final_state/status"]))
+    with pytest.raises(ValueError, match="never mentions"):
+        _check_verifier_reads(draft(["/final_state/files/test_engine.py"]))
+    _check_verifier_reads(
+        draft(["/final_state/files/test_engine.py"], reveal="/workspace/test_engine.py")
+    )
+    _check_verifier_reads(
+        draft(["/final_state/files/smoothing.py"]), ("Create smoothing.py implementing MAP.",)
+    )
 
 
 @pytest.mark.parametrize(

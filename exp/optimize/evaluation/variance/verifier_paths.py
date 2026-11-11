@@ -15,11 +15,18 @@ into such a map as nested segments (``.../files/confcheck/__init__.py``) names n
 holds, so it is rewritten to the map's own key style (``.../files/confcheck~1__init__.py``), or
 left for the authoring check to refuse when the map's style cannot decide it
 (:func:`map_style`).
+
+A pointer can be well formed and still name a file nobody mentioned: run 32's author wrote
+``engine~1py`` and ``test~1engine.py`` for ``engine.py`` and ``test_engine.py``, so every branch
+failed with required state absent. :func:`ungrounded` lists every pointer naming a files-map
+entry that neither the initial files map nor the task names, with the closest names that are.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import difflib
+import re
+from collections.abc import Iterable, Mapping
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.simulation.reconstruction.models import resolve
@@ -354,6 +361,126 @@ def _pointers(verifier: JsonObject) -> list[tuple[str, bool]]:
                 rows.extend(
                     (pointer, True) for side in sides if isinstance(pointer := row.get(side), str)
                 )
+    return rows
+
+
+WORKSPACE_ROOTS = ("/workspace/", "/testbed/", "/app/", "/repo/", "/home/user/", "./")
+"""Prefixes naming the workspace root, dropped when comparing a named path with a file key."""
+
+_TOKEN_BREAK = re.compile(r"[\s'\"`(),;:<>\[\]{}=|]+")
+"""Characters that end a path token in free text."""
+
+
+def workspace_relative(path: str) -> str:
+    """A path with its workspace-root prefix removed (``/workspace/a.py`` is ``a.py``)."""
+    stripped = True
+    while stripped:
+        stripped = False
+        for root in WORKSPACE_ROOTS:
+            if path.startswith(root) and len(path) > len(root):
+                path, stripped = path[len(root) :], True
+    return path
+
+
+def path_tokens(text: str) -> set[str]:
+    """Every whitespace- or punctuation-delimited token of a text, workspace-relative.
+
+    A token is matched whole: ``engine.py`` names ``engine.py`` but not ``test_engine.py``.
+    Trailing sentence punctuation is dropped (``engine.py.`` is ``engine.py``).
+    """
+    rows = set()
+    for raw in _TOKEN_BREAK.split(text):
+        word = raw.rstrip(".!?")
+        if word:
+            rows.add(workspace_relative(word))
+    return rows
+
+
+def file_entry(value: JsonValue, keys: list[str]) -> tuple[int, str] | None:
+    """Where keys below ``value`` reach a files map, and the entry key they name there.
+
+    Named fields and list indexes are followed while they resolve; at a files map
+    (:func:`keyed_by_paths`, or an empty object entered by one path-like key) the remaining keys
+    are one entry key in the map's style (:func:`map_style`).
+
+    Returns:
+        The number of keys before the files map and the entry key, or None when the keys reach
+        no files map or the style cannot decide them.
+    """
+    node = value
+    for index, key in enumerate(keys):
+        rest = keys[index:]
+        if isinstance(node, dict):
+            if keyed_by_paths(node) or (not node and len(rest) == 1 and _path_key(key)):
+                styled = map_style(node, rest)
+                return (index, styled[0]) if styled else None
+            if key not in node:
+                return None
+            node = node[key]
+        elif isinstance(node, list) and key.isascii() and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+        else:
+            return None
+    return None
+
+
+def _file_name(name: str) -> bool:
+    """Whether a named path looks like a file (its last segment holds an extension)."""
+    last = name.rsplit("/", 1)[-1]
+    return "." in last.strip(".")
+
+
+def ungrounded(
+    verifier: JsonObject, state: JsonValue, probes: Mapping[str, str], named: Iterable[str]
+) -> list[str]:
+    """One reason per verifier pointer naming a files-map entry nothing grounds.
+
+    An entry is grounded when its key is a key of the initial files map, or when its
+    workspace-relative form is one of ``named`` (paths the task text, reveal probes or facts
+    state, made workspace-relative by the caller). A file the agent must create is grounded by
+    the task naming it. Each reason names the pointer, the file it reads and the closest
+    grounded file names, so a repair can fix the key.
+
+    Args:
+        verifier: The verifier in probe coordinates.
+        state: The start's raw initial state.
+        probes: Probe name to raw-state pointer.
+        named: Workspace-relative paths the task names.
+    """
+    names = set(named)
+    rows: list[str] = []
+    for pointer, rooted in _pointers(verifier):
+        try:
+            keys = split(pointer)
+        except ValueError:
+            continue
+        lead = 1 if rooted else 0
+        if rooted and (not keys or keys[0] not in WORKFLOW_STATES):
+            continue
+        if len(keys) <= lead or keys[lead] not in probes:
+            continue
+        try:
+            value = resolve(state, probes[keys[lead]])
+        except ValueError:
+            continue
+        found = file_entry(value, keys[lead + 1 :])
+        if found is None:
+            continue
+        depth, key = found
+        prefix = keys[: lead + 1 + depth]
+        holder = resolve(value, join(keys[lead + 1 : lead + 1 + depth]))
+        existing = list(holder) if isinstance(holder, dict) else []
+        if key in existing or workspace_relative(key) in names:
+            continue
+        choices = {workspace_relative(name): name for name in names if _file_name(name)}
+        choices.update({workspace_relative(name): name for name in existing})
+        close = difflib.get_close_matches(workspace_relative(key), list(choices), n=3, cutoff=0.6)
+        shown = [choices[name] for name in close] or sorted(choices.values())[:6]
+        hint = f"; did you mean {join([*prefix, shown[0]])!r}" if close else ""
+        rows.append(
+            f"{pointer!r} reads file {key!r}, which neither the initial files map nor the task "
+            f"names; closest grounded files: {shown}{hint}"
+        )
     return rows
 
 

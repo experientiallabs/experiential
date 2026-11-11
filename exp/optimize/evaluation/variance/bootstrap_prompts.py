@@ -24,7 +24,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v15"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v16"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
@@ -59,7 +59,10 @@ boolean flips, a number changes, a list keeps its length with placeholder items)
 must fail it, so rules that only check a file exists, has a type or has enough items are
 refused: at least one rule must read the content or behavioral result the task asks for.
 A files map keyed by paths holds each file under one key, so pkg/mod.py is the pointer token
-pkg~1mod.py under the files map's probe, never nested segments.
+pkg~1mod.py under the files map's probe, never nested segments. File keys must be the exact
+relative file names that appear in the task or initial workspace: test_engine.py stays
+test_engine.py (only a '/' inside a name is written '~1'), and a pointer naming any other file
+is refused.
 
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
 or rules) or unknown (nothing recorded decides it). Mark a fact deciding when the right course
