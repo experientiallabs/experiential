@@ -51,6 +51,7 @@ from exp.runtime.gateway.native_decisions import (
     NativeDecisionsMixin,
     _decisions_rung,
     _priced_decision_rung,
+    no_image_decisions_error,
 )
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_TOTAL_ATTEMPTS,
@@ -277,6 +278,18 @@ def _admit_accepted(
         is not None
     }
     capable = tuple(wires)
+    if capable and request.has_images:
+        # Google's image block (and OpenAI's input_image) reach only a rung
+        # that declares image input; a declining rung's 400 is terminal, so
+        # an image-capable fallback must be chosen here, never after.
+        capable = tuple(
+            index
+            for index in capable
+            if route.deployments[index].gateway.capabilities.supports_image_input
+        )
+        if not capable:
+            _finish_unsupported(plane, authorization, no_images=True)
+            raise NativeBridgeError(no_image_decisions_error(authorization.alias, "input"))
     if not capable:
         # The SystemOne lane's own rung predicate decides whether the same model
         # id is servable on /v1/systemone; there is no second rule here.
@@ -381,9 +394,12 @@ def _finish_unsupported(
     *,
     serves_systemone: bool = False,
     untranslatable: bool = False,
+    no_images: bool = False,
 ) -> None:
     """Finish an accepted request naming an alias that cannot serve OpenAI decisions."""
-    if untranslatable:
+    if no_images:
+        safe_message = "no decision deployment accepts images"
+    elif untranslatable:
         safe_message = "the request cannot be expressed on the model's Google Decisions API wire"
     elif serves_systemone:
         safe_message = (

@@ -282,6 +282,11 @@ class OpenAIDecisionRequest(DecisionRequest):
         return "openai"
 
     @property
+    def has_images(self) -> bool:
+        """Whether any message carries an inline image part (this wire has no ``assets``)."""
+        return self._image_count() > 0
+
+    @property
     def input_token_reservation(self) -> int:
         """Reserve text and question bytes plus fixed image and question allowances."""
         text_bytes = 0

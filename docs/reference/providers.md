@@ -723,7 +723,8 @@ dispatches on one upstream: the first priced capable rung in route order picks O
 | `usage` | `total_input_tokens` as `input_tokens`, `total_output_tokens` (documented as always 0; absent counts as 0) as `output_tokens`; no cache legs |
 | answer `confidence` | must restate the winning probability (`max(noul, 1 - noul)`, the chosen value's or the highest level's probability) within half a hundredth, else the answer is malformed |
 | `prompt_feedback.block_reason` (Google's input filter answered, no `answers`) | the model's 400 `refusal` naming Google's reason token (`safety`, `blocklist`, `prohibited_content`, `image_safety`, `other`), never its message; no retry or failover |
-| Google's 400 with a `google.rpc.ErrorInfo` reason `API_KEY_INVALID` (a rejected key answered under 400) | the credential class (`provider_authentication`, ledger detail `http 400: api_key_invalid`): known-unbilled, and the only decision 400 that fails over, to an independently credentialed rung |
+| Google's 400 or 403 with a `google.rpc.ErrorInfo` reason `API_KEY_INVALID` or `API_KEY_SERVICE_BLOCKED` (a rejected or blocked key) | the credential class (`provider_authentication`, ledger detail `http 400: api_key_invalid` or `http 403: api_key_blocked`): known-unbilled, and the only decision 400/403 that fails over, to an independently credentialed rung |
+| an `input_image` on a route whose rungs do not declare `supports_image_input` | 400 `unsupported_capability` on `input` before dispatch; a rung that declares it is chosen ahead of one that does not |
 
 Refused with a typed 400 on `questions` before dispatch, because Google cannot express them: a
 choice value that is not a valid Google option key (1 through 128 characters, no leading or
