@@ -125,3 +125,19 @@ def test_named_fields_keep_their_keys_and_file_maps_may_change() -> None:
     last_run = properties["last_run"]
     assert isinstance(last_run, dict) and last_run["required"] == ["exit_code", "passed"]
     assert properties["files"] == {"type": "object"}
+
+
+def test_a_probed_file_stays_while_the_rest_of_its_files_map_may_change() -> None:
+    """Run 30's simulator dropped a probed file while editing another; that is now refused."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import shape_schema
+    from exp.runtime.environments.world_responses import validate_state_projection
+
+    domain = {"files": {"/w/test.py": "t", "/w/a.py": "a"}}
+    schema = shape_schema(domain, [["files", "/w/test.py"]])
+    validate_state_projection(
+        {"fs": {"files": {"/w/test.py": "t", "/w/b.py": "b"}}}, {"fs": schema}
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="transition refused"):
+        validate_state_projection({"fs": {"files": {"/w/a.py": "edited"}}}, {"fs": schema})

@@ -513,7 +513,14 @@ def normalise_draft(
                 and isinstance(name := row.get("name"), str)
                 and name in state
             ):
-                row = {**row, "state_schema": shape_schema(state[name])}
+                probed = [
+                    keys[1:]
+                    for pointer in (probes.values() if isinstance(probes, dict) else ())
+                    if isinstance(pointer, str)
+                    and (keys := _pointer_keys(pointer))
+                    and keys[0] == name
+                ]
+                row = {**row, "state_schema": shape_schema(state[name], probed)}
                 notes.append(f"manifest.domains: {name!r} keeps its initial shape on every move")
             rows.append(row)
         answer = {**answer, "manifest": {**manifest, "domains": rows}}
@@ -1700,7 +1707,7 @@ def _check_verifier_reads(draft: StartDraft) -> None:
                 )
 
 
-def shape_schema(value: JsonValue) -> JsonObject:
+def shape_schema(value: JsonValue, probed: Sequence[Sequence[str]] = ()) -> JsonObject:
     """The shape a simulated domain must keep: its type and, for an object, its top-level keys.
 
     Run 28's simulator replaced a whole filesystem domain with a string on the first write, and
@@ -1708,17 +1715,24 @@ def shape_schema(value: JsonValue) -> JsonObject:
     checked on every transition, so a prediction changing a type or dropping a named field (to
     :data:`SHAPE_DEPTH` levels) is refused and re-asked instead of corrupting the world. Values
     may change; only container and text types are pinned, values starting null or numeric
-    stay loose, and maps keyed by paths or file names may gain and lose entries.
+    stay loose, and maps keyed by paths or file names may gain and lose entries, except the
+    entries a probe reads: run 30's simulator dropped a probed file from the files map while
+    editing another in 10 of 10 such branches, so the files the evaluator reads are pinned too.
+
+    Args:
+        value: The domain's initial value.
+        probed: Key paths, relative to the domain, that probes read.
     """
-    return _shape(value, SHAPE_DEPTH)
+    return _shape(value, SHAPE_DEPTH, [list(keys) for keys in probed if keys])
 
 
 SHAPE_DEPTH = 3
 """Object levels whose keys a domain's state_schema pins."""
 
 
-def _shape(value: JsonValue, depth: int) -> JsonObject:
-    """The pinned shape of one value: types, and the keys of named-field objects."""
+def _shape(value: JsonValue, depth: int, probed: list[list[str]] | None = None) -> JsonObject:
+    """The pinned shape of one value: types, the keys of named-field objects, probed entries."""
+    probed = probed or []
     kind = _json_kind(value)
     if not isinstance(value, dict):
         return {} if kind is None else {"type": kind}
@@ -1726,9 +1740,19 @@ def _shape(value: JsonValue, depth: int) -> JsonObject:
     # A map keyed by paths or file names (a files map) may gain and lose entries; an object of
     # named fields keeps every field.
     named = all("/" not in key and "." not in key for key in value)
-    if depth > 0 and named:
-        schema["required"] = sorted(value)
-        schema["properties"] = {key: _shape(item, depth - 1) for key, item in value.items()}
+    kept = {keys[0] for keys in probed if keys[0] in value}
+    if named and depth > 0:
+        kept |= set(value)
+    if kept:
+        schema["required"] = sorted(kept)
+        schema["properties"] = {
+            key: _shape(
+                value[key],
+                depth - 1 if named else 0,
+                [keys[1:] for keys in probed if keys[0] == key and keys[1:]],
+            )
+            for key in sorted(kept)
+        }
     return schema
 
 
@@ -1743,3 +1767,11 @@ def _json_kind(value: JsonValue) -> str | None:
     if isinstance(value, str):
         return "string"
     return None
+
+
+def _pointer_keys(pointer: str) -> list[str]:
+    """A pointer's keys, or none for one that is not a valid absolute pointer."""
+    try:
+        return split(pointer)
+    except ValueError:
+        return []
