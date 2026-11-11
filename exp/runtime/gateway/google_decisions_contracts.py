@@ -14,9 +14,10 @@ What maps:
 - ``input`` text forwards verbatim; user messages become Google content
   blocks (``input_text`` to ``text``, an inline base64 ``input_image`` data
   URL to an ``image`` block with its MIME type; ``detail`` low/high become
-  the ``resolution`` low/high and ``original`` becomes ``ultra_high``), with a
-  newline text block between messages because Google concatenates adjacent
-  text with no separator.
+  the ``resolution`` low/high, and ``original`` is served at ``high``, Google's
+  largest level inside the surface's per-image token reservation; ``auto``
+  leaves Google's default), with a newline text block between messages
+  because Google concatenates adjacent text with no separator.
 - ``predicate`` becomes ``noul``; ``choice`` becomes ``choice`` whose
   ``criteria`` map each requested value to its description (empty when none);
   ``score`` becomes ``score`` whose ordered ``criteria`` carry each level's
@@ -56,7 +57,9 @@ characters never exceed)."""
 SAFETY_IDENTIFIER_DROPPED = "safety_identifier->dropped(google_decisions)"
 """Disclosure recorded when the Google wire cannot carry ``safety_identifier``."""
 
-_RESOLUTIONS: dict[str, str] = {"low": "low", "high": "high", "original": "ultra_high"}
+# Google's ``ultra_high`` (2,240 tokens per image) exceeds the surface's
+# per-image reservation (2,048), so ``original`` is served at ``high`` (1,120).
+_RESOLUTIONS: dict[str, str] = {"low": "low", "high": "high", "original": "high"}
 _MESSAGE_SEPARATOR: dict[str, JsonValue] = {"type": "text", "text": "\n"}
 
 

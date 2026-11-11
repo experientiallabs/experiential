@@ -151,7 +151,14 @@ fn translate_answer(question: &Value, answer: &Value) -> Result<Value, Failure> 
     }
     match kind {
         "predicate" => {
+            // Google's contract clamps noul to [0.01, 0.99]; an endpoint
+            // value is a shape the model never emits.
             let noul = probability(&answer["noul"])?;
+            if !(0.01..=0.99).contains(&noul) {
+                return Err(malformed(
+                    "decision noul probability is outside Google's 0.01 to 0.99 range",
+                ));
+            }
             consistent_confidence(probability(&answer["confidence"])?, noul.max(1.0 - noul))?;
             public.insert("probability".to_string(), answer["noul"].clone());
         }

@@ -14,6 +14,43 @@ use crate::error_envelope::{openai_family_envelope, parse_error_document};
 use crate::param_attribution::{error_message_field, rejected_model_not_found};
 use crate::stream_errors::is_refusal_code;
 
+/// Google's `google.rpc.ErrorInfo` reasons for a rejected API key. Gemini
+/// answers them under HTTP 400 (`API_KEY_INVALID`: "API key not valid.
+/// Please pass a valid API key.") or 403 (`API_KEY_SERVICE_BLOCKED`), so a
+/// status-only read files an invalid key as the caller's request error and
+/// never fails over to an independently credentialed rung.
+const GEMINI_CREDENTIAL_REASONS: &[&str] = &["API_KEY_INVALID", "API_KEY_SERVICE_BLOCKED"];
+
+/// Whether a Gemini error body is Google's verdict on the CREDENTIAL: an
+/// `error.details[]` entry of type `google.rpc.ErrorInfo` whose `reason` is a
+/// documented API-key rejection. Only the structured reason decides; the
+/// sentence is never read, so request text echoed in a message cannot turn
+/// a caller error into a lane failover.
+pub fn rejected_gemini_credential(dialect: Dialect, body: &str) -> bool {
+    if dialect != Dialect::GeminiGenerateContent {
+        return false;
+    }
+    let Some(value) = parse_error_document(body) else {
+        return false;
+    };
+    value
+        .get("error")
+        .and_then(|error| error.get("details"))
+        .and_then(Value::as_array)
+        .is_some_and(|details| {
+            details.iter().any(|detail| {
+                detail
+                    .get("@type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.ends_with("google.rpc.ErrorInfo"))
+                    && detail
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| GEMINI_CREDENTIAL_REASONS.contains(&reason))
+            })
+        })
+}
+
 /// Sentences a provider answers with a 400 for a request shape the OpenAI
 /// contract allows but THIS lane's serving stack cannot carry (a chat
 /// template that only accepts a leading system turn). They are lane
@@ -456,6 +493,33 @@ pub(crate) fn names_account_policy_block(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::param_attribution::rejected_detail;
+
+    #[test]
+    fn geminis_structured_api_key_rejection_is_a_credential_verdict() {
+        // Exact live shape of generativelanguage.googleapis.com for a bad key.
+        let invalid = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.",
+            "status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+            "reason":"API_KEY_INVALID","domain":"googleapis.com","metadata":{"service":"generativelanguage.googleapis.com"}}]}}"#;
+        assert!(rejected_gemini_credential(
+            Dialect::GeminiGenerateContent,
+            invalid
+        ));
+        assert!(!rejected_gemini_credential(
+            Dialect::OpenAiCompatible,
+            invalid
+        ));
+        // A caller's request error carrying the same sentence is not a verdict.
+        let prose = r#"{"error":{"code":400,"message":"API key not valid: renew it","status":"INVALID_ARGUMENT"}}"#;
+        assert!(!rejected_gemini_credential(
+            Dialect::GeminiGenerateContent,
+            prose
+        ));
+        let other_reason = r#"{"error":{"code":400,"message":"x","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INVALID_ARGUMENT"}]}}"#;
+        assert!(!rejected_gemini_credential(
+            Dialect::GeminiGenerateContent,
+            other_reason
+        ));
+    }
 
     #[test]
     fn a_resellers_flat_lane_limitation_sentence_is_read_on_the_compatible_dialect() {
