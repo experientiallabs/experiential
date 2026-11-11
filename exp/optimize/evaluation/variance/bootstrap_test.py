@@ -217,6 +217,7 @@ def _draft(task_id: str, opening: JsonObject) -> JsonObject:
             "rules": [
                 {"path": "/final_state/tickets/outcome", "operator": "equals", "value": "right"}
             ],
+            "preserved_paths": ["/tickets/severity"],
         },
         "provenance": provenance,
         "facts": facts,
@@ -531,6 +532,9 @@ def test_a_family_bootstraps_into_validated_registrations(
     assert len({draw.variant for draw in auth.rounds[0].reviews}) == 3
     for registration in (obs, recon, auth):
         preflight_continuation_job(setup.project, registration.job)
+        # Qualification needs an explicit tool list: the start's own, none invented or dropped.
+        assert registration.draft.verifier.allowed_tools == tuple(tool.name for tool in TOOLS)
+        assert registration.job.study.verifier.allowed_tools == tuple(tool.name for tool in TOOLS)
     assert load_batch_manifest(setup.project, manifest.batch) == manifest
 
     replayed = setup.run(BootScript(), monkeypatch)
@@ -940,3 +944,31 @@ def test_a_frozen_family_runtime_is_kept_and_only_the_start_is_replaced(
     ) == frozen.model_dump(exclude={"task", "manifest", "initial_state", "probe_paths", "facts"})
     assert (definition.task.task_id, definition.initial_state) == ("recon", HIGH)
     assert definition.facts is None and definition.maximum_reasks == 2
+
+
+def test_an_admitted_verifier_meets_the_qualification_shape_preconditions() -> None:
+    """Qualification refuses a verifier without explicit tools or a state-retention check, so
+    authoring refuses it first instead of after mining (executable/qualification.py)."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import (
+        check_qualification_preconditions,
+    )
+    from exp.simulation.evaluation.tasks import TaskVerifier
+
+    base: JsonObject = {
+        "description": "d",
+        "outcome_schema": {},
+        "rules": [{"path": "/final_state/tickets/outcome", "operator": "equals", "value": "x"}],
+    }
+    with pytest.raises(ValueError, match="no permitted tools"):
+        check_qualification_preconditions(
+            TaskVerifier.model_validate({**base, "preserved_paths": ["/tickets/severity"]})
+        )
+    with pytest.raises(ValueError, match="preserved_paths"):
+        check_qualification_preconditions(
+            TaskVerifier.model_validate({**base, "allowed_tools": ["close"]})
+        )
+    check_qualification_preconditions(
+        TaskVerifier.model_validate(
+            {**base, "allowed_tools": ["close"], "preserved_paths": ["/tickets/severity"]}
+        )
+    )

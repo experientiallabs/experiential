@@ -35,6 +35,7 @@ from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
+from exp.optimize.evaluation.executable.qualification import _pins_full_output
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.agent_loop import (
     AgentProfile,
@@ -94,6 +95,7 @@ from exp.runtime.models.providers.errors import (
 )
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
 from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.rules.contracts import trace_locator, trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
@@ -486,6 +488,13 @@ def normalise_draft(
     verifier = answer.get("verifier")
     if isinstance(verifier, dict):
         verifier = dict(verifier)
+        names = [tool["name"] for tool in task_tools]
+        if names and verifier.get("allowed_tools") != names:
+            # Qualification needs an explicit permitted-tool list. The start exposes exactly
+            # the task's tools, and any of them may serve a valid alternative solution, so the
+            # list is the task's own, never an author's narrower or invented one.
+            notes.append("verifier.allowed_tools: set to the task's own tools")
+            verifier["allowed_tools"] = names
         if "outcome_schema" in verifier:
             verifier["outcome_schema"] = normalise_schema(
                 verifier["outcome_schema"], "verifier.outcome_schema", notes
@@ -627,6 +636,7 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
     allowed = draft.verifier.allowed_tools
     if allowed is not None and not set(allowed) <= set(names):
         raise ValueError("the verifier allows tools the start does not offer")
+    check_qualification_preconditions(draft.verifier)
     _check_facts(draft, material.inventory)
     if draft.provenance not in material.allowed():
         raise ValueError(
@@ -1726,6 +1736,29 @@ def _check_verifier_reads(draft: StartDraft) -> None:
                     "full shape in initial_state (every key the verifier reads, null where not "
                     "yet known) so the simulator keeps those keys"
                 )
+
+
+def check_qualification_preconditions(verifier: TaskVerifier) -> None:
+    """Refuse a verifier executable qualification would refuse on its shape alone.
+
+    Qualification (:mod:`~exp.optimize.evaluation.executable.qualification`) requires an
+    explicit permitted-tool list and a check over observed state, either preservation or a pin
+    on the complete output, because argument rules constrain only the calls they name. A start
+    lacking either fails only after mining has been paid for, so authoring checks it first.
+
+    Raises:
+        ValueError: The tool list is absent or no state-retention check exists.
+    """
+    if not verifier.allowed_tools:
+        raise ValueError(
+            "the verifier names no permitted tools and the task declares none, so qualification "
+            "cannot check the actor's operations; a start needs the task's explicit tool list"
+        )
+    if not (verifier.preserved_paths or verifier.preserve_state or _pins_full_output(verifier)):
+        raise ValueError(
+            "the verifier checks no observed state beyond its goal: protect the files the task "
+            "must not change with preserved_paths, so an unrequested write elsewhere is seen"
+        )
 
 
 def shape_schema(value: JsonValue, probed: Sequence[Sequence[str]] = ()) -> JsonObject:
