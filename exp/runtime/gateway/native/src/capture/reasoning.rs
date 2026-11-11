@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::collector::Collector;
+use super::collector::{CheckpointFailure, Collector};
 use crate::admission::Admission;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Event;
@@ -14,7 +14,9 @@ use crate::waterfall::Won;
 /// Losing lanes never checkpoint: a later BYOK winner must not inherit a
 /// host-funded lane's capture. Default collectors require durable acknowledgement;
 /// explicitly asynchronous hosts wait for queue admission. SQL remains the final
-/// live-consent authority.
+/// live-consent authority. A collector configured with
+/// `checkpoint_failure = discard` drops a failed or late checkpoint's capture
+/// and returns the winner instead of failing the request.
 pub(crate) async fn checkpoint_winner(
     collector: Option<&Arc<Collector>>,
     admission: &Admission,
@@ -56,6 +58,13 @@ pub(crate) async fn checkpoint_winner(
         },
         Err(()) => Failure::new(FailureClass::Internal, "capture checkpoint failed"),
     };
+    if collector.config.checkpoint_failure == CheckpointFailure::Discard {
+        // Capture never fails the request: drop this capture and expose the
+        // committed output unchanged.
+        unfinished.armed = false;
+        collector.discard_checkpoint(&admission.request_id);
+        return won;
+    }
     // Close the physical transport before any durable settlement callback can wait.
     attempt.relay.close_transport();
     let usage = attempt.usage.clone();

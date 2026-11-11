@@ -460,4 +460,10 @@ impl CaptureCollector {
     fn maintenance_failures(&self) -> u64 {
         self.inner.maintenance_failures()
     }
+
+    /// Requests served uncaptured because their prompt checkpoint failed
+    /// under `checkpoint_failure = "discard"`.
+    fn checkpoint_discarded(&self) -> u64 {
+        self.inner.checkpoint_discarded()
+    }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::capture::collector::Configuration;
+use crate::capture::collector::{CheckpointFailure, Configuration};
 use crate::capture::delivery::{Limits, Sink};
 use crate::capture::record::{Protocol, Record, Request, Scope};
 use bytes::Bytes;
@@ -57,6 +57,7 @@ fn collector_with_relay(
                 capture_hidden_reasoning: true,
                 capture_logprobs: false,
                 spill: None,
+                checkpoint_failure: CheckpointFailure::Fail,
             },
             MemorySink(sender),
         )
@@ -140,6 +141,7 @@ async fn stalled_writer_only_backpressures_when_response_memory_is_reserved() {
                     capture_hidden_reasoning: true,
                     capture_logprobs: false,
                     spill: None,
+                    checkpoint_failure: CheckpointFailure::Fail,
                 },
                 HeldSink {
                     entered: Some(started),

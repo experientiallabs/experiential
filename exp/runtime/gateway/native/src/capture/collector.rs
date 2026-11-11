@@ -43,6 +43,22 @@ pub(crate) struct Configuration {
     /// bounded in-memory capture (every limit above applies unchanged).
     #[serde(default)]
     pub spill: Option<super::spill::Configuration>,
+    /// What a hosted prompt checkpoint that cannot be handed to delivery does
+    /// to its request: fail it (the default) or discard that capture and
+    /// release the response unchanged.
+    #[serde(default)]
+    pub checkpoint_failure: CheckpointFailure,
+}
+
+/// The outcome of a failed or late hosted prompt checkpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CheckpointFailure {
+    /// Fail the request before any committed output is exposed.
+    #[default]
+    Fail,
+    /// Drop this request's capture, count it, and expose the output.
+    Discard,
 }
 
 impl Configuration {
@@ -186,6 +202,7 @@ pub(crate) struct Collector {
     delivery: Delivery,
     pending: Arc<Mutex<Pending>>,
     skipped: Arc<AtomicU64>,
+    checkpoint_discarded: AtomicU64,
     admissions: Arc<AtomicUsize>,
     handoff_bytes: Arc<AtomicUsize>,
     body_bytes: AtomicUsize,
@@ -225,6 +242,7 @@ impl Collector {
             config,
             pending,
             skipped,
+            checkpoint_discarded: AtomicU64::new(0),
             admissions: Arc::new(AtomicUsize::new(0)),
             handoff_bytes: Arc::new(AtomicUsize::new(0)),
             body_bytes: AtomicUsize::new(0),
@@ -445,6 +463,23 @@ impl Collector {
         self.delivery
             .checkpoint(record, None, lease, self.config.asynchronous_delivery)
             .map(Some)
+    }
+
+    /// Drop a request whose prompt checkpoint failed so its output can be
+    /// exposed uncaptured; later taps and settlement find no entry.
+    pub(crate) fn discard_checkpoint(&self, request_id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(entry) = pending.entries.remove(request_id) {
+                pending.bytes -= entry.map_bytes();
+                entry.response_discarded.store(true, Ordering::Release);
+            }
+        }
+        self.checkpoint_discarded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Requests served uncaptured because their prompt checkpoint failed.
+    pub(crate) fn checkpoint_discarded(&self) -> u64 {
+        self.checkpoint_discarded.load(Ordering::Relaxed)
     }
 
     /// Terminal policy controls response retention; the winning lane was frozen
