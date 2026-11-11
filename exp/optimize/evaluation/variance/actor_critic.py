@@ -31,7 +31,8 @@ Harbor starts. Unknown outcomes stay explicit and are never redrawn.
 from __future__ import annotations
 
 import random
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
@@ -102,6 +103,7 @@ from exp.optimize.evaluation.variance.point_selection import (
     load_point_bar,
     schedule_chosen,
 )
+from exp.optimize.evaluation.variance.reward_states import PointState
 from exp.optimize.evaluation.variance.rewards import (
     CriticScore,
     GroupAdvantage,
@@ -560,14 +562,15 @@ def run_actor_critic(
         loader = cache(lambda ref: load_continuation_checkpoint(store, ref))
         references = load_references(store, spec.references)
         search = open_trace_search(store, r, exposure, embedder) if (r := spec.retrieval) else None
-        pick, packet = _pick(group, identity, spec, loader, references)
+        gate = spec.gate
+        records = None if gate is None else load_point_bar(store, gate.records)
+        pick, packet = _pick(group, identity, spec, loader, references, records)
         sources = (
             source,
             *packet.pool.points.values(),
             *{reference.artifact for reference in spec.references},
         )
-        gate = spec.gate
-        record = None if gate is None else load_point_bar(store, gate.records)[packet.pool.branch]
+        record = None if records is None else records[packet.pool.branch]
         judges = run_at_once(
             [
                 lambda j=j: _judge(
@@ -758,6 +761,7 @@ def _pick(
     spec: ActorCriticSpec,
     loader: Callable[[ArtifactInput], ContinuationCheckpoint],
     references: tuple[LoadedReference, ...],
+    records: Mapping[int, BarRecord] | None = None,
 ) -> tuple[PickRecord, EvidencePacket]:
     """Pick the first seeded-shuffled eligible attempt and record the eligible population.
 
@@ -792,10 +796,21 @@ def _pick(
             < 2
         ):
             ineligible[row.index] = "fewer than two boundaries with actor calls left"
+        elif records is not None and not any(
+            point.state == PointState.QUALIFIED
+            for point in (records[row.index].points if row.index in records else ())
+        ):
+            # Selectors may only pick qualified points, so an attempt without one would buy
+            # every judge draw for a selection that cannot exist.
+            ineligible[row.index] = "no point qualified by the bar"
     eligible = tuple(index for index in candidates if index not in ineligible)
     picked = next((index for index in order if index in eligible), None)
     if picked is None:
-        raise ValueError("no attempt in the group offers two continuable points")
+        reasons = Counter(ineligible.values())
+        raise ValueError(
+            "no attempt in the group offers two continuable points with a point qualified by "
+            f"the bar; ineligible: {dict(reasons)}"
+        )
     record = PickRecord(
         seed_material_sha256=sha256_json({"material": material}),
         population=tuple(row.index for row in group.branches),

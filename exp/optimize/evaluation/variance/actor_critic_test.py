@@ -719,3 +719,48 @@ def test_point_continuations_run_at_once_within_the_registered_host_limits(
 
     limits.write_text("alias_max_in_flight = 1\n")
     assert admitted_concurrency(project, "judge") == 1
+
+
+def test_an_attempt_without_a_qualified_point_is_never_picked_for_judging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run 30: every point was rejected or uncertain, so all judges bought nothing usable."""
+    from collections.abc import Callable
+    from types import SimpleNamespace
+    from typing import cast
+
+    from exp.common.core.artifacts import ArtifactInput
+    from exp.optimize.evaluation.variance import actor_critic
+    from exp.optimize.evaluation.variance.point_bar import BarRecord
+    from exp.optimize.evaluation.variance.reward_states import PointState
+    from exp.simulation.continuations import ContinuationCheckpoint
+
+    def record(*states: PointState) -> BarRecord:
+        points = [SimpleNamespace(point=i, state=state) for i, state in enumerate(states)]
+        return cast(BarRecord, SimpleNamespace(points=points))
+
+    branches = [SimpleNamespace(index=i, status="completed", checkpoints=("c",)) for i in range(3)]
+    group = cast(actor_critic.ContinuationStudy, SimpleNamespace(branches=branches))
+    spec = cast(
+        actor_critic.ActorCriticSpec,
+        SimpleNamespace(
+            model_dump=lambda **_: {}, seed=0, initial=SimpleNamespace(maximum_model_calls=9)
+        ),
+    )
+    monkeypatch.setattr(actor_critic, "candidate_branches", lambda _: (0, 1, 2))
+    monkeypatch.setattr(actor_critic, "continuable_points", lambda *_, **__: {1: "a", 2: "b"})
+    monkeypatch.setattr(actor_critic, "evidence_packet", lambda *_, **__: "packet")
+    rejected = {
+        0: record(PointState.REJECTED, PointState.UNCERTAIN),
+        1: record(PointState.REJECTED),
+        2: record(PointState.REJECTED, PointState.QUALIFIED),
+    }
+    loader = cast(Callable[[ArtifactInput], ContinuationCheckpoint], lambda ref: ref)
+    pick, _ = actor_critic._pick(group, "run", spec, loader, (), rejected)
+    assert pick.picked == 2 and pick.ineligible == {
+        0: "no point qualified by the bar",
+        1: "no point qualified by the bar",
+    }
+    none = {index: record(PointState.UNCERTAIN) for index in range(3)}
+    with pytest.raises(ValueError, match="no point qualified by the bar"):
+        actor_critic._pick(group, "run", spec, loader, (), none)
