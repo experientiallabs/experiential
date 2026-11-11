@@ -430,12 +430,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judged:JUDGED_LABELS_PROTOCOL",
-        "judged-labels-v2",
+        "judged-labels-v3",
         (
             "exp.optimize.evaluation.variance.judged",
             "exp.optimize.evaluation.variance.episode_evidence",
         ),
-        "2b26ae0c1cda7b2ceaa1ab4cce7d8535cb638d99ff24eee9d41b96dd185b701c",
+        "f6b5acc9b55206575906c508e8d8ca3364cca12b1ad763bd0a064a9e8d70ee52",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.admission:FAMILY_ADMISSION_POLICY",

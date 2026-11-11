@@ -357,3 +357,37 @@ def test_a_study_judged_concurrently_keeps_branch_order_and_overlaps_its_judgmen
         for slot in judged.branches
     )
     assert slot_rewards(project, judged.branches, judge.identity) == (1.0,) * planned
+
+
+def test_a_judge_protocol_change_rejudges_saved_branches_without_repeating_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changed assessment behavior must not be hidden behind cached study labels."""
+    from exp.optimize.evaluation.variance import judge as judge_owner
+
+    project, judge, reference = _study(tmp_path, monkeypatch)
+    source_study = load_study(project.artifacts, reference)
+    current_protocol = judge_owner.JUDGE_PROTOCOL
+    assert current_protocol != "episode-judge-v3"
+    router = route_judge(monkeypatch, verdict=always("malformed"))
+    monkeypatch.setattr(judge_owner, "JUDGE_PROTOCOL", "episode-judge-v3")
+    old_ref, old_labels = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="unchanged"
+    )
+    assert slot_rewards(project, old_labels.branches, judge.identity) == (None, None)
+
+    monkeypatch.setattr(judge_owner, "JUDGE_PROTOCOL", current_protocol)
+    router.verdict = always("pass")
+    new_ref, new_labels = judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="unchanged"
+    )
+    assert new_ref != old_ref
+    assert slot_rewards(project, new_labels.branches, judge.identity) == (1.0, 1.0)
+    assert len(router.judged) == 2 * len(source_study.branches)
+    assert router.requests == []
+    assert load_study(project.artifacts, reference) == source_study
+    assert slot_rewards(project, old_labels.branches, judge.identity) == (None, None)
+    assert judge_study(
+        project, reference, judge, configuration=CONFIGURATION, code_revision="unrelated-edit"
+    ) == (new_ref, new_labels)
+    assert len(router.judged) == 2 * len(source_study.branches)
