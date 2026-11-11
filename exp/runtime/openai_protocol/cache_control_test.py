@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.cache_write import requests_hour_cache
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -14,6 +15,177 @@ from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import decode_chat
+
+
+def _opencode_tool_cache_request(marker: JsonValue) -> JsonObject:
+    """Build the tool, system and message checkpoints emitted by OpenCode.
+
+    Args:
+        marker: Annotation on the final function tool definition.
+
+    Returns:
+        A Chat request with an unmarked tool before the marked definition.
+    """
+    return {
+        "model": "coding",
+        "max_tokens": 32,
+        "tools": [
+            {"type": "function", "function": {"name": "list_files", "parameters": {}}},
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {"type": "object"}},
+                "cache_control": marker,
+            },
+        ],
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "Read files.", "cache_control": {"type": "ephemeral"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Read a.py.", "cache_control": {"type": "ephemeral"}}
+                ],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize("ttl", [None, "5m", "1h"])
+@pytest.mark.parametrize("explicit_type", [False, True])
+def test_opencode_tool_cache_checkpoint_reaches_anthropic(
+    ttl: str | None, explicit_type: bool
+) -> None:
+    """Retain every OpenCode checkpoint without mutating its original request.
+
+    Args:
+        ttl: Explicit supported cache lifetime, or the provider default.
+        explicit_type: Whether function declarations include their default type.
+    """
+    marker: JsonObject = {"type": "ephemeral"}
+    if ttl is not None:
+        marker["ttl"] = ttl
+    body = _opencode_tool_cache_request(marker)
+    if not explicit_type:
+        declarations = body["tools"]
+        assert isinstance(declarations, list)
+        for declaration in declarations:
+            assert isinstance(declaration, dict)
+            declaration.pop("type")
+    original = deepcopy(body)
+    request = decode_chat(body).request
+    assert body == original
+    assert request.tools[0].cache_control is None
+    assert request.tools[1].cache_control == marker
+    assert requests_hour_cache(request) == (ttl == "1h")
+    assert not request.ignored_parameters
+    payload = dialect_stream_payload(
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            model_id="claude-sonnet-5-5",
+            url="https://example.invalid",
+        ),
+        request,
+    )
+    tools = payload["tools"]
+    assert isinstance(tools, list) and isinstance(tools[1], dict)
+    assert tools[1]["cache_control"] == marker
+    assert '"cache_control"' in json.dumps(payload["system"])
+    assert '"cache_control"' in json.dumps(payload["messages"])
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        True,
+        1,
+        "ephemeral",
+        [],
+        {},
+        {"type": "persistent"},
+        {"type": "ephemeral", "ttl": None},
+        {"type": "ephemeral", "ttl": "24h"},
+        {"type": "ephemeral", "extra": True},
+    ],
+)
+def test_chat_tool_cache_checkpoint_rejects_invalid_values(marker: JsonValue) -> None:
+    """Reject malformed annotations at their original tool index.
+
+    Args:
+        marker: Value outside the supported ephemeral cache schema.
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(_opencode_tool_cache_request(marker))
+    assert raised.value.detail.param == "tools.1.cache_control"
+
+
+def test_chat_tool_cache_checkpoint_null_is_unmarked() -> None:
+    """An explicit null annotation requests no tool checkpoint."""
+    request = decode_chat(_opencode_tool_cache_request(None)).request
+    assert all(tool.cache_control is None for tool in request.tools)
+
+
+def test_chat_tool_cache_checkpoint_keeps_indices_across_native_tools() -> None:
+    """Provider-native declarations must not shift function checkpoint ownership."""
+    body = _opencode_tool_cache_request({"type": "ephemeral"})
+    tools = body["tools"]
+    assert isinstance(tools, list)
+    tools.insert(1, {"type": "openrouter:tool_search", "max_results": 1})
+    request = decode_chat(body).request
+    assert [(tool.name, tool.cache_control) for tool in request.tools] == [
+        ("list_files", None),
+        ("read_file", {"type": "ephemeral"}),
+    ]
+    assert request.provider_native_tools[0].index == 1
+
+
+def test_chat_tool_cache_checkpoint_does_not_hide_unknown_tool_fields() -> None:
+    """Accepting a cache annotation keeps other tool fields strictly validated."""
+    body = _opencode_tool_cache_request({"type": "ephemeral"})
+    tools = body["tools"]
+    assert isinstance(tools, list) and isinstance(tools[1], dict)
+    tools[1]["unknown"] = True
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(body)
+    assert raised.value.detail.param == "tools.1.unknown"
+
+
+def test_chat_tool_cache_checkpoint_is_disclosed_on_unsupported_routes() -> None:
+    """Generic Chat routes omit and disclose the unsupported tool checkpoint."""
+    request = decode_chat(_opencode_tool_cache_request({"type": "ephemeral"})).request
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://example.invalid")
+    public, _ = route_generation_parameter_requests((profile,), request)
+    assert any(
+        item.startswith("tools.cache_control->not_forwarded(") for item in public.ignored_parameters
+    )
+    assert "cache_control" not in json.dumps(dialect_stream_payload(profile, request))
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {"type": "custom", "custom": {"name": "read_file", "format": {"type": "text"}}},
+        {"type": "openrouter:tool_search", "max_results": 1},
+    ],
+)
+def test_chat_tool_cache_checkpoint_refuses_non_function_tools(tool: JsonObject) -> None:
+    """Unsupported tool kinds cannot silently discard a supplied checkpoint.
+
+    Args:
+        tool: A provider-native declaration without a function cache carrier.
+    """
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{**tool, "cache_control": {"type": "ephemeral"}}],
+            }
+        )
+    assert raised.value.detail.param == "tools.0.cache_control"
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])

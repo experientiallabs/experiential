@@ -2076,6 +2076,7 @@ def test_every_chat_cache_control_placement_follows_its_classified_decision() ->
         "messages": "validated_and_forwarded_to_cache_capable_adapters",
         "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
         "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
+        "tools": "validated_and_forwarded_to_cache_capable_adapters",
     }
     decoded = decode_chat(
         {

@@ -33,6 +33,7 @@ from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPrefe
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
     restore_chat_cache_control,
+    restore_chat_tool_cache_control,
 )
 from exp.runtime.openai_protocol.client_field_repairs import (
     chat_output_cap,
@@ -270,8 +271,8 @@ def decode_chat(
 ) -> DecodedGatewayRequest:
     """Decode one Chat Completions body without silently dropping fields.
 
-    OpenCode may attach an Anthropic-style ``cache_control`` annotation on Chat messages and on
-    text content parts. Supported ephemeral forms are validated outside official OpenAI
+    OpenCode may attach ``cache_control`` to Chat messages, text parts and function definitions.
+    Supported ephemeral forms are validated outside official OpenAI
     validation and retained on canonical cache carriers for adapters that support them. Unknown
     keys on messages, their tool calls and content parts are dropped with disclosure
     (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown nested
@@ -351,7 +352,10 @@ def decode_chat(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
             messages=messages,
-            tools=tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
+            tools=restore_chat_tool_cache_control(
+                tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
+                cache_payload,
+            ),
             provider_native_tools=chat_native_tools,
             tool_search=chat_tool_search(chat_native_tools),
             tool_choice=chat_tool_choice(request.tool_choice, native_tools=chat_native_tools),

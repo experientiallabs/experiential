@@ -496,6 +496,31 @@ gateway hops and SDK provider adapters restore those details to unknown before v
 Every relay hop must preserve this evidence. A downstream parser cannot recover observability
 that an older relay already discarded.
 
+Chat accepts Anthropic-style `cache_control` on function-tool definitions, messages, text
+parts and assistant tool calls. A function definition carries the annotation on the enclosing
+`tools` entry, beside `type` and `function`, not inside the function's JSON schema:
+
+```json
+{
+  "type": "function",
+  "function": {"name": "read_file", "parameters": {"type": "object"}},
+  "cache_control": {"type": "ephemeral"}
+}
+```
+
+The supported marker has `type: "ephemeral"` and an optional `ttl` of `"5m"` or `"1h"`.
+A null marker requests no checkpoint. Invalid markers and markers on non-function tool
+declarations are rejected at `tools.<index>.cache_control`. Supported adapters retain or
+translate the checkpoint; routes that cannot honor it disclose omission. The prompt-caching
+policy switch removes tool markers along with message markers when caching is disabled.
+
+For OpenCode 2.x using `@opencode/ai/providers/openai-compatible`, set
+`compatibility.cacheFormat: "anthropic"` on each model served through an Anthropic-compatible
+cache route. OpenCode then marks the final tool definition, system prompt and latest message.
+Its generic compatible route does not infer those markers from the model name alone. Keep the
+setting model-specific when the provider serves other model families. See
+[OpenCode prompt caching](https://opencode.ai/docs/models/#prompt-caching).
+
 OpenAI's 12-hour prompt cache lifetime rides Responses `prompt_cache_options.ttl: "12h"`
 ([OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching): "In the
 Responses API, set `prompt_cache_options.ttl` to choose the minimum cache lifetime"). `"30m"` is
