@@ -420,12 +420,13 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judge:JUDGE_PROTOCOL",
-        "episode-judge-v3",
+        "episode-judge-v4",
         (
             "exp.optimize.evaluation.variance.judge",
             "exp.optimize.evaluation.variance.judge_prompt",
+            "exp.optimize.evaluation.variance.judge_reading",
         ),
-        "4504f963b8caaa9442d4c5a860f1d43793e4870428ec3e902cbacb2273f6a4e8",
+        "00c3f0d11144150d046552cf0879942f94809c00baac6e309f6a22a9cd718a13",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judged:JUDGED_LABELS_PROTOCOL",
