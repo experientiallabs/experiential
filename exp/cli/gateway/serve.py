@@ -427,6 +427,14 @@ def _gateway_not_initialized(*, json_output: bool) -> None:
         "exp config gateway grant add default ALIAS --non-interactive --json",
         "exp config gateway key issue default --key-id KEY --json",
     )
+    # Tools stay off by default because many models cannot call them, but a coding
+    # agent sends tools on every request, so an alias authored from the bare command
+    # above refuses its very first call.
+    notes = (
+        "Tool-calling clients such as coding agents need the alias created with "
+        "--supports-tools --supports-streaming-tool-arguments; without them every "
+        "request that carries tools is refused.",
+    )
     if json_output:
         typer.echo(
             json.dumps(
@@ -436,6 +444,7 @@ def _gateway_not_initialized(*, json_output: bool) -> None:
                         "code": "gateway_not_initialized",
                         "message": "The local gateway has no explicit configuration.",
                         "next_commands": commands,
+                        "notes": notes,
                     },
                 },
                 separators=(",", ":"),
@@ -445,6 +454,8 @@ def _gateway_not_initialized(*, json_output: bool) -> None:
         typer.echo("gateway_not_initialized: run these commands:", err=True)
         for command in commands:
             typer.echo(f"  {command}", err=True)
+        for note in notes:
+            typer.echo(f"note: {note}", err=True)
     raise typer.Exit(2)
 
 

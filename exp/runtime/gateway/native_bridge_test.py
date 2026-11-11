@@ -300,6 +300,35 @@ def test_forced_tool_choice_refusal_tells_the_caller_what_to_send_instead() -> N
         assert "forced_tool_choice" not in error.detail.message
 
 
+@pytest.mark.parametrize(
+    ("capability", "flag"),
+    [
+        ("function_tools", "--supports-tools"),
+        ("streaming_tool_arguments", "--supports-streaming-tool-arguments"),
+    ],
+)
+def test_tool_refusal_names_the_operator_fix(capability: str, flag: str) -> None:
+    """A coding agent cannot drop its tools, so "remove the field" is no way out:
+    an alias authored without these declarations refused every Claude Code
+    request (2026-11-06). Each refusal names the declaration that is missing."""
+    for surface in (
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.MESSAGES,
+    ):
+        error = _public_capability_error(
+            ProviderCapabilityError(capability=capability),
+            surface,
+            public_stream=False,
+            public_tools=True,
+        )
+        assert error.status_code == 400
+        assert error.detail.param == "tools"
+        assert error.detail.code == "unsupported_capability"
+        assert flag in error.detail.message
+        assert "Remove the field" not in error.detail.message
+
+
 def test_public_capability_error_never_exposes_internal_labels() -> None:
     """Internal route requirements fail against model without leaking their names."""
     error = _public_capability_error(
@@ -3539,7 +3568,7 @@ def test_non_streaming_tool_transport_failure_names_tools(tmp_path: Path) -> Non
     error = json.loads(raised.value.public_error_json)
     assert error["code"] == "unsupported_capability"
     assert error["param"] == "tools"
-    assert "Remove the field" in error["message"]
+    assert "--supports-streaming-tool-arguments" in error["message"]
 
 
 def test_admit_preserves_parameter_path_for_an_over_limit_stop_list(tmp_path: Path) -> None:

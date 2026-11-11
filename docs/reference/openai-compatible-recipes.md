@@ -34,8 +34,9 @@ exp config gateway provider add fireworks \
 ```
 
 Then bind one exact model as a direct alias. The capability flags are the template for a
-current Fireworks chat model: most support tools and structured output, and none require
-developer messages. Confirm the flags and the nano-USD prices per million tokens against
+current Fireworks chat model: most support tools (streamed as incremental arguments, which
+the gateway needs to serve tools on an openai-compatible route) and structured output, and none
+require developer messages. Confirm the flags and the nano-USD prices per million tokens against
 the Fireworks model page before authoring, because the gateway treats both as frozen
 authority for routing and accounting.
 
@@ -47,7 +48,7 @@ separated by `.`, `_`, or `-` (for example `llama-v3p1-70b-instruct`).
 exp config gateway alias create coding \
   --deployment fireworks:accounts/fireworks/models/llama-v3p1-70b-instruct \
   --exact-model llama-v3p1-70b-instruct \
-  --supports-tools --supports-structured-output \
+  --supports-tools --supports-streaming-tool-arguments --supports-structured-output \
   --input-price 900000 --output-price 900000 \
   --pricing-source "https://fireworks.ai/pricing" \
   --root ROOT --non-interactive --json
@@ -87,6 +88,11 @@ exp config gateway alias create local-serve \
   --pricing-source "self-hosted Modal deployment" \
   --root ROOT --non-interactive --json
 ```
+
+If the served model was started with tool calling (for vLLM, `--enable-auto-tool-choice` and a
+tool-call parser), add `--supports-tools --supports-streaming-tool-arguments` to the alias;
+without them the gateway refuses every request that carries `tools`, which is every request
+from a coding agent.
 
 `SERVED_MODEL_ID` is the model name the deployment reports in its own `GET /v1/models`;
 self-hosted deployments usually bill through Modal compute rather than per token, so zero

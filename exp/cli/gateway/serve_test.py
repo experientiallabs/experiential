@@ -389,6 +389,33 @@ def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path
     payload = json.loads(result.stdout)
     assert payload["error"]["code"] == "gateway_not_initialized"
     assert payload["error"]["next_commands"][0].startswith("exp config gateway init")
+    assert payload["error"]["notes"] == [
+        "Tool-calling clients such as coding agents need the alias created with "
+        "--supports-tools --supports-streaming-tool-arguments; without them every "
+        "request that carries tools is refused."
+    ]
+    # The printed alias command itself keeps the CLI default: tools stay opt-in.
+    alias_command = next(
+        command
+        for command in payload["error"]["next_commands"]
+        if command.startswith("exp config gateway alias create")
+    )
+    assert "--supports-tools" not in alias_command
+    assert not (tmp_path / "gateway").exists()
+
+
+def test_noninteractive_default_gateway_text_empty_state_names_tool_flags(
+    tmp_path: Path,
+) -> None:
+    """A coding agent always sends tools, so the text next steps name the alias flags."""
+    result = CliRunner().invoke(app, ["--root", str(tmp_path), "--non-interactive"])
+
+    assert result.exit_code == 2
+    assert "gateway_not_initialized: run these commands:" in result.stderr
+    assert (
+        "note: Tool-calling clients such as coding agents need the alias created with "
+        "--supports-tools --supports-streaming-tool-arguments" in result.stderr
+    )
     assert not (tmp_path / "gateway").exists()
 
 
