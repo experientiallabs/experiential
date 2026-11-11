@@ -1,7 +1,8 @@
 //! Native decisions: `POST /v1/systemone` (TypeSafe SystemOne wire) and
-//! `POST /v1/decisions` (OpenAI Decisions API wire), buffered, not chat.
+//! `POST /v1/decisions` (OpenAI Decisions API shape, dispatched to OpenAI's
+//! own wire or translated to Google's Decisions API), buffered, not chat.
 //!
-//! Both wires share admission authority, the attempt ladder, settlement and
+//! All wires share admission authority, the attempt ladder, settlement and
 //! billing evidence; they differ only in the admission bridge method, the
 //! upstream dialect, and how a provider answer is validated against the
 //! admitted questions.
@@ -37,6 +38,7 @@ use crate::settlement::AttemptGuard;
 use crate::upstream::open_decision_stream;
 use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
 use body_budget::reserve_body;
+use google::{google_decision_usage, public_google_decisions};
 use openai::{openai_decision_usage, public_openai_decisions};
 use residual::residual_envelope;
 use served::{disclose, served_headers};
@@ -57,7 +59,7 @@ struct DecisionsAdmission {
     /// Which decisions wire this admission dispatches; required, so a stale
     /// or malformed producer fails closed as wire drift.
     wire: DecisionWire,
-    /// OpenAI question definitions, in request order (OpenAI wire only).
+    /// OpenAI question definitions, in request order (OpenAI and Google wires).
     #[serde(default)]
     openai_questions: Vec<Value>,
     maximum_total_attempts: u32,
@@ -76,6 +78,8 @@ enum DecisionWire {
     Systemone,
     /// OpenAI Decisions API (`/v1/decisions`).
     Openai,
+    /// Google Decisions API, reached through the OpenAI shape on `/v1/decisions`.
+    Google,
 }
 
 impl DecisionsAdmission {
@@ -102,7 +106,13 @@ pub(crate) async fn decisions(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Response {
-    serve(state, request, "admit_decisions", DecisionWire::Systemone).await
+    serve(
+        state,
+        request,
+        "admit_decisions",
+        &[DecisionWire::Systemone],
+    )
+    .await
 }
 
 /// `POST /v1/decisions`: the OpenAI Decisions API wire.
@@ -114,7 +124,7 @@ pub(crate) async fn openai_decisions(
         state,
         request,
         "admit_openai_decisions",
-        DecisionWire::Openai,
+        &[DecisionWire::Openai, DecisionWire::Google],
     )
     .await
 }
@@ -123,7 +133,7 @@ async fn serve(
     state: AppState,
     request: axum::extract::Request,
     admission_method: &'static str,
-    expected_wire: DecisionWire,
+    expected_wires: &[DecisionWire],
 ) -> Response {
     state.handled_requests.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
@@ -159,7 +169,7 @@ async fn serve(
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
-    let admission = match parse_admission(&admission_text, expected_wire) {
+    let admission = match parse_admission(&admission_text, expected_wires) {
         Ok(admission) => admission,
         Err(Parsed::Escalate(reason)) => {
             METRICS.record_escalation(classify_escalation(&reason));
@@ -207,7 +217,10 @@ struct EscalationProbe {
 
 /// Decode the admission straight from its text: the route carries every
 /// rung's provider payload, so no intermediate `Value` copy is kept.
-fn parse_admission(text: &str, expected_wire: DecisionWire) -> Result<DecisionsAdmission, Parsed> {
+fn parse_admission(
+    text: &str,
+    expected_wires: &[DecisionWire],
+) -> Result<DecisionsAdmission, Parsed> {
     let Ok(probe) = serde_json::from_str::<EscalationProbe>(text) else {
         return Err(Parsed::Malformed);
     };
@@ -217,7 +230,7 @@ fn parse_admission(text: &str, expected_wire: DecisionWire) -> Result<DecisionsA
         ));
     }
     match serde_json::from_str::<DecisionsAdmission>(text) {
-        Ok(admission) if admission.wire == expected_wire => Ok(admission),
+        Ok(admission) if expected_wires.contains(&admission.wire) => Ok(admission),
         _ => Err(Parsed::Drift(
             serde_json::from_str(text).unwrap_or(Value::Null),
         )),
@@ -418,6 +431,10 @@ async fn dispatch(
         // Direct OpenAI connections speak the Responses dialect for chat; the
         // decisions endpoint shares their OpenAI error envelope.
         DecisionWire::Openai if wire.dialect == "openai_responses" => Dialect::OpenAiCompatible,
+        // A Gemini connection: its error envelope is the generateContent one.
+        DecisionWire::Google if wire.dialect == "gemini_generate_content" => {
+            Dialect::GeminiGenerateContent
+        }
         _ => return Err(wire_failure()),
     };
     if !wire.timeout_seconds.is_finite() {
@@ -466,6 +483,7 @@ async fn collect_response(
     let usage = match admission.wire {
         DecisionWire::Systemone => decision_usage(&payload),
         DecisionWire::Openai => openai_decision_usage(&payload),
+        DecisionWire::Google => google_decision_usage(&payload),
     };
     if let Ok(usage) = usage {
         guard.record_decision_usage(usage);
@@ -473,6 +491,7 @@ async fn collect_response(
     let served = match admission.wire {
         DecisionWire::Systemone => public_decisions(payload, admission)?,
         DecisionWire::Openai => public_openai_decisions(payload, admission)?,
+        DecisionWire::Google => public_google_decisions(payload, admission)?,
     };
     if remaining(deadline).is_zero() {
         return Err(timeout_failure());
@@ -955,6 +974,11 @@ fn token_count(value: &Value) -> Result<u64, Failure> {
 mod admission_tests;
 #[path = "route_decisions/body_budget.rs"]
 mod body_budget;
+#[path = "route_decisions/google.rs"]
+mod google;
+#[cfg(test)]
+#[path = "route_decisions/google_tests.rs"]
+mod google_tests;
 #[path = "route_decisions/openai.rs"]
 mod openai;
 #[cfg(test)]

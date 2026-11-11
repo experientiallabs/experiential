@@ -714,7 +714,7 @@ class Plane:
         return json.dumps(self.calls)
 "#;
 
-fn guarded() -> (AttemptGuard, Py<PyAny>, Arc<AtomicUsize>) {
+pub(super) fn guarded() -> (AttemptGuard, Py<PyAny>, Arc<AtomicUsize>) {
     Python::initialize();
     let object = Python::attach(|py| {
         pyo3::types::PyModule::from_code(py, PLANE_SOURCE, c"decision_plane.py", c"decision_plane")
@@ -733,7 +733,7 @@ fn guarded() -> (AttemptGuard, Py<PyAny>, Arc<AtomicUsize>) {
     (guard, observer, pending)
 }
 
-fn calls(object: &Py<PyAny>) -> Value {
+pub(super) fn calls(object: &Py<PyAny>) -> Value {
     Python::attach(|py| {
         let text = object
             .bind(py)
@@ -745,7 +745,7 @@ fn calls(object: &Py<PyAny>) -> Value {
     })
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -753,7 +753,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-fn response(body: impl Into<reqwest::Body>) -> reqwest::Response {
+pub(super) fn response(body: impl Into<reqwest::Body>) -> reqwest::Response {
     http::Response::builder()
         .status(200)
         .header("retry-after", "2")

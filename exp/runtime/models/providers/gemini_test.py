@@ -314,3 +314,15 @@ def test_a_non_text_thought_signature_is_a_provider_response_error() -> None:
             configured_model=_snapshot(),
             latency_seconds=0.1,
         )
+
+
+def test_gateway_wire_profile_exposes_googles_decisions_endpoint() -> None:
+    """A Gemini connection serves the OpenAI-shaped decisions surface on Google's wire."""
+    client = GeminiClient(model=_snapshot(), api_key="secret-canary")
+    profile = client.gateway_wire_profile()
+    assert (
+        profile.google_decisions_url == "https://generativelanguage.googleapis.com/v1beta/decisions"
+    )
+    assert profile.openai_decisions_url is None
+    assert profile.decisions_url is None
+    assert profile.headers["x-goog-api-key"] == "secret-canary"
