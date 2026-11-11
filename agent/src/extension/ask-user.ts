@@ -40,9 +40,12 @@ export function createAskUserTool() {
     name: "ask_user",
     label: "Question",
     description:
-      "Ask the user a question and wait for the answer. Use it only when the request is genuinely ambiguous or a choice changes the result substantially (for example which file, which audience, which format). Do not ask for permission to do what was already asked. Offer options when you can.",
+      "Ask the user a question and wait for the answer. Use it only when the request is genuinely ambiguous or a choice changes the result substantially (for example which file, which audience, which format). Never ask for facts you could find yourself: search the web and read the files first, then ask only about what is left. Do not ask for permission to do what was already asked. Offer options when you can.",
     promptSnippet: "Ask the user a question when the request is genuinely ambiguous",
-    promptGuidelines: ["Ask with ask_user only when a choice substantially changes the result; otherwise make a sensible choice and say which."],
+    promptGuidelines: [
+      "Ask with ask_user only when a choice substantially changes the result; otherwise make a sensible choice and say which.",
+      "Before asking about a company, product or topic, research it with web_search and the working directory; ask only about what you could not find."
+    ],
     parameters: askSchema,
     executionMode: "sequential",
     async execute(_toolCallId, { question, options }, signal, _onUpdate, ctx) {

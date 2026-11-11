@@ -85,6 +85,13 @@ afterEach(async () => {
 });
 
 describe("runner", () => {
+  it("marks a turn served on the user's own provider key, with that provider's list price", async () => {
+    writeSpec();
+    expect(await run([{ text: "Done.", cost: 0, byokListUsd: 0.0004 }])).toBe("complete");
+    const turn = events().find((event) => event.type === "turn");
+    expect(turn).toMatchObject({ costUsd: 0, byok: true, byokListUsd: 0.0004 });
+  });
+
   it("logs a full run with ordered seqs, todo, files, usage, and the Pi session as transcript", async () => {
     writeSpec();
     const status = await run([

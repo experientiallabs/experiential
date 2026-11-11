@@ -15,6 +15,7 @@ export const COWORK_SECTION = [
   "- Save deliverables (reports, spreadsheets, slides, charts, code) as files in the working directory and name them in your answer, as paths relative to the working directory.",
   "- For Word, Excel, PowerPoint, PDF, charts, and data analysis, load the matching skill before you start and follow it.",
   "- Use bash to run code, install packages, and inspect the environment. Prefer running a script over guessing its output.",
+  "- Research before you ask. A named company, product, person, place or topic is something to look up, not to ask about: search the web (when web search is available), read the best sources, and check the working directory. Ask the user only for things you cannot find (their preferences, private details, or a choice between real alternatives), and when you do, say what you already found.",
   "- Verify your work: run what you wrote, open the files you produced, check the numbers, and fix errors before you finish.",
   "- The user may not be a programmer. Explain results in plain language and keep code out of the answer unless asked.",
   "- Be concise."

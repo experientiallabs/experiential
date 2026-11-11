@@ -10,7 +10,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 
 export type FakeTurn =
-  | { text: string; reasoning?: string; delayMs?: number; cost?: number }
+  | { text: string; reasoning?: string; delayMs?: number; cost?: number; byokListUsd?: number }
   | { calls: { name: string; arguments: Record<string, unknown> }[]; delayMs?: number }
   | { status: number; error: string };
 
@@ -77,7 +77,9 @@ function turnChunks(turn: Exclude<FakeTurn, { status: number }>, index: number):
     chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
   }
   const cost = "cost" in turn && turn.cost !== undefined ? turn.cost : 0.001;
-  chunks.push({ ...base, choices: [], usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55, cost } });
+  // A turn served on the caller's own provider key: no credits charged, the provider's list price reported.
+  const byok = "byokListUsd" in turn && turn.byokListUsd !== undefined ? { is_byok: true, cost_details: { upstream_inference_cost: turn.byokListUsd } } : {};
+  chunks.push({ ...base, choices: [], usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55, cost, ...byok } });
   return chunks;
 }
 

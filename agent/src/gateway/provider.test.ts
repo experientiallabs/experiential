@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GatewayConfig } from "./config.js";
-import { gatewayProviderConfig, gatewayProviderModels, literalApiKey, reportedCost } from "./provider.js";
+import { gatewayProviderConfig, gatewayProviderModels, literalApiKey, reportedBilling, reportedCost } from "./provider.js";
 
 const local: GatewayConfig = { kind: "local", baseUrl: "http://127.0.0.1:8000/v1", apiKey: "k" };
 
@@ -27,5 +27,14 @@ describe("gateway provider", () => {
       ["a", "openai-completions"],
       ["gpt-6-luna", "openai-responses"]
     ]);
+  });
+});
+
+describe("reportedBilling", () => {
+  it("reads the credits charged and, for a call on the caller's own key, the provider's list price", () => {
+    expect(reportedBilling({ usage: { cost: 0.002 } })).toEqual({ cost: 0.002, byok: false, byokListUsd: null });
+    expect(reportedBilling({ usage: { cost: 0, is_byok: true, cost_details: { upstream_inference_cost: 0.0004 } } })).toEqual({ cost: 0, byok: true, byokListUsd: 0.0004 });
+    expect(reportedBilling({ usage: { cost: 0, is_byok: true } })).toEqual({ cost: 0, byok: true, byokListUsd: null });
+    expect(reportedBilling({ usage: { prompt_tokens: 1 } })).toBeUndefined();
   });
 });
