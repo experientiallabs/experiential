@@ -720,7 +720,9 @@ dispatches on one upstream: the first capable rung in route order picks OpenAI o
 | `score` with `levels: [{label, description?}]` | `score` with ordered `criteria` of `label: description` (or the bare label); the answer's `score` (Google's probability-weighted 0-based level index) and `probabilities` come back as the `[{value, label, probability}]` list with `confidence` |
 | questions keyed by optional `name` | keyed positionally `q0`, `q1`, ... (Google never shows keys to the model); names are restored on the answers |
 | `safety_identifier` | dropped, disclosed as `safety_identifier->dropped(google_decisions)` in `x-experiential-ignored-parameters` |
-| `usage` | `total_input_tokens` as `input_tokens`, `total_output_tokens` (always 0) as `output_tokens`; no cache legs |
+| `usage` | `total_input_tokens` as `input_tokens`, `total_output_tokens` (documented as always 0; absent counts as 0) as `output_tokens`; no cache legs |
+| answer `confidence` | must restate the winning probability (`max(noul, 1 - noul)`, the chosen value's or the highest level's probability) within half a hundredth, else the answer is malformed |
+| `prompt_feedback.block_reason` (Google's input filter answered, no `answers`) | the model's 400 `refusal` naming Google's reason token (`safety`, `blocklist`, `prohibited_content`, `image_safety`, `other`), never its message; no retry or failover |
 
 Refused with a typed 400 on `questions` before dispatch, because Google cannot express them: a
 choice value that is not a valid Google option key (ASCII, 1 through 128 characters, no leading or
