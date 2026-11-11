@@ -4,7 +4,9 @@ The @ai-sdk stack attaches Anthropic-style ephemeral cache hints to recent
 messages for Claude-family model ids. Placements are classified in
 ``CHAT_CACHE_CONTROL_PLACEMENTS``: message-level and text-part hints are
 validated and temporarily removed for official SDK validation, then retained
-on canonical message carriers. Tool-call hints ride canonical tool calls.
+on canonical message carriers. Function-tool definitions follow the same
+validation boundary and retain their hints on canonical tools. Tool-call
+hints ride canonical tool calls.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, field_va
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MessageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import GatewayMessage
+from exp.runtime.gateway.tool_contracts import GatewayToolDefinition
 from exp.runtime.models.providers.cache_policy import (
     merge_cache_checkpoint,
     multimodal_text_cache_blocks,
@@ -53,14 +56,14 @@ class EphemeralCacheControl(_HintWireModel):
 
 
 def drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
-    """Remove supported OpenCode ``cache_control`` annotations from Chat messages.
+    """Remove validated message and function-tool hints before Chat wire validation.
 
     Args:
         payload: Parsed Chat Completions body.
 
     Returns:
-        The original payload, or a shallow copy whose messages no longer carry
-        a supported ``cache_control`` annotation.
+        The original payload, or a shallow copy whose messages and function
+        tools no longer carry a supported ``cache_control`` annotation.
 
     Raises:
         OpenAIProtocolError: A ``cache_control`` value is malformed or unsupported.
@@ -74,11 +77,57 @@ def drop_opencode_cache_control(payload: JsonObject) -> JsonObject:
         message, message_changed = _without_message_hint(raw_message, index)
         cleaned_messages.append(message)
         changed = changed or message_changed
+    raw_tools = payload.get("tools")
+    cleaned_tools: list[JsonValue] = []
+    if isinstance(raw_tools, list):
+        for index, raw_tool in enumerate(raw_tools):
+            if not isinstance(raw_tool, dict) or "cache_control" not in raw_tool:
+                cleaned_tools.append(raw_tool)
+                continue
+            param = f"tools.{index}.cache_control"
+            if raw_tool.get("type", "function") != "function":
+                raise invalid_field(param, "Cache checkpoints require a function tool definition.")
+            require_supported_cache_control(raw_tool["cache_control"], param)
+            cleaned_tools.append(
+                {key: value for key, value in raw_tool.items() if key != "cache_control"}
+            )
+            changed = True
     if not changed:
         return payload
     cleaned_payload = dict(payload)
     cleaned_payload["messages"] = cleaned_messages
+    if isinstance(raw_tools, list):
+        cleaned_payload["tools"] = cleaned_tools
     return cleaned_payload
+
+
+def restore_chat_tool_cache_control(
+    tools: tuple[GatewayToolDefinition, ...], payload: JsonObject
+) -> tuple[GatewayToolDefinition, ...]:
+    """Restore validated checkpoints onto the corresponding function definitions.
+
+    Args:
+        tools: Canonical function tools from the validated, cleaned Chat body.
+        payload: Original body whose cache annotations were validated separately.
+
+    Returns:
+        Function tools with their supplied cache annotations. Provider-native
+        declarations are excluded from both sides of the positional mapping.
+    """
+    raw_tools = payload.get("tools")
+    if not isinstance(raw_tools, list):
+        return tools
+    functions = (
+        tool
+        for tool in raw_tools
+        if isinstance(tool, dict) and tool.get("type", "function") == "function"
+    )
+    return tuple(
+        tool.model_copy(update={"cache_control": raw["cache_control"]})
+        if isinstance(raw.get("cache_control"), dict)
+        else tool
+        for tool, raw in zip(tools, functions, strict=True)
+    )
 
 
 def restore_chat_cache_control(

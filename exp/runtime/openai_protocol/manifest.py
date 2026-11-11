@@ -388,13 +388,15 @@ CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
     "messages": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.content": "validated_and_forwarded_to_cache_capable_adapters",
     "messages.tool_calls": "validated_and_forwarded_to_anthropic_tool_use",
+    "tools": "validated_and_forwarded_to_cache_capable_adapters",
 }
 """Every Chat-surface ``cache_control`` placement and its conscious decision.
 
 The @ai-sdk stack attaches an Anthropic-style ephemeral cache hint to the
 last content part of recent messages for Claude-family model ids; depending
 on that part's shape the hint lands on the message, a text part, or inside a
-``tool_calls`` entry. Placements are classified here so a new placement is a
+``tool_calls`` entry. OpenCode also marks the last function-tool definition.
+Placements are classified here so a new placement is a
 recorded decision (this table plus its behavior test), never a silent 400.
 Validated placements ride canonical cache carriers. Anthropic, Bedrock and
 OpenRouter adapters forward or translate them; other routes disclose omission.
