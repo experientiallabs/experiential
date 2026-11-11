@@ -1,0 +1,65 @@
+name: agent
+
+# exp-code, the TypeScript agent package under agent/. Runs only when it changes.
+# No paid providers and no secrets: tests use a local fake gateway.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent.yml"
+  pull_request:
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.19.0", "24"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - name: Install the locked dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        env:
+          PI_TELEMETRY: "0"
+          DO_NOT_TRACK: "1"
+        run: npm test
+      - name: Build the CLI and bundle the runner
+        run: |
+          npm run build
+          npm run bundle
+      - name: Smoke the built CLI and the self-contained runner bundle
+        run: |
+          set -euo pipefail
+          node dist/cli.js --version
+          bundle_dir="$(mktemp -d)"
+          cp dist/runner.mjs "$bundle_dir/"
+          # Outside the package, with no node_modules: a usage error proves the bundle loads.
+          status=0
+          (cd "$bundle_dir" && node runner.mjs) || status=$?
+          test "$status" -eq 2
+      - name: Check the package contents
+        run: npm pack --dry-run

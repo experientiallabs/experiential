@@ -67,6 +67,19 @@ with exp.load_router("my-project") as client:
     )
 ```
 
+## Coding Agent
+
+`exp code` runs [exp-code](./agent/README.md), Experiential's open-source coding and cowork
+agent built on [Pi](https://github.com/earendil-works/pi). It needs Node.js 22.19 or newer and
+uses your running local gateway, or the hosted gateway after `exp login`:
+
+```bash
+exp code                       # interactive terminal UI
+exp code -p "Summarize sales.csv into report.docx"
+```
+
+Every argument goes to exp-code, so its print, JSON, and RPC modes work through `exp code` too.
+
 ## Capture Traffic
 
 Capture is designed to collect supported traces from the Codex and Claude Code desktop apps using

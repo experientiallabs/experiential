@@ -43,7 +43,7 @@ uv run pytest -q
   may not import optimize or cli; optimize may not import cli. Optimize owns application
   orchestration and may depend inward on common, runtime, and simulation. The AST gate rejects
   every current forbidden edge directly and proves that the package graph is acyclic.
-- The root CLI command set is exact: `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`.
+- The root CLI command set is exact: `build`, `capture`, `code`, `config`, `eval`, `login`, `optimize`, and `run`.
   An invocation without a subcommand opens the default gateway home screen.
   `exp/cli/app_test.py` and the release tests
   enforce the current command and distribution shape.
@@ -51,7 +51,7 @@ uv run pytest -q
 ## CLI package ownership
 
 - `exp/cli/app.py` owns root command composition only. Command implementations live in the
-  `build/`, `capture/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
+  `build/`, `capture/`, `code/`, `config/`, `evaluation/`, `judge/`, `optimize/`, and `gateway/` packages. Gateway serving and the
   default home screen live under `gateway/`.
 - `exp/cli/providers/` owns provider discovery, model selection, and catalog setup shared by
   commands. Command-specific orchestration stays with its command package. In particular,
@@ -153,7 +153,8 @@ uv run pytest -q
   orchestration lives in `automatic/`, manual judge calibration in `judging/`, offline policy work
   in `fit/`, and evaluation preparation in `evaluation/`. The durable judgment ledger remains at
   `judgment_budget.py`.
-- The root CLI is locked to `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`. Capture runs
+- The root CLI is locked to `build`, `capture`, `code`, `config`, `eval`, `login`, `optimize`, and `run`. `code`
+  passes every argument to the pinned exp-code release and owns no options of its own. Capture runs
   in the foreground with no management subcommands. The optimize group is locked
   to `router` and `model`; the config group is locked to `budget`, `gateway`, `judge`, `providers`,
   and `telemetry`. Widening any of those three sets, whether with a command, an alias, or a flag, is a
@@ -247,7 +248,7 @@ uv run pytest -q
    its existing identity digest remains frozen for router artifact compatibility.
 
 5. **The top level is a closed allowlist.** The tracked top-level directories are exactly: `exp/`,
-   `docs/`, `assets/`, `.claude/`, `.github/`, `.gitlab/`. That list is closed.
+   `agent/`, `docs/`, `assets/`, `.claude/`, `.github/`, `.gitlab/`. That list is closed.
 
    `.agents/` is the one sanctioned scratchpad: a local, gitignored working directory for agent
    sessions (notes, probe scripts, run outputs). It is never tracked, never part of a PR, and
@@ -287,7 +288,11 @@ uv run pytest -q
      `exp/runtime/models/providers/`.
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `.github/`: the gate, gateway-latency, and python-package workflows.
+   - `agent/`: exp-code, the open-source coding and cowork agent, as one TypeScript npm package
+     (`exp-code`) built on an exact-pinned Pi coding agent. It is the only non-Python code outside
+     `exp/`; its tests, lockfile (`package-lock.json`), and bundle script live inside it, and
+     `exp code` launches its pinned release.
+   - `.github/`: the gate, gateway-latency, python-package, and agent workflows.
    - `.gitlab/`: GitLab CI. `.gitlab/ci/` holds one file per pipeline area, included by the
      root `.gitlab-ci.yml`; its `osv-scanner.toml` is the shared advisory policy for both CI
      systems. `docs/gitlab-ci.md` describes the conventions.
@@ -388,6 +393,7 @@ uv run pytest -q
     | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
+    | Launching exp-code | `exp/cli/code/launcher.py` | `launch`; the agent itself lives in `agent/` |
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
@@ -437,6 +443,11 @@ Rules of the road:
   main, and uses PyPI trusted publishing from the `pypi` environment. Only the isolated
   publish jobs have `id-token: write`. Publish the native distribution before the flagship.
   `docs/gitlab-ci.md` documents GitHub operation and the retained GitLab configuration.
+- **The exp-code npm carve-out**: `agent/` is the npm package `exp-code`, released separately
+  under `exp-code-v<version>` tags. Its dependencies, Pi included, are exact pins with a committed
+  npm lockfile. `exp/cli/code/launcher.py` pins the release `exp code` runs, and
+  `launcher_test.py` keeps that pin equal to `agent/package.json`, so a release bumps both in one
+  change. `.github/workflows/agent.yml` installs, typechecks, tests, and bundles it.
 
 ## Docs
 

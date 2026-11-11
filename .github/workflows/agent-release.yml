@@ -1,0 +1,75 @@
+name: agent-release
+
+# Release exp-code: a tag `exp-code-vX.Y.Z` (matching agent/package.json) builds, tests and
+# bundles the agent, then attaches the self-contained sandbox runner to a GitHub release:
+#   exp-code-runner.mjs         the runner (node exp-code-runner.mjs <runId>), one file
+#   exp-code-runner.mjs.sha256  its digest
+#   exp-code-protocol.ts        the runner's file and push protocol (RunSpec, RunEvent, ...)
+# Consumers pin a version and verify the digest. When the NPM_TOKEN secret exists, the same
+# build is also published to npm as `exp-code`.
+on:
+  push:
+    tags: ["exp-code-v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.19.0"
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+          registry-url: https://registry.npmjs.org
+      - name: The tag names the package version
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          test "${GITHUB_REF_NAME}" = "exp-code-v${version}" || { echo "tag ${GITHUB_REF_NAME} does not match package version ${version}"; exit 1; }
+      - name: Install the locked dependencies
+        run: npm ci
+      - name: Typecheck and test
+        env:
+          PI_TELEMETRY: "0"
+          DO_NOT_TRACK: "1"
+        run: |
+          npm run typecheck
+          npm test
+      - name: Build and bundle
+        run: |
+          npm run build
+          npm run bundle
+      - name: Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$(mktemp -d)"
+          cp dist/runner.mjs "$out/exp-code-runner.mjs"
+          cp src/runner/protocol.ts "$out/exp-code-protocol.ts"
+          (cd "$out" && sha256sum exp-code-runner.mjs > exp-code-runner.mjs.sha256)
+          # The bundle must load on its own (a usage error proves it does).
+          status=0
+          (cd "$out" && node exp-code-runner.mjs) || status=$?
+          test "$status" -eq 2
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "exp-code ${GITHUB_REF_NAME#exp-code-v}" \
+            --notes "exp-code ${GITHUB_REF_NAME#exp-code-v}: the open-source coding and cowork agent (agent/). The sandbox runner is attached as one self-contained file with its sha256." \
+            "$out/exp-code-runner.mjs" "$out/exp-code-runner.mjs.sha256" "$out/exp-code-protocol.ts"
+      - name: Publish to npm (when configured)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then echo "NPM_TOKEN is not configured; skipping npm."; exit 0; fi
+          npm publish --access public

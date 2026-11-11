@@ -10,6 +10,7 @@ import typer
 from exp.cli.auth import login
 from exp.cli.build.app import build
 from exp.cli.capture.app import capture_app
+from exp.cli.code.app import CODE_CONTEXT_SETTINGS, CODE_HELP, code
 from exp.cli.config.app import config_app
 from exp.cli.evaluation.app import evaluate
 from exp.cli.gateway.home import default_gateway
@@ -40,6 +41,9 @@ add_deferred_typer(
 app.command("eval", help="Evaluate models on a project and inspect saved results.")(evaluate)
 app.command("build", help="Import traces, mine scenarios, and build a grounded world model.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
+app.command("code", help=CODE_HELP, context_settings=CODE_CONTEXT_SETTINGS, add_help_option=False)(
+    code
+)
 app.command(
     "login",
     help="Sign in to Experiential Cloud through Platform and sync account models.",
