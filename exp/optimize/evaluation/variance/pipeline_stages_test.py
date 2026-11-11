@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -51,3 +53,76 @@ def test_an_attempt_past_the_priced_step_bound_is_labelled_over_its_first_steps(
     assert pipeline_stages.labelled_steps(branch, "actor-kimi", 100) == steps
     empty = ContinuationBranch(index=0, status="outcome_unknown", outcome={})
     assert pipeline_stages.labelled_steps(empty, "actor-kimi", 80) == []
+
+
+def test_zero_qualified_points_means_zero_rubric_author_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 31 authored the mining rubric although no point of any attempt qualified."""
+    from exp.common.project import ProjectStore
+    from exp.optimize.evaluation.variance.point_bar import (
+        DEFAULT_BAR,
+        BarRecord,
+        PointQualification,
+    )
+    from exp.optimize.evaluation.variance.point_selection import save_point_bar
+    from exp.optimize.evaluation.variance.reward_states import PointState
+
+    project = ProjectStore(tmp_path, "eligible-rubric")
+    authored: list[object] = []
+    rubric = ArtifactInput(artifact_id="rubric-authored", sha256="1" * 64)
+
+    def author(context: object, build: object, rules: object) -> tuple[ArtifactInput, None]:
+        authored.append(context)
+        return rubric, None
+
+    monkeypatch.setattr(pipeline_stages, "mining_rubric", author)
+
+    def bars(*states: PointState) -> ArtifactInput:
+        """Save one tier's attempts, one point per attempt in the given states."""
+        records = {
+            index: BarRecord(
+                bar_id=DEFAULT_BAR.bar_id,
+                bar_version=DEFAULT_BAR.version,
+                trace_id=f"tier/attempt:{index}",
+                points=(PointQualification(point=0, state=state, steps=()),),
+            )
+            for index, state in enumerate(states)
+        }
+        return save_point_bar(project.artifacts, DEFAULT_BAR, records, code_revision="test")
+
+    spec = SimpleNamespace(
+        mining=SimpleNamespace(rubric=None, qualification=object(), schedule=None)
+    )
+    context = SimpleNamespace(project=project, spec=spec)
+
+    def rubric_for(traceml: SimpleNamespace) -> object:
+        """Ask the stage helper for the rubric over these tiers' saved bars."""
+        return pipeline_stages.eligible_rubric(
+            cast(Any, context), cast(Any, None), cast(Any, None), cast(Any, traceml)
+        )
+
+    rejected = bars(PointState.REJECTED, PointState.UNCERTAIN)
+    none = SimpleNamespace(point_bars={"actor-kimi": rejected, "actor-mimo": rejected})
+    with pytest.raises(ValueError, match="no point qualified by the bar"):
+        rubric_for(none)
+    assert authored == []
+
+    one = SimpleNamespace(
+        point_bars={
+            "actor-kimi": bars(PointState.UNCERTAIN, PointState.QUALIFIED),
+            "actor-mimo": rejected,
+        }
+    )
+    with pytest.raises(ValueError, match="actor-mimo"):
+        rubric_for(one)
+    assert authored == []
+
+    every = SimpleNamespace(
+        point_bars={
+            "actor-kimi": bars(PointState.QUALIFIED),
+            "actor-mimo": bars(PointState.QUALIFIED),
+        }
+    )
+    assert rubric_for(every) == (rubric, None)
+    assert len(authored) == 1

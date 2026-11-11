@@ -40,6 +40,7 @@ from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
     ActorCriticSpec,
     admitted_concurrency,
+    require_qualified_points,
     run_actor_critic,
 )
 from exp.optimize.evaluation.variance.actor_critic_costs import (
@@ -119,6 +120,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     TraceMLOutputs,
     cost_lines,
 )
+from exp.optimize.evaluation.variance.point_selection import load_point_bar
 from exp.optimize.evaluation.variance.rubric_author import judge_definition
 from exp.optimize.evaluation.variance.schedule import complete_rollout, next_rollout_plan
 from exp.runtime.agents.chat import ChatAgentRuntime
@@ -579,6 +581,37 @@ class _TraceMLStage:
         return StageRun(outputs, saved, summary)
 
 
+def eligible_rubric(
+    context: StageContext, build: BuildOutputs, rules: RulesOutputs, traceml: TraceMLOutputs
+) -> tuple[ArtifactInput, ArtifactInput | None]:
+    """Return the mining rubric, authoring it only once every gated tier can be picked.
+
+    Under the qualification bar a tier whose attempts have no qualified point stops at its pick,
+    so the check runs before the rubric author is called (:func:`require_qualified_points`). The
+    scheduled tier is left to its rollout plan's own registration.
+
+    Returns:
+        The rubric and the packet it was authored from (None for a registered rubric).
+
+    Raises:
+        ValueError: A gated tier has no qualified point, or authoring failed.
+    """
+    spec = context.spec
+    if spec.mining.qualification is not None:
+        schedule = spec.mining.schedule
+        scheduled = None if schedule is None else schedule.base.initial.actor_alias
+        require_qualified_points(
+            {
+                alias: load_point_bar(context.project.artifacts, reference)
+                for alias, reference in traceml.point_bars.items()
+                if alias != scheduled
+            }
+        )
+    if spec.mining.rubric is not None:
+        return spec.mining.rubric, None
+    return mining_rubric(context, build, rules)
+
+
 class _MiningStage:
     """The ``error-mining`` stage."""
 
@@ -698,9 +731,7 @@ class _MiningStage:
         profile = mining_profile(spec)
         start = load_continuation_checkpoint(project.artifacts, rules.job.study.checkpoint)
         probe = probe_line(build, start.task.task_id)
-        rubric, packet = spec.mining.rubric, None
-        if rubric is None:
-            rubric, packet = mining_rubric(context, build, rules)
+        rubric, packet = eligible_rubric(context, build, rules, traceml)
         embedder = None
         if spec.mining.retrieval and build.index is not None:
             embedder = retrieval_embedder(context, build.index)

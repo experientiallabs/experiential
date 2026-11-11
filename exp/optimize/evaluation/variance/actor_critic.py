@@ -755,6 +755,45 @@ def export_point_harbor(
     )
 
 
+NO_QUALIFIED_POINT = "no point qualified by the bar"
+"""Why the pick passes over an attempt the qualification bar left without a qualified point."""
+
+
+def has_qualified_point(records: Mapping[int, BarRecord], attempt: int) -> bool:
+    """Whether the bar qualified at least one point of one attempt; a missing record has none."""
+    record = records.get(attempt)
+    return record is not None and any(
+        point.state == PointState.QUALIFIED for point in record.points
+    )
+
+
+def require_qualified_points(tiers: Mapping[str, Mapping[int, BarRecord]]) -> None:
+    """Refuse a mining phase in which some tier's attempts have no point the bar qualified.
+
+    The pick (:func:`_pick`) refuses such a tier before any judge draw, but the stage authors the
+    mining rubric before it reaches the pick, so run 31 paid for a rubric no selection could use.
+    The stage calls this first: a tier without a qualified point would stop the phase at its pick
+    anyway, so no authoring or judging is bought for it. Passing is necessary, not sufficient:
+    the pick still applies its other eligibility rules.
+
+    Args:
+        tiers: Each gated tier's saved per-attempt qualification records.
+
+    Raises:
+        ValueError: A tier has no attempt with a qualified point; names each such tier.
+    """
+    empty = {
+        tier: len(records)
+        for tier, records in tiers.items()
+        if not any(has_qualified_point(records, attempt) for attempt in records)
+    }
+    if empty:
+        raise ValueError(
+            f"{NO_QUALIFIED_POINT} in any attempt of tiers {empty} (tier: attempts); stopping "
+            "before the mining rubric is authored or any judge is drawn"
+        )
+
+
 def _pick(
     group: ContinuationStudy,
     identity: str,
@@ -796,13 +835,10 @@ def _pick(
             < 2
         ):
             ineligible[row.index] = "fewer than two boundaries with actor calls left"
-        elif records is not None and not any(
-            point.state == PointState.QUALIFIED
-            for point in (records[row.index].points if row.index in records else ())
-        ):
+        elif records is not None and not has_qualified_point(records, row.index):
             # Selectors may only pick qualified points, so an attempt without one would buy
             # every judge draw for a selection that cannot exist.
-            ineligible[row.index] = "no point qualified by the bar"
+            ineligible[row.index] = NO_QUALIFIED_POINT
     eligible = tuple(index for index in candidates if index not in ineligible)
     picked = next((index for index in order if index in eligible), None)
     if picked is None:
