@@ -24,7 +24,7 @@ import copy
 from typing import Literal
 
 from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue
-from exp.optimize.evaluation.variance.verifier_paths import project_verifier, split
+from exp.optimize.evaluation.variance.verifier_paths import keyed_by_paths, project_verifier, split
 from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, grade
 from exp.simulation.reconstruction.models import resolve
 
@@ -69,16 +69,23 @@ def projection(state: JsonObject, probes: dict[str, str]) -> JsonObject:
 
 
 def _set(value: JsonObject, pointer: str, item: JsonValue) -> bool:
-    """Write ``item`` at a pointer, filling missing or null parents with objects.
+    """Write ``item`` at a pointer in the state's own key style, filling missing parents.
+
+    A missing or null parent becomes an object, as a recorded run fills one, except inside a
+    files map (:func:`~.verifier_paths.keyed_by_paths`): the simulator holds each file there
+    under one flat key and never nests directories, so a witness may not either.
 
     Returns False when the pointer runs through a text, number or boolean, which no state can
-    hold a value inside.
+    hold a value inside, or would nest objects inside a files map.
     """
     keys = split(pointer)
     node: JsonValue = value
     for key in keys[:-1]:
         if isinstance(node, dict):
             child = node.get(key)
+            if child is None and keyed_by_paths(node):
+                # No run nests a directory inside a files map; the pointer names nothing real.
+                return False
             if child is None:
                 # A missing or null value may become an object, as a recorded run fills it.
                 child = {}

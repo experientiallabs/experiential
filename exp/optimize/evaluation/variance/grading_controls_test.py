@@ -141,3 +141,57 @@ def test_a_probed_file_stays_while_the_rest_of_its_files_map_may_change() -> Non
 
     with pytest.raises(ValueError, match="transition refused"):
         validate_state_projection({"fs": {"files": {"/w/a.py": "edited"}}}, {"fs": schema})
+
+
+def test_a_positive_control_writes_a_file_as_the_files_map_holds_it() -> None:
+    """The control builder once filled confcheck/__init__.py as nested objects, a shape no run
+    produces; its witness now uses the map's flat key and refuses to nest inside a files map."""
+    from exp.optimize.evaluation.variance.grading_controls import _set
+
+    state: JsonObject = {
+        "Workspace filesystem": {"files": {".teich-prompt.txt": "the task", "setup.py": "s"}}
+    }
+    probes = {
+        "workspace_files": "/Workspace filesystem/files",
+        "prompt_file": "/Workspace filesystem/files/.teich-prompt.txt",
+    }
+    verifier: JsonObject = {
+        "description": "The package exists and the prompt is kept.",
+        "outcome_schema": {},
+        "required_paths": ["/final_state/workspace_files"],
+        "rules": [
+            {"operator": "exists", "path": "/final_state/workspace_files/confcheck/__init__.py"}
+        ],
+        "preserved_paths": ["/prompt_file"],
+    }
+    results = {row.control: row for row in run_controls(verifier, state, probes)}
+    assert results["correct"].ok, results["correct"]
+    files: JsonObject = {".teich-prompt.txt": "the task"}
+    assert not _set({"files": files}, "/files/confcheck/__init__.py", "x")
+    assert _set({"files": files}, "/files/confcheck~1__init__.py", "x")
+    assert files["confcheck/__init__.py"] == "x"
+    named: JsonObject = {"oracle": {"status": "red"}}
+    assert _set(named, "/oracle/last_run/exit_code", 0)
+    assert named == {"oracle": {"status": "red", "last_run": {"exit_code": 0}}}
+
+
+def test_a_draft_reading_inside_a_files_map_off_its_key_style_is_refused() -> None:
+    """A pointer normalisation cannot place in the map's key style refuses the draft."""
+    from types import SimpleNamespace
+    from typing import cast
+
+    import pytest
+
+    from exp.optimize.evaluation.variance.bootstrap_agents import _check_verifier_reads
+    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft
+    from exp.simulation.evaluation.tasks import TaskVerifier
+
+    state: JsonObject = {"fs": {"files": {"a.py": {"text": "x"}}}}
+    probes = {"files": "/fs/files"}
+    rule: JsonObject = {"operator": "exists", "path": "/final_state/files/pkg/b.py/text"}
+    verifier = TaskVerifier.model_validate(
+        {"description": "d", "outcome_schema": {}, "rules": [rule]}
+    )
+    stand_in = SimpleNamespace(initial_state=state, probe_paths=probes, verifier=verifier)
+    with pytest.raises(ValueError, match="files map"):
+        _check_verifier_reads(cast("StartDraft", stand_in))

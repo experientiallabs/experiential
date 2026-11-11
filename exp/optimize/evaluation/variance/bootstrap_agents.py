@@ -81,7 +81,13 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     instruction,
 )
 from exp.optimize.evaluation.variance.grading_controls import projection, run_controls
-from exp.optimize.evaluation.variance.verifier_paths import project_verifier, split, unplaced
+from exp.optimize.evaluation.variance.verifier_paths import (
+    keyed_by_paths,
+    off_style,
+    project_verifier,
+    split,
+    unplaced,
+)
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
     ProviderRetryableResponseError,
@@ -277,7 +283,9 @@ class StartMaterial:
                 "/final_state hold each probe_paths value keyed by its probe name, so required and "
                 "rule paths are /final_state/<probe>/... and preserved paths are /<probe>/...; add "
                 "a probe for every part of the state the verifier reads, for example the files map "
-                "to see a file the agent creates"
+                "to see a file the agent creates. A files map keyed by paths holds each file under "
+                "one key, so pkg/mod.py in a files map probed as files is /final_state/files/"
+                "pkg~1mod.py, never /final_state/files/pkg/mod.py"
             ),
             "verifier JSON Schemas": (
                 "outcome_schema and every argument schema are JSON Schema objects: each value "
@@ -1685,8 +1693,21 @@ def _check_verifier_reads(draft: StartDraft) -> None:
     A rule demanding a long text equal (a whole file) passes only a byte-identical rewrite. A
     rule reading inside a probe that starts null depends on the simulator inventing the shape
     it fills in (run 30 lost 11 branches to a missing ``exit_code``); the start must declare
-    that shape in initial_state, so the domain's state_schema keeps it.
+    that shape in initial_state, so the domain's state_schema keeps it. A pointer walking into a
+    files map as nested directories names a shape no run holds (run 31: none of 11 such rules
+    resolved in any of 13 final states, where each file is one flat key), and is refused when
+    normalisation could not rewrite it to the map's key style.
     """
+    if off := off_style(
+        draft.verifier.model_dump(mode="json"), draft.initial_state, dict(draft.probe_paths)
+    ):
+        raise ValueError(
+            f"verifier pointers {off[:6]} walk into a files map as nested segments or several "
+            "keys deep into an empty object, which no simulated state holds: a files map keyed by "
+            "paths holds each file under one key, so write the key escaped "
+            "(/final_state/<files probe>/pkg~1mod.py for pkg/mod.py), and give an object the "
+            "verifier reads inside at least one entry so its key style is known"
+        )
     initial = projection(draft.initial_state, dict(draft.probe_paths))
     for rule in draft.verifier.rules:
         if rule.operator == "equals" and isinstance(rule.value, str):
@@ -1739,7 +1760,7 @@ def _shape(value: JsonValue, depth: int, probed: list[list[str]] | None = None) 
     schema: JsonObject = {"type": "object"}
     # A map keyed by paths or file names (a files map) may gain and lose entries; an object of
     # named fields keeps every field.
-    named = all("/" not in key and "." not in key for key in value)
+    named = not keyed_by_paths(value)
     kept = {keys[0] for keys in probed if keys[0] in value}
     if named and depth > 0:
         kept |= set(value)
