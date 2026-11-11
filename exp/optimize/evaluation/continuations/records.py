@@ -59,6 +59,7 @@ def load_study(store: ArtifactStore, reference: ArtifactInput) -> ContinuationSt
     if set(registration.inputs) != expected_registration:
         raise ValueError("study registration lost its frozen checkpoint or training specification")
     inputs = [artifact_input(registration)]
+    parent = load_continuation_checkpoint(store, study.spec.checkpoint)
     for branch in study.branches:
         branch_id = f"{identity}-branch-{branch.index}"
         saved = store.read(branch_id).manifest
@@ -70,7 +71,6 @@ def load_study(store: ArtifactStore, reference: ArtifactInput) -> ContinuationSt
         expected_branch = {artifact_input(registration), *branch.checkpoints, *branch.actor_calls}
         if branch.actor_calls != saved_actor_call_evidence(store, branch_id):
             raise ValueError("study branch lost its retained actor call inventory")
-        parent = load_continuation_checkpoint(store, study.spec.checkpoint)
         previous_call = parent.actor.calls
         for point_ref in branch.checkpoints:
             point = load_continuation_checkpoint(store, point_ref)
