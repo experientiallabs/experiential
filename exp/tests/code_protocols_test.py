@@ -47,6 +47,12 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
+        "exp.optimize.evaluation.variance.actor_critic_phases:PHASE_ACCOUNTING_PROTOCOL",
+        "actor-critic-phase-accounting-v1",
+        ("exp.optimize.evaluation.variance.actor_critic_phases",),
+        "e9a3844d0329c78b5d53998f4acf56ec5cc7607ae1484e7178cb365e3b4d3c1a",
+    ),
+    Protocol(
         "exp.optimize.evaluation.variance.behavior_differences:BEHAVIOR_DIFFERENCES_PROTOCOL",
         "behavior-differences-v1",
         (
@@ -420,21 +426,22 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judge:JUDGE_PROTOCOL",
-        "episode-judge-v3",
+        "episode-judge-v4",
         (
             "exp.optimize.evaluation.variance.judge",
             "exp.optimize.evaluation.variance.judge_prompt",
+            "exp.optimize.evaluation.variance.judge_reading",
         ),
-        "4504f963b8caaa9442d4c5a860f1d43793e4870428ec3e902cbacb2273f6a4e8",
+        "00c3f0d11144150d046552cf0879942f94809c00baac6e309f6a22a9cd718a13",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.judged:JUDGED_LABELS_PROTOCOL",
-        "judged-labels-v2",
+        "judged-labels-v3",
         (
             "exp.optimize.evaluation.variance.judged",
             "exp.optimize.evaluation.variance.episode_evidence",
         ),
-        "2b26ae0c1cda7b2ceaa1ab4cce7d8535cb638d99ff24eee9d41b96dd185b701c",
+        "f6b5acc9b55206575906c508e8d8ca3364cca12b1ad763bd0a064a9e8d70ee52",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.admission:FAMILY_ADMISSION_POLICY",

@@ -54,6 +54,7 @@ from exp.optimize.evaluation.continuations.intervention import ActionInterventio
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.variance import judge as episode_judgment
 from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.episode_evidence import (
     evidence_from_branch,
@@ -71,7 +72,7 @@ from exp.optimize.evaluation.variance.episodes import (
 from exp.optimize.evaluation.variance.judge import judge_episode, load_assessment
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 
-JUDGED_LABELS_PROTOCOL = "judged-labels-v2"
+JUDGED_LABELS_PROTOCOL = "judged-labels-v3"
 """Version of how saved episodes become judged evidence and labels; bump when that changes."""
 
 JUDGED_STUDY_TYPE = "judged-continuation-study"
@@ -386,6 +387,7 @@ def judge_study(
         JUDGED_STUDY_TYPE,
         {
             "protocol": JUDGED_LABELS_PROTOCOL,
+            "assessment_protocol": episode_judgment.JUDGE_PROTOCOL,
             "judge": judge.identity,
             "study": reference.model_dump(mode="json"),
         },

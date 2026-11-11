@@ -275,7 +275,7 @@ def test_a_saved_assessment_replays_without_a_call_and_a_new_rubric_rejudges(
 @pytest.mark.parametrize(
     ("reply", "reason"),
     [
-        (_reply({"role": "assistant", "content": "It passed."}), "exactly one call"),
+        (_reply({"role": "assistant", "content": "It passed."}), "only offered tools"),
         (_answer("pass", right_order="not_met"), "pass contradicts"),
         (_answer("fail"), "fail needs a required criterion"),
         (
@@ -614,3 +614,233 @@ def test_behavior_diagnostics_are_a_role_of_their_own_and_guidance_is_described(
     assert "behavior_diagnostic" in judge_module._ROLES
     assert judge_module._REQUIRED == "required_correctness"
     assert "behavior_guidance" in JUDGE_PROMPT and "behavior_diagnostic" in JUDGE_PROMPT
+
+
+def _tool_batch(*calls: tuple[str, str, JsonObject]) -> JsonHttpResponse:
+    """One provider response containing the supplied calls in order."""
+    return _reply(
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": call_id,
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+                for call_id, name, arguments in calls
+            ],
+        },
+        "tool_calls",
+    )
+
+
+def _read_calls(*ranges: tuple[str, str, str]) -> JsonHttpResponse:
+    """One provider response requesting the declared event ranges together."""
+    calls: list[tuple[str, str, JsonObject]] = []
+    for call_id, first, last in ranges:
+        arguments: JsonObject = {"first_event_id": first, "last_event_id": last}
+        calls.append((call_id, "read_events", arguments))
+    return _tool_batch(*calls)
+
+
+@pytest.mark.parametrize("agentic", [False, True])
+def test_a_judge_accepts_two_reads_in_one_response_and_replies_to_each_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agentic: bool
+) -> None:
+    """Both protocols keep one assistant response and two matching replies for a read batch."""
+    reads = _read_calls(("read-one", "e2", "e3"), ("read-two", "e4", "e4"))
+    replies = (
+        [_PLAN, reads, _checks("pass", ["e2", "e3", "e4"]), _SELF, _answer("pass")]
+        if agentic
+        else [reads, _answer("pass")]
+    )
+    project, definition, settings, transport = _fixture(
+        tmp_path, monkeypatch, replies, tools=2, input_bytes=19000
+    )
+    if agentic:
+        definition = _agentic(definition)
+    reference, assessment = judge_episode(
+        project, definition, _large(), settings=settings, code_revision="test"
+    )
+    assert assessment.status == "judged", assessment.failure
+    assert episode_reward(assessment) == 1.0
+    next_request = _sent(transport, 2 if agentic else 1)
+    messages = next_request["messages"]
+    assert isinstance(messages, list)
+    positions = [
+        i
+        for i, row in enumerate(messages)
+        if isinstance(row, dict)
+        and row.get("role") == "assistant"
+        and isinstance(row.get("tool_calls"), list)
+        and len(row["tool_calls"]) == 2
+    ]
+    assert len(positions) == 1
+    replies_after = messages[positions[0] + 1 : positions[0] + 3]
+    assert [row.get("role") for row in replies_after if isinstance(row, dict)] == ["tool", "tool"]
+    assert [row.get("tool_call_id") for row in replies_after if isinstance(row, dict)] == [
+        "read-one",
+        "read-two",
+    ]
+    inspection = json.loads(project.artifacts.read_bytes(reference.artifact_id, "inspection.json"))
+    assert inspection["reads"] == 2
+    assert inspection["inspected"] == ["e2", "e3", "e4"]
+    sent = len(transport.requests)
+    assert judge_episode(
+        project, definition, _large(), settings=settings, code_revision="test"
+    ) == (reference, assessment)
+    assert len(transport.requests) == sent
+
+
+@pytest.mark.parametrize("agentic", [False, True])
+@pytest.mark.parametrize("problem", ["duplicate", "mixed", "over_budget", "phase_batch"])
+def test_an_invalid_batch_is_unscored_without_serving_any_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agentic: bool, problem: str
+) -> None:
+    """Invalid batches cannot spend extra reads or advance a phase alongside a read."""
+    phase = "record_criterion_checks" if agentic else "assess_episode"
+    read: tuple[str, str, JsonObject] = (
+        "one",
+        "read_events",
+        {"first_event_id": "e2", "last_event_id": "e3"},
+    )
+    second: tuple[str, str, JsonObject] = (
+        "one" if problem == "duplicate" else "two",
+        "read_events",
+        read[2],
+    )
+    if problem == "mixed":
+        second = ("two", phase, {})
+    elif problem == "phase_batch":
+        read, second = ("one", phase, {}), ("two", phase, {})
+    batch = _tool_batch(read, second)
+    replies = [_PLAN, batch] if agentic else [batch]
+    project, definition, settings, transport = _fixture(
+        tmp_path,
+        monkeypatch,
+        replies,
+        tools=1 if problem == "over_budget" else 2,
+        input_bytes=19000,
+    )
+    if agentic:
+        definition = _agentic(definition)
+    reference, assessment = judge_episode(
+        project, definition, _large(), settings=settings, code_revision="test"
+    )
+    assert assessment.status == "malformed" and episode_reward(assessment) is None
+    assert len(transport.requests) == len(replies)
+    inspection = json.loads(project.artifacts.read_bytes(reference.artifact_id, "inspection.json"))
+    assert inspection["reads"] == 0 and inspection["inspected"] == []
+    assert len(inspection["phases"]) == int(agentic)
+    assert assessment.failure is not None
+    expected = {
+        "duplicate": "unique",
+        "mixed": "batch only",
+        "phase_batch": "batch only",
+        "over_budget": "only 1 left",
+    }
+    assert expected[problem] in assessment.failure
+
+
+@pytest.mark.parametrize("agentic", [False, True])
+def test_cumulative_batch_replies_cannot_grant_inspection_of_an_oversized_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agentic: bool
+) -> None:
+    """Ranges that fit separately can overflow together; refused evidence stays unread."""
+    evidence = _large()
+    evidence = evidence.model_copy(
+        update={
+            "events": tuple(
+                event.model_copy(update={"content": "record " * 1800})
+                if event.event_id in {"e2", "e3"}
+                else event
+                for event in evidence.events
+            )
+        }
+    )
+    reads = _read_calls(("one", "e2", "e2"), ("two", "e3", "e3"))
+    replies = (
+        [_PLAN, reads, _checks("pass", ["e3"]), _SELF, _answer("pass", decisive="e3")]
+        if agentic
+        else [reads, _answer("pass", decisive="e3")]
+    )
+    project, definition, settings, transport = _fixture(
+        tmp_path, monkeypatch, replies, tools=2, input_bytes=31000 if agentic else 29000
+    )
+    if agentic:
+        definition = _agentic(definition)
+    reference, assessment = judge_episode(
+        project, definition, evidence, settings=settings, code_revision="test"
+    )
+    assert assessment.status == "malformed", assessment.failure
+    assert episode_reward(assessment) is None
+    inspection = json.loads(project.artifacts.read_bytes(reference.artifact_id, "inspection.json"))
+    assert inspection["reads"] == 2 and inspection["inspected"] == ["e2"]
+    messages = _sent(transport, 2 if agentic else 1)["messages"]
+    assert isinstance(messages, list)
+    tool_replies = [row for row in messages if isinstance(row, dict) and row.get("role") == "tool"]
+    assert len(tool_replies) == (3 if agentic else 2)
+    assert "read refused" not in str(tool_replies[-2])
+    assert "read refused" in str(tool_replies[-1])
+    assert assessment.failure is not None and "never read" in assessment.failure
+
+
+def test_a_protocol_change_does_not_replay_an_old_malformed_assessment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Protocol identity separates old outcomes while code revision alone preserves replay."""
+    from exp.optimize.evaluation.variance import judge as judge_module
+
+    current = judge_module.JUDGE_PROTOCOL
+    assert current != "episode-judge-v3"
+    project, definition, settings, transport = _fixture(
+        tmp_path,
+        monkeypatch,
+        [_reply({"role": "assistant", "content": "no call"}), _answer("pass")],
+    )
+    monkeypatch.setattr(judge_module, "JUDGE_PROTOCOL", "episode-judge-v3")
+    old_ref, old_assessment = judge_episode(
+        project, definition, _evidence(), settings=settings, code_revision="same"
+    )
+    monkeypatch.setattr(judge_module, "JUDGE_PROTOCOL", current)
+    new_ref, new_assessment = judge_episode(
+        project, definition, _evidence(), settings=settings, code_revision="same"
+    )
+    assert old_assessment.status == "malformed" and new_assessment.status == "judged"
+    assert old_ref != new_ref and len(transport.requests) == 2
+    assert load_assessment(project, old_ref) == old_assessment
+    assert judge_episode(
+        project, definition, _evidence(), settings=settings, code_revision="different"
+    ) == (new_ref, new_assessment)
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {},
+        {"first_event_id": "e4", "last_event_id": "e2"},
+        {"first_event_id": "missing", "last_event_id": "e4"},
+    ],
+)
+def test_a_refused_range_in_a_batch_does_not_hide_its_valid_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: JsonObject
+) -> None:
+    """Malformed, reversed and unknown ranges consume reads but never gain inspection."""
+    reads = _tool_batch(
+        ("bad", "read_events", bad),
+        ("good", "read_events", {"first_event_id": "e2", "last_event_id": "e4"}),
+    )
+    project, definition, settings, transport = _fixture(
+        tmp_path, monkeypatch, [reads, _answer("pass")], tools=2, input_bytes=19000
+    )
+    reference, assessment = judge_episode(
+        project, definition, _large(), settings=settings, code_revision="test"
+    )
+    assert assessment.status == "judged" and episode_reward(assessment) == 1.0
+    inspection = json.loads(project.artifacts.read_bytes(reference.artifact_id, "inspection.json"))
+    assert inspection["reads"] == 2 and inspection["inspected"] == ["e2", "e3", "e4"]
+    messages = _sent(transport, 1)["messages"]
+    assert isinstance(messages, list)
+    assert "read refused" in str(messages[-2])
+    assert "read refused" not in str(messages[-1])

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from functools import partial
 from typing import Literal
 
 from pydantic import Field, ValidationError
@@ -64,7 +65,6 @@ from exp.optimize.evaluation.variance.episodes import (
     EVENT_CONTRACT_VERSION,
     CriterionFinding,
     EpisodeAssessment,
-    EpisodeEvent,
     EpisodeEvidence,
     JudgeDefinition,
 )
@@ -79,7 +79,6 @@ from exp.optimize.evaluation.variance.judge_prompt import (
     READ_SCHEMA,
     READ_TOOL,
     CriterionChecks,
-    EventRange,
     JudgeAnswer,
     JudgePhaseName,
     JudgePromptSet,
@@ -88,8 +87,14 @@ from exp.optimize.evaluation.variance.judge_prompt import (
     judge_prompt_sha256,
     judge_schema_sha256,
 )
+from exp.optimize.evaluation.variance.judge_reading import (
+    event_inventory,
+    evidence_scope,
+    read_event_batch,
+    response_call_problem,
+)
 
-JUDGE_PROTOCOL = "episode-judge-v3"
+JUDGE_PROTOCOL = "episode-judge-v4"
 """Version of the judge's rendering, reading and validation; bump it whenever they change."""
 
 EVIDENCE_TYPE = "episode-evidence"
@@ -396,13 +401,7 @@ class _Judgment:
             call = response.output.tool_calls[0]
             if call.name == ASSESS_TOOL:
                 return self._assess(call.arguments, reference, mode)
-            self.reads += 1
-            reply = self._read(call.arguments, call.call_id, request, response)
-            messages = (
-                *request.messages,
-                ModelMessage(role="assistant", assistant_action=response.output),
-                ModelMessage(role="tool", tool_call_id=call.call_id, content=reply),
-            )
+            messages = self._read_batch(request, response, own=ASSESS_SCHEMA, agentic=False)
             final = self.reads >= budget
             request = self._request(
                 None,
@@ -418,7 +417,7 @@ class _Judgment:
         The whole evidence is rendered when it fits; otherwise the event inventory is, and the
         judge reads ranges (shared across the investigate and self-check phases) within the
         profile's evidence-tool budget. Each phase tool is forced once a reading turn is not
-        allowed; a reading turn counts against the budget even when refused.
+        allowed; each read call counts against the budget even when its range is refused.
 
         Args:
             sources: Saved artifacts every draw was rendered from.
@@ -465,9 +464,10 @@ class _Judgment:
                 self._phase(turn, phase, call.name, call.arguments, reference)
                 return self._assess(call.arguments, reference, mode)
             if call.name == READ_TOOL:
-                self.reads += 1
-                reply = self._read(call.arguments, call.call_id, request, response)
-                self._phase(turn, phase, call.name, call.arguments, reference)
+                messages = self._read_batch(request, response, own=own, agentic=True)
+                for read in response.output.tool_calls:
+                    self._phase(turn, phase, read.name, read.arguments, reference)
+                continue
             else:
                 checks = self._host_checks(call.arguments) if phase == "investigate" else ()
                 self._phase(turn, phase, call.name, call.arguments, reference, checks)
@@ -505,7 +505,7 @@ class _Judgment:
             mode: How the evidence was presented.
 
         Returns:
-            The saved response reference and the response, which makes exactly one offered call.
+            The saved response reference and one phase call or an admitted batch of reads.
 
         Raises:
             _Stop: The request does not fit, no response exists, or the response is malformed;
@@ -533,12 +533,11 @@ class _Judgment:
         self.responses.append(reference)
         calls = response.output.tool_calls
         allowed = {tool.name for tool in request.tools}
-        if (
-            response.finish_reason.value != "completed"
-            or len(calls) != 1
-            or calls[0].name not in allowed
-        ):
-            failure = f"judge must complete exactly one call of {sorted(allowed)}"
+        problem = response_call_problem(
+            calls, frozenset(allowed), self.definition.profile.evidence_tool_budget - self.reads
+        )
+        if response.finish_reason.value != "completed" or problem is not None:
+            failure = problem or f"judge must complete a call of {sorted(allowed)}"
             raise _Stop(self._unscored("malformed", failure, reference), self._record(mode))
         return reference, response
 
@@ -605,50 +604,41 @@ class _Judgment:
             problems.append("fail needs a required criterion found not_met")
         return tuple(problems)
 
-    def _read(
-        self, arguments: JsonObject, call_id: str, request: ModelRequest, response: ModelResponse
-    ) -> str:
-        """Answer one evidence-tool call with a full range, or say why it was refused.
-
-        Args:
-            arguments: The tool call's arguments.
-            call_id: The tool call's id, which the result message carries.
-            request: The request the call answered.
-            response: The response that made the call.
-
-        Returns:
-            The tool result text; inspected events are recorded only when they are returned.
-        """
-        try:
-            wanted = EventRange.model_validate(arguments)
-        except ValidationError as error:
-            return f"read refused: malformed range ({error.error_count()} errors)"
-        by_id = {event.event_id: event for event in self.evidence.events}
-        first, last = by_id.get(wanted.first_event_id), by_id.get(wanted.last_event_id)
-        if first is None or last is None or first.sequence > last.sequence:
-            return "read refused: name two existing event ids, the first not after the last"
-        events = self.evidence.events[first.sequence : last.sequence + 1]
-        reply = json.dumps(
-            {"events": [event.model_dump(mode="json") for event in events]}, sort_keys=True
+    def _read_batch(
+        self, request: ModelRequest, response: ModelResponse, *, own: ToolSchema, agentic: bool
+    ) -> tuple[ModelMessage, ...]:
+        """Answer every admitted read and retain only byte-admitted inspection identities."""
+        result = read_event_batch(
+            self.evidence,
+            request,
+            response,
+            reads=self.reads,
+            budget=self.definition.profile.evidence_tool_budget,
+            maximum_input_bytes=self.settings.maximum_input_bytes,
+            request_builder=partial(self._reading_request, own=own, agentic=agentic),
         )
-        remaining = self.definition.profile.evidence_tool_budget - self.reads
-        trial = self._request(
+        self.reads = result.reads
+        self.inspected.update(result.inspected)
+        return result.messages
+
+    def _reading_request(
+        self,
+        messages: tuple[ModelMessage, ...],
+        remaining: int,
+        *,
+        own: ToolSchema,
+        agentic: bool,
+    ) -> ModelRequest:
+        """Frame the next unchanged phase with the remaining event-read allowance."""
+        request = self._request(
             None,
-            tools=(ASSESS_SCHEMA,) if remaining <= 0 else (READ_SCHEMA, ASSESS_SCHEMA),
-            final=remaining <= 0,
-            messages=(
-                *request.messages,
-                ModelMessage(role="assistant", assistant_action=response.output),
-                ModelMessage(role="tool", tool_call_id=call_id, content=reply),
-            ),
+            tools=(READ_SCHEMA, own) if remaining > 0 else (own,),
+            final=remaining <= 0 and not agentic,
+            messages=messages,
         )
-        if _size(trial) > self.settings.maximum_input_bytes:
-            return (
-                f"read refused: {len(events)} events need {len(reply.encode())} bytes, more than "
-                "the remaining input budget; read a smaller range"
-            )
-        self.inspected.update(event.event_id for event in events)
-        return reply
+        if agentic and remaining <= 0:
+            return request.model_copy(update={"tool_choice": ToolChoice(name=own.name)})
+        return request
 
     def _assess(
         self,
@@ -801,7 +791,7 @@ class _Judgment:
         evidence = self.evidence
         definition = self.definition
         events: list[JsonValue] = [
-            _inventory_row(event) if inventory else event.model_dump(mode="json")
+            event_inventory(event) if inventory else event.model_dump(mode="json")
             for event in evidence.events
         ]
         record: JsonObject = {"complete": evidence.complete, "missing": list(evidence.missing)}
@@ -822,7 +812,7 @@ class _Judgment:
                 {"criterion_id": criterion, "role": role}
                 for criterion, role in self.rubric.criteria
             ],
-            "assessment_scope": _scope(evidence),
+            "assessment_scope": evidence_scope(evidence),
         }
         if inventory:
             payload["evidence_inventory"] = {**record, "events": events}
@@ -863,25 +853,6 @@ class _Judgment:
             temperature=profile.temperature,
             maximum_output_tokens=profile.maximum_output_tokens,
         )
-
-
-def _scope(evidence: EpisodeEvidence) -> JsonObject:
-    """Render the assessment scope: context, scored, imposed and actor-owned event ids."""
-    scored = [e for e in evidence.events if e.scope == "scored"]
-    return {
-        "context_event_ids": [e.event_id for e in evidence.events if e.scope == "context"],
-        "scored_event_ids": [e.event_id for e in scored],
-        "scored_start": scored[0].event_id if scored else None,
-        "experiment_imposed_event_ids": [e.event_id for e in scored if e.owner == "experiment"],
-        "actor_scored_event_ids": [e.event_id for e in scored if e.owner == "actor"],
-    }
-
-
-def _inventory_row(event: EpisodeEvent) -> JsonValue:
-    """Render one event without its content, stating the content's exact size."""
-    row = event.model_dump(mode="json", exclude={"content"})
-    row["content_bytes"] = len(json.dumps(event.content, sort_keys=True).encode())
-    return row
 
 
 def _size(request: ModelRequest) -> int:
