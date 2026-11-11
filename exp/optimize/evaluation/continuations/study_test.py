@@ -969,3 +969,53 @@ def test_parallel_branches_match_sequential_ones_under_the_rollout_bound(tmp_pat
     assert grades(parallel) == grades(serial)
     assert parallel.metrics()["successes"] == serial.metrics()["successes"] == 4
     assert peaks[0] == 1 and peaks[1] == 2
+
+
+def test_a_refused_simulator_prediction_is_re_asked_within_the_bound() -> None:
+    """A rolled-back invalid prediction is predicted again; past the bound, or when its
+    effects are unknown, the error stands."""
+    from typing import Any, cast
+
+    from exp.optimize.evaluation.continuations.study import (
+        _execute_reasking,
+        study_simulator_retries,
+    )
+    from exp.runtime.environments.interface import Observation
+    from exp.runtime.environments.world_outcomes import WorldExecutionReceipt
+    from exp.simulation.world_model.executable import InvalidPredictionError
+
+    action = ToolCall(name="bash", call_id="c", arguments={"command": "ls"})
+
+    class Session:
+        def __init__(self, failures: int, effects: str = "rolled_back") -> None:
+            self.failures, self.effects, self.calls = failures, effects, 0
+            self.last_execution: WorldExecutionReceipt | None = None
+
+        def execute(self, call: ToolCall) -> Observation:
+            self.calls += 1
+            if self.calls <= self.failures:
+                self.last_execution = WorldExecutionReceipt(
+                    owner="simulated", action_sha256=sha256_json(call), phase="backend",
+                    dispatched=True, effects=cast(Any, self.effects),
+                    before_sha256="a" * 64, after_sha256="a" * 64,
+                    error_type="InvalidPredictionError",
+                )  # fmt: skip
+                raise InvalidPredictionError("state violates schema; transition refused")
+            return Observation(content="ok")
+
+        def close(self) -> None:
+            """Nothing to release."""
+
+    with study_simulator_retries(2):
+        once = Session(2)
+        assert _execute_reasking(cast(Any, once), action).content == "ok" and once.calls == 3
+        exhausted = Session(3)
+        with pytest.raises(InvalidPredictionError):
+            _execute_reasking(cast(Any, exhausted), action)
+        unknown = Session(1, effects="unknown")
+        with pytest.raises(InvalidPredictionError):
+            _execute_reasking(cast(Any, unknown), action)
+        assert unknown.calls == 1
+    plain = Session(1)
+    with pytest.raises(InvalidPredictionError):
+        _execute_reasking(cast(Any, plain), action)

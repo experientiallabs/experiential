@@ -237,7 +237,8 @@ def test_mining_draws_on_its_own_finite_simulator_ledger(
     rollouts = len(mining.actors) * (mining.attempts + mining.points * mining.continuations)
     reasks = job.configuration.get("maximum_reasks", 0)
     assert isinstance(reasks, int)
-    assert sized == min(100_000, rollouts * (job.maximum_model_calls or 1) * (1 + reasks) * 3)
+    retries = (1 + reasks) * (1 + mining.simulator_retries)
+    assert sized == min(100_000, rollouts * (job.maximum_model_calls or 1) * retries * 3)
     explicit = mining.model_copy(update={"simulator_physical_attempts": 12_345})
     assert explicit.registered.configuration["maximum_physical_attempts"] == 12_345
     before = GroundedRuntimeDefinition.model_validate(job.configuration)

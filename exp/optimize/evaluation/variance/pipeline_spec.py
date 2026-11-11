@@ -322,6 +322,8 @@ class MiningSettings(ContractModel):
             apart from bootstrap validation; None sizes it from the mining shape
             (:meth:`simulator_ceiling`).
         workers: Attempts (and continuations) of one study run at once.
+        simulator_retries: Fresh simulator predictions of one action after the world refuses
+            one (a broken domain shape or contract), before the branch fails.
         active_rollouts: Most rollouts running at once across the whole pipeline.
     """
 
@@ -354,6 +356,7 @@ class MiningSettings(ContractModel):
         default=None, ge=1, le=100_000, exclude_if=lambda value: value is None
     )
     workers: int = Field(default=3, ge=1, le=32, strict=True)
+    simulator_retries: int = Field(default=2, ge=0, le=4, strict=True)
     active_rollouts: int = Field(default=12, ge=1, le=128, strict=True)
     qualification: PointQualification | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -387,12 +390,13 @@ class MiningSettings(ContractModel):
 
         Every tier runs ``attempts`` group attempts and continues up to ``points`` points with
         ``continuations`` suffixes each, every rollout reaching the call horizon, each call
-        predicted with its re-asks on every ledger route. Bounded by the runtime's 100,000.
+        predicted with its re-asks and study retries on every ledger route. Bounded by the
+        runtime's 100,000.
         """
         if self.simulator_physical_attempts is not None:
             return self.simulator_physical_attempts
         reasks = job.configuration.get("maximum_reasks", 0)
-        retries = 1 + (reasks if isinstance(reasks, int) else 0)
+        retries = (1 + (reasks if isinstance(reasks, int) else 0)) * (1 + self.simulator_retries)
         rollouts = len(self.actors) * (self.attempts + self.points * self.continuations)
         calls = job.maximum_model_calls or 1
         return min(100_000, rollouts * calls * retries * SIMULATOR_ROUTES)

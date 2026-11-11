@@ -59,7 +59,11 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.study import rollout_gate, study_workers
+from exp.optimize.evaluation.continuations.study import (
+    rollout_gate,
+    study_simulator_retries,
+    study_workers,
+)
 from exp.optimize.evaluation.variance.bootstrap import resolve_bootstrap
 from exp.optimize.evaluation.variance.pipeline_build import BUILD_STAGE
 from exp.optimize.evaluation.variance.pipeline_families import FAMILIES_STAGE
@@ -220,6 +224,7 @@ def run_decision_variance(
             with (
                 study_workers(spec.mining.workers),
                 rollout_gate(spec.mining.active_rollouts),
+                study_simulator_retries(spec.mining.simulator_retries),
             ):
                 saved = _execute(
                     project, spec, row, bound[row.stage], records, references, code_revision,

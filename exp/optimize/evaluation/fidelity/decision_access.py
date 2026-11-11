@@ -7,6 +7,7 @@ from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, stable_id
 from exp.common.project import ProjectStore
+from exp.common.project.errors import ArtifactAlreadyExistsError
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import ProviderTransportError
@@ -89,7 +90,9 @@ def receipt_recorder(
     def record(receipt: JsonObject) -> None:
         """Persist one content-addressed receipt beside the run's other artifacts."""
         identity = stable_id("jev-receipt", {"run": run_id, "receipt": receipt})
-        if not project.artifacts.exists(identity):
+        if project.artifacts.exists(identity):
+            return
+        try:
             project.artifacts.write_json(
                 artifact_id=identity,
                 artifact_type="jev-receipt",
@@ -98,5 +101,9 @@ def receipt_recorder(
                 ),
                 files={"receipt.json": {"run": run_id, **receipt}},
             )
+        except ArtifactAlreadyExistsError:
+            # Parallel branches asking the same decision record the same content-addressed
+            # receipt; whichever wrote first holds it, and the receipt is the same.
+            return
 
     return record

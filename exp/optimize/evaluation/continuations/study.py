@@ -74,6 +74,7 @@ from exp.simulation.continuations import (
 )
 from exp.simulation.development_scope import require_development_task
 from exp.simulation.evaluation.tasks import TaskVerifier, VerifierGrade, grade
+from exp.simulation.world_model.executable import InvalidPredictionError
 
 WorldRuntime = ExecutableWorldRuntime | MixedRealityEnvironmentRuntime
 
@@ -305,7 +306,7 @@ class _ObservedEnvironment:
         self.outcome["steps"] = list(self.steps)
         self.outcome["execution_phase"] = "tool_dispatch"
         try:
-            observation = execute_with_recovery(self._session, action)
+            observation = _execute_reasking(self._session, action)
         except Exception:
             if known_failed_effects(execution_receipt(self._session, action)):
                 self.outcome["execution_phase"] = "tool_dispatch_failed_known_effects"
@@ -614,6 +615,45 @@ _WORKERS: ContextVar[int] = ContextVar("continuation_study_workers", default=1)
 _GATE_LOCK = threading.Lock()
 _GATE: list[threading.BoundedSemaphore] = []
 """The installed process-wide bound on running rollouts, outermost first."""
+
+
+_SIMULATOR_RETRIES: ContextVar[int] = ContextVar("continuation_simulator_retries", default=0)
+"""Fresh simulator predictions of one action after a known invalid one, in this context."""
+
+
+@contextmanager
+def study_simulator_retries(retries: int) -> Iterator[None]:
+    """Re-ask the simulator up to ``retries`` times when its prediction is refused.
+
+    Raises:
+        ValueError: The retry count is negative.
+    """
+    if retries < 0:
+        raise ValueError("simulator retries must not be negative")
+    token = _SIMULATOR_RETRIES.set(retries)
+    try:
+        yield
+    finally:
+        _SIMULATOR_RETRIES.reset(token)
+
+
+def _execute_reasking(session: EnvironmentSession, action: ToolCall) -> Observation:
+    """Execute one action, re-predicting it after a refused, rolled-back simulator prediction.
+
+    A prediction the world refuses (a broken shape, contract or rule after its own re-asks) is
+    a known invalid reply whose effects were rolled back, so the same action is predicted again,
+    on the same session and ledger, up to the installed retry count; then the error stands.
+    """
+    retries = _SIMULATOR_RETRIES.get()
+    for attempt in range(retries + 1):
+        try:
+            return execute_with_recovery(session, action)
+        except InvalidPredictionError:
+            receipt = execution_receipt(session, action)
+            rolled_back = receipt is not None and receipt.effects in ("rolled_back", "not_started")
+            if attempt == retries or not rolled_back:
+                raise
+    raise AssertionError("unreachable")
 
 
 @contextmanager
