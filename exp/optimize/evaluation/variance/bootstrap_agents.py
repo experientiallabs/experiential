@@ -80,8 +80,8 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
-from exp.optimize.evaluation.variance.grading_controls import run_controls
-from exp.optimize.evaluation.variance.verifier_paths import project_verifier, unplaced
+from exp.optimize.evaluation.variance.grading_controls import projection, run_controls
+from exp.optimize.evaluation.variance.verifier_paths import project_verifier, split, unplaced
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
     ProviderRetryableResponseError,
@@ -588,6 +588,7 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             f"rule paths) or /<probe>/... (preserved paths) with a probe of "
             f"{sorted(draft.probe_paths)}"
         )
+    _check_verifier_reads(draft)
     controls = {
         row.control: row
         for row in run_controls(
@@ -1667,23 +1668,68 @@ def _schema_object(depth: int) -> JsonObject:
     return node
 
 
+LONG_EQUALS = 200
+"""Longest text an ``equals`` rule may demand; longer means byte-identical file contents."""
+
+
+def _check_verifier_reads(draft: StartDraft) -> None:
+    """Refuse verifier rules that read what no simulated run reliably holds.
+
+    A rule demanding a long text equal (a whole file) passes only a byte-identical rewrite. A
+    rule reading inside a probe that starts null depends on the simulator inventing the shape
+    it fills in (run 30 lost 11 branches to a missing ``exit_code``); the start must declare
+    that shape in initial_state, so the domain's state_schema keeps it.
+    """
+    initial = projection(draft.initial_state, dict(draft.probe_paths))
+    for rule in draft.verifier.rules:
+        if rule.operator == "equals" and isinstance(rule.value, str):
+            if len(rule.value) > LONG_EQUALS:
+                raise ValueError(
+                    f"rule at {rule.path} demands a {len(rule.value)}-character text verbatim: "
+                    "check the behaviour (a recorded test run) instead, and protect files that "
+                    "must not change with preserved_paths"
+                )
+    for pointer in (*draft.verifier.required_paths, *(rule.path for rule in draft.verifier.rules)):
+        keys = split(pointer)
+        if len(keys) > 2 and keys[0] == "final_state" and keys[1] in initial:
+            if initial[keys[1]] is None:
+                raise ValueError(
+                    f"{pointer} reads inside probe {keys[1]!r}, which starts null: give it its "
+                    "full shape in initial_state (every key the verifier reads, null where not "
+                    "yet known) so the simulator keeps those keys"
+                )
+
+
 def shape_schema(value: JsonValue) -> JsonObject:
     """The shape a simulated domain must keep: its type and, for an object, its top-level keys.
 
     Run 28's simulator replaced a whole filesystem domain with a string on the first write, and
     every protected file under it read as removed. A domain's declared ``state_schema`` is
-    checked on every transition, so a prediction changing the domain's type or dropping a
-    top-level key is refused (and re-asked) instead of corrupting the world. Values may change;
-    only container and text types are pinned, and keys starting null or numeric stay loose.
+    checked on every transition, so a prediction changing a type or dropping a named field (to
+    :data:`SHAPE_DEPTH` levels) is refused and re-asked instead of corrupting the world. Values
+    may change; only container and text types are pinned, values starting null or numeric
+    stay loose, and maps keyed by paths or file names may gain and lose entries.
     """
-    if isinstance(value, dict):
-        properties: JsonObject = {}
-        for key, item in value.items():
-            kind = _json_kind(item)
-            properties[key] = {} if kind is None else {"type": kind}
-        return {"type": "object", "required": sorted(value), "properties": properties}
+    return _shape(value, SHAPE_DEPTH)
+
+
+SHAPE_DEPTH = 3
+"""Object levels whose keys a domain's state_schema pins."""
+
+
+def _shape(value: JsonValue, depth: int) -> JsonObject:
+    """The pinned shape of one value: types, and the keys of named-field objects."""
     kind = _json_kind(value)
-    return {} if kind is None else {"type": kind}
+    if not isinstance(value, dict):
+        return {} if kind is None else {"type": kind}
+    schema: JsonObject = {"type": "object"}
+    # A map keyed by paths or file names (a files map) may gain and lose entries; an object of
+    # named fields keeps every field.
+    named = all("/" not in key and "." not in key for key in value)
+    if depth > 0 and named:
+        schema["required"] = sorted(value)
+        schema["properties"] = {key: _shape(item, depth - 1) for key, item in value.items()}
+    return schema
 
 
 def _json_kind(value: JsonValue) -> str | None:

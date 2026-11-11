@@ -842,7 +842,12 @@ def test_a_frozen_family_reaches_the_pipeline_with_no_rules_learning(
     with pytest.raises(ValueError, match="register a mining job"):
         resolve_bootstrap(project, bootstrapped.model_copy(update={"mining": unbound}))
     resolved = resolve_bootstrap(project, bootstrapped)
-    assert resolved.mining.registered == recon.job
+    assert resolved.mining.job == recon.job
+    # Mining runs the registered job on a simulator ledger of its own.
+    ceiling = resolved.mining.simulator_ceiling(recon.job)
+    assert resolved.mining.registered == recon.job.model_copy(
+        update={"configuration": {**recon.job.configuration, "maximum_physical_attempts": ceiling}}
+    )
     assert RULES_STAGE.plan(project, resolved, "test") == ((), (PLAN_LINE,))
     silent = BootScript(lambda role, opening: True)
     monkeypatch.setattr(
@@ -850,7 +855,11 @@ def test_a_frozen_family_reaches_the_pipeline_with_no_rules_learning(
     )
     run = RULES_STAGE.run(StageContext(project, resolved, "rules", "test"))
     outputs = RulesOutputs.model_validate(run.outputs.model_dump(mode="json"))
-    assert (outputs.report, outputs.rulebook, outputs.job) == (report, rulebook, recon.job)
+    assert (outputs.report, outputs.rulebook, outputs.job) == (
+        report,
+        rulebook,
+        resolved.mining.registered,
+    )
     assert outputs.challenges == 0 and silent.seen == []
 
 

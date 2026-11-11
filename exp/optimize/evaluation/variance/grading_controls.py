@@ -69,15 +69,23 @@ def projection(state: JsonObject, probes: dict[str, str]) -> JsonObject:
 
 
 def _set(value: JsonObject, pointer: str, item: JsonValue) -> bool:
-    """Write ``item`` at a pointer, creating objects on the way; False when it cannot."""
+    """Write ``item`` at a pointer, filling missing or null parents with objects.
+
+    Returns False when the pointer runs through a text, number or boolean, which no state can
+    hold a value inside.
+    """
     keys = split(pointer)
     node: JsonValue = value
     for key in keys[:-1]:
         if isinstance(node, dict):
             child = node.get(key)
-            if not isinstance(child, (dict, list)):
+            if child is None:
+                # A missing or null value may become an object, as a recorded run fills it.
                 child = {}
                 node[key] = child
+            elif not isinstance(child, (dict, list)):
+                # A rule reading inside text or a number names nothing any state can hold.
+                return False
             node = child
         elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
             node = node[int(key)]
@@ -216,7 +224,7 @@ def run_controls(
     record(
         "correct",
         workflow(final) if built else None,
-        "a rule path is outside the final state",
+        "a rule path is outside the final state or reads inside a text or number",
     )
     record("no_op", workflow(copy.deepcopy(initial)))
     wrong = copy.deepcopy(final)

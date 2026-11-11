@@ -71,3 +71,57 @@ def test_a_domain_keeps_its_initial_shape() -> None:
 
     with pytest.raises(ValueError, match="transition refused"):
         validate_state_projection({"fs": "the whole filesystem as text"}, {"fs": schema})
+
+
+def test_verifier_reads_the_simulator_cannot_be_trusted_to_hold_are_refused() -> None:
+    """Run 30: a whole file demanded verbatim, and fields read inside a probe that starts null."""
+    from types import SimpleNamespace
+    from typing import cast
+
+    import pytest
+
+    from exp.optimize.evaluation.variance.bootstrap_agents import _check_verifier_reads
+    from exp.simulation.evaluation.tasks import TaskVerifier
+
+    state: JsonObject = {**STATE, "Tests": {"status": "red", "last_run": None}}
+    probes = {**PROBES, "last_run": "/Tests/last_run"}
+
+    from exp.optimize.evaluation.variance.bootstrap_contracts import StartDraft
+
+    def draft(rules: list[JsonObject]) -> StartDraft:
+        verifier = TaskVerifier.model_validate(
+            {"description": "d", "outcome_schema": {}, "rules": rules}
+        )
+        stand_in = SimpleNamespace(initial_state=state, probe_paths=probes, verifier=verifier)
+        return cast("StartDraft", stand_in)
+
+    verbatim: JsonObject = {
+        "operator": "equals",
+        "path": "/final_state/test_file",
+        "value": "x" * 500,
+    }
+    with pytest.raises(ValueError, match="verbatim"):
+        _check_verifier_reads(draft([verbatim]))
+    unshaped: JsonObject = {
+        "operator": "equals",
+        "path": "/final_state/last_run/exit_code",
+        "value": 0,
+    }
+    with pytest.raises(ValueError, match="starts null"):
+        _check_verifier_reads(draft([unshaped]))
+    _check_verifier_reads(
+        draft([{"operator": "equals", "path": "/final_state/status", "value": "green"}])
+    )
+
+
+def test_named_fields_keep_their_keys_and_file_maps_may_change() -> None:
+    """Nested named fields are pinned; a files map keyed by paths may gain and lose files."""
+    from exp.optimize.evaluation.variance.bootstrap_agents import shape_schema
+
+    schema = shape_schema({"last_run": {"exit_code": None, "passed": 0}, "files": {"/a.py": "x"}})
+    assert schema["required"] == ["files", "last_run"]
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    last_run = properties["last_run"]
+    assert isinstance(last_run, dict) and last_run["required"] == ["exit_code", "passed"]
+    assert properties["files"] == {"type": "object"}
