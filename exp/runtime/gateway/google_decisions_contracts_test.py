@@ -127,6 +127,17 @@ def test_messages_become_content_blocks_with_images_and_separators() -> None:
     ]
 
 
+def test_a_models_prefixed_wire_id_is_sent_bare() -> None:
+    """Google's Decisions API reference names the bare id; a resource prefix is stripped."""
+    decoded = decode_openai_decision_request(
+        json.dumps(
+            {"model": "x", "input": "x", "questions": [{"type": "predicate", "instructions": "i"}]}
+        )
+    )
+    body, _dropped = google_decision_body(decoded.request, "models/gemini-decision-1")
+    assert body["model"] == "gemini-decision-1"
+
+
 def test_safety_identifier_is_dropped_with_a_disclosure() -> None:
     """Google has no end-user identifier field, so the answer discloses the drop."""
     translated, dropped = _translate(

@@ -49,6 +49,7 @@ from exp.runtime.gateway.openai_decisions_contracts import (
     OpenAIScoreQuestion,
     PredicateQuestion,
 )
+from exp.runtime.models.providers.gemini_requests import gemini_model_path
 
 MAX_GOOGLE_OPTION_KEY_CHARACTERS = 128
 """Google's documented option-key length (at most 512 UTF-8 bytes, which 128
@@ -189,7 +190,9 @@ def google_decision_body(
 
     Args:
         request: The typed, already validated customer request.
-        model: The deployment's Google wire id (``gemini-decision-1``).
+        model: The deployment's Google wire id (``gemini-decision-1``, with or
+            without the ``models/`` resource prefix; the body carries the bare
+            id Google's Decisions API reference documents).
 
     Returns:
         The upstream body and the disclosures the translation dropped.
@@ -198,7 +201,7 @@ def google_decision_body(
         GoogleDecisionTranslationError: A question cannot be expressed on this wire.
     """
     body: dict[str, JsonValue] = {
-        "model": model,
+        "model": gemini_model_path(model),
         "input": _input(request),
         "questions": {
             google_question_key(index): _question(question)

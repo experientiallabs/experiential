@@ -801,6 +801,9 @@ async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "upstream/gemini_decision_tests.rs"]
+mod gemini_decision_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
