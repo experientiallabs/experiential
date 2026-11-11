@@ -16,6 +16,8 @@
 export const SESSION_DIR = "/opt/agent/session";
 export const WORK_DIR = "/home/user/work";
 export const RUNNER_PATH = "/opt/agent/runner.mjs";
+/** Pi's session file under the session directory: the conversation a host backs up and restores. */
+export const SESSION_FILE = "session.jsonl";
 /** Bumped whenever the runner bundle or the sandbox layout changes. */
 export const RUNNER_PROTOCOL_VERSION = 4;
 

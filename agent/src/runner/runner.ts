@@ -41,7 +41,7 @@ import { INTERRUPTED_LIMIT_MESSAGE, modelErrorEvent, RESTART_LIMIT_MESSAGE, RUN_
 import { currentRun, EventLog, readEventLog } from "./event-log.js";
 import { listWorkFiles } from "./files.js";
 import { readInbox } from "./inbox.js";
-import type { RunEndStatus, RunSpec, RunStatus } from "./protocol.js";
+import { type RunEndStatus, type RunSpec, type RunStatus, SESSION_FILE } from "./protocol.js";
 import { EventPusher } from "./push.js";
 import { repairDanglingToolCalls, RESUME_NOTE } from "./recovery.js";
 import { type SandboxAccount, sandboxBashOperations, sandboxEditOperations, sandboxWriteOperations } from "./sandbox.js";
@@ -185,7 +185,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
 
   const gateway: GatewayConfig = { kind: "hosted", baseUrl: trimBaseUrl(spec.gatewayBaseUrl), apiKey: options.apiKey };
   const tools = runnerTools(spec, options, gateway);
-  const sessionManager = SessionManager.open(join(options.sessionDir, "session.jsonl"), options.sessionDir, options.workDir);
+  const sessionManager = SessionManager.open(join(options.sessionDir, SESSION_FILE), options.sessionDir, options.workDir);
   // A restarted run whose agent had already finished its answer has nothing left to ask for.
   let answered = false;
   if (restarting) {
