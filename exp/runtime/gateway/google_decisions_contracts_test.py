@@ -84,7 +84,12 @@ def test_every_question_type_maps_onto_googles_shape() -> None:
 
 
 def test_messages_become_content_blocks_with_images_and_separators() -> None:
-    """Text parts and inline images cross as Google blocks; messages are newline-separated."""
+    """Text parts and inline images cross as Google blocks; messages are newline-separated.
+
+    ``original`` detail is served at Google's ``high`` (1,120 tokens), never
+    ``ultra_high`` (2,240), which would exceed the surface's 2,048-token
+    per-image reservation.
+    """
     translated, _dropped = _translate(
         {
             "model": "gemini-decision-1",
@@ -117,12 +122,7 @@ def test_messages_become_content_blocks_with_images_and_separators() -> None:
         {"type": "text", "text": "\n"},
         {"type": "text", "text": "Customer photo:"},
         {"type": "image", "data": "/9j/4AAQ", "mime_type": "image/jpeg", "resolution": "low"},
-        {
-            "type": "image",
-            "data": "iVBORw0KGgo=",
-            "mime_type": "image/png",
-            "resolution": "ultra_high",
-        },
+        {"type": "image", "data": "iVBORw0KGgo=", "mime_type": "image/png", "resolution": "high"},
         {"type": "image", "data": "UklGR", "mime_type": "image/webp"},
     ]
 

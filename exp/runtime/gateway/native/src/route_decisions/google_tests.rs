@@ -167,6 +167,9 @@ fn google_answers_that_do_not_match_the_questions_are_malformed() {
     bad_total["answers"]["q0"]["probabilities"]["support"] = json!(0.5);
     let mut out_of_range = google_payload();
     out_of_range["answers"]["q1"]["noul"] = json!(1.5);
+    let mut endpoint_noul = google_payload();
+    endpoint_noul["answers"]["q1"]["noul"] = json!(1.0);
+    endpoint_noul["answers"]["q1"]["confidence"] = json!(1.0);
     let mut wrong_legend = google_payload();
     wrong_legend["answers"]["q2"]["legend"]["1"] = json!("high: now");
     let mut score_mismatch = google_payload();
@@ -187,6 +190,7 @@ fn google_answers_that_do_not_match_the_questions_are_malformed() {
         extra_option,
         bad_total,
         out_of_range,
+        endpoint_noul,
         wrong_legend,
         score_mismatch,
         score_outside,
