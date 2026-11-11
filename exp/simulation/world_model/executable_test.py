@@ -38,7 +38,11 @@ from exp.simulation.retrieval.state_rag import StateRAG, StateRetrievalPolicy
 from exp.simulation.retrieval.state_rag_test import served
 from exp.simulation.retrieval.state_tags_test import ERROR, bank
 from exp.simulation.rules.model import Predicate, Rule, RuleBook
-from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
+from exp.simulation.world_model.executable import (
+    GroundedWorldFactory,
+    InvalidPredictionError,
+    PredictorEvent,
+)
 from exp.simulation.world_model.grounded_session import (
     STATE_PRECEDENTS_GUIDANCE,
     GroundedTransitionEngine,
@@ -66,8 +70,12 @@ def world_fixture(
     rule_book: RuleBook | None = None,
     state_recall: StateRAG | None = None,
     state_memory: StateMemory | None = None,
+    reply: str | None = None,
 ) -> tuple[ExecutableWorldRuntime, list[PredictorEvent], list[JsonObject]]:
-    """Use the real grounded prompt/parser with scripted provider responses, never native truth."""
+    """Use the real grounded prompt/parser with scripted provider responses, never native truth.
+
+    ``reply`` replaces the default JSON reply with one text reply.
+    """
     predictor, _, _ = _runtime("", capabilities=ModelCapabilities(supports_tools=True))
     task = _task("escalate")
     engine = GroundedTransitionEngine(
@@ -121,6 +129,8 @@ def world_fixture(
                                     "reply": {"status": "escalated"},
                                     "encoding": "json",
                                 }
+                                if reply is None
+                                else {"call_id": "call", "reply": reply, "encoding": "text"}
                             ],
                             "effect": {"kind": "edits", "edits": edits[index]},
                         },
@@ -1015,3 +1025,53 @@ def test_state_precedents_and_state_description_reach_the_prompt_and_bind_the_de
     assert isinstance(excluded, list) and _task("escalate").lineage_group_id in excluded
     assert len([row for row in receipts if "selected" in row]) == 3
     assert any("transition" in row for row in receipts), "recall moves are recorded too"
+
+
+PYTEST_PASS = "collected 4 items\n\ntest_tickets.py ....\n\n===== 4 passed in 0.02s ====="
+
+
+def test_text_test_summary_contradicting_state_is_recorded_but_never_refused() -> None:
+    """Without a declared receipt, a printed pass beside not_run state commits with a finding."""
+    runtime, events, requests = world_fixture([status_edit("not_run")], reply=PYTEST_PASS)
+    with runtime.open(_task("escalate")) as world:
+        observation = world.execute(
+            ToolCall(name="escalate", call_id="call", arguments={"command": "pytest -q"})
+        )
+        saved = world.checkpoint()
+    assert len(requests) == 1 and "rejection" not in [e.stage for e in events]
+    assert observation.content == PYTEST_PASS
+    findings = observation.metadata["world_consistency"]
+    assert isinstance(findings, list) and len(findings) == 1
+    finding = findings[0]
+    assert isinstance(finding, str) and "4 passed" in finding and "'not_run'" in finding
+    state = json.loads(saved.image.parts["predictor.json"])["state"]
+    assert state["tickets"] == {"status": "not_run"}
+
+
+def test_declared_command_receipt_refuses_until_reasks_are_exhausted() -> None:
+    """A frozen suite command's structured result must match committed state, or it is refused."""
+    binding = ReplyStateBinding.model_validate(
+        {
+            "reply_path": ["status"],
+            "state_path": ["tickets", "status"],
+            "command": {"argument": "command", "equals": "pytest test_tickets.py"},
+        }
+    )
+    runtime, events, requests = world_fixture(
+        [status_edit("not_run"), status_edit("not_run")],
+        reply_bindings=(binding,),
+        maximum_reasks=1,
+    )
+    suite = ToolCall(
+        name="escalate", call_id="call", arguments={"command": "pytest test_tickets.py"}
+    )
+    with runtime.open(_task("escalate")) as world:
+        initial = world.checkpoint()
+        with pytest.raises(InvalidPredictionError, match="contradicts its declared after state"):
+            world.execute(suite)
+        assert world.checkpoint() == initial
+    assert len(requests) == 2 and [e.stage for e in events].count("rejection") == 2
+    # Another command is outside the frozen scope and commits.
+    other, _, _ = world_fixture([status_edit("not_run")], reply_bindings=(binding,))
+    with other.open(_task("escalate")) as world:
+        world.execute(ToolCall(name="escalate", call_id="call", arguments={"command": "ls"}))

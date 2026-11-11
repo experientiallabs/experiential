@@ -1019,3 +1019,29 @@ def test_a_refused_simulator_prediction_is_re_asked_within_the_bound() -> None:
     plain = Session(1)
     with pytest.raises(InvalidPredictionError):
         _execute_reasking(cast(Any, plain), action)
+
+
+def test_world_consistency_findings_roll_up_to_the_branch_without_grading() -> None:
+    """A step's simulator self-contradiction is listed on the branch outcome, ungraded."""
+    from typing import Any, cast
+
+    from exp.optimize.evaluation.continuations.study import _ObservedEnvironment
+    from exp.runtime.environments.interface import Observation
+
+    replies = [
+        Observation(content="ok"),
+        Observation(content="4 passed in 0.02s", metadata={"world_consistency": ["finding"]}),
+    ]
+
+    class Session:
+        def execute(self, call: ToolCall) -> Observation:
+            return replies.pop(0)
+
+    outcome: dict[str, Any] = {"steps": []}
+    observed = _ObservedEnvironment(
+        cast(Any, Session()), lambda: cast(Any, None), lambda _: {}, outcome
+    )
+    for command in ("ls", "pytest"):
+        observed.execute(ToolCall(name="bash", call_id=command, arguments={"command": command}))
+    assert outcome["world_consistency"] == [{"step": 2, "findings": ["finding"]}]
+    assert [step["status"] for step in outcome["steps"]] == ["valid", "valid"]

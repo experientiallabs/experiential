@@ -63,6 +63,19 @@ class ArrayLength(ContractModel):
     length: Literal[True]
 
 
+class Utf8Length(ContractModel):
+    """Read the UTF-8 byte length of a known string, such as written file content.
+
+    A write reply's byte count binds to the committed file (overwrite semantics) or, after an
+    ``ArgumentValue`` of the written content, to the bytes the call appended.
+
+    Attributes:
+        utf8_length: Literal operation discriminator; an unavailable string is never empty.
+    """
+
+    utf8_length: Literal[True]
+
+
 class EmptyArrayDefault(ContractModel):
     """A declared view of a known empty array, without filling absent or unknown state.
 
@@ -123,6 +136,7 @@ type StatePathPart = (
     | SelectItem
     | SliceItems
     | ArrayLength
+    | Utf8Length
     | ProjectItems
     | ArgumentValue
     | PageCursor
@@ -186,6 +200,10 @@ def state_at(value: JsonValue, path: tuple[StatePathPart, ...], arguments: JsonO
             if not isinstance(value, list):
                 raise ValueError("state length requires a known array")
             value = len(value)
+        elif isinstance(part, Utf8Length):
+            if not isinstance(value, str):
+                raise ValueError("state byte length requires a known string")
+            value = len(value.encode())
         elif isinstance(part, SelectItem):
             if part.argument not in arguments or not isinstance(value, list):
                 raise ValueError("state selection requires a known argument and list")

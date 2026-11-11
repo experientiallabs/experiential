@@ -14,6 +14,13 @@ over the simulated domains before and after, the action and its proposed reply. 
 rules reject is refused like any unusable proposal and re-asked with the broken rules as feedback.
 The rule book changes the frozen definition only when present.
 
+Declared reply bindings, including command-scoped test receipts and UTF-8 byte counts, refuse a
+contradicting proposal, which is re-asked like any other invalid proposal; an exhausted re-ask is
+a simulator fault, not an actor outcome. A text reply printing a test summary that the committed
+test state contradicts, on a tool without a declared receipt, is only recorded as a
+``world_consistency`` finding in the observation metadata (``printed_test_run_inconsistency``):
+it is never refused, graded or applied to state, and the actor sees only the observation content.
+
 An optional rule memory recall selects, before each prediction, the few rule files of a pinned
 memory set that govern the current call (typed Jev decisions over the set's index), and attaches
 only those to the called tool. Its identity, which covers the memory set digest and the recall
@@ -48,6 +55,7 @@ from exp.common.tasks.facts import ConditioningFacts, FactProvenance, FactValida
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.world_contracts import NativeImage, WorldAccess, WorldManifest
 from exp.runtime.environments.world_responses import (
+    printed_test_run_inconsistency,
     validate_reply,
     validate_reply_state,
     validate_state_projection,
@@ -574,6 +582,14 @@ class _GroundedWorldBackend:
             action=action,
             domains=policy.domains(),
         )
+        finding = printed_test_run_inconsistency(
+            action, observation, domains, frozenset(policy.writes), policy.reply_bindings
+        )
+        if finding is not None:
+            # Diagnostic only: recorded on the step, never refused, graded or applied to state.
+            observation = observation.model_copy(
+                update={"metadata": {**observation.metadata, "world_consistency": [finding]}}
+            )
         verdict = None
         if self.factory.rule_book is not None:
             verdict = _checked(self.factory.rule_book, action, self.state, domains, predicted)

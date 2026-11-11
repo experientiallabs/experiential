@@ -212,7 +212,9 @@ class ContinuationBranch(ContractModel):
     Attributes:
         index: Zero-based planned branch position.
         status: Completed execution, known execution failure, or ambiguous outcome.
-        outcome: Actor actions, observations and evaluator-only state projections.
+        outcome: Actor actions, observations and evaluator-only state projections, plus an
+            ungraded ``world_consistency`` list naming steps whose simulated reply and
+            committed state contradicted each other.
         assessment: Goal/policy assessment when execution produced a saved outcome.
         failure: Sanitized exception type, never provider credentials or raw error text.
         failure_detail: Operator-only phase, stable reason and originating intent reference.
@@ -323,6 +325,12 @@ class _ObservedEnvironment:
             after=self._probe(self._snapshot()),
         )
         self.outcome["steps"] = list(self.steps)
+        findings = observation.metadata.get("world_consistency")
+        if isinstance(findings, list) and findings:
+            # Diagnostic only: the simulator contradicted itself on this step. Never graded.
+            rollup = self.outcome.setdefault("world_consistency", [])
+            assert isinstance(rollup, list)
+            rollup.append({"step": len(self.steps), "findings": findings})
         return observation
 
 
