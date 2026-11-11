@@ -47,6 +47,12 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
+        "exp.optimize.evaluation.variance.actor_critic_phases:PHASE_ACCOUNTING_PROTOCOL",
+        "actor-critic-phase-accounting-v1",
+        ("exp.optimize.evaluation.variance.actor_critic_phases",),
+        "e9a3844d0329c78b5d53998f4acf56ec5cc7607ae1484e7178cb365e3b4d3c1a",
+    ),
+    Protocol(
         "exp.optimize.evaluation.variance.behavior_differences:BEHAVIOR_DIFFERENCES_PROTOCOL",
         "behavior-differences-v1",
         (
