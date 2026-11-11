@@ -84,16 +84,23 @@ def not_a_decision_model_error(alias: str) -> OpenAIProtocolError:
     )
 
 
-def no_image_decisions_error(alias: str) -> OpenAIProtocolError:
-    """Return the refusal for image assets sent to a model with no image-capable rung."""
+def no_image_decisions_error(alias: str, param: str = "assets") -> OpenAIProtocolError:
+    """Return the refusal for images sent to a model with no image-capable rung.
+
+    Args:
+        alias: The model id the caller requested.
+        param: The request field carrying the images: SystemOne ``assets`` or
+            the OpenAI shape's ``input``.
+    """
     return OpenAIProtocolError(
         status_code=400,
         code="unsupported_capability",
         message=(
-            f"The model {alias!r} does not accept images in decision requests. Remove assets, "
-            "or choose a decision model with image input from GET /v1/models."
+            f"The model {alias!r} does not accept images in decision requests. Remove the "
+            f"images from {param}, or choose a decision model with image input from "
+            "GET /v1/models."
         ),
-        param="assets",
+        param=param,
     )
 
 

@@ -42,6 +42,7 @@ def _control_plane(
     supports_decisions: bool = True,
     prices: GatewayTokenPrices = _PRICES,
     provider: str = "openai",
+    supports_image_input: bool = True,
 ) -> tuple[NativeControlPlane, str]:
     """Create real authority and ledger state with one decisions lane.
 
@@ -64,7 +65,9 @@ def _control_plane(
         exact_model_id="gpt-6-luna-decisions",
         revision=None,
         capabilities=ModelCapabilities(supports_completions=False, supports_embeddings=False),
-        gateway_capabilities=GatewayDeploymentCapabilities(supports_decisions=supports_decisions),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_decisions=supports_decisions, supports_image_input=supports_image_input
+        ),
         prices=prices,
         pricing_source="test-fixture",
         replace=False,
@@ -238,6 +241,29 @@ def test_an_untranslatable_request_is_refused_on_a_gemini_lane_without_echoing_c
         "the request cannot be expressed on the model's Google Decisions API wire"
     ]
     assert _rows(control) == [("decisions", "failed")]
+
+
+@pytest.mark.parametrize("provider", ["openai", "gemini"])
+def test_an_image_request_needs_a_rung_that_declares_image_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    """A text-only decision rung never receives an image block; the refusal is typed."""
+    control, raw_key = _control_plane(tmp_path, provider=provider, supports_image_input=False)
+    recorded = _recorded_failures(control, monkeypatch)
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key)
+    error = _public_error(refused.value)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_capability"
+    assert error["param"] == "input"
+    assert "canary" not in refused.value.public_error_json
+    assert [failure.safe_message for failure in recorded] == [
+        "no decision deployment accepts images"
+    ]
+    text_only = _body()
+    text_only["input"] = "private-input-canary"
+    admitted = _admit(control, raw_key, text_only)
+    assert admitted["wire"] == ("openai" if provider == "openai" else "google")
 
 
 def test_settlement_bills_reported_input_tokens(tmp_path: Path) -> None:
