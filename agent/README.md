@@ -151,3 +151,7 @@ EXP_API_KEY=xpl_... npm run test:live   # optional live smoke against the hosted
 
 Releases are tagged `exp-code-v<version>`. The version in `package.json` must equal
 `EXP_CODE_VERSION` in `src/version.ts` and in `exp/cli/code/launcher.py`; tests check both.
+Pushing the tag runs `.github/workflows/agent-release.yml`: it tests and bundles the package and
+attaches `exp-code-runner.mjs` (the self-contained sandbox runner), its `.sha256`, and
+`exp-code-protocol.ts` (the runner protocol) to a GitHub release, so a host can pin a version
+and verify the file it runs. With an `NPM_TOKEN` secret configured it also publishes to npm.

@@ -71,8 +71,10 @@ export type RunEventBody =
   /** A message the user sent while the run was working (steering). */
   | { type: "user_message"; text: string }
   /** Coalesced assistant text (the runner flushes at most every 100 ms). */
-  | { type: "text"; delta: string }
-  | { type: "thinking"; delta: string }
+  // endTs: set by a host that archives a compacted log, on an event that merged several
+  // consecutive deltas (the last one's time); the runner never writes it.
+  | { type: "text"; delta: string; endTs?: number }
+  | { type: "thinking"; delta: string; endTs?: number }
   | { type: "tool_start"; id: string; name: string; args: Record<string, unknown> }
   /** The tail of a running tool's output so far (bash). */
   | { type: "tool_update"; id: string; output: string }
