@@ -26,6 +26,7 @@ from exp.common.rollouts.artifact import StopReason
 from exp.common.tasks import TaskCase
 from exp.simulation.actor_context import ActorContextFragment
 from exp.simulation.capability_briefs import load_capability_brief
+from exp.simulation.evaluation.state_attribution import change_owners
 from exp.simulation.evaluation.table_relations import TableRelation, assess_table_relation
 from exp.simulation.reconstruction.models import check_schema, path_parts, resolve
 
@@ -331,6 +332,24 @@ class VerifierGrade(Assessment):
     goal: Assessment
     policy: Assessment
     complete: bool
+
+    @property
+    def attribution(self) -> Literal["actor", "simulator"] | None:
+        """Who owns a non-pass verdict as far as the workflow shows; None for a pass or unknown.
+
+        A known failure is the actor's (the grader never fails on simulator drift); an
+        unassessable policy masking simulator drift is the simulator's. A missing observation
+        names no owner here: the executor that recorded the ending knows it.
+        """
+        if self.status == "fail":
+            return "actor"
+        if self.status == "unassessable" and self.policy.reason.startswith(SIMULATOR_DRIFT):
+            return "simulator"
+        return None
+
+
+SIMULATOR_DRIFT = "protected state changed by the simulator, not by an actor action"
+"""Reason prefix of a policy assessment left unassessable by simulator drift."""
 
 
 class VerifierChallenge(ContractModel):
@@ -663,36 +682,33 @@ def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) 
             missing.append("state transition observation unavailable")
     elif paths:
         missing.append("state transition inventory unavailable")
+    drift: list[str] = []
     for pointer in paths:
-        try:
-            initial = resolve(value.get("initial_state"), pointer)
-            if value.get("initial_state") is None:
-                raise ValueError("missing initial state")
-        except ValueError:
-            if _absent_from_observed(value.get("initial_state"), pointer):
-                # Nothing was there to protect: preserving it means it stays absent.
-                for state in states:
-                    if isinstance(state, dict) and _resolves(state, pointer):
-                        violations.append(f"protected state created: {pointer}")
-                        break
-                continue
+        initial = value.get("initial_state")
+        if initial is None or not (
+            _resolves(initial, pointer) or _absent_from_observed(initial, pointer)
+        ):
             missing.append(f"initial state comparison unavailable: {pointer}")
             continue
-        for state in states:
-            if state is None:
-                missing.append(f"state comparison unavailable: {pointer}")
-                continue
-            try:
-                observed = resolve(state, pointer)
-            except ValueError:
-                violations.append(f"protected state removed: {pointer}")
-                continue
-            if not strict_equal(initial, observed):
-                violations.append(f"protected state changed: {pointer}")
-        if not complete:
+        # Each change is the actor's only when its own action named the protected item.
+        found, unavailable = change_owners(
+            initial, pointer, steps if isinstance(steps, list) else [], value.get("final_state")
+        )
+        missing.extend(unavailable)
+        for owner, reason, step in found:
+            if owner == "actor":
+                violations.append(reason)
+            else:
+                drift.append(f"{reason} by the simulator at step {step}")
+        if not complete and _resolves(initial, pointer):
             missing.append("incomplete workflow cannot establish state preservation")
     if violations:
         return Assessment(status="fail", reason="; ".join(dict.fromkeys(violations)))
+    if drift:
+        # Simulator drift is not the actor's verdict: the policy cannot be assessed, and the
+        # raw finding stays in the reason as diagnostic evidence.
+        findings = "; ".join(dict.fromkeys(drift))
+        return Assessment(status="unassessable", reason=f"{SIMULATOR_DRIFT}: {findings}"[:4000])
     if missing:
         return Assessment(status="unassessable", reason="; ".join(dict.fromkeys(missing)))
     return Assessment(status="pass", reason="observed workflow satisfies the declared policy")

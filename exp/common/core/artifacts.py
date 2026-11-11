@@ -101,7 +101,13 @@ class FailureCode(StrEnum):
 
 
 class FailureAttribution(StrEnum):
-    """The runtime boundary that owns an operation failure."""
+    """The runtime boundary that owns an operation failure.
+
+    Continuation branches name the owner of their ending with ``actor`` (the evaluated agent's
+    own decisions), ``simulator`` (the world model's predictions or drift), ``provider`` (a
+    model provider's transport or deadline) or ``store`` (artifact persistence or an
+    interrupted record).
+    """
 
     AGENT = "agent"
     MODEL = "model"
@@ -109,6 +115,10 @@ class FailureAttribution(StrEnum):
     ENVIRONMENT = "environment"
     RESET = "reset"
     CLEANUP = "cleanup"
+    ACTOR = "actor"
+    SIMULATOR = "simulator"
+    PROVIDER = "provider"
+    STORE = "store"
 
 
 class StructuredFailure(ContractModel):

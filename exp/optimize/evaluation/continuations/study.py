@@ -41,6 +41,7 @@ from exp.common.models import (
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.continuations.attribution import attributed, ending_owner
 from exp.optimize.evaluation.continuations.critic import require_prediction_binding
 from exp.optimize.evaluation.continuations.deciders import RecordedDecider
 from exp.optimize.evaluation.equivalence.policy import load_admission_policy
@@ -532,6 +533,7 @@ def run_continuation_study(
                     failure="UnfinishedDispatchIntent",
                     failure_detail=StructuredFailure(
                         code=FailureCode.CANCELLED,
+                        attribution=ending_owner("UnfinishedDispatchIntent", None),
                         message=(
                             "Branch execution was interrupted; inspect saved actor calls "
                             "and world receipts before reconciliation. No automatic redraw."
@@ -796,11 +798,13 @@ def _run_branch(
             outcome["stop_reason"] = episode.stop_reason.value
             outcome["execution_phase"] = "world_cleanup"
         outcome["execution_phase"] = "verifier_grade"
+        assessment = grade(spec.verifier, outcome)
         return ContinuationBranch(
             index=index,
             status="completed",
             outcome=outcome,
-            assessment=grade(spec.verifier, outcome),
+            assessment=assessment,
+            failure_detail=attributed(None, assessment, None, "verifier_grade"),
             final_world=final_world,
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
@@ -828,13 +832,14 @@ def _run_branch(
                 }
             )
             outcome["execution_phase"] = "actor_tool_authorization"
+        assessment = grade(spec.verifier, outcome)
         return ContinuationBranch(
             index=index,
             status="failed"
             if outcome["execution_phase"] == "tool_dispatch_failed_known_effects"
             else "outcome_unknown",
             outcome=outcome,
-            assessment=grade(spec.verifier, outcome),
+            assessment=assessment,
             final_world=final_world,
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
@@ -847,24 +852,36 @@ def _run_branch(
             )
             else None,
             failure=type(error).__name__,
-            failure_detail=StructuredFailure(
-                code=FailureCode.TIMEOUT
-                if isinstance(error, TimeoutError)
-                else FailureCode.VALIDATION
-                if isinstance(error, ValueError)
-                else FailureCode.INTERNAL,
-                message=(
-                    "Continuation stopped at the recorded phase; inspect the linked branch "
-                    "intent and actor-call receipts. A missing result is not proof that no "
-                    "effect occurred."
-                ),
-                exception_type=type(error).__name__,
-                details={
-                    "phase": outcome["execution_phase"],
-                    "branch_intent": intent.model_dump(mode="json"),
-                },
+            failure_detail=attributed(
+                _failure_detail(error, outcome, intent),
+                assessment,
+                type(error).__name__,
+                str(outcome["execution_phase"]),
             ),
         )
+
+
+def _failure_detail(
+    error: Exception, outcome: JsonObject, intent: ArtifactInput
+) -> StructuredFailure:
+    """The executor's operator-only description of the exception a branch stopped on."""
+    return StructuredFailure(
+        code=FailureCode.TIMEOUT
+        if isinstance(error, TimeoutError)
+        else FailureCode.VALIDATION
+        if isinstance(error, ValueError)
+        else FailureCode.INTERNAL,
+        message=(
+            "Continuation stopped at the recorded phase; inspect the linked branch "
+            "intent and actor-call receipts. A missing result is not proof that no "
+            "effect occurred."
+        ),
+        exception_type=type(error).__name__,
+        details={
+            "phase": outcome["execution_phase"],
+            "branch_intent": intent.model_dump(mode="json"),
+        },
+    )
 
 
 def saved_actor_call_evidence(store: ArtifactStore, branch_id: str) -> tuple[ArtifactInput, ...]:

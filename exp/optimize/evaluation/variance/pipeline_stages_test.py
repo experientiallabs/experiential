@@ -126,3 +126,33 @@ def test_zero_qualified_points_means_zero_rubric_author_calls(
     )
     assert rubric_for(every) == (rubric, None)
     assert len(authored) == 1
+
+
+def test_a_simulator_ending_is_masked_from_the_bar_but_kept_in_the_record() -> None:
+    """A refused, rolled-back prediction ends the attempt; it is no actor decision to qualify."""
+    from exp.common.core.artifacts import FailureAttribution, FailureCode, StructuredFailure
+
+    steps = [
+        {"status": "valid", "action": {"name": "write"}},
+        {"status": "valid", "action": {"name": "bash"}},
+        {"status": "failure", "action": {"name": "write"}, "execution": {"effects": "rolled_back"}},
+    ]
+    detail = StructuredFailure(
+        code=FailureCode.VALIDATION, message="m", attribution=FailureAttribution.SIMULATOR
+    )
+    branch = ContinuationBranch(
+        index=4,
+        status="failed",
+        outcome={"steps": steps, "execution_phase": "tool_dispatch_failed_known_effects"},
+        failure="InvalidPredictionError",
+        failure_detail=detail,
+    )
+    assert pipeline_stages.operational_ending(branch) == steps[2:]
+    assert pipeline_stages.labelled_steps(branch, "actor-kimi", 80) == steps[:2]
+    assert branch.outcome["steps"] == steps
+    legacy = branch.model_copy(update={"failure_detail": None})
+    assert pipeline_stages.labelled_steps(legacy, "actor-kimi", 80) == steps[:2]
+    actor = branch.model_copy(
+        update={"failure_detail": detail.model_copy(update={"attribution": "actor"})}
+    )
+    assert pipeline_stages.labelled_steps(actor, "actor-kimi", 80) == steps

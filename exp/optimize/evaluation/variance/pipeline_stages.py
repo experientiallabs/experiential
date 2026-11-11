@@ -19,6 +19,7 @@ from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue, sha2
 from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelRequest, ModelResponse, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.continuations.attribution import NON_ACTOR, ending_owner
 from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
     continuation_result_reference,
@@ -271,14 +272,45 @@ def run_groups(
     return dict(zip(aliases, results, strict=True))
 
 
+def operational_ending(branch: ContinuationBranch) -> list[JsonValue]:
+    """The trailing steps of a branch that ended on a simulator, provider or store fault.
+
+    Those steps (a refused, rolled-back prediction; a dispatch the provider or store failed)
+    record the fault, not an actor decision, so mining masks them from the point bar. A record
+    saved before attributions existed is attributed from its exception and phase.
+    """
+    if branch.status == "completed":
+        return []
+    detail = branch.failure_detail
+    owner = detail.attribution if detail is not None else None
+    if owner is None:
+        phase = branch.outcome.get("execution_phase")
+        owner = ending_owner(branch.failure, phase if isinstance(phase, str) else None)
+    if owner not in NON_ACTOR:
+        return []
+    steps = branch.outcome.get("steps")
+    rows = steps if isinstance(steps, list) else []
+    end = len(rows)
+    while end and isinstance(rows[end - 1], dict) and rows[end - 1].get("status") != "valid":
+        end -= 1
+    return rows[end:]
+
+
 def labelled_steps(branch: ContinuationBranch, alias: str, limit: int) -> list[JsonValue]:
     """Return an attempt's steps to label: at most ``limit``, the bound labelling was priced at.
+
+    A simulator, provider or store ending (:func:`operational_ending`) is left out.
 
     An attempt past ``steps_per_call`` steps per actor call is labelled over its first
     ``limit`` steps instead of refusing the whole stage for every tier.
     """
     steps = branch.outcome.get("steps")
     rows = steps if isinstance(steps, list) else []
+    masked = operational_ending(branch)
+    if masked:
+        # A simulator, provider or store ending is no actor evidence: the bar never sees it,
+        # and the branch record keeps it as the raw finding.
+        rows = rows[: len(rows) - len(masked)]
     if len(rows) > limit:
         logger.warning(
             "traceml: attempt %s of %s has %s steps; labelling the first %s",
@@ -505,10 +537,16 @@ class _TraceMLStage:
         judge_settings = spec.traceml.move_judge
         assert judge_settings is not None
         groups_run = run_groups(project, spec, job, revision)
+        masked: JsonObject = {}
         for alias in spec.mining.actors:
             reference, study = groups_run[alias]
             start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
             trajectories = []
+            masked[alias] = {
+                str(branch.index): len(ending)
+                for branch in study.branches
+                if (ending := operational_ending(branch))
+            }
             for branch in study.branches:
                 rows = labelled_steps(branch, alias, limit)
                 trajectories.append(
@@ -569,6 +607,7 @@ class _TraceMLStage:
         summary: JsonObject = {
             "labels": {alias: ref.artifact_id for alias, ref in labels.items()},
             "error_points": points,
+            "masked_operational_endings": masked,
         }
         saved = (
             *groups.values(),
