@@ -142,14 +142,23 @@ pub fn transport_failure(status: Option<u16>) -> Failure {
     Failure::new(class, message).with_retry(retryable, failover)
 }
 
-/// Pin TypeSafe rejection evidence to the received status, never an inferred class.
+/// Pin decision rejection evidence to the received status, never an inferred class.
 pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failure {
     failure.decision_provider_rejected = matches!(status, 400 | 401 | 403 | 404 | 422);
     // Zero-work accounting evidence does not itself authorize another call.
-    // Only a rejected credential may try an independently credentialed rung;
-    // every other status ends this request without automatic dispatch.
+    // Only a rejected credential may try an independently credentialed rung
+    // (a 401, or Google's structured API-key verdict under its 400 or 403,
+    // which the classification above already filed as the credential class
+    // with a key-specific ledger detail); every other status, a bare 403
+    // included, ends this request without automatic dispatch.
     failure.retryable_same_deployment = false;
-    failure.failover_eligible = status == 401;
+    failure.failover_eligible = status == 401
+        || (matches!(status, 400 | 403)
+            && failure.failure_class == FailureClass::ProviderAuthentication
+            && failure
+                .provider_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(": api_key_")));
     failure
 }
 
@@ -510,6 +519,17 @@ async fn non_success_failure(
         return failure;
     }
     if status == 403 {
+        // Google answers a blocked key (`API_KEY_SERVICE_BLOCKED`) under 403
+        // with the same structured reason family as its 400 `API_KEY_INVALID`:
+        // the credential verdict the decision ladder may fail over on.
+        if body
+            .as_deref()
+            .is_some_and(|body| crate::rejection_shapes::rejected_gemini_credential(dialect, body))
+        {
+            return transport_failure(Some(401))
+                .with_provider_detail(Some(format!("{}: api_key_blocked", status_detail(status))))
+                .with_rate_limit_facts(rate_limit.clone(), retry_after);
+        }
         if body
             .as_deref()
             .is_some_and(|body| rejected_by_routing_gate(dialect, body))
@@ -563,6 +583,17 @@ async fn non_success_failure(
                 .with_rate_limit_facts(rate_limit.clone(), retry_after);
         }
         return failure;
+    }
+    // Gemini answers a rejected API key under 400 (`API_KEY_INVALID`): the
+    // credential class, so the ladder fails over to an independently
+    // credentialed rung and the lane can be demoted. Ledger detail only.
+    if body
+        .as_deref()
+        .is_some_and(|body| crate::rejection_shapes::rejected_gemini_credential(dialect, body))
+    {
+        return transport_failure(Some(401))
+            .with_provider_detail(Some(format!("{}: api_key_invalid", status_detail(status))))
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
     }
     // A client-error status whose body names a missing model is the
     // catalog's fault, not the caller's: it takes the 404 policy so the
@@ -786,6 +817,9 @@ async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
     String::from_utf8(collected).ok()
 }
 
+#[cfg(test)]
+#[path = "upstream/gemini_decision_tests.rs"]
+mod gemini_decision_tests;
 #[cfg(test)]
 mod tests;
 

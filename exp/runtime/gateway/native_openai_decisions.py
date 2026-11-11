@@ -4,9 +4,14 @@ The OpenAI Decisions API is a second wire of the decisions surface: the same
 authority, ledger surface (``decisions``), direct-route resolution, explicit
 input-only pricing rule and one-dispatch-per-deployment policy as the TypeSafe
 SystemOne wire in :mod:`exp.runtime.gateway.native_decisions`. Only the body
-shape and the qualifying rungs differ: a rung serves this wire when the catalog
-positively declares decisions support and the connection exposes OpenAI's own
-``/decisions`` endpoint (direct OpenAI only).
+shape and the qualifying rungs differ: a rung serves this surface when the
+catalog positively declares decisions support and the connection exposes
+either OpenAI's own ``/decisions`` endpoint (direct OpenAI, the body forwards
+verbatim) or Google's Decisions API endpoint (a Gemini connection, the body is
+translated by :mod:`exp.runtime.gateway.google_decisions_contracts` and the
+answer back by the data plane). One request dispatches on one upstream wire:
+the first capable rung in route order picks it and rungs of the other wire are
+left out of the ladder.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import replace
-from typing import Protocol
+from typing import Literal, Protocol
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -23,6 +28,10 @@ from exp.runtime.gateway.contracts import (
     DirectTarget,
     GatewayFailure,
     GatewayFailureClass,
+)
+from exp.runtime.gateway.google_decisions_contracts import (
+    GoogleDecisionTranslationError,
+    google_decision_body,
 )
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -42,6 +51,7 @@ from exp.runtime.gateway.native_decisions import (
     NativeDecisionsMixin,
     _decisions_rung,
     _priced_decision_rung,
+    no_image_decisions_error,
 )
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_TOTAL_ATTEMPTS,
@@ -113,13 +123,36 @@ def not_an_openai_decision_model_error(
     )
 
 
+UpstreamDecisionWire = Literal["openai", "google"]
+"""The provider wire an OpenAI-shaped decision dispatches on."""
+
+
+def _upstream_wire(
+    profile: GatewayWireProfile, supports_decisions: bool
+) -> UpstreamDecisionWire | None:
+    """The upstream decisions wire a rung serves this surface on, if any.
+
+    Positive decisions evidence and an unsigned endpoint are required on both:
+    OpenAI's own ``/decisions`` (direct OpenAI) or Google's Decisions API
+    (a Gemini connection).
+    """
+    if supports_decisions is not True or profile.signs_request_body:
+        return None
+    if profile.openai_decisions_url is not None:
+        return "openai"
+    if profile.google_decisions_url is not None:
+        return "google"
+    return None
+
+
 def _openai_decisions_rung(profile: GatewayWireProfile, supports_decisions: bool) -> bool:
-    """Require positive decisions evidence and OpenAI's own unsigned endpoint."""
-    return (
-        supports_decisions is True
-        and profile.openai_decisions_url is not None
-        and not profile.signs_request_body
-    )
+    """Whether a rung serves the OpenAI-shaped decisions surface on any upstream wire."""
+    return _upstream_wire(profile, supports_decisions) is not None
+
+
+def _upstream_url(profile: GatewayWireProfile, wire: UpstreamDecisionWire) -> str | None:
+    """The rung's endpoint on the chosen upstream wire."""
+    return profile.openai_decisions_url if wire == "openai" else profile.google_decisions_url
 
 
 class NativeOpenAIDecisionsMixin:
@@ -133,9 +166,9 @@ class NativeOpenAIDecisionsMixin:
                 keys are ignored; no keyed replay contract is claimed.
 
         Returns:
-            Frozen route entries, the admitted question list, the ``openai``
-            wire marker, and one-attempt-per-deployment limits, or a terminal
-            content-free escalation.
+            Frozen route entries, the admitted question list, the upstream wire
+            marker (``openai`` or ``google``), and one-attempt-per-deployment
+            limits, or a terminal content-free escalation.
 
         Raises:
             NativeBridgeError: Authentication, request validation, authorization,
@@ -232,15 +265,31 @@ def _admit_accepted(
         return plane._escalate_accepted(  # noqa: SLF001
             authorization, UNAVAILABLE_AT_ADMISSION
         )
-    capable = tuple(
-        index
+    wires = {
+        index: wire
         for index, (profile, _client) in zip(
             dispatchable.indexes, dispatchable.resolved_wires, strict=True
         )
-        if _openai_decisions_rung(
-            profile, route.deployments[index].gateway.capabilities.supports_decisions
+        if (
+            wire := _upstream_wire(
+                profile, route.deployments[index].gateway.capabilities.supports_decisions
+            )
         )
-    )
+        is not None
+    }
+    capable = tuple(wires)
+    if capable and request.has_images:
+        # Google's image block (and OpenAI's input_image) reach only a rung
+        # that declares image input; a declining rung's 400 is terminal, so
+        # an image-capable fallback must be chosen here, never after.
+        capable = tuple(
+            index
+            for index in capable
+            if route.deployments[index].gateway.capabilities.supports_image_input
+        )
+        if not capable:
+            _finish_unsupported(plane, authorization, no_images=True)
+            raise NativeBridgeError(no_image_decisions_error(authorization.alias, "input"))
     if not capable:
         # The SystemOne lane's own rung predicate decides whether the same model
         # id is servable on /v1/systemone; there is no second rule here.
@@ -258,9 +307,14 @@ def _admit_accepted(
                 authorization.alias, serves_systemone=serves_systemone
             )
         )
-    serving = tuple(
+    priced = tuple(
         index for index in capable if _priced_decision_rung(route.deployments[index].gateway.prices)
-    )[:MAXIMUM_TOTAL_ATTEMPTS]
+    )
+    # One upstream wire per request: the first PRICED capable rung in route
+    # order picks it (an unpriced rung never suppresses a servable one), so
+    # every answer in the ladder is validated the same way.
+    upstream: UpstreamDecisionWire = wires[priced[0]] if priced else "openai"
+    serving = tuple(index for index in priced if wires[index] == upstream)[:MAXIMUM_TOTAL_ATTEMPTS]
     if not serving:
         plane._accounting.finish_request_quietly(  # noqa: SLF001
             authorization, gateway_updating_failure()
@@ -282,16 +336,24 @@ def _admit_accepted(
     ]
     route = select_route_deployments(route, serving)
     wire_route: list[JsonObject] = []
+    ignored_parameters: tuple[str, ...] = ()
     for deployment, (profile, _client) in zip(route.deployments, served_wires, strict=True):
-        decisions_url = profile.openai_decisions_url
+        decisions_url = _upstream_url(profile, upstream)
         if decisions_url is None:  # pragma: no cover - filtered above.
             raise GatewayRoutingError("OpenAI decision rung lost its wire endpoint")
+        if upstream == "google":
+            try:
+                upstream_payload, ignored_parameters = google_decision_body(
+                    request, profile.model_id
+                )
+            except GoogleDecisionTranslationError as exc:
+                _finish_unsupported(plane, authorization, untranslatable=True)
+                raise NativeBridgeError(invalid_field(exc.param, exc.message)) from exc
+        else:
+            upstream_payload = request.provider_body(profile.model_id)
         wire_route.append(
             deployment_wire_entry(
-                route,
-                deployment,
-                replace(profile, url=decisions_url),
-                request.provider_body(profile.model_id),
+                route, deployment, replace(profile, url=decisions_url), upstream_payload
             )
         )
     depth = len(route.deployments)
@@ -303,10 +365,11 @@ def _admit_accepted(
         "exact_model_id": route.snapshot.exact_model_id,
         "route_reason": route.route_reason,
         "route": wire_route,
-        "wire": "openai",
+        "wire": upstream,
         "openai_questions": request.question_definitions(),
         "maximum_total_attempts": depth,
         "maximum_same_deployment_attempts": 1,
+        "ignored_parameters": list(ignored_parameters),
     }
     serialized = json.dumps(response, separators=(",", ":"))
     plane._accounting.register(  # noqa: SLF001
@@ -330,13 +393,20 @@ def _finish_unsupported(
     authorization: AuthorizationSnapshot,
     *,
     serves_systemone: bool = False,
+    untranslatable: bool = False,
+    no_images: bool = False,
 ) -> None:
     """Finish an accepted request naming an alias that cannot serve OpenAI decisions."""
-    safe_message = (
-        "the model alias serves native decisions on /v1/systemone, not the OpenAI Decisions API"
-        if serves_systemone
-        else "the model alias does not serve the OpenAI Decisions API"
-    )
+    if no_images:
+        safe_message = "no decision deployment accepts images"
+    elif untranslatable:
+        safe_message = "the request cannot be expressed on the model's Google Decisions API wire"
+    elif serves_systemone:
+        safe_message = (
+            "the model alias serves native decisions on /v1/systemone, not the OpenAI Decisions API"
+        )
+    else:
+        safe_message = "the model alias does not serve the OpenAI Decisions API"
     plane._accounting.finish_request_quietly(  # noqa: SLF001
         authorization,
         GatewayFailure(
