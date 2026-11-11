@@ -13,10 +13,15 @@ use serde_json::{json, Map, Value};
 
 use super::{
     choice_can_be_highest, distribution, malformed, probability, score_matches_distribution,
-    score_mismatch, token_count, wire_failure, DecisionsAdmission,
+    score_mismatch, token_count, wire_failure, DecisionsAdmission, PROBABILITY_TOLERANCE,
 };
-use crate::errors::Failure;
+use crate::errors::{Failure, FailureClass};
 use crate::events::Usage;
+
+/// Confidence is the winning outcome's probability (`max(noul, 1 - noul)` for
+/// a yes/no answer), rounded independently to the same hundredths, so it may
+/// sit half a hundredth from the bin it restates.
+const CONFIDENCE_TOLERANCE: f64 = 0.005 + PROBABILITY_TOLERANCE;
 
 /// The positional Google question key admission gave the question at `index`.
 fn question_key(index: usize) -> String {
@@ -41,19 +46,60 @@ fn level_criterion(level: &Value) -> Option<String> {
     })
 }
 
+/// Google's input content filters answered instead of the model: a
+/// `prompt_feedback.block_reason` with no answers. The reason is Google's own
+/// bounded token (`safety`, `blocklist`, `prohibited_content`, `image_safety`,
+/// `other`), never its free-text message.
+fn blocked(reason: &str) -> Failure {
+    let token = if !reason.is_empty()
+        && reason.len() <= 32
+        && reason
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        reason
+    } else {
+        "unspecified"
+    };
+    Failure::new(
+        FailureClass::Refusal,
+        &format!("the decision model's input filter blocked the request ({token})"),
+    )
+    .with_retry(false, false)
+}
+
+/// Confidence restates the winning outcome's probability.
+fn consistent_confidence(confidence: f64, expected: f64) -> Result<(), Failure> {
+    if (confidence - expected).abs() > CONFIDENCE_TOLERANCE {
+        return Err(malformed(
+            "decision confidence does not match its winning probability",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a Google Decisions API answer against the admitted questions and
 /// return it in the OpenAI shape.
 ///
-/// Every admitted question needs its positional key answered with the
-/// question's Google type. Probabilities must be finite, within `[0, 1]`,
+/// A `prompt_feedback.block_reason` is the model's refusal of the whole input.
+/// Otherwise every admitted question needs its positional key answered with
+/// the question's Google type. Probabilities must be finite, within `[0, 1]`,
 /// keyed by exactly the requested option keys (choice) or level indices
-/// (score), and sum to one within the published-rounding envelope; a score's
-/// legend must be the admitted criteria and the score the probability-weighted
-/// level average. Usage is Google's `total_input_tokens` with zero output.
+/// (score), and sum to one within the published-rounding envelope; confidence
+/// must restate the winning probability; a score's legend must be the admitted
+/// criteria and the score the probability-weighted level average. Usage is
+/// Google's `total_input_tokens` with zero output.
 pub(super) fn public_google_decisions(
     payload: Value,
     admission: &DecisionsAdmission,
 ) -> Result<(Value, Usage), Failure> {
+    if let Some(reason) = payload
+        .get("prompt_feedback")
+        .and_then(|feedback| feedback.get("block_reason"))
+        .filter(|reason| !reason.is_null())
+    {
+        return Err(blocked(reason.as_str().unwrap_or_default()));
+    }
     let answers = payload
         .get("answers")
         .and_then(Value::as_object)
@@ -105,7 +151,8 @@ fn translate_answer(question: &Value, answer: &Value) -> Result<Value, Failure> 
     }
     match kind {
         "predicate" => {
-            probability(&answer["noul"])?;
+            let noul = probability(&answer["noul"])?;
+            consistent_confidence(probability(&answer["confidence"])?, noul.max(1.0 - noul))?;
             public.insert("probability".to_string(), answer["noul"].clone());
         }
         "choice" => translate_choice(question, answer, &mut public)?,
@@ -141,7 +188,7 @@ fn translate_choice(
         .iter()
         .position(|key| key == chosen)
         .ok_or_else(|| malformed("decision choice is not a requested value"))?;
-    probability(&answer["confidence"])?;
+    consistent_confidence(probability(&answer["confidence"])?, probabilities[selected])?;
     if !choice_can_be_highest(selected, &probabilities) {
         return Err(malformed(
             "decision choice is not a highest-probability value",
@@ -183,7 +230,8 @@ fn translate_score(
         ));
     }
     let probabilities = distribution(&answer["probabilities"], legend.keys().map(String::as_str))?;
-    probability(&answer["confidence"])?;
+    let highest = probabilities.iter().copied().fold(0.0_f64, f64::max);
+    consistent_confidence(probability(&answer["confidence"])?, highest)?;
     let score = answer
         .get("score")
         .and_then(Value::as_f64)
@@ -219,10 +267,14 @@ fn translate_score(
 
 /// Google's billing evidence: `usage.total_input_tokens` (text, image and
 /// audio tokens together) and `usage.total_output_tokens`, documented as
-/// always zero. No cache legs exist on this wire.
+/// always zero and, on Google's shared usage contract, optional: an absent
+/// count is zero. No cache legs exist on this wire.
 pub(super) fn google_decision_usage(payload: &Value) -> Result<Usage, Failure> {
     let input_tokens = token_count(&payload["usage"]["total_input_tokens"])?;
-    let output_tokens = token_count(&payload["usage"]["total_output_tokens"])?;
+    let output_tokens = match &payload["usage"]["total_output_tokens"] {
+        Value::Null => 0,
+        reported => token_count(reported)?,
+    };
     if input_tokens == 0 && output_tokens == 0 {
         return Err(malformed(
             "decision response reported no billable token usage",

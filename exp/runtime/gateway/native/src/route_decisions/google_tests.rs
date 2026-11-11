@@ -77,6 +77,62 @@ fn google_answers_come_back_in_the_openai_shape_in_question_order() {
 }
 
 #[test]
+fn an_input_block_is_the_models_refusal_not_a_malformed_answer() {
+    for (reason, token) in [
+        (json!("safety"), "safety"),
+        (json!("prohibited_content"), "prohibited_content"),
+        (json!("Request blocked: <html>"), "unspecified"),
+        (json!(7), "unspecified"),
+    ] {
+        let payload = json!({
+            "prompt_feedback": {"block_reason": reason, "block_reason_message": "private-text-canary"},
+            "usage": {"total_input_tokens": 12, "total_output_tokens": 0},
+        });
+        let failure = public_google_decisions(payload, &google_admission()).expect_err("blocked");
+        assert_eq!(failure.failure_class, FailureClass::Refusal);
+        assert!(!failure.retryable_same_deployment);
+        assert!(!failure.failover_eligible);
+        assert!(failure.safe_message.ends_with(&format!("({token})")));
+        assert!(!failure.safe_message.contains("canary"));
+    }
+    let mut unblocked = google_payload();
+    unblocked["prompt_feedback"] = json!({"block_reason": null});
+    public_google_decisions(unblocked, &google_admission()).unwrap();
+}
+
+#[test]
+fn an_omitted_output_count_is_zero_and_a_reported_one_passes_through() {
+    let mut omitted = google_payload();
+    omitted["usage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_output_tokens");
+    let (body, usage) = public_google_decisions(omitted, &google_admission()).unwrap();
+    assert_eq!(usage.output_tokens, Some(0));
+    assert_eq!(body["usage"]["output_tokens"], 0);
+    let mut reported = google_payload();
+    reported["usage"]["total_output_tokens"] = json!(3);
+    let (_body, usage) = public_google_decisions(reported, &google_admission()).unwrap();
+    assert_eq!(usage.output_tokens, Some(3));
+}
+
+#[test]
+fn confidence_must_restate_the_winning_probability_within_a_half_hundredth() {
+    let mut near = google_payload();
+    near["answers"]["q0"]["confidence"] = json!(0.895);
+    near["answers"]["q1"]["confidence"] = json!(0.694);
+    near["answers"]["q2"]["confidence"] = json!(0.705);
+    public_google_decisions(near, &google_admission()).unwrap();
+    for (key, confidence) in [("q0", 0.2), ("q1", 0.31), ("q2", 0.3)] {
+        let mut payload = google_payload();
+        payload["answers"][key]["confidence"] = json!(confidence);
+        let failure =
+            public_google_decisions(payload, &google_admission()).expect_err("inconsistent");
+        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    }
+}
+
+#[test]
 fn a_boolean_choice_is_read_back_from_its_spelled_key() {
     let mut payload = google_payload();
     payload["answers"]["q0"]["choice"] = json!("true");

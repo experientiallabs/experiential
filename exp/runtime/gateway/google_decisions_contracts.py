@@ -34,7 +34,7 @@ disclosure on the answer (``x-experiential-ignored-parameters``).
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, assert_never
 
 from exp.common.core.artifacts import JsonValue
 from exp.runtime.gateway.openai_decisions_contracts import (
@@ -132,6 +132,8 @@ def _question(question: OpenAIDecisionQuestion) -> dict[str, JsonValue]:
                 "instructions": question.instructions,
                 "criteria": [google_level_criterion(level) for level in question.levels],
             }
+        case _:
+            assert_never(question)
 
 
 def _image_block(part: InputImagePart) -> dict[str, JsonValue]:
