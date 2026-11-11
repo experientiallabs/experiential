@@ -25,15 +25,17 @@ What maps:
   shows keys to the model and OpenAI names may exceed Google's key rules.
 
 What cannot map is refused with a typed 400 before dispatch: a choice value
-that is not a valid Google option key (ASCII, 1 through 128 characters, no
-leading or trailing space, no control characters) or that collides with
-another value's key (the boolean ``true`` beside the string ``"true"``).
+that is not a valid Google option key (1 through 128 characters, no leading
+or trailing whitespace, no control characters, no non-ASCII spaces) or that
+collides with another value's key (the boolean ``true`` beside the string
+``"true"``).
 ``safety_identifier`` has no Google counterpart and is dropped with a
 disclosure on the answer (``x-experiential-ignored-parameters``).
 """
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Literal, assert_never
 
 from exp.common.core.artifacts import JsonValue
@@ -48,7 +50,8 @@ from exp.runtime.gateway.openai_decisions_contracts import (
 )
 
 MAX_GOOGLE_OPTION_KEY_CHARACTERS = 128
-"""Google's documented option-key length (ASCII, so characters equal bytes)."""
+"""Google's documented option-key length (at most 512 UTF-8 bytes, which 128
+characters never exceed)."""
 
 SAFETY_IDENTIFIER_DROPPED = "safety_identifier->dropped(google_decisions)"
 """Disclosure recorded when the Google wire cannot carry ``safety_identifier``."""
@@ -91,17 +94,22 @@ def google_option_key(value: str | bool) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if (
-        not value.isascii()
-        or len(value) > MAX_GOOGLE_OPTION_KEY_CHARACTERS
-        or value != value.strip(" ")
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        len(value) > MAX_GOOGLE_OPTION_KEY_CHARACTERS
+        or value != value.strip()
+        or any(_disallowed_in_option_key(character) for character in value)
     ):
         raise GoogleDecisionTranslationError(
             "questions",
-            "choice values on this model must be ASCII text of 1 through 128 characters "
-            "with no leading or trailing spaces and no control characters",
+            "choice values on this model must be 1 through 128 characters with no leading "
+            "or trailing spaces, no control characters and no non-ASCII spaces",
         )
     return value
+
+
+def _disallowed_in_option_key(character: str) -> bool:
+    """Google refuses control characters and every space other than ASCII space."""
+    category = unicodedata.category(character)
+    return category == "Cc" or (category == "Zs" and character != " ")
 
 
 def google_level_criterion(level: DecisionLevel) -> str:

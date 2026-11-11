@@ -51,7 +51,7 @@ on the exact release checkout.
   direct OpenAI deployments that declare decisions support and price output at zero, billed on
   reported input tokens. A Gemini deployment serving `gemini-decision-1` serves the same request
   shape through Google's Decisions API: the body is translated, the answer translated back, and
-  what Google cannot express (non-key choice values) is a typed 400 before dispatch.
+  what Google cannot express (choice values that are not Google option keys) is a typed 400 before dispatch.
   Real Rust HTTP and SQLite tests cover all answer types, authentication, unsupported inputs,
   missing or invalid usage, certified 401 fallback, cancellation, timeout, and content-free accounting.
 - The no-subcommand default gateway launch, the direct `exp run [PROJECT]` form, and the

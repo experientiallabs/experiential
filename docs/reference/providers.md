@@ -709,7 +709,7 @@ second upstream of the OpenAI-shaped decisions surface: a caller sends the same 
 (`exp/runtime/gateway/google_decisions_contracts.py`) and translates the answer back
 (`route_decisions/google.rs`). A rung serves it under the OpenAI wire's rules (declared
 `supports_decisions`, output priced at zero, the Google endpoint on its connection). One request
-dispatches on one upstream: the first capable rung in route order picks OpenAI or Google.
+dispatches on one upstream: the first priced capable rung in route order picks OpenAI or Google.
 
 | OpenAI shape (what the caller sends and receives) | Google wire |
 |---|---|
@@ -725,9 +725,9 @@ dispatches on one upstream: the first capable rung in route order picks OpenAI o
 | `prompt_feedback.block_reason` (Google's input filter answered, no `answers`) | the model's 400 `refusal` naming Google's reason token (`safety`, `blocklist`, `prohibited_content`, `image_safety`, `other`), never its message; no retry or failover |
 
 Refused with a typed 400 on `questions` before dispatch, because Google cannot express them: a
-choice value that is not a valid Google option key (ASCII, 1 through 128 characters, no leading or
-trailing space, no control characters), and a boolean `true` beside the string `"true"` (the
-spelled keys collide). Google's own 400s (its safety codes `safety`, `prohibited_content`,
+choice value that is not a valid Google option key (1 through 128 characters, no leading or
+trailing whitespace, no control characters, no non-ASCII spaces), and a boolean `true` beside the
+string `"true"` (the spelled keys collide). Google's own 400s (its safety codes `safety`, `prohibited_content`,
 `blocklist`, `image_safety`, `content_blocked`, and limit violations) are the caller's
 `invalid_request` with the provider's sentence, known-unbilled like every decision 400. Google's
 audio, video and PDF blocks, URI inputs, more than 64 choices or 10 levels, and more than 32

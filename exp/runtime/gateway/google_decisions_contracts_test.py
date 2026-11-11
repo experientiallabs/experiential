@@ -143,17 +143,23 @@ def test_safety_identifier_is_dropped_with_a_disclosure() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ["", " padded", "padded ", "x" * 129, "café", "tab\there", "line\nbreak"],
+    [" padded", "padded ", "x" * 129, "tab\there", "line\nbreak", "no\u00a0break", "\u3000wide"],
 )
 def test_unexpressible_choice_values_are_refused_without_being_quoted(value: str) -> None:
     """A value outside Google's option-key rules is a typed refusal naming the rule."""
-    if not value:
-        pytest.skip("the OpenAI decoder already refuses an empty value")
     with pytest.raises(GoogleDecisionTranslationError) as refused:
         google_option_key(value)
     assert refused.value.param == "questions"
     assert value.strip() not in refused.value.message or value.strip() in {"x" * 129}
     assert "128 characters" in refused.value.message
+
+
+@pytest.mark.parametrize(
+    "value", ["caf\u00e9", "\u65e5\u672c\u8a9e", "Needs review", "\U0001f600" * 128]
+)
+def test_unicode_choice_values_are_google_option_keys(value: str) -> None:
+    """Google keys are Unicode text; only control characters and non-ASCII spaces are out."""
+    assert google_option_key(value) == value
 
 
 def test_a_boolean_beside_its_spelled_string_collides() -> None:

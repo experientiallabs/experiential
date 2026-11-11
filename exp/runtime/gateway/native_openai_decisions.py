@@ -276,10 +276,7 @@ def _admit_accepted(
         )
         is not None
     }
-    # One upstream wire per request: the first capable rung in route order
-    # picks it, so every answer in the ladder is validated the same way.
-    upstream: UpstreamDecisionWire = next(iter(wires.values()), "openai")
-    capable = tuple(index for index, wire in wires.items() if wire == upstream)
+    capable = tuple(wires)
     if not capable:
         # The SystemOne lane's own rung predicate decides whether the same model
         # id is servable on /v1/systemone; there is no second rule here.
@@ -297,9 +294,14 @@ def _admit_accepted(
                 authorization.alias, serves_systemone=serves_systemone
             )
         )
-    serving = tuple(
+    priced = tuple(
         index for index in capable if _priced_decision_rung(route.deployments[index].gateway.prices)
-    )[:MAXIMUM_TOTAL_ATTEMPTS]
+    )
+    # One upstream wire per request: the first PRICED capable rung in route
+    # order picks it (an unpriced rung never suppresses a servable one), so
+    # every answer in the ladder is validated the same way.
+    upstream: UpstreamDecisionWire = wires[priced[0]] if priced else "openai"
+    serving = tuple(index for index in priced if wires[index] == upstream)[:MAXIMUM_TOTAL_ATTEMPTS]
     if not serving:
         plane._accounting.finish_request_quietly(  # noqa: SLF001
             authorization, gateway_updating_failure()
