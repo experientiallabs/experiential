@@ -396,6 +396,11 @@ class GatewayWireProfile:
     OpenAI connections and sharing ``headers``; ``None`` keeps the OpenAI-shaped
     decisions surface off every other wire."""
 
+    google_decisions_url: str | None = None
+    """Full Google Decisions API ``/decisions`` endpoint, present only on Gemini
+    connections and sharing ``headers``. The OpenAI-shaped decisions surface
+    translates its body to this wire; ``None`` keeps the surface off it."""
+
     images_url: str | None = None
     """Full image-generation endpoint for this connection, sharing ``headers``:
     the OpenAI-wire ``/images/generations`` URL, or a Bedrock Stability model's

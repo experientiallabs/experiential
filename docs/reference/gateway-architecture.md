@@ -115,7 +115,7 @@ Reservations count repeated state and per-question protocol allowances, not the 
 They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
 Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.
 HTTP 402/429/529, ambiguous transport, and malformed answers are terminal unknown outcomes, holds kept.
-At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails. `POST /v1/decisions`: see [OpenAI Decisions API](providers.md#openai-decisions-api).
+At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails. `POST /v1/decisions`: see [OpenAI Decisions API](providers.md#openai-decisions-api) and, for a Gemini rung, its translation to the [Google Decisions API](providers.md#google-decisions-api).
 
 Multi-deployment certified pools execute natively. Admission returns the full
 ordered route plus the frozen retry-policy facts without starting an attempt;

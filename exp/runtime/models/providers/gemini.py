@@ -40,6 +40,8 @@ from exp.runtime.models.providers.openai_compatible import normalize_embedding_v
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_DECISIONS_PATH = "decisions"
+"""The Google Decisions API route below the Gemini API base URL (gemini-decision-1 only)."""
 
 
 def gemini_generate_response(
@@ -152,6 +154,7 @@ class GeminiClient(ProviderHttpClient):
             dialect="gemini_generate_content",
             url=f"{self._base_url}/models/{model_id}:streamGenerateContent?alt=sse",
             videos_url=f"{self._base_url}/models/{model_id}:predictLongRunning",
+            google_decisions_url=f"{self._base_url}/{GEMINI_DECISIONS_PATH}",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,

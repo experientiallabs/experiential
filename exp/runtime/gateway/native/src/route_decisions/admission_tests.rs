@@ -33,18 +33,18 @@ fn admission(wire: &str) -> String {
 
 #[test]
 fn a_matching_admission_parses_without_an_intermediate_value() {
-    let parsed = parse_admission(&admission("systemone"), DecisionWire::Systemone);
+    let parsed = parse_admission(&admission("systemone"), &[DecisionWire::Systemone]);
     assert!(matches!(parsed, Ok(ref admission) if admission.request_id == "request-1"));
 }
 
 #[test]
 fn escalation_drift_and_malformed_answers_stay_distinct() {
-    let escalated = parse_admission(r#"{"escalate":"unavailable"}"#, DecisionWire::Systemone);
+    let escalated = parse_admission(r#"{"escalate":"unavailable"}"#, &[DecisionWire::Systemone]);
     assert!(matches!(escalated, Err(Parsed::Escalate(ref reason)) if reason == "unavailable"));
-    let drifted = parse_admission(&admission("openai"), DecisionWire::Systemone);
+    let drifted = parse_admission(&admission("openai"), &[DecisionWire::Systemone]);
     assert!(matches!(drifted, Err(Parsed::Drift(ref value)) if value["wire"] == "openai"));
     assert!(matches!(
-        parse_admission("not json", DecisionWire::Systemone),
+        parse_admission("not json", &[DecisionWire::Systemone]),
         Err(Parsed::Malformed)
     ));
 }

@@ -699,3 +699,35 @@ unknown. The same one-dispatch-per-deployment rule applies, and the HTTP status 
 known rejection (a rejected credential alone fails over) while the OpenAI error envelope still
 names the caller's parameter.
 Reference: https://developers.openai.com/api/docs/guides/decisions
+
+## Google Decisions API
+
+A Gemini connection (`provider = "gemini"`) serving `gemini-decision-1` exposes Google's Decisions
+API (`POST {base_url}/decisions`, the same `x-goog-api-key` header as generateContent) as a
+second upstream of the OpenAI-shaped decisions surface: a caller sends the same `POST
+/v1/decisions` body as to an OpenAI decision model, and the gateway translates it
+(`exp/runtime/gateway/google_decisions_contracts.py`) and translates the answer back
+(`route_decisions/google.rs`). A rung serves it under the OpenAI wire's rules (declared
+`supports_decisions`, output priced at zero, the Google endpoint on its connection). One request
+dispatches on one upstream: the first capable rung in route order picks OpenAI or Google.
+
+| OpenAI shape (what the caller sends and receives) | Google wire |
+|---|---|
+| `input` string | forwarded verbatim |
+| `input` user messages; `input_text`; inline base64 `input_image` with `detail` | content blocks: `text`; `image` with `data`, `mime_type` and `resolution` (`low`, `high`; `original` is `ultra_high`; `auto` omitted); a newline text block between messages |
+| `predicate` | `noul`; the answer's `noul` is the `probability` |
+| `choice` with `choices: [{value, description?}]` | `choice` with `criteria: {value: description or ""}`; the answer's `choice` and `probabilities` map come back as the typed requested value and the `[{value, probability}]` list in requested order, with `confidence` |
+| `score` with `levels: [{label, description?}]` | `score` with ordered `criteria` of `label: description` (or the bare label); the answer's `score` (Google's probability-weighted 0-based level index) and `probabilities` come back as the `[{value, label, probability}]` list with `confidence` |
+| questions keyed by optional `name` | keyed positionally `q0`, `q1`, ... (Google never shows keys to the model); names are restored on the answers |
+| `safety_identifier` | dropped, disclosed as `safety_identifier->dropped(google_decisions)` in `x-experiential-ignored-parameters` |
+| `usage` | `total_input_tokens` as `input_tokens`, `total_output_tokens` (always 0) as `output_tokens`; no cache legs |
+
+Refused with a typed 400 on `questions` before dispatch, because Google cannot express them: a
+choice value that is not a valid Google option key (ASCII, 1 through 128 characters, no leading or
+trailing space, no control characters), and a boolean `true` beside the string `"true"` (the
+spelled keys collide). Google's own 400s (its safety codes `safety`, `prohibited_content`,
+`blocklist`, `image_safety`, `content_blocked`, and limit violations) are the caller's
+`invalid_request` with the provider's sentence, known-unbilled like every decision 400. Google's
+audio, video and PDF blocks, URI inputs, more than 64 choices or 10 levels, and more than 32
+questions are not reachable through the OpenAI shape and are not served.
+Reference: https://ai.google.dev/gemini-api/docs/decisions-api
