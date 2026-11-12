@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -82,6 +83,7 @@ from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.authoring_loop import AuthoringLoopSpec, author_family_bank
 from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS, DecisionsTraceTagger
+from exp.simulation.mining.dispatch import DEFAULT_TAGGING_CONCURRENCY
 from exp.simulation.mining.environment_families import (
     EnvironmentFamily,
     admitted_families,
@@ -462,7 +464,23 @@ def decision_tagger(
         resolved,
         transport=ReasonedDecisionTransport(transport),
         cache=DecisionCache(project.paths),
+        maximum_concurrency=tagging_concurrency(),
     )
+
+
+TAGGING_CONCURRENCY_ENV = "EXP_TAGGING_CONCURRENCY"
+"""Environment override for decision calls in flight; it changes only how long a pass takes."""
+
+
+def tagging_concurrency() -> int:
+    """Return the decision calls in flight, from the environment or the shared default."""
+    raw = os.environ.get(TAGGING_CONCURRENCY_ENV, "").strip()
+    if not raw:
+        return DEFAULT_TAGGING_CONCURRENCY
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"{TAGGING_CONCURRENCY_ENV} must be at least 1, not {value}")
+    return value
 
 
 def author_draw(
