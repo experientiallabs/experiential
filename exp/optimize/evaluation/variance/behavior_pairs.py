@@ -58,11 +58,11 @@ from exp.simulation.mining.dispatch import dispatch_tagging
 from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tagging import TagMatrix, TraceTagger, TraceTaggingError
 from exp.simulation.mining.traceml import (
-    POINT_NUMBERING,
     TraceStep,
     TraceTrajectory,
     step_units,
 )
+from exp.simulation.mining.traceml_turns import POINT_NUMBERING
 
 ALIGN_TOOL = "align_behavior_pair"
 AUDIT_TOOL = "review_behavior_difference"

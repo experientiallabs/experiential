@@ -59,7 +59,7 @@ from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.simulation.continuations import ContinuationCheckpoint
-from exp.simulation.mining.traceml import workflow_step_turns
+from exp.simulation.mining.traceml_turns import workflow_step_turns
 from exp.simulation.retrieval.contracts import RAGAction, RAGQuery
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.retrieval.retriever import TraceRAGRetriever

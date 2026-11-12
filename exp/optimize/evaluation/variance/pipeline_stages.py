@@ -148,14 +148,13 @@ from exp.simulation.continuations import (
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.tagging import DecisionCache, TraceTagger
 from exp.simulation.mining.traceml import (
-    POINT_NUMBERING,
     TraceTrajectory,
     label_traces,
     persist_traceml_labels,
     traceml_bank,
-    trajectory_from_workflow_steps,
 )
 from exp.simulation.mining.traceml_moves import MoveJudge, MoveJudgeError
+from exp.simulation.mining.traceml_turns import POINT_NUMBERING, trajectory_by_turns
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.rules.recall import RecallPolicy
 
@@ -326,7 +325,7 @@ def attempt_trajectory(
     saved before turn ``k``'s decision, even when one turn made several tool calls.
     """
     rows = labelled_steps(branch, alias, limit)
-    return trajectory_from_workflow_steps(
+    return trajectory_by_turns(
         f"{alias}/attempt:{branch.index}",
         alias,
         rows,
@@ -527,7 +526,7 @@ class _TraceMLStage:
         The stage reads the qualification bar and the grading settings from outside its own
         slice, so a changed bar or grader re-keys it instead of replaying records answered
         under the old ones. Its labels and bars number points by actor turn
-        (:data:`~exp.simulation.mining.traceml.POINT_NUMBERING`), so records saved under the
+        (:data:`~exp.simulation.mining.traceml_turns.POINT_NUMBERING`), so records saved under the
         earlier call-position numbering re-key too; the actor groups, keyed by their own jobs,
         still replay.
         """

@@ -105,12 +105,6 @@ STRATEGY_QUESTIONS = (
 _CONDENSE = TraceViewSpec()
 """Shared condensing controls; only the list preview size is read."""
 
-POINT_NUMBERING = "actor-turn-v1"
-"""How step boundaries number points: by actor turn, every call of one response sharing it.
-
-Records that carry point numbers (TraceML labels, point bars, behavior differences) are keyed
-by it, so records saved under the earlier call-position numbering are never replayed as turns.
-"""
 _FAILED_STATUSES = frozenset({"failure", "failed", "blocked", "unsupported", "error"})
 """Step statuses that mean the action did not succeed."""
 
@@ -127,9 +121,7 @@ class TraceStep(ContractModel):
     Attributes:
         index: Zero-based position in the trajectory.
         locator: Citation unique in its trajectory, such as ``attempt:3/step:2`` or ``span:7``.
-        boundary: Actor turns completed before this step, the point a move here is decided at.
-            Every tool call of one assistant turn shares its turn's boundary: the actor saves
-            one checkpoint per turn, after all of the turn's calls are observed.
+        boundary: Tool turns completed before this step, the point a move here is decided at.
         kind: ``tool`` for a tool call with its result, ``message`` for a visible agent message.
         tool: Called tool name, None for a message.
         arguments: Decoded call arguments.
@@ -458,7 +450,6 @@ def trajectory_from_workflow_steps(
     steps: Sequence[JsonValue],
     *,
     task: str = "",
-    turns: Sequence[int],
     locator_prefix: str = "step",
     initial_state: JsonValue = None,
     final_answer: JsonValue = None,
@@ -469,32 +460,21 @@ def trajectory_from_workflow_steps(
     optionally ``before`` and ``after`` states, as continuation outcomes and workflow evidence
     record them. Locators are ``<prefix>:<i>`` with ``i`` 1-based, so a continuation attempt's
     steps cite as ``attempt:<n>/step:<i>`` with prefix ``attempt:<n>/step``, matching the
-    evidence packet. A step is decided at its actor turn's point, ``turns[i]``
-    (:func:`workflow_step_turns`), never at its call position: one assistant turn may make
-    several calls, and the actor saves one checkpoint per turn.
+    evidence packet, and step ``i`` (0-based) is decided at point ``i``.
 
     Args:
         trace_id: Trajectory identity.
         tier: Producer tier.
         steps: Saved step mappings in order; anything else is skipped.
         task: Task text.
-        turns: Actor turn of each step mapping, in order, non-decreasing.
         locator_prefix: Locator prefix.
         initial_state: State before the first step, when recorded.
-        final_answer: The final answer, appended as a message step when present; it is decided
-            in the turn after the last step's.
-
-    Raises:
-        ValueError: ``turns`` does not give one non-negative, non-decreasing turn per step.
+        final_answer: The final answer, appended as a message step when present.
     """
-    kept = [raw for raw in steps if isinstance(raw, dict)]
-    turns = tuple(turns)
-    if len(turns) != len(kept):
-        raise ValueError(f"trajectory {trace_id} has {len(kept)} steps but {len(turns)} turns")
-    if any(turn < 0 for turn in turns) or list(turns) != sorted(turns):
-        raise ValueError(f"trajectory {trace_id} step turns must be non-negative and in order")
     rows: list[TraceStep] = []
-    for raw, turn in zip(kept, turns, strict=True):
+    for raw in steps:
+        if not isinstance(raw, dict):
+            continue
         action = raw.get("action")
         action = action if isinstance(action, dict) else {}
         name, status = action.get("name", action.get("tool")), raw.get("status")
@@ -504,7 +484,7 @@ def trajectory_from_workflow_steps(
             TraceStep(
                 index=len(rows),
                 locator=f"{locator_prefix}:{len(rows) + 1}",
-                boundary=turn,
+                boundary=len(rows),
                 kind="tool",
                 tool=name if isinstance(name, str) else None,
                 arguments=action.get("arguments"),
@@ -516,10 +496,8 @@ def trajectory_from_workflow_steps(
         )
     if final_answer is not None:
         locator, text = f"{locator_prefix}:final", _rendered(final_answer)
-        n, turn = len(rows), turns[-1] + 1 if turns else 0
-        rows.append(
-            TraceStep(index=n, locator=locator, boundary=turn, kind="message", message=text)
-        )
+        n = len(rows)
+        rows.append(TraceStep(index=n, locator=locator, boundary=n, kind="message", message=text))
     return TraceTrajectory(
         trace_id=trace_id,
         tier=tier,
@@ -527,57 +505,6 @@ def trajectory_from_workflow_steps(
         initial_state_sha256=None if initial_state is None else sha256_json(initial_state),
         steps=tuple(rows),
     )
-
-
-def workflow_step_turns(
-    steps: Sequence[JsonValue], model_calls: Sequence[JsonValue]
-) -> tuple[int, ...]:
-    """Return the actor turn of each saved step, matched to the turn's call by ``call_id``.
-
-    A continuation outcome records one ``model_calls`` receipt per actor turn and one ``steps``
-    row per dispatched tool call, in call order. The actor saves one checkpoint per turn, after
-    every call of the turn is observed, so a step's fork point is its turn's index: the state
-    before the assistant response that made the call. Calls of a length-stopped response are
-    never dispatched and hold no step.
-
-    Args:
-        steps: Saved step mappings in order; anything else is skipped, as
-            :func:`trajectory_from_workflow_steps` skips it.
-        model_calls: Saved actor call receipts in order, each with its ``response``.
-
-    Returns:
-        One zero-based turn index per step mapping.
-
-    Raises:
-        ValueError: A step's action does not match the next call its turns made, or a step is
-            left over after every recorded call.
-    """
-    kept = [raw for raw in steps if isinstance(raw, dict)]
-    turns: list[int] = []
-    for turn, receipt in enumerate(model_calls):
-        response = receipt.get("response") if isinstance(receipt, dict) else None
-        if not isinstance(response, dict) or response.get("finish_reason") == "length":
-            continue
-        output = response.get("output")
-        calls = output.get("tool_calls") if isinstance(output, dict) else None
-        for call in calls if isinstance(calls, list) else ():
-            if len(turns) == len(kept):
-                break
-            action = kept[len(turns)].get("action")
-            action = action if isinstance(action, dict) else {}
-            expected = (call.get("call_id"), call.get("name")) if isinstance(call, dict) else None
-            if (action.get("call_id"), action.get("name")) != expected:
-                raise ValueError(
-                    f"step {len(turns) + 1} action {action.get('call_id')!r} is not call "
-                    f"{expected!r} of actor turn {turn}; the steps and actor calls disagree"
-                )
-            turns.append(turn)
-    if len(turns) != len(kept):
-        raise ValueError(
-            f"{len(kept) - len(turns)} of {len(kept)} steps match no recorded actor call; "
-            "their turns, and so their fork points, are unknown"
-        )
-    return tuple(turns)
 
 
 def step_row_id(trace_id: str, locator: str) -> str:

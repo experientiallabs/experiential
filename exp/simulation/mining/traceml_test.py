@@ -42,7 +42,6 @@ from exp.simulation.mining.traceml import (
     traceml_bank,
     trajectory_from_trace,
     trajectory_from_workflow_steps,
-    workflow_step_turns,
 )
 from exp.simulation.mining.traceml_moves import (
     DEFAULT_MOVE_VARIANTS,
@@ -158,7 +157,6 @@ def _research(tier: str = "glm-5.3", trace_id: str = "attempt-0") -> TraceTrajec
         tier,
         steps,
         task="Fix the failing build.",
-        turns=range(len(steps)),
         locator_prefix="attempt:0/step",
         initial_state={"v": 0},
     )
@@ -316,12 +314,7 @@ def test_a_pivot_on_the_same_tool_and_target_is_judged() -> None:
         _step("edit", {"path": "a.py", "change": "rewrite the config loader instead"}),
     ]
     trajectory = trajectory_from_workflow_steps(
-        "same-target",
-        "kimi-k3",
-        steps,
-        task="Fix the build.",
-        turns=range(len(steps)),
-        locator_prefix="attempt:0/step",
+        "same-target", "kimi-k3", steps, task="Fix the build.", locator_prefix="attempt:0/step"
     )
     judge = _unanimous([("pivot", "attempt:0/step:3", None)])
     labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=judge)
@@ -424,9 +417,7 @@ def test_without_a_judge_moves_are_recorded_as_not_judged() -> None:
 def test_uncertain_steps_are_kept_and_counted() -> None:
     """A step answered inside the ambiguity band is kept, flagged and counted, never dropped."""
     steps = [_step("search", {"query": "x"}), _step("ponder", {"about": "y"})]
-    trajectory = trajectory_from_workflow_steps(
-        "unsure", "gemma-4-26b-a4b-it", steps, turns=range(len(steps))
-    )
+    trajectory = trajectory_from_workflow_steps("unsure", "gemma-4-26b-a4b-it", steps)
     labels = label_traces([trajectory], tagger=_tagger(_Scripted()), bank=_bank(), move_judge=None)
 
     step = labels.traces[0].steps[1]
@@ -437,7 +428,7 @@ def test_uncertain_steps_are_kept_and_counted() -> None:
 def test_a_refused_trace_and_an_empty_trace_are_recorded_in_the_coverage_manifest() -> None:
     """One trace failing to tag does not abort the others; every planned step is counted."""
     refused = trajectory_from_workflow_steps(
-        "refused", "glm-5.3-flash", [_step("search", {"query": "poison"})], turns=(0,)
+        "refused", "glm-5.3-flash", [_step("search", {"query": "poison"})]
     )
     empty = TraceTrajectory(trace_id="empty", tier="glm-5.3-flash")
     labels = label_traces(
@@ -459,7 +450,7 @@ def test_a_refused_trace_and_an_empty_trace_are_recorded_in_the_coverage_manifes
 def test_tiers_are_compared_with_human_as_the_reference() -> None:
     """Distributions differ across tiers, so their divergence is positive."""
     explorer = trajectory_from_workflow_steps(
-        "human-0", "human", [_step("search", {"query": str(n)}) for n in range(3)], turns=range(3)
+        "human-0", "human", [_step("search", {"query": str(n)}) for n in range(3)]
     )
     labels = label_traces(
         [_research("mimo-v2.6-pro"), explorer],
@@ -585,49 +576,3 @@ def test_a_canonical_trace_becomes_tool_and_message_steps() -> None:
     )
     assert [step.dominant for step in labels.traces[0].steps] == ["explore", "ask"]
     assert labels.traces[0].steps[0].strategy == {}
-
-
-def _receipt(*calls: tuple[str, str], finish: str = "completed") -> JsonObject:
-    """One saved actor call receipt making ``(name, call_id)`` calls in one response."""
-    tool_calls: list[JsonValue] = [
-        {"call_id": call_id, "name": name, "arguments": {}} for name, call_id in calls
-    ]
-    output: JsonObject = {"content": None if calls else "done", "tool_calls": tool_calls}
-    return {"response": {"output": output, "finish_reason": finish}}
-
-
-def _called(name: str, call_id: str) -> JsonObject:
-    """One saved step for the call."""
-    return {"action": {"call_id": call_id, "name": name, "arguments": {}}, "status": "valid"}
-
-
-def test_steps_of_one_assistant_turn_share_its_point() -> None:
-    """Parallel calls of one response are decided at the same point, the turn's index."""
-    steps = [_called("read", "a"), _called("grep", "b"), _called("edit", "c"), _called("test", "d")]
-    calls = [
-        _receipt(("read", "a"), ("grep", "b")),
-        _receipt(("edit", "c"), finish="length"),
-        _receipt(("edit", "c"), ("test", "d")),
-        _receipt(),
-    ]
-    # The length-stopped response dispatched nothing; its re-issued calls belong to turn 2.
-    assert workflow_step_turns(steps, calls) == (0, 0, 2, 2)
-    trajectory = trajectory_from_workflow_steps(
-        "t", "kimi-k3", steps, turns=(0, 0, 2, 2), final_answer="done"
-    )
-    assert [step.boundary for step in trajectory.steps] == [0, 0, 2, 2, 3]
-    # A prefix of the steps (a labelling bound) takes the prefix of the turns.
-    assert workflow_step_turns(steps[:3], calls) == (0, 0, 2)
-
-
-def test_steps_that_disagree_with_the_actor_calls_are_refused() -> None:
-    """A step that matches no call, or the wrong one, has no known fork point."""
-    calls = [_receipt(("read", "a"))]
-    with pytest.raises(ValueError, match="disagree"):
-        workflow_step_turns([_called("read", "z")], calls)
-    with pytest.raises(ValueError, match="match no recorded actor call"):
-        workflow_step_turns([_called("read", "a"), _called("edit", "b")], calls)
-    with pytest.raises(ValueError, match="steps but 1 turns"):
-        trajectory_from_workflow_steps("t", "kimi-k3", [_called("read", "a")] * 2, turns=(0,))
-    with pytest.raises(ValueError, match="in order"):
-        trajectory_from_workflow_steps("t", "kimi-k3", [_called("read", "a")] * 2, turns=(1, 0))
