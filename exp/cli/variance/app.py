@@ -49,6 +49,9 @@ def run_command(
     detach: bool = typer.Option(
         False, "--detach", help="Run in the background; closing the terminal keeps it running."
     ),
+    step: bool = typer.Option(
+        False, "--step", help="Pause before and after each stage to show its evidence."
+    ),
     log: Path | None = LOG_OPTION,
     code_revision: str | None = REVISION_OPTION,
 ) -> None:
@@ -67,6 +70,7 @@ def run_command(
                 consent=consent,
                 non_interactive=non_interactive,
                 detach=detach,
+                step=step,
                 log=log,
                 code_revision=code_revision,
             ),

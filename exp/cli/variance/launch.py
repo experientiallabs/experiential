@@ -22,7 +22,7 @@ by the CLI so ``exp variance run`` is the whole demo:
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -195,6 +195,8 @@ class ReportingExecutor:
     inner: StageExecutor
     stage: StageName
     hook: ProgressHook
+    before: Callable[[str, str], None] | None = None
+    after: Callable[[str, str, Mapping[str, object]], None] | None = None
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
         """Delegate: the identity is the owner's."""
@@ -214,15 +216,23 @@ class ReportingExecutor:
         index = stages.index(self.stage)
         name = f"pipeline {task}"
         report(self.hook, name, completed=index, total=len(stages), detail=self.stage)
+        if self.before is not None:
+            self.before(task, self.stage)
         result = self.inner.run(context)
         report(self.hook, name, completed=index + 1, total=len(stages), detail=self.stage)
+        if self.after is not None:
+            self.after(task, self.stage, result.summary)
         return result
 
 
-def reporting_executors(hook: ProgressHook) -> dict[StageName, StageExecutor]:
-    """The owner-bound pipeline executors, each wrapped to report its stage."""
+def reporting_executors(
+    hook: ProgressHook,
+    before: Callable[[str, str], None] | None = None,
+    after: Callable[[str, str, Mapping[str, object]], None] | None = None,
+) -> dict[StageName, StageExecutor]:
+    """The owner-bound pipeline executors, each wrapped to report its stage (and step)."""
     return {
-        stage: ReportingExecutor(executor, stage, hook)
+        stage: ReportingExecutor(executor, stage, hook, before, after)
         for stage, executor in DEFAULT_EXECUTORS.items()
     }
 
@@ -235,6 +245,8 @@ def front_door_dependencies(
     root: Path,
     announce: Callable[[tuple[str, ...]], None] | None = None,
     progress: ProgressHook | None = None,
+    before_stage: Callable[[str, str], None] | None = None,
+    after_stage: Callable[[str, str, Mapping[str, object]], None] | None = None,
 ) -> FrontDoorDependencies:
     """Every collaborator the run needs, as the operator scripts bound them.
 
@@ -266,7 +278,9 @@ def front_door_dependencies(
     return FrontDoorDependencies(
         builder=ExpBuild(root=root, project=project.paths.project_id),
         bootstrap=BootstrapDependencies(decisions=memory),
-        executors=None if progress is None else reporting_executors(progress),
+        executors=None
+        if progress is None
+        else reporting_executors(progress, before_stage, after_stage),
         slots={name: slot_executor(name) for name in configured_slots(spec)},
         announce=announce,
         progress=progress,

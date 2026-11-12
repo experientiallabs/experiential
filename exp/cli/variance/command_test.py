@@ -253,6 +253,32 @@ def test_watch_without_a_run_names_the_missing_run(tmp_path: Path, fakes: Fakes)
     assert "no front-door run" in result.output
 
 
+def test_step_cannot_detach(tmp_path: Path, fakes: Fakes) -> None:
+    """Step mode pauses in this terminal."""
+    result = _invoke(tmp_path, "--step", "--detach", "--yes")
+    assert result.exit_code != 0 and fakes.planned == 0
+
+
+def test_step_on_a_replay_needs_no_consent_and_runs_with_cards(
+    tmp_path: Path, fakes: Fakes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete plan replays without a question or a ceiling, in step mode."""
+    complete = PLAN.model_copy(
+        update={
+            "stages": tuple(
+                row.model_copy(update={"status": StageState.DONE, "costs": ()})
+                for row in PLAN.stages
+            )
+        }
+    )
+    monkeypatch.setattr(command, "plan_front_door", lambda store, value, **kwargs: complete)
+    result = _invoke(tmp_path, "--step", "--non-interactive")
+    assert result.exit_code == 0, result.output
+    assert "Step mode every stage replays from the store; no model call" in result.output
+    (run,) = fakes.runs
+    assert run["approval"] is None and fakes.ceilings == []
+
+
 def _options(tmp_path: Path) -> command.RunOptions:
     """The options the consent test invoked."""
     return command.RunOptions(

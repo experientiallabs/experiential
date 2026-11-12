@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,8 +44,9 @@ from exp.cli.variance.sources import (
     read_admission,
     segment_after,
 )
+from exp.cli.variance.step import Stepper
 from exp.cli.variance.view import FrontDoorView, progress_view
-from exp.common.progress import report
+from exp.common.progress import ProgressEvent, report
 from exp.common.project import ProjectStore
 from exp.common.project.database import content_database_path
 from exp.optimize.evaluation.variance.frontdoor import (
@@ -73,6 +75,7 @@ class RunOptions:
     consent: str | None = None
     non_interactive: bool = False
     detach: bool = False
+    step: bool = False
     log: Path | None = None
     code_revision: str | None = None
 
@@ -93,9 +96,19 @@ def run(console: Console, options: RunOptions) -> None:
     spec = launch.load_spec(options.spec)
     aliases = launch.check_spec(spec)
     revision = options.code_revision or launch.source_revision()
+    if options.step and options.detach:
+        raise ValueError("--step pauses in this terminal; it cannot be combined with --detach")
     view = FrontDoorView(title="front door", project=options.project)
+    relay = Relay(view)
     dependencies = launch.front_door_dependencies(
-        store, spec, revision, root=options.root, announce=view.announce, progress=view.observe
+        store,
+        spec,
+        revision,
+        root=options.root,
+        announce=view.announce,
+        progress=relay.observe,
+        before_stage=relay.before,
+        after_stage=relay.after,
     )
     render_preflight(console, options, launch.slot_names(spec), revision, aliases)
     with progress_display(console) as hook:
@@ -116,7 +129,7 @@ def run(console: Console, options: RunOptions) -> None:
     if options.detach:
         detach(console, options, store, spec, plan, revision)
         return
-    run_here(console, options, store, spec, plan, revision, dependencies, view)
+    run_here(console, options, store, spec, plan, revision, dependencies, view, relay)
 
 
 def render_preflight(
@@ -233,8 +246,9 @@ def run_here(
     revision: str,
     dependencies: object,
     view: FrontDoorView,
+    relay: Relay | None = None,
 ) -> None:
-    """Install the ceiling and run the front door in this process under the progress line."""
+    """Install the ceiling and run the front door here: under the progress line, or stepping."""
     from exp.cli.evaluation.front_door_action import front_door_summary
     from exp.cli.evaluation.learning_summary import save_details
     from exp.runtime.models.spend_ceiling import operation_spend_scope
@@ -263,8 +277,11 @@ def run_here(
             approval = launch.approval(plan, launch.DEFAULT_ADMISSION_ATTEMPTS)
         save_record(store, record)
         refresh = refresher(options.root, options.project, view, record)
+        shown = progress_view(console, view, refresh)
+        if options.step and relay is not None:
+            shown = stepping(console, store, view, plan, record, relay, options)
         try:
-            with progress_view(console, view, refresh):
+            with shown:
                 result = run_front_door(
                     store,
                     spec,
@@ -315,6 +332,67 @@ def finish(  # noqa: PLR0913 - the closing lines need each of these
         "[dim](resumes; saved work replays)[/dim]"
     )
     raise typer.Exit(code=2)
+
+
+class Relay:
+    """Forwards the front door's hooks to the view, or to the stepper in step mode.
+
+    The dependencies are bound before the plan exists (they plan it); the stepper needs the
+    plan, so it is attached afterwards. The hooks only observe either way.
+    """
+
+    def __init__(self, view: FrontDoorView) -> None:
+        """Forward to the view until a stepper is attached."""
+        self.view = view
+        self.stepper: Stepper | None = None
+
+    def observe(self, event: ProgressEvent) -> None:
+        """A front-door progress event."""
+        (self.stepper.observe if self.stepper is not None else self.view.observe)(event)
+
+    def before(self, task: str, stage: str) -> None:
+        """A pipeline stage about to run."""
+        if self.stepper is not None:
+            self.stepper.before_stage(task, stage)
+
+    def after(self, task: str, stage: str, summary: Mapping[str, object]) -> None:
+        """A pipeline stage that just ran."""
+        if self.stepper is not None:
+            self.stepper.after_stage(task, stage, summary)
+
+
+@contextmanager
+def stepping(
+    console: Console,
+    store: ProjectStore,
+    view: FrontDoorView,
+    plan: FrontDoorPlan,
+    record: RunRecord,
+    relay: Relay,
+    options: RunOptions,
+) -> Iterator[None]:
+    """Step mode: cards before and after each stage instead of the progress line."""
+    runtime = store.paths.runtime_directory
+    ledger = runtime / "spend" / record.operation / "ledger.sqlite"
+    relay.stepper = Stepper(
+        console=console,
+        store=store,
+        view=view,
+        plan=plan,
+        journal=runtime / "front-door" / record.journal / "transitions.jsonl",
+        traffic=Traffic(ledger, content_database_path(options.root), options.project),
+        pause=not options.non_interactive and can_prompt(console),
+    )
+    replay = (
+        "every stage replays from the store; no model call"
+        if plan.complete
+        else ("stages that are saved replay; the others run now")
+    )
+    console.print(f"[bold]Step mode[/bold] [dim]{replay}[/dim]")
+    try:
+        yield
+    finally:
+        relay.stepper = None
 
 
 def refresher(
