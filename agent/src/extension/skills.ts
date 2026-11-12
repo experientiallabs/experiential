@@ -7,7 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,15 +34,48 @@ export function readSkills(dir: string): Record<string, string> {
   return skills;
 }
 
-/** Write a skill map under `root`, in a directory named by its content so updates never mix. */
+/**
+ * Refuse a skills directory someone else could have planted or can change: it must be ours and
+ * writable by nobody else. A skill is instructions the model follows, so a writable one is a way
+ * to steer the agent.
+ */
+function assertTrusted(path: string): void {
+  const stats = lstatSync(path);
+  const uid = process.getuid?.();
+  if (stats.isSymbolicLink() || (uid !== undefined && stats.uid !== uid) || (stats.mode & 0o022) !== 0) {
+    throw new Error(`refusing skills directory ${path}: it must be owned by this process and writable by nobody else`);
+  }
+}
+
+/** A root others can add to only if it is sticky (like /tmp): nobody can replace our entries. */
+function assertSafeRoot(path: string): void {
+  const stats = lstatSync(path);
+  if (stats.isSymbolicLink() || ((stats.mode & 0o022) !== 0 && (stats.mode & 0o1000) === 0)) {
+    throw new Error(`refusing skills root ${path}: others can write to it`);
+  }
+}
+
+/**
+ * Write a skill map under `root`, in a directory named by its content so updates never mix. The
+ * skills are world-readable (the model's tools may run as another account) and writable only by us.
+ */
 export function materializeSkills(skills: Record<string, string>, root: string): string {
   const digest = createHash("sha256").update(JSON.stringify(skills)).digest("hex").slice(0, 16);
   const dir = join(root, `exp-code-skills-${digest}`);
-  if (existsSync(dir)) return dir;
+  mkdirSync(root, { recursive: true, mode: 0o755 });
+  assertSafeRoot(root);
+  if (existsSync(dir)) {
+    assertTrusted(dir);
+    return dir;
+  }
   const staging = `${dir}.${process.pid}.tmp`;
+  mkdirSync(staging, { recursive: true, mode: 0o755 });
+  chmodSync(staging, 0o755);
   for (const [name, text] of Object.entries(skills)) {
-    mkdirSync(join(staging, name), { recursive: true });
-    writeFileSync(join(staging, name, "SKILL.md"), text);
+    mkdirSync(join(staging, name), { mode: 0o755 });
+    chmodSync(join(staging, name), 0o755);
+    writeFileSync(join(staging, name, "SKILL.md"), text, { mode: 0o644 });
+    chmodSync(join(staging, name, "SKILL.md"), 0o644);
   }
   try {
     renameSync(staging, dir);

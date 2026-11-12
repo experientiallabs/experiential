@@ -105,9 +105,13 @@ AGENT_GATEWAY_KEY=xpl_... AGENT_CALLBACK_TOKEN=... node runner.mjs <runId> \
 ```
 
 The runner reads the two secrets once and deletes them from its environment. When it runs as
-root, the model's commands run as the unprivileged `--user` account with a minimal environment,
-and files the model writes belong to that account. Extensions, prompt templates, and themes are
-never loaded from the working directory, which the model can write.
+root, every tool the model uses runs as the unprivileged `--user` account: its shell commands
+(with a minimal environment) and its file reads, writes and edits too, so the kernel decides what
+the model may touch and the private session directory (which holds the run's key) is out of its
+reach. The bundled skills are then written to `/usr/local/share/exp-code`, which must be owned by
+root and writable by nobody else (the runner refuses otherwise): the model can read them but
+never plant one. Extensions, prompt templates, and themes are never loaded from the working
+directory, which the model can write.
 
 The protocol is files under the session directory (types in `src/runner/protocol.ts`, exported
 as `exp-code/protocol`):
