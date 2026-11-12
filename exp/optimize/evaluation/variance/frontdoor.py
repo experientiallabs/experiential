@@ -44,7 +44,8 @@ from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.models.client import RequestAdmissionRefused
-from exp.common.progress import ProgressHook, report
+from exp.common.progress import ProgressHook
+from exp.common.progress import report as report_progress
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
@@ -508,7 +509,7 @@ class _Runner:
         outcomes: list[PipelineOutcome] = []
         starts = len(prepared.bindings)
         for index, binding in enumerate(prepared.bindings):
-            report(
+            report_progress(
                 deps.progress, "pipelines", completed=index, total=starts, detail=binding.task_id
             )
             try:
@@ -523,7 +524,7 @@ class _Runner:
                     stopped=f"raised {type(error).__name__}: {str(error)[:1000]}",
                 )
             outcomes.append(outcome)
-        report(deps.progress, "pipelines", completed=starts, total=starts)
+        report_progress(deps.progress, "pipelines", completed=starts, total=starts)
         stops = [f"{row.task_id}: {row.stopped}" for row in outcomes if row.stopped is not None]
         if stops:
             return report.model_copy(
@@ -572,7 +573,7 @@ class _Runner:
             state = self.tracker.stage(name, StageState.PLANNED.value)
         progress = self.dependencies.progress
         if state == StageState.DONE:
-            report(progress, name, detail="replayed")
+            report_progress(progress, name, detail="replayed")
             return work(), None
         usd = sum(row.usd for row in costs if row.usd is not None)
         attempts = sum(row.attempts for row in costs if row.usd is None)
@@ -582,11 +583,11 @@ class _Runner:
         reason = self.ledger.admit(name, usd, attempts)
         if reason is not None:
             self.tracker.stage(name, "refused")
-            report(progress, name, detail="refused")
+            report_progress(progress, name, detail="refused")
             return None, reason
         self.tracker.stage(name, "approved")
         self.tracker.stage(name, "started")
-        report(progress, name, detail="running")
+        report_progress(progress, name, detail="running")
         before = measure(self.project)
         try:
             result = work()
@@ -594,12 +595,12 @@ class _Runner:
             # A budget or admission stop is a BaseException; the phase is settled either way.
             self.ledger.settle(name, before, measure(self.project))
             self.tracker.stage(name, "raised")
-            report(progress, name, detail="raised")
+            report_progress(progress, name, detail="raised")
             raise
         self.ledger.settle(name, before, measure(self.project))
         reason = stopped(result)
         self.tracker.stage(name, "stopped" if reason is not None else "finished")
-        report(progress, name, detail="stopped" if reason is not None else "finished")
+        report_progress(progress, name, detail="stopped" if reason is not None else "finished")
         return result, reason
 
     def preview(self, name: str, costs: tuple[CostLine, ...]) -> tuple[str, ...]:
