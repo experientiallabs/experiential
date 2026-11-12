@@ -111,7 +111,7 @@ class QualificationBar(ContractModel):
 
 DEFAULT_BAR = QualificationBar(
     bar_id="point-bar-v1",
-    version=1,
+    version=2,
     rules=(
         MetaRule(
             rule_id="bar.consequential_choice",
@@ -122,6 +122,10 @@ DEFAULT_BAR = QualificationBar(
             rule_id="bar.downstream_failure",
             text="Does a judged error or failure follow later in the trajectory that is causally "
             "downstream of the choice made at the focal step?",
+            # Answered over one step's view, the decision model cannot see the later outcome
+            # (run 32: maximum 0.56 over 446 steps, so no point could ever qualify). Outcome
+            # consequences are measured instead: a point whose blast radius is zero is rejected.
+            required=False,
         ),
         MetaRule(
             rule_id="bar.observable_facts",
