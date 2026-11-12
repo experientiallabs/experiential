@@ -30,7 +30,11 @@ Tagging (:class:`RubricStepTagger`). Each step is rendered as structured JSON ev
 - ``action``: the tool, arguments and recorded output of a tool call;
 - ``claim``: an agent message with the tool calls recorded since the latest file change.
 
-A slot's questions are asked in one request per step (speculative fan-out). A tag's value is the
+Questions citing the same slot fields are asked in one request per step (speculative fan-out),
+and each request carries only the fields its questions cite, since unrelated state is a
+distractor (measured on the pilot: restricting the edit slot to ``source`` sharpened the code
+tags). A ``true``/``false`` side may be a :class:`Situation` with generic example shapes
+(structured criteria). A tag's value is the
 minimum over its applicability answer and its parts, each part being the agreement of its two
 wordings (a disagreement across the band reads 0.5). The minimum is exactly the three-way rule of
 a conjunction: present when every proposition is above the band, absent when any is below it,
