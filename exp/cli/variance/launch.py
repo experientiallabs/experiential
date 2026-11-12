@@ -131,19 +131,50 @@ def check_spec(spec: FrontDoorSpec) -> dict[str, str | None]:
     Raises:
         SpecRefused: An ``astra_alias`` is set, an alias is ``jev``, or a decision is not Clef.
     """
-    if spec.astra_alias is not None:
+    aliases = decision_aliases(spec)
+    check_aliases(aliases, astra_alias=spec.astra_alias, text=spec.model_dump_json())
+    return aliases
+
+
+def check_aliases(aliases: dict[str, str | None], *, astra_alias: str | None, text: str) -> None:
+    """Refuse an Astra role, the retired ``jev`` alias and any decision not answered by Clef.
+
+    Args:
+        aliases: Every decision alias, by where it is set.
+        astra_alias: The spec's ``astra_alias``.
+        text: The spec's JSON.
+
+    Raises:
+        SpecRefused: The first rule broken.
+    """
+    if astra_alias is not None:
         raise SpecRefused(
-            f"the spec declares astra_alias {spec.astra_alias!r}; every pipeline role must be "
+            f"the spec declares astra_alias {astra_alias!r}; every pipeline role must be "
             "open-weight, so remove it"
         )
-    if '"jev"' in spec.model_dump_json():
+    if '"jev"' in text:
         raise SpecRefused("the spec still names the retired alias jev")
-    aliases = decision_aliases(spec)
     wrong = {where: alias for where, alias in aliases.items() if alias != "clef"}
     if wrong:
         named = ", ".join(f"{where}={alias}" for where, alias in sorted(wrong.items()))
         raise SpecRefused(f"every decision must be answered by clef; these are not: {named}")
-    return aliases
+
+
+def load_spec(path: Path) -> FrontDoorSpec:
+    """Read and validate one front-door spec file."""
+    return FrontDoorSpec.model_validate_json(path.read_bytes())
+
+
+def slot_names(spec: FrontDoorSpec) -> list[str]:
+    """The configured slots, in their fixed order."""
+    return [str(name) for name in configured_slots(spec)]
+
+
+def journal_name(project: ProjectStore, spec: FrontDoorSpec) -> str:
+    """The registration's run directory name, ``front-door-<spec16>``."""
+    from exp.optimize.evaluation.variance.frontdoor import run_directory
+
+    return run_directory(project, spec).name
 
 
 def priced_bound(plan: FrontDoorPlan) -> float:

@@ -46,7 +46,6 @@ from exp.optimize.evaluation.variance.frontdoor import (
     FrontDoorReport,
     FrontDoorSpec,
     plan_front_door,
-    run_directory,
     run_front_door,
 )
 
@@ -98,14 +97,14 @@ def load_env(path: Path) -> None:
 def run(console: Console, options: RunOptions) -> None:
     """Preflight, plan, consent once by digest, then run (in process or detached)."""
     store = ProjectStore(options.root, options.project)
-    spec = FrontDoorSpec.model_validate_json(options.spec.read_bytes())
+    spec = launch.load_spec(options.spec)
     aliases = launch.check_spec(spec)
     revision = options.code_revision or launch.source_revision()
     view = FrontDoorView(title="front door (planning)", project=options.project)
     dependencies = launch.front_door_dependencies(
         store, spec, revision, root=options.root, announce=view.announce, progress=view.observe
     )
-    render_preflight(console, options, spec, revision, aliases)
+    render_preflight(console, options, launch.slot_names(spec), revision, aliases)
     started = time.monotonic()
     with progress_display(console) as hook:
         report(hook, "planning: reading the store, no model call")
@@ -134,13 +133,11 @@ def run(console: Console, options: RunOptions) -> None:
 def render_preflight(
     console: Console,
     options: RunOptions,
-    spec: FrontDoorSpec,
+    slots: list[str],
     revision: str,
     aliases: dict[str, str | None],
 ) -> None:
     """The ``exp build``-style preflight block."""
-    from exp.optimize.evaluation.variance.frontdoor import configured_slots
-
     console.print("[bold]Front-door preflight[/bold]")
     console.print(Text.assemble(("  spec        ", "dim"), str(options.spec)))
     console.print(Text.assemble(("  project     ", "dim"), f"{options.project} at {options.root}"))
@@ -152,7 +149,7 @@ def render_preflight(
         )
     )
     console.print(Text.assemble(("  roles       ", "dim"), "open-weight only (no astra_alias)"))
-    console.print(Text.assemble(("  slots       ", "dim"), ", ".join(configured_slots(spec))))
+    console.print(Text.assemble(("  slots       ", "dim"), ", ".join(slots)))
     console.print(
         Text.assemble(
             ("  spend       ", "dim"),
@@ -226,7 +223,7 @@ def detach(
     pid = spawn_detached(arguments, log)
     record = RunRecord(
         digest=plan.digest,
-        journal=run_directory(store, spec).name,
+        journal=launch.journal_name(store, spec),
         operation=launch.operation_name(plan.digest),
         spec=str(options.spec.resolve()),
         revision=revision,
@@ -261,7 +258,7 @@ def run_here(
 
     record = RunRecord(
         digest=plan.digest,
-        journal=run_directory(store, spec).name,
+        journal=launch.journal_name(store, spec),
         operation=launch.operation_name(plan.digest),
         spec=str(options.spec.resolve()),
         revision=revision,
@@ -310,7 +307,7 @@ def run_here(
         for line in view.summary_lines():
             console.print(Text(f"  {line}"))
     details = save_details(
-        store, "front-door", run_directory(store, spec).name, result.model_dump_json(indent=2)
+        store, "front-door", launch.journal_name(store, spec), result.model_dump_json(indent=2)
     )
     console.print_json(data=front_door_summary(result))
     console.print(Text(f"Report: {details}"))
@@ -352,6 +349,8 @@ def refresher(
         }
         if segment is not None:
             values["note"] = ""
+        elif not view.note:
+            values["note"] = "waiting for the run's journal (a run re-plans first; no model call)"
         tasks = view.tasks()
         if tasks and time.monotonic() - float(state["probed"]) >= STORE_EVERY:  # ty: ignore
             if state["store"] is None:

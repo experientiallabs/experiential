@@ -321,6 +321,8 @@ class FrontDoorView:
                 previous = moment
             elif sub is not None and sub.stage == stage:
                 state = "done" if sub.finished else "running"
+                if sub.finished:
+                    previous = datetime.fromtimestamp(sub.at, UTC)
             elif first_open and phase_state in ("running", "failed", "stopped_at_cap"):
                 state = "running" if phase_state == "running" else phase_state
             else:
@@ -545,7 +547,7 @@ class FrontDoorView:
             line.append(glyph, style=style)
         label_style = "dim" if row.state in ("planned", "blocked", "pending") else ""
         line.append(f" {row.label:<{max(1, 38 - 2 * row.depth)}}", style=label_style)
-        line.append(f" {_WORDS.get(row.state, row.state):<8}", style=style)
+        line.append(f" {_WORDS.get(row.state, row.state):<11}", style=style)
         if row.elapsed is not None:
             line.append(f" {duration_text(row.elapsed):>7}", style="dim")
         if row.note:

@@ -12,6 +12,7 @@ newest run.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import typer
@@ -71,7 +72,7 @@ def run_command(
     """Plan the front door, consent once by plan digest, and run it under a live view."""
     from exp.cli.variance import command
 
-    console = Console(theme=EXP_THEME)
+    console = Console(theme=EXP_THEME, soft_wrap=not sys.stdout.isatty())
     with usage_error(OSError, ValueError):
         for path in env_file or ():
             command.load_env(path)
@@ -110,6 +111,6 @@ def watch_command(
     """Reopen the live view on a running or finished front door."""
     from exp.cli.variance import command
 
-    console = Console(theme=EXP_THEME)
+    console = Console(theme=EXP_THEME, soft_wrap=not sys.stdout.isatty())
     with usage_error(OSError, ValueError):
         command.watch(console, project=project, root=root, run=run, once=once, interval=interval)
