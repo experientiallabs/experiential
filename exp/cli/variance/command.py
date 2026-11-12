@@ -74,13 +74,17 @@ class RunOptions:
     non_interactive: bool = False
     detach: bool = False
     log: Path | None = None
+    code_revision: str | None = None
 
     def rerun(self, digest: str) -> list[str]:
         """The ``exp`` arguments that run exactly this plan without a question."""
-        return [
+        arguments = [
             "variance", "run", self.project, str(self.spec.resolve()),
             "--root", str(self.root.resolve()), "--consent", digest, "--non-interactive",
         ]  # fmt: skip
+        if self.code_revision is not None:
+            arguments += ["--code-revision", self.code_revision]
+        return arguments
 
 
 def run(console: Console, options: RunOptions) -> None:
@@ -88,7 +92,7 @@ def run(console: Console, options: RunOptions) -> None:
     store = ProjectStore(options.root, options.project)
     spec = launch.load_spec(options.spec)
     aliases = launch.check_spec(spec)
-    revision = launch.source_revision()
+    revision = options.code_revision or launch.source_revision()
     view = FrontDoorView(title="front door", project=options.project)
     dependencies = launch.front_door_dependencies(
         store, spec, revision, root=options.root, announce=view.announce, progress=view.observe

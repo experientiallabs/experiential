@@ -27,6 +27,7 @@ variance_app = typer.Typer(
 
 SPEC_ARGUMENT = typer.Argument(..., help="FrontDoorSpec JSON file.", exists=True, dir_okay=False)
 LOG_OPTION = typer.Option(None, "--log", hidden=True)
+REVISION_OPTION = typer.Option(None, "--code-revision", hidden=True)
 
 
 def _console() -> Console:
@@ -49,6 +50,7 @@ def run_command(
         False, "--detach", help="Run in the background; closing the terminal keeps it running."
     ),
     log: Path | None = LOG_OPTION,
+    code_revision: str | None = REVISION_OPTION,
 ) -> None:
     """Plan the front door, consent once by plan digest, and run it."""
     from exp.cli.variance import command
@@ -66,6 +68,7 @@ def run_command(
                 non_interactive=non_interactive,
                 detach=detach,
                 log=log,
+                code_revision=code_revision,
             ),
         )
 
