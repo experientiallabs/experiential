@@ -16,6 +16,7 @@ EXPECTED_SUBCOMMANDS = {
     "capture": set(),
     "config": {"budget", "gateway", "judge", "providers", "telemetry"},
     "optimize": {"model", "router"},
+    "variance": {"run", "watch"},
 }
 
 
@@ -35,6 +36,7 @@ def test_root_cli_and_subgroups_are_exact() -> None:
         "login",
         "optimize",
         "run",
+        "variance",
     }
 
     for name, expected in EXPECTED_SUBCOMMANDS.items():

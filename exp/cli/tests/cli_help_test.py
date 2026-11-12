@@ -54,6 +54,7 @@ def test_help_renders_only_user_facing_descriptions(argv: list[str]) -> None:
         ["config", "judge", "calibrate", "--help"],
         ["optimize", "router", "--help"],
         ["optimize", "model", "--help"],
+        ["variance", "run", "--help"],
     ],
 )
 def test_every_paid_command_exposes_deterministic_agent_flags(argv: list[str]) -> None:
