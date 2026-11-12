@@ -11,7 +11,6 @@ grader answers through a scripted decision client.
 from __future__ import annotations
 
 import json
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,17 +20,11 @@ import pytest
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
-from exp.optimize.evaluation.continuations.job import (
-    continuation_result_reference,
-    execute_continuation_job,
+from exp.optimize.evaluation.executable.judged_acceptance import (
+    accept_judged_task,
+    load_judged_acceptance,
 )
-from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.package import verify_executable_package
-from exp.optimize.evaluation.executable.qualification import (
-    ExecutableQualificationSpec,
-    load_executable_qualification,
-    qualify_executable_task,
-)
 from exp.optimize.evaluation.executable.task import persist_executable_task
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, run_actor_critic
@@ -62,13 +55,6 @@ from exp.optimize.evaluation.variance.tests.grounded_world_test import (
     grounded_rules_stage,
 )
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
-from exp.simulation.evaluation.admission import (
-    EvaluationSpecification,
-    persist_specification,
-    record_label_witness,
-)
-from exp.simulation.evaluation.calibration import CalibrationCase
-from exp.simulation.evaluation.tasks import TaskVerifier, VerifierChallenge
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 
 _INTENT = "Escalate or close a support ticket as its service tier requires."
@@ -270,97 +256,27 @@ def _run(
 
 
 def _qualification(run: _Run, report: FamilyReport, scenario_id: str) -> ArtifactInput:
-    """Qualify the exact executable task of one variant with a feasible run and controls."""
+    """Accept the exact executable task of one variant by its frozen judge over a feasible run.
+
+    The export separately requires the family's eligibility, so the acceptance here takes the
+    admission as given and checks only the judged feasible run.
+    """
     project = run.project
     task = family_executable_task(report, scenario_id, intent=_INTENT)
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision="test"
     )
-    study = execute_continuation_job(project, task.job, code_revision="test")
-    feasibility = continuation_result_reference(project, task.job, code_revision="test")
-    verifier = required_verifier(task.job.study)
-    independent = TaskVerifier(
-        description="Authored ticket acceptance with an independent outcome schema.",
-        outcome_schema={
-            "properties": {
-                "final_state": {
-                    "type": "object",
-                    "properties": {
-                        "tickets": {
-                            "type": "object",
-                            "properties": {"outcome": {"const": "right"}},
-                            "required": ["outcome"],
-                        }
-                    },
-                    "required": ["tickets"],
-                }
-            },
-            "required": ["final_state"],
-        },
-        allowed_tools=verifier.allowed_tools,
-        preserved_paths=verifier.preserved_paths,
-    )
-    specification = persist_specification(
-        project.artifacts,
-        EvaluationSpecification(
-            description="A handled ticket's outcome is right and its tier and lock are kept.",
-            predicate=independent,
-            subject="outcome",
-        ),
-        created_at=datetime.now(UTC),
-        code_revision="test",
-    )
-    cases = []
-    for partition in ("development", "confirmation"):
-        for index, kind in enumerate(
-            ("valid-one", "valid-two", "goal-miss", "side-effect", "unknown")
-        ):
-            outcome = deepcopy(study.branches[0].outcome)
-            final = outcome["final_state"]
-            assert isinstance(final, dict) and isinstance(final["tickets"], dict)
-            outcome["final_answer"] = f"{partition} control {index}"
-            if kind == "goal-miss":
-                final["tickets"]["outcome"] = "wrong"
-            elif kind == "side-effect":
-                final["tickets"]["severity"] = "low"
-            elif kind == "unknown":
-                outcome["steps"] = None
-            expected = (
-                "pass"
-                if kind.startswith("valid")
-                else "unassessable"
-                if kind == "unknown"
-                else "fail"
-            )
-            witness = record_label_witness(
-                project.artifacts,
-                specification=specification,
-                outcome=outcome,
-                created_at=datetime.now(UTC),
-                code_revision="test",
-            )
-            cases.append(
-                CalibrationCase(
-                    challenge=VerifierChallenge(
-                        id=f"{partition}-{kind}",
-                        outcome=outcome,
-                        expected=expected,
-                        authority="synthetic_specification",
-                        witness=witness,
-                        rationale="Authored observation-level verifier challenge.",
-                    ),
-                    lineage=f"ticket-control-{partition}-{index}",
-                    partition=partition,
-                )
-            )
-    qualification = qualify_executable_task(
+    acceptance = accept_judged_task(
         project,
-        ExecutableQualificationSpec(task=reference, feasibility=feasibility, cases=tuple(cases)),
+        reference,
+        admission=None,
+        admitted=True,
         created_at=datetime.now(UTC),
         code_revision="test",
     )
-    assert load_executable_qualification(project, qualification).qualified
-    return qualification
+    saved = load_judged_acceptance(project, acceptance)
+    assert saved.qualified, saved.refusals
+    return acceptance
 
 
 def _cited(project: ProjectStore, references: tuple[ArtifactInput, ...]) -> set[ArtifactInput]:
@@ -435,7 +351,7 @@ def test_a_grounded_family_is_qualified_confirmed_eligible_and_exported(
         qualification=qualification,
     )
     binding = verify_harbor_export(qualified)
-    assert binding["qualification"] == "qualified_observable_contract"
+    assert binding["qualification"] == "qualified_judged_acceptance"
     assert run.spec.judging is not None
     assert binding["episode_judge"] == run.spec.judging["urgent"].judge.identity
     assert "rubric" not in json.dumps(binding)

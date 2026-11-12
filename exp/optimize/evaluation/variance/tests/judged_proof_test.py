@@ -33,7 +33,6 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
@@ -42,16 +41,12 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
-    continuation_result_reference,
-    execute_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
-from exp.optimize.evaluation.executable.qualification import (
-    ExecutableQualificationSpec,
-    load_executable_qualification,
-    qualify_executable_task,
+from exp.optimize.evaluation.executable.judged_acceptance import (
+    accept_judged_task,
+    load_judged_acceptance,
 )
 from exp.optimize.evaluation.executable.task import persist_executable_task
 from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial
@@ -172,13 +167,6 @@ from exp.optimize.evaluation.variance.world_freeze import (
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.continuations import load_continuation_checkpoint
-from exp.simulation.evaluation.admission import (
-    EvaluationSpecification,
-    persist_specification,
-    record_label_witness,
-)
-from exp.simulation.evaluation.calibration import CalibrationCase
-from exp.simulation.evaluation.tasks import TaskVerifier, VerifierChallenge
 from exp.simulation.induction.sandbox import ProgramSandbox
 
 Policy = Callable[[JsonObject], str]
@@ -736,84 +724,15 @@ def qualify(proof: Proof, scenario_id: str) -> tuple[ArtifactInput, ArtifactInpu
     reference = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision=REVISION
     )
-    study = execute_continuation_job(project, task.job, code_revision=REVISION)
-    feasibility = continuation_result_reference(project, task.job, code_revision=REVISION)
-    specification = persist_specification(
-        project.artifacts,
-        EvaluationSpecification(
-            description="A handled ticket's outcome is right and its tier and lock are kept.",
-            predicate=TaskVerifier(
-                description="Authored ticket acceptance with an independent outcome schema.",
-                outcome_schema={
-                    "properties": {
-                        "final_state": {
-                            "properties": {
-                                "tickets": {
-                                    "properties": {"outcome": {"const": "right"}},
-                                    "required": ["outcome"],
-                                }
-                            },
-                            "required": ["tickets"],
-                        }
-                    },
-                    "required": ["final_state"],
-                },
-                allowed_tools=required_verifier(task.job.study).allowed_tools,
-                preserved_paths=required_verifier(task.job.study).preserved_paths,
-            ),
-            subject="outcome",
-        ),
-        created_at=datetime.now(UTC),
-        code_revision=REVISION,
-    )
-    cases = []
-    for partition in ("development", "confirmation"):
-        for index, kind in enumerate(
-            ("valid-one", "valid-two", "goal-miss", "side-effect", "unknown")
-        ):
-            outcome = json.loads(json.dumps(study.branches[0].outcome))
-            outcome["final_answer"] = f"{partition} control {index}"
-            if kind == "goal-miss":
-                outcome["final_state"]["tickets"]["outcome"] = "wrong"
-            elif kind == "side-effect":
-                outcome["final_state"]["tickets"]["severity"] = "low"
-            elif kind == "unknown":
-                outcome["steps"] = None
-            expected: Literal["pass", "fail", "unassessable"] = (
-                "unassessable"
-                if kind == "unknown"
-                else "pass"
-                if kind.startswith("valid")
-                else "fail"
-            )
-            witness = record_label_witness(
-                project.artifacts,
-                specification=specification,
-                outcome=outcome,
-                created_at=datetime.now(UTC),
-                code_revision=REVISION,
-            )
-            cases.append(
-                CalibrationCase(
-                    challenge=VerifierChallenge(
-                        id=f"{partition}-{kind}",
-                        outcome=outcome,
-                        expected=expected,
-                        authority="synthetic_specification",
-                        witness=witness,
-                        rationale="Authored observation-level verifier challenge.",
-                    ),
-                    lineage=f"ticket-proof-{partition}-{index}",
-                    partition=partition,
-                )
-            )
-    qualification = qualify_executable_task(
+    qualification = accept_judged_task(
         project,
-        ExecutableQualificationSpec(task=reference, feasibility=feasibility, cases=tuple(cases)),
+        reference,
+        admission=None,
+        admitted=True,
         created_at=datetime.now(UTC),
         code_revision=REVISION,
     )
-    saved = load_executable_qualification(project, qualification)
+    saved = load_judged_acceptance(project, qualification)
     assert saved.qualified, saved
     return reference, qualification
 

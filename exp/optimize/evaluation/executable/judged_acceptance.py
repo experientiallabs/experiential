@@ -104,13 +104,11 @@ def accept_judged_task(
         The saved acceptance.
 
     Raises:
-        ValueError: The task carries no judge or still registers a verifier.
+        ValueError: The task carries no judge.
     """
     task = load_executable_task(project, task_ref)
     if task.judge is None:
         raise ValueError("judged acceptance needs a task with an episode judge")
-    if task.job.study.verifier is not None:
-        raise ValueError("a judged task registers no verifier; its judge is the only grader")
     if saved_continuation_job(project, task.job, code_revision=code_revision) is None:
         execute_continuation_job(project, task.job, code_revision=code_revision)
     feasibility = continuation_result_reference(project, task.job, code_revision=code_revision)
@@ -181,7 +179,11 @@ def load_judged_acceptance(project: ProjectStore, reference: ArtifactInput) -> J
 
 
 def reward_qualification(
-    project: ProjectStore, reference: ArtifactInput, *, judged: bool
+    project: ProjectStore,
+    reference: ArtifactInput,
+    *,
+    judged: bool,
+    allow_native_replay: bool = True,
 ) -> tuple[ArtifactInput, str, bool, str]:
     """Return a reward gate's task, profile, verdict and scope.
 
@@ -192,6 +194,7 @@ def reward_qualification(
         project: Project holding the gate.
         reference: The saved gate.
         judged: Whether the gated task carries an episode judge.
+        allow_native_replay: Whether an unjudged task's qualification may need native replay.
 
     Raises:
         ValueError: The gate is the wrong kind for the task.
@@ -204,5 +207,9 @@ def reward_qualification(
         return accepted.task, accepted.profile_sha256, accepted.qualified, accepted.scope
     if kind == JUDGED_ACCEPTANCE_TYPE:
         raise ValueError("a judged acceptance gates only a task with an episode judge")
-    report = load_executable_qualification(project, reference)
+    report = load_executable_qualification(
+        project, reference, allow_native_replay=allow_native_replay
+    )
+    if report.spec.task != report.task:
+        raise ValueError("qualification evidence names another task")
     return report.task, report.profile_sha256, report.qualified, report.scope

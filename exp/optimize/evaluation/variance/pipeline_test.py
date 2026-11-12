@@ -1516,12 +1516,30 @@ def test_every_stage_runs_through_its_owner_on_two_tiers(
         )
         assert saved.group_tier is not None and saved.group_tier.label == tier.tier
         assert saved.spec.initial.study.checkpoint == rules.job.study.checkpoint
-        # The tier's labels and its error-ranked attempt points are both registered references.
-        assert [ref.artifact for ref in saved.spec.references] == [
+        # The rubric, the judge's verdicts on the group, the tier's labels and its error-ranked
+        # attempt points are the registered references; no verifier grade is among them.
+        references = saved.spec.references
+        assert [ref.artifact for ref in references[2:]] == [
             labels[tier.tier],
             traceml.error_points[tier.tier],
         ]
-        assert [ref.kind for ref in saved.spec.references] == ["traceml_labels", "error_points"]
+        assert references[0].artifact == run.rubric
+        assert [ref.kind for ref in references] == [
+            "grader_rubric",
+            "judge_verdicts",
+            "traceml_labels",
+            "error_points",
+        ]
+        verdicts = json.loads(
+            project.artifacts.read_bytes(references[1].artifact.artifact_id, "verdicts.json")
+        )
+        assert verdicts["source"] == traceml.judged[tier.tier].model_dump(mode="json")
+        assert {row["verdict"] for row in verdicts["attempts"]} <= {
+            "pass",
+            "fail",
+            "unassessable",
+            None,
+        }
         assert saved.spec.initial.actor_alias == tier.tier
         # Selectors and critics search the scoped world-learning index, never held-out traces.
         assert tier.retrieval is not None and saved.spec.retrieval == tier.retrieval

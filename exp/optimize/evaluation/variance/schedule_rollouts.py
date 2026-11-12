@@ -30,8 +30,9 @@ from exp.optimize.evaluation.continuations.job import (
     execute_continuation_job,
     saved_continuation_job,
 )
-from exp.optimize.evaluation.executable.qualification import load_executable_qualification
+from exp.optimize.evaluation.executable.judged_acceptance import reward_qualification
 from exp.optimize.evaluation.executable.task import load_executable_task
+from exp.optimize.evaluation.variance import judge as episode_judgment
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.judged import (
     JUDGED_LABELS_PROTOCOL,
@@ -51,21 +52,25 @@ PointDecisions = Callable[[ActorCriticReport], Mapping[str, PointDecision]]
 
 
 def validate_curriculum(project: ProjectStore, stages: Sequence[CurriculumStage]) -> None:
-    """Reproduce each executable stage's exact qualification before planning or resuming."""
+    """Reproduce each executable stage's exact reward gate before planning or resuming.
+
+    A judged stage is gated by its judged acceptance, an unjudged one by its witnessed
+    qualification without native replay (see
+    :func:`~exp.optimize.evaluation.executable.judged_acceptance.reward_qualification`).
+    """
     for stage in stages:
         if stage.job is None:
             continue
         if stage.task is None or stage.qualification is None:
             raise ValueError("executable curriculum needs its exact task and qualification")
         task = load_executable_task(project, stage.task)
-        qualification = load_executable_qualification(
-            project, stage.qualification, allow_native_replay=False
+        gated, profile, qualified, _ = reward_qualification(
+            project, stage.qualification, judged=task.judge is not None, allow_native_replay=False
         )
         if (
-            not qualification.qualified
-            or qualification.task != stage.task
-            or qualification.spec.task != stage.task
-            or qualification.profile_sha256 != task.profile()
+            not qualified
+            or gated != stage.task
+            or profile != task.profile()
             or task.job != stage.job
             or task.judge != stage.judge
         ):
@@ -158,6 +163,7 @@ def saved_actor_rollout(
         JUDGED_STUDY_TYPE,
         {
             "protocol": JUDGED_LABELS_PROTOCOL,
+            "assessment_protocol": episode_judgment.JUDGE_PROTOCOL,
             "judge": plan.episode_judge.identity,
             "study": reference.model_dump(mode="json"),
         },

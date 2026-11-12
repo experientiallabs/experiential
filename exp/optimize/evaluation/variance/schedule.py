@@ -102,7 +102,7 @@ from exp.optimize.evaluation.variance.schedule_rollouts import (
     saved_actor_rollout as saved_actor_rollout,
 )
 
-SCHEDULE_PROTOCOL = "variance-schedule-v2"
+SCHEDULE_PROTOCOL = "variance-schedule-v3"
 """Version of the schedule's decision rules; bump when a plan for the same events changes."""
 
 SCHEDULE_TYPE = "variance-schedule"
@@ -180,7 +180,7 @@ class TrainingScheduleSpec(ContractModel):
             decisions for a version 2 objective; left out of the identity while None.
     """
 
-    protocol: Literal["variance-schedule-v2"] = SCHEDULE_PROTOCOL
+    protocol: Literal["variance-schedule-v3"] = SCHEDULE_PROTOCOL
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
     base: ActorCriticSpec
     steady_draws: int = Field(default=15, ge=1, le=16, strict=True)

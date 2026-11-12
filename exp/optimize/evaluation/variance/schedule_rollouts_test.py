@@ -8,10 +8,14 @@ from typing import cast
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput
+from exp.common.project import artifact_input
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.study import required_verifier
-from exp.optimize.evaluation.executable.qualification import qualify_executable_task
+from exp.optimize.evaluation.executable.judged_acceptance import (
+    JUDGED_ACCEPTANCE_TYPE,
+    JudgedAcceptance,
+)
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.task import load_executable_task, persist_executable_task
 from exp.optimize.evaluation.variance import actor_critic_test as mining
@@ -34,7 +38,7 @@ def test_bound_rungs_replace_the_task_start_and_judge_and_unbound_tiers_keep_the
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Each rollout of a bound tier runs one rung's checkpoint, runtime and judge in turn."""
-    project, original, qualification_spec = qualified_fixture(tmp_path, monkeypatch)
+    project, original, _ = qualified_fixture(tmp_path, monkeypatch)
     task = load_executable_task(project, original)
     job = task.job
     base = mining._spec(project, job)
@@ -44,11 +48,28 @@ def test_bound_rungs_replace_the_task_start_and_judge_and_unbound_tiers_keep_the
     task_ref = persist_executable_task(
         project, task, created_at=datetime.now(UTC), code_revision="test"
     )
-    qualification = qualify_executable_task(
-        project,
-        qualification_spec.model_copy(update={"task": task_ref}),
-        created_at=datetime.now(UTC),
-        code_revision="test",
+    # The rung's judge differs from its profile on purpose, so its acceptance is saved directly.
+    feasibility = ArtifactInput(artifact_id="feasibility", sha256="4" * 64)
+    report = JudgedAcceptance(
+        task=task_ref,
+        profile_sha256=task.profile(),
+        admitted=True,
+        feasibility=feasibility,
+        judged=feasibility,
+        planned=1,
+        assessed=1,
+        passes=1,
+        qualified=True,
+    )
+    qualification = artifact_input(
+        project.artifacts.write_json(
+            artifact_id="judged-acceptance-rung",
+            artifact_type=JUDGED_ACCEPTANCE_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+            ),
+            files={"acceptance.json": report},
+        )
     )
     rung_job = task.job
     actor_study = base.initial.study.model_copy(

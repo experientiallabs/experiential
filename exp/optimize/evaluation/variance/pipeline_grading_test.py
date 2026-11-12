@@ -23,7 +23,11 @@ def ref(name: str) -> ArtifactInput:
 
 def context(*, adversarial: object | None, library_id: str | None = "agent-behavior") -> Any:  # noqa: ANN401
     """A stage context whose spec has the given adversarial and library settings."""
-    authoring = SimpleNamespace(adversarial=adversarial, library_id=library_id)
+    authoring = SimpleNamespace(
+        adversarial=adversarial,
+        library_id=library_id,
+        adversarial_spec=lambda: adversarial,
+    )
     spec = SimpleNamespace(mining=SimpleNamespace(rubric=None), authoring=authoring)
     build = SimpleNamespace(outputs={})
     return SimpleNamespace(

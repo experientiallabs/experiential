@@ -60,7 +60,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.behavior_pairs",
             "exp.optimize.evaluation.variance.pipeline_behaviors",
         ),
-        "5e186f7e00ef71ebcabf46a2d14f6e1186ce1959c933a5f03516ea359b18ff69",
+        "7a67bb8bdd9fb1e2f6d43181beebabaef612330aafe4d1fd7c0ab1cf26cf055f",
     ),
     Protocol(
         "exp.simulation.mining.descriptors:DESCRIPTOR_EMBEDDING",
@@ -632,12 +632,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.schedule:SCHEDULE_PROTOCOL",
-        "variance-schedule-v2",
+        "variance-schedule-v3",
         (
             "exp.optimize.evaluation.variance.schedule",
             "exp.optimize.evaluation.variance.schedule_rollouts",
         ),
-        "d80c51faffa155a2249785be154cf6a287702a6f0f8f260785af422ee1e62233",
+        "6c64a483280b166be4e6d566efaa8ac3005c19baccb6388681a8ae8f17611ace",
     ),
     Protocol(
         "exp.simulation.mining.traceml:TRACEML_PROTOCOL",

@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, JsonValue
-from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.judged_acceptance import load_judged_acceptance
 from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.task import load_executable_task
@@ -600,7 +599,7 @@ def test_every_measured_stage_runs_from_sampling_to_records_and_replays_without_
     assert rollout.spec is not None and rollout.curriculum[0].scenario_id == "urgent-nudge-0"
     assert rollout.actor_job.study.checkpoint == strong.job.study.checkpoint
     assert rollout.actor_job.configuration == strong.job.configuration
-    assert required_verifier(rollout.actor_job.study) == required_verifier(strong.job.study)
+    assert rollout.actor_job.study.verifier is None and strong.job.study.verifier is None
     assert rollout.actor_job.runtime_sha256 == strong.job.runtime_sha256
     assert all(stage.task and stage.qualification for stage in rollout.curriculum)
     assert rollout.episode_judge == strong.judge == rollout.spec.episode_judge
