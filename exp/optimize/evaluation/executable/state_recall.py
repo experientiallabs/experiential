@@ -6,6 +6,11 @@ tool response, the recorded transitions whose pre-turn state agrees best with th
 admitted native decision alias (Clef by default) through the project decision cache, so a
 replayed episode makes no call; the tie-break embedder is the world model's own retrieval
 embedder and is bound only when the index stored vectors with that exact model.
+
+A binding that also names a ``transition_bank`` serves transition-tag retrieval instead
+(:class:`~exp.simulation.retrieval.transition_tags.TransitionRAG`): ``index`` is then a
+``transition-tag-index`` and the live (state, action) is tagged in the predicted framing. Without
+it the binding, its identity and its behavior are exactly today's state-tag retrieval.
 """
 
 from __future__ import annotations
@@ -32,6 +37,12 @@ from exp.simulation.retrieval.state_rag import (
 )
 from exp.simulation.retrieval.state_tags import cached_state_decider
 from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.retrieval.transition_tags import (
+    TransitionRAG,
+    TransitionRetrievalPolicy,
+    load_transition_bank,
+    load_transition_index,
+)
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 
@@ -42,11 +53,20 @@ class StateRecallBinding(ContractModel):
         index: Saved ``state-tag-index`` artifact built over the world model's fit steps.
         policy: Frozen agreement scoring.
         decision_alias: Admitted native decision alias tagging each live state.
+        transition_bank: Saved ``transition-tag-bank`` version; when set, ``index`` is its
+            ``transition-tag-index`` and retrieval matches transitions, not states.
+        transition_policy: Transition scoring, used only with ``transition_bank``.
     """
 
     index: ArtifactInput
     policy: StateRetrievalPolicy = Field(default_factory=StateRetrievalPolicy)
     decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
+    transition_bank: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    transition_policy: TransitionRetrievalPolicy | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 def check_state_recall(catalog: ModelCatalog, binding: StateRecallBinding) -> None:
@@ -71,7 +91,7 @@ def bind_state_recall(
     clock: Callable[[], datetime],
     record: Callable[[JsonObject], None],
     embedding: RAGEmbedderBinding | None,
-) -> StateRAG:
+) -> StateRAG | TransitionRAG:
     """Return the served state retrieval over the world model's own fit transitions.
 
     Args:
@@ -91,7 +111,6 @@ def bind_state_recall(
     Raises:
         ValueError: The index was built over other transitions or another embedder.
     """
-    index = load_state_tag_index(project.artifacts, binding.index)
     artifact = load_grounded_world_model_artifact(project.artifacts, world_model)
     loaded = load_rag_index(project.artifacts, artifact.serving_rag.artifact_id)
     native = registry.resolve(binding.decision_alias)
@@ -101,6 +120,19 @@ def bind_state_recall(
         decision_caller(native, transport, deadline, clock),
         model,
     )
+    if binding.transition_bank is not None:
+        transition_index = load_transition_index(project.artifacts, binding.index)
+        if transition_index.embedder is not None:
+            raise ValueError("served transition retrieval binds only an unembedded index")
+        return TransitionRAG(
+            load_transition_bank(project.artifacts, binding.transition_bank),
+            transition_index,
+            binding.transition_policy or TransitionRetrievalPolicy(),
+            {transition.transition_id: transition for transition in loaded.transitions},
+            decide=decide,
+            record=record,
+        )
+    index = load_state_tag_index(project.artifacts, binding.index)
     embedder = None
     if index.embedder is not None:
         if embedding is None or embedding.snapshot.model_dump(mode="json") != index.embedder:
