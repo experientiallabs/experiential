@@ -129,3 +129,13 @@ def test_the_coalition_holds_every_attempt_label_selector_critic_and_step_label(
     with pytest.raises(ValueError, match="share tier"):
         mining_coalition(project, [report, report])
     assert len(load_step_labels(project, artifact_input(labels))) == 3
+
+
+def test_a_long_trigger_text_is_cut_to_the_step_label_limit() -> None:
+    """Run-31 pivots carried trigger texts past 1500 characters; they are cut, not refused."""
+    from exp.optimize.evaluation.variance.coalition import DETAIL_LIMIT, StepLabel, _bounded_detail
+
+    detail = _bounded_detail("triggers " + "x" * 4000, " (uncertain)")
+    assert len(detail) == DETAIL_LIMIT and detail.endswith("[truncated] (uncertain)")
+    StepLabel(trace_id="t", step=1, label="pivot", detail=detail)
+    assert _bounded_detail("triggers short", "") == "triggers short"

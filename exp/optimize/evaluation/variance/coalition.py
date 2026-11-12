@@ -213,6 +213,10 @@ class ContrastOutcome(ContractModel):
     status: Literal["judged"] = "judged"
 
 
+DETAIL_LIMIT = 1500
+"""Longest step-label detail; a longer TraceML trigger text is cut to fit, marked as cut."""
+
+
 class StepLabel(ContractModel):
     """One TraceML step label, analysis rather than authority.
 
@@ -229,7 +233,7 @@ class StepLabel(ContractModel):
     trace_id: str | None = None
     step: int = Field(ge=0)
     label: str = Field(min_length=1, max_length=200)
-    detail: str | None = Field(default=None, max_length=1500)
+    detail: str | None = Field(default=None, max_length=DETAIL_LIMIT)
     status: Literal["hypothesis"] = "hypothesis"
 
 
@@ -582,17 +586,25 @@ def load_step_labels(project: ProjectStore, reference: ArtifactInput) -> tuple[S
                 )
             )
         for row in (*_rows(trace, "pivots"), *_rows(trace, "returns")):
-            triggers = row.get("triggers")
+            uncertain = " (uncertain)" if row.get("uncertain") else ""
             labels.append(
                 StepLabel(
                     trace_id=trace_id,
                     step=_int(row, "step"),
                     label=str(row.get("kind")),
-                    detail=f"triggers {triggers}"
-                    + (" (uncertain)" if row.get("uncertain") else ""),
+                    detail=_bounded_detail(f"triggers {row.get('triggers')}", uncertain),
                 )
             )
     return tuple(labels)
+
+
+def _bounded_detail(text: str, suffix: str) -> str:
+    """Return ``text`` plus ``suffix``, cutting ``text`` so the whole fits :data:`DETAIL_LIMIT`."""
+    room = DETAIL_LIMIT - len(suffix)
+    if len(text) > room:
+        marker = " ... [truncated]"
+        text = text[: room - len(marker)] + marker
+    return text + suffix
 
 
 def _rows(trace: dict[str, object], key: str) -> list[dict[str, object]]:
