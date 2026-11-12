@@ -116,7 +116,12 @@ export function runAsAccount(account: SandboxAccount, argv: string[], input?: st
     child.stderr!.on("data", (chunk: Buffer) => err.push(chunk));
     child.on("error", reject);
     child.on("close", (code) => resolve({ code: code ?? 1, stdout: Buffer.concat(out), stderr: Buffer.concat(err).toString("utf8").trim() }));
-    if (input !== undefined) child.stdin!.end(input);
+    if (input !== undefined) {
+      // A command that fails early (no permission to create the file) closes its input before
+      // reading it; the exit code reports that, so the broken pipe is not a second error.
+      child.stdin!.on("error", () => undefined);
+      child.stdin!.end(input);
+    }
   });
 }
 
