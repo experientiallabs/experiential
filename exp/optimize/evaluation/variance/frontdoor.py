@@ -37,6 +37,7 @@ otherwise the run stops with saved work intact and a rerun shows the now-priced 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -101,6 +102,7 @@ from exp.optimize.evaluation.variance.pipeline import (
     plan_decision_variance,
     run_decision_variance,
 )
+from exp.optimize.evaluation.variance.pipeline_points import _deferred_path
 from exp.optimize.evaluation.variance.pipeline_spec import (
     CostLine,
     PipelineApproval,
@@ -379,6 +381,31 @@ def run_directory(project: ProjectStore, spec: FrontDoorSpec) -> Path:
     """Return the directory holding a registration's transition journal and phase ledger."""
     identity = f"front-door-{sha256_json(spec)[:16]}"
     return project.paths.runtime_directory / "front-door" / identity
+
+
+REPLAY_DEFERRED = "EXP_REPLAY_DEFERRED"
+"""Environment variable naming a replay's deferred-points snapshot directory."""
+
+
+def restore_deferred(project: ProjectStore, spec: object, task_id: str) -> None:
+    """Before a replayed start is planned, restore the deferred points it saw when it ran.
+
+    The error-mining stage keys on the shared deferred-points file, which later starts
+    overwrite. A replay sets ``EXP_REPLAY_DEFERRED`` to a directory holding, per start,
+    ``<task_id>.json`` (the file's content when that start was planned) or nothing (no file
+    existed then), so each start plans the identities it ran under. Unset, nothing changes.
+    """
+    directory = os.environ.get(REPLAY_DEFERRED)
+    if not directory:
+        return
+    path = _deferred_path(project, spec)  # type: ignore[arg-type]
+    snapshot = Path(directory) / f"{task_id}.json"
+    if snapshot.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(snapshot.read_bytes())
+    else:
+        path.unlink(missing_ok=True)
+    logger.info("replay restored deferred points for %s from %s", task_id, snapshot)
 
 
 @dataclass
@@ -661,6 +688,7 @@ class _Runner:
         """Run, resume or replay one start's pipeline as its own phase."""
         deps = self.dependencies
         pipeline_spec = self.spec.pipeline_spec(prepared, binding)
+        restore_deferred(self.project, pipeline_spec, binding.task_id)
         plan = plan_decision_variance(
             self.project, pipeline_spec, code_revision=self.code_revision, executors=deps.executors
         )
