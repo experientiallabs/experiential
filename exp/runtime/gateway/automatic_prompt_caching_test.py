@@ -265,6 +265,53 @@ def test_a_tool_definition_marker_counts_as_a_caller_marker(profile: GatewayWire
         assert _bedrock_tail(payload) != {"cachePoint": {"type": "default"}}
 
 
+def test_decoded_chat_tool_and_message_markers_survive_without_an_automatic_one() -> None:
+    """An OpenCode-shaped Chat body (last tool marked, plus message markers) keeps its own.
+
+    The decoder accepts ``tools[].cache_control``, the markers reach the Anthropic
+    payload where the caller put them, and no top-level automatic marker is added.
+    """
+    marker: JsonObject = {"type": "ephemeral"}
+    request = decode_chat(
+        {
+            "model": "claude-haiku",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": _SYSTEM, "cache_control": marker}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "List the files.", "cache_control": marker}
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "glob", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "read", "parameters": {"type": "object"}},
+                    "cache_control": marker,
+                },
+            ],
+        }
+    ).request
+    assert request.tools[-1].cache_control == marker
+    payload = _payload(_rung("anthropic"), _ANTHROPIC, request)
+    assert "cache_control" not in payload
+    tools = payload["tools"]
+    assert isinstance(tools, list) and isinstance(tools[-1], dict)
+    assert tools[-1].get("cache_control") == marker
+    assert isinstance(tools[0], dict) and "cache_control" not in tools[0]
+    rendered = str(payload).count("'cache_control'")
+    assert rendered == 3
+
+
 def test_messages_surface_is_unchanged() -> None:
     """A Messages caller decides its own caching: no marker is ever added there."""
     request = decode_messages(
