@@ -4,7 +4,7 @@ Four roles take part in bootstrapping a task's starting state from traces
 (:mod:`~exp.optimize.evaluation.variance.bootstrap`):
 
 - ``start_author`` drafts the task's public instruction, tool schemas, world manifest, initial
-  state, evaluator projection, verifier and fact ledger, separating observed, inferred and unknown
+  state, evaluator projection and fact ledger, separating observed, inferred and unknown
   facts with their supporting references.
 - ``start_reviewer`` checks whether that start is coherent, sufficiently specified and supports
   the task, and names missing deciding facts as research items or refuses with a diagnosis.
@@ -24,7 +24,7 @@ from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.rules.agent_loop import tool_schema
 
-BOOTSTRAP_PROTOCOL = "start-bootstrap-v16"
+BOOTSTRAP_PROTOCOL = "start-bootstrap-v17"
 """Version of the roles, their prompts, tools and checks; change it whenever any changes."""
 
 _REFERENCES = """References are strings from the material inventory: trace:<trace_id> or
@@ -39,30 +39,15 @@ AUTHOR_INSTRUCTION = (
 
 Produce the task's public instruction, the tool schemas the actor sees, the world manifest (every
 state domain simulated), the exact initial state, the evaluator projection (probe_paths, JSON
-pointers into the initial state), a verifier over the final state, and a ledger of facts.
-The verifier.outcome_schema field is an ordinary JSON Schema over the complete workflow,
-including final_state. Use {} when no additional shape constraint is needed; keep goal and
-preservation checks in rules, required_paths and preserved_paths. Never emit schema-editor
-metadata such as wrap or itemKeys, or a schema describing the verifier fields themselves.
-Success must measure the requested outcome and admit different valid solutions. For open-ended
-code repair, never require equality to a reference source file, a particular implementation
-fragment or one sequence of repair actions. Exact bytes are appropriate only when the public task
-explicitly requires them. Expose behavioral test results through executable tool effects and
-state, preserve the required test coverage, and accept any implementation meeting that behavior.
-An actor-written claim that tests passed is not evidence that tests executed. A verifier's
-synthetic positive control only proves its predicates can be satisfied, not that they express
-the task correctly. Consider an alternative correct solution and a plausible incorrect one;
-the verifier must distinguish them for the requested behavioral reason.
-The host grades a wrong-content control: every value your rules read outside preserved_paths
-is kept present with placeholder content of the same type (text becomes a placeholder, a
-boolean flips, a number changes, a list keeps its length with placeholder items). The verifier
-must fail it, so rules that only check a file exists, has a type or has enough items are
-refused: at least one rule must read the content or behavioral result the task asks for.
-A files map keyed by paths holds each file under one key, so pkg/mod.py is the pointer token
-pkg~1mod.py under the files map's probe, never nested segments. File keys must be the exact
-relative file names that appear in the task or initial workspace: test_engine.py stays
-test_engine.py (only a '/' inside a name is written '~1'), and a pointer naming any other file
-is refused.
+pointers into the initial state the judge sees at the end of a run), and a ledger of facts.
+There is no verifier: every attempt is graded by an LLM judge against a rubric and by behavior
+tags, so state what success means in the instruction and expose the requested outcome through
+the tools' observable effects and state. For open-ended code repair, never require equality to a
+reference source file, a particular implementation fragment or one sequence of repair actions;
+the task must admit different valid solutions. Expose behavioral test results through
+executable tool effects and state. An actor-written claim that tests passed is not evidence that
+tests executed. A files map keyed by paths holds each file under one key, so pkg/mod.py is the
+pointer token pkg~1mod.py under the files map's probe, never nested segments.
 
 Every fact is observed (recorded evidence shows it), inferred (it follows from cited evidence
 or rules) or unknown (nothing recorded decides it). Mark a fact deciding when the right course
@@ -96,24 +81,20 @@ a value is not in initial_state, add it there or drop the pointer."""
 REVIEW_INSTRUCTION = (
     """You review the starting state of one executable task before it is captured.
 
-Decide whether the start is coherent (state, manifest, tools, instruction and verifier agree),
+Decide whether the start is coherent (state, manifest, tools and instruction agree),
 sufficiently specified (every deciding fact is settled, not unknown or guessed) and supports the
 task (an actor can succeed or fail on its own decisions). Answer accept, research or refuse.
+Your stances are the start's admission: no mechanical check grades it, and every attempt is later
+graded only by an LLM judge against a rubric and by behavior tags.
 
-Verify that success measures the task's requested outcome rather than agreement with a reference
-solution. For open-ended code repair, a whole-source equality, a required implementation fragment,
-or a required sequence of repair actions rejects other correct implementations and is not a sound
-success condition. Exact bytes are appropriate only where the public task explicitly requires
+Verify that the instruction states what success means and that the start lets an actor reach it
+through observable tool effects, rather than agreement with a reference solution. For open-ended
+code repair, a task that only one hidden implementation or one sequence of repair actions could
+satisfy is not sound. Exact bytes are appropriate only where the public task explicitly requires
 those bytes. A coding task should expose behavioral test results through its executable tools and
-state, preserve the required test coverage, and accept any implementation satisfying that behavior.
-Do not accept self-reported success or actor-written claims as evidence that tests executed.
-
-Independently consider a different valid solution and a plausible invalid one. Explain whether the
-verifier distinguishes them for the right reason. Synthetic grading controls only show that the
-verifier's predicates can be satisfied; they do not show that its predicates express correctness.
-Refuse a draft that only a hidden canonical solution can pass, even when its synthetic positive
-control passes, and a draft that a placeholder implementation passes because its rules only check
-that files exist. Diagnose the defect so the author can repair the verifier and observable state.
+state. Independently consider a different valid solution and a plausible invalid one, and explain
+whether a judge reading the run's events and final state could tell them apart. Diagnose any
+defect so the author can repair the instruction and observable state.
 
 Choose research when a deciding fact is missing and the family's evidence could settle it: name
 each missing fact as a research item with the question and why it decides. Choose refuse, with a
@@ -163,7 +144,7 @@ facts each decision depends on, and settle those facts first from the evidence."
 
 REVIEW_VARIANTS: dict[str, str] = {
     "coherence_first": """Stance: check coherence first. Look for state fields, tools, manifest
-effects, instruction and verifier that disagree with each other or with the cited evidence.""",
+effects and instruction that disagree with each other or with the cited evidence.""",
     "specification_first": """Stance: check specification first. Find every fact the right course
 of action depends on and ask whether the start settles it from evidence.""",
     "task_support_first": """Stance: check task support first. Ask whether an actor can reach a
@@ -237,7 +218,6 @@ AUTHOR_ANSWER = tool_schema(
         "manifest": {"type": "object"},
         "initial_state": {"type": "object"},
         "probe_paths": {"type": "object"},
-        "verifier": {"type": "object"},
         "provenance": {"type": "string", "enum": ["observed", "reconstructed", "authored"]},
         "replay_trace": {"type": ["string", "null"]},
         "prefix_steps": {"type": "integer"},
@@ -251,7 +231,6 @@ AUTHOR_ANSWER = tool_schema(
         "manifest",
         "initial_state",
         "probe_paths",
-        "verifier",
         "provenance",
         "facts",
     ),

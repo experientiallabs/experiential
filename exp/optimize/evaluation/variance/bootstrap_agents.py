@@ -6,7 +6,7 @@ Every role is a bounded draw of the shared agentic loop
 answer tool. Prompts and stances come from
 :mod:`~exp.optimize.evaluation.variance.bootstrap_prompts`.
 
-Code only checks structure: a draft's manifest, tools, state, pointers and verifier agree; every
+Code only checks structure: a draft's manifest, tools, state and pointers agree; every
 cited reference is in the material inventory; an observed fact cites recorded evidence and an
 inferred fact cites support; the claimed provenance is one the evidence allows. Whether a start is
 coherent, sufficiently specified and supports its task, what a missing fact is, and whether a
@@ -35,7 +35,6 @@ from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
-from exp.optimize.evaluation.executable.qualification import _pins_full_output
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.agent_loop import (
     AgentProfile,
@@ -81,17 +80,9 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     bootstrap_prompts_sha256,
     instruction,
 )
-from exp.optimize.evaluation.variance.grading_controls import projection, run_controls
-from exp.optimize.evaluation.variance.verifier_paths import (
-    file_entry,
+from exp.optimize.evaluation.variance.state_pointers import (
     keyed_by_paths,
-    off_style,
-    path_tokens,
-    project_verifier,
     split,
-    ungrounded,
-    unplaced,
-    workspace_relative,
 )
 from exp.runtime.models.providers.errors import (
     ProviderResponseError,
@@ -99,7 +90,6 @@ from exp.runtime.models.providers.errors import (
 )
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleResponseError
 from exp.runtime.models.providers.transport import ProviderTransportError
-from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.rules.contracts import trace_locator, trajectory_view
 from exp.simulation.rules.model import RuleBook, ToolContract
@@ -278,27 +268,6 @@ class StartMaterial:
                 )
             ),
             "provenance": self._provenance_requirements(),
-            "verifier.argument_schemas": (
-                f"optional; maps a tool name from {tools} to a JSON Schema object over that "
-                'tool\'s arguments, e.g. {"type": "object", "properties": {"command": '
-                '{"type": "string"}}}; no \'pattern\'. Put the verifier\'s own fields '
-                "(description, outcome_schema) beside it, never inside it"
-            ),
-            "verifier coordinates": (
-                "the verifier is graded over the evaluator projection: /initial_state and "
-                "/final_state hold each probe_paths value keyed by its probe name, so required and "
-                "rule paths are /final_state/<probe>/... and preserved paths are /<probe>/...; add "
-                "a probe for every part of the state the verifier reads, for example the files map "
-                "to see a file the agent creates. A files map keyed by paths holds each file under "
-                "one key, so pkg/mod.py in a files map probed as files is /final_state/files/"
-                "pkg~1mod.py, never /final_state/files/pkg/mod.py"
-            ),
-            "verifier JSON Schemas": (
-                "outcome_schema and every argument schema are JSON Schema objects: each value "
-                'under \'properties\' is itself a schema object such as {"type": "string"}, '
-                'never a bare type string; write "type": "object" beside \'properties\', never '
-                "inside it"
-            ),
         }
 
     def _provenance_requirements(self) -> JsonObject:
@@ -376,77 +345,6 @@ class StartMaterial:
         return status, result, served if status == "ok" else ()
 
 
-JSON_TYPES = frozenset({"object", "array", "string", "number", "integer", "boolean", "null"})
-"""JSON Schema type names a bare string in a schema position is read as."""
-
-SCHEMA_KEYWORDS = frozenset(
-    {
-        "type", "properties", "items", "required", "enum", "const", "description", "title",
-        "additionalProperties", "minItems", "maxItems", "minLength", "maxLength", "minimum",
-        "maximum", "exclusiveMinimum", "exclusiveMaximum", "default", "examples", "anyOf",
-        "oneOf", "allOf", "not", "prefixItems", "contains", "uniqueItems", "minProperties",
-        "maxProperties", "format", "multipleOf",
-    }
-)  # fmt: skip
-"""Keywords that mark a ``properties`` map as a schema written one level too deep."""
-
-_SCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
-_SCHEMA_CHILDREN = (
-    "items", "additionalProperties", "additionalItems", "contains", "not", "if", "then", "else",
-    "propertyNames", "unevaluatedItems", "unevaluatedProperties",
-)  # fmt: skip
-_SCHEMA_LISTS = ("allOf", "anyOf", "oneOf", "prefixItems")
-
-
-def normalise_schema(node: JsonValue, path: str, notes: list[str]) -> JsonValue:
-    """Repair the two shapes drafts keep writing in a JSON Schema, recording each repair.
-
-    A bare type name where a schema belongs (``{"properties": {"name": "string"}}``) becomes
-    ``{"type": "string"}``. A ``properties`` map that is plainly a schema itself (its ``type`` is
-    a type name and every key is a schema keyword the parent lacks) is lifted into its parent.
-    Anything else is left for the verifier's schema check to judge.
-    """
-    if isinstance(node, str) and node in JSON_TYPES:
-        notes.append(f"{path or '/'}: wrapped the bare type {node!r} as a schema")
-        return {"type": node}
-    if not isinstance(node, dict):
-        return node
-    node = dict(node)
-    nested = node.get("properties")
-    if (
-        isinstance(nested, dict)
-        and isinstance(nested.get("type"), str)
-        and nested["type"] in JSON_TYPES
-        and set(nested) <= SCHEMA_KEYWORDS
-        and not set(nested) & (set(node) - {"properties"})
-    ):
-        notes.append(f"{path}/properties: lifted a schema written as a properties map")
-        node.pop("properties")
-        node.update(nested)
-    for key in _SCHEMA_MAPS:
-        children = node.get(key)
-        if isinstance(children, dict):
-            node[key] = {
-                name: normalise_schema(child, f"{path}/{key}/{name}", notes)
-                for name, child in children.items()
-            }
-    for key in _SCHEMA_CHILDREN:
-        child = node.get(key)
-        if isinstance(child, list) and key == "items":
-            node[key] = [
-                normalise_schema(row, f"{path}/{key}/{i}", notes) for i, row in enumerate(child)
-            ]
-        elif isinstance(child, (dict, str)):
-            node[key] = normalise_schema(child, f"{path}/{key}", notes)
-    for key in _SCHEMA_LISTS:
-        children = node.get(key)
-        if isinstance(children, list):
-            node[key] = [
-                normalise_schema(row, f"{path}/{key}/{i}", notes) for i, row in enumerate(children)
-            ]
-    return node
-
-
 def normalise_draft(
     answer: JsonObject, material: StartMaterial
 ) -> tuple[JsonObject, tuple[str, ...]]:
@@ -456,9 +354,8 @@ def normalise_draft(
     task tool, so the author's versions never decide either: ``tools`` is filled from the task,
     ``manifest.tools`` keeps the author's first policy for each task tool, drops repeats and
     extras, and declares a missing tool as reading and writing every domain (an effect the
-    family's contracts do not settle is not assumed absent). Verifier and argument schemas get
-    :func:`normalise_schema`; slash-split pointers and a replay trace named by its locator are
-    canonicalised. The checks still run on the result.
+    family's contracts do not settle is not assumed absent). Slash-split pointers and a replay
+    trace named by its locator are canonicalised. The checks still run on the result.
     """
     notes: list[str] = []
     answer = dict(answer)
@@ -489,41 +386,11 @@ def normalise_draft(
                 )
                 written[name] = {"name": name, "reads": domains, "writes": domains}
         answer["manifest"] = {**manifest, "tools": [written[name] for name in names]}
-    verifier = answer.get("verifier")
-    if isinstance(verifier, dict):
-        verifier = dict(verifier)
-        names = [tool["name"] for tool in task_tools]
-        if names and verifier.get("allowed_tools") != names:
-            # Qualification needs an explicit permitted-tool list. The start exposes exactly
-            # the task's tools, and any of them may serve a valid alternative solution, so the
-            # list is the task's own, never an author's narrower or invented one.
-            notes.append("verifier.allowed_tools: set to the task's own tools")
-            verifier["allowed_tools"] = names
-        if "outcome_schema" in verifier:
-            verifier["outcome_schema"] = normalise_schema(
-                verifier["outcome_schema"], "verifier.outcome_schema", notes
-            )
-        policies = verifier.get("argument_schemas")
-        if isinstance(policies, dict):
-            verifier["argument_schemas"] = {
-                name: normalise_schema(schema, f"verifier.argument_schemas.{name}", notes)
-                for name, schema in policies.items()
-            }
-        answer["verifier"] = verifier
     canonical = canonical_pointers(answer)
     if canonical != answer:
         notes.append("pointers: rewrote slash-split pointers to their escaped form")
     answer = canonical
     state, probes = answer.get("initial_state"), answer.get("probe_paths")
-    verifier = answer.get("verifier")
-    if isinstance(verifier, dict) and isinstance(probes, dict) and isinstance(state, dict):
-        authored = set(probes)
-        probes = {str(name): str(pointer) for name, pointer in probes.items()}
-        verifier, moved = project_verifier(verifier, state, probes, add=True)
-        added = sorted(set(probes) - authored)
-        notes.extend(moved)
-        notes.extend(f"probe_paths: added {name!r} for the verifier" for name in added)
-        answer = {**answer, "verifier": verifier, "probe_paths": probes}
     manifest = answer.get("manifest")
     if isinstance(manifest, dict) and isinstance(state, dict):
         rows: list[JsonValue] = []
@@ -585,10 +452,6 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
             f"{sorted(set(names) - set(declared))}; only in manifest.tools: "
             f"{sorted(set(declared) - set(names))}"
         )
-    if unknown := sorted(set(draft.verifier.argument_schemas) - set(names)):
-        raise ValueError(
-            f"verifier.argument_schemas keys must be tool names from {sorted(names)}; got {unknown}"
-        )
     domains = {domain.name for domain in draft.manifest.domains}
     if any(domain.owner != "simulated" for domain in draft.manifest.domains):
         raise ValueError("every domain of a bootstrapped start is simulated")
@@ -609,47 +472,6 @@ def validate_draft(answer: JsonObject, material: StartMaterial) -> StartDraft:
                 f"pointer {pointer!r} does not resolve in initial_state; "
                 f"{pointer_hint(draft.initial_state, pointer)}"
             ) from None
-    if outside := unplaced(draft.verifier.model_dump(mode="json"), draft.probe_paths):
-        raise ValueError(
-            f"verifier pointers {outside[:6]} name nothing the grade observes: the verifier is "
-            "graded over the probe projection, so write /final_state/<probe>/... (required and "
-            f"rule paths) or /<probe>/... (preserved paths) with a probe of "
-            f"{sorted(draft.probe_paths)}"
-        )
-    _check_verifier_reads(draft, (material.task.task.instruction,))
-    controls = {
-        row.control: row
-        for row in run_controls(
-            draft.verifier.model_dump(mode="json"),
-            draft.initial_state,
-            dict(draft.probe_paths),
-            add=False,
-        )
-    }
-    if not controls["correct"].ok:
-        raise ValueError(
-            "no final state can pass the verifier: a state satisfying every rule and keeping "
-            f"every preserved path grades {controls['correct'].status} "
-            f"({controls['correct'].reason}); make the rules and preserved paths consistent"
-        )
-    if controls["no_op"].status == "pass":
-        raise ValueError(
-            "the verifier passes when the agent does nothing: require the outcome the task asks "
-            "for, not the initial state"
-        )
-    if not controls["wrong_content"].ok:
-        raise ValueError(
-            "the verifier does not tell a solution from a stub: with every value its rules read "
-            "outside preserved_paths kept present but holding placeholder content (placeholder "
-            "text, a flipped boolean, a changed number) it grades "
-            f"{controls['wrong_content'].status} ({controls['wrong_content'].reason}); add a "
-            "rule on the content or behavioral result the task asks for, such as a recorded "
-            "test outcome, not only that a file exists or has a type"
-        )
-    allowed = draft.verifier.allowed_tools
-    if allowed is not None and not set(allowed) <= set(names):
-        raise ValueError("the verifier allows tools the start does not offer")
-    check_qualification_preconditions(draft.verifier)
     _check_facts(draft, material.inventory)
     if draft.provenance not in material.allowed():
         raise ValueError(
@@ -1627,12 +1449,10 @@ def reveal_answer_schema() -> ToolSchema:
 def task_answer_schema(material: StartMaterial) -> ToolSchema:
     """The submit tool narrowed to this task's fixed shape: its tools, domains and policies.
 
-    The generic contract leaves tool and domain names free and ``verifier.argument_schemas`` an
-    open map, so drafts repeated or swapped tool names and kept writing verifier fields
-    (``description``, ``outcome_schema``) inside the argument-policy map. The requirements were
-    already exact; the schema now says the same: names come from the task's tools and the
-    family's domains, each listed once, initial_state is keyed by exactly those domains, and
-    argument policies are keyed only by tool name.
+    The generic contract leaves tool and domain names free, so drafts repeated or swapped tool
+    names. The requirements were already exact; the schema now says the same: names come from
+    the task's tools and the family's domains, each listed once, and initial_state is keyed by
+    exactly those domains.
     """
     base = author_answer_schema()
     body = copy.deepcopy(base.input_schema)
@@ -1666,161 +1486,7 @@ def task_answer_schema(material: StartMaterial) -> ToolSchema:
             "required": domains,
             "additionalProperties": False,
         }
-    verifier = properties["verifier"]["properties"]
-    verifier["outcome_schema"] = _schema_object(SCHEMA_DEPTH)
-    verifier["argument_schemas"] = {
-        "type": "object",
-        "description": "Optional JSON Schema over each named tool's call arguments.",
-        "properties": {name: _schema_object(SCHEMA_DEPTH) for name in tools},
-        "additionalProperties": False,
-    }
     return base.model_copy(update={"input_schema": body})
-
-
-SCHEMA_DEPTH = 2
-"""Nesting depth to which the submit tool spells out a JSON Schema's own shape.
-
-The provider decodes under a grammar compiled from the submit schema; at depth 4 over seven
-tools that grammar failed verification mid-generation (HTTP 400) on every draw of one task.
-Two levels cover a schema's top-level properties and their children."""
-
-
-def _schema_object(depth: int) -> JsonObject:
-    """The shape of a JSON Schema object: every ``properties`` value is itself a schema object.
-
-    Drafts wrote ``{"properties": {"type": "object"}}``, a type string where a property schema
-    belongs, which the verifier rightly refuses. Spelling the shape out to a bounded depth lets
-    the submit tool say so where the value is written.
-    """
-    node: JsonObject = {"type": "object", "description": "A JSON Schema object."}
-    if depth:
-        child = _schema_object(depth - 1)
-        node["properties"] = {
-            "properties": {
-                "type": "object",
-                "description": "Each property's own JSON Schema object, never a type string.",
-                "additionalProperties": child,
-            },
-            "items": child,
-        }
-    return node
-
-
-LONG_EQUALS = 200
-"""Longest text an ``equals`` rule may demand; longer means byte-identical file contents."""
-
-
-def _check_verifier_reads(draft: StartDraft, texts: Sequence[str] = ()) -> None:
-    """Refuse verifier rules that read what no simulated run reliably holds.
-
-    A rule demanding a long text equal (a whole file) passes only a byte-identical rewrite. A
-    rule reading inside a probe that starts null depends on the simulator inventing the shape
-    it fills in (run 30 lost 11 branches to a missing ``exit_code``); the start must declare
-    that shape in initial_state, so the domain's state_schema keeps it. A pointer walking into a
-    files map as nested directories names a shape no run holds (run 31: none of 11 such rules
-    resolved in any of 13 final states, where each file is one flat key), and is refused when
-    normalisation could not rewrite it to the map's key style. A pointer naming a file neither
-    the initial files map nor the task names (run 32: ``engine~1py`` for ``engine.py``) is
-    refused with the closest grounded names (:func:`grounded_names`).
-
-    Args:
-        draft: The draft.
-        texts: Task text beyond the draft's own instruction (the selected task's instruction).
-    """
-    if off := off_style(
-        draft.verifier.model_dump(mode="json"), draft.initial_state, dict(draft.probe_paths)
-    ):
-        raise ValueError(
-            f"verifier pointers {off[:6]} walk into a files map as nested segments or several "
-            "keys deep into an empty object, which no simulated state holds: a files map keyed by "
-            "paths holds each file under one key, so write the key escaped "
-            "(/final_state/<files probe>/pkg~1mod.py for pkg/mod.py), and give an object the "
-            "verifier reads inside at least one entry so its key style is known"
-        )
-    if stray := ungrounded(
-        draft.verifier.model_dump(mode="json"),
-        draft.initial_state,
-        dict(draft.probe_paths),
-        grounded_names(draft, texts),
-    ):
-        raise ValueError(
-            f"verifier pointers name files the task never mentions: {stray[:6]}; a file key is "
-            "the exact relative file name as the task or initial_state writes it (only a '/' "
-            "inside it becomes '~1'), never a respelling of it"
-        )
-    initial = projection(draft.initial_state, dict(draft.probe_paths))
-    for rule in draft.verifier.rules:
-        if rule.operator == "equals" and isinstance(rule.value, str):
-            if len(rule.value) > LONG_EQUALS:
-                raise ValueError(
-                    f"rule at {rule.path} demands a {len(rule.value)}-character text verbatim: "
-                    "check the behaviour (a recorded test run) instead, and protect files that "
-                    "must not change with preserved_paths"
-                )
-    for pointer in (*draft.verifier.required_paths, *(rule.path for rule in draft.verifier.rules)):
-        keys = split(pointer)
-        if len(keys) > 2 and keys[0] == "final_state" and keys[1] in initial:
-            if initial[keys[1]] is None:
-                raise ValueError(
-                    f"{pointer} reads inside probe {keys[1]!r}, which starts null: give it its "
-                    "full shape in initial_state (every key the verifier reads, null where not "
-                    "yet known) so the simulator keeps those keys"
-                )
-
-
-def grounded_names(draft: StartDraft, texts: Sequence[str] = ()) -> set[str]:
-    """Workspace-relative paths the task names: in its text, reveal probes and fact state paths.
-
-    A file the agent must create is grounded by the task naming it (``smoothing.py``); a reveal
-    probe reading ``/workspace/engine.py`` grounds ``engine.py``.
-    """
-    names: set[str] = set()
-    for text in (draft.instruction, *texts):
-        names |= path_tokens(text)
-
-    def argument_text(value: JsonValue) -> None:
-        if isinstance(value, str):
-            names.update(path_tokens(value))
-        elif isinstance(value, dict):
-            for item in value.values():
-                argument_text(item)
-        elif isinstance(value, list):
-            for item in value:
-                argument_text(item)
-
-    for probe in draft.reveal_probes:
-        argument_text(probe.arguments)
-    for fact in draft.facts:
-        for pointer in fact.state_paths:
-            keys = _pointer_keys(pointer)
-            if len(keys) > 1 and keys[0] in draft.initial_state:
-                found = file_entry(draft.initial_state[keys[0]], keys[1:])
-                if found is not None:
-                    names.add(workspace_relative(found[1]))
-    return names
-
-
-def check_qualification_preconditions(verifier: TaskVerifier) -> None:
-    """Refuse a verifier executable qualification would refuse on its shape alone.
-
-    Qualification (:mod:`~exp.optimize.evaluation.executable.qualification`) requires an
-    explicit permitted-tool list and a check over observed state, either preservation or a pin
-    on the complete output, because argument rules constrain only the calls they name. A start
-    lacking either fails only after mining has been paid for, so authoring checks it first.
-
-    Raises:
-        ValueError: The tool list is absent or no state-retention check exists.
-    """
-    if not verifier.allowed_tools:
-        raise ValueError(
-            "the verifier names no permitted tools and the task declares none, so qualification "
-            "cannot check the actor's operations; a start needs the task's explicit tool list"
-        )
-    if not (verifier.preserved_paths or verifier.preserve_state or _pins_full_output(verifier)):
-        raise ValueError(
-            "the verifier checks no observed state beyond its goal: protect the files the task "
-            "must not change with preserved_paths, so an unrequested write elsewhere is seen"
-        )
 
 
 def shape_schema(value: JsonValue, probed: Sequence[Sequence[str]] = ()) -> JsonObject:

@@ -210,15 +210,6 @@ def _draft(task_id: str, opening: JsonObject) -> JsonObject:
         },
         "initial_state": state,
         "probe_paths": {"tickets": "/tickets"},
-        "verifier": {
-            "description": "The ticket is handled the way its tier requires.",
-            "outcome_schema": {},
-            "required_paths": ["/final_state/tickets/outcome"],
-            "rules": [
-                {"path": "/final_state/tickets/outcome", "operator": "equals", "value": "right"}
-            ],
-            "preserved_paths": ["/tickets/severity"],
-        },
         "provenance": provenance,
         "facts": facts,
         "limitations": [],
@@ -532,9 +523,9 @@ def test_a_family_bootstraps_into_validated_registrations(
     assert len({draw.variant for draw in auth.rounds[0].reviews}) == 3
     for registration in (obs, recon, auth):
         preflight_continuation_job(setup.project, registration.job)
-        # Qualification needs an explicit tool list: the start's own, none invented or dropped.
-        assert registration.draft.verifier.allowed_tools == tuple(tool.name for tool in TOOLS)
-        assert registration.job.study.verifier.allowed_tools == tuple(tool.name for tool in TOOLS)
+        # No verifier is authored or registered: the rubric judge grades every attempt.
+        assert registration.job.study.verifier is None
+        assert "verifier" not in registration.draft.model_dump(mode="json")
     assert load_batch_manifest(setup.project, manifest.batch) == manifest
 
     replayed = setup.run(BootScript(), monkeypatch)
@@ -833,7 +824,8 @@ def test_a_frozen_family_reaches_the_pipeline_with_no_rules_learning(
     assert recon.job.configuration["rule_book"] == rulebook.model_dump(mode="json")
 
     binding = BootstrapBinding(batch=freeze_batch(project, manifest), task_id="recon")
-    registered = make_spec(setup.fixture, None, tmp_path)
+    rubric = ArtifactInput(artifact_id="rubric-registered", sha256="0" * 64)
+    registered = make_spec(setup.fixture, rubric, tmp_path)
     mining = registered.mining.model_copy(update={"job": None, "bootstrap": binding})
     bootstrapped = DecisionVarianceSpec.model_validate(
         {**registered.model_dump(mode="json"), "mining": mining.model_dump(mode="json")}
@@ -852,17 +844,19 @@ def test_a_frozen_family_reaches_the_pipeline_with_no_rules_learning(
     assert resolved.mining.registered == recon.job.model_copy(
         update={"configuration": {**recon.job.configuration, "maximum_physical_attempts": ceiling}}
     )
-    assert RULES_STAGE.plan(project, resolved, "test") == ((), (PLAN_LINE,))
+    general = "General rubric: saved rubric rubric-registered."
+    assert RULES_STAGE.plan(project, resolved, "test") == ((), (PLAN_LINE, general))
     silent = BootScript(lambda role, opening: True)
     monkeypatch.setattr(
         "exp.optimize.evaluation.factory.authoring.HttpxJsonTransport", lambda: silent
     )
     run = RULES_STAGE.run(StageContext(project, resolved, "rules", "test"))
     outputs = RulesOutputs.model_validate(run.outputs.model_dump(mode="json"))
-    assert (outputs.report, outputs.rulebook, outputs.job) == (
+    assert (outputs.report, outputs.rulebook, outputs.job, outputs.rubric) == (
         report,
         rulebook,
         resolved.mining.registered,
+        rubric,
     )
     assert outputs.challenges == 0 and silent.seen == []
 
@@ -944,31 +938,3 @@ def test_a_frozen_family_runtime_is_kept_and_only_the_start_is_replaced(
     ) == frozen.model_dump(exclude={"task", "manifest", "initial_state", "probe_paths", "facts"})
     assert (definition.task.task_id, definition.initial_state) == ("recon", HIGH)
     assert definition.facts is None and definition.maximum_reasks == 2
-
-
-def test_an_admitted_verifier_meets_the_qualification_shape_preconditions() -> None:
-    """Qualification refuses a verifier without explicit tools or a state-retention check, so
-    authoring refuses it first instead of after mining (executable/qualification.py)."""
-    from exp.optimize.evaluation.variance.bootstrap_agents import (
-        check_qualification_preconditions,
-    )
-    from exp.simulation.evaluation.tasks import TaskVerifier
-
-    base: JsonObject = {
-        "description": "d",
-        "outcome_schema": {},
-        "rules": [{"path": "/final_state/tickets/outcome", "operator": "equals", "value": "x"}],
-    }
-    with pytest.raises(ValueError, match="no permitted tools"):
-        check_qualification_preconditions(
-            TaskVerifier.model_validate({**base, "preserved_paths": ["/tickets/severity"]})
-        )
-    with pytest.raises(ValueError, match="preserved_paths"):
-        check_qualification_preconditions(
-            TaskVerifier.model_validate({**base, "allowed_tools": ["close"]})
-        )
-    check_qualification_preconditions(
-        TaskVerifier.model_validate(
-            {**base, "allowed_tools": ["close"], "preserved_paths": ["/tickets/severity"]}
-        )
-    )

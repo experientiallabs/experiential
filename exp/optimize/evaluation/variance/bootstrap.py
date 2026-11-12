@@ -9,12 +9,14 @@ BootstrapSpec` over selected environment families:
    governed rule memory set) over its member traces. The family's reconciled tool contracts take
    precedence over those the rules stage parses; its shared state domains bind every start.
 2. **Author.** For each selected task an agentic author drafts the public instruction, tool
-   schemas, world manifest, initial state, evaluator projection, verifier and a fact ledger that
-   separates observed, inferred and unknown facts, each with its trace references.
+   schemas, world manifest, initial state, evaluator projection and a fact ledger that
+   separates observed, inferred and unknown facts, each with its trace references. No verifier
+   is authored: every attempt from the start is graded by the rubric judge and behavior tags.
 3. **Review.** Every reviewer stance checks whether the start is coherent, sufficiently specified
-   and supports the task. Missing deciding facts (named by a reviewer, or deciding facts the
-   draft leaves unknown) become research work items answered by the family's research step and
-   fed back to the author, for at most ``research_rounds`` rounds; then a diagnostic refusal.
+   and supports the task; the stances are the start's admission. Missing deciding facts (named
+   by a reviewer, or deciding facts the draft leaves unknown) become research work items
+   answered by the family's research step and fed back to the author, for at most
+   ``research_rounds`` rounds; then a diagnostic refusal.
 4. **Capture and validate.** An accepted start is captured through the existing capture owner
    and validated by its provenance (exact restore, prefix replay, or coherence plus first
    reveal). A failed validation is a diagnostic refusal. Only an observed start claims to be the

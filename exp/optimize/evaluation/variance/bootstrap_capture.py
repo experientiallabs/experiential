@@ -609,7 +609,8 @@ def mining_job(
         runtime: The family's runtime template.
         definition: The start's runtime.
         checkpoint: The captured start.
-        draft: The accepted draft, whose verifier the study declares.
+        draft: The accepted draft. The study registers no verifier: its attempts are graded
+            only by the rubric judge and the tag signals.
 
     Returns:
         The job, preflighted.
@@ -620,7 +621,6 @@ def mining_job(
     study = ContinuationStudySpec(
         checkpoint=checkpoint,
         actor_model=snapshot,
-        verifier=draft.verifier,
         probe_sha256=definition.probe_sha256,
         repeats=template.repeats,
         selector=f"start bootstrap: {draft.provenance} initial start of {definition.task.task_id}",

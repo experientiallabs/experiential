@@ -54,7 +54,6 @@ from exp.optimize.evaluation.variance.bootstrap_prompts import (
     RESEARCH_VARIANTS as RESEARCHER_VARIANTS,
 )
 from exp.runtime.environments.world_contracts import WorldManifest
-from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.mining.decisions import DEFAULT_DECISION_ALIAS
 from exp.simulation.retrieval.scope import CorpusScope
 from exp.simulation.rules.model import ToolContract
@@ -529,8 +528,8 @@ class StartDraft(ContractModel):
         tools: Tool schemas the actor sees.
         manifest: World manifest; every domain simulated.
         initial_state: Exact initial state of every domain.
-        probe_paths: Evaluator field names to JSON pointers into the state.
-        verifier: Declared assessment predicate over the final state.
+        probe_paths: Evaluator field names to JSON pointers into the state; the judge reads
+            their final values.
         provenance: Observed, reconstructed or authored.
         replay_trace: Source trace whose prefix a reconstructed start replays.
         prefix_steps: Recorded steps of that trace the replay must reproduce.
@@ -544,7 +543,6 @@ class StartDraft(ContractModel):
     manifest: WorldManifest
     initial_state: JsonObject
     probe_paths: dict[str, str] = Field(min_length=1, max_length=128)
-    verifier: TaskVerifier
     provenance: Provenance
     replay_trace: str | None = None
     prefix_steps: int = Field(default=0, ge=0, le=64)
