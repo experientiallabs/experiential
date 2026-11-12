@@ -10,6 +10,7 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.task import load_executable_task, persist_executable_task
@@ -52,7 +53,7 @@ def test_bound_rungs_replace_the_task_start_and_judge_and_unbound_tiers_keep_the
     rung_job = task.job
     actor_study = base.initial.study.model_copy(
         update={
-            "verifier": job.study.verifier.model_copy(update={"preserved_paths": ()}),
+            "verifier": required_verifier(job.study).model_copy(update={"preserved_paths": ()}),
             "probe_sha256": "2" * 64,
         }
     )
@@ -86,8 +87,8 @@ def test_bound_rungs_replace_the_task_start_and_judge_and_unbound_tiers_keep_the
     assert stage == bound and chosen == judge
     assert started.study.checkpoint == rung_job.study.checkpoint
     assert started.configuration == rung_job.configuration
-    assert started.study.verifier == rung_job.study.verifier
-    assert started.study.verifier != actor.study.verifier
+    assert required_verifier(started.study) == required_verifier(rung_job.study)
+    assert required_verifier(started.study) != required_verifier(actor.study)
     assert started.runtime_file == rung_job.runtime_file != actor.runtime_file
     assert started.runtime_sha256 == rung_job.runtime_sha256 != actor.runtime_sha256
     assert started.study.actor_model == base.initial.study.actor_model

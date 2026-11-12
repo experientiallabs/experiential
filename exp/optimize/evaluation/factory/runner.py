@@ -27,6 +27,7 @@ from exp.optimize.evaluation.continuations.actors import (
     PanelActor,
     preflight_actor_panel,
 )
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.candidates import (
     CandidateBatch,
@@ -202,7 +203,7 @@ def factory_population(project: ProjectStore, spec: TaskFactorySpec) -> tuple[Fa
                 workflow=sha256_json(
                     {
                         "intent": base.intent,
-                        "verifier": base.job.study.verifier.model_dump(mode="json"),
+                        "verifier": required_verifier(base.job.study).model_dump(mode="json"),
                         "tools": [tool.model_dump(mode="json") for tool in point.task.tools],
                     }
                 ),
@@ -269,8 +270,8 @@ def preflight_task_factory(
             raise ValueError("factory seed source revision differs; republish its frozen task")
         CalibrationPack(
             task=family.proposal.base,
-            parent=task.job.study.verifier,
-            candidate=task.job.study.verifier,
+            parent=required_verifier(task.job.study),
+            candidate=required_verifier(task.job.study),
             cases=family.controls,
         )
         for case in family.controls:

@@ -20,7 +20,7 @@ from exp.optimize.evaluation.continuations.observation_contrast import (
     preflight_observation_contrast,
     run_observation_contrast,
 )
-from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.continuations.study import ContinuationStudy, required_verifier
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.continuations import load_continuation_checkpoint
@@ -35,7 +35,7 @@ def observation_fixture(
     """Execute a real workbook edit once and compare its acknowledgement with an authored error."""
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     if forbidden:
-        verifier = job.study.verifier.model_copy(update={"allowed_tools": ()})
+        verifier = required_verifier(job.study).model_copy(update={"allowed_tools": ()})
         job = job.model_copy(update={"study": job.study.model_copy(update={"verifier": verifier})})
     spec = ActionInterventionSpec(base=job, action=workbook_case().first, rationale="Native edit.")
     capture_action_intervention(project, spec, code_revision="test")

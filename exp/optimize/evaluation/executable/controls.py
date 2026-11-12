@@ -17,6 +17,7 @@ from pydantic import Field, JsonValue, model_validator
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
     preflight_executable_qualification,
@@ -191,7 +192,7 @@ def witness_controls(
     """
     preflight_controls(project, spec)
     specification = _specification(project, spec)
-    predicate = load_executable_task(project, spec.task).job.study.verifier
+    predicate = required_verifier(load_executable_task(project, spec.task).job.study)
     cases: list[CalibrationCase] = []
     refusals: list[AdmissionRefusal] = []
     for control, outcome in _outcomes(project, spec):

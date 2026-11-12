@@ -32,7 +32,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationBranch
+from exp.optimize.evaluation.continuations.study import ContinuationBranch, required_verifier
 from exp.optimize.evaluation.equivalence.calibration import (
     CaseScope,
     PolicyCalibration,
@@ -474,7 +474,7 @@ def _assemble(
                     other,
                     checkpoint=checkpoint,
                     actor_sha256=actor_id,
-                    verifier=case.reference.study.verifier,
+                    verifier=required_verifier(case.reference.study),
                     initial_paths=case.initial_state_paths,
                     final_paths=case.final_state_paths,
                     case=index,

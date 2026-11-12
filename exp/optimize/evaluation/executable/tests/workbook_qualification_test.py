@@ -6,6 +6,7 @@ import pytest
 
 from exp.common.core.artifacts import sha256_bytes
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.qualification import _pins_native_workbook_outputs
 from exp.optimize.evaluation.executable.task import ExecutableTask
@@ -95,10 +96,10 @@ def second_output(task: ExecutableTask, *, cover: bool) -> ExecutableTask:
         update={"output_paths": ("output.xlsx", "second.xlsx")}
     )
     if cover:
-        predicate = task.job.study.verifier.model_copy(
+        predicate = required_verifier(task.job.study).model_copy(
             update={
                 "rules": (
-                    *task.job.study.verifier.rules,
+                    *required_verifier(task.job.study).rules,
                     OutcomeRule(
                         path="/final_state/views/second/sha256", operator="equals", value="b" * 64
                     ),
@@ -172,7 +173,7 @@ def test_incomplete_or_unowned_views_do_not_count(
             if kind == "malformed_digest"
             else OutcomeRule(path="/final_state/views/whole/sha256", operator="exists")
         )
-        predicate = task.job.study.verifier.model_copy(update={"rules": (rule,)})
+        predicate = required_verifier(task.job.study).model_copy(update={"rules": (rule,)})
         task = task.model_copy(
             update={
                 "job": task.job.model_copy(

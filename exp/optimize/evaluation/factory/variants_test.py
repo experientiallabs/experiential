@@ -11,6 +11,7 @@ from exp.optimize.evaluation.continuations.intervention import (
     capture_action_intervention,
 )
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
@@ -53,7 +54,7 @@ def variant_fixture(
         kind="rephrasing",
         intent=intent,
         prompt="Remove the first data row. Keep the source workbook intact.",
-        verifier=job.study.verifier,
+        verifier=required_verifier(job.study),
         brief=capability,
     )
 

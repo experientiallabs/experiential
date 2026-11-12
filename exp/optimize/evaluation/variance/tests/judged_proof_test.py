@@ -46,6 +46,7 @@ from exp.optimize.evaluation.continuations.job import (
     execute_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
@@ -757,8 +758,8 @@ def qualify(proof: Proof, scenario_id: str) -> tuple[ArtifactInput, ArtifactInpu
                     },
                     "required": ["final_state"],
                 },
-                allowed_tools=task.job.study.verifier.allowed_tools,
-                preserved_paths=task.job.study.verifier.preserved_paths,
+                allowed_tools=required_verifier(task.job.study).allowed_tools,
+                preserved_paths=required_verifier(task.job.study).preserved_paths,
             ),
             subject="outcome",
         ),

@@ -74,7 +74,11 @@ from exp.common.traces.ingest.vendor_records import VendorTraceFormatError
 from exp.optimize.evaluation.continuations.admission import require_pinned_policy
 from exp.optimize.evaluation.continuations.prefix import _executed_parent
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
+from exp.optimize.evaluation.continuations.study import (
+    ContinuationBranch,
+    ContinuationStudy,
+    required_verifier,
+)
 from exp.optimize.evaluation.equivalence.dimensions import StepOwner, step_owner, world_identity
 from exp.optimize.evaluation.equivalence.policy import (
     AdmissionPolicy,
@@ -413,7 +417,7 @@ def _trajectory(
         admission.policy,
         branch,
         checkpoint=checkpoint,
-        verifier=study.spec.verifier,
+        verifier=required_verifier(study.spec),
         actor_model=study.spec.actor_model,
         calibrations=admission.calibrations,
     )

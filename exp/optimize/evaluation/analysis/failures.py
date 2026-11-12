@@ -20,7 +20,11 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelRequest, ModelResponse, ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
+from exp.optimize.evaluation.continuations.study import (
+    ContinuationBranch,
+    ContinuationStudy,
+    required_verifier,
+)
 from exp.runtime.environments.world_outcomes import WorldExecutionReceipt
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
@@ -120,7 +124,7 @@ def _analyse_branch(
     store: ArtifactStore, study: ContinuationStudy, branch: ContinuationBranch
 ) -> BranchFailureAnalysis:
     """Keep final failure separate from observed per-step violations and operational symptoms."""
-    assessment = grade(study.spec.verifier, branch.grading_outcome())
+    assessment = grade(required_verifier(study.spec), branch.grading_outcome())
     points = (study.spec.checkpoint, *branch.checkpoints)
     capsules = {ref: load_continuation_checkpoint(store, ref) for ref in points}
     root_calls = capsules[study.spec.checkpoint].actor.calls
@@ -174,7 +178,7 @@ def _analyse_branch(
             "steps": [step],
             "stop_reason": "failure",
         }
-        policy = grade(study.spec.verifier, observed).policy
+        policy = grade(required_verifier(study.spec), observed).policy
         if policy.status == "fail":
             signals.append(FailureSignal(kind="policy_violation", reason=policy.reason, **context))
         execution = step.get("execution")

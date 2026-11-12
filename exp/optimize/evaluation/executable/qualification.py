@@ -24,6 +24,7 @@ from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import load_continuation_runtime
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
     load_executable_task,
@@ -89,7 +90,7 @@ def preflight_executable_qualification(
     if spec.replay_native_records:
         preflight_executable_task(project, task)
     load_study(project.artifacts, spec.feasibility)
-    predicate = task.job.study.verifier
+    predicate = required_verifier(task.job.study)
     CalibrationPack(task=spec.task, parent=predicate, candidate=predicate, cases=spec.cases)
     for case in spec.cases:
         reference = case.challenge.witness
@@ -128,7 +129,7 @@ def _assess(
     record_runtime: RecordReplayRuntime | None,
 ) -> ExecutableQualification:
     """Judge every case, with native record replay when the open task runtime is supplied."""
-    predicate = task.job.study.verifier
+    predicate = required_verifier(task.job.study)
     # Reuse the established identity, duplicate and grouped-partition checks.
     CalibrationPack(task=spec.task, parent=predicate, candidate=predicate, cases=spec.cases)
     refusals = []
@@ -252,7 +253,7 @@ def _pins_native_workbook_outputs(task: ExecutableTask) -> bool:
     ):
         return False
     covered: set[str] = set()
-    for rule in task.job.study.verifier.rules:
+    for rule in required_verifier(task.job.study).rules:
         parts = path_parts(rule.path)
         if (
             rule.operator != "equals"

@@ -22,6 +22,7 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.authoring import (
     AuthorSettings,
@@ -194,7 +195,7 @@ def _variant(
         kind=spec.kind,
         prompt=row.prompt,
         intent=base.intent,
-        verifier=base.job.study.verifier,
+        verifier=required_verifier(base.job.study),
         brief=spec.brief,
         proposal=response,
     )

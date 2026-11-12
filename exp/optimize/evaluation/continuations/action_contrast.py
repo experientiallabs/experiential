@@ -33,7 +33,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import known_outcomes
+from exp.optimize.evaluation.continuations.study import known_outcomes, required_verifier
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -176,11 +176,17 @@ def preflight_action_contrast(
 
 def _assessment(
     project: ProjectStore, intervention: ActionIntervention, result: ArtifactInput
-) -> VerifierGrade:
-    """Include the intervention itself so a violating prefix cannot disappear at rewind."""
+) -> VerifierGrade | None:
+    """Include the intervention itself so a violating prefix cannot disappear at rewind.
+
+    A study registered without a verifier (graded only by its episode judge) has no mechanical
+    assessment; its cells are labelled by the judge alone.
+    """
     study = load_study(project.artifacts, result)
     if study.spec != _job(intervention).study or len(study.branches) != 1:
         raise ValueError("action contrast suffix changed its frozen policy or population")
+    if study.spec.verifier is None:
+        return None
     return grade_intervention_outcome(intervention, study.branches[0].grading_outcome())
 
 
@@ -204,7 +210,7 @@ def grade_intervention_outcome(
         },
         *steps,
     ]
-    return grade(intervention.spec.base.study.verifier, outcome)
+    return grade(required_verifier(intervention.spec.base.study), outcome)
 
 
 def _metrics(cells: tuple[ContrastCell, ...]) -> JsonObject:

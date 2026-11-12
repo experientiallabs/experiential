@@ -23,7 +23,7 @@ from exp.optimize.evaluation.continuations.evidence import (
     verify_training_evidence,
 )
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.continuations.study import ContinuationStudy, required_verifier
 from exp.optimize.evaluation.equivalence.policy import (
     load_admission_policy,
     require_policy_precedes,
@@ -171,11 +171,11 @@ def admit_continuations(
             rules,
             branch,
             checkpoint=checkpoint,
-            verifier=study.spec.verifier,
+            verifier=required_verifier(study.spec),
             actor_model=study.spec.actor_model,
             calibrations=calibrations,
         )
-        assessment = grade(study.spec.verifier, branch.grading_outcome())
+        assessment = grade(required_verifier(study.spec), branch.grading_outcome())
         if branch.status != "completed" or not assessment.complete:
             reason = "execution incomplete or outcome unknown"
         elif assessment.status != "pass" or assessment.policy.status != "pass":
@@ -207,7 +207,7 @@ def admit_continuations(
                 rationale="Independent specification pinned before continuation sampling.",
             )
             refusal = verify_label_witness(
-                store, challenge, label="pass", compared=(study.spec.verifier,)
+                store, challenge, label="pass", compared=(required_verifier(study.spec),)
             )
             if refusal is not None:
                 reason = f"{refusal.reason}: {refusal.detail}"

@@ -10,6 +10,7 @@ from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import execute_continuation_job
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
     assess_executable_qualification,
@@ -164,7 +165,7 @@ def test_argument_rules_alone_cannot_stand_in_for_a_state_check(
     """Rules over named call arguments leave unrequested writes unobserved."""
     project, reference, spec = qualified_fixture(tmp_path, monkeypatch)
     task = load_executable_task(project, reference)
-    verifier = task.job.study.verifier
+    verifier = required_verifier(task.job.study)
     pinned = OutcomeRule(path="/final_state/files/output.xlsx", operator="equals", value="0" * 64)
     weakened = verifier.model_copy(
         update={

@@ -19,6 +19,7 @@ from exp.optimize.evaluation.continuations.admission import (
 )
 from exp.optimize.evaluation.continuations.job import continuation_result_reference
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.equivalence.policy_test import registered_policy
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
@@ -323,7 +324,7 @@ def test_cli_registers_a_specification_and_witnesses_controls_for_qualification(
         str(path),
         "--non-interactive",
     ]
-    verifier = load_executable_task(project, task).job.study.verifier
+    verifier = required_verifier(load_executable_task(project, task).job.study)
     registration = SpecificationRegistration(
         specification=EvaluationSpecification(
             description="Independent rows check.",

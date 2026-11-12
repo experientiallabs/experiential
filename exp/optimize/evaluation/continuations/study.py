@@ -117,7 +117,9 @@ class ContinuationStudySpec(ContractModel):
     Attributes:
         checkpoint: Exact paired actor/world checkpoint.
         actor_model: Expected model identity for every response.
-        verifier: Declared assessment predicate; not independent label authority.
+        verifier: Declared assessment predicate; not independent label authority. None for a
+            study graded only by an LLM judge and tag signals: no branch is then graded
+            mechanically, and its ending is attributed by execution phase alone.
         probe_sha256: Identity of the evaluator-only state projection.
         repeats: Planned fresh continuations, all retained in the denominator.
         predicted_success: Optional critic estimate registered before any branch executes.
@@ -145,7 +147,7 @@ class ContinuationStudySpec(ContractModel):
     critic_prediction: ArtifactInput | None = None
     selection_plan: ArtifactInput | None = None
     actor_model: ModelSnapshot
-    verifier: TaskVerifier
+    verifier: TaskVerifier | None = Field(default=None, exclude_if=lambda value: value is None)
     probe_sha256: Sha256
     repeats: int = Field(default=4, ge=1, le=100, strict=True)
     predicted_success: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
@@ -170,6 +172,20 @@ class ContinuationStudySpec(ContractModel):
         ):
             raise ValueError("cascade episodes measure behavior; training admission is separate")
         return self
+
+
+def required_verifier(spec: ContinuationStudySpec) -> TaskVerifier:
+    """Return the study's mechanical verifier for a path that grades by it.
+
+    Raises:
+        ValueError: The study registered none; it is graded only by an LLM judge and tags.
+    """
+    if spec.verifier is None:
+        raise ValueError(
+            "this path grades branches by the start's mechanical verifier, but the study is "
+            "graded only by an LLM judge and tag signals; judge it with its episode judge"
+        )
+    return spec.verifier
 
 
 def study_identity(spec: ContinuationStudySpec, code_revision: str) -> str:
@@ -805,8 +821,10 @@ def _run_branch(
             )
             outcome["stop_reason"] = episode.stop_reason.value
             outcome["execution_phase"] = "world_cleanup"
-        outcome["execution_phase"] = "verifier_grade"
-        assessment = grade(spec.verifier, outcome)
+        assessment = None
+        if spec.verifier is not None:
+            outcome["execution_phase"] = "verifier_grade"
+            assessment = grade(spec.verifier, outcome)
         return ContinuationBranch(
             index=index,
             status="completed",
@@ -840,7 +858,7 @@ def _run_branch(
                 }
             )
             outcome["execution_phase"] = "actor_tool_authorization"
-        assessment = grade(spec.verifier, outcome)
+        assessment = None if spec.verifier is None else grade(spec.verifier, outcome)
         return ContinuationBranch(
             index=index,
             status="failed"

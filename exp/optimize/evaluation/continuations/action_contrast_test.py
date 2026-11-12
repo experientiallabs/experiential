@@ -18,7 +18,7 @@ from exp.optimize.evaluation.continuations.action_contrast import (
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.continuations.study import ContinuationStudy, required_verifier
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 
@@ -103,7 +103,7 @@ def test_imposed_policy_violation_is_not_erased_by_resuming_after_it(
 ) -> None:
     """Finish-only suffixes satisfy the read-only policy alone, but their imposed edits do not."""
     project, spec, transport = contrast_fixture(tmp_path, monkeypatch)
-    verifier = spec.base.study.verifier.model_copy(update={"allowed_tools": ()})
+    verifier = required_verifier(spec.base.study).model_copy(update={"allowed_tools": ()})
     job = spec.base.model_copy(
         update={"study": spec.base.study.model_copy(update={"verifier": verifier})}
     )

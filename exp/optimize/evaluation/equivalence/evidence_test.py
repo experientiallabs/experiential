@@ -11,6 +11,7 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
 from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.equivalence.evidence import (
     PairMeasurement,
     equivalence_metrics,
@@ -63,7 +64,7 @@ def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
         candidate,
         checkpoint=checkpoint,
         actor_sha256=sha256_json(checkpoint.actor),
-        verifier=study.spec.verifier,
+        verifier=required_verifier(study.spec),
         initial_paths=("/input_digest",),
         final_paths=("/rows",),
         case=0,

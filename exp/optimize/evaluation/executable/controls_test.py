@@ -7,6 +7,7 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.controls import (
     ControlWitnessSpec,
     DeclaredControl,
@@ -108,7 +109,7 @@ def test_controls_refuse_what_qualification_would_refuse(
     mislabeled = spec.model_copy(update={"controls": (*spec.controls[:2], wrong)})
     with pytest.raises(EvidenceAdmissionError, match="establishes fail, but the label declares"):
         witness_controls(project, mislabeled, created_at=NOW, code_revision="test")
-    verifier = load_executable_task(project, spec.task).job.study.verifier
+    verifier = required_verifier(load_executable_task(project, spec.task).job.study)
     own = register_specification(
         project,
         SpecificationRegistration(
@@ -133,7 +134,7 @@ def test_specification_registration_is_idempotent_and_checks_sources(
 ) -> None:
     """Identical content saves once; a source that differs from its digest is refused."""
     project, spec = controls_fixture(tmp_path, monkeypatch)
-    verifier = load_executable_task(project, spec.task).job.study.verifier
+    verifier = required_verifier(load_executable_task(project, spec.task).job.study)
     registration = SpecificationRegistration(
         specification=EvaluationSpecification(
             description="Independent check.", predicate=verifier, subject="native_observation"

@@ -22,6 +22,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.actors import ActorPanelReport, PanelActor
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
 from exp.optimize.evaluation.factory.authoring import (
@@ -296,7 +297,7 @@ def review_task_quality(
                 else "mixed"
             ),
             "world_limits": list(candidate.known_limits),
-            "verifier": candidate.job.study.verifier.model_dump(mode="json"),
+            "verifier": required_verifier(candidate.job.study).model_dump(mode="json"),
             "executions": [
                 {"status": row.status, "outcome": row.outcome} for row in study.branches
             ],
