@@ -19,7 +19,7 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapPreparationReport,
     BootstrapPreparationSpec,
 )
-from exp.optimize.evaluation.variance.frontdoor_executors import PIPELINE_SETTINGS
+from exp.optimize.evaluation.variance.frontdoor_executors import PIPELINE_SETTINGS, SCOPED_SLOTS
 from exp.optimize.evaluation.variance.frontdoor_slots import SlotName
 from exp.optimize.evaluation.variance.frontdoor_source import FRONT_DOOR_PROTOCOL, TraceSource
 from exp.optimize.evaluation.variance.frontdoor_states import StageState
@@ -93,7 +93,7 @@ class FrontDoorSpec(ContractModel):
 
     @model_validator(mode="after")
     def _rules(self) -> Self:
-        """Require a rules registration, and the template setting each in-pipeline slot runs by."""
+        """Require rules, each in-pipeline slot's template setting, and a scoped slot's tasks."""
         if self.pipeline.rules is None and self.preparation.bootstrap.rules is None:
             raise ValueError("give pipeline.rules when the preparation registers no rules")
         enabled = {
@@ -108,6 +108,16 @@ class FrontDoorSpec(ContractModel):
                 raise ValueError(
                     f"slot {name} runs inside each pipeline; set {PIPELINE_SETTINGS[name][1]}"
                 )
+        scoped = sorted(
+            name
+            for name, settings in self.slots.items()
+            if name in SCOPED_SLOTS and settings.get("scope", "all") != "all"
+        )
+        if scoped and not self.preparation.task_ids:
+            raise ValueError(
+                f"slots {', '.join(scoped)} are scoped to the run's tasks; give "
+                "preparation.task_ids, whose families they cover"
+            )
         refuse_astra_outside_its_roles(self.model_dump(mode="json"), self.astra_alias)
         return self
 

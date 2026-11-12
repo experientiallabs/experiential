@@ -34,7 +34,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 from pydantic import Field
 
@@ -61,7 +61,11 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapPreparationSpec,
 )
 from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
-from exp.optimize.evaluation.variance.build_records import VarianceBuildReport, load_tag_matrix
+from exp.optimize.evaluation.variance.build_records import (
+    FamilyScope,
+    VarianceBuildReport,
+    load_tag_matrix,
+)
 from exp.optimize.evaluation.variance.dense_prompt import dense_model_calls
 from exp.optimize.evaluation.variance.dense_vocabulary import inflow_dense, vocabulary
 from exp.optimize.evaluation.variance.family_simulators import load_family_simulator
@@ -106,6 +110,7 @@ from exp.simulation.mining.task_types import TaskTypeSpec, task_types
 from exp.simulation.mining.views import TraceViewName, Unit, build_units
 from exp.simulation.retrieval.contracts import RAGLineageBinding
 from exp.simulation.retrieval.state_rag import (
+    StateRAGCalls,
     StateRetrievalPolicy,
     build_state_tag_index,
     plan_state_rag_calls,
@@ -218,6 +223,85 @@ def saved_corpus(context: SlotContext) -> Corpus | None:
     return _CORPORA[memo]
 
 
+FamilyCoverage = Literal["all", "run_tasks"]
+"""Which admitted families a per-family slot works on: every one, or only the run's own.
+
+``run_tasks`` keeps the families that hold the preparation's selected ``task_ids``, read from the
+variance build's probe placements, so a cluster run authors banks and indexes for its own family
+only and a spec never names a family by hand.
+"""
+
+SCOPED_SLOTS = frozenset({"tag-banks", "task-types", "state-rag"})
+"""Per-family slots that take a ``scope`` setting (:data:`FamilyCoverage`)."""
+
+
+def run_families(context: SlotContext, corpus: Corpus) -> tuple[str, ...]:
+    """Return the families holding the preparation's selected tasks, sorted.
+
+    Raises:
+        ValueError: The preparation names no ``task_ids``, or one of them is not placed in a
+            family of the saved build.
+    """
+    task_ids = context.preparation.task_ids
+    if not task_ids:
+        raise ValueError(
+            "scope run_tasks needs preparation.task_ids: the run's families are those holding "
+            "its selected tasks"
+        )
+    scoping = corpus.report.environment_families
+    assert scoping is not None
+    placed = {row.task_id: row.family_id for row in scoping.placements if row.family_id}
+    unplaced = sorted(task for task in task_ids if task not in placed)
+    if unplaced:
+        raise ValueError(f"scope run_tasks: tasks not placed in any family: {', '.join(unplaced)}")
+    return tuple(sorted({placed[task] for task in task_ids}))
+
+
+def slot_families(
+    context: SlotContext, corpus: Corpus, scope: FamilyCoverage
+) -> frozenset[str] | None:
+    """Return the family identities a slot is scoped to, or None for every family."""
+    return None if scope == "all" else frozenset(run_families(context, corpus))
+
+
+def scoped_families(
+    corpus: Corpus, families: frozenset[str] | None
+) -> tuple[EnvironmentFamily, ...]:
+    """Return the admitted families within a scope, in review order."""
+    if families is None:
+        return corpus.families
+    return tuple(row for row in corpus.families if row.family_id in families)
+
+
+def scope_note(corpus: Corpus, families: frozenset[str] | None) -> str:
+    """Return the plan text naming a narrowed scope, empty for every family."""
+    if families is None:
+        return ""
+    scoping = corpus.report.environment_families
+    assert scoping is not None
+    paths = {row.family_id: row.path for row in scoping.scopes}
+    named = ", ".join(sorted(paths.get(f, f[:24]) for f in families))
+    return f" (scope run_tasks: only {named}, of {len(corpus.families)} admitted)"
+
+
+def _identity_settings(
+    name: str, settings: JsonObject, context: SlotContext, corpus: Corpus
+) -> tuple[JsonObject, JsonObject | None]:
+    """Return the settings a slot's identity hashes, and its resolved scope.
+
+    An explicit ``scope: "all"`` hashes like an absent one, so it keeps every saved result. A
+    narrowed scope joins the identity with the families it resolved to, so an all-family result
+    and a scoped one, or two runs scoped to different families, never share a result.
+    """
+    if name not in SCOPED_SLOTS:
+        return settings, None
+    scope = settings.get("scope", "all")
+    keyed = {key: value for key, value in settings.items() if key != "scope"}
+    if scope == "all":
+        return keyed, None
+    return keyed, {"mode": scope, "families": list(run_families(context, corpus))}
+
+
 def slot_identity(
     name: str,
     settings: JsonObject,
@@ -235,12 +319,14 @@ def slot_identity(
         depends: Earlier results it reads; only these join the identity.
     """
     refined = refined_identity(context.project, SLOT_ROLES.get(name, frozenset()))
+    keyed, scope = _identity_settings(name, settings, context, corpus)
     return stable_id(
         SLOT_RECORD_TYPE,
         {
             **refined,
             "slot": name,
-            "settings": sha256_json(settings),
+            "settings": sha256_json(keyed),
+            **({} if scope is None else {"scope": scope}),
             "build": corpus.report.identity,
             "inputs": {
                 key: context.results[key].model_dump(mode="json")
@@ -540,10 +626,12 @@ class FamilyBanks(ContractModel):
         banks: Each family's authored, selected and published bank; a family with fewer than
             :data:`MIN_AUTHORED_MEMBERS` members has none.
         matrices: Each family's member matrices per view, as saved tag matrices.
+        scope: The families the slot was scoped to, sorted; None when it covered every one.
     """
 
     banks: dict[str, AuthoredBank]
     matrices: dict[str, dict[str, TagMatrix]] = Field(default_factory=dict)
+    scope: tuple[str, ...] | None = None
 
 
 class TagBankSlot(ContractModel):
@@ -556,6 +644,7 @@ class TagBankSlot(ContractModel):
         bank_root: Directory the banks are published under; None for the local bank root.
         decision_alias: Native decision alias tagging the selection sample and the members.
         loop: When a large family that collapses to one task type is re-authored with feedback.
+        scope: Every admitted family, or only the families of the run's selected tasks.
     """
 
     author: AuthorSettings
@@ -564,6 +653,15 @@ class TagBankSlot(ContractModel):
     loop: AuthoringLoopSpec = AuthoringLoopSpec()
     bank_root: Path | None = None
     decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
+    scope: FamilyCoverage = "all"
+
+
+def _unsaved_families(context: SlotContext, scope: FamilyCoverage) -> int:
+    """Families a slot prices before the families are saved: the limit, or the run's tasks."""
+    bound = context.preparation.limits.maximum_families
+    if scope == "run_tasks" and context.preparation.task_ids:
+        bound = min(bound, len(context.preparation.task_ids))
+    return bound
 
 
 @dataclass
@@ -586,15 +684,9 @@ class TagBankExecutor:
             slot_identity("tag-banks", settings, context, corpus)
         ):
             return True, (), ("Saved: authored banks per family; replays with no call.",)
-        families = (
-            context.preparation.limits.maximum_families if corpus is None else len(corpus.families)
-        )
-        members = sum(len(row.members) for row in corpus.families) if corpus else 0
-        members = members or families * context.preparation.limits.maximum_family_traces
-        author = slot.authoring.calls() * families
-        chunks = math.ceil(slot.selection.max_questions / MAX_DECISION_QUESTIONS)
-        decisions = len(AUTHORED_VIEWS) * members * chunks * 2
-        looping, loop_author, loop_decisions = loop_worst_case(context, slot, corpus)
+        bounds = tag_bank_bounds(context, slot, corpus)
+        author, decisions = bounds.author, bounds.decisions
+        loop_author, loop_decisions = bounds.loop_author, bounds.loop_decisions
         costs: list[CostComponent] = [
             row.scaled(author + loop_author)
             for row in evaluation_costs(context.project, slot.author)
@@ -603,10 +695,10 @@ class TagBankExecutor:
             decision_cost(context.project, slot.decision_alias, decisions + loop_decisions)
         )
         lines = (
-            f"{families} families: up to {author} author calls with "
+            f"{bounds.families} families{bounds.note}: up to {author} author calls with "
             f"{slot.author.model_alias}, then at most {decisions} decisions with "
             f"{slot.decision_alias} (selection sample and every member, per view).",
-            f"Re-authoring loop: {looping} families of at least "
+            f"Re-authoring loop: {bounds.looping} families of at least "
             f"{slot.loop.min_members_to_retry} members may collapse to one task type; at worst "
             f"{slot.loop.max_rounds} rounds each add {loop_author} author calls and "
             f"{loop_decisions} decisions.",
@@ -633,7 +725,9 @@ class TagBankExecutor:
         if context.project.artifacts.exists(identity):
             return artifact_input(context.project.artifacts.read(identity).manifest)
         project = context.project
-        members_total = sum(len(row.members) for row in corpus.families)
+        scope = slot_families(context, corpus, slot.scope)
+        families = scoped_families(corpus, scope)
+        members_total = sum(len(row.members) for row in families)
         tagger = self.tagger or decision_tagger(
             project,
             slot.decision_alias,
@@ -653,7 +747,7 @@ class TagBankExecutor:
         inputs: list[ArtifactInput] = [scoping.families]
         task_view = next(row for row in corpus.report.tagging if row.plan.view == "task")
         shared = (load_tag_matrix(project, task_view.matrix),)
-        for family in corpus.families:
+        for family in families:
             rendered = [_views(corpus, t, AUTHORED_VIEWS) for t in family.members]
             if len(rendered) < MIN_AUTHORED_MEMBERS:
                 # A question must hold in some members and fail in others, so a family this
@@ -678,8 +772,53 @@ class TagBankExecutor:
             banks[family.family_id] = result.bank
             inputs.extend((result.bank.authoring, result.bank.selection, *result.bank.rounds))
             matrices[family.family_id] = result.matrices
-        record = FamilyBanks(banks=banks, matrices=matrices)
+        record = FamilyBanks(
+            banks=banks, matrices=matrices, scope=None if scope is None else tuple(sorted(scope))
+        )
         return save_slot(context, identity, record, tuple(inputs))
+
+
+class TagBankBounds(NamedTuple):
+    """The tag-banks slot's call bound over its scoped families.
+
+    Attributes:
+        families: Families priced.
+        author: Author calls.
+        decisions: Decisions over the selection sample and every member, per view.
+        looping: Families that may run the re-authoring loop.
+        loop_author: The loop's extra author calls over all rounds.
+        loop_decisions: The loop's extra decisions over all rounds.
+        note: Plan text naming a narrowed scope, empty for every family.
+    """
+
+    families: int
+    author: int
+    decisions: int
+    looping: int
+    loop_author: int
+    loop_decisions: int
+    note: str
+
+
+def tag_bank_bounds(
+    context: SlotContext, slot: TagBankSlot, corpus: Corpus | None
+) -> TagBankBounds:
+    """Bound the tag-banks slot's calls over its scoped families, with no call."""
+    if corpus is None:
+        families = _unsaved_families(context, slot.scope)
+        members = families * context.preparation.limits.maximum_family_traces
+        note = ""
+    else:
+        scope = slot_families(context, corpus, slot.scope)
+        rows = scoped_families(corpus, scope)
+        families = len(rows)
+        members = sum(len(row.members) for row in rows)
+        note = scope_note(corpus, scope)
+    author = slot.authoring.calls() * families
+    chunks = math.ceil(slot.selection.max_questions / MAX_DECISION_QUESTIONS)
+    decisions = len(AUTHORED_VIEWS) * members * chunks * 2
+    looping, loop_author, loop_decisions = loop_worst_case(context, slot, corpus)
+    return TagBankBounds(families, author, decisions, looping, loop_author, loop_decisions, note)
 
 
 def loop_worst_case(
@@ -696,9 +835,10 @@ def loop_worst_case(
     loop = slot.loop
     if corpus is None:
         size = context.preparation.limits.maximum_family_traces
-        sizes = [size] * context.preparation.limits.maximum_families
+        sizes = [size] * _unsaved_families(context, slot.scope)
     else:
-        sizes = [len(row.members) for row in corpus.families]
+        scope = slot_families(context, corpus, slot.scope)
+        sizes = [len(row.members) for row in scoped_families(corpus, scope)]
     looping = [size for size in sizes if size >= MIN_AUTHORED_MEMBERS and loop.loops(size)]
     spec = slot.authoring
     candidates = len(spec.variants) * spec.rounds * spec.questions_per_draw
@@ -714,10 +854,13 @@ class TaskTypeSlot(ContractModel):
     Attributes:
         namer_alias: Admitted open-weight naming alias.
         spec: Second-level clustering and naming.
+        scope: Every admitted family, or only the families of the run's selected tasks; no
+            wider than the ``tag-banks`` slot's scope.
     """
 
     namer_alias: str = Field(min_length=1)
     spec: TaskTypeSpec = TaskTypeSpec()
+    scope: FamilyCoverage = "all"
 
 
 @dataclass
@@ -744,12 +887,14 @@ class TaskTypeExecutor:
             )
         ):
             return True, (), ("Saved: task types per family; replays with no call.",)
-        families = (
-            context.preparation.limits.maximum_families if corpus is None else len(corpus.families)
-        )
+        families, note = _unsaved_families(context, slot.scope), ""
+        if corpus is not None:
+            scope = slot_families(context, corpus, slot.scope)
+            families, note = len(scoped_families(corpus, scope)), scope_note(corpus, scope)
         calls = families * slot.spec.naming.calls(slot.spec.clustering.max_clusters)
         costs = (model_cost(context.project, slot.namer_alias, calls, 1200),)
-        return False, cost_lines(costs), (f"Up to {calls} naming calls with {slot.namer_alias}.",)
+        line = f"Up to {calls} naming calls with {slot.namer_alias}{note}."
+        return False, cost_lines(costs), (line,)
 
     def run(self, context: SlotContext, settings: JsonObject) -> ArtifactInput:
         """Run, or replay, every family's task types over the authored banks' matrices."""
@@ -763,10 +908,19 @@ class TaskTypeExecutor:
         if project.artifacts.exists(identity):
             return artifact_input(project.artifacts.read(identity).manifest)
         banks = read_slot(context, banks_ref, FamilyBanks)
+        scope = slot_families(context, corpus, slot.scope)
+        if banks.scope is not None and (scope is None or not scope <= set(banks.scope)):
+            raise ValueError(
+                "the task-types scope is wider than the tag-banks scope: families outside "
+                "the banks' scope have no authored bank; give both slots the same scope"
+            )
+        families = scoped_families(corpus, scope)
         task_view = next(row for row in corpus.report.tagging if row.plan.view == "task")
         matrices: list[TagMatrix] = [load_tag_matrix(project, task_view.matrix)]
         questions: dict[str, str] = {}
         for family_id, per_view in banks.matrices.items():
+            if scope is not None and family_id not in scope:
+                continue
             matrices.extend(per_view.values())
             questions.update({q.question_id: q.text for q in banks.banks[family_id].bank.questions})
         namer = self.namer
@@ -780,13 +934,13 @@ class TaskTypeExecutor:
         exemplars = {
             trace_id: _views(corpus, trace_id, ("task",))["task"].text
             for trace_id in corpus.traces
-            if any(trace_id in row.members for row in corpus.families)
+            if any(trace_id in row.members for row in families)
         }
         scoping = corpus.report.environment_families
         assert scoping is not None
         record, saved = task_types(
             project.artifacts,
-            corpus.families,
+            families,
             matrices,
             namer,
             families_record=scoping.families.artifact_id,
@@ -834,6 +988,8 @@ class StateRagSlot(ContractModel):
         live_steps: Live steps a served family runtime may tag, for pricing.
         memory: Per-task state description policy bound into every start's simulator.
         concurrency: Fit steps tagged at once; the saved index does not depend on it.
+        scope: Every family scope of the build, or only the families of the run's selected
+            tasks; a start of a family with no index runs without state recall.
     """
 
     author_alias: str = Field(min_length=1)
@@ -844,6 +1000,7 @@ class StateRagSlot(ContractModel):
     live_steps: int = Field(default=0, ge=0)
     memory: StateMemoryPolicy | None = None
     concurrency: int = Field(default=1, ge=1, le=64)
+    scope: FamilyCoverage = "all"
 
 
 def state_rag_preparation(
@@ -871,6 +1028,45 @@ def state_rag_preparation(
     return preparation.model_copy(update={"bootstrap": bootstrap})
 
 
+def state_rag_scopes(
+    context: SlotContext, slot: StateRagSlot, corpus: Corpus
+) -> tuple[FamilyScope, ...]:
+    """Return the build's family scopes the slot indexes, in build order."""
+    scoping = corpus.report.environment_families
+    assert scoping is not None
+    families = slot_families(context, corpus, slot.scope)
+    return tuple(row for row in scoping.scopes if families is None or row.family_id in families)
+
+
+def state_rag_bounds(
+    context: SlotContext, slot: StateRagSlot, corpus: Corpus | None
+) -> tuple[int, StateRAGCalls, str]:
+    """Bound the state-rag slot's calls over its scoped families, with no call.
+
+    Returns:
+        The families priced, the call bound, and the plan text naming a narrowed scope.
+    """
+    families = _unsaved_families(context, slot.scope)
+    steps, note = 0, ""
+    if corpus is not None:
+        scopes = state_rag_scopes(context, slot, corpus)
+        families = len(scopes)
+        store = context.project.artifacts
+        for scope in scopes:
+            steps += len(load_rag_index(store, scope.index.artifact_id).transitions)
+        note = scope_note(corpus, slot_families(context, corpus, slot.scope))
+        if slot.scope == "all":
+            families = len(corpus.families)
+    steps = steps or families * context.preparation.limits.maximum_family_traces * 50
+    calls = plan_state_rag_calls(
+        authoring_calls=slot.authoring.calls * families,
+        questions=slot.authoring.maximum_questions,
+        corpus_steps=steps,
+        live_steps=slot.live_steps,
+    )
+    return families, calls, note
+
+
 @dataclass
 class StateRagExecutor:
     """Authors a state-tag bank per family and tags every fit step's pre-turn state.
@@ -894,24 +1090,7 @@ class StateRagExecutor:
             slot_identity("state-rag", settings, context, corpus)
         ):
             return True, (), ("Saved: state-tag index per family; replays with no call.",)
-        families = (
-            context.preparation.limits.maximum_families if corpus is None else len(corpus.families)
-        )
-        steps = 0
-        if corpus is not None:
-            scoping = corpus.report.environment_families
-            assert scoping is not None
-            for scope in scoping.scopes:
-                steps += len(
-                    load_rag_index(context.project.artifacts, scope.index.artifact_id).transitions
-                )
-        steps = steps or families * context.preparation.limits.maximum_family_traces * 50
-        calls = plan_state_rag_calls(
-            authoring_calls=slot.authoring.calls * families,
-            questions=slot.authoring.maximum_questions,
-            corpus_steps=steps,
-            live_steps=slot.live_steps,
-        )
+        families, calls, note = state_rag_bounds(context, slot, corpus)
         costs = (
             model_cost(
                 context.project,
@@ -922,7 +1101,7 @@ class StateRagExecutor:
             decision_cost(context.project, slot.decision_alias, calls.decisions),
         )
         line = (
-            f"{families} families: {calls.authoring_completions} authoring completions with "
+            f"{families} families{note}: {calls.authoring_completions} authoring completions with "
             f"{slot.author_alias}, {calls.corpus_decisions} corpus and {calls.live_decisions} "
             f"live decisions with {slot.decision_alias}."
         )
@@ -953,7 +1132,7 @@ class StateRagExecutor:
         assert scoping is not None
         bindings: dict[str, StateRecallBinding] = {}
         banks: dict[str, ArtifactInput] = {}
-        for scope in scoping.scopes:
+        for scope in state_rag_scopes(context, slot, corpus):
             loaded = load_rag_index(project.artifacts, scope.index.artifact_id)
             traces = sorted({row.trace_id for row in loaded.transitions})
             ordered = trace_order([corpus.traces[t] for t in traces], loaded.transitions)

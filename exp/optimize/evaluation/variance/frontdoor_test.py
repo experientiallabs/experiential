@@ -463,3 +463,24 @@ def test_one_consent_over_a_pending_build_prices_each_waiting_stage_on_the_way(
     assert len(run.builder.calls) == 1 and report.source is not None
     assert slot.runs == [{"banks": 2}]
     assert report.preparation is not None, report.stopped
+
+
+def test_a_slot_scoped_to_the_run_tasks_needs_the_preparations_task_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``run_tasks`` scope reads its families from ``preparation.task_ids``; none is refused."""
+    run = front_door(tmp_path, monkeypatch)
+    payload = run.spec.model_dump(mode="json")
+    assert not run.spec.preparation.task_ids
+    with pytest.raises(ValueError, match="slots state-rag, tag-banks are scoped"):
+        FrontDoorSpec.model_validate(
+            {
+                **payload,
+                "slots": {
+                    "tag-banks": {"scope": "run_tasks"},
+                    "state-rag": {"scope": "run_tasks"},
+                    "task-types": {"scope": "all"},
+                },
+            }
+        )
+    FrontDoorSpec.model_validate({**payload, "slots": {"tag-banks": {"scope": "all"}}})
