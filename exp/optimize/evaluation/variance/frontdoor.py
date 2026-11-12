@@ -44,6 +44,7 @@ from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.models.client import RequestAdmissionRefused
+from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.state_machine import TransitionJournal
 from exp.optimize.evaluation.variance.bootstrap_contracts import BootstrapBinding
@@ -139,6 +140,10 @@ class FrontDoorDependencies:
         slots: Slot executors replacing the owner-bound defaults.
         announce: Shown the dry-run view of each phase (completed work, the phase's remaining
             calls and unpriced components, the ledger left) before it is admitted.
+        progress: Observer of each phase's lifecycle (stage = phase name, detail = what
+            happened: ``replayed``, ``running``, ``finished``, ``stopped``, ``refused`` or
+            ``raised``) and of the registered starts' count (stage ``pipelines``). It only
+            observes; the plan and every identity are the same with or without it.
     """
 
     builder: ProjectBuilder | None = None
@@ -147,6 +152,7 @@ class FrontDoorDependencies:
     executors: Mapping[StageName, StageExecutor] | None = None
     slots: dict[SlotName, SlotExecutor] = field(default_factory=dict)
     announce: Callable[[tuple[str, ...]], None] | None = None
+    progress: ProgressHook | None = None
 
 
 def plan_front_door(
@@ -500,7 +506,11 @@ class _Runner:
         # after-pipeline slots when any start stopped; a rerun replays the finished starts and
         # resumes the stopped one.
         outcomes: list[PipelineOutcome] = []
-        for binding in prepared.bindings:
+        starts = len(prepared.bindings)
+        for index, binding in enumerate(prepared.bindings):
+            report(
+                deps.progress, "pipelines", completed=index, total=starts, detail=binding.task_id
+            )
             try:
                 outcome = self.pipeline(prepared, binding)
             except (Exception, RequestAdmissionRefused) as error:  # noqa: BLE001 - per start
@@ -513,6 +523,7 @@ class _Runner:
                     stopped=f"raised {type(error).__name__}: {str(error)[:1000]}",
                 )
             outcomes.append(outcome)
+        report(deps.progress, "pipelines", completed=starts, total=starts)
         stops = [f"{row.task_id}: {row.stopped}" for row in outcomes if row.stopped is not None]
         if stops:
             return report.model_copy(
@@ -559,7 +570,9 @@ class _Runner:
         state = self.tracker.stages.get(name)
         if state is None:
             state = self.tracker.stage(name, StageState.PLANNED.value)
+        progress = self.dependencies.progress
         if state == StageState.DONE:
+            report(progress, name, detail="replayed")
             return work(), None
         usd = sum(row.usd for row in costs if row.usd is not None)
         attempts = sum(row.attempts for row in costs if row.usd is None)
@@ -569,9 +582,11 @@ class _Runner:
         reason = self.ledger.admit(name, usd, attempts)
         if reason is not None:
             self.tracker.stage(name, "refused")
+            report(progress, name, detail="refused")
             return None, reason
         self.tracker.stage(name, "approved")
         self.tracker.stage(name, "started")
+        report(progress, name, detail="running")
         before = measure(self.project)
         try:
             result = work()
@@ -579,10 +594,12 @@ class _Runner:
             # A budget or admission stop is a BaseException; the phase is settled either way.
             self.ledger.settle(name, before, measure(self.project))
             self.tracker.stage(name, "raised")
+            report(progress, name, detail="raised")
             raise
         self.ledger.settle(name, before, measure(self.project))
         reason = stopped(result)
         self.tracker.stage(name, "stopped" if reason is not None else "finished")
+        report(progress, name, detail="stopped" if reason is not None else "finished")
         return result, reason
 
     def preview(self, name: str, costs: tuple[CostLine, ...]) -> tuple[str, ...]:

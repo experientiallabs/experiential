@@ -38,6 +38,14 @@ add_deferred_typer(
     help="Optimize supported frozen project artifacts.",
     known_names=("router", "model"),
 )
+add_deferred_typer(
+    app,
+    name="variance",
+    module="exp.cli.variance.app",
+    attr="variance_app",
+    help="Plan, run and watch the decision-variance front door.",
+    known_names=("run", "watch"),
+)
 app.command("eval", help="Evaluate models on a project and inspect saved results.")(evaluate)
 app.command("build", help="Import traces, mine scenarios, and build a grounded world model.")(build)
 app.command("run", help="Run the local gateway, optionally with one project-backed alias.")(run)
