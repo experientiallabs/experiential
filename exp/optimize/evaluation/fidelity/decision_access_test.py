@@ -84,7 +84,7 @@ def test_a_rate_limited_decision_is_retried_after_retry_after_instead_of_abortin
     assert waits == [7.0, 1.0, 2.0]
 
     refused = _Gateway([(400, None)])
-    with pytest.raises(ProviderTransportError, match="HTTP 400"):
+    with pytest.raises(ProviderTransportError, match="HTTP 400: code=rate_limited"):
         _decide(refused)(request)  # type: ignore[arg-type]
     assert refused.posts == 1
 
@@ -130,3 +130,25 @@ def test_parallel_receipt_recorders_publish_one_immutable_receipt(
         "run": "same-run",
         **receipt,
     }
+
+
+def test_a_refused_decision_names_the_providers_reason_but_never_the_request() -> None:
+    """A 400 carries the gateway's error type, code and message, bounded; the state never."""
+
+    class _Refusing(_Gateway):
+        def post(self, url: str, **kwargs: object) -> JsonHttpResponse:
+            del url, kwargs
+            self.posts += 1
+            message = "The model's provider rejected the request without giving a reason. " * 20
+            error = {"message": message, "type": "invalid_request_error", "code": "invalid_request"}
+            body = {"error": error}
+            return JsonHttpResponse(status_code=400, body=body, retry_after_seconds=None)
+
+    request = SimpleNamespace(provider_body=lambda model: {"model": model, "state": "SECRET-STATE"})
+    with pytest.raises(ProviderTransportError) as caught:
+        _decide(_Refusing([]))(request)  # type: ignore[arg-type]
+    text = str(caught.value)
+    assert caught.value.status_code == 400
+    assert "type=invalid_request_error; code=invalid_request; message=The model's provider" in text
+    assert "SECRET-STATE" not in text and len(text) < 500
+    assert decision_access.refusal_reason("not json") == "no error object in the response"

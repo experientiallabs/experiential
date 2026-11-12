@@ -26,6 +26,19 @@ _sleep: Callable[[float], None] = time.sleep
 _sample: Callable[[], float] = random.random
 
 
+def refusal_reason(body: object) -> str:
+    """Return the provider's stated error type, code and message, bounded, never the request."""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return "no error object in the response"
+    parts = [
+        f"{key}={str(error[key])[:300]}"
+        for key in ("type", "code", "message")
+        if isinstance(error.get(key), str)
+    ]
+    return "; ".join(parts) or "an error object with no type, code or message"
+
+
 def decision_caller(
     resolved: ResolvedModel,
     transport: AdmittedJsonTransport,
@@ -63,7 +76,8 @@ def decision_caller(
             if response.status_code == 200 and isinstance(response.body, dict):
                 return response.body
             failure = ProviderTransportError(
-                f"memory-recall decision returned HTTP {response.status_code}",
+                f"memory-recall decision returned HTTP {response.status_code}: "
+                f"{refusal_reason(response.body)}",
                 status_code=response.status_code,
                 retry_after_seconds=response.retry_after_seconds,
             )

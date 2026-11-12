@@ -56,7 +56,7 @@ from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost, model_cost
 from exp.optimize.evaluation.executable.state_recall import StateRecallBinding
 from exp.optimize.evaluation.factory.authoring import AuthorSettings, author_response
-from exp.optimize.evaluation.fidelity.decision_access import decision_caller
+from exp.optimize.evaluation.fidelity.decision_access import decision_caller, refusal_reason
 from exp.optimize.evaluation.rules.memory_admission import load_guard_table
 from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapDependencies,
@@ -494,34 +494,92 @@ def fit_decision_unit(unit: Unit, maximum_tokens: int = MAXIMUM_DECISION_STATE_T
     return Unit(unit.trace_id, unit.view, cut(low), dict(unit.meta))
 
 
+_Leaf = tuple[tuple[str | int, ...], str]
+"""A string inside a JSON value and its path of keys and indexes."""
+
+
+def _string_leaves(value: object, path: tuple[str | int, ...] = ()) -> list[_Leaf]:
+    """Return every string inside a JSON value with its path, depth first in document order."""
+    if isinstance(value, str):
+        return [(path, value)]
+    if isinstance(value, dict):
+        return [leaf for key, item in value.items() for leaf in _string_leaves(item, (*path, key))]
+    if isinstance(value, (list, tuple)):
+        return [leaf for i, item in enumerate(value) for leaf in _string_leaves(item, (*path, i))]
+    return []
+
+
+def _replaced(value: Any, path: tuple[str | int, ...], text: str) -> Any:  # noqa: ANN401
+    """Return a copy of a JSON value with the string at ``path`` replaced; the rest is shared."""
+    if not path:
+        return text
+    head, rest = path[0], path[1:]
+    if isinstance(value, dict):
+        return {**value, head: _replaced(value[head], rest, text)}
+    items = list(value)
+    items[head] = _replaced(items[head], rest, text)
+    return items
+
+
 def fit_decision_request(
     request: DecisionRequest, maximum_tokens: int = MAXIMUM_DECISION_STATE_TOKENS
 ) -> DecisionRequest:
-    """Return the request unchanged when its state fits, otherwise with its longest text fitted.
+    """Return the request unchanged when its state fits, otherwise with its longest texts fitted.
 
-    State-retrieval decisions carry the rendered pre-turn state as one string field; a state that
-    inlines a whole repository is refused by hosted Clef with a bare HTTP 400. The longest string
-    field gives way exactly as :func:`fit_decision_unit` cuts a unit, so a request that already
-    fits keeps its identity and its cached answer.
+    State-retrieval decisions carry the rendered pre-turn state as a nested object (task, recent
+    actions and their results); a state whose recent action inlines a whole file or a runaway tool
+    argument is refused by hosted Clef with a bare HTTP 400. The longest string anywhere in the
+    state gives way exactly as :func:`fit_decision_unit` cuts a unit, so a request that already fits
+    keeps its identity and its cached answer, and a top-level string state is cut exactly as
+    before. When that one text cannot make room alone, every text is capped at one shared ceiling.
     """
     state = request.state
     if not isinstance(state, dict) or count_reservation_tokens(json.dumps(state)) <= maximum_tokens:
         return request
-    texts = {key: value for key, value in state.items() if isinstance(value, str)}
-    if not texts:
+    leaves = _string_leaves(state)
+    if not leaves:
         return request
-    key = max(texts, key=lambda name: len(texts[name]))
-    rest = count_reservation_tokens(json.dumps({**state, key: ""}))
+    path, text = max(leaves, key=lambda leaf: len(leaf[1]))
+    rest = count_reservation_tokens(json.dumps(_replaced(state, path, "")))
     budget = max(1, maximum_tokens - rest)
-    candidate = state
+    candidate: Any = state
     for _ in range(8):  # JSON escaping and token joins can overshoot; shrink by the overshoot
-        fitted = fit_decision_unit(Unit("state", "state", texts[key], {}), budget)
-        candidate = {**state, key: fitted.text}
+        fitted = fit_decision_unit(Unit("state", "state", text, {}), budget)
+        candidate = _replaced(state, path, fitted.text)
         over = count_reservation_tokens(json.dumps(candidate)) - maximum_tokens
         if over <= 0 or budget <= 1:
             break
         budget = max(1, budget - over - 8)
+    if count_reservation_tokens(json.dumps(candidate)) > maximum_tokens:
+        candidate = _capped_state(state, leaves, maximum_tokens)
     return request.model_copy(update={"state": candidate})
+
+
+def _capped_state(
+    state: JsonObject, leaves: Sequence[_Leaf], maximum_tokens: int
+) -> Any:  # noqa: ANN401
+    """Cap every text at the largest shared token ceiling that fits, when one cut is not enough.
+
+    Several long texts (four recent actions each inlining a file) share the room evenly instead
+    of the longest ones being erased; a state whose structure alone overflows gets the smallest cap.
+    """
+
+    def capped(ceiling: int) -> Any:  # noqa: ANN401
+        result: Any = state
+        for path, text in leaves:
+            fitted = fit_decision_unit(Unit("state", "state", text, {}), ceiling).text
+            if fitted is not text:
+                result = _replaced(result, path, fitted)
+        return result
+
+    low, high = 1, maximum_tokens
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_reservation_tokens(json.dumps(capped(middle))) <= maximum_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return capped(low)
 
 
 class FittedDecisionsTagger(DecisionsTraceTagger):
@@ -536,19 +594,6 @@ class FittedDecisionsTagger(DecisionsTraceTagger):
     def _unit_answers(self, unit: Unit, chunks: Sequence[Sequence[Question]]) -> Any:  # noqa: ANN401
         """Answer the bank about the unit as fitted to the input ceiling."""
         return super()._unit_answers(fit_decision_unit(unit, self.maximum_state_tokens), chunks)
-
-
-def _refusal_reason(body: object) -> str:
-    """Return the provider's stated error type, code and message, bounded, never the request."""
-    error = body.get("error") if isinstance(body, dict) else None
-    if not isinstance(error, dict):
-        return "no error object in the response"
-    parts = [
-        f"{key}={str(error[key])[:300]}"
-        for key in ("type", "code", "message")
-        if isinstance(error.get(key), str)
-    ]
-    return "; ".join(parts) or "an error object with no type, code or message"
 
 
 @dataclass(frozen=True)
@@ -576,7 +621,7 @@ class ReasonedDecisionTransport(JsonHttpTransport):
         if response.status_code != 200 or not isinstance(response.body, dict):
             raise ProviderTransportError(
                 f"tagging decision returned HTTP {response.status_code}: "
-                f"{_refusal_reason(response.body)}",
+                f"{refusal_reason(response.body)}",
                 status_code=response.status_code,
             )
         return response
