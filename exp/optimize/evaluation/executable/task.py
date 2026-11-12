@@ -142,7 +142,10 @@ class ExecutableTask(ContractModel):
         return self
 
     def profile(self) -> str:
-        """Bind the world, probe, verifier, actor context and execution allowance."""
+        """Bind the world, probe, judge, actor context and execution allowance.
+
+        A judged task's study registers no verifier, so its profile binds none.
+        """
         return sha256_json(self)
 
 

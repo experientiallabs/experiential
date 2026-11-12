@@ -24,7 +24,6 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
@@ -48,8 +47,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace, TraceSource
 from exp.common.traces.ingest import TraceNormalizationResult, persist_trace_dataset
 from exp.common.traces.trace import TraceOutcome
-from exp.optimize.evaluation.executable.controls import DeclaredControl
-from exp.optimize.evaluation.executable.qualification import load_executable_qualification
+from exp.optimize.evaluation.executable.judged_acceptance import load_judged_acceptance
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.optimize.evaluation.rules.extraction import EXTRACTION_TOOL
@@ -158,8 +156,6 @@ from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
-from exp.simulation.evaluation.admission import EvaluationSpecification, persist_specification
-from exp.simulation.evaluation.tasks import TaskVerifier
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.error_tags import ERROR_BANK_ID
 from exp.simulation.mining.traceml import ACTION_LABELS, TRACEML_BANK_ID, load_traceml_labels
@@ -1780,97 +1776,21 @@ def test_an_interrupted_stage_resumes_without_recalling_finished_work(
     assert run.calls()[0] >= before[0]
 
 
-def ticket_qualification(project: ProjectStore, verifier: TaskVerifier) -> VariantQualification:
-    """Independent ticket acceptance and ten controls on each variant's first feasible branch.
-
-    Per partition: two valid outcomes that differ only in what the agent said, a wrong outcome,
-    a changed tier (a prohibited effect) and a missing step log (unavailable evidence).
-
-    Args:
-        project: Project receiving the specification.
-        verifier: The task verifier, whose permitted tools and preserved paths the independent
-            specification keeps.
-
-    Returns:
-        The qualification settings.
-    """
-    specification = persist_specification(
-        project.artifacts,
-        EvaluationSpecification(
-            description="A handled ticket's outcome is right and its tier and lock are kept.",
-            predicate=TaskVerifier(
-                description="Authored ticket acceptance with an independent outcome schema.",
-                outcome_schema={
-                    "properties": {
-                        "final_state": {
-                            "properties": {
-                                "tickets": {
-                                    "properties": {"outcome": {"const": "right"}},
-                                    "required": ["outcome"],
-                                }
-                            },
-                            "required": ["tickets"],
-                        }
-                    },
-                    "required": ["final_state"],
-                },
-                allowed_tools=verifier.allowed_tools,
-                preserved_paths=verifier.preserved_paths,
-            ),
-            subject="outcome",
-        ),
-        created_at=datetime.now(UTC),
-        code_revision=REVISION,
-    )
-    edits: dict[str, tuple[JsonValue, ...]] = {
-        "valid-one": (),
-        "valid-two": (),
-        "goal-miss": (
-            {"op": "set", "path": ["final_state", "tickets", "outcome"], "value": "wrong"},
-        ),
-        "side-effect": (
-            {"op": "set", "path": ["final_state", "tickets", "severity"], "value": "low"},
-        ),
-        "unknown": ({"op": "set", "path": ["steps"], "value": None},),
-    }
-    controls = []
-    for partition in ("development", "confirmation"):
-        for index, (kind, changes) in enumerate(edits.items()):
-            said = {"op": "set", "path": ["final_answer"], "value": f"{partition} control {index}"}
-            expected: Literal["pass", "fail", "unassessable"] = (
-                "unassessable"
-                if kind == "unknown"
-                else "pass"
-                if kind.startswith("valid")
-                else "fail"
-            )
-            controls.append(
-                DeclaredControl(
-                    id=f"{partition}-{kind}",
-                    lineage=f"ticket-pipeline-{partition}-{index}",
-                    partition=partition,
-                    expected=expected,
-                    branch=0,
-                    edits=(said, *changes),
-                    rationale="Authored observation-level control over the feasible branch.",
-                )
-            )
-    return VariantQualification(specification=specification, controls=tuple(controls))
-
-
 def test_admitted_variants_are_qualified_before_their_harbor_export(
     pipeline: tuple[Run, PipelineReport],
 ) -> None:
-    """A variant whose feasible run and controls qualify is exported qualified; others record why.
+    """A variant the frozen judge accepts is exported accepted; others record why.
 
-    The scripted actor always escalates, so the routine (low tier) variant has no successful
-    feasibility run: it stays diagnostic with its failure recorded, never silently qualified.
+    Acceptance reads the family's admission and the variant's feasibility run judged by its own
+    frozen judge; no verifier or control takes part. The scripted actor always escalates, so the
+    routine (low tier) variant has no judged pass: it stays diagnostic with its refusals
+    recorded, never silently accepted.
     """
     run, first = pipeline
     project = run.project
     dispositions = dispositions_for(project, first)
     reviewed(run, dispositions)
-    qualification = ticket_qualification(project, run.fixture.job.study.verifier)
+    qualification = VariantQualification()
     spec = make_spec(
         run.fixture,
         run.rubric,
@@ -1898,11 +1818,13 @@ def test_admitted_variants_are_qualified_before_their_harbor_export(
             assert binding["qualification"] == "diagnostic_only"
             continue
         assert row.qualification is not None and row.failure is None and not row.refusals
-        assert load_executable_qualification(project, row.qualification).qualified
-        assert binding["qualification"] == "qualified_observable_contract"
+        accepted = load_judged_acceptance(project, row.qualification)
+        assert accepted.qualified and accepted.passes >= 1 and accepted.admitted
+        assert task.job.study.verifier is None
+        assert binding["qualification"] == "qualified_judged_acceptance"
         assert binding["qualification_evidence"] == row.qualification.model_dump(mode="json")
     routine = [row for row in records.harbor if row.scenario_id == "routine"]
-    assert all(row.diagnostic and row.failure for row in routine)
+    assert all(row.diagnostic and (row.failure or row.refusals) for row in routine)
     before = run.calls()
     assert [row.replayed for row in run.run(spec, approve=False).stages] == [True] * 6
     assert run.calls() == before

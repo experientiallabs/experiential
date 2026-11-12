@@ -38,8 +38,10 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.study import (
     CheckpointSession,
+    required_verifier,
     restore_continuation_world,
 )
+from exp.optimize.evaluation.executable.judged_acceptance import reward_qualification
 from exp.optimize.evaluation.executable.ledger import LedgerKind, TrialLedgerEntry, trial_ledger
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime, load_runtime_definition
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant, ProviderLimits
@@ -376,7 +378,7 @@ class ExecutableHarborTrial:
                 "steps": self._steps,
                 "stop_reason": "failure" if self._failed or answer is None else "completed",
             }
-            assessment = grade(self.task.job.study.verifier, outcome)
+            assessment = grade(required_verifier(self.task.job.study), outcome)
             qualified = False
             scope = "diagnostic; observable mechanical predicate only"
             if self.qualification is not None:
@@ -417,8 +419,7 @@ class ExecutableHarborTrial:
             "reward": None,
             "label_authority": "frozen LLM episode judge",
             "judge": {"definition": judge.identity, "assessment": None, "verdict": None},
-            "qualification": "qualified_observable_contract" if qualified else "diagnostic_only",
-            "judge_qualification": "not_qualified_by_observable_contract",
+            "qualification": "qualified_judged_acceptance" if qualified else "diagnostic_only",
             "scope": scope,
             "outcome_unknown": self._outcome_unknown,
             "execution_failed": self._failed,
@@ -476,13 +477,19 @@ class ExecutableHarborTrial:
         return result
 
     def _qualification(self) -> tuple[bool, str]:
-        """Return whether the exact task profile is qualified, and the qualification scope."""
+        """Return whether the judged task is accepted for reward, and the acceptance scope.
+
+        A judged task is gated only by its judged acceptance (the frozen rubric judge over a
+        feasible run plus the admission evidence), never by a verifier qualification.
+        """
         if self.qualification is None:
-            return False, "diagnostic; observable mechanical predicate only"
-        report = load_executable_qualification(self.project, self.qualification)
-        if report.task != self.task_ref or report.profile_sha256 != self.task.profile():
-            raise ValueError("qualification differs from this exact executable profile")
-        return report.qualified, report.scope
+            return False, "diagnostic; no judged acceptance"
+        task, profile, qualified, scope = reward_qualification(
+            self.project, self.qualification, judged=True
+        )
+        if task != self.task_ref or profile != self.task.profile():
+            raise ValueError("acceptance differs from this exact executable profile")
+        return qualified, scope
 
     def output_files(self) -> JsonObject:
         """Export only declared final files after submission, with exact digest verification."""
@@ -543,8 +550,10 @@ def open_executable_harbor_trial(
         )
     checkpoint = load_continuation_checkpoint(project.artifacts, task.job.study.checkpoint)
     if qualification is not None:
-        report = load_executable_qualification(project, qualification)
-        if report.task != task_ref or report.profile_sha256 != task.profile():
+        gated, profile, _, _ = reward_qualification(
+            project, qualification, judged=task.judge is not None
+        )
+        if gated != task_ref or profile != task.profile():
             raise ValueError("qualification differs from the selected task before runtime startup")
     identity = stable_id(
         "executable-trial",

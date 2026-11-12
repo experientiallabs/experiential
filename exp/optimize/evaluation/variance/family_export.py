@@ -4,14 +4,16 @@
 checkpoint under the family's frozen job (rebound to a frozen variant's runtime definition by
 :func:`variant_job`), rewarded only by the variant's frozen judge. :func:`export_family_harbor`
 packages it, diagnostic unless the family is eligible, the variant's winner was confirmed on
-fresh samples and an executable qualification for that exact task is supplied. Both are
+fresh samples and a judged acceptance for that exact task is supplied
+(:func:`~exp.optimize.evaluation.executable.judged_acceptance.accept_judged_task`: the family's
+admission plus a feasibility run judged by the variant's own judge; no verifier). Both are
 re-exported by :mod:`~exp.optimize.evaluation.variance.family`.
 
 A nudge-ladder rung of an admitted family is a task of its own: :func:`rung_executable_task`
 starts at the rung's replayed decision checkpoint under its own frozen judge, and
 :func:`export_rung_harbor` packages it with its ladder, strength and position recorded in the
-package metadata, qualified only when the family is eligible and the rung's own executable
-qualification is supplied.
+package metadata, qualified only when the family is eligible and the rung's own judged
+acceptance is supplied. Every package interfaces only with the family's frozen simulator.
 """
 
 from __future__ import annotations

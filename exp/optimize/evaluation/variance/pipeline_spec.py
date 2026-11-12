@@ -39,7 +39,6 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ToolCall
 from exp.optimize.evaluation.continuations.job import ContinuationJob
-from exp.optimize.evaluation.executable.controls import DeclaredControl
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
@@ -586,22 +585,21 @@ class AuthoringSettings(ContractModel):
 
 
 class VariantQualification(ContractModel):
-    """Executable qualification of every exported variant, before its Harbor export.
+    """Judged acceptance of every exported variant, before its Harbor export.
 
     Each confirmed variant of an admitted family is turned into its exact executable task (its
-    frozen start, its frozen runtime and its own frozen judge), executed once for feasibility,
-    and qualified by
-    :func:`~exp.optimize.evaluation.executable.qualification.qualify_executable_task` with these
-    controls witnessed by :func:`~exp.optimize.evaluation.executable.controls.witness_controls`.
+    frozen start, its frozen runtime and its own frozen judge), executed once for feasibility
+    from the frozen simulator state, judged by that judge, and accepted by
+    :func:`~exp.optimize.evaluation.executable.judged_acceptance.accept_judged_task` only when the
+    family's admission holds (the decision is real, its outcome differs and the better option is
+    clear, measured by judged contrasts) and the feasibility run shows the task solvable under
+    the judge. No verifier, control or predicate over the final state takes part.
 
     Attributes:
-        specification: Independent ``evaluation-specification`` the controls are witnessed
-            against; never the task's own verifier.
-        controls: Declared controls, each on a feasibility branch or a literal outcome.
+        minimum_judged: Least share of feasibility branches the judge must give a verdict.
     """
 
-    specification: ArtifactInput
-    controls: tuple[DeclaredControl, ...] = Field(min_length=1, max_length=64)
+    minimum_judged: float = Field(default=0.5, gt=0.0, le=1.0)
 
 
 class RecordsSettings(ContractModel):
@@ -614,9 +612,9 @@ class RecordsSettings(ContractModel):
         crosstalk_attempts: Source best-of-N size.
         crosstalk_top_k: Exemplars per exemplar arm.
         crosstalk_repeats: Attempts per target arm.
-        qualification: Qualify each exported variant first, or None to export every variant
-            as diagnostic. A variant that does not qualify is exported as diagnostic with its
-            refusals or failure recorded.
+        qualification: Accept each exported variant by its frozen judge first, or None to
+            export every variant as diagnostic. A variant that is not accepted is exported as
+            diagnostic with its refusals or failure recorded.
         point_decisions: Derive every continued point's options from its judged continuations
             and classify them (:mod:`~exp.optimize.evaluation.variance.point_options`), so the
             version 2 selector records score every selector draw, not only picks that reached

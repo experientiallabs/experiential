@@ -50,24 +50,21 @@ from exp.common.core.artifacts import (
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
-    continuation_result_reference,
-    execute_continuation_job,
-    saved_continuation_job,
 )
-from exp.optimize.evaluation.executable.controls import ControlWitnessSpec, witness_controls
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
-from exp.optimize.evaluation.executable.model_costs import CostComponent
-from exp.optimize.evaluation.executable.qualification import (
-    load_executable_qualification,
-    qualify_executable_task,
+from exp.optimize.evaluation.executable.judged_acceptance import (
+    accept_judged_task,
+    load_judged_acceptance,
 )
+from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
     MiningProvenance,
     load_executable_task,
     persist_executable_task,
 )
+from exp.optimize.evaluation.variance.actor_critic import admitted_concurrency
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_start
 from exp.optimize.evaluation.variance.blast_radius import load_cross_tier
 from exp.optimize.evaluation.variance.crosstalk import (
@@ -210,11 +207,13 @@ class _RecordsStage:
             for alias in spec.mining.actors:
                 feasibility = group_job(project, spec, spec.mining.registered, alias)
                 costs.extend(row.scaled(variants) for row in job_costs(project, feasibility))
+                costs.extend(judge_costs(project, spec, variants * feasibility.study.repeats))
             lines.append(
-                f"Qualification: one feasibility run per exported variant and curriculum rung "
-                f"(up to {rungs} rungs per family), up to {variants} per tier, and "
-                f"{len(records.qualification.controls)} witnessed controls each; qualification "
-                "itself makes no model call."
+                f"Acceptance: one feasibility run per exported variant and curriculum rung "
+                f"(up to {rungs} rungs per family), up to {variants} per tier, each branch judged "
+                "by the variant's frozen judge; accepted only on the family's admission evidence "
+                f"and at least one judged pass with {records.qualification.minimum_judged:.0%} of "
+                "branches judged. No verifier or control takes part."
             )
         if records.schedule:
             lines.append(
@@ -411,7 +410,7 @@ def _export(context: StageContext, row: FamilyOutcome, report: FamilyReport) -> 
                 dense=_dense(context, report),
                 provenance=provenance,
             )
-            export = _qualify(context, task, export)
+            export = _qualify(context, task, export, row, report)
         if not destination.exists():
             export_family_harbor(
                 context.project,
@@ -470,7 +469,7 @@ def _export_rungs(
             exports.append(export.model_copy(update={"failure": f"not exported: {error}"}))
             continue
         if context.spec.records.qualification is not None:
-            export = _qualify(context, task, export)
+            export = _qualify(context, task, export, row, report)
         if not destination.exists():
             _package_rung(context, report, rung, export, name, provenance)
         exports.append(export)
@@ -628,20 +627,30 @@ def _schedule(
     )
 
 
-def _qualify(context: StageContext, task: ExecutableTask, export: HarborExport) -> HarborExport:
-    """Qualify one variant's or rung's exact executable task, recording every refusal or failure.
+def _qualify(
+    context: StageContext,
+    task: ExecutableTask,
+    export: HarborExport,
+    row: FamilyOutcome,
+    report: FamilyReport,
+) -> HarborExport:
+    """Accept one variant's or rung's exact executable task by its frozen judge, or record why not.
 
-    The task is the one its Harbor package starts from, rewarded only by its frozen judge. Its
-    feasibility run executes, or replays, once; the declared controls are witnessed against the
-    independent specification and the result is saved, passing or not.
+    The task is the one its Harbor package starts from, rewarded only by its frozen judge. The
+    family's admission (judged evidence that the decision is real, its outcome differs and the
+    better option is clear) is the admission evidence; the task's feasibility run executes, or
+    replays, once from the frozen simulator state and is judged by the task's judge. The
+    acceptance is saved, passing or not. No verifier takes part.
 
     Args:
         context: The running stage.
         task: The exact executable task.
         export: The variant's or rung's export, diagnostic so far.
+        row: The admitted family.
+        report: Its saved report.
 
     Returns:
-        The export, qualified when every observable-contract check passed.
+        The export, accepted when the admission holds and the judged run shows it solvable.
     """
     project, revision = context.project, context.code_revision
     settings = context.spec.records.qualification
@@ -650,30 +659,27 @@ def _qualify(context: StageContext, task: ExecutableTask, export: HarborExport) 
         project, task, created_at=datetime.now(UTC), code_revision=revision
     )
     export = export.model_copy(update={"task": reference})
+    judge = task.judge
     try:
-        if saved_continuation_job(project, task.job, code_revision=revision) is None:
-            execute_continuation_job(project, task.job, code_revision=revision)
-        feasibility = continuation_result_reference(project, task.job, code_revision=revision)
-        cases = witness_controls(
+        acceptance = accept_judged_task(
             project,
-            ControlWitnessSpec(
-                task=reference,
-                feasibility=feasibility,
-                specification=settings.specification,
-                controls=settings.controls,
-            ),
+            reference,
+            admission=row.report,
+            admitted=row.admitted and report.eligibility.eligible,
+            admission_reasons=(*row.reasons, *report.eligibility.reasons),
             created_at=datetime.now(UTC),
             code_revision=revision,
+            minimum_judged=settings.minimum_judged,
+            concurrency=1
+            if judge is None
+            else admitted_concurrency(project, judge.settings.model_alias),
         )
-        qualification = qualify_executable_task(
-            project, cases, created_at=datetime.now(UTC), code_revision=revision
-        )
-        result = load_executable_qualification(project, qualification)
+        result = load_judged_acceptance(project, acceptance)
     except ValueError as error:
         return export.model_copy(update={"failure": f"{type(error).__name__}: {error}"})
     return export.model_copy(
         update={
-            "qualification": qualification,
+            "qualification": acceptance,
             "diagnostic": not result.qualified,
             "refusals": result.refusals,
         }

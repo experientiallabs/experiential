@@ -2,6 +2,7 @@
 
 import base64
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
@@ -9,8 +10,13 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.models import ToolCall
+from exp.common.project import ProjectStore
+from exp.optimize.evaluation.executable.judged_acceptance import (
+    accept_judged_task,
+    load_judged_acceptance,
+)
 from exp.optimize.evaluation.executable.ledger import LedgerKind, trial_ledger
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
@@ -20,9 +26,11 @@ from exp.optimize.evaluation.executable.trial import (
     open_executable_harbor_trial,
 )
 from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
+from exp.optimize.evaluation.variance.dense_judge import DenseRewardJudge
 from exp.optimize.evaluation.variance.dense_judge_test import dense_judge, unanimous
 from exp.optimize.evaluation.variance.dense_judge_test import finding as dense_finding
 from exp.optimize.evaluation.variance.dense_reward import DenseRewardExport
+from exp.optimize.evaluation.variance.judged import EpisodeJudge
 from exp.optimize.evaluation.variance.judged_test import (
     episode_judge,
     judge_settings,
@@ -324,26 +332,55 @@ def test_ledger_reconciles_a_committed_reply_after_the_process_stops(
         assert resumed.ledger() == ledger
 
 
-def test_a_judged_task_is_rewarded_only_by_its_frozen_judge_over_the_ledger(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The same submitted episode under pass, fail and unassessable verdicts: 1, 0 and none."""
-    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
+def judged_task(
+    project: ProjectStore, task: ArtifactInput, *, dense: bool = False
+) -> tuple[ArtifactInput, EpisodeJudge, DenseRewardJudge | None]:
+    """Bind a frozen judge (and optionally a dense judge) to a task whose study has no verifier."""
     loaded = load_executable_task(project, task)
     run = run_digests(project, loaded.job.study.checkpoint, loaded.job.configuration)
     judge = episode_judge(project, judge_settings(project), **run)
-    judged = loaded.model_copy(update={"judge": judge})
+    bound = dense_judge(project, **run) if dense else None
+    study = loaded.job.study.model_copy(update={"verifier": None})
+    judged = loaded.model_copy(
+        update={
+            "judge": judge,
+            "dense": bound,
+            "job": loaded.job.model_copy(update={"study": study}),
+        }
+    )
     reference = persist_executable_task(
         project, judged, created_at=datetime.now(UTC), code_revision="test"
     )
-    qualification = qualify_executable_task(
+    return reference, judge, bound
+
+
+def accepted(project: ProjectStore, reference: ArtifactInput) -> ArtifactInput:
+    """Accept a judged task on admitted evidence and its judged feasibility run."""
+    return accept_judged_task(
         project,
-        spec.model_copy(update={"task": reference}),
+        reference,
+        admission=None,
+        admitted=True,
         created_at=datetime.now(UTC),
         code_revision="test",
     )
-    verdicts = iter(["pass", "fail", "unassessable"])
-    router = route_judge(monkeypatch, verdict=lambda evidence: next(verdicts))
+
+
+def test_a_judged_task_is_rewarded_only_by_its_frozen_judge_over_the_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same submitted episode under pass, fail and unassessable verdicts: 1, 0 and none.
+
+    The reward gate is the judged acceptance (a judged feasible run), never a verifier.
+    """
+    project, task, _ = qualified_fixture(tmp_path, monkeypatch)
+    reference, judge, _ = judged_task(project, task)
+    script: dict[str, Iterator[str]] = {"verdicts": iter(())}
+    router = route_judge(monkeypatch, verdict=lambda evidence: next(script["verdicts"], "pass"))
+    qualification = accepted(project, reference)
+    assert load_judged_acceptance(project, qualification).qualified
+    script["verdicts"] = iter(["pass", "fail", "unassessable"])
+    first = len(router.judged)
     rewards = []
     for trial_id in ("judged-pass", "judged-fail", "judged-unscored"):
         with open_executable_harbor_trial(
@@ -361,8 +398,8 @@ def test_a_judged_task_is_rewarded_only_by_its_frozen_judge_over_the_ledger(
             assert trial.result() == result
             rewards.append((result["status"], result["reward"]))
     assert rewards == [("completed", 1), ("completed", 0), ("incomplete", None)]
-    assert len(router.judged) == 3
-    events = router.judged[0]["events"]
+    assert len(router.judged) == first + 3
+    events = router.judged[first]["events"]
     assert isinstance(events, list)
     kinds = [e["kind"] for e in events if isinstance(e, dict) and e["scope"] == "scored"]
     assert kinds[:2] == ["assistant_message", "tool_call"] and "final_answer" in kinds
@@ -372,21 +409,11 @@ def test_a_dense_reward_is_judged_after_the_episode_beside_the_unchanged_reward(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ledger is judged for dense findings; the outcome reward is unchanged and separate."""
-    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
-    loaded = load_executable_task(project, task)
-    run = run_digests(project, loaded.job.study.checkpoint, loaded.job.configuration)
-    judge = episode_judge(project, judge_settings(project), **run)
-    dense = dense_judge(project, **run)
-    bound = loaded.model_copy(update={"judge": judge, "dense": dense})
-    reference = persist_executable_task(
-        project, bound, created_at=datetime.now(UTC), code_revision="test"
-    )
-    qualification = qualify_executable_task(
-        project,
-        spec.model_copy(update={"task": reference}),
-        created_at=datetime.now(UTC),
-        code_revision="test",
-    )
+    project, task, _ = qualified_fixture(tmp_path, monkeypatch)
+    reference, _, dense = judged_task(project, task, dense=True)
+    assert dense is not None
+    route_judge(monkeypatch, verdict=lambda evidence: "pass")
+    qualification = accepted(project, reference)
     credit = dense_finding("verified_result", "established", observed_refs=["ledger.2"])
     route_judge(monkeypatch, roles=unanimous(credit), verdict=lambda evidence: "pass")
     with open_executable_harbor_trial(

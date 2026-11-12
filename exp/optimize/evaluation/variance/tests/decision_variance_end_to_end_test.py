@@ -23,8 +23,9 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, JsonValue
+from exp.optimize.evaluation.continuations.study import required_verifier
+from exp.optimize.evaluation.executable.judged_acceptance import load_judged_acceptance
 from exp.optimize.evaluation.executable.package import verify_executable_package
-from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
 from exp.optimize.evaluation.variance.behavior_pairs import (
@@ -51,6 +52,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     PipelineReport,
     RecordsOutputs,
     StageDependencies,
+    VariantQualification,
 )
 from exp.optimize.evaluation.variance.pipeline_test import (
     ANSWERS,
@@ -71,7 +73,6 @@ from exp.optimize.evaluation.variance.pipeline_test import (
     rebound,
     scenario_answer,
     step_tagger,
-    ticket_qualification,
     unrevised,
     write_bank,
 )
@@ -475,7 +476,7 @@ def test_every_measured_stage_runs_from_sampling_to_records_and_replays_without_
     spec = measured_spec(run)
     first = run.run(spec)
     assert first.complete, first.stopped
-    qualification = ticket_qualification(run.project, run.fixture.job.study.verifier)
+    qualification = VariantQualification()
     reviewed = spec.model_copy(
         update={
             "authoring": spec.authoring.model_copy(
@@ -555,7 +556,7 @@ def test_every_measured_stage_runs_from_sampling_to_records_and_replays_without_
         assert row.ladder == family.ladder.artifact_id and row.failure is None
         assert not row.diagnostic and not row.refusals, row
         assert row.task is not None and row.qualification is not None
-        assert load_executable_qualification(project, row.qualification).qualified
+        assert load_judged_acceptance(project, row.qualification).qualified
         task = load_executable_task(project, row.task)
         assert task.judge == judges[row.scenario_id]
         assert task.dense is not None and task.dense.definition.tags == (TAG,)
@@ -568,7 +569,7 @@ def test_every_measured_stage_runs_from_sampling_to_records_and_replays_without_
             "strength": row.strength,
             "position": row.position,
         }
-        assert binding["qualification"] == "qualified_observable_contract"
+        assert binding["qualification"] == "qualified_judged_acceptance"
         metadata = tomllib.loads((package / "task.toml").read_text())["metadata"]
         assert metadata["curriculum_strength"] == row.strength
         assert metadata["curriculum_position"] == row.position
@@ -599,7 +600,7 @@ def test_every_measured_stage_runs_from_sampling_to_records_and_replays_without_
     assert rollout.spec is not None and rollout.curriculum[0].scenario_id == "urgent-nudge-0"
     assert rollout.actor_job.study.checkpoint == strong.job.study.checkpoint
     assert rollout.actor_job.configuration == strong.job.configuration
-    assert rollout.actor_job.study.verifier == strong.job.study.verifier
+    assert required_verifier(rollout.actor_job.study) == required_verifier(strong.job.study)
     assert rollout.actor_job.runtime_sha256 == strong.job.runtime_sha256
     assert all(stage.task and stage.qualification for stage in rollout.curriculum)
     assert rollout.episode_judge == strong.judge == rollout.spec.episode_judge

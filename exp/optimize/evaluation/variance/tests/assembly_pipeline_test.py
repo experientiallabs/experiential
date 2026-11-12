@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue
+from exp.optimize.evaluation.executable.judged_acceptance import load_judged_acceptance
 from exp.optimize.evaluation.executable.package import verify_executable_package
-from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.blast_radius import SEVERITY_TOOL, BlastSpec
@@ -43,6 +43,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     RecordsOutputs,
     StageDependencies,
     TraceMLOutputs,
+    VariantQualification,
 )
 from exp.optimize.evaluation.variance.pipeline_test import (
     ANSWERS,
@@ -57,7 +58,6 @@ from exp.optimize.evaluation.variance.pipeline_test import (
     rebound,
     selector_answer,
     step_tagger,
-    ticket_qualification,
     write_bank,
 )
 from exp.optimize.evaluation.variance.point_bar import DEFAULT_BAR
@@ -253,7 +253,7 @@ def test_five_tiers_reach_qualified_packages_through_the_bar_blast_radius_and_hy
     assert any("qualification bar" in line for line in mining_plan.lines)
     first = run.run(spec)
     assert first.complete, first.stopped
-    qualification = ticket_qualification(run.project, run.fixture.job.study.verifier)
+    qualification = VariantQualification()
     reviewed = spec.model_copy(
         update={
             "authoring": spec.authoring.model_copy(
@@ -317,7 +317,7 @@ def test_five_tiers_reach_qualified_packages_through_the_bar_blast_radius_and_hy
     versions: dict[str, str] = {}
     for row in qualified:
         assert row.task is not None and row.qualification is not None
-        assert load_executable_qualification(project, row.qualification).qualified
+        assert load_judged_acceptance(project, row.qualification).qualified
         task = load_executable_task(project, row.task)
         assert task.dense is not None and task.judge is not None
         package = Path(row.path)

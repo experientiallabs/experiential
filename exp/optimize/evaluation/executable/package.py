@@ -6,7 +6,7 @@ from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.executable.qualification import load_executable_qualification
+from exp.optimize.evaluation.executable.judged_acceptance import reward_qualification
 from exp.optimize.evaluation.executable.task import MiningProvenance, load_executable_task
 from exp.optimize.evaluation.harbor.export import (
     preflight_harbor_destination,
@@ -46,12 +46,16 @@ def export_executable_harbor(
     checkpoint = load_continuation_checkpoint(project.artifacts, task.job.study.checkpoint)
     qualified = False
     if qualification is not None:
-        report = load_executable_qualification(project, qualification)
-        if report.task != task_ref:
+        gated, _, qualified, _ = reward_qualification(
+            project, qualification, judged=task.judge is not None
+        )
+        if gated != task_ref:
             raise ValueError("qualification belongs to another executable task")
-        qualified = report.qualified
     if not qualified and not diagnostic:
-        raise ValueError("observable contract is unqualified; use an explicit diagnostic export")
+        raise ValueError(
+            "the task is unqualified for reward (judged acceptance for a judged task, observable "
+            "qualification otherwise); use an explicit diagnostic export"
+        )
     return write_harbor_package(
         destination,
         name=name,
@@ -68,7 +72,15 @@ def export_executable_harbor(
             "task": task_ref.model_dump(mode="json"),
             "checkpoint": task.job.study.checkpoint.model_dump(mode="json"),
             "profile_sha256": task.profile(),
-            "qualification": "qualified_observable_contract" if qualified else "diagnostic_only",
+            "qualification": (
+                (
+                    "qualified_judged_acceptance"
+                    if task.judge is not None
+                    else "qualified_observable_contract"
+                )
+                if qualified
+                else "diagnostic_only"
+            ),
             "qualification_evidence": None
             if qualification is None
             else qualification.model_dump(mode="json"),
