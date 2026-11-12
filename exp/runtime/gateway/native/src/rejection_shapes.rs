@@ -56,16 +56,36 @@ pub fn rejected_gemini_credential(dialect: Dialect, body: &str) -> bool {
 /// template that only accepts a leading system turn). They are lane
 /// limitations, not caller errors: the request fails over to the next rung and
 /// only a route with no other rung surfaces the sentence.
+///
+/// The Bedrock pairing sentence is a relay's verdict, not the caller's: a
+/// reseller relaying Claude to AWS Bedrock (Novita `anthropic/claude-*`,
+/// 2026-11-12) answered `ValidationException: messages.N.content.0: unexpected
+/// tool_use_id found in tool_result blocks ... Each tool_result block must
+/// have a corresponding tool_use block in the previous message` for ~7% of a
+/// long tool-heavy conversation's turns while the SAME body, resent seconds
+/// later on the same lane, served (61 of 99 failures), and the direct
+/// Anthropic rungs never refused one. The gateway's own encoding pairs every
+/// result with its call (verified on the captured bodies), so the sentence
+/// names what the relay made of the history on that dispatch, and the ladder
+/// must advance past it.
 const LANE_LIMITATION_PHRASES: &[&str] = &[
     "system message must be at the beginning",
     "system message should be at the beginning",
     "only the first message can be a system message",
 ];
 
+/// Bedrock's pairing verdict as a RELAY on the Chat dialect forwards it (see
+/// the note above). Read on that dialect only: a direct Anthropic rung
+/// answering the same sentence is judging the caller's own history, which
+/// the gateway replays on that wire byte for byte, so there it stays the
+/// caller's error.
+const RELAYED_PAIRING_PHRASES: &[&str] =
+    &["must have a corresponding `tool_use` block in the previous message"];
+
 /// Whether a 4xx body's error SENTENCE describes a limitation of the lane
-/// rather than of the caller's request (see [`LANE_LIMITATION_PHRASES`]). Only
-/// the dialect's message field is read, so request text echoed elsewhere in
-/// the body cannot change routing.
+/// rather than of the caller's request (see [`LANE_LIMITATION_PHRASES`] and
+/// [`RELAYED_PAIRING_PHRASES`]). Only the dialect's message field is read,
+/// so request text echoed elsewhere in the body cannot change routing.
 pub fn rejected_by_lane_limitation(dialect: Dialect, body: &str) -> bool {
     let Some(value) = parse_error_document(body) else {
         return false;
@@ -75,6 +95,10 @@ pub fn rejected_by_lane_limitation(dialect: Dialect, body: &str) -> bool {
         LANE_LIMITATION_PHRASES
             .iter()
             .any(|phrase| lowered.contains(phrase))
+            || (dialect == Dialect::OpenAiCompatible
+                && RELAYED_PAIRING_PHRASES
+                    .iter()
+                    .any(|phrase| lowered.contains(phrase)))
     })
 }
 
@@ -532,6 +556,33 @@ mod tests {
         ));
         let other =
             r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"max_tokens too large"}"#;
+        assert!(!rejected_by_lane_limitation(
+            Dialect::OpenAiCompatible,
+            other
+        ));
+    }
+
+    #[test]
+    fn a_relays_bedrock_tool_result_pairing_verdict_fails_over() {
+        // Novita's envelope for a Claude lane relayed to AWS Bedrock, as the
+        // production ledger recorded it on 2026-11-12 (ids shortened): the
+        // request paired every result with its call, the relay did not.
+        let relayed = r#"{"error":{"message":"InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, RequestID: 6f1c, ValidationException: messages.38.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_bdrk_01A, toolu_bdrk_01B. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.","type":"invalid_request_error","code":400}}"#;
+        assert!(rejected_by_lane_limitation(
+            Dialect::OpenAiCompatible,
+            relayed
+        ));
+        // The flat reseller envelope carries the same verdict.
+        let flat = r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"ValidationException: messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01X. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.","metadata":{}}"#;
+        assert!(rejected_by_lane_limitation(Dialect::OpenAiCompatible, flat));
+        // A direct Anthropic rung's own pairing verdict is the caller's
+        // error: the gateway replays that wire byte for byte.
+        assert!(!rejected_by_lane_limitation(
+            Dialect::AnthropicMessages,
+            relayed
+        ));
+        // A different tool_result complaint is still the caller's.
+        let other = r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"messages.3.content.0.tool_use_id: Field required"}"#;
         assert!(!rejected_by_lane_limitation(
             Dialect::OpenAiCompatible,
             other

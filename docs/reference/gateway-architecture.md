@@ -796,7 +796,11 @@ message and folds every later plain-text system or developer turn into user text
 Responses, and Messages surfaces alike, and admission discloses
 `messages.system->folded(system_messages_leading_only)` when a turn moved. An undeclared rung's
 messages are never rewritten; the 400 stays classified as a lane limitation the ladder fails
-over.
+over. The same classification covers a relay's Bedrock pairing verdict (`Each tool_result block
+must have a corresponding tool_use block in the previous message`): a Claude lane relayed to AWS
+Bedrock through a Chat reseller answered it intermittently for histories the gateway had paired
+correctly (Novita, 2026-11-12), so on the Chat dialect that sentence fails over instead of
+surfacing as the caller's error; a direct Anthropic rung's own verdict stays the caller's.
 
 The instruction-hoisting wires (Gemini `systemInstruction`, Bedrock Converse `system`) carry
 instructions only outside the turn list, so a system turn after conversation start has no
