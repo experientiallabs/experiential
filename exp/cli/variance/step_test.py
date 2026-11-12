@@ -101,8 +101,9 @@ def test_a_pipeline_stage_that_runs_shows_its_summary(tmp_path: Path) -> None:
     assert waits == ["run", "continue"]
 
 
-def test_stage_keys_and_summaries() -> None:
+def test_stage_keys_and_summaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Wiki page keys are the stage names, hyphenated; long summaries are cut."""
+    monkeypatch.setattr(step, "WIKI", tmp_path / "wiki")
     assert stage_key("slot tag-banks") == "slot-tag-banks"
     assert stage_key("pipeline task-1 traceml") == "pipeline-task-1-traceml"
     assert evidence("bootstrap-preparation").endswith("(not built yet)[/dim]")
