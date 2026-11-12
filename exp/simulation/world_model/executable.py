@@ -67,6 +67,7 @@ from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.engines.transition import Completion, ProposedObservation
 from exp.simulation.retrieval.state_rag import StateRAG, recalled_transition
 from exp.simulation.retrieval.state_tags import live_pre_turn_state
+from exp.simulation.retrieval.transition_tags import TransitionRAG
 from exp.simulation.rules.checker import TransitionVerdict, check_proposed_transition
 from exp.simulation.rules.model import RuleBook, Transition
 from exp.simulation.rules.recall import RuleRecall
@@ -134,7 +135,7 @@ class GroundedWorldFactory:
         maximum_reasks: int = 0,
         rule_book: RuleBook | None = None,
         rule_memory: RuleRecall | None = None,
-        state_recall: StateRAG | None = None,
+        state_recall: StateRAG | TransitionRAG | None = None,
         state_memory: StateMemory | None = None,
     ) -> None:
         """Bind one task without retrieving, loading credentials or calling a provider."""
@@ -391,7 +392,20 @@ class _GroundedWorldBackend:
                 history_steps=rag.policy.history_steps,
                 observation_characters=rag.policy.observation_characters,
             )
-            matched, state_receipt = rag.retrieve(live, (task.lineage_group_id,))
+            if isinstance(rag, TransitionRAG):
+                # Transition retrieval tags the prediction: the live state and this action.
+                matched, state_receipt = rag.retrieve(
+                    live,
+                    (task.lineage_group_id,),
+                    action={
+                        "kind": "tool_call",
+                        "content": None,
+                        "tool_name": action.name,
+                        "tool_arguments": action.arguments,
+                    },
+                )
+            else:
+                matched, state_receipt = rag.retrieve(live, (task.lineage_group_id,))
             precedents = [
                 recalled_transition(transition, match)
                 for transition, match in zip(matched, state_receipt.selected, strict=True)

@@ -16,7 +16,10 @@ entry points; every result is a saved record the next phase reads.
 - ``state-rag`` (:class:`StateRagExecutor`): per family, a state-tag bank is authored from
   sampled pre-turn states of its fit steps and every fit step is tagged (``authored_state_tags``,
   ``build_state_tag_index``); the saved index binds into the family's served runtimes as
-  ``state_recall`` with the optional ``state_memory`` policy.
+  ``state_recall`` with the optional ``state_memory`` policy. With ``retrieval:
+  "transition-tags"`` the slot instead runs one sample-evaluate-prune round of transition tags
+  per family (``run_transition_family``) and binds the family's transition-tag bank and index;
+  the default ``"state-tags"`` keeps today's behavior and identity.
 - ``rule-admission`` (:class:`RuleAdmissionExecutor`): the family rules already ran under tag
   admission inside the preparation; the executor loads every family's guard table, checks it
   converts to the runtime rule book (``guard_rulebook``) and records the bindings.
@@ -72,6 +75,7 @@ from exp.optimize.evaluation.variance.family_simulators import load_family_simul
 from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
 from exp.optimize.evaluation.variance.refined_prompts import SLOT_ROLES, refined_identity
+from exp.optimize.evaluation.variance.transition_rag_slot import run_transition_family
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.runtime.gateway.reservation_tokenizer import count_reservation_tokens
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
@@ -125,6 +129,11 @@ from exp.simulation.retrieval.state_tags import (
     trace_order,
 )
 from exp.simulation.retrieval.store import load_rag_index
+from exp.simulation.retrieval.transition_tags import (
+    RoundSpec,
+    TransitionAuthor,
+    plan_transition_rag_calls,
+)
 from exp.simulation.rules.admission import guard_rulebook
 from exp.simulation.world_model.state_memory import StateMemoryPolicy
 
@@ -990,6 +999,13 @@ class StateRagSlot(ContractModel):
         concurrency: Fit steps tagged at once; the saved index does not depend on it.
         scope: Every family scope of the build, or only the families of the run's selected
             tasks; a start of a family with no index runs without state recall.
+        retrieval: ``state-tags`` (today: pre-turn state questions over every fit step) or
+            ``transition-tags`` (authored transition descriptors, measured and pruned on a
+            sample, growing an append-only bank). Omitted, the slot and its identity are
+            unchanged.
+        transition: The transition-tag round, used only with ``transition-tags``.
+        transition_parent: A saved transition bank per family (or ``*`` for every family) to
+            grow from; its active tags are re-measured and its rows kept.
     """
 
     author_alias: str = Field(min_length=1)
@@ -1001,6 +1017,9 @@ class StateRagSlot(ContractModel):
     memory: StateMemoryPolicy | None = None
     concurrency: int = Field(default=1, ge=1, le=64)
     scope: FamilyCoverage = "all"
+    retrieval: Literal["state-tags", "transition-tags"] = "state-tags"
+    transition: RoundSpec = RoundSpec()
+    transition_parent: dict[str, ArtifactInput] = Field(default_factory=dict)
 
 
 def state_rag_preparation(
@@ -1058,6 +1077,24 @@ def state_rag_bounds(
         if slot.scope == "all":
             families = len(corpus.families)
     steps = steps or families * context.preparation.limits.maximum_family_traces * 50
+    if slot.retrieval == "transition-tags":
+        round_spec = slot.transition
+        plan = plan_transition_rag_calls(
+            authoring_calls=round_spec.authoring.calls * families,
+            tags=round_spec.authoring.maximum_tags,
+            sample_steps=min(steps, round_spec.sample_steps * families),
+            development_steps=round_spec.development_steps * families,
+            live_steps=slot.live_steps,
+        )
+        return (
+            families,
+            StateRAGCalls(
+                authoring_completions=plan["authoring_completions"],
+                corpus_decisions=plan["sample_decisions"] + plan["development_decisions"],
+                live_decisions=plan["live_decisions"],
+            ),
+            note,
+        )
     calls = plan_state_rag_calls(
         authoring_calls=slot.authoring.calls * families,
         questions=slot.authoring.maximum_questions,
@@ -1132,6 +1169,33 @@ class StateRagExecutor:
         assert scoping is not None
         bindings: dict[str, StateRecallBinding] = {}
         banks: dict[str, ArtifactInput] = {}
+        if slot.retrieval == "transition-tags":
+            for scope in state_rag_scopes(context, slot, corpus):
+                bank_ref, index_ref = run_transition_family(
+                    project,
+                    scope.family_id,
+                    scope.index,
+                    corpus.traces,
+                    TransitionAuthor(client=author.client, model=author.model),
+                    decide,
+                    model,
+                    slot.transition,
+                    parent=slot.transition_parent.get(scope.family_id)
+                    or slot.transition_parent.get("*"),
+                    code_revision=context.code_revision,
+                    concurrency=slot.concurrency,
+                )
+                banks[scope.family_id] = bank_ref
+                bindings[scope.family_id] = StateRecallBinding(
+                    index=index_ref,
+                    policy=slot.policy,
+                    decision_alias=slot.decision_alias,
+                    transition_bank=bank_ref,
+                    transition_policy=slot.transition.policy,
+                )
+            record = FamilyStateIndexes(bindings=bindings, banks=banks)
+            inputs = (*banks.values(), *(row.index for row in bindings.values()))
+            return save_slot(context, identity, record, inputs)
         for scope in state_rag_scopes(context, slot, corpus):
             loaded = load_rag_index(project.artifacts, scope.index.artifact_id)
             traces = sorted({row.trace_id for row in loaded.transitions})
