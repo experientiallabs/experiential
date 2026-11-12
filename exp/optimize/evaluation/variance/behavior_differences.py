@@ -43,7 +43,9 @@ class BehaviorDifferenceSpec(ContractModel):
         negative_tags: Hack and failure-mode tags, or empty to read them from the bank.
         maximum_pairs: Most same-task pairs compared per tier.
         maximum_window_steps: Most steps in one aligned window.
-        confidence: Probability above which a tag is present (below its complement, absent).
+        confidence: Probability above which a tag is present (below its complement, absent);
+            between the two a tag is uncertain and its pair unresolved. Lower it toward 0.5 for
+            a tagger whose answers sit near the middle.
         seed: Seed of the bounded pair sample.
         view: Step view the tags are asked over.
     """
@@ -55,7 +57,7 @@ class BehaviorDifferenceSpec(ContractModel):
     negative_tags: tuple[str, ...] = ()
     maximum_pairs: int = Field(default=16, ge=1, le=128, strict=True)
     maximum_window_steps: int = Field(default=64, ge=1, le=512, strict=True)
-    confidence: float = Field(default=0.7, gt=0.5, lt=1.0)
+    confidence: float = Field(default=0.7, ge=0.5, lt=1.0)
     seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
     view: StepViewSpec = StepViewSpec()
 
@@ -229,7 +231,12 @@ class BehaviorDifferenceGroup(ContractModel):
 
 
 class BehaviorDifferenceReport(ContractModel):
-    """Saved tag evidence, reviewed pairs, canonical groups and honest coverage."""
+    """Saved tag evidence, reviewed pairs, canonical groups and honest coverage.
+
+    ``pairing`` says how good and poor attempts were told apart: by the episode judge's verdict,
+    or, when every attempt received the same verdict, by whether a hack or failure-mode tag
+    fired confidently on some step.
+    """
 
     protocol: Literal["behavior-differences-v2"] = BEHAVIOR_DIFFERENCES_PROTOCOL
     study: ArtifactInput
@@ -243,6 +250,7 @@ class BehaviorDifferenceReport(ContractModel):
     attempts: tuple[BehaviorAttempt, ...]
     failures: dict[int, str]
     eligible_pairs: int = Field(ge=0)
+    pairing: Literal["verdict", "failure_mode_tags"] = "verdict"
     pairs: tuple[PairDifference, ...]
     groups: tuple[BehaviorDifferenceGroup, ...]
 

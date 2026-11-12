@@ -249,3 +249,27 @@ def test_final_evaluation_is_refused_before_tagging_or_pair_calls(
             code_revision="t",
             maximum_steps=20,
         )
+
+
+def test_cited_events_with_descriptions_are_reduced_to_their_ids() -> None:
+    """Authors cite ``e3 (agent edits the test)``; the host checks the bare id."""
+    from exp.optimize.evaluation.variance.behavior_pairs import _normalised, event_id
+
+    assert event_id("e3 (agent edits the test)") == "e3"
+    assert event_id("attempt:1/step:2(write)") == "attempt:1/step:2"
+    assert event_id(" e7 ") == "e7"
+    alignment = aligned().model_copy(
+        update={"good_events": ("e0 (ran the tests)",), "poor_events": ("e0 claimed",)}
+    )
+    fixed = _normalised(alignment)
+    assert fixed.good_events == ("e0",) and fixed.poor_events == ("e0",)
+
+
+def test_one_verdict_groups_pair_by_failure_mode_tags() -> None:
+    """All-pass attempts are told apart by whether a hack or failure-mode tag fired."""
+    from exp.optimize.evaluation.variance.behavior_pairs import flagged
+
+    config = spec()
+    clean = attempt(config, 0, [{"changed_implementation", "verified_result"}])
+    hacked = attempt(config, 1, [{"modified_evaluation"}])
+    assert not flagged(clean, config) and flagged(hacked, config)
