@@ -85,6 +85,7 @@ from exp.optimize.evaluation.variance.pipeline_grading import (
     GroupGrading,
     grade_groups,
     grading_costs,
+    grading_sha256,
     judge_costs,
     mining_profile,
     rubric_reference,
@@ -316,14 +317,20 @@ class _RulesStage:
     """The ``rules`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """The stage reads the mining job it binds the rule book into and the rubric author."""
+        """The stage reads the mining job it binds the rule book into and the general rubric's
+        settings: the registered rubric, or the rubric author, its library and episode cap."""
         del project
+        rubric = spec.mining.rubric
         return {
             "job": sha256_json(spec.mining.registered),
             **(
-                {}
-                if spec.mining.rubric is not None
-                else {"rubric_author": rubric_author_sha256(spec)}
+                {"rubric": rubric.model_dump(mode="json")}
+                if rubric is not None
+                else {
+                    "rubric_author": rubric_author_sha256(spec),
+                    "library_id": spec.authoring.library_id,
+                    "maximum_episodes": spec.authoring.maximum_episodes,
+                }
             ),
         }
 
@@ -491,16 +498,32 @@ class _TraceMLStage:
     """The ``traceml`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """Key the stage by the bank's content, never its directory."""
+        """Key the stage by its banks' content (never their directory), the bar and the grading.
+
+        The stage reads the qualification bar and the grading settings from outside its own
+        slice, so a changed bar or grader re-keys it instead of replaying records answered
+        under the old ones.
+        """
         del project
         if not spec.traceml.enabled:
             return {}
         errors = tier_error_bank(spec)
         behaviors = behavior_bank(spec)
+        qualification = spec.mining.qualification
         return {
             "bank": sha256_json(traceml_bank(spec.traceml.bank_root)),
             **({} if errors is None else {"error_bank": sha256_json(errors)}),
             **({} if behaviors is None else {"behavior_bank": sha256_json(behaviors)}),
+            **(
+                {}
+                if qualification is None
+                else {
+                    "point_bar": sha256_json(
+                        qualification_bar(qualification, spec.traceml.bank_root)
+                    )
+                }
+            ),
+            "grading": grading_sha256(spec),
         }
 
     def plan(

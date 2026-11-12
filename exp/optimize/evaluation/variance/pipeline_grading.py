@@ -89,6 +89,27 @@ def judge_costs(
     return tuple(row.scaled(calls) for row in evaluation_costs(project, spec.mining.judge))
 
 
+def grading_sha256(spec: DecisionVarianceSpec) -> str:
+    """Digest of every setting outside TraceML's slice that its grading reads."""
+    mining, authoring = spec.mining, spec.authoring
+    adversarial = authoring.adversarial_spec()
+    return sha256_json(
+        {
+            "actors": list(mining.actors),
+            "attempts": mining.attempts,
+            "judge": mining.judge.model_dump(mode="json"),
+            "profile": mining_profile(spec).model_dump(mode="json"),
+            "behaviors": None
+            if mining.behaviors is None
+            else mining.behaviors.model_dump(mode="json"),
+            "adversarial": None if adversarial is None else adversarial.model_dump(mode="json"),
+            "library_id": authoring.library_id,
+            "rubric_author": authoring.rubric_author.model_dump(mode="json"),
+            "rubric_profile": authoring.rubric_profile.model_dump(mode="json"),
+        }
+    )
+
+
 def tier_judge(
     project: ProjectStore, spec: DecisionVarianceSpec, job: ContinuationJob, rubric: ArtifactInput
 ) -> EpisodeJudge:

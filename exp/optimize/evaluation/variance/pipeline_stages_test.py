@@ -134,3 +134,23 @@ def test_a_simulator_ending_is_masked_from_the_bar_but_kept_in_the_record() -> N
     assert pipeline_stages.labelled_steps(graded, "actor-kimi", 80) == steps[:2]
     actor = branch.model_copy(update={"failure": "InvisibleToolCallError", "failure_detail": None})
     assert pipeline_stages.labelled_steps(actor, "actor-kimi", 80) == steps
+
+
+def test_a_changed_qualification_bar_rekeys_traceml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point-bar records answered under an old bar never replay under a new one."""
+    monkeypatch.setattr(pipeline_stages, "traceml_bank", lambda root: {"bank": 1})
+    monkeypatch.setattr(pipeline_stages, "tier_error_bank", lambda spec: None)
+    monkeypatch.setattr(pipeline_stages, "behavior_bank", lambda spec: None)
+    monkeypatch.setattr(pipeline_stages, "grading_sha256", lambda spec: "g")
+    monkeypatch.setattr(pipeline_stages, "qualification_bar", lambda settings, root: settings)
+
+    def keys(bar: object) -> object:
+        """The TraceML keys under one qualification setting."""
+        spec = SimpleNamespace(
+            traceml=SimpleNamespace(enabled=True, bank_root=None),
+            mining=SimpleNamespace(qualification=bar),
+        )
+        return pipeline_stages.TRACEML_STAGE.keys(cast(Any, None), cast(Any, spec))
+
+    assert keys({"bar": "v1"}) != keys({"bar": "v2"})
+    assert "point_bar" not in cast(dict[str, object], keys(None))
