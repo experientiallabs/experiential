@@ -24,6 +24,7 @@ from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.tool_contracts import GatewayToolDefinition
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
+from exp.runtime.openai_protocol.requests import decode_chat
 
 _EPHEMERAL: JsonObject = {"type": "ephemeral"}
 
@@ -105,6 +106,36 @@ def _deployment(deployment_id: str, provider: str) -> ExactModelDeployment:
         connection_sha256="b" * 64,
         capabilities_sha256="c" * 64,
         capabilities=ModelCapabilities(maximum_output_tokens=128_000),
+    )
+
+
+def test_caching_off_strips_decoded_chat_tool_checkpoint() -> None:
+    """Chat function checkpoints obey the same organization policy as Messages."""
+    request = decode_chat(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "look up the file"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {"type": "object"}},
+                    "cache_control": _EPHEMERAL,
+                }
+            ],
+        }
+    ).request
+    authority = _authorization(disabled=True).model_copy(
+        update={"surface": GatewayApiSurface.CHAT_COMPLETIONS}
+    )
+    stripped = without_prompt_caching(request, authority)
+    assert stripped.tools[0].cache_control is None
+    assert stripped.ignored_parameters == (f"tools.cache_control{PROMPT_CACHING_OFF_SUFFIX}",)
+    assert request.tools[0].cache_control == _EPHEMERAL
+    assert (
+        without_prompt_caching(
+            request, authority.model_copy(update={"prompt_caching_disabled": False})
+        )
+        is request
     )
 
 

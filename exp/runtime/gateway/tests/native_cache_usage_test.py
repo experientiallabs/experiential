@@ -359,3 +359,141 @@ def test_native_and_python_twelve_hour_split_matches(half_day: int | None, surfa
     assert ('"cache_write_tokens_details"' in terminal) == (half_day is not None)
     if half_day is not None:
         assert f'"ttl_30m_tokens":{3247 - half_day},"ttl_12h_tokens":{half_day}' in terminal
+
+
+def _anthropic_cached_turn() -> list[bytes]:
+    """An Anthropic stream whose turn read 9,000 cached tokens and wrote 1,500."""
+    return [
+        _sse(
+            {
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 200,
+                        "cache_read_input_tokens": 9_000,
+                        "cache_creation_input_tokens": 1_500,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1_500,
+                            "ephemeral_1h_input_tokens": 0,
+                        },
+                        "output_tokens": 1,
+                    }
+                },
+            }
+        ),
+        _sse(
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "done"},
+            }
+        ),
+        _sse({"type": "content_block_stop", "index": 0}),
+        _sse(
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 30},
+            }
+        ),
+        _sse({"type": "message_stop"}),
+    ]
+
+
+def _bedrock_cached_turn() -> list[bytes]:
+    """A Bedrock Converse stream reporting the same reads and writes."""
+    from exp.runtime.gateway.tests.native_signed_dispatch_test import _eventstream_message
+
+    return [
+        _eventstream_message("messageStart", {"role": "assistant"}),
+        _eventstream_message(
+            "contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "done"}}
+        ),
+        _eventstream_message("contentBlockStop", {"contentBlockIndex": 0}),
+        _eventstream_message("messageStop", {"stopReason": "end_turn"}),
+        _eventstream_message(
+            "metadata",
+            {
+                "usage": {
+                    "inputTokens": 200,
+                    "outputTokens": 30,
+                    "cacheReadInputTokens": 9_000,
+                    "cacheWriteInputTokens": 1_500,
+                },
+                "metrics": {"latencyMs": 12},
+            },
+        ),
+    ]
+
+
+@pytest.mark.parametrize("dialect", ["anthropic_messages", "bedrock_converse_stream"])
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+def test_claude_cache_reads_and_writes_settle_at_cached_rates(dialect: str, surface: str) -> None:
+    """A Chat or Responses caller served by Claude settles cache reads and writes.
+
+    Gateway-added automatic caching makes these counts non-zero for OpenAI-style
+    callers. The upstream normalizer's usage is what settlement records
+    (``cached_input_tokens`` and ``cache_creation_input_tokens``, the platform's
+    cache read and cache write legs), and the public Chat and Responses usage
+    carries the same split, so the caller is billed 0.1x on reads and 1.25x on
+    writes rather than the full input rate.
+    """
+    native = pytest.importorskip("exp_gateway_native")
+    chunks = _anthropic_cached_turn() if dialect == "anthropic_messages" else _bedrock_cached_turn()
+    normalized = _native_normalized(dialect, chunks)
+    assert normalized["failure"] is None
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=100_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_250_000_000,
+        # Automatic caching writes only five-minute entries; Bedrock reports no
+        # lifetime split, which prices at the five-minute rate.
+        cache_creation_1h_input_nano_usd_per_million_tokens=1_250_000_000,
+        output_nano_usd_per_million_tokens=5_000_000_000,
+        reasoning_nano_usd_per_million_tokens=5_000_000_000,
+    )
+    # 200 fresh + 9,000 read at 0.1x + 1,500 written at 1.25x, then 30 output.
+    expected_cost = 200_000 + 900_000 + 1_875_000 + 150_000
+
+    def settled(events: list[JsonObject]) -> None:
+        """Assert the usage settlement records and the cost it prices to."""
+        usage = [event for event in events if event["kind"] == "usage"][-1]
+        assert usage["input_tokens"] == 10_700
+        assert usage["cached_input_tokens"] == 9_000
+        assert usage["cache_creation_input_tokens"] == 1_500
+        assert usage["output_tokens"] == 30
+        recorded = Usage.model_validate(
+            {
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "cached_input_tokens": usage["cached_input_tokens"],
+                "cache_write_input_tokens": usage["cache_creation_input_tokens"],
+                "cache_write_1h_input_tokens": usage.get("cache_creation_1h_input_tokens"),
+                "reasoning_tokens": usage["reasoning_tokens"],
+            }
+        )
+        assert schedule_usage_cost_nano_usd(prices, recorded) == expected_cost
+
+    settled(cast(list[JsonObject], normalized["events"]))
+    events = cast(list[JsonObject], normalized["events"])
+    fixture = json.dumps([event for event in events if event["kind"] != "text_block_started"])
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        stream=True,
+    )
+    if surface == "chat":
+        wire = native.encode_chat_fixture("request", "model", 123, True, fixture)
+        assert '"cached_tokens":9000' in "".join(wire)
+        assert '"cache_write_tokens":1500' in "".join(wire)
+    else:
+        wire = native.encode_responses_fixture(
+            "request", "model", 123, json.dumps(responses_envelope(request)), fixture
+        )
+    public = json.loads(
+        native.normalize_stream_fixture(
+            "openai_compatible" if surface == "chat" else "openai_responses", json.dumps(wire)
+        )
+    )
+    assert public["failure"] is None
+    settled(cast(list[JsonObject], public["events"]))

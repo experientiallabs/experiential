@@ -257,6 +257,22 @@ class GatewayRungDispatchPolicy(ContractModel):
             Both kinds may be authored; the stricter binds. Video jobs
             (``/v1/videos``) do not pass the waterfall reservation and are not
             gated. Inert on a host that attaches no fleet gate.
+        automatic_prompt_caching: Whether the gateway adds Anthropic automatic
+            prompt caching on this rung (``exp.runtime.gateway.automatic_prompt_caching``)
+            for Chat Completions and Responses requests that carry no cache
+            choice of their own, dispatched on the Anthropic Messages or Bedrock
+            Converse wire: the payload gets the top-level ``cache_control``
+            (``{"type": "ephemeral"}``), or a Converse ``cachePoint`` after the
+            last message. ``None`` (default) turns it on only where the origin
+            is verified to honor it (Anthropic's own API, Claude 3.5 Haiku and
+            later on Bedrock) and leaves it off elsewhere, including Claude on
+            Vertex AI and Azure AI Foundry, because a provider 400 does not fail
+            over. ``True`` turns it on for a rung on either wire whose origin
+            the default does not cover; ``False`` opts the rung out. Either
+            way it applies only to a rung whose capabilities declare
+            ``reports_cache_creation_input_tokens``, so the attempt reservation
+            covers the write rate. Never read on any other wire, and never on
+            the Messages surface, whose caller places its own markers.
     """
 
     concurrency_bound: int | None = Field(default=None, ge=1)
@@ -372,6 +388,7 @@ class GatewayRungDispatchPolicy(ContractModel):
     ``build_rung_dispatch`` injects it only on ``openai_responses``. ``None``
     injects nothing.
     """
+    automatic_prompt_caching: bool | None = None
     max_prompt_tokens: int | None = Field(default=None, ge=1)
     """The longest prompt this rung takes, by the prompt's lower-bound estimate.
 
