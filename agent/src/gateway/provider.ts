@@ -35,26 +35,32 @@ export function reportedCost(data: unknown): number | undefined {
 /**
  * What the gateway reported about a response's billing: `usage.cost` (the credits it charged),
  * and for a call served on the caller's own provider key (bring your own key) `usage.is_byok`
- * with that provider's list price as `usage.cost_details.upstream_inference_cost`.
+ * with that provider's list price as `usage.cost_details.upstream_inference_cost`. A call charged
+ * below its list price (free under a promotion or a plan, or discounted) carries the list price
+ * as `usage.cost_details.list_cost`.
  */
 export interface ReportedBilling {
   cost: number;
   byok: boolean;
   byokListUsd: number | null;
+  /** List price of a call charged below it (free or discounted); null when it paid list. */
+  listUsd: number | null;
 }
 
 export function reportedBilling(data: unknown): ReportedBilling | undefined {
   if (typeof data !== "object" || data === null) return undefined;
   const usage = (data as { usage?: unknown; response?: { usage?: unknown } }).usage ?? (data as { response?: { usage?: unknown } }).response?.usage;
   if (typeof usage !== "object" || usage === null) return undefined;
-  const record = usage as { cost?: unknown; is_byok?: unknown; cost_details?: { upstream_inference_cost?: unknown } };
+  const record = usage as { cost?: unknown; is_byok?: unknown; cost_details?: { upstream_inference_cost?: unknown; list_cost?: unknown } };
   const cost = record.cost;
   if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return undefined;
-  const upstream = record.cost_details?.upstream_inference_cost;
+  const amount = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null);
+  const listUsd = amount(record.cost_details?.list_cost);
   return {
     cost,
     byok: record.is_byok === true,
-    byokListUsd: typeof upstream === "number" && Number.isFinite(upstream) && upstream >= 0 ? upstream : null
+    byokListUsd: amount(record.cost_details?.upstream_inference_cost),
+    listUsd: listUsd !== null && listUsd > cost ? listUsd : null
   };
 }
 

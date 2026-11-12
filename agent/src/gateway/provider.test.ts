@@ -32,9 +32,12 @@ describe("gateway provider", () => {
 
 describe("reportedBilling", () => {
   it("reads the credits charged and, for a call on the caller's own key, the provider's list price", () => {
-    expect(reportedBilling({ usage: { cost: 0.002 } })).toEqual({ cost: 0.002, byok: false, byokListUsd: null });
-    expect(reportedBilling({ usage: { cost: 0, is_byok: true, cost_details: { upstream_inference_cost: 0.0004 } } })).toEqual({ cost: 0, byok: true, byokListUsd: 0.0004 });
-    expect(reportedBilling({ usage: { cost: 0, is_byok: true } })).toEqual({ cost: 0, byok: true, byokListUsd: null });
+    expect(reportedBilling({ usage: { cost: 0.002 } })).toEqual({ cost: 0.002, byok: false, byokListUsd: null, listUsd: null });
+    expect(reportedBilling({ usage: { cost: 0, is_byok: true, cost_details: { upstream_inference_cost: 0.0004 } } })).toEqual({ cost: 0, byok: true, byokListUsd: 0.0004, listUsd: null });
+    expect(reportedBilling({ usage: { cost: 0, is_byok: true } })).toEqual({ cost: 0, byok: true, byokListUsd: null, listUsd: null });
+    expect(reportedBilling({ usage: { cost: 0, cost_details: { list_cost: 0.003 } } })).toEqual({ cost: 0, byok: false, byokListUsd: null, listUsd: 0.003 });
+    // A list figure at or below the charge is no saving.
+    expect(reportedBilling({ usage: { cost: 0.003, cost_details: { list_cost: 0.003 } } })?.listUsd).toBeNull();
     expect(reportedBilling({ usage: { prompt_tokens: 1 } })).toBeUndefined();
   });
 });

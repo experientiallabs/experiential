@@ -88,7 +88,8 @@ export type RunEventBody =
   /**
    * One model response finished. costUsd is the credits the gateway charged when it reported
    * them. byok: the call ran on the user's own provider key (bring your own key), which that
-   * provider bills directly; byokListUsd is that provider's list price for the call.
+   * provider bills directly; byokListUsd is that provider's list price for the call. listUsd is
+   * the list price of a call charged below it (free under a promotion or plan, or discounted).
    */
   | {
       type: "turn";
@@ -99,6 +100,7 @@ export type RunEventBody =
       costUsd: number | null;
       byok?: boolean;
       byokListUsd?: number | null;
+      listUsd?: number;
       durationMs: number;
       stopReason: string;
     }

@@ -358,6 +358,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
           outputTokens: assistant.usage.output,
           costUsd: cost,
           ...(billing?.byok ? { byok: true, byokListUsd: billing.byokListUsd } : {}),
+          ...(billing?.listUsd != null ? { listUsd: billing.listUsd } : {}),
           durationMs: assistant.durationMs ?? now() - turnStartedAt,
           stopReason: assistant.stopReason
         });
