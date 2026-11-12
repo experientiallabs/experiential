@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn
@@ -160,3 +161,24 @@ def test_other_author_value_errors_still_propagate(monkeypatch: pytest.MonkeyPat
     draw = module.author_draw(object(), object(), "rev")
     with pytest.raises(ValueError, match="deadline"):
         draw(object(), identity="x")
+
+
+def test_an_oversized_state_request_is_fitted_and_a_small_one_is_unchanged() -> None:
+    """Over-long state-retrieval decisions are cut; ones that fit keep their identity."""
+    from exp.optimize.evaluation.variance import frontdoor_executors as module
+    from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
+
+    def request(text: str) -> DecisionRequest:
+        return DecisionRequest(
+            state={"pre_turn_state": text, "authority": "recorded data"},
+            questions={"q": NoulQuestion(instructions="Is a file open?")},
+        )
+
+    small = request("short state")
+    assert module.fit_decision_request(small, 1000) is small
+    big = request("word " * 5000)
+    fitted = module.fit_decision_request(big, 500)
+    assert fitted is not big
+    assert "elided" in fitted.state["pre_turn_state"]
+    assert fitted.state["authority"] == "recorded data"
+    assert module.count_reservation_tokens(json.dumps(fitted.state)) <= 500

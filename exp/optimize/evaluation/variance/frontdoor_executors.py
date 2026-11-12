@@ -72,7 +72,7 @@ from exp.optimize.evaluation.variance.family_simulators import load_family_simul
 from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, review_costs
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
 from exp.optimize.evaluation.variance.refined_prompts import SLOT_ROLES, refined_identity
-from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
+from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS, DecisionRequest
 from exp.runtime.gateway.reservation_tokenizer import count_reservation_tokens
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.codex_cli import offline_closed_model
@@ -480,6 +480,36 @@ def fit_decision_unit(unit: Unit, maximum_tokens: int = MAXIMUM_DECISION_STATE_T
         else:
             high = middle - 1
     return Unit(unit.trace_id, unit.view, cut(low), dict(unit.meta))
+
+
+def fit_decision_request(
+    request: DecisionRequest, maximum_tokens: int = MAXIMUM_DECISION_STATE_TOKENS
+) -> DecisionRequest:
+    """Return the request unchanged when its state fits, otherwise with its longest text fitted.
+
+    State-retrieval decisions carry the rendered pre-turn state as one string field; a state that
+    inlines a whole repository is refused by hosted Clef with a bare HTTP 400. The longest string
+    field gives way exactly as :func:`fit_decision_unit` cuts a unit, so a request that already
+    fits keeps its identity and its cached answer.
+    """
+    state = request.state
+    if not isinstance(state, dict) or count_reservation_tokens(json.dumps(state)) <= maximum_tokens:
+        return request
+    texts = {key: value for key, value in state.items() if isinstance(value, str)}
+    if not texts:
+        return request
+    key = max(texts, key=lambda name: len(texts[name]))
+    rest = count_reservation_tokens(json.dumps({**state, key: ""}))
+    budget = max(1, maximum_tokens - rest)
+    candidate = state
+    for _ in range(8):  # JSON escaping and token joins can overshoot; shrink by the overshoot
+        fitted = fit_decision_unit(Unit("state", "state", texts[key], {}), budget)
+        candidate = {**state, key: fitted.text}
+        over = count_reservation_tokens(json.dumps(candidate)) - maximum_tokens
+        if over <= 0 or budget <= 1:
+            break
+        budget = max(1, budget - over - 8)
+    return request.model_copy(update={"state": candidate})
 
 
 class FittedDecisionsTagger(DecisionsTraceTagger):
@@ -1194,7 +1224,8 @@ class StateRagExecutor:
             model = native.snapshot.model_dump(mode="json")
             deadline = datetime.now(UTC) + timedelta(hours=24)
             decide = decision_caller(native, transport, deadline, lambda: datetime.now(UTC))
-        return author, cached_state_decider(DecisionCache(project.paths), decide, model), model
+        cached = cached_state_decider(DecisionCache(project.paths), decide, model)
+        return author, (lambda request: cached(fit_decision_request(request))), model
 
 
 class FamilyGuards(ContractModel):
