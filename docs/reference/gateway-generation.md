@@ -161,8 +161,9 @@ the order the model produced.
   Any other key, or a non-null non-boolean value, is a named 400.
 - OpenRouter's usage-accounting request parameter, Chat `usage: {"include": true}`
   ([usage accounting](https://openrouter.ai/docs/use-cases/usage-accounting)), is consumed
-  and never forwarded: every answer already carries `usage` (with `usage.cost`). On a
-  buffered call `include: true` is satisfied silently and `include: false` is disclosed as
+  and never forwarded. A buffered answer carries the usage the provider accounted (`null`
+  when it reported no credible counts) with or without the parameter, so `include: true`
+  unlocks nothing and is consumed silently, and `include: false` is disclosed as
   `usage.include->ignored(always_included)`; on a stream `include: true` becomes
   `stream_options.include_usage: true` (`usage.include->translated(stream_options.include_usage)`,
   so the final chunk carries usage), `false` is the stream's default, and a value

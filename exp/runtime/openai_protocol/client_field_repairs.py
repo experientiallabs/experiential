@@ -16,8 +16,8 @@ OpenRouter's Chat ``modalities`` of text and image, which the route's own
 declared output modalities already decide. OpenRouter's deprecated
 ``include_reasoning`` boolean is rewritten to the ``reasoning.exclude`` it
 aliases, and its usage-accounting ``usage: {"include": true}`` is consumed
-(the gateway always reports usage; on a stream it becomes
-``stream_options.include_usage``). A
+(a buffered answer reports the usage the provider accounted either way; on a
+stream it becomes ``stream_options.include_usage``). A
 named 400 for any of them fails every request the client makes, so each is
 removed here, before the compatibility manifest and the wire models read the
 body, and every removal that changes what the caller asked for is named in
@@ -133,9 +133,12 @@ OpenRouter's usage-accounting request parameter (docs "Usage Accounting",
 https://openrouter.ai/docs/use-cases/usage-accounting, read 2026-11-12) is
 ``usage: {"include": true}`` on Chat Completions only; the Responses API has no
 equivalent. OpenRouter now reports usage on every response and documents the
-field as having no effect, and this gateway always returns ``usage`` (with its
-``cost``) on a buffered answer. A stream reports usage only on its final chunk
-when asked, so the request is carried as the OpenAI control that asks for it."""
+field as having no effect. This gateway's buffered answer carries ``usage``
+whenever the provider accounted the turn (token counts; a deployment may
+annotate a cost on top), and ``null`` when it did not, whatever the caller
+asked, so the parameter unlocks nothing there. A stream reports usage only on
+its final chunk when asked, so the request is carried as the OpenAI control
+that asks for it."""
 
 USAGE_INCLUDE_ALWAYS_INCLUDED = "usage.include->ignored(always_included)"
 """Disclosure recorded when a buffered Chat call asks for ``usage.include: false``.
@@ -783,9 +786,10 @@ def accept_chat_usage_accounting(payload: JsonObject) -> tuple[JsonObject, tuple
 
     The object is removed before the manifest reads the body and never reaches
     a provider. ``null``, an empty object and ``include: null`` ask for nothing
-    and are removed silently. On a buffered call ``include: true`` is already
-    satisfied (every answer carries ``usage``) and ``include: false`` cannot be
-    honored, so only the latter is disclosed. On a stream ``include: true``
+    and are removed silently. On a buffered call ``include: true`` unlocks
+    nothing (the answer carries whatever usage the provider accounted, with or
+    without the request) and ``include: false`` cannot be honored, so only the
+    latter is disclosed. On a stream ``include: true``
     becomes ``stream_options.include_usage: true`` when the caller set no
     explicit ``include_usage`` (disclosed as a translation), ``include: false``
     is the stream's default, and a value contradicting an explicit
