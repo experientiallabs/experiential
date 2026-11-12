@@ -200,7 +200,7 @@ def build_variant_checkpoint(
         project: Project whose artifacts hold the trajectory.
         base: Checkpoint at the decision, ``branch_checkpoints[decision.step]``.
         branch_checkpoints: Every saved boundary of the trajectory in order, start first;
-            boundary ``k`` follows tool turn ``k``.
+            boundary ``k`` precedes actor turn ``k`` (it follows turn ``k - 1``).
         decision: The decision state the scenario varies.
         scenario: The variant, whose edits must be declared axes with permitted values.
         facts: Instance facts supplied to the world model for this task, if any.

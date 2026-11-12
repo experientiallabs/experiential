@@ -20,7 +20,11 @@ from exp.optimize.evaluation.variance.episodes import EpisodeEvent, EpisodeEvide
 from exp.optimize.evaluation.variance.tests.grounded_world_test import grounded_fixture
 
 
-def event(index: int, kind: str, owner: str, content: JsonObject | str) -> EpisodeEvent:
+def event(
+    index: int, kind: str, owner: str, content: JsonObject | str, turn: int | None = None
+) -> EpisodeEvent:
+    """One scored event; an actor event made in actor call ``turn`` cites that saved call."""
+    source = "log" if turn is None else f"branch#outcome.model_calls[{turn}].response.output"
     return EpisodeEvent.model_validate(
         {
             "event_id": f"e{index}",
@@ -29,7 +33,7 @@ def event(index: int, kind: str, owner: str, content: JsonObject | str) -> Episo
             "owner": owner,
             "scope": "scored",
             "content": content,
-            "source": "log",
+            "source": source,
         }
     )
 
@@ -41,10 +45,10 @@ def test_actor_messages_and_success_claims_are_tagged_with_real_checkpoint_curso
         world_sha256="2" * 64,
         complete=True,
         events=(
-            event(0, "assistant_message", "actor", "I will check the original tests"),
-            event(1, "tool_call", "actor", {"call_id": "c", "name": "test", "arguments": {}}),
+            event(0, "assistant_message", "actor", "I will check the original tests", 0),
+            event(1, "tool_call", "actor", {"call_id": "c", "name": "test", "arguments": {}}, 0),
             event(2, "tool_result", "world", {"tool_call_id": "c", "passed": False}),
-            event(3, "final_answer", "actor", "All tests passed"),
+            event(3, "final_answer", "actor", "All tests passed", 1),
         ),
     )
     trace = behavior_trajectory(evidence, tier="actor", attempt=0, task="Fix the feature")
@@ -62,13 +66,47 @@ def test_unanswered_calls_do_not_invent_a_completed_checkpoint() -> None:
         complete=False,
         missing=("result missing",),
         events=(
-            event(0, "tool_call", "actor", {"call_id": "c", "name": "test", "arguments": {}}),
-            event(1, "final_answer", "actor", "done"),
+            event(0, "tool_call", "actor", {"call_id": "c", "name": "test", "arguments": {}}, 0),
+            event(1, "tool_call", "actor", {"call_id": "d", "name": "test", "arguments": {}}, 0),
         ),
     )
     assert [
         s.boundary for s in behavior_trajectory(evidence, tier="actor", attempt=0, task="Fix").steps
     ] == [0, 0]
+
+
+def test_every_call_of_one_response_is_decided_before_that_turn() -> None:
+    """Two calls of one response share its turn's point; the next response is the next point.
+
+    The actor saves one checkpoint per turn, so the second call of turn 0 forks from the start,
+    not from the checkpoint after turn 0, which already holds both calls' effects.
+    """
+    call = {"name": "test", "arguments": {}}
+    evidence = EpisodeEvidence(
+        episode_id="ep",
+        task_sha256="1" * 64,
+        world_sha256="2" * 64,
+        complete=True,
+        events=(
+            event(0, "tool_call", "actor", {**call, "call_id": "a"}, 0),
+            event(1, "tool_result", "world", {"tool_call_id": "a"}),
+            event(2, "tool_call", "actor", {**call, "call_id": "b"}, 0),
+            event(3, "tool_result", "world", {"tool_call_id": "b"}),
+            event(4, "tool_call", "actor", {**call, "call_id": "c"}, 1),
+            event(5, "tool_result", "world", {"tool_call_id": "c"}),
+            event(6, "final_answer", "actor", "done", 2),
+        ),
+    )
+    trace = behavior_trajectory(evidence, tier="actor", attempt=0, task="Fix")
+    assert [step.boundary for step in trace.steps] == [0, 0, 1, 2]
+    unsourced = evidence.model_copy(update={"events": (event(0, "final_answer", "actor", "x"),)})
+    with pytest.raises(ValueError, match="names no saved actor call"):
+        behavior_trajectory(unsourced, tier="actor", attempt=0, task="Fix", require_turns=True)
+    mixed = evidence.model_copy(
+        update={"events": (*evidence.events, event(7, "final_answer", "actor", "x"))}
+    )
+    with pytest.raises(ValueError, match="names no saved actor call"):
+        behavior_trajectory(mixed, tier="actor", attempt=0, task="Fix")
 
 
 @pytest.mark.parametrize("review", ["accept", "reject", "needs_research"])
@@ -199,9 +237,9 @@ def test_reused_call_ids_keep_each_calls_own_result() -> None:
         world_sha256="2" * 64,
         complete=True,
         events=(
-            event(0, "tool_call", "actor", {"call_id": "same", "name": "test", "arguments": {}}),
+            event(0, "tool_call", "actor", {"call_id": "same", "name": "test", "arguments": {}}, 0),
             event(1, "tool_error", "world", {"tool_call_id": "same", "passed": False}),
-            event(2, "tool_call", "actor", {"call_id": "same", "name": "test", "arguments": {}}),
+            event(2, "tool_call", "actor", {"call_id": "same", "name": "test", "arguments": {}}, 1),
             event(3, "tool_result", "world", {"tool_call_id": "same", "passed": True}),
         ),
     )

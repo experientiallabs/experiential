@@ -60,6 +60,7 @@ from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import (
     ReferenceSource,
     TraceSearch,
+    attempt_step_turns,
     open_trace_search,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
@@ -147,6 +148,8 @@ from exp.simulation.continuations import (
 from exp.simulation.mining.decisions import DecisionsTraceTagger
 from exp.simulation.mining.tagging import DecisionCache, TraceTagger
 from exp.simulation.mining.traceml import (
+    POINT_NUMBERING,
+    TraceTrajectory,
     label_traces,
     persist_traceml_labels,
     traceml_bank,
@@ -311,6 +314,26 @@ def labelled_steps(branch: ContinuationBranch, alias: str, limit: int) -> list[J
             limit,
         )
     return rows[:limit]
+
+
+def attempt_trajectory(
+    branch: ContinuationBranch, alias: str, limit: int, *, task: str
+) -> TraceTrajectory:
+    """Read one attempt's labelled steps into the trajectory its labels and bar are keyed by.
+
+    Each step's boundary is its actor turn (:func:`~.evidence.attempt_step_turns`), so a point
+    ``k`` of the labels and the bar forks at ``attempt_boundaries(...)[k]``, the checkpoint
+    saved before turn ``k``'s decision, even when one turn made several tool calls.
+    """
+    rows = labelled_steps(branch, alias, limit)
+    return trajectory_from_workflow_steps(
+        f"{alias}/attempt:{branch.index}",
+        alias,
+        rows,
+        task=task,
+        turns=attempt_step_turns(branch, rows),
+        locator_prefix=f"attempt:{branch.index}/step",
+    )
 
 
 class _RulesStage:
@@ -498,11 +521,15 @@ class _TraceMLStage:
     """The ``traceml`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """Key the stage by its banks' content (never their directory), the bar and the grading.
+        """Key the stage by its banks' content (never their directory), the bar, the grading
+        and the point numbering.
 
         The stage reads the qualification bar and the grading settings from outside its own
         slice, so a changed bar or grader re-keys it instead of replaying records answered
-        under the old ones.
+        under the old ones. Its labels and bars number points by actor turn
+        (:data:`~exp.simulation.mining.traceml.POINT_NUMBERING`), so records saved under the
+        earlier call-position numbering re-key too; the actor groups, keyed by their own jobs,
+        still replay.
         """
         del project
         if not spec.traceml.enabled:
@@ -524,6 +551,7 @@ class _TraceMLStage:
                 }
             ),
             "grading": grading_sha256(spec),
+            "point_numbering": POINT_NUMBERING,
         }
 
     def plan(
@@ -611,15 +639,8 @@ class _TraceMLStage:
                 if (ending := operational_ending(branch))
             }
             for branch in study.branches:
-                rows = labelled_steps(branch, alias, limit)
                 trajectories.append(
-                    trajectory_from_workflow_steps(
-                        f"{alias}/attempt:{branch.index}",
-                        alias,
-                        rows,
-                        task=start.task.instruction,
-                        locator_prefix=f"attempt:{branch.index}/step",
-                    )
+                    attempt_trajectory(branch, alias, limit, task=start.task.instruction)
                 )
             labelled = label_traces(
                 trajectories,

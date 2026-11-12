@@ -56,9 +56,10 @@ from pydantic import Field, JsonValue
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject
 from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
-from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.simulation.continuations import ContinuationCheckpoint
+from exp.simulation.mining.traceml import workflow_step_turns
 from exp.simulation.retrieval.contracts import RAGAction, RAGQuery
 from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.retrieval.retriever import TraceRAGRetriever
@@ -265,6 +266,67 @@ def candidate_branches(study: ContinuationStudy) -> tuple[int, ...]:
     )
 
 
+def attempt_boundaries(
+    study: ContinuationStudy, branch: ContinuationBranch
+) -> tuple[ArtifactInput, ...]:
+    """Return an attempt's saved boundaries, start first: boundary ``k`` precedes actor turn ``k``.
+
+    The start is the state before turn 0 and ``branch.checkpoints[k - 1]`` the state after turn
+    ``k - 1``, so point ``k`` forks before the decision of turn ``k``.
+    """
+    return (study.spec.checkpoint, *branch.checkpoints)
+
+
+def fork_checkpoint(boundaries: Sequence[ArtifactInput], point: int) -> ArtifactInput:
+    """Return the checkpoint saved before the decision of turn ``point``.
+
+    Raises:
+        ValueError: No boundary was saved before that turn; the point is never clamped to the
+            last saved one, which would fork past the decision.
+    """
+    if not 0 <= point < len(boundaries):
+        raise ValueError(
+            f"point {point} has no saved pre-decision checkpoint: the attempt saved "
+            f"{len(boundaries)} boundaries (points 0..{len(boundaries) - 1})"
+        )
+    return boundaries[point]
+
+
+def attempt_step_turns(
+    branch: ContinuationBranch, steps: Sequence[JsonValue] | None = None
+) -> tuple[int, ...]:
+    """Return the actor turn, and so the fork point, of each of an attempt's saved steps.
+
+    Args:
+        branch: The attempt.
+        steps: A prefix of the attempt's steps, or None for all of them.
+
+    Raises:
+        ValueError: The steps disagree with the saved actor calls, the attempt is a cascade
+            attempt (decider-authored turns hold no saved actor call), or a step's turn has no
+            saved pre-decision checkpoint.
+    """
+    if branch.cascade_decisions:
+        raise ValueError(
+            f"attempt {branch.index} is a cascade attempt; its decider-authored turns hold no "
+            "saved actor call to number its points by"
+        )
+    saved = branch.outcome.get("steps")
+    rows = steps if steps is not None else saved if isinstance(saved, list) else []
+    calls = branch.outcome.get("model_calls")
+    try:
+        turns = workflow_step_turns(rows, calls if isinstance(calls, list) else [])
+    except ValueError as error:
+        raise ValueError(f"attempt {branch.index}: {error}") from error
+    if turns and turns[-1] > len(branch.checkpoints):
+        raise ValueError(
+            f"attempt {branch.index} decides a step at turn {turns[-1]} but saved only "
+            f"{len(branch.checkpoints)} checkpoints after its start; that turn has no "
+            "pre-decision checkpoint"
+        )
+    return turns
+
+
 def continuable_points(
     study: ContinuationStudy,
     branch: int,
@@ -289,7 +351,7 @@ def continuable_points(
     picked = next((row for row in study.branches if row.index == branch), None)
     if picked is None or picked.status != "completed":
         raise ValueError(f"group attempt {branch} is absent or did not complete")
-    boundaries = (study.spec.checkpoint, *picked.checkpoints)
+    boundaries = attempt_boundaries(study, picked)
     return {
         turn: reference
         for turn, reference in enumerate(boundaries)

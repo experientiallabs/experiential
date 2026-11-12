@@ -162,3 +162,87 @@ def test_a_changed_qualification_bar_rekeys_traceml(monkeypatch: pytest.MonkeyPa
 
     assert keys({"bar": "v1"}) != keys({"bar": "v2"})
     assert "point_bar" not in cast(dict[str, object], keys(None))
+
+
+def _turn(*calls: str) -> dict[str, object]:
+    """One saved actor call receipt whose response makes ``calls`` (``name:call_id`` each)."""
+    tool_calls = [
+        {"call_id": call.split(":")[1], "name": call.split(":")[0], "arguments": {}}
+        for call in calls
+    ]
+    output = {"content": None if calls else "done", "tool_calls": tool_calls}
+    return {"response": {"output": output, "finish_reason": "completed"}}
+
+
+def _call_step(call: str) -> dict[str, object]:
+    """One saved step for the call ``name:call_id``."""
+    name, call_id = call.split(":")
+    return {"action": {"call_id": call_id, "name": name, "arguments": {}}, "status": "valid"}
+
+
+def test_every_call_of_one_turn_forks_at_the_checkpoint_before_that_turn() -> None:
+    """A point indexes the per-turn checkpoints, so a multi-call turn's calls share one point.
+
+    Turn 0 reads and greps in one response; turn 1 edits; turn 2 answers. The actor saves one
+    checkpoint per tool turn, so boundaries are ``start, after turn 0, after turn 1``. The edit,
+    the third call, is decided at point 1 and must fork from the checkpoint after turn 0, before
+    the edit: numbering by call position put it at point 2, the checkpoint after the edit.
+    """
+    from exp.optimize.evaluation.variance.evidence import (
+        attempt_boundaries,
+        attempt_step_turns,
+        fork_checkpoint,
+    )
+    from exp.optimize.evaluation.variance.point_bar import qualify_points
+
+    def ref(name: str) -> ArtifactInput:
+        """A checkpoint reference."""
+        return ArtifactInput(artifact_id=name, sha256="0" * 64)
+
+    start, after_turn_0, after_turn_1 = ref("start"), ref("after-turn-0"), ref("after-turn-1")
+    calls = ("read:c1", "grep:c2", "edit:c3")
+    branch = ContinuationBranch(
+        index=4,
+        status="completed",
+        outcome={
+            "steps": [_call_step(call) for call in calls],
+            "model_calls": [_turn("read:c1", "grep:c2"), _turn("edit:c3"), _turn()],
+        },
+        checkpoints=(after_turn_0, after_turn_1),
+    )
+    study = SimpleNamespace(spec=SimpleNamespace(checkpoint=start))
+    boundaries = attempt_boundaries(cast(Any, study), branch)
+
+    trajectory = pipeline_stages.attempt_trajectory(branch, "actor-glmflash", 80, task="Fix")
+
+    assert [step.boundary for step in trajectory.steps] == [0, 0, 1]
+    edit = trajectory.steps[2]
+    assert edit.tool == "edit" and fork_checkpoint(boundaries, edit.boundary) == after_turn_0
+    record = qualify_points(trajectory, None)
+    assert [(p.point, len(p.steps)) for p in record.points] == [(0, 2), (1, 1)]
+    assert all(fork_checkpoint(boundaries, p.point) != after_turn_1 for p in record.points)
+    with pytest.raises(ValueError, match="no saved pre-decision checkpoint"):
+        fork_checkpoint(boundaries, 3)
+
+    swapped = branch.model_copy(
+        update={"outcome": {**branch.outcome, "steps": [_call_step(c) for c in reversed(calls)]}}
+    )
+    with pytest.raises(ValueError, match="steps and actor calls disagree"):
+        attempt_step_turns(swapped)
+    unsaved = branch.model_copy(update={"checkpoints": ()})
+    with pytest.raises(ValueError, match="no pre-decision checkpoint"):
+        attempt_step_turns(unsaved)
+
+
+def test_turn_numbered_points_rekey_traceml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Labels and bars saved under call-position point numbers never replay as turn numbers."""
+    monkeypatch.setattr(pipeline_stages, "traceml_bank", lambda root: {"bank": 1})
+    monkeypatch.setattr(pipeline_stages, "tier_error_bank", lambda spec: None)
+    monkeypatch.setattr(pipeline_stages, "behavior_bank", lambda spec: None)
+    monkeypatch.setattr(pipeline_stages, "grading_sha256", lambda spec: "g")
+    spec = SimpleNamespace(
+        traceml=SimpleNamespace(enabled=True, bank_root=None),
+        mining=SimpleNamespace(qualification=None),
+    )
+    keys = pipeline_stages.TRACEML_STAGE.keys(cast(Any, None), cast(Any, spec))
+    assert keys["point_numbering"] == "actor-turn-v1"

@@ -550,7 +550,13 @@ def mining_provenance(
     kind = group = signature = None
     if tier.behavior_differences is not None:
         report = load_behavior_differences(project, tier.behavior_differences)
-        pairs = {pair.pair_id for pair in report.pairs if pair.point == point}
+        # A pair diverges at this point when its pre-action checkpoint is the point's own: the
+        # same number in another attempt is another state.
+        pairs = {
+            pair.pair_id
+            for pair in report.pairs
+            if pair.checkpoint is not None and pair.checkpoint.artifact_id == checkpoint
+        }
         for candidate in report.groups:
             if pairs & set(candidate.pairs):
                 hack = report_signature(report, candidate)
