@@ -55,8 +55,10 @@ def test_an_attempt_past_the_priced_step_bound_is_labelled_over_its_first_steps(
     assert pipeline_stages.labelled_steps(empty, "actor-kimi", 80) == []
 
 
-def test_a_tier_without_a_qualified_point_stops_mining_before_any_pick(tmp_path: Path) -> None:
-    """The pick-time guard refuses mining until every gated tier has a qualified point."""
+def test_tiers_without_a_qualified_point_are_left_out_and_none_stops_mining(
+    tmp_path: Path,
+) -> None:
+    """One tier without a qualified point no longer refuses the task; only all of them do."""
     from exp.common.project import ProjectStore
     from exp.optimize.evaluation.variance.point_bar import (
         DEFAULT_BAR,
@@ -81,26 +83,32 @@ def test_a_tier_without_a_qualified_point_stops_mining_before_any_pick(tmp_path:
         }
         return save_point_bar(project.artifacts, DEFAULT_BAR, records, code_revision="test")
 
-    spec = SimpleNamespace(mining=SimpleNamespace(qualification=object(), schedule=None))
+    spec = SimpleNamespace(
+        mining=SimpleNamespace(
+            qualification=object(), schedule=None, actors=("actor-kimi", "actor-mimo")
+        )
+    )
     context = SimpleNamespace(project=project, spec=spec)
 
-    def guard(traceml: SimpleNamespace) -> None:
+    def guard(traceml: SimpleNamespace) -> tuple[str, ...]:
         """Run the stage guard over these tiers' saved bars."""
-        pipeline_stages.require_pickable_tiers(cast(Any, context), cast(Any, traceml))
+        return pipeline_stages.require_pickable_tiers(cast(Any, context), cast(Any, traceml))
 
     rejected = bars(PointState.REJECTED, PointState.UNCERTAIN)
     with pytest.raises(ValueError, match="no point qualified by the bar"):
         guard(SimpleNamespace(point_bars={"actor-kimi": rejected, "actor-mimo": rejected}))
     one = {"actor-kimi": bars(PointState.UNCERTAIN, PointState.QUALIFIED), "actor-mimo": rejected}
-    with pytest.raises(ValueError, match="actor-mimo"):
-        guard(SimpleNamespace(point_bars=one))
+    assert guard(SimpleNamespace(point_bars=one)) == ("actor-kimi",)
     every = {"actor-kimi": bars(PointState.QUALIFIED), "actor-mimo": bars(PointState.QUALIFIED)}
-    guard(SimpleNamespace(point_bars=every))
+    assert guard(SimpleNamespace(point_bars=every)) == ("actor-kimi", "actor-mimo")
     ungated = SimpleNamespace(
         project=project,
-        spec=SimpleNamespace(mining=SimpleNamespace(qualification=None, schedule=None)),
+        spec=SimpleNamespace(
+            mining=SimpleNamespace(qualification=None, schedule=None, actors=("actor-kimi",))
+        ),
     )
-    pipeline_stages.require_pickable_tiers(cast(Any, ungated), cast(Any, SimpleNamespace()))
+    picked = pipeline_stages.require_pickable_tiers(cast(Any, ungated), cast(Any, None))
+    assert picked == ("actor-kimi",)
 
 
 def test_a_simulator_ending_is_masked_from_the_bar_but_kept_in_the_record() -> None:

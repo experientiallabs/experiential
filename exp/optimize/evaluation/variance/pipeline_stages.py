@@ -691,28 +691,30 @@ class _TraceMLStage:
         return StageRun(outputs, saved, summary)
 
 
-def require_pickable_tiers(context: StageContext, traceml: TraceMLOutputs) -> None:
-    """Refuse a mining run in which a gated tier has no qualified point to pick.
+def require_pickable_tiers(context: StageContext, traceml: TraceMLOutputs) -> tuple[str, ...]:
+    """Return the tiers error mining runs: every tier except a gated one with no qualified point.
 
-    Under the qualification bar a tier whose attempts have no qualified point stops at its pick,
-    so the guard runs before any selector or critic is called (:func:`require_qualified_points`).
-    The scheduled tier is left to its rollout plan's own registration.
+    Under the qualification bar a tier whose attempts have no qualified point would stop at its
+    pick, so it is left out before any selector or critic is called; the other tiers proceed
+    (:func:`require_qualified_points`). The scheduled tier is left to its rollout plan's own
+    registration.
 
     Raises:
-        ValueError: A gated tier has no qualified point.
+        ValueError: No gated tier has a qualified point.
     """
     spec = context.spec
+    actors = spec.mining.actors
     if spec.mining.qualification is None:
-        return
+        return actors
     schedule = spec.mining.schedule
     scheduled = None if schedule is None else schedule.base.initial.actor_alias
-    require_qualified_points(
-        {
-            alias: load_point_bar(context.project.artifacts, reference)
-            for alias, reference in traceml.point_bars.items()
-            if alias != scheduled
-        }
-    )
+    gated = {
+        alias: load_point_bar(context.project.artifacts, reference)
+        for alias, reference in traceml.point_bars.items()
+        if alias != scheduled
+    }
+    pickable = set(require_qualified_points(gated))
+    return tuple(alias for alias in actors if alias not in gated or alias in pickable)
 
 
 class _MiningStage:
@@ -822,7 +824,7 @@ class _MiningStage:
         profile = mining_profile(spec)
         start = load_continuation_checkpoint(project.artifacts, rules.job.study.checkpoint)
         probe = probe_line(build, start.task.task_id)
-        require_pickable_tiers(context, traceml)
+        pickable = require_pickable_tiers(context, traceml)
         grading = _grading(context, rules, traceml)
         rubric, packet = grading.rubric.rubric, grading.rubric.packet
         embedder = None
@@ -830,7 +832,7 @@ class _MiningStage:
             embedder = retrieval_embedder(context, build.index)
         tiers: list[TierMining] = []
         references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
-        for alias in spec.mining.actors:
+        for alias in pickable:
             tier = self._tier(
                 context,
                 _Tier(
@@ -880,6 +882,7 @@ class _MiningStage:
             "probe": probe,
             "rubric": rubric.artifact_id,
             "rubric_authored": packet is not None,
+            "tiers_without_qualified_point": [a for a in spec.mining.actors if a not in pickable],
             "tiers": {
                 tier.tier: {
                     "report": tier.report.artifact_id,

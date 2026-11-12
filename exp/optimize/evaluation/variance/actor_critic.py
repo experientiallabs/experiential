@@ -718,8 +718,10 @@ def export_point_harbor(
 
     The environment uses the run's own world runtime, so tool calls are answered by the same
     world model and learned rules the continuations ran against, and its reward is the run's
-    frozen episode judge over the trial ledger. Without a qualification for the exact task the
-    package is diagnostic and awards no reward.
+    frozen episode judge over the trial ledger: the judge's verdict is the reward that pays.
+    The gate is a judged acceptance of the exact task
+    (:func:`~exp.optimize.evaluation.executable.judged_acceptance.accept_judged_task`), never a
+    verifier qualification; without one the package is diagnostic and awards no reward.
 
     Args:
         project: Project holding the run.
@@ -729,7 +731,7 @@ def export_point_harbor(
         name: Harbor ``organization/name``.
         intent: The capability the environment measures.
         code_revision: Producing source identity.
-        qualification: Qualification report for the exact task, when it has one.
+        qualification: Judged acceptance of the exact task, when it has one.
 
     Returns:
         The published package directory.
@@ -767,31 +769,34 @@ def has_qualified_point(records: Mapping[int, BarRecord], attempt: int) -> bool:
     )
 
 
-def require_qualified_points(tiers: Mapping[str, Mapping[int, BarRecord]]) -> None:
-    """Refuse a mining phase in which some tier's attempts have no point the bar qualified.
+def require_qualified_points(tiers: Mapping[str, Mapping[int, BarRecord]]) -> tuple[str, ...]:
+    """Return the gated tiers with a qualified point; refuse only when no tier has one.
 
-    The pick (:func:`_pick`) refuses such a tier before any judge draw, but the stage authors the
-    mining rubric before it reaches the pick, so run 31 paid for a rubric no selection could use.
-    The stage calls this first: a tier without a qualified point would stop the phase at its pick
-    anyway, so no authoring or judging is bought for it. Passing is necessary, not sufficient:
-    the pick still applies its other eligibility rules.
+    The pick (:func:`_pick`) refuses a tier without a qualified point before any judge draw, so
+    the stage leaves such a tier out of the phase instead of stopping every other tier: one tier
+    without a point under the bar (run 33: mimo under bar v2) no longer refuses the task. Passing
+    is necessary, not sufficient: the pick still applies its other eligibility rules.
 
     Args:
         tiers: Each gated tier's saved per-attempt qualification records.
 
+    Returns:
+        The tiers that have an attempt with a qualified point, in the given order.
+
     Raises:
-        ValueError: A tier has no attempt with a qualified point; names each such tier.
+        ValueError: No tier has an attempt with a qualified point; names each tier.
     """
     empty = {
         tier: len(records)
         for tier, records in tiers.items()
         if not any(has_qualified_point(records, attempt) for attempt in records)
     }
-    if empty:
+    if tiers and len(empty) == len(tiers):
         raise ValueError(
             f"{NO_QUALIFIED_POINT} in any attempt of tiers {empty} (tier: attempts); stopping "
-            "before the mining rubric is authored or any judge is drawn"
+            "before any selector, critic or judge is drawn"
         )
+    return tuple(tier for tier in tiers if tier not in empty)
 
 
 def _pick(
