@@ -45,10 +45,14 @@ Both are five-minute entries that move forward with the conversation, so each tu
 loop reads the previous turn's prefix. Caller markers always win and are never supplemented.
 Messages requests are never touched. It is on by default where the origin documents automatic
 caching (Anthropic's own API, Claude on Vertex AI, Claude on Azure AI Foundry, Claude on
-Bedrock) and off on other origins of those wires (a proxy or another vendor's
+Bedrock), including bring-your-own-key rungs, whose provider invoices then show cache
+writes and reads, and off on other origins of those wires (a proxy or another vendor's
 Anthropic-compatible endpoint), because a provider 400 does not fail over. The rung's dispatch
 policy overrides the default (`automatic_prompt_caching: false` opts a rung out, `true` opts an
-unknown origin in). An organization with prompt caching off never gets it, and
+unknown origin in). A request routed under zero data retention never gets it (the caller's
+`provider: {"zdr": true}`, `AuthorizationSnapshot.zdr_requested`, which a host sets for an
+organization that requires ZDR, or a rung the host flagged for ZDR-constrained dispatch); its own
+markers still forward. An organization with prompt caching off never gets it, and
 `EXP_GATEWAY_AUTOMATIC_PROMPT_CACHING=0` (or `false`, `off`, `no`) stops it for the process
 without a catalog change.
 

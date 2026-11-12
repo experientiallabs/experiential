@@ -14,8 +14,9 @@ wire fails closed here, never dispatching unconstrained.
 
 A Chat Completions or Responses request with no cache marker of its own gets
 Anthropic's five-minute automatic prompt caching on an Anthropic Messages or
-Bedrock Converse rung (``automatic_prompt_caching``), unless the organization,
-the operator or the rung turned it off.
+Bedrock Converse rung (``automatic_prompt_caching``), unless the request is
+routed under zero data retention or the organization, the operator or the rung
+turned it off.
 
 A rung whose authored dispatch policy sets ``upstream_priority`` (a self-hosted
 vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
@@ -222,7 +223,10 @@ def build_rung_dispatch(
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
     )
-    if automatic_prompt_caching_applies(deployment, profile, rung_request, authorization):
+    zdr_constrained = deployment.deployment_id in route.snapshot.zdr_constrained_deployment_ids
+    if automatic_prompt_caching_applies(
+        deployment, profile, rung_request, authorization, zdr_constrained=zdr_constrained
+    ):
         # A Chat or Responses caller with no markers of its own: ask an
         # Anthropic-wire rung for its five-minute automatic cache.
         upstream_payload = with_automatic_prompt_caching(upstream_payload, profile.dialect)
@@ -277,7 +281,6 @@ def build_rung_dispatch(
         if profile.dialect == "anthropic_messages"
         else None
     )
-    zdr_constrained = deployment.deployment_id in route.snapshot.zdr_constrained_deployment_ids
     if zdr_constrained:
         upstream_payload, request_headers = zdr_constrained_dispatch(
             deployment, profile, upstream_payload

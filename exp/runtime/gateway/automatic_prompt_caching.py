@@ -21,7 +21,8 @@ five-minute lifetime:
   receives on Bedrock.
 
 Any caller marker wins and disables the gateway's own (a request is never given
-a second breakpoint the caller did not place). Nothing is added when the
+a second breakpoint the caller did not place). Nothing is added to a request
+routed under zero data retention (:func:`zdr_routed`), when the
 organization turned prompt caching off
 (``AuthorizationSnapshot.prompt_caching_disabled``), when the operator stopped the
 feature for the process (:data:`AUTOMATIC_PROMPT_CACHING_ENV`), when the rung's
@@ -130,6 +131,7 @@ def automatic_prompt_caching_applies(
     request: GatewayRequest,
     authorization: AuthorizationSnapshot,
     *,
+    zdr_constrained: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     """Decide whether this rung's payload gets the gateway's own cache checkpoint.
@@ -139,18 +141,22 @@ def automatic_prompt_caching_applies(
         profile: Its resolved wire profile.
         request: The request this rung dispatches (after admission shaping).
         authorization: Frozen authority for the accepted request.
+        zdr_constrained: Whether the host flagged this rung for zero-data-retention
+            dispatch (``ExecutionSnapshot.zdr_constrained_deployment_ids``).
         environ: The environment to read for the operator stop; ``None`` reads
             ``os.environ``.
 
     Returns:
         True only for a Chat Completions or Responses request with no caller
-        cache marker, on a caching wire, with caching allowed by the
-        organization, the operator and the rung, and a prompt that could reach
-        the smallest cacheable prefix.
+        cache marker, not routed under zero data retention, on a caching wire,
+        with caching allowed by the organization, the operator and the rung,
+        and a prompt that could reach the smallest cacheable prefix.
     """
     if request.surface not in _AUTOMATIC_SURFACES or profile.dialect not in CACHING_WIRES:
         return False
-    if authorization.prompt_caching_disabled:
+    if authorization.prompt_caching_disabled or zdr_routed(
+        request, authorization, zdr_constrained=zdr_constrained
+    ):
         return False
     policy = deployment.gateway.dispatch
     setting = None if policy is None else policy.automatic_prompt_caching
@@ -165,6 +171,36 @@ def automatic_prompt_caching_applies(
     ):
         return False
     return not certainly_below_cacheable_minimum(request)
+
+
+def zdr_routed(
+    request: GatewayRequest,
+    authorization: AuthorizationSnapshot,
+    *,
+    zdr_constrained: bool = False,
+) -> bool:
+    """Whether this dispatch is routed under zero data retention.
+
+    The gateway adds no cache state of its own to a ZDR-routed request, the same
+    rule as automatic explicit caching (``native_explicit_cache``). Caller markers
+    on such a request are untouched: they forward exactly as before.
+
+    The engine sees three facts: the caller's per-request demand
+    (``GatewayRequest.zdr_requested``, ``provider: {"zdr": true}``), the
+    authority's ``AuthorizationSnapshot.zdr_requested``, and a rung the host
+    flagged for ZDR-constrained dispatch. An organization-wide ZDR requirement
+    is a host posture the engine does not see on its own; a host excludes such
+    an organization by setting ``AuthorizationSnapshot.zdr_requested``.
+
+    Args:
+        request: The request this rung dispatches.
+        authorization: Frozen authority for the accepted request.
+        zdr_constrained: Whether the host flagged this rung for ZDR dispatch.
+
+    Returns:
+        True when any of the three facts holds.
+    """
+    return request.zdr_requested or authorization.zdr_requested or zdr_constrained
 
 
 def certainly_below_cacheable_minimum(request: GatewayRequest) -> bool:

@@ -16,6 +16,7 @@ from exp.runtime.gateway.automatic_prompt_caching import (
     caches_by_default,
     certainly_below_cacheable_minimum,
     with_automatic_prompt_caching,
+    zdr_routed,
 )
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -312,6 +313,50 @@ def test_organization_prompt_caching_off_wins() -> None:
     authorization = _AUTHORIZATION.model_copy(update={"prompt_caching_disabled": True})
     payload = _payload(_rung("anthropic", setting=True), _ANTHROPIC, _chat(), authorization)
     assert "cache_control" not in payload
+
+
+@pytest.mark.parametrize("fact", ["request", "authorization"])
+@pytest.mark.parametrize("profile", [_ANTHROPIC, _BEDROCK])
+def test_zdr_routed_requests_get_no_gateway_caching(fact: str, profile: GatewayWireProfile) -> None:
+    """A ZDR-routed request gets no gateway-added cache state, even on an opted-in rung."""
+    provider = "anthropic" if profile is _ANTHROPIC else "bedrock"
+    request = _chat()
+    authorization = _AUTHORIZATION
+    if fact == "request":
+        request = request.model_copy(update={"zdr_requested": True})
+    else:
+        authorization = authorization.model_copy(update={"zdr_requested": True})
+    assert zdr_routed(request, authorization)
+    payload = _payload(_rung(provider, setting=True), profile, request, authorization)
+    assert "cache_control" not in payload
+    if profile is _BEDROCK:
+        assert _bedrock_tail(payload) != {"cachePoint": {"type": "default"}}
+
+
+def test_zdr_constrained_rung_gets_no_gateway_caching() -> None:
+    """A rung the host flagged for ZDR-constrained dispatch is never marked."""
+    rung = _rung("anthropic", setting=True)
+    request = _chat()
+    assert automatic_prompt_caching_applies(rung, _ANTHROPIC, request, _AUTHORIZATION, environ={})
+    assert not automatic_prompt_caching_applies(
+        rung, _ANTHROPIC, request, _AUTHORIZATION, zdr_constrained=True, environ={}
+    )
+    assert zdr_routed(request, _AUTHORIZATION, zdr_constrained=True)
+    assert not zdr_routed(request, _AUTHORIZATION)
+
+
+def test_zdr_routed_caller_markers_still_forward() -> None:
+    """Under ZDR the caller's own markers pass through exactly as before."""
+    authorization = _AUTHORIZATION.model_copy(update={"zdr_requested": True})
+    payload = _payload(_rung("anthropic"), _ANTHROPIC, _chat(marked=True), authorization)
+    assert "cache_control" not in payload
+    system = payload["system"]
+    assert isinstance(system, list)
+    assert system[-1] == {
+        "type": "text",
+        "text": _SYSTEM,
+        "cache_control": {"type": "ephemeral"},
+    }
 
 
 def test_operator_stop() -> None:
