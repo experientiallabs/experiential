@@ -159,6 +159,18 @@ the order the model produced.
   `include_obfuscation: true` is disclosed as
   `stream_options.include_obfuscation->ignored(not_emitted)`. A null value asks for nothing.
   Any other key, or a non-null non-boolean value, is a named 400.
+- OpenRouter's usage-accounting request parameter, Chat `usage: {"include": true}`
+  ([usage accounting](https://openrouter.ai/docs/use-cases/usage-accounting)), is consumed
+  and never forwarded: every answer already carries `usage` (with `usage.cost`). On a
+  buffered call `include: true` is satisfied silently and `include: false` is disclosed as
+  `usage.include->ignored(always_included)`; on a stream `include: true` becomes
+  `stream_options.include_usage: true` (`usage.include->translated(stream_options.include_usage)`,
+  so the final chunk carries usage), `false` is the stream's default, and a value
+  contradicting an explicit `stream_options.include_usage` yields to it
+  (`usage.include->ignored(explicit_stream_options)`). `null`, `{}` and `include: null` ask
+  for nothing. Anything but an object with an optional boolean `include` is a 400
+  `invalid_parameter` naming `usage`, `usage.include` or the unknown key. OpenRouter documents
+  no Responses equivalent, so `usage` on `/v1/responses` stays `unsupported_parameter`.
 - Responses `background: false` (or `null`) is accepted and removed without
   disclosure: every response is already served in the foreground, and n8n's OpenAI
   node sends `background: false` on every call. `background: true` (a stored,

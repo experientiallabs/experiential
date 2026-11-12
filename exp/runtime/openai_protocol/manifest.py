@@ -152,6 +152,12 @@ CHAT_MANIFEST = CompatibilityManifest(
             "prompt_cache_boundaries",
         ),
         _field("seed", CompatibilityDisposition.IGNORED),
+        # OpenRouter's usage-accounting request parameter, ``usage: {"include":
+        # true}`` (Chat only; the Responses API has no equivalent). Every answer
+        # already carries ``usage``, so the object is consumed before the
+        # manifest reads the body (``client_field_repairs.accept_chat_usage_accounting``):
+        # on a stream ``include: true`` becomes ``stream_options.include_usage``.
+        _field("usage", CompatibilityDisposition.IGNORED),
         # OpenAI's deprecated (not removed) spellings of ``tools`` and
         # ``tool_choice``: rewritten to them with disclosure before manifest
         # validation (``legacy_functions.translate_legacy_functions``).

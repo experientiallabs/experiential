@@ -24,6 +24,10 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     STREAM_OBFUSCATION_IGNORED,
     STREAM_OPTIONS_NOT_STREAMING,
     THINKING_DISPLAY_DROPPED,
+    USAGE_INCLUDE_ALWAYS_INCLUDED,
+    USAGE_INCLUDE_EXPLICIT_STREAM_OPTIONS,
+    USAGE_INCLUDE_TRANSLATED,
+    accept_chat_usage_accounting,
     accept_foreground_responses,
     accept_messages_stream_options,
     accept_responses_stream_options,
@@ -495,3 +499,111 @@ def test_responses_call_arguments_that_name_no_object_are_served_with_a_stand_in
     assert call.raw_arguments == arguments
     assert call.arguments == {"_unparsed_arguments": arguments}
     assert call.arguments_treatment == treatment
+
+
+@pytest.mark.parametrize("include", (True, False))
+def test_chat_usage_accounting_is_accepted_and_never_decoded(include: bool) -> None:
+    """OpenRouter's ``usage: {"include": ...}`` serves on a buffered Chat call.
+
+    ``include: true`` is already satisfied (every answer carries ``usage``), so
+    only ``false`` is disclosed; neither reaches the canonical request.
+    """
+    decoded = decode_chat({**_CHAT_BASE, "usage": {"include": include}})
+    assert decoded.request.include_usage is False
+    assert decoded.request.ignored_parameters == (
+        () if include else (USAGE_INCLUDE_ALWAYS_INCLUDED,)
+    )
+
+
+@pytest.mark.parametrize("value", (None, {}, {"include": None}))
+def test_chat_usage_accounting_asking_for_nothing_is_consumed_silently(
+    value: JsonValue,
+) -> None:
+    repaired, disclosures = accept_chat_usage_accounting({**_CHAT_BASE, "usage": value})
+    assert "usage" not in repaired
+    assert disclosures == ()
+    assert decode_chat({**_CHAT_BASE, "usage": value}).request.ignored_parameters == ()
+
+
+def test_chat_usage_accounting_on_a_stream_turns_on_the_usage_chunk() -> None:
+    """``include: true`` on a stream is ``stream_options.include_usage: true``."""
+    repaired, disclosures = accept_chat_usage_accounting(
+        {**_CHAT_BASE, "stream": True, "usage": {"include": True}}
+    )
+    assert "usage" not in repaired
+    assert repaired["stream_options"] == {"include_usage": True}
+    assert disclosures == (USAGE_INCLUDE_TRANSLATED,)
+    decoded = decode_chat({**_CHAT_BASE, "stream": True, "usage": {"include": True}})
+    assert decoded.request.stream is True
+    assert decoded.request.include_usage is True
+    assert decoded.request.ignored_parameters == (USAGE_INCLUDE_TRANSLATED,)
+
+
+def test_chat_usage_accounting_false_on_a_stream_is_the_default() -> None:
+    decoded = decode_chat({**_CHAT_BASE, "stream": True, "usage": {"include": False}})
+    assert decoded.request.include_usage is False
+    assert decoded.request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize(("include", "explicit"), ((True, False), (False, True)))
+def test_chat_usage_accounting_yields_to_explicit_stream_options(
+    include: bool, explicit: bool
+) -> None:
+    """The OpenAI-native control wins over the OpenRouter alias, disclosed."""
+    decoded = decode_chat(
+        {
+            **_CHAT_BASE,
+            "stream": True,
+            "stream_options": {"include_usage": explicit},
+            "usage": {"include": include},
+        }
+    )
+    assert decoded.request.include_usage is explicit
+    assert decoded.request.ignored_parameters == (USAGE_INCLUDE_EXPLICIT_STREAM_OPTIONS,)
+
+
+@pytest.mark.parametrize("include", (True, False))
+def test_chat_usage_accounting_agreeing_with_stream_options_is_silent(include: bool) -> None:
+    decoded = decode_chat(
+        {
+            **_CHAT_BASE,
+            "stream": True,
+            "stream_options": {"include_usage": include},
+            "usage": {"include": include},
+        }
+    )
+    assert decoded.request.include_usage is include
+    assert decoded.request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("value", (True, "include", 1, [True]))
+def test_chat_usage_accounting_non_object_is_a_named_400(value: JsonValue) -> None:
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({**_CHAT_BASE, "usage": value})
+    assert error.value.status_code == 400
+    assert error.value.detail.code == "invalid_parameter"
+    assert error.value.detail.param == "usage"
+    assert "object" in error.value.detail.message
+
+
+@pytest.mark.parametrize("value", ("true", 1, {"all": True}))
+def test_chat_usage_accounting_non_boolean_include_is_a_named_400(value: JsonValue) -> None:
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({**_CHAT_BASE, "usage": {"include": value}})
+    assert error.value.detail.code == "invalid_parameter"
+    assert error.value.detail.param == "usage.include"
+
+
+def test_chat_usage_accounting_unknown_key_is_a_named_400() -> None:
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({**_CHAT_BASE, "usage": {"include": True, "cost": True}})
+    assert error.value.detail.code == "invalid_parameter"
+    assert error.value.detail.param == "usage.cost"
+
+
+def test_responses_usage_is_still_refused_by_name() -> None:
+    """OpenRouter documents no Responses equivalent, so the field stays a named 400."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_responses({"model": "m", "input": "hi", "usage": {"include": True}})
+    assert error.value.detail.code == "unsupported_parameter"
+    assert error.value.detail.param == "usage"
