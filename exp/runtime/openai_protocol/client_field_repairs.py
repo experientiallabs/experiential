@@ -15,7 +15,9 @@ n8n sends Responses ``background: false``, and image clients send
 OpenRouter's Chat ``modalities`` of text and image, which the route's own
 declared output modalities already decide. OpenRouter's deprecated
 ``include_reasoning`` boolean is rewritten to the ``reasoning.exclude`` it
-aliases. A
+aliases, and its usage-accounting ``usage: {"include": true}`` is consumed
+(a buffered answer reports the usage the provider accounted either way; on a
+stream it becomes ``stream_options.include_usage``). A
 named 400 for any of them fails every request the client makes, so each is
 removed here, before the compatibility manifest and the wire models read the
 body, and every removal that changes what the caller asked for is named in
@@ -123,6 +125,32 @@ OpenRouter documents the legacy boolean as ``include_reasoning: true`` meaning
 https://openrouter.ai/docs/guides/best-practices/reasoning-tokens, read
 2026-10-24). ``true`` asks for the default (reasoning returned where the model
 produces it) and ``null`` for nothing, so both are removed without disclosure."""
+
+USAGE_INCLUDE_TRANSLATED = "usage.include->translated(stream_options.include_usage)"
+"""Disclosure recorded when ``usage.include: true`` turns on the stream's usage chunk.
+
+OpenRouter's usage-accounting request parameter (docs "Usage Accounting",
+https://openrouter.ai/docs/use-cases/usage-accounting, read 2026-11-12) is
+``usage: {"include": true}`` on Chat Completions only; the Responses API has no
+equivalent. OpenRouter now reports usage on every response and documents the
+field as having no effect. This gateway's buffered answer carries ``usage``
+whenever the provider accounted the turn (token counts; a deployment may
+annotate a cost on top), and ``null`` when it did not, whatever the caller
+asked, so the parameter unlocks nothing there. A stream reports usage only on
+its final chunk when asked, so the request is carried as the OpenAI control
+that asks for it."""
+
+USAGE_INCLUDE_ALWAYS_INCLUDED = "usage.include->ignored(always_included)"
+"""Disclosure recorded when a buffered Chat call asks for ``usage.include: false``.
+
+The non-streaming answer always carries ``usage``, so leaving it out cannot be
+honored."""
+
+USAGE_INCLUDE_EXPLICIT_STREAM_OPTIONS = "usage.include->ignored(explicit_stream_options)"
+"""Disclosure recorded when ``usage.include`` contradicts ``stream_options.include_usage``.
+
+The OpenAI-native control decides the stream's usage chunk; the OpenRouter
+alias yields to it rather than failing the request."""
 
 RESPONSES_ARGUMENTS_SERIALIZED = "input.arguments->serialized(json_object)"
 """Disclosure recorded when a ``function_call`` item's ``arguments`` arrive as an object."""
@@ -753,6 +781,68 @@ def _double_encoded_object(arguments: JsonValue) -> str | None:
     return outer if isinstance(inner, dict) else None
 
 
+def accept_chat_usage_accounting(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Consume OpenRouter's ``usage: {"include": ...}`` accounting parameter on a Chat request.
+
+    The object is removed before the manifest reads the body and never reaches
+    a provider. ``null``, an empty object and ``include: null`` ask for nothing
+    and are removed silently. On a buffered call ``include: true`` unlocks
+    nothing (the answer carries whatever usage the provider accounted, with or
+    without the request) and ``include: false`` cannot be honored, so only the
+    latter is disclosed. On a stream ``include: true``
+    becomes ``stream_options.include_usage: true`` when the caller set no
+    explicit ``include_usage`` (disclosed as a translation), ``include: false``
+    is the stream's default, and a value contradicting an explicit
+    ``stream_options.include_usage`` yields to it with disclosure. A
+    ``stream_options`` that is not an object is left for the wire model's own
+    refusal.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload without ``usage`` (and with ``stream_options.include_usage``
+        when translated), plus its disclosures.
+
+    Raises:
+        OpenAIProtocolError: ``usage`` is not an object, names a key other than
+            ``include``, or carries a non-null, non-boolean ``include``.
+    """
+    if "usage" not in payload:
+        return payload, ()
+    options = payload["usage"]
+    remaining = {key: value for key, value in payload.items() if key != "usage"}
+    if options is None:
+        return remaining, ()
+    if not isinstance(options, dict):
+        raise invalid_field(
+            "usage", "'usage' must be an object with an optional boolean 'include'."
+        )
+    unknown = sorted(set(options) - {"include"})
+    if unknown:
+        raise invalid_field(
+            f"usage.{unknown[0]}",
+            f"Unknown parameter: 'usage.{unknown[0]}'. usage accepts only include.",
+        )
+    include = options.get("include")
+    if include is None:
+        return remaining, ()
+    if not isinstance(include, bool):
+        raise invalid_field("usage.include", "'usage.include' must be a boolean.")
+    if not stream_requested(remaining):
+        return remaining, () if include else (USAGE_INCLUDE_ALWAYS_INCLUDED,)
+    stream_options = remaining.get("stream_options")
+    if stream_options is not None and not isinstance(stream_options, dict):
+        return remaining, ()
+    explicit = None if stream_options is None else stream_options.get("include_usage")
+    if explicit is not None:
+        return remaining, () if explicit == include else (USAGE_INCLUDE_EXPLICIT_STREAM_OPTIONS,)
+    if not include:
+        return remaining, ()
+    merged = {**(stream_options or {}), "include_usage": True}
+    return {**remaining, "stream_options": merged}, (USAGE_INCLUDE_TRANSLATED,)
+
+
 def repair_chat(
     payload: JsonObject, disclosures: tuple[str, ...]
 ) -> tuple[JsonObject, tuple[str, ...]]:
@@ -774,6 +864,7 @@ def repair_chat(
     payload, stream = drop_chat_stream_options_without_stream(payload)
     payload, display = drop_chat_thinking_display(payload)
     payload, include_reasoning = translate_chat_include_reasoning(payload)
+    payload, usage = accept_chat_usage_accounting(payload)
     payload = accept_chat_output_modalities(payload)
     return payload, (
         *disclosures,
@@ -785,6 +876,7 @@ def repair_chat(
         *stream,
         *display,
         *include_reasoning,
+        *usage,
     )
 
 

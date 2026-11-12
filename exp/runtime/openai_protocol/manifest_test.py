@@ -89,6 +89,10 @@ def test_manifests_classify_explicit_exclusions() -> None:
     for hint in ("prompt_cache_retention", "seed"):
         assert chat[hint] == CompatibilityDisposition.IGNORED
         assert responses[hint] == CompatibilityDisposition.IGNORED
+    # OpenRouter's usage-accounting request parameter is consumed on Chat (every
+    # answer already carries usage); the Responses API documents no equivalent.
+    assert chat["usage"] == CompatibilityDisposition.IGNORED
+    assert "usage" not in responses
 
 
 def test_schema_drift_fields_carry_capability_vocabulary() -> None:
