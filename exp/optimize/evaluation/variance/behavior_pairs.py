@@ -52,6 +52,7 @@ from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.judge import load_assessment
 from exp.optimize.evaluation.variance.judged import JUDGED_STUDY_TYPE, JudgedStudy, judged_episode
 from exp.optimize.evaluation.variance.rubric_author import forced_request
+from exp.optimize.evaluation.variance.rubric_tags import RubricTagSet, fire_screen
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.mining.dispatch import dispatch_tagging
@@ -281,13 +282,22 @@ def _attempts(
             continue
         units = step_units(trajectory, spec.view)
         tag_id = f"{identity}-tags-{branch.index}"
+        files: dict[str, ContractModel] = {}
         if project.artifacts.exists(tag_id):
             matrix = TagMatrix.model_validate_json(
                 project.artifacts.read_bytes(tag_id, "tags.json")
             )
         else:
             try:
-                matrix = tagger.tag(units, bank)
+                tag_steps = getattr(tagger, "tag_steps", None)
+                if tag_steps is not None:
+                    # Rubric tags are asked over each step's structured episode evidence.
+                    matrix = tag_steps(trajectory, evidence, units, bank)
+                    answers = getattr(tagger, "last_answers", None)
+                    if isinstance(answers, ContractModel):
+                        files["answers.json"] = answers
+                else:
+                    matrix = tagger.tag(units, bank)
             except (TraceTaggingError, ProviderTransportError) as error:
                 failures[branch.index] = bounded_reason(error)
                 continue
@@ -314,11 +324,25 @@ def _attempts(
                         sorted((source, slot.episode.assessment), key=lambda ref: ref.artifact_id)
                     ),
                 ),
-                files={"tags.json": matrix},
+                files={"tags.json": matrix, **files},
             )
         sources.append(artifact_input(project.artifacts.read(tag_id).manifest))
         attempts.append(attempt)
     return tuple(attempts), failures, tuple(sources)
+
+
+def _screened(
+    attempts: Sequence[BehaviorAttempt], spec: BehaviorDifferenceSpec
+) -> dict[str, str]:
+    """Rubric tags present on nearly every attempt, kept out of every signature."""
+    if spec.rubric_tags is None:
+        return {}
+    return fire_screen(
+        [attempt.tags for attempt in attempts],
+        (*spec.positive_tags, *spec.negative_tags),
+        confidence=spec.confidence,
+        maximum=spec.rubric_tags.maximum_fire_rate,
+    )
 
 
 def flagged(attempt: BehaviorAttempt, spec: BehaviorDifferenceSpec) -> bool:
@@ -401,6 +425,8 @@ def _pair(
     identity: str,
     sources: tuple[ArtifactInput, ...],
     revision: str,
+    tag_set: RubricTagSet | None = None,
+    screened: dict[str, str] | None = None,
 ) -> PairDifference:
     pair_id = f"{identity}-g{good.attempt}-p{poor.attempt}"
     base = PairDifference(pair_id=pair_id, good=good.attempt, poor=poor.attempt)
@@ -412,6 +438,9 @@ def _pair(
         "maximum_window_steps": spec.maximum_window_steps,
         "vocabulary": bank.model_dump(mode="json"),
     }
+    if tag_set is not None:
+        payload["tag_meanings"] = tag_set.described()
+        payload["screened_tags"] = dict(screened or {})
     answer, ref, failure = _draw(
         project,
         spec,
@@ -430,7 +459,7 @@ def _pair(
     try:
         _citations(good, answer.good_events)
         _citations(poor, answer.poor_events)
-        delta = behavior_delta(good, poor, answer, spec)
+        delta = behavior_delta(good, poor, answer, spec, tuple(screened or {}))
         assert answer.poor_window is not None
         point = poor.trajectory.steps[answer.poor_window.start].boundary
         checkpoint = poor.checkpoints.get(point)
@@ -485,6 +514,7 @@ def run_behavior_differences(
     code_revision: str,
     maximum_steps: int,
     concurrency: int = 1,
+    tag_set: tuple[ArtifactInput, RubricTagSet] | None = None,
 ) -> tuple[ArtifactInput, BehaviorDifferenceReport]:
     """Tag, align, diff, review and group one task's independently judged actor attempts.
 
@@ -492,7 +522,15 @@ def run_behavior_differences(
     seeded sample, prioritizing judged failures on which a hack or failure-mode tag fired
     confidently on some step. Missing judgments, tag failures, semantic refusals and ambiguity
     remain in coverage.
+
+    With ``spec.rubric_tags``, ``tag_set`` is the rubric-authored set whose bank this is; its
+    tagger answers each step's structured evidence, and tags present on nearly every attempt are
+    screened out of the signatures (:func:`~.rubric_tags.fire_screen`).
     """
+    if (spec.rubric_tags is None) != (tag_set is None):
+        raise ValueError("rubric tags and their authored tag set go together")
+    if tag_set is not None and tag_set[1].bank() != bank:
+        raise ValueError("behavior bank is not the rubric tag set's bank")
     if maximum_steps < 1 or not 1 <= concurrency <= 64:
         raise ValueError("behavior mining requires positive step bounds and concurrency in 1..64")
     if spec.author is None or spec.reviewer is None:
@@ -522,6 +560,7 @@ def run_behavior_differences(
             "tier": tier,
             "code": code_revision,
             "maximum_steps": maximum_steps,
+            **({} if tag_set is None else {"tag_set": tag_set[0].model_dump(mode="json")}),
         },
     )
     store = project.artifacts
@@ -543,6 +582,7 @@ def run_behavior_differences(
             code_revision,
             maximum_steps,
         )
+        screened = _screened(attempts, spec)
         good = [a for a in attempts if a.verdict == "pass"]
         poor = [a for a in attempts if a.verdict == "fail"]
         pairing: Literal["verdict", "failure_mode_tags"] = "verdict"
@@ -567,6 +607,8 @@ def run_behavior_differences(
                 identity=identity,
                 sources=sources,
                 revision=code_revision,
+                tag_set=None if tag_set is None else tag_set[1],
+                screened=screened,
             )
 
         pairs = dispatch_tagging(
@@ -587,6 +629,8 @@ def run_behavior_differences(
             pairing=pairing,
             pairs=pairs,
             groups=difference_groups(pairs, bank_sha256=sha256_json(bank)),
+            tag_set=None if tag_set is None else tag_set[0],
+            screened=screened,
         )
         store.write_json(
             artifact_id=identity,
@@ -616,6 +660,8 @@ def load_behavior_differences(
         project.artifacts.read_bytes(reference.artifact_id, "differences.json")
     )
     report.spec.check_bank(report.bank)
+    if report.screened != _screened(report.attempts, report.spec):
+        raise ValueError("saved screened tags differ from their attempts' tags")
     for attempt in report.attempts:
         check_attempt(attempt, report.bank, report.spec.view)
         if (attempt.episode.task_sha256, attempt.episode.world_sha256) != (
@@ -649,7 +695,7 @@ def load_behavior_differences(
                 and flagged(poor, report.spec)
             )
             if not contrasted or pair.delta != behavior_delta(
-                good, poor, pair.alignment, report.spec
+                good, poor, pair.alignment, report.spec, tuple(report.screened)
             ):
                 raise ValueError("saved behavioral difference is inconsistent with its evidence")
     if report.groups != difference_groups(report.pairs, bank_sha256=sha256_json(report.bank)):

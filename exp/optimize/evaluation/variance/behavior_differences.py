@@ -7,7 +7,7 @@ presence versus absence becomes an Added/Removed signature. Uncertainty stays ex
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Literal, Self
 
 from pydantic import Field, model_validator
@@ -15,6 +15,7 @@ from pydantic import Field, model_validator
 from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, stable_id
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence, JudgedEpisode
+from exp.optimize.evaluation.variance.rubric_tag_settings import RubricTagSettings
 from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tagging import TagMatrix
 from exp.simulation.mining.traceml import StepViewSpec, TraceTrajectory, step_units
@@ -48,6 +49,10 @@ class BehaviorDifferenceSpec(ContractModel):
             a tagger whose answers sit near the middle.
         seed: Seed of the bounded pair sample.
         view: Step view the tags are asked over.
+        rubric_tags: When set, the bank is authored from the frozen rubric and its trace
+            analysis (:mod:`~.rubric_tags`) and asked over each step's structured evidence;
+            ``bank_id`` is then the authored set's bank. Off (None) by default, and left out of
+            the spec's serialized identity while off.
     """
 
     bank_id: str = Field(min_length=1)
@@ -60,6 +65,9 @@ class BehaviorDifferenceSpec(ContractModel):
     confidence: float = Field(default=0.7, ge=0.5, lt=1.0)
     seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
     view: StepViewSpec = StepViewSpec()
+    rubric_tags: RubricTagSettings | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _polarities(self) -> Self:
@@ -174,11 +182,18 @@ class PairAlignment(ContractModel):
 
 
 class BehaviorDelta(ContractModel):
-    """Poor minus good: exact confident changes and unresolved comparisons."""
+    """Poor minus good: exact confident changes and unresolved comparisons.
+
+    ``uncertain`` tags block the pair. ``unscored`` tags (rubric tags with
+    ``unscored_uncertain``) were also unresolved but are left out of the signature instead, and
+    ``screened`` tags fired on nearly every attempt, so they never enter it.
+    """
 
     added: tuple[str, ...]
     removed: tuple[str, ...]
     uncertain: tuple[str, ...]
+    unscored: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
+    screened: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
 
 
 class PairAudit(ContractModel):
@@ -253,6 +268,8 @@ class BehaviorDifferenceReport(ContractModel):
     pairing: Literal["verdict", "failure_mode_tags"] = "verdict"
     pairs: tuple[PairDifference, ...]
     groups: tuple[BehaviorDifferenceGroup, ...]
+    tag_set: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    screened: dict[str, str] = Field(default_factory=dict, exclude_if=lambda value: not value)
 
 
 class BehaviorPairEvidence(ContractModel):
@@ -312,8 +329,17 @@ def behavior_delta(
     poor: BehaviorAttempt,
     alignment: PairAlignment,
     spec: BehaviorDifferenceSpec,
+    screened: Collection[str] = (),
 ) -> BehaviorDelta:
-    """Compute presence changes over aligned windows, never treating unknown as absent."""
+    """Compute presence changes over aligned windows, never treating unknown as absent.
+
+    Args:
+        good: The good attempt.
+        poor: The poor attempt.
+        alignment: The aligned windows.
+        spec: Polarity, threshold and uncertainty policy.
+        screened: Non-discriminating tags kept out of the signature.
+    """
     if (
         alignment.status != "aligned"
         or alignment.good_window is None
@@ -331,7 +357,10 @@ def behavior_delta(
     added: list[str] = []
     removed: list[str] = []
     uncertain: list[str] = []
+    excluded = sorted(set(screened))
     for tag in sorted((*spec.positive_tags, *spec.negative_tags)):
+        if tag in excluded:
+            continue
         a, b = left[tag], right[tag]
         a_present, b_present = a > spec.confidence, b > spec.confidence
         a_absent, b_absent = 1 - a > spec.confidence, 1 - b > spec.confidence
@@ -341,7 +370,20 @@ def behavior_delta(
             removed.append(tag)
         elif not ((a_present and b_present) or (a_absent and b_absent)):
             uncertain.append(tag)
-    return BehaviorDelta(added=tuple(added), removed=tuple(removed), uncertain=tuple(uncertain))
+    if spec.rubric_tags is not None and spec.rubric_tags.unscored_uncertain:
+        return BehaviorDelta(
+            added=tuple(added),
+            removed=tuple(removed),
+            uncertain=(),
+            unscored=tuple(uncertain),
+            screened=tuple(excluded),
+        )
+    return BehaviorDelta(
+        added=tuple(added),
+        removed=tuple(removed),
+        uncertain=tuple(uncertain),
+        screened=tuple(excluded),
+    )
 
 
 def difference_groups(

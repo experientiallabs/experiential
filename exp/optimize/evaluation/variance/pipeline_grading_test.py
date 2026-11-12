@@ -57,8 +57,9 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[object]]:
     library = SimpleNamespace(reference=ref("library-1"))
 
     def judge_tiers(
-        context: object, groups: object, rubric: ArtifactInput
+        context: object, groups: object, rubric: ArtifactInput, packet: object = None
     ) -> tuple[dict[str, ArtifactInput], dict[str, ArtifactInput]]:
+        del packet
         calls["judged_by"].append(rubric.artifact_id)
         return {"actor": ref(f"judged-{rubric.artifact_id}")}, {
             "actor": ref(f"differences-{rubric.artifact_id}")

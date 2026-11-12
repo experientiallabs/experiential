@@ -33,6 +33,7 @@ from exp.optimize.evaluation.variance.behavior_pairs import (
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.optimize.evaluation.variance.pipeline_inputs import admitted_transport
+from exp.optimize.evaluation.variance.rubric_tags import RubricStepTagger, author_rubric_tags
 from exp.optimize.evaluation.variance.pipeline_spec import (
     DecisionVarianceSpec,
     StageContext,
@@ -45,7 +46,14 @@ from exp.simulation.mining.tagging import DecisionCache
 
 
 def behavior_bank(spec: DecisionVarianceSpec) -> QuestionBank | None:
-    """Resolve the exact local behavior bank before pricing or provider dispatch."""
+    """Resolve the exact local behavior bank before pricing or provider dispatch.
+
+    Rubric-authored tags have no local bank: theirs is authored in the stage from the frozen
+    rubric, so None here and the settings themselves key the stage.
+    """
+    behaviors = spec.mining.behaviors
+    if behaviors is not None and behaviors.rubric_tags is not None:
+        return None
     resolved = behavior_settings(spec)
     return None if resolved is None else resolved[1]
 
@@ -61,6 +69,8 @@ def behavior_settings(
     settings = spec.mining.behaviors
     if settings is None:
         return None
+    if settings.rubric_tags is not None:
+        raise ValueError("rubric-authored behavior tags have no local bank to resolve")
     bank = resolve_question_bank(settings.bank_id, root=spec.traceml.bank_root)
     authoring = spec.authoring
     resolved = settings.resolved(
@@ -71,6 +81,9 @@ def behavior_settings(
 
 def behavior_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[CostComponent, ...]:
     """Bound per-step tagging plus one alignment and independent audit per proposed pair."""
+    behaviors = spec.mining.behaviors
+    if behaviors is not None and behaviors.rubric_tags is not None:
+        return rubric_tag_costs(project, spec)
     resolved = behavior_settings(spec)
     if resolved is None:
         return ()
@@ -89,11 +102,43 @@ def behavior_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[C
     return tuple(row.scaled(len(mining.actors)) for row in costs)
 
 
+def rubric_tag_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[CostComponent, ...]:
+    """Bound rubric-authored tags: authoring draws, the wording screen, up to two slot requests
+    per step (tool calls carry an action and possibly an edit request), and the pair reviews."""
+    behaviors = spec.mining.behaviors
+    assert behaviors is not None and behaviors.rubric_tags is not None
+    tags = behaviors.rubric_tags
+    authoring = spec.authoring
+    author = tags.author or behaviors.author or authoring.rubric_author
+    reviewer = behaviors.reviewer or authoring.decision_reviewer or authoring.rubric_author
+    mining = spec.mining
+    steps = mining.registered.maximum_model_calls * (spec.traceml.steps_per_call + 1)
+    calls = mining.attempts * steps * 2 * len(mining.actors) + tags.maximum_tags
+    retries = RetryPolicy().maximum_attempts
+    costs = [decision_cost(project, spec.traceml.decision_alias, calls * retries)]
+    costs.extend(row.scaled(tags.repairs + 1) for row in evaluation_costs(project, author))
+    for role in (behaviors.author or authoring.rubric_author, reviewer):
+        costs.extend(
+            row.scaled(behaviors.maximum_pairs * len(mining.actors))
+            for row in evaluation_costs(project, role)
+        )
+    return tuple(costs)
+
+
 def behavior_lines(spec: DecisionVarianceSpec) -> tuple[str, ...]:
     """Describe the enabled contrast work in the credential-free stage plan."""
     settings = spec.mining.behaviors
     if settings is None:
         return ()
+    if settings.rubric_tags is not None:
+        return (
+            "Behavior differences: tags authored from the frozen rubric and its trace analysis "
+            "(one per failure pattern and accepted alternative), screened for wording, asked on "
+            "each step's edit, action or claim evidence; up to "
+            f"{settings.maximum_pairs} same-task judged pass/fail pairs per tier, uncertain tags "
+            "unscored, always-firing tags screened; groups inform the rubric revision, never "
+            "actor rewards.",
+        )
     return (
         f"Behavior differences: authored bank {settings.bank_id} answered on every step of every "
         f"attempt, up to {settings.maximum_pairs} same-task judged pass/fail pairs per tier, one "
@@ -108,6 +153,8 @@ def behavior_differences(
     source: ArtifactInput,
     judged: ArtifactInput,
     exposure: ExposurePlan,
+    rubric: ArtifactInput | None = None,
+    packet: ArtifactInput | None = None,
 ) -> ArtifactInput | None:
     """Mine one tier's reviewed behavior differences over its judged group, when enabled.
 
@@ -117,11 +164,18 @@ def behavior_differences(
         source: The tier's saved group result.
         judged: The group judged by the rubric judge.
         exposure: The frozen data roles.
+        rubric: The rubric the group was judged by; rubric-authored tags are derived from it.
+        packet: That rubric's authoring packet (its trace analysis), when it has one.
 
     Returns:
         The saved behavior differences, or None without ``mining.behaviors``.
     """
     spec, project = context.spec, context.project
+    behaviors = spec.mining.behaviors
+    if behaviors is not None and behaviors.rubric_tags is not None:
+        if rubric is None:
+            raise ValueError("rubric-authored behavior tags need the judged rubric")
+        return _rubric_tag_differences(context, job, source, judged, exposure, rubric, packet)
     resolved = behavior_settings(spec)
     if resolved is None:
         return None
@@ -157,6 +211,80 @@ def behavior_differences(
         code_revision=context.code_revision,
         maximum_steps=job.maximum_model_calls * (spec.traceml.steps_per_call + 1),
         concurrency=spec.traceml.concurrency,
+    )
+    return ref
+
+
+def _rubric_tag_differences(
+    context: StageContext,
+    job: ContinuationJob,
+    source: ArtifactInput,
+    judged: ArtifactInput,
+    exposure: ExposurePlan,
+    rubric: ArtifactInput,
+    packet: ArtifactInput | None,
+) -> ArtifactInput:
+    """Author (or replay) the rubric's tag set, then mine the tier's differences with it."""
+    spec, project = context.spec, context.project
+    behaviors = spec.mining.behaviors
+    assert behaviors is not None and behaviors.rubric_tags is not None
+    authoring = spec.authoring
+    tags = behaviors.rubric_tags.model_copy(
+        update={
+            "author": behaviors.rubric_tags.author or behaviors.author or authoring.rubric_author
+        }
+    )
+    catalog = load_model_catalog(project.model_catalog_path)
+    model = RuntimeModelCatalog(catalog).resolve(spec.traceml.decision_alias)
+    steps = job.maximum_model_calls * (spec.traceml.steps_per_call + 1)
+    calls = spec.mining.attempts * steps * 2 + tags.maximum_tags
+    transport = admitted_transport(
+        context,
+        f"rubric-tags-{job.actor_alias}",
+        calls * RetryPolicy().maximum_attempts,
+        datetime.now(UTC) + timedelta(hours=spec.traceml.deadline_hours),
+    ).priced_as(spec.traceml.decision_alias)
+    # The typed decision boundary and model identity of the configured decision alias; the
+    # rubric tagger asks structured states over the same wire, cache and accounting.
+    wire = DecisionsTraceTagger.for_alias(model, transport=transport)
+    decide, identity = wire._decide, wire.model_identity  # noqa: SLF001
+    cache = DecisionCache(project.paths)
+    tag_ref, tag_set = author_rubric_tags(
+        project,
+        tags,
+        rubric=rubric,
+        packet=packet,
+        decide=decide,
+        cache=cache,
+        model_identity=identity,
+        code_revision=context.code_revision,
+    )
+    bank = tag_set.bank()
+    settings = behaviors.model_copy(
+        update={"bank_id": bank.bank_id, "positive_tags": (), "negative_tags": (), "rubric_tags": tags}
+    ).resolved(bank, authoring.rubric_author, authoring.decision_reviewer or authoring.rubric_author)
+    tagger = context.dependencies.traceml_tagger or RubricStepTagger(
+        decide,
+        identity,
+        tag_set,
+        tags,
+        cache=cache,
+        maximum_concurrency=spec.traceml.concurrency,
+    )
+    ref, _ = run_behavior_differences(
+        project,
+        settings,
+        study=source,
+        judged=judged,
+        bank=bank,
+        tier=job.actor_alias,
+        exposure=exposure,
+        configuration=job.configuration,
+        tagger=tagger,
+        code_revision=context.code_revision,
+        maximum_steps=steps,
+        concurrency=spec.traceml.concurrency,
+        tag_set=(tag_ref, tag_set),
     )
     return ref
 
