@@ -487,7 +487,7 @@ class FrontDoorView:
         out.extend(row.text() for row in self.rows())
         running = self.running()
         if running:
-            out.append("Running")
+            out.append("Running" if self.interrupted is None else "Last running")
             out.extend(f"  {line}" for line in running)
         calls = self.calls_lines()
         if calls:
@@ -514,7 +514,9 @@ class FrontDoorView:
                 parts.append(self._render_row(row))
             running = self.running()
             if running:
-                parts.append(Text("Running", style="bold"))
+                parts.append(
+                    Text("Running" if self.interrupted is None else "Last running", style="bold")
+                )
                 parts.extend(Text(f"  {line}", style="cyan") for line in running)
             table = self.calls_table()
             if table is not None:
