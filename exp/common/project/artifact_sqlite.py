@@ -140,15 +140,23 @@ def read_artifact(paths: ProjectPaths, artifact_id: str) -> StoredArtifact:
                         f"artifact {artifact_id} blob reference differs from its digest"
                     )
                 validate_artifact_file_path(blob_path)
-                payload = _read_artifact_file_snapshot(paths.root, blob_path)
+                # Verified against its digest here, once per unchanged file in this process.
+                payload = _read_artifact_file_snapshot(
+                    paths.root,
+                    blob_path,
+                    digest=digest,
+                    mismatch=lambda path=path: ArtifactCorruptionError(
+                        f"artifact {artifact_id} data file digest mismatch: {path}"
+                    ),
+                )
             else:
                 payload = bytes(inline)
-            try:
-                verified_payload(payload, digest)
-            except ProjectRecordError as exc:
-                raise ArtifactCorruptionError(
-                    f"artifact {artifact_id} data file digest mismatch: {path}"
-                ) from exc
+                try:
+                    verified_payload(payload, digest)
+                except ProjectRecordError as exc:
+                    raise ArtifactCorruptionError(
+                        f"artifact {artifact_id} data file digest mismatch: {path}"
+                    ) from exc
             if len(payload) != size:
                 raise ArtifactCorruptionError(
                     f"artifact {artifact_id} data file size mismatch: {path}"

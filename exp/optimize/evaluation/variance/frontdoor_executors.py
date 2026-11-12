@@ -60,7 +60,10 @@ from exp.optimize.evaluation.variance.bootstrap_plan import (
     BootstrapPreparationReport,
     BootstrapPreparationSpec,
 )
-from exp.optimize.evaluation.variance.build import plan_variance_build, run_variance_build
+from exp.optimize.evaluation.variance.build_plans import (
+    planned_variance_build,
+    replay_or_run_variance_build,
+)
 from exp.optimize.evaluation.variance.build_records import (
     FamilyScope,
     VarianceBuildReport,
@@ -193,7 +196,7 @@ def saved_corpus(context: SlotContext) -> Corpus | None:
     if early in _CORPORA:
         return _CORPORA[early]
     reviewer = build.reviewer
-    plan = plan_variance_build(
+    plan = planned_variance_build(
         context.project,
         build.spec,
         code_revision=context.code_revision,
@@ -383,7 +386,7 @@ def review_families(
     reviewer = collaborators.reviewer or family_reviewer(
         project, build, code_revision=code_revision
     )
-    run_variance_build(
+    replay_or_run_variance_build(
         project,
         build.spec,
         code_revision=code_revision,
@@ -403,7 +406,7 @@ def families_review_plan(
     """
     build = context.preparation.build
     reviewer = build.reviewer
-    plan = plan_variance_build(
+    plan = planned_variance_build(
         context.project,
         build.spec,
         code_revision=context.code_revision,
