@@ -159,6 +159,7 @@ def _judge_tiers(
     context: StageContext,
     groups: Mapping[str, tuple[ArtifactInput, ContinuationJob]],
     rubric: ArtifactInput,
+    packet: ArtifactInput | None = None,
 ) -> tuple[dict[str, ArtifactInput], dict[str, ArtifactInput]]:
     """Judge every tier's group by ``rubric`` and mine its behavior differences, if enabled."""
     project, spec, revision = context.project, context.spec, context.code_revision
@@ -176,7 +177,9 @@ def _judge_tiers(
             code_revision=revision,
             concurrency=admitted_concurrency(project, judge.settings.model_alias),
         )
-        differences = behavior_differences(context, job, source, judged[alias], exposure)
+        differences = behavior_differences(
+            context, job, source, judged[alias], exposure, rubric=rubric, packet=packet
+        )
         if differences is not None:
             behavior[alias] = differences
     return judged, behavior
@@ -248,11 +251,11 @@ def grade_groups(
     rubric = GeneralRubric(
         rubric=rules.rubric, packet=rules.rubric_packet, library=rules.rubric_library
     )
-    judged, behavior = _judge_tiers(context, groups, rubric.rubric)
+    judged, behavior = _judge_tiers(context, groups, rubric.rubric, rubric.packet)
     revised = revised_rubric(context, rules, behavior)
     if revised is not None:
         rubric = revised
-        judged, behavior = _judge_tiers(context, groups, rubric.rubric)
+        judged, behavior = _judge_tiers(context, groups, rubric.rubric, rubric.packet)
     return GroupGrading(rubric=rubric, judged=judged, behavior=behavior)
 
 
