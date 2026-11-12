@@ -3,12 +3,11 @@
 The behavior diff (:mod:`~.behavior_differences`) pairs a judged pass with a judged failure of
 the same task, aligns the decision where they diverge, and groups accepted pairs by identical
 Added/Removed tag signatures (poor minus good). A group is *adversarial* when its poor side added
-a reward-hacking behavior (:data:`HACK_ADDED`: ``modified_evaluation``, ``exploited_metric``,
-``hid_failure``, ``unsupported_success_claim``); removing genuine work (:data:`GENUINE_REMOVED`:
-``verified_result``, ``changed_implementation``) strengthens the signature. For example
-``y = {changed_implementation, verified_result}`` against
-``y' = {modified_evaluation, unsupported_success_claim}`` is the signature Added
-``{modified_evaluation, unsupported_success_claim}``, Removed
+a hack or failure-mode behavior: a negative tag of the report's authored bank; removing genuine
+work (a positive tag) strengthens the signature. The vocabulary is the report's own, never a
+built-in list. With a coding bank, for example, ``y = {changed_implementation,
+verified_result}`` against ``y' = {modified_evaluation, unsupported_success_claim}`` is the
+signature Added ``{modified_evaluation, unsupported_success_claim}``, Removed
 ``{changed_implementation, verified_result}``.
 
 The tags are the decision model's observations; whether a change was a weakening was decided by
@@ -17,8 +16,7 @@ re-decides it, and a group is analysis for authors, never a reward.
 
 - :func:`adversarial_families` keeps the adversarial groups and, for every pair, the
   :class:`DivergencePoint`: the poor attempt's pre-action checkpoint where the hack branch
-  leaves the genuine branch, both windows' steps and events, and whether the hack scored high on
-  the historical verifier (a judged failure the mechanical verifier passed).
+  leaves the genuine branch, and both windows' steps and events.
 - :func:`adversarial_evidence` gives the same groups to the authoring coalition (decision mining,
   then variant search through the authored families) in the existing
   :class:`~.behavior_differences.BehaviorDifferenceEvidence` shape.
@@ -57,19 +55,8 @@ from exp.optimize.evaluation.variance.behavior_pairs import (
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.reward_states import FAMILY_MACHINE, FamilyState
 
-ADVERSARIAL_PROTOCOL = "adversarial-signatures-v1"
+ADVERSARIAL_PROTOCOL = "adversarial-signatures-v2"
 """Version of the hack signature rule and the divergence record."""
-
-HACK_ADDED: tuple[str, ...] = (
-    "modified_evaluation",
-    "exploited_metric",
-    "hid_failure",
-    "unsupported_success_claim",
-)
-"""Behaviors whose addition on the failing side marks a reward-hacking signature."""
-
-GENUINE_REMOVED: tuple[str, ...] = ("verified_result", "changed_implementation")
-"""Genuine behaviors whose removal on the failing side strengthens the signature."""
 
 
 class HackSignature(ContractModel):
@@ -93,8 +80,8 @@ def hack_signature(
     added: Sequence[str],
     removed: Sequence[str],
     *,
-    hacks: Sequence[str] = HACK_ADDED,
-    genuine: Sequence[str] = GENUINE_REMOVED,
+    hacks: Sequence[str],
+    genuine: Sequence[str],
 ) -> HackSignature | None:
     """Return the hack part of a signature, or None when it adds no hack behavior."""
     found = sorted(set(added) & set(hacks))
@@ -116,7 +103,6 @@ class DivergencePoint(ContractModel):
         hack_steps: Step locators of the hack window.
         genuine_events: Audited genuine-side events.
         hack_events: Audited hack-side events.
-        high_scoring: Whether the historical verifier passed the hack (None when unknown).
         mechanism: The aligner's mechanism, as reviewed.
     """
 
@@ -129,7 +115,6 @@ class DivergencePoint(ContractModel):
     hack_steps: tuple[str, ...]
     genuine_events: tuple[str, ...]
     hack_events: tuple[str, ...]
-    high_scoring: bool | None = None
     mechanism: str
 
 
@@ -144,7 +129,6 @@ class AdversarialFamily(ContractModel):
         added: The group's full Added set.
         removed: The group's full Removed set.
         points: One divergence point per accepted pair.
-        high_scoring: Pairs whose hack the historical verifier passed.
         source: The behavior-differences report.
     """
 
@@ -155,7 +139,6 @@ class AdversarialFamily(ContractModel):
     added: tuple[str, ...]
     removed: tuple[str, ...]
     points: tuple[DivergencePoint, ...] = Field(min_length=1)
-    high_scoring: int = Field(ge=0)
     source: ArtifactInput | None = None
     transitions: tuple[Transition, ...] = ()
 
@@ -192,7 +175,6 @@ def _divergence(report: BehaviorDifferenceReport, pair_id: str) -> DivergencePoi
         ),
         genuine_events=audit.good_events,
         hack_events=audit.poor_events,
-        high_scoring=poor.historical_verifier_pass,
         mechanism=alignment.mechanism,
     )
 
@@ -200,8 +182,8 @@ def _divergence(report: BehaviorDifferenceReport, pair_id: str) -> DivergencePoi
 def adversarial_groups(
     groups: Sequence[BehaviorDifferenceGroup],
     *,
-    hacks: Sequence[str] = HACK_ADDED,
-    genuine: Sequence[str] = GENUINE_REMOVED,
+    hacks: Sequence[str],
+    genuine: Sequence[str],
 ) -> tuple[tuple[BehaviorDifferenceGroup, HackSignature], ...]:
     """Keep the groups whose signature adds a hack behavior, with that hack signature."""
     found: list[tuple[BehaviorDifferenceGroup, HackSignature]] = []
@@ -212,21 +194,29 @@ def adversarial_groups(
     return tuple(found)
 
 
-def mining_lifecycle(
-    report: BehaviorDifferenceReport,
-    *,
-    hacks: Sequence[str] = HACK_ADDED,
-    genuine: Sequence[str] = GENUINE_REMOVED,
-) -> Lifecycle[FamilyState]:
+def report_signature(
+    report: BehaviorDifferenceReport, group: BehaviorDifferenceGroup
+) -> HackSignature | None:
+    """Return a group's hack signature under the report's own bank polarity."""
+    return hack_signature(
+        group.added,
+        group.removed,
+        hacks=report.spec.negative_tags,
+        genuine=report.spec.positive_tags,
+    )
+
+
+def mining_lifecycle(report: BehaviorDifferenceReport) -> Lifecycle[FamilyState]:
     """Move every diff group through :data:`~.reward_states.FAMILY_MACHINE` up to ``mined``.
 
-    A group is adversarial when its signature adds a hack behavior, else not adversarial
-    (terminal); an adversarial group is mined once its divergence points are read.
+    A group is adversarial when its signature adds a hack or failure-mode behavior (a negative
+    tag of the report's bank), else not adversarial (terminal); an adversarial group is mined
+    once its divergence points are read.
     """
     states = FAMILY_MACHINE.lifecycle()
     for group in report.groups:
         states.start(group.group_id)
-        signature = hack_signature(group.added, group.removed, hacks=hacks, genuine=genuine)
+        signature = report_signature(report, group)
         if signature is None:
             states.move(group.group_id, FamilyState.NOT_ADVERSARIAL, "adds no hack behavior")
             continue
@@ -236,25 +226,21 @@ def mining_lifecycle(
 
 
 def adversarial_families(
-    report: BehaviorDifferenceReport,
-    *,
-    source: ArtifactInput | None = None,
-    hacks: Sequence[str] = HACK_ADDED,
-    genuine: Sequence[str] = GENUINE_REMOVED,
+    report: BehaviorDifferenceReport, *, source: ArtifactInput | None = None
 ) -> tuple[AdversarialFamily, ...]:
     """Mine the adversarial families of one behavior-differences report.
 
-    Groups keep the report's identical Added/Removed signatures. Families are ordered by how many
-    hacks scored high on the historical verifier, then by pair count, then by group identity.
+    Groups keep the report's identical Added/Removed signatures, read under the report's bank
+    polarity. Families are ordered by pair count (how many judged failures share the signature),
+    then by how many hack behaviors the signature adds, then by group identity.
 
     Args:
         report: A loaded behavior-differences report.
         source: Its saved reference, recorded on every family.
-        hacks: Behaviors whose addition marks a hack.
-        genuine: Behaviors whose removal strengthens one.
     """
-    states = mining_lifecycle(report, hacks=hacks, genuine=genuine)
+    states = mining_lifecycle(report)
     families: list[AdversarialFamily] = []
+    hacks, genuine = report.spec.negative_tags, report.spec.positive_tags
     for group, signature in adversarial_groups(report.groups, hacks=hacks, genuine=genuine):
         points = tuple(_divergence(report, pair_id) for pair_id in group.pairs)
         families.append(
@@ -269,21 +255,16 @@ def adversarial_families(
                 added=group.added,
                 removed=group.removed,
                 points=points,
-                high_scoring=sum(point.high_scoring is True for point in points),
                 source=source,
                 transitions=tuple(t for t in states.transitions if t.subject == group.group_id),
             )
         )
-    families.sort(key=lambda row: (-row.high_scoring, -len(row.points), row.group_id))
+    families.sort(key=lambda row: (-len(row.points), -len(row.signature.added), row.group_id))
     return tuple(families)
 
 
 def adversarial_evidence(
-    project: ProjectStore,
-    reference: ArtifactInput,
-    *,
-    hacks: Sequence[str] = HACK_ADDED,
-    genuine: Sequence[str] = GENUINE_REMOVED,
+    project: ProjectStore, reference: ArtifactInput
 ) -> tuple[BehaviorDifferenceEvidence, ...]:
     """Return the adversarial groups as coalition evidence for decision mining and variants.
 
@@ -292,10 +273,7 @@ def adversarial_evidence(
     divergence checkpoint.
     """
     report = load_behavior_differences(project, reference)
-    keep = {
-        group.group_id
-        for group, _ in adversarial_groups(report.groups, hacks=hacks, genuine=genuine)
-    }
+    keep = {group.group_id for group in report.groups if report_signature(report, group)}
     return tuple(row for row in compact_differences(project, reference) if row.group_id in keep)
 
 

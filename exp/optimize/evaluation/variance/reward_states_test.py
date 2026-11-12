@@ -134,8 +134,21 @@ def test_an_aggregation_that_scores_an_uncertain_finding_is_refused() -> None:
 
 
 def test_family_mining_persists_its_moves_and_rechecks_them_on_resume() -> None:
-    """Groups move to mined or not adversarial; a tampered persisted move is refused."""
-    states = mining_lifecycle(report())
+    """Groups move to mined or not adversarial; a tampered persisted move is refused.
+
+    The vocabulary here counts a skipped step as neither hack nor failure mode, so its group is
+    not adversarial.
+    """
+    saved = report()
+    lenient = saved.spec.model_copy(
+        update={
+            "positive_tags": (*saved.spec.positive_tags, "skipped_required_step"),
+            "negative_tags": tuple(
+                tag for tag in saved.spec.negative_tags if tag != "skipped_required_step"
+            ),
+        }
+    )
+    states = mining_lifecycle(saved.model_copy(update={"spec": lenient}))
     finals = sorted(state.value for state in states.current.values())
     assert finals == ["mined", "mined", "not_adversarial"]
 

@@ -19,29 +19,40 @@ from exp.simulation.mining.questions import QuestionBank
 from exp.simulation.mining.tagging import TagMatrix
 from exp.simulation.mining.traceml import StepViewSpec, TraceTrajectory, step_units
 
-BEHAVIOR_DIFFERENCES_PROTOCOL = "behavior-differences-v1"
+BEHAVIOR_DIFFERENCES_PROTOCOL = "behavior-differences-v2"
 BEHAVIOR_DIFFERENCES_TYPE = "behavior-differences"
 
 
 class BehaviorDifferenceSpec(ContractModel):
     """Local mixed-tag bank, explicit polarity and bounded semantic pair analysis.
 
-    Question text is local configuration, never inferred from the tag name. The default
-    identities name a coding-task vocabulary; callers supply the bank with their definitions.
-    Positive tags never enter error ranking or change episode reward.
+    The vocabulary is the bank's: question text is local configuration, never inferred from the
+    tag name, and the bank is authored for the task kind (a family's behavior bank), never a
+    built-in list. With no declared tags the polarity is read from the bank's declared families:
+    ``*.positive`` questions are genuine work, ``*.negative`` questions hack or failure modes,
+    and every question must carry one of them. :meth:`resolved` fixes the declared tags before
+    any mining, so a saved report names its exact polarity. Positive tags never enter error
+    ranking or change episode reward.
+
+    Attributes:
+        bank_id: The behavior bank's identity under the TraceML bank root.
+        author: Pair aligner (open-weight); None uses the pipeline's rubric author.
+        reviewer: Independent pair auditor (open-weight); None uses the pipeline's decision
+            reviewer, or its rubric author.
+        positive_tags: Genuine-work tags, or empty to read them from the bank.
+        negative_tags: Hack and failure-mode tags, or empty to read them from the bank.
+        maximum_pairs: Most same-task pairs compared per tier.
+        maximum_window_steps: Most steps in one aligned window.
+        confidence: Probability above which a tag is present (below its complement, absent).
+        seed: Seed of the bounded pair sample.
+        view: Step view the tags are asked over.
     """
 
     bank_id: str = Field(min_length=1)
-    author: AuthorSettings
-    reviewer: AuthorSettings
-    positive_tags: tuple[str, ...] = ("changed_implementation", "verified_result")
-    negative_tags: tuple[str, ...] = (
-        "unsupported_success_claim",
-        "modified_evaluation",
-        "skipped_required_step",
-        "exploited_metric",
-        "hid_failure",
-    )
+    author: AuthorSettings | None = None
+    reviewer: AuthorSettings | None = None
+    positive_tags: tuple[str, ...] = ()
+    negative_tags: tuple[str, ...] = ()
     maximum_pairs: int = Field(default=16, ge=1, le=128, strict=True)
     maximum_window_steps: int = Field(default=64, ge=1, le=512, strict=True)
     confidence: float = Field(default=0.7, gt=0.5, lt=1.0)
@@ -51,9 +62,52 @@ class BehaviorDifferenceSpec(ContractModel):
     @model_validator(mode="after")
     def _polarities(self) -> Self:
         tags = (*self.positive_tags, *self.negative_tags)
-        if not tags or len(set(tags)) != len(tags) or any(not tag for tag in tags):
+        if len(set(tags)) != len(tags) or any(not tag for tag in tags):
             raise ValueError("behavior tags need distinct nonempty identities and one polarity")
+        if tags and not self.negative_tags:
+            raise ValueError("declared behavior tags need at least one negative tag")
         return self
+
+    def resolved(
+        self, bank: QuestionBank, author: AuthorSettings, reviewer: AuthorSettings
+    ) -> BehaviorDifferenceSpec:
+        """Return the spec with its polarity read from the bank and its roles bound.
+
+        Args:
+            bank: The behavior bank.
+            author: Aligner used when the spec names none.
+            reviewer: Auditor used when the spec names none.
+
+        Raises:
+            ValueError: The bank is another bank, or a question carries no polarity.
+        """
+        positive, negative = self.positive_tags, self.negative_tags
+        if not positive and not negative:
+            unpolarized = [
+                q.question_id
+                for q in bank.questions
+                if not q.family.endswith((".positive", ".negative"))
+            ]
+            if unpolarized:
+                raise ValueError(
+                    f"behavior bank {bank.bank_id} has questions without a declared polarity "
+                    f"({', '.join(unpolarized[:5])}); give each a '*.positive' or '*.negative' "
+                    "family, or declare positive_tags and negative_tags"
+                )
+            families = {q.question_id: q.family for q in bank.questions}
+            positive = tuple(q for q, family in families.items() if family.endswith(".positive"))
+            negative = tuple(q for q, family in families.items() if family.endswith(".negative"))
+        resolved = self.model_copy(
+            update={
+                "author": self.author or author,
+                "reviewer": self.reviewer or reviewer,
+                "positive_tags": positive,
+                "negative_tags": negative,
+            }
+        )
+        resolved = BehaviorDifferenceSpec.model_validate(resolved.model_dump(mode="json"))
+        resolved.check_bank(bank)
+        return resolved
 
     def check_bank(self, bank: QuestionBank) -> None:
         """Require an exact vocabulary, so unclassified columns cannot become errors."""
@@ -72,7 +126,6 @@ class BehaviorAttempt(ContractModel):
     episode: EpisodeEvidence
     judgment: JudgedEpisode
     verdict: Literal["pass", "fail"]
-    historical_verifier_pass: bool | None = None
     checkpoints: dict[int, ArtifactInput]
 
     @model_validator(mode="after")
@@ -178,7 +231,7 @@ class BehaviorDifferenceGroup(ContractModel):
 class BehaviorDifferenceReport(ContractModel):
     """Saved tag evidence, reviewed pairs, canonical groups and honest coverage."""
 
-    protocol: Literal["behavior-differences-v1"] = BEHAVIOR_DIFFERENCES_PROTOCOL
+    protocol: Literal["behavior-differences-v2"] = BEHAVIOR_DIFFERENCES_PROTOCOL
     study: ArtifactInput
     judged: ArtifactInput
     bank: QuestionBank

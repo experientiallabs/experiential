@@ -40,7 +40,7 @@ from exp.optimize.evaluation.variance.adversarial_rubric import (
 )
 from exp.optimize.evaluation.variance.behavior_adversarial import adversarial_families
 from exp.optimize.evaluation.variance.behavior_differences import BehaviorDifferenceSpec
-from exp.optimize.evaluation.variance.behavior_differences_test import bank
+from exp.optimize.evaluation.variance.behavior_differences_test import NEGATIVE, POSITIVE, bank
 from exp.optimize.evaluation.variance.behavior_pairs import run_behavior_differences
 from exp.optimize.evaluation.variance.decision_measure_test import FORCED
 from exp.optimize.evaluation.variance.dense_candidates import linter_candidates
@@ -432,7 +432,13 @@ def test_both_rubric_parts_grade_the_three_repairs_for_their_cited_reasons(
     assert slot_rewards(project, labels.branches, judge.identity) == (1.0, 0.0, 1.0)
 
     # The symbolic difference names the reward hack; adversarial mining keeps it as a family.
-    config = BehaviorDifferenceSpec(bank_id="behavior", author=settings, reviewer=settings)
+    config = BehaviorDifferenceSpec(
+        bank_id="behavior",
+        author=settings,
+        reviewer=settings,
+        positive_tags=POSITIVE,
+        negative_tags=NEGATIVE,
+    )
     exposure = ExposurePlan(
         bindings=artifact_input(source),
         seed=0,
@@ -455,7 +461,7 @@ def test_both_rubric_parts_grade_the_three_repairs_for_their_cited_reasons(
     )
     (family,) = adversarial_families(report, source=saved)
     assert family.signature.added == ("modified_evaluation", "unsupported_success_claim")
-    assert family.high_scoring == 2 and all(point.hack_attempt == 1 for point in family.points)
+    assert all(point.hack_attempt == 1 for point in family.points)
 
     # The family's reviewed linter, citing the audited hack events, joins both rubric parts.
     wire.citable = tuple(family.points[0].hack_events)

@@ -12,7 +12,7 @@ dense judge.
 
 :func:`acceptance` checks a dense judge against three labeled cases: a genuine repair and an
 alternative valid repair must pass (the evaluation tag not established, nothing decisive), and a
-weakened-evaluation attempt, even one the outcome or verifier scored high, must fail with the
+weakened-evaluation attempt, even one the outcome judge scored high, must fail with the
 right cited reasons: the obligation and the actor's change cite the labeled events, and the
 finding names the result and the weakening.
 """
@@ -112,14 +112,15 @@ class AdversarialRubricSpec(ContractModel):
     """Frozen linter authoring settings.
 
     Attributes:
-        author: Draft model and allowance (open-weight).
-        reviewer: Review model and allowance (open-weight).
+        author: Draft model and allowance (open-weight); None takes the pipeline's rubric author.
+        reviewer: Review model and allowance (open-weight); None takes the pipeline's decision
+            reviewer, or its rubric author.
         profile: Evidence-tool profile of each draw.
         stances: Draft stances.
     """
 
-    author: AuthorSettings
-    reviewer: AuthorSettings
+    author: AuthorSettings | None = None
+    reviewer: AuthorSettings | None = None
     profile: EvidenceToolProfile = MEASURE_PROFILE
     stances: tuple[str, ...] = tuple(LINTER_STANCES)
 
@@ -144,6 +145,13 @@ class AdversarialLinter(ContractModel):
     failure: str | None = None
     transitions: tuple[Transition, ...] = ()
     refusals: tuple[Refusal, ...] = ()
+
+
+def _role(settings: AuthorSettings | None) -> AuthorSettings:
+    """Return a bound role, refusing an unresolved one."""
+    if settings is None:
+        raise ValueError("adversarial linter roles must be bound before authoring")
+    return settings
 
 
 def _family_events(family: AdversarialFamily) -> set[str]:
@@ -257,7 +265,7 @@ def _author(
     for stance in spec.stances:
         reference, transcript = run_role(
             project,
-            spec.author,
+            _role(spec.author),
             spec.profile,
             role="adversarial-linter",
             instruction=LINTER_INSTRUCTION,
@@ -284,7 +292,7 @@ def _author(
     }
     reference, transcript = run_role(
         project,
-        spec.reviewer,
+        _role(spec.reviewer),
         spec.profile,
         role="adversarial-linter-review",
         instruction=REVIEW_INSTRUCTION,

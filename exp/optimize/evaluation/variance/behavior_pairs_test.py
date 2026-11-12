@@ -80,9 +80,7 @@ def test_a_symbolic_difference_requires_independent_semantic_acceptance_and_repl
     fixture = grounded_fixture(tmp_path, monkeypatch)
     config = spec().model_copy(update={"author": fixture.settings, "reviewer": fixture.settings})
     good = attempt(config, 0, [{"changed_implementation", "verified_result"}])
-    poor = attempt(config, 1, [{"modified_evaluation", "unsupported_success_claim"}]).model_copy(
-        update={"historical_verifier_pass": True}
-    )
+    poor = attempt(config, 1, [{"modified_evaluation", "unsupported_success_claim"}])
     alignment = aligned()
     audit = PairAudit.model_validate(
         {

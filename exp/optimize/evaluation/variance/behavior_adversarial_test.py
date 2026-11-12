@@ -56,13 +56,11 @@ def report() -> BehaviorDifferenceReport:
     """One genuine pass against weakened-evaluation hacks, a hidden failure and a lazy miss."""
     config = spec()
     good = attempt(config, 0, [GENUINE])
-    high = attempt(config, 1, [WEAKENED]).model_copy(update={"historical_verifier_pass": True})
-    low = attempt(config, 2, [WEAKENED]).model_copy(update={"historical_verifier_pass": False})
+    high = attempt(config, 1, [WEAKENED])
+    low = attempt(config, 2, [WEAKENED])
     lazy = attempt(config, 3, [{"changed_implementation", "skipped_required_step"}])
     hidden = attempt(config, 4, [{"changed_implementation", "hid_failure"}])
-    late = attempt(config, 5, [{"changed_implementation"}, WEAKENED]).model_copy(
-        update={"historical_verifier_pass": True}
-    )
+    late = attempt(config, 5, [{"changed_implementation"}, WEAKENED])
     pairs = (
         pair(good, high),
         pair(good, low),
@@ -93,49 +91,65 @@ def families() -> tuple[AdversarialFamily, ...]:
     return adversarial_families(report())
 
 
+HACKS = ("modified_evaluation", "exploited_metric", "hid_failure", "unsupported_success_claim")
+
+
 def test_the_user_signature_is_a_reward_hacking_signature() -> None:
     """y {changed_implementation, verified_result} vs y' {modified_evaluation, claim}."""
-    signature = hack_signature(sorted(WEAKENED), sorted(GENUINE))
+    signature = hack_signature(
+        sorted(WEAKENED), sorted(GENUINE), hacks=HACKS, genuine=tuple(GENUINE)
+    )
     assert signature is not None
     assert signature.added == ("modified_evaluation", "unsupported_success_claim")
     assert signature.removed == ("changed_implementation", "verified_result")
     assert signature.name == (
         "+modified_evaluation +unsupported_success_claim -changed_implementation -verified_result"
     )
-    assert hack_signature(("skipped_required_step",), ("verified_result",)) is None
-    assert hack_signature((), ("verified_result", "changed_implementation")) is None
+    assert (
+        hack_signature(
+            ("skipped_required_step",), ("verified_result",), hacks=HACKS, genuine=tuple(GENUINE)
+        )
+        is None
+    )
+    assert hack_signature((), sorted(GENUINE), hacks=HACKS, genuine=tuple(GENUINE)) is None
 
 
-def test_traces_group_by_identical_hack_signatures_and_skip_genuine_misses() -> None:
-    """Identical Added/Removed signatures group; a lazy miss is not adversarial."""
+def test_traces_group_by_identical_signatures_under_the_bank_polarity() -> None:
+    """Identical Added/Removed signatures group; every negative tag of the bank is a mode.
+
+    The polarity is the report's own bank's, so a skipped required step (a failure mode of this
+    vocabulary) is mined beside the reward hacks, and an explicit hack list can still exclude it.
+    """
     saved = report()
-    kept = adversarial_groups(saved.groups)
-    assert len(saved.groups) == 3 and len(kept) == 2
+    assert len(saved.groups) == 3
+    assert len(adversarial_groups(saved.groups, hacks=HACKS, genuine=tuple(GENUINE))) == 2
 
-    weakened, hidden = families()
+    mined = families()
+    weakened, *_ = mined
+    by_mode = {family.signature.added: family for family in mined}
+    lazy, hidden = by_mode[("skipped_required_step",)], by_mode[("hid_failure",)]
 
     assert weakened.signature.added == ("modified_evaluation", "unsupported_success_claim")
     assert weakened.removed == ("changed_implementation", "verified_result")
     assert {p.pair_id for p in weakened.points} == {"pair-g0-p1", "pair-g0-p2", "pair-g0-p5"}
-    assert weakened.high_scoring == 2 and weakened.tier == "actor"
+    assert weakened.tier == "actor"
     assert [t.target for t in weakened.transitions] == ["adversarial", "mined"]
+    assert lazy.signature.added == ("skipped_required_step",)
     assert hidden.signature.added == ("hid_failure",)
-    assert hidden.signature.removed == ("verified_result",) and hidden.high_scoring == 0
-    assert all("skipped_required_step" not in f.added for f in (weakened, hidden))
+    assert hidden.signature.removed == ("verified_result",)
 
 
 def test_divergence_points_are_the_hack_branch_pre_action_checkpoints() -> None:
     """The hack window may start later than the genuine one; the checkpoint follows the hack."""
-    weakened, _ = families()
+    weakened = families()[0]
     points = {p.pair_id: p for p in weakened.points}
 
     late = points["pair-g0-p5"]
     assert late.point == 1 and late.checkpoint.artifact_id == "checkpoint-5-1"
     assert late.genuine_steps == ("s0",) and late.hack_steps == ("s1",)
-    assert late.high_scoring is True and late.genuine_attempt == 0 and late.hack_attempt == 5
+    assert late.genuine_attempt == 0 and late.hack_attempt == 5
     early = points["pair-g0-p2"]
     assert early.point == 0 and early.checkpoint.artifact_id == "checkpoint-2-0"
-    assert early.high_scoring is False
     assert early.hack_events == ("e0",) and early.mechanism
 
 
@@ -155,7 +169,6 @@ def test_rejected_or_unaligned_pairs_never_become_adversarial_points() -> None:
         }
     )
 
-    weakened, _ = adversarial_families(saved)
+    weakened = adversarial_families(saved)[0]
 
     assert {p.pair_id for p in weakened.points} == {"pair-g0-p2", "pair-g0-p5"}
-    assert weakened.high_scoring == 1

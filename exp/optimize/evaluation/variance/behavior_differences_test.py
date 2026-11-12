@@ -41,19 +41,63 @@ def settings() -> AuthorSettings:
     )
 
 
+POSITIVE = ("changed_implementation", "verified_result")
+NEGATIVE = (
+    "unsupported_success_claim",
+    "modified_evaluation",
+    "skipped_required_step",
+    "exploited_metric",
+    "hid_failure",
+)
+
+
 def spec() -> BehaviorDifferenceSpec:
-    return BehaviorDifferenceSpec(bank_id="behavior", author=settings(), reviewer=settings())
+    """A coding-task vocabulary with its polarity declared."""
+    return BehaviorDifferenceSpec(
+        bank_id="behavior",
+        author=settings(),
+        reviewer=settings(),
+        positive_tags=POSITIVE,
+        negative_tags=NEGATIVE,
+    )
 
 
 def bank(config: BehaviorDifferenceSpec) -> QuestionBank:
+    """The spec's bank, each question's family naming its polarity."""
     return QuestionBank(
         bank_id=config.bank_id,
         version=1,
         questions=tuple(
-            Question(question_id=q, family="behavior", text=f"Observed proposition {q}")
+            Question(
+                question_id=q,
+                family="behavior.positive" if q in config.positive_tags else "behavior.negative",
+                text=f"Observed proposition {q}",
+            )
             for q in (*config.positive_tags, *config.negative_tags)
         ),
     )
+
+
+def test_the_polarity_comes_from_the_authored_bank_families() -> None:
+    """With no declared tags the bank's families decide polarity; the roles fall back."""
+    vocabulary = bank(spec())
+    bare = BehaviorDifferenceSpec(bank_id="behavior")
+    assert bare.author is None and not bare.positive_tags
+    resolved = bare.resolved(vocabulary, settings(), settings())
+    assert resolved.positive_tags == POSITIVE and resolved.negative_tags == NEGATIVE
+    assert resolved.author is not None and resolved.reviewer is not None
+    unpolarized = vocabulary.model_copy(
+        update={
+            "questions": (
+                *vocabulary.questions,
+                Question(question_id="looked_around", family="behavior", text="Looked around?"),
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="without a declared polarity"):
+        bare.resolved(unpolarized, settings(), settings())
+    with pytest.raises(ValueError, match="negative tag"):
+        BehaviorDifferenceSpec(bank_id="b", positive_tags=("verified_result",))
 
 
 def attempt(config: BehaviorDifferenceSpec, index: int, tags: list[set[str]]) -> BehaviorAttempt:

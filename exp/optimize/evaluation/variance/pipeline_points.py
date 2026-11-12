@@ -37,7 +37,7 @@ from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.executable.task import MiningProvenance
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport, admitted_concurrency
-from exp.optimize.evaluation.variance.behavior_adversarial import hack_signature
+from exp.optimize.evaluation.variance.behavior_adversarial import report_signature
 from exp.optimize.evaluation.variance.behavior_pairs import load_behavior_differences
 from exp.optimize.evaluation.variance.blast_radius import (
     BlastRadius,
@@ -553,7 +553,7 @@ def mining_provenance(
         pairs = {pair.pair_id for pair in report.pairs if pair.point == point}
         for candidate in report.groups:
             if pairs & set(candidate.pairs):
-                hack = hack_signature(candidate.added, candidate.removed)
+                hack = report_signature(report, candidate)
                 kind = "adversarial" if hack is not None else "behavior"
                 group = candidate.group_id
                 signature = " ".join(

@@ -30,7 +30,7 @@ from exp.optimize.evaluation.variance.behavior_differences import (
     BehaviorAttempt,
     BehaviorDifferenceSpec,
 )
-from exp.optimize.evaluation.variance.behavior_differences_test import bank
+from exp.optimize.evaluation.variance.behavior_differences_test import NEGATIVE, POSITIVE, bank
 from exp.optimize.evaluation.variance.behavior_pairs import (
     ALIGN_TOOL,
     AUDIT_TOOL,
@@ -240,7 +240,6 @@ class RepairWire:
         good = BehaviorAttempt.model_validate(packet["good"])
         poor = BehaviorAttempt.model_validate(packet["poor"])
         assert good.verdict == "pass" and poor.verdict == "fail"
-        assert poor.historical_verifier_pass is True
         g, p = good.trajectory.steps[1], poor.trajectory.steps[1]
         assert isinstance(g.arguments, dict) and isinstance(p.arguments, dict)
         assert g.arguments["path"] == "implementation.py" and p.arguments["path"] == "tests.py"
@@ -459,7 +458,13 @@ def test_native_repairs_reject_weakened_tests_and_preserve_pre_error_bytes(
         project, reference, judge, configuration=CONFIGURATION, code_revision="test"
     )
     assert slot_rewards(project, labels.branches, judge.identity) == (1.0, 0.0, 1.0)
-    config = BehaviorDifferenceSpec(bank_id="behavior", author=settings, reviewer=settings)
+    config = BehaviorDifferenceSpec(
+        bank_id="behavior",
+        author=settings,
+        reviewer=settings,
+        positive_tags=POSITIVE,
+        negative_tags=NEGATIVE,
+    )
     exposure = ExposurePlan(
         bindings=artifact_input(source),
         seed=0,
