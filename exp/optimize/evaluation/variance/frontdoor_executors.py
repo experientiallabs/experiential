@@ -483,6 +483,10 @@ def tagging_concurrency() -> int:
     return value
 
 
+UNKNOWN_AUTHOR_OUTCOME = "author dispatch has an unknown outcome"
+"""Prefix of the refusal for a draw whose earlier dispatch has no recorded outcome."""
+
+
 def author_draw(
     project: ProjectStore, settings: AuthorSettings, code_revision: str
 ) -> Callable[..., ModelResponse]:
@@ -511,6 +515,14 @@ def author_draw(
                 raise
             raise ReviewerError(
                 f"the author exhausted its {settings.output_tokens}-token output allowance"
+            ) from error
+        except ValueError as error:
+            # A draw interrupted mid-dispatch (its run was stopped) has an unknown outcome and is
+            # never drawn again; fail only that draw so the slot goes on with its other draws.
+            if not str(error).startswith(UNKNOWN_AUTHOR_OUTCOME):
+                raise
+            raise ReviewerError(
+                "the author draw has an unknown outcome from an earlier run"
             ) from error
         return response
 

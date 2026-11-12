@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -129,3 +130,33 @@ def test_an_answered_decision_passes_through() -> None:
     transport = frontdoor_executors.ReasonedDecisionTransport(ScriptedJsonTransport([answered]))
     response = transport.post("https://example.test", headers={}, payload={}, timeout_seconds=1)
     assert response.body == {"answers": {}}
+
+
+def test_an_unknown_author_outcome_fails_only_that_draw(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A draw left mid-dispatch by a stopped run fails as a ReviewerError, not the slot."""
+    import pytest
+
+    from exp.optimize.evaluation.variance import frontdoor_executors as module
+
+    def refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise ValueError("author dispatch has an unknown outcome; no implicit redraw")
+
+    monkeypatch.setattr(module, "author_response", refuse)
+    draw = module.author_draw(object(), object(), "rev")
+    with pytest.raises(module.ReviewerError):
+        draw(object(), identity="x")
+
+
+def test_other_author_value_errors_still_propagate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the unknown-outcome refusal is narrowed to one draw."""
+    import pytest
+
+    from exp.optimize.evaluation.variance import frontdoor_executors as module
+
+    def refuse(*args: object, **kwargs: object) -> NoReturn:
+        raise ValueError("author deadline expired before dispatch")
+
+    monkeypatch.setattr(module, "author_response", refuse)
+    draw = module.author_draw(object(), object(), "rev")
+    with pytest.raises(ValueError, match="deadline"):
+        draw(object(), identity="x")
